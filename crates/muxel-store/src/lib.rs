@@ -11,9 +11,25 @@ use directories::ProjectDirs;
 use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
+const MUXEL_UAT_ROOT: &str = "MUXEL_UAT_ROOT";
+
+fn overridden_dir_from(root: Option<std::ffi::OsString>, kind: &str) -> Option<PathBuf> {
+    let root = root?;
+    if root.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(root).join(kind))
+}
+
+fn overridden_dir(kind: &str) -> Option<PathBuf> {
+    overridden_dir_from(std::env::var_os(MUXEL_UAT_ROOT), kind)
+}
+
 /// The muxel config directory (e.g. `~/.config/muxel` on Linux).
 pub fn config_dir() -> Option<PathBuf> {
-    ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.config_dir().to_path_buf())
+    overridden_dir("config").or_else(|| {
+        ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.config_dir().to_path_buf())
+    })
 }
 
 /// Path to the hand-editable settings file.
@@ -58,7 +74,8 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<()> {
 
 /// The muxel data directory (e.g. `~/.local/share/muxel` on Linux).
 pub fn data_dir() -> Option<PathBuf> {
-    ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf())
+    overridden_dir("data")
+        .or_else(|| ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf()))
 }
 
 /// Path to the persisted workspace document.
@@ -688,5 +705,29 @@ mod tests {
         assert!(rotated.starts_with('x'));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod uat_root_tests {
+    use super::*;
+
+    #[test]
+    fn override_keeps_config_and_data_under_one_root() {
+        let root = std::ffi::OsString::from("D:/tmp/muxel-uat/test");
+        assert_eq!(
+            overridden_dir_from(Some(root.clone()), "config"),
+            Some(PathBuf::from(&root).join("config"))
+        );
+        assert_eq!(
+            overridden_dir_from(Some(root.clone()), "data"),
+            Some(PathBuf::from(root).join("data"))
+        );
+    }
+
+    #[test]
+    fn empty_override_is_ignored() {
+        assert_eq!(overridden_dir_from(Some("".into()), "data"), None);
+        assert_eq!(overridden_dir_from(None, "data"), None);
     }
 }

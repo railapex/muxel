@@ -4342,8 +4342,15 @@ impl MuxelApp {
             this.report_save_error(SaveTarget::Settings, format!("{e:#}"));
         }
 
-        // No workspace is loaded yet — the workspace selector (shown at launch)
-        // calls `enter_workspace`, which loads the chosen workspace.
+        // Explicit UAT roots are seeded fixtures, so enter their current workspace
+        // without depending on selector accessibility. Normal launches still start
+        // at the selector and load only the workspace the user chooses.
+        if std::env::var_os("MUXEL_UAT_ROOT").is_some()
+            && !this.show_terms
+            && let Some(id) = this.workspaces.current
+        {
+            this.enter_workspace(id, window, cx);
+        }
         this
     }
 

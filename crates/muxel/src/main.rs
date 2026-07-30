@@ -98,7 +98,36 @@ fn spawn_present_pump() {
     present_pump::spawn();
 }
 
+fn uat_root_from_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--uat-root" {
+            let root = args.next().ok_or("--uat-root requires an absolute path")?;
+            let root = std::path::PathBuf::from(root);
+            if !root.is_absolute() {
+                return Err("--uat-root requires an absolute path".into());
+            }
+            return Ok(Some(root));
+        }
+    }
+    Ok(None)
+}
+
+fn configure_uat_root() -> Result<(), String> {
+    if let Some(root) = uat_root_from_args(std::env::args_os().skip(1))? {
+        // SAFETY: this runs at the start of main, before logging or threads.
+        unsafe { std::env::set_var("MUXEL_UAT_ROOT", root) };
+    }
+    Ok(())
+}
+
 fn main() {
+    if let Err(error) = configure_uat_root() {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     match session_binding::hook_instance_from_args(
         std::env::args_os().skip(1),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
@@ -276,4 +305,31 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod uat_root_tests {
+    use super::uat_root_from_args;
+
+    #[test]
+    fn parses_absolute_uat_root_anywhere_in_args() {
+        let root = std::env::temp_dir().join("muxel-uat-test");
+        let args = vec![
+            "--other".into(),
+            "--uat-root".into(),
+            root.clone().into_os_string(),
+        ];
+        assert_eq!(uat_root_from_args(args), Ok(Some(root)));
+    }
+
+    #[test]
+    fn rejects_missing_or_relative_uat_root() {
+        assert!(uat_root_from_args(vec!["--uat-root".into()]).is_err());
+        assert!(uat_root_from_args(vec!["--uat-root".into(), "relative".into()]).is_err());
+    }
+
+    #[test]
+    fn no_uat_root_preserves_normal_startup() {
+        assert_eq!(uat_root_from_args(vec!["--other".into()]), Ok(None));
+    }
 }
