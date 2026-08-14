@@ -17,6 +17,12 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
+const PAGE_CLOSE_MSG: &str = "muxel:close-pane";
+
+fn is_page_close_message(body: &str) -> bool {
+    body == PAGE_CLOSE_MSG
+}
+
 /// Native browser state that can be reused when creating another tab. On
 /// Windows this avoids rebuilding the WebView2 environment for every tab.
 #[derive(Clone, Default)]
@@ -131,8 +137,8 @@ fn native_focus_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFocusDecision, NativeFocusEvent, handoff_url, native_focus_decision,
-        should_publish_url, tab_label,
+        NativeFocusDecision, NativeFocusEvent, handoff_url, is_page_close_message,
+        native_focus_decision, should_publish_url, tab_label,
     };
 
     #[test]
@@ -177,6 +183,13 @@ mod tests {
             "https://requested"
         );
         assert_eq!(handoff_url("https://cached", None, None), "https://cached");
+    }
+
+    #[test]
+    fn page_close_message_is_exact() {
+        assert!(is_page_close_message("muxel:close-pane"));
+        assert!(!is_page_close_message("close-pane"));
+        assert!(!is_page_close_message("muxel:close-pane-now"));
     }
 
     #[test]
@@ -400,8 +413,35 @@ mod imp {
         })();
     "#;
 
+    /// A focused native child receives keys before GPUI. Forward the platform
+    /// tab-close chord to the host's state-aware close path.
+    const CLOSE_SCRIPT: &str = r#"
+        (function () {
+          window.addEventListener('keydown', function (event) {
+            const key = String(event.key || '').toLowerCase();
+            const macOS = /mac/i.test(String(navigator.platform || ''));
+            const primary = macOS
+              ? (event.metaKey && !event.ctrlKey)
+              : (event.ctrlKey && !event.metaKey);
+            const platformClose = !event.altKey && !event.shiftKey && key === 'w' && primary;
+            if (platformClose) {
+              try {
+                if (window.chrome && window.chrome.webview) {
+                  window.chrome.webview.postMessage('muxel:close-pane');
+                } else if (window.ipc) {
+                  window.ipc.postMessage('muxel:close-pane');
+                }
+                event.preventDefault();
+                event.stopPropagation();
+              } catch (e) {}
+            }
+          }, true);
+        })();
+    "#;
+
     enum NativeBrowserEvent {
         OpenTab(String),
+        ClosePane,
     }
 
     pub struct BrowserView {
@@ -621,6 +661,7 @@ mod imp {
                             .with_visible(initially_visible)
                             .with_initialization_script(&page_click_script)
                             .with_initialization_script(COPY_SCRIPT)
+                            .with_initialization_script(CLOSE_SCRIPT)
                             .with_new_window_req_handler(move |url, _features| {
                                 // A dropped receiver means this BrowserView was already torn down;
                                 // still deny the native popup so no orphan OS window escapes.
@@ -628,9 +669,15 @@ mod imp {
                                 wry::NewWindowResponse::Deny
                             });
                         #[cfg(target_os = "macos")]
+                        let page_event_tx = native_event_tx.clone();
+                        #[cfg(target_os = "macos")]
                         let builder = builder.with_ipc_handler(move |req| {
-                            if req.body().as_str() == click_message {
+                            let body = req.body().as_str();
+                            if body == click_message {
                                 let _ = focus_tx.send(NativeFocusEvent::Pointer);
+                            }
+                            if super::is_page_close_message(body) {
+                                let _ = page_event_tx.try_send(NativeBrowserEvent::ClosePane);
                             }
                         });
                         let controller_started = std::time::Instant::now();
@@ -667,6 +714,7 @@ mod imp {
                             // directly instead.
                             let pointer_tx = focus_tx.clone();
                             let pointer_message = click_message;
+                            let page_event_tx = native_event_tx.clone();
                             let web_message =
                                 WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
                                     if let Some(args) = args {
@@ -674,8 +722,14 @@ mod imp {
                                         let result =
                                             unsafe { args.TryGetWebMessageAsString(&mut raw) };
                                         let body = CoTaskMemPWSTR::from(raw).to_string();
-                                        if result.is_ok() && body == pointer_message {
-                                            let _ = pointer_tx.send(NativeFocusEvent::Pointer);
+                                        if result.is_ok() {
+                                            if body == pointer_message {
+                                                let _ = pointer_tx.send(NativeFocusEvent::Pointer);
+                                            }
+                                            if super::is_page_close_message(&body) {
+                                                let _ = page_event_tx
+                                                    .try_send(NativeBrowserEvent::ClosePane);
+                                            }
                                         }
                                     }
                                     Ok(())
@@ -743,8 +797,15 @@ mod imp {
                 });
 
                 drop(native_event_tx);
-                while let Ok(NativeBrowserEvent::OpenTab(url)) = native_events.recv().await {
-                    crate::app::open_browser_tab_from_native(instance_id, url, cx);
+                while let Ok(event) = native_events.recv().await {
+                    match event {
+                        NativeBrowserEvent::OpenTab(url) => {
+                            crate::app::open_browser_tab_from_native(instance_id, url, cx);
+                        }
+                        NativeBrowserEvent::ClosePane => {
+                            crate::app::close_browser_pane_from_native(instance_id, cx);
+                        }
+                    }
                 }
             })
             .detach();

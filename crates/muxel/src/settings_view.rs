@@ -35,7 +35,12 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("TabPrev", "ctrl-shift-tab", None),
     ("SplitRight", "ctrl-shift-l", None),
     ("SplitDown", "ctrl-shift-j", None),
-    ("ClosePane", "ctrl-shift-w", None),
+    // Platform-standard tab close. Keep global while a terminal is focused;
+    // users who need shell kill-word can add it to terminal passthrough.
+    #[cfg(target_os = "macos")]
+    ("ClosePane", "cmd-w", None),
+    #[cfg(not(target_os = "macos"))]
+    ("ClosePane", "ctrl-w", None),
     ("FocusNext", "ctrl-shift-]", None),
     ("FocusPrev", "ctrl-shift-[", None),
     ("FocusLeft", "ctrl-alt-left", None),
@@ -100,7 +105,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
 /// Actions whose plain `ctrl-<letter>` binding stays live while a terminal is
 /// focused. Everything else with that shape is scoped to `!Terminal`.
 pub const KEEP_GLOBAL_WHILE_TERMINAL: &[&str] = &[
-    "NewTab", // ctrl-t — open a tab without leaving the agent
+    "NewTab",    // ctrl-t — open a tab without leaving the agent
+    "ClosePane", // ctrl-w — close the active tab like other tabbed apps
 ];
 
 /// Which settings section is shown.

@@ -1193,6 +1193,28 @@ pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &
     });
 }
 
+/// Route the platform-standard close chord from a focused native browser child
+/// through the same state-aware close path as tabs and GPUI keybindings.
+pub(crate) fn close_browser_pane_from_native(instance_id: Uuid, cx: &mut AsyncApp) {
+    let _ = cx.update(|cx| {
+        let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .and_then(|handle| handle.0.upgrade())
+        else {
+            return;
+        };
+        app.update(cx, |app, cx| {
+            if app
+                .workspace
+                .instance(instance_id)
+                .is_some_and(|instance| instance.kind == InstanceKind::Browser)
+            {
+                app.request_close_instance(instance_id, cx);
+            }
+        });
+    });
+}
+
 /// Set the active preset (by id) for new panes.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = muxel, no_json)]
@@ -1476,6 +1498,27 @@ fn resolve_binding_context<'a>(
         return Some("!Terminal");
     }
     None
+}
+
+#[cfg(test)]
+mod keybinding_policy_tests {
+    use super::resolve_binding_context;
+
+    #[test]
+    fn close_tab_is_global_until_explicitly_passed_through() {
+        assert_eq!(
+            resolve_binding_context("ClosePane", "ctrl-w", None, &[]),
+            None
+        );
+        assert_eq!(
+            resolve_binding_context("ClosePane", "ctrl-w", None, &["CTRL-W"]),
+            Some("!Terminal")
+        );
+        assert_eq!(
+            resolve_binding_context("SaveFile", "ctrl-s", None, &[]),
+            Some("!Terminal")
+        );
+    }
 }
 
 /// The user's home directory (`HOME` on Unix, `USERPROFILE` on Windows).
