@@ -1197,34 +1197,26 @@ pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &
 /// Route the platform-standard close chord from a focused native browser child
 /// through the same state-aware close path as tabs and GPUI keybindings.
 pub(crate) fn close_browser_pane_from_native(instance_id: Uuid, cx: &mut AsyncApp) {
-    let target = cx.update(|cx| {
+    let app = cx.update(|cx| {
         let app = cx
             .try_global::<MuxelHandle>()
             .and_then(|handle| handle.0.upgrade())?;
-        let popout = app.read(cx).popouts.get(&instance_id).and_then(|popout| {
-            matches!(popout.view, PaneView::Browser(_))
-                .then(|| AnyWindowHandle::from(popout.window))
-        });
-        Some((app, popout))
+        Some(app)
     });
-    let Some((app, popout)) = target else {
+    let Some(app) = app else {
         return;
     };
-    if let Some(handle) = popout {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
-    } else {
-        let _ = cx.update(|cx| {
-            app.update(cx, |app, cx| {
-                if app
-                    .workspace
-                    .instance(instance_id)
-                    .is_some_and(|instance| instance.kind == InstanceKind::Browser)
-                {
-                    app.request_close_instance(instance_id, cx);
-                }
-            });
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            if app
+                .workspace
+                .instance(instance_id)
+                .is_some_and(|instance| instance.kind == InstanceKind::Browser)
+            {
+                app.request_close_instance(instance_id, cx);
+            }
         });
-    }
+    });
 }
 
 /// Set the active preset (by id) for new panes.
@@ -2471,6 +2463,11 @@ pub struct MuxelApp {
     update_resize: Option<(Point<Pixels>, gpui::Size<Pixels>)>,
     /// A terminal shown maximized over the pane area (transient; not persisted).
     maximized: Option<Uuid>,
+    /// Terminal close actions still inside their recovery grace period. Their
+    /// live views and instance metadata remain owned here while layout leaves
+    /// are hidden.
+    pending_terminal_closes: Vec<PendingTerminalClose>,
+    next_terminal_close_generation: u64,
     /// Panes detached into their own OS windows, keyed by instance id.
     popouts: HashMap<Uuid, PopOut>,
     /// Secondary (per-monitor) workspace windows, one per pinned project.
@@ -2809,6 +2806,14 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
     }
 }
 
+fn tab_index_in_layout(layout: &PaneNode, iid: Uuid) -> Option<usize> {
+    let path = layout.find_path(iid)?;
+    let PaneNode::Leaf(leaf) = layout.get_at_path(&path)? else {
+        return None;
+    };
+    leaf.tabs.iter().position(|tab| *tab == iid)
+}
+
 /// Root view for a popped-out pane window: a title bar (with a Dock button)
 /// plus the pane content. The window close hook asks for confirmation, then the
 /// main app observes `on_window_closed` and tears the pane down. The Dock button
@@ -2869,21 +2874,35 @@ impl PopoutView {
         }
     }
 
-    fn request_close(&mut self, cx: &mut Context<Self>) {
-        let needs_confirm = matches!(self.view, PaneView::Terminal(_))
-            || matches!(
-                &self.view,
-                PaneView::Editor(editor) if editor.read(cx).is_dirty()
-            );
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty_editor = matches!(
+            &self.view,
+            PaneView::Editor(editor) if editor.read(cx).is_dirty()
+        );
+        let app = cx
+            .try_global::<MuxelHandle>()
+            .and_then(|handle| handle.0.upgrade());
+        let terminal_disposition = app.as_ref().and_then(|app| {
+            matches!(self.view, PaneView::Terminal(_))
+                .then(|| app.read(cx).terminal_close_disposition_for(self.iid, cx))
+        });
+        let needs_confirm =
+            dirty_editor || terminal_disposition == Some(TerminalCloseDisposition::Confirm);
         if needs_confirm {
             self.show_close_confirm = true;
             cx.notify();
-        } else if let Some(app) = cx
-            .try_global::<MuxelHandle>()
-            .and_then(|handle| handle.0.upgrade())
-        {
+        } else if let Some(app) = app {
             let iid = self.iid;
-            app.update(cx, |app, cx| app.execute_close_group(vec![iid], cx));
+            let recoverable = terminal_disposition == Some(TerminalCloseDisposition::Recoverable);
+            app.update(cx, |app, cx| {
+                if recoverable {
+                    app.redock_popout(iid, cx);
+                }
+                app.execute_close_group(vec![iid], cx);
+            });
+            if recoverable {
+                window.remove_window();
+            }
         }
     }
 }
@@ -3219,6 +3238,173 @@ fn requested_recently_closed_group(
     }
 }
 
+fn recently_closed_browser_url(
+    metadata: Option<String>,
+    docked_handoff: Option<String>,
+    popout_handoff: Option<String>,
+) -> Option<String> {
+    docked_handoff.or(popout_handoff).or(metadata)
+}
+
+const TERMINAL_CLOSE_GRACE: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalCloseDisposition {
+    Recoverable,
+    Confirm,
+    Immediate,
+}
+
+fn terminal_close_disposition(
+    status: Option<AgentStatus>,
+    has_live_view: bool,
+    launching: bool,
+    confirm_active: bool,
+) -> TerminalCloseDisposition {
+    if !has_live_view {
+        return TerminalCloseDisposition::Immediate;
+    }
+    if launching
+        || matches!(
+            status,
+            None | Some(AgentStatus::Working | AgentStatus::Blocked)
+        )
+    {
+        return if confirm_active {
+            TerminalCloseDisposition::Confirm
+        } else {
+            TerminalCloseDisposition::Immediate
+        };
+    }
+    TerminalCloseDisposition::Recoverable
+}
+
+fn should_restore_terminal_close_at_expiry(active: impl IntoIterator<Item = bool>) -> bool {
+    active.into_iter().any(std::convert::identity)
+}
+
+#[derive(Clone)]
+struct PendingTerminalItem {
+    iid: Uuid,
+    title: String,
+    tab_index: Option<usize>,
+    redock: RedockAnchor,
+}
+
+#[derive(Clone)]
+struct PendingTerminalClose {
+    project_id: Uuid,
+    items: Vec<PendingTerminalItem>,
+    layout_before: Option<PaneNode>,
+    layout_after: Option<PaneNode>,
+    restore_focus: Uuid,
+    generation: u64,
+    deadline: Instant,
+}
+
+impl PendingTerminalClose {
+    fn contains(&self, iid: Uuid) -> bool {
+        self.items.iter().any(|item| item.iid == iid)
+    }
+}
+
+fn take_pending_terminal_close(
+    groups: &mut Vec<PendingTerminalClose>,
+    generation: u64,
+) -> Option<PendingTerminalClose> {
+    let index = groups
+        .iter()
+        .position(|group| group.generation == generation)?;
+    Some(groups.remove(index))
+}
+
+fn refresh_terminal_close_deadlines(groups: &mut [PendingTerminalClose], deadline: Instant) {
+    for group in groups {
+        group.deadline = deadline;
+    }
+}
+
+fn restore_batch_tabs(
+    layout: &mut Option<PaneNode>,
+    anchor: Uuid,
+    items: &[PendingTerminalItem],
+) -> bool {
+    let Some(root) = layout.as_ref() else {
+        return false;
+    };
+    if root.find_path(anchor).is_none()
+        || items.len() < 2
+        || items
+            .iter()
+            .any(|item| item.tab_index.is_none() || root.find_path(item.iid).is_some())
+    {
+        return false;
+    }
+    let mut ordered: Vec<&PendingTerminalItem> = items.iter().collect();
+    ordered.sort_by_key(|item| item.tab_index);
+    let mut restored = layout.clone();
+    if !ordered.into_iter().all(|item| {
+        add_tab_at(
+            &mut restored,
+            anchor,
+            item.iid,
+            item.tab_index.expect("validated tab index"),
+        )
+    }) {
+        return false;
+    }
+    *layout = restored;
+    true
+}
+
+fn restore_terminal_item(layout: &mut Option<PaneNode>, item: &PendingTerminalItem) {
+    if layout
+        .as_ref()
+        .is_some_and(|root| root.find_path(item.iid).is_some())
+    {
+        return;
+    }
+    let anchor_alive = |id| {
+        layout
+            .as_ref()
+            .is_some_and(|root| root.find_path(id).is_some())
+    };
+    match item.redock {
+        RedockAnchor::Tab { sibling, index } if anchor_alive(sibling) => {
+            if add_tab_at(layout, sibling, item.iid, index) {
+                return;
+            }
+        }
+        RedockAnchor::Split {
+            anchor,
+            dir,
+            before,
+        } if anchor_alive(anchor) => {
+            split_beside(layout, anchor, dir, item.iid, before);
+            return;
+        }
+        _ => {}
+    }
+    if let Some(target) = layout.as_ref().and_then(PaneNode::first_instance) {
+        split(layout, target, SplitDirection::Horizontal, item.iid);
+    } else {
+        *layout = Some(PaneNode::leaf(item.iid));
+    }
+}
+
+fn restore_terminal_close_layout(layout: &mut Option<PaneNode>, group: &PendingTerminalClose) {
+    if *layout == group.layout_after {
+        *layout = group.layout_before.clone();
+        return;
+    }
+    if restore_batch_tabs(layout, group.restore_focus, &group.items) {
+        return;
+    }
+    for item in &group.items {
+        restore_terminal_item(layout, item);
+    }
+}
+
 /// State for the confirmation modal (title/message + the pending action).
 struct PendingConfirm {
     title: SharedString,
@@ -3431,7 +3617,9 @@ impl Render for PopoutView {
                     v.read(cx).session().write_input(b"\x1b[Z");
                 }
             }))
-            .on_action(cx.listener(|this, _: &ClosePane, _window, cx| this.request_close(cx)))
+            .on_action(
+                cx.listener(|this, _: &ClosePane, window, cx| this.request_close(window, cx)),
+            )
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -3442,7 +3630,9 @@ impl Render for PopoutView {
                 // selectable popped-out content (e.g. a rendered-markdown editor).
                 // The mouse-down on the title-content row below claims the press.
                 TitleBar::new()
-                    .on_close_window(cx.listener(|this, _ev, _window, cx| this.request_close(cx)))
+                    .on_close_window(
+                        cx.listener(|this, _ev, window, cx| this.request_close(window, cx)),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -3593,7 +3783,17 @@ impl Render for PopoutView {
                                                     }
                                                     cx.notify();
                                                 } else {
-                                                    window.remove_window();
+                                                    let iid = this.iid;
+                                                    if let Some(app) = cx
+                                                        .try_global::<MuxelHandle>()
+                                                        .and_then(|handle| handle.0.upgrade())
+                                                    {
+                                                        app.update(cx, |app, cx| {
+                                                            app.execute_close_group(vec![iid], cx)
+                                                        });
+                                                    } else {
+                                                        window.remove_window();
+                                                    }
                                                 }
                                             })),
                                     ),
@@ -4657,6 +4857,8 @@ impl MuxelApp {
             update_modal_size: size(px(560.0), px(520.0)),
             update_resize: None,
             maximized: None,
+            pending_terminal_closes: Vec::new(),
+            next_terminal_close_generation: 0,
             popouts: HashMap::new(),
             secondary_windows: Vec::new(),
             main_window: Some(window.window_handle()),
@@ -6545,7 +6747,16 @@ impl MuxelApp {
         let Some(path) = muxel_store::workspace_doc_path(id) else {
             return false;
         };
-        match muxel_store::save_workspace_to(&path, &self.workspace) {
+        // A recoverable close is session-only. Persist a clone with every
+        // pending group restored so a crash or quit cannot strand live instance
+        // metadata outside the saved layout.
+        let mut persisted = self.workspace.clone();
+        for group in self.pending_terminal_closes.iter().rev() {
+            if let Some(project) = persisted.project_mut(group.project_id) {
+                restore_terminal_close_layout(&mut project.layout, group);
+            }
+        }
+        match muxel_store::save_workspace_to(&path, &persisted) {
             Ok(()) => {
                 self.auto_name_save_due = None;
                 self.clear_save_error(SaveTarget::Workspace);
@@ -6595,6 +6806,10 @@ impl MuxelApp {
         // another process to open.
         self.workspace_lock = Some(lock);
 
+        // The saved old workspace sees every pending terminal restored. Its live
+        // views are about to be torn down with the rest of that workspace, so no
+        // recovery action may follow us into the new document.
+        self.pending_terminal_closes.clear();
         self.failed_launches.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
@@ -7027,6 +7242,7 @@ impl MuxelApp {
         // the remote copy is current even if we don't return for a while.
         if let Some(prev) = self.workspace.active_project
             && prev != pid
+            && !self.has_pending_terminal_close_for_project(prev)
             && self.remote_push_due.remove(&prev).is_some()
         {
             self.push_remote_layout_now(prev, cx);
@@ -8697,7 +8913,11 @@ impl MuxelApp {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
-            } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
+            } else if exited
+                && exit_code == Some(0)
+                && self.settings.close_on_exit
+                && !self.is_pending_terminal_close(iid)
+            {
                 // Close-on-exit keys off the actual process exit, not the display
                 // state (Done also means "finished a turn" while still running).
                 // Only a *clean* exit qualifies: a crash (non-zero) or a bare PTY
@@ -8887,6 +9107,7 @@ impl MuxelApp {
             .auto
             .iter()
             .filter(|(_, a)| a.enabled)
+            .filter(|(iid, _)| !self.is_pending_terminal_close(**iid))
             .filter_map(|(iid, _)| {
                 let v = self.terminals.get(iid)?.read(cx);
                 let activity = match v.status() {
@@ -8975,6 +9196,7 @@ impl MuxelApp {
                 untrack.push(iid);
                 continue;
             }
+            let pending_close = self.is_pending_terminal_close(iid);
             let status = self.last_status.get(&iid).copied();
             let run = self.running_loops.get_mut(&iid).expect("present");
             if status == Some(AgentStatus::Working) {
@@ -8985,7 +9207,7 @@ impl MuxelApp {
             let timed_out = run.started.elapsed() >= MAX_LOOP_RUNTIME;
             if finished || timed_out {
                 untrack.push(iid);
-                if run.post_run == PostRunAction::Exit {
+                if run.post_run == PostRunAction::Exit && !pending_close {
                     close.push(iid);
                 }
             }
@@ -11448,6 +11670,295 @@ impl MuxelApp {
         cx.notify();
     }
 
+    fn terminal_close_disposition_for(&self, iid: Uuid, cx: &App) -> TerminalCloseDisposition {
+        let docked_status = self
+            .terminals
+            .get(&iid)
+            .map(|terminal| terminal.read(cx).status());
+        let popped_status = self
+            .popouts
+            .get(&iid)
+            .and_then(|popout| match &popout.view {
+                PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
+                PaneView::Editor(_) | PaneView::Browser(_) => None,
+            });
+        terminal_close_disposition(
+            docked_status
+                .or(popped_status)
+                .or_else(|| self.last_status.get(&iid).copied()),
+            docked_status.is_some() || popped_status.is_some(),
+            self.terminal_launching.contains_key(&iid),
+            self.settings.confirm_close_terminal,
+        )
+    }
+
+    fn is_pending_terminal_close(&self, iid: Uuid) -> bool {
+        self.pending_terminal_closes
+            .iter()
+            .any(|group| group.contains(iid))
+    }
+
+    fn has_pending_terminal_close_for_project(&self, project_id: Uuid) -> bool {
+        self.pending_terminal_closes
+            .iter()
+            .any(|group| group.project_id == project_id)
+    }
+
+    /// Hide idle/done terminal tabs while retaining their live views for Undo.
+    fn soft_close_terminals(
+        &mut self,
+        ids: Vec<Uuid>,
+        restore_focus: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if ids.is_empty()
+            || ids.iter().any(|iid| self.is_pending_terminal_close(*iid))
+            || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
+        {
+            return;
+        }
+        let Some(project_id) = ids
+            .first()
+            .and_then(|iid| self.workspace.instance(*iid))
+            .map(|instance| instance.project_id)
+        else {
+            return;
+        };
+        if ids.iter().any(|iid| {
+            self.workspace.instance(*iid).is_none_or(|instance| {
+                instance.project_id != project_id || instance.kind != InstanceKind::Terminal
+            }) || !self.terminals.contains_key(iid)
+        }) {
+            return;
+        }
+        let Some(layout_root) = self
+            .workspace
+            .project(project_id)
+            .and_then(|project| project.layout.clone())
+        else {
+            return;
+        };
+        let layout_before = Some(layout_root.clone());
+        let items: Vec<PendingTerminalItem> = ids
+            .iter()
+            .filter_map(|iid| {
+                let instance = self.workspace.instance(*iid)?;
+                Some(PendingTerminalItem {
+                    iid: *iid,
+                    title: instance.display_name().to_string(),
+                    tab_index: tab_index_in_layout(&layout_root, *iid),
+                    redock: compute_redock_anchor(&layout_before, *iid),
+                })
+            })
+            .collect();
+        if items.len() != ids.len() {
+            return;
+        }
+        let mut layout_after = layout_before.clone();
+        if ids.iter().any(|iid| !remove(&mut layout_after, *iid)) {
+            return;
+        }
+
+        let single_survivor = (ids.len() == 1)
+            .then(|| layout_root.surviving_active_after_remove(ids[0]))
+            .flatten();
+        if let Some(project) = self.workspace.project_mut(project_id) {
+            project.layout = layout_after.clone();
+        }
+        if self
+            .active_instance
+            .is_some_and(|active| ids.contains(&active))
+        {
+            self.active_instance = single_survivor.or_else(|| {
+                (!ids.contains(&restore_focus))
+                    .then_some(restore_focus)
+                    .or_else(|| {
+                        self.workspace
+                            .project(project_id)
+                            .and_then(Project::first_instance)
+                    })
+            });
+        }
+        if self.maximized.is_some_and(|iid| ids.contains(&iid)) {
+            self.maximized = None;
+        }
+
+        self.next_terminal_close_generation = self.next_terminal_close_generation.wrapping_add(1);
+        let generation = self.next_terminal_close_generation;
+        let deadline = Instant::now() + TERMINAL_CLOSE_GRACE;
+        refresh_terminal_close_deadlines(&mut self.pending_terminal_closes, deadline);
+        self.pending_terminal_closes.push(PendingTerminalClose {
+            project_id,
+            items,
+            layout_before,
+            layout_after,
+            restore_focus,
+            generation,
+            deadline,
+        });
+        muxel_store::append_event_log(&format!(
+            "soft-close-terminals: count={} generation={generation}",
+            ids.len()
+        ));
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let keep_waiting = view
+                    .update(cx, |this, cx| {
+                        let Some(group) = this
+                            .pending_terminal_closes
+                            .iter()
+                            .find(|group| group.generation == generation)
+                        else {
+                            return false;
+                        };
+                        if Instant::now() >= group.deadline {
+                            this.resolve_pending_terminal_close(generation, cx);
+                            false
+                        } else {
+                            cx.notify();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_waiting {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn restore_pending_terminal_layout(&mut self, group: &PendingTerminalClose) -> Option<Uuid> {
+        if self.workspace.project(group.project_id).is_none()
+            || group
+                .items
+                .iter()
+                .any(|item| !self.terminals.contains_key(&item.iid))
+        {
+            return None;
+        }
+        let project = self.workspace.project_mut(group.project_id)?;
+        restore_terminal_close_layout(&mut project.layout, group);
+        project
+            .layout
+            .as_ref()
+            .filter(|layout| layout.find_path(group.restore_focus).is_some())
+            .map(|_| group.restore_focus)
+            .or_else(|| group.items.first().map(|item| item.iid))
+    }
+
+    fn undo_terminal_close(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self
+            .pending_terminal_closes
+            .iter()
+            .find(|group| group.generation == generation)
+            .cloned()
+        else {
+            return;
+        };
+        let focus = self.restore_pending_terminal_layout(&group);
+        if focus.is_none() {
+            self.finish_pending_terminal_close(generation, "close-recovery-lost", cx);
+            return;
+        }
+        let Some(group) =
+            take_pending_terminal_close(&mut self.pending_terminal_closes, generation)
+        else {
+            return;
+        };
+        self.workspace.active_project = Some(group.project_id);
+        self.active_instance = focus;
+        self.persist();
+        if let Some(focus) = focus {
+            self.focus_instance_with_attendance(focus, false, window, cx);
+        }
+        muxel_store::append_event_log(&format!(
+            "undo-terminal-close: count={} generation={}",
+            group.items.len(),
+            group.generation
+        ));
+        cx.notify();
+    }
+
+    /// At expiry, active/unknown terminals return to the layout instead of being
+    /// killed under a stale idle/done decision.
+    fn resolve_pending_terminal_close(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let should_restore = self
+            .pending_terminal_closes
+            .iter()
+            .find(|group| group.generation == generation)
+            .is_some_and(|group| {
+                should_restore_terminal_close_at_expiry(
+                    group
+                        .items
+                        .iter()
+                        .map(|item| self.terminal_interruption_for(item.iid, cx).is_some()),
+                )
+            });
+        if !should_restore {
+            self.finish_pending_terminal_close(generation, "close-expired", cx);
+            return;
+        }
+        let Some(group) = self
+            .pending_terminal_closes
+            .iter()
+            .find(|group| group.generation == generation)
+            .cloned()
+        else {
+            return;
+        };
+        if self.restore_pending_terminal_layout(&group).is_none() {
+            self.finish_pending_terminal_close(generation, "close-recovery-lost", cx);
+            return;
+        }
+        if take_pending_terminal_close(&mut self.pending_terminal_closes, generation).is_none() {
+            return;
+        }
+        self.persist();
+        muxel_store::append_event_log(&format!(
+            "restore-active-terminal-close: count={} generation={}",
+            group.items.len(),
+            group.generation
+        ));
+        cx.notify();
+    }
+
+    fn finish_pending_terminal_close(
+        &mut self,
+        generation: u64,
+        reason: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ids) = self
+            .pending_terminal_closes
+            .iter()
+            .find(|group| group.generation == generation)
+            .map(|group| group.items.iter().map(|item| item.iid).collect::<Vec<_>>())
+        else {
+            return;
+        };
+        // Leave the group registered while its items are torn down. Each close
+        // removes its own item, so an intervening persistence write still restores
+        // every not-yet-finalized terminal instead of saving orphan metadata.
+        for iid in ids {
+            self.close_instance_inner(iid, reason, cx);
+        }
+    }
+
+    fn dismiss_terminal_close(&mut self, generation: u64, cx: &mut Context<Self>) {
+        self.finish_pending_terminal_close(generation, "close-dismissed", cx);
+        cx.notify();
+    }
+
     /// Close a specific pane (window-free): removes it from its project layout,
     /// kills the process, tears down its tmux session + worktree, and drops the
     /// metadata. Used by auto-close-on-exit and as the core of `close_active`.
@@ -11533,6 +12044,15 @@ impl MuxelApp {
         // Invalidate a PTY still being created. Its eventual result sees the
         // missing token, drops, and kills the child instead of becoming invisible.
         self.terminal_launching.remove(&iid);
+        for group in &mut self.pending_terminal_closes {
+            if group.contains(iid) {
+                group.items.retain(|item| item.iid != iid);
+                remove(&mut group.layout_before, iid);
+                remove(&mut group.layout_after, iid);
+            }
+        }
+        self.pending_terminal_closes
+            .retain(|group| !group.items.is_empty());
         self.clear_notifications_for(iid);
         // Durable trace of every close: with stderr often discarded, this log is
         // what distinguishes "I closed it" from "it vanished" after the fact.
@@ -12146,7 +12666,7 @@ impl MuxelApp {
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
         let mut changed = false;
         for pid in synced {
-            if !self.project_syncs_layout(pid) {
+            if !self.project_syncs_layout(pid) || self.has_pending_terminal_close_for_project(pid) {
                 continue;
             }
             let Some(proj) = self.workspace.project(pid) else {
@@ -12170,7 +12690,7 @@ impl MuxelApp {
         let due: Vec<Uuid> = self
             .remote_push_due
             .iter()
-            .filter(|(_, t)| **t <= now)
+            .filter(|(pid, t)| **t <= now && !self.has_pending_terminal_close_for_project(**pid))
             .map(|(pid, _)| *pid)
             .collect();
         for pid in due {
@@ -12183,7 +12703,7 @@ impl MuxelApp {
     /// `<root>/.muxel/workspace.json` off the UI thread (backs up the previous copy
     /// first) — over SSH for a remote project, on the local filesystem for a local one.
     fn push_remote_layout_now(&mut self, pid: Uuid, cx: &mut Context<Self>) {
-        if !self.project_syncs_layout(pid) {
+        if !self.project_syncs_layout(pid) || self.has_pending_terminal_close_for_project(pid) {
             return;
         }
         let Some(loc) = self.repo_loc(pid) else {
@@ -13968,7 +14488,7 @@ impl MuxelApp {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
         let root = self.attach_workspace_actions(root, cx);
-        root.child(self.render_secondary_titlebar(sidebar_hidden, cx))
+        root.child(self.render_secondary_titlebar(pid, sidebar_hidden, cx))
             .child(div().flex_1().min_h_0().flex().child(body))
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {
                 div()
@@ -14087,11 +14607,11 @@ impl MuxelApp {
                     // invoke TitleBar::on_close_window. Guard the actual window
                     // close request so the X, Alt+F4, and Linux decorations all
                     // use the same resource/terminal close decision.
-                    window.on_window_should_close(cx, move |_window, cx| {
+                    window.on_window_should_close(cx, move |window, cx| {
                         let Some(view) = close_view.upgrade() else {
                             return true;
                         };
-                        view.update(cx, |this, cx| this.request_close(cx));
+                        view.update(cx, |this, cx| this.request_close(window, cx));
                         false
                     });
                     cx.new(|cx| {
@@ -14431,22 +14951,17 @@ impl MuxelApp {
             .iter()
             .filter_map(|iid| {
                 let kind = self.workspace.instance(*iid)?.kind;
-                let idle_lone_shell = single
-                    && kind == InstanceKind::Terminal
-                    && self
-                        .workspace
-                        .instance(*iid)
-                        .is_some_and(|instance| instance.program.is_none())
-                    && self.other_tabs_in_pane(*iid).is_empty()
-                    && self
-                        .terminals
-                        .get(iid)
-                        .is_some_and(|view| view.read(cx).session().is_idle_foreground());
-                (self.confirm_close_for(kind) && !idle_lone_shell).then_some((*iid, kind))
+                let needs_confirm = if kind == InstanceKind::Terminal {
+                    self.terminal_close_disposition_for(*iid, cx)
+                        == TerminalCloseDisposition::Confirm
+                } else {
+                    self.confirm_close_for(kind)
+                };
+                needs_confirm.then_some((*iid, kind))
             })
             .collect();
         if needs_confirm.is_empty() {
-            self.execute_close_group(ids, cx);
+            self.execute_terminal_aware_close_group(ids, restore_focus, false, cx);
             return;
         }
         let terminal_count = needs_confirm
@@ -14512,10 +15027,8 @@ impl MuxelApp {
     }
 
     fn execute_close_group(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
-        self.record_recently_closed_resources(&ids);
-        for iid in ids {
-            self.close_group_instance(iid, cx);
-        }
+        let restore_focus = ids.first().copied().unwrap_or_default();
+        self.execute_terminal_aware_close_group(ids, restore_focus, true, cx);
     }
 
     fn close_group_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
@@ -14533,7 +15046,7 @@ impl MuxelApp {
         }
     }
 
-    fn record_recently_closed_resources(&mut self, ids: &[Uuid]) -> Option<u64> {
+    fn record_recently_closed_resources(&mut self, ids: &[Uuid], cx: &App) -> Option<u64> {
         let workspace_id = self.current_workspace?;
         let project_id = ids
             .first()
@@ -14548,7 +15061,22 @@ impl MuxelApp {
                     kind: instance.kind,
                     title: instance.display_name().to_string(),
                     path: instance.editor_path.clone(),
-                    url: instance.browser_url.clone(),
+                    url: if instance.kind == InstanceKind::Browser {
+                        recently_closed_browser_url(
+                            instance.browser_url.clone(),
+                            self.browsers
+                                .get(iid)
+                                .map(|browser| browser.read(cx).handoff_url(cx)),
+                            self.popouts.get(iid).and_then(|popout| match &popout.view {
+                                PaneView::Browser(browser) => {
+                                    Some(browser.read(cx).handoff_url(cx))
+                                }
+                                PaneView::Terminal(_) | PaneView::Editor(_) => None,
+                            }),
+                        )
+                    } else {
+                        instance.browser_url.clone()
+                    },
                 })
             })
             .collect();
@@ -14566,8 +15094,50 @@ impl MuxelApp {
         push_recently_closed_group(history, group);
         Some(generation)
     }
-    /// Which window the pending confirmation belongs in. A dirty-editor close
-    /// must appear beside the pane even when that project is popped out.
+
+    fn execute_terminal_aware_close_group(
+        &mut self,
+        ids: Vec<Uuid>,
+        restore_focus: Uuid,
+        active_confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut recoverable = Vec::new();
+        let mut immediate = Vec::new();
+        for iid in ids {
+            let Some(kind) = self.workspace.instance(iid).map(|instance| instance.kind) else {
+                continue;
+            };
+            if kind != InstanceKind::Terminal {
+                immediate.push(iid);
+                continue;
+            }
+            match self.terminal_close_disposition_for(iid, cx) {
+                TerminalCloseDisposition::Recoverable => recoverable.push(iid),
+                TerminalCloseDisposition::Immediate => immediate.push(iid),
+                TerminalCloseDisposition::Confirm if active_confirmed => immediate.push(iid),
+                TerminalCloseDisposition::Confirm => return,
+            }
+        }
+        let all_ids: Vec<Uuid> = recoverable
+            .iter()
+            .chain(immediate.iter())
+            .copied()
+            .collect();
+        self.record_recently_closed_resources(&all_ids, cx);
+        if !recoverable.is_empty() {
+            self.soft_close_terminals(recoverable, restore_focus, cx);
+        }
+        for iid in immediate {
+            self.close_group_instance(iid, cx);
+        }
+    }
+
+    /// Which window the pending confirm dialog belongs in: `Some(pid)` for the
+    /// project window showing the pane it acts on, `None` for the main window.
+    /// A dialog rendered in the wrong window is invisible — a popped-out project
+    /// sits on another monitor, and the modal would open over the main window
+    /// while the pane the user just tried to close is somewhere else entirely.
     fn confirm_window_pid(&self) -> Option<Uuid> {
         let iid = self.confirm.as_ref()?.action.pane_instance()?;
         let pid = self.workspace.instance(iid)?.project_id;
@@ -14672,11 +15242,8 @@ impl MuxelApp {
             ConfirmAction::DiscardDirtyAndContinue { ids, restore_focus } => {
                 self.request_close_group_after_dirty(ids, restore_focus, cx)
             }
-            ConfirmAction::CloseGroup {
-                ids,
-                restore_focus: _,
-            } => {
-                self.execute_close_group(ids, cx);
+            ConfirmAction::CloseGroup { ids, restore_focus } => {
+                self.execute_terminal_aware_close_group(ids, restore_focus, true, cx);
                 if let Some(focus) = self.active_instance {
                     self.focus_instance(focus, window, cx);
                 }
@@ -20602,6 +21169,7 @@ impl MuxelApp {
     /// It must never quit the app: this window is one project, not muxel.
     fn render_secondary_titlebar(
         &self,
+        project_id: Uuid,
         sidebar_hidden: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -20635,7 +21203,13 @@ impl MuxelApp {
                                     })),
                             ),
                     )
-                    .child(div().font_semibold().child(t("muxel"))),
+                    .child(div().font_semibold().child(t("muxel")))
+                    .child(div().flex_1())
+                    .children(
+                        (self.recovery_project_id() == Some(project_id))
+                            .then(|| self.render_terminal_recovery_control(cx)),
+                    )
+                    .child(div().flex_1()),
             )
     }
 
@@ -20687,17 +21261,22 @@ impl MuxelApp {
                             .child(workspace_name),
                     )
                     .child(div().flex_1())
-                    .child(nodrag(
-                        Button::new("global-search")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Search)
-                            .label(t("Search…"))
-                            .tooltip(t("Search files and terminals (Ctrl+P)"))
-                            .on_click(cx.listener(|this, _ev, window, cx| {
-                                this.open_search_palette(window, cx)
-                            })),
-                    ))
+                    .child(if self.recovery_is_for_main_window() {
+                        self.render_terminal_recovery_control(cx)
+                    } else {
+                        nodrag(
+                            Button::new("global-search")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Search)
+                                .label(t("Search…"))
+                                .tooltip(t("Search files and terminals (Ctrl+P)"))
+                                .on_click(cx.listener(|this, _ev, window, cx| {
+                                    this.open_search_palette(window, cx)
+                                })),
+                        )
+                        .into_any_element()
+                    })
                     .child(div().flex_1())
                     .child(nodrag(
                         Button::new("update")
@@ -22519,6 +23098,125 @@ impl MuxelApp {
             None => true,
             Some(prog) => self.available_programs.contains(prog),
         }
+    }
+
+    fn recovery_project_id(&self) -> Option<Uuid> {
+        self.pending_terminal_closes
+            .last()
+            .map(|group| group.project_id)
+    }
+
+    fn recovery_window_pid(&self) -> Option<Uuid> {
+        let project_id = self.recovery_project_id()?;
+        self.secondary_windows
+            .iter()
+            .any(|window| window.pid == project_id)
+            .then_some(project_id)
+    }
+
+    fn recovery_is_for_main_window(&self) -> bool {
+        self.recovery_project_id().is_some() && self.recovery_window_pid().is_none()
+    }
+
+    fn render_terminal_recovery_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(group) = self.pending_terminal_closes.last() else {
+            return div().into_any_element();
+        };
+        let generation = group.generation;
+        let remaining = group
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32();
+        let fraction = (remaining / TERMINAL_CLOSE_GRACE.as_secs_f32()).clamp(0.0, 1.0);
+        let item_count = group.items.len();
+        let mut label = if item_count == 1 {
+            tf(
+                "Closed \"{name}\"",
+                &[("name", group.items[0].title.as_str())],
+            )
+        } else {
+            tn(
+                "Closed {n} terminal",
+                "Closed {n} terminals",
+                item_count,
+                &[("n", &item_count.to_string())],
+            )
+        };
+        let earlier = self.pending_terminal_closes.len() - 1;
+        if earlier > 0 {
+            label = tf(
+                "{label} · +{n}",
+                &[("label", &label.to_string()), ("n", &earlier.to_string())],
+            );
+        }
+        let undo_label = if item_count == 1 {
+            t("Undo")
+        } else {
+            t("Undo all")
+        };
+        div()
+            .id("muxel.pending-terminal-close-control")
+            .role(Role::Group)
+            .aria_label(label.clone())
+            .relative()
+            .h(px(30.0))
+            .max_w(px(460.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().primary)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(Icon::new(IconName::Undo).small())
+            .child(
+                div()
+                    .max_w(px(270.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .font_semibold()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .w(px(28.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{}s", remaining.ceil() as u64)),
+            )
+            .child(
+                Button::new("undo-terminal-close")
+                    .primary()
+                    .xsmall()
+                    .label(undo_label)
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.undo_terminal_close(generation, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("finish-terminal-close")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip(t("Finish close now"))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.dismiss_terminal_close(generation, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .h(px(2.0))
+                    .w(relative(fraction))
+                    .bg(cx.theme().primary),
+            )
+            .into_any_element()
     }
 
     fn render_place_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -26659,7 +27357,7 @@ mod grok_session_tests {
 mod resource_close_tests {
     use super::{
         RECENTLY_CLOSED_LIMIT, RecentlyClosedGroup, push_recently_closed_group,
-        requested_recently_closed_group,
+        recently_closed_browser_url, requested_recently_closed_group,
     };
     use std::collections::VecDeque;
     use uuid::Uuid;
@@ -26709,6 +27407,174 @@ mod resource_close_tests {
             Some(1)
         );
         assert!(requested_recently_closed_group(&history, Some(99)).is_none());
+    }
+
+    #[test]
+    fn live_docked_or_popout_browser_url_wins_over_polled_metadata() {
+        let metadata = Some("https://example.test/old".to_string());
+        assert_eq!(
+            recently_closed_browser_url(
+                metadata.clone(),
+                Some("https://example.test/docked-current".to_string()),
+                None,
+            )
+            .as_deref(),
+            Some("https://example.test/docked-current")
+        );
+        assert_eq!(
+            recently_closed_browser_url(
+                metadata,
+                None,
+                Some("https://example.test/popout-current".to_string()),
+            )
+            .as_deref(),
+            Some("https://example.test/popout-current")
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_close_tests {
+    use super::{
+        PendingTerminalClose, PendingTerminalItem, RedockAnchor, TerminalCloseDisposition,
+        refresh_terminal_close_deadlines, restore_terminal_close_layout,
+        should_restore_terminal_close_at_expiry, take_pending_terminal_close,
+        terminal_close_disposition, terminal_interruption,
+    };
+    use muxel_core::{PaneNode, add_tab, remove};
+    use muxel_terminal::AgentStatus;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    fn item(iid: Uuid, tab_index: usize, sibling: Uuid) -> PendingTerminalItem {
+        PendingTerminalItem {
+            iid,
+            title: "test".into(),
+            tab_index: Some(tab_index),
+            redock: RedockAnchor::Tab {
+                sibling,
+                index: tab_index,
+            },
+        }
+    }
+
+    fn group(generation: u64) -> PendingTerminalClose {
+        let iid = Uuid::new_v4();
+        PendingTerminalClose {
+            project_id: Uuid::new_v4(),
+            items: vec![PendingTerminalItem {
+                iid,
+                title: "test".into(),
+                tab_index: Some(0),
+                redock: RedockAnchor::Floating,
+            }],
+            layout_before: Some(PaneNode::leaf(iid)),
+            layout_after: None,
+            restore_focus: iid,
+            generation,
+            deadline: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn only_idle_or_done_live_terminals_are_recoverable() {
+        use AgentStatus::{Blocked, Done, Idle, Working};
+
+        assert_eq!(
+            terminal_close_disposition(Some(Idle), true, false, true),
+            TerminalCloseDisposition::Recoverable
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Done), true, false, true),
+            TerminalCloseDisposition::Recoverable
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Working), true, false, true),
+            TerminalCloseDisposition::Confirm
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Blocked), true, false, true),
+            TerminalCloseDisposition::Confirm
+        );
+        assert_eq!(
+            terminal_close_disposition(None, true, false, true),
+            TerminalCloseDisposition::Confirm
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Idle), true, true, true),
+            TerminalCloseDisposition::Confirm
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Working), true, false, false),
+            TerminalCloseDisposition::Immediate
+        );
+        assert_eq!(
+            terminal_close_disposition(Some(Working), false, false, true),
+            TerminalCloseDisposition::Immediate
+        );
+    }
+
+    #[test]
+    fn active_status_at_expiry_restores_the_whole_group() {
+        assert!(!should_restore_terminal_close_at_expiry([false, false]));
+        assert!(should_restore_terminal_close_at_expiry([false, true]));
+
+        let disposition =
+            terminal_close_disposition(Some(AgentStatus::Working), true, false, false);
+        assert_eq!(disposition, TerminalCloseDisposition::Immediate);
+        assert!(should_restore_terminal_close_at_expiry([
+            terminal_interruption(Some(AgentStatus::Working), true, false).is_some(),
+        ]));
+    }
+
+    #[test]
+    fn generation_ownership_and_refreshed_deadlines_are_stable() {
+        let mut groups = vec![group(1), group(2)];
+        assert!(take_pending_terminal_close(&mut groups, 99).is_none());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            take_pending_terminal_close(&mut groups, 1).map(|group| group.generation),
+            Some(1)
+        );
+        let refreshed = Instant::now() + Duration::from_secs(15);
+        refresh_terminal_close_deadlines(&mut groups, refreshed);
+        assert!(groups.iter().all(|group| group.deadline == refreshed));
+    }
+
+    #[test]
+    fn grouped_tabs_restore_without_overwriting_later_tabs() {
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut before = Some(PaneNode::leaf(a));
+        assert!(add_tab(&mut before, a, b));
+        assert!(add_tab(&mut before, b, c));
+        let mut after = before.clone();
+        assert!(remove(&mut after, a));
+        assert!(remove(&mut after, c));
+        let close = PendingTerminalClose {
+            project_id: Uuid::new_v4(),
+            items: vec![item(a, 0, b), item(c, 2, b)],
+            layout_before: before,
+            layout_after: after.clone(),
+            restore_focus: b,
+            generation: 1,
+            deadline: Instant::now(),
+        };
+        assert!(add_tab(&mut after, b, d));
+
+        restore_terminal_close_layout(&mut after, &close);
+
+        assert_eq!(
+            after
+                .as_ref()
+                .and_then(PaneNode::tabs)
+                .map(|(tabs, _)| tabs),
+            Some(&[a, b, c, d][..])
+        );
     }
 }
 #[cfg(test)]

@@ -45,6 +45,11 @@ feature is added or changed, update the matching entry here in the same change**
   bounded **Recently closed** list in Search and reopen in their project.
   Dirty editors use the conventional **Save / Don't Save / Cancel** decision first;
   closed resource views are recreated rather than retained in memory.
+- **Recoverable terminal close** — idle/done terminals retain their live process
+  for 15 seconds behind an inline title-bar Undo control; its close button finishes
+  immediately. Working, blocked, launching, and unknown terminals honor the normal
+  destructive-confirmation setting, and a retained terminal that becomes active
+  is restored instead of killed when the grace period ends.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
