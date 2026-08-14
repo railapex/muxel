@@ -1766,12 +1766,10 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
     /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on (they hold a running process); editors/diffs default off (cheap to
-    /// reopen, nothing is lost).
+    /// on because they hold a running process; diffs default off because they are
+    /// cheap to reopen. Dirty editors always use Save / Don't Save / Cancel.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
-    #[serde(default)]
-    pub confirm_close_editor: bool,
     #[serde(default)]
     pub confirm_close_diff: bool,
     /// Highest Terms/Privacy version the user has accepted (0 = never). When this
@@ -2143,7 +2141,6 @@ impl Default for Settings {
             browser_enabled: true,
             close_on_exit: true,
             confirm_close_terminal: true,
-            confirm_close_editor: false,
             confirm_close_diff: false,
             accepted_terms_version: 0,
             preset_seed_version: PRESET_SEED_VERSION,
@@ -2338,6 +2335,14 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn legacy_editor_close_confirmation_is_ignored() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"confirm_close_editor":true}"#).expect("parse");
+        let serialized = serde_json::to_value(settings).expect("serialize");
+        assert!(serialized.get("confirm_close_editor").is_none());
     }
 
     #[test]

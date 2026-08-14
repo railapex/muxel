@@ -41,6 +41,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **Recoverable resource close** — clean editors, diffs, and browsers close into a
+  bounded **Recently closed** list in Search and reopen in their project.
+  Dirty editors use the conventional **Save / Don't Save / Cancel** decision first;
+  closed resource views are recreated rather than retained in memory.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
