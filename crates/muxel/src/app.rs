@@ -3209,6 +3209,16 @@ fn push_recently_closed_group(
     history.truncate(RECENTLY_CLOSED_LIMIT);
 }
 
+fn requested_recently_closed_group(
+    history: &VecDeque<RecentlyClosedGroup>,
+    generation: Option<u64>,
+) -> Option<&RecentlyClosedGroup> {
+    match generation {
+        Some(generation) => history.iter().find(|group| group.generation == generation),
+        None => history.front(),
+    }
+}
+
 /// State for the confirmation modal (title/message + the pending action).
 struct PendingConfirm {
     title: SharedString,
@@ -10517,13 +10527,7 @@ impl MuxelApp {
         let Some((generation, project_id)) = self
             .recently_closed
             .get(&workspace_id)
-            .and_then(|history| {
-                generation
-                    .and_then(|generation| {
-                        history.iter().find(|group| group.generation == generation)
-                    })
-                    .or_else(|| history.front())
-            })
+            .and_then(|history| requested_recently_closed_group(history, generation))
             .map(|group| (group.generation, group.project_id))
         else {
             return;
@@ -20402,12 +20406,11 @@ impl MuxelApp {
                 MouseButton::Left,
                 cx.listener(|this, _e, _w, cx| this.close_search_palette(cx)),
             )
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
                 match ev.keystroke.key.as_str() {
                     "escape" => this.close_search_palette(cx),
                     "down" => this.move_search_selection(1, cx),
                     "up" => this.move_search_selection(-1, cx),
-                    "enter" => this.confirm_search(window, cx),
                     _ => {}
                 }
             }))
@@ -26654,7 +26657,10 @@ mod grok_session_tests {
 
 #[cfg(test)]
 mod resource_close_tests {
-    use super::{RECENTLY_CLOSED_LIMIT, RecentlyClosedGroup, push_recently_closed_group};
+    use super::{
+        RECENTLY_CLOSED_LIMIT, RecentlyClosedGroup, push_recently_closed_group,
+        requested_recently_closed_group,
+    };
     use std::collections::VecDeque;
     use uuid::Uuid;
 
@@ -26678,6 +26684,31 @@ mod resource_close_tests {
             Some(RECENTLY_CLOSED_LIMIT as u64 + 3)
         );
         assert_eq!(history.back().map(|group| group.generation), Some(4));
+    }
+
+    #[test]
+    fn an_explicit_missing_history_generation_never_reopens_the_next_group() {
+        let mut history = VecDeque::new();
+        for generation in 1..=2 {
+            push_recently_closed_group(
+                &mut history,
+                RecentlyClosedGroup {
+                    generation,
+                    project_id: Uuid::new_v4(),
+                    items: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            requested_recently_closed_group(&history, None).map(|group| group.generation),
+            Some(2)
+        );
+        assert_eq!(
+            requested_recently_closed_group(&history, Some(1)).map(|group| group.generation),
+            Some(1)
+        );
+        assert!(requested_recently_closed_group(&history, Some(99)).is_none());
     }
 }
 #[cfg(test)]
