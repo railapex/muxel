@@ -1196,23 +1196,34 @@ pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &
 /// Route the platform-standard close chord from a focused native browser child
 /// through the same state-aware close path as tabs and GPUI keybindings.
 pub(crate) fn close_browser_pane_from_native(instance_id: Uuid, cx: &mut AsyncApp) {
-    let _ = cx.update(|cx| {
-        let Some(app) = cx
+    let target = cx.update(|cx| {
+        let app = cx
             .try_global::<MuxelHandle>()
-            .and_then(|handle| handle.0.upgrade())
-        else {
-            return;
-        };
-        app.update(cx, |app, cx| {
-            if app
-                .workspace
-                .instance(instance_id)
-                .is_some_and(|instance| instance.kind == InstanceKind::Browser)
-            {
-                app.request_close_instance(instance_id, cx);
-            }
+            .and_then(|handle| handle.0.upgrade())?;
+        let popout = app.read(cx).popouts.get(&instance_id).and_then(|popout| {
+            matches!(popout.view, PaneView::Browser(_))
+                .then(|| AnyWindowHandle::from(popout.window))
         });
+        Some((app, popout))
     });
+    let Some((app, popout)) = target else {
+        return;
+    };
+    if let Some(handle) = popout {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    } else {
+        let _ = cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                if app
+                    .workspace
+                    .instance(instance_id)
+                    .is_some_and(|instance| instance.kind == InstanceKind::Browser)
+                {
+                    app.request_close_instance(instance_id, cx);
+                }
+            });
+        });
+    }
 }
 
 /// Set the active preset (by id) for new panes.
@@ -1456,6 +1467,12 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // so a focused agent (e.g. opencode, which uses Ctrl+P) receives it, while
     // deselecting a pane (or focusing the sidebar/editor) routes Ctrl+P to muxel.
     bindings.push(KeyBinding::new("ctrl-p", GlobalSearch, Some("!Terminal")));
+    // Preserve shell/readline Ctrl+W while retaining explicit terminal and
+    // Windows close-document aliases.
+    #[cfg(not(target_os = "macos"))]
+    bindings.push(KeyBinding::new("ctrl-shift-w", ClosePane, Some("Terminal")));
+    #[cfg(target_os = "windows")]
+    bindings.push(KeyBinding::new("ctrl-f4", ClosePane, None));
     // Own both Windows copy chords. The component-level binding was unreliable
     // when selectable Markdown or a settings input lived below Muxel's root.
     #[cfg(not(target_os = "macos"))]
@@ -1505,14 +1522,18 @@ mod keybinding_policy_tests {
     use super::resolve_binding_context;
 
     #[test]
-    fn close_tab_is_global_until_explicitly_passed_through() {
+    fn close_tab_preserves_terminal_ctrl_w() {
         assert_eq!(
             resolve_binding_context("ClosePane", "ctrl-w", None, &[]),
-            None
+            Some("!Terminal")
         );
         assert_eq!(
             resolve_binding_context("ClosePane", "ctrl-w", None, &["CTRL-W"]),
             Some("!Terminal")
+        );
+        assert_eq!(
+            resolve_binding_context("ClosePane", "ctrl-f4", None, &[]),
+            None
         );
         assert_eq!(
             resolve_binding_context("SaveFile", "ctrl-s", None, &[]),

@@ -423,7 +423,10 @@ mod imp {
             const primary = macOS
               ? (event.metaKey && !event.ctrlKey)
               : (event.ctrlKey && !event.metaKey);
-            const platformClose = !event.altKey && !event.shiftKey && key === 'w' && primary;
+            const closeW = !event.altKey && !event.shiftKey && key === 'w' && primary;
+            const closeF4 = !macOS && !event.altKey && !event.shiftKey &&
+              event.ctrlKey && !event.metaKey && (key === 'f4' || event.code === 'F4');
+            const platformClose = closeW || closeF4;
             if (platformClose) {
               try {
                 if (window.chrome && window.chrome.webview) {
