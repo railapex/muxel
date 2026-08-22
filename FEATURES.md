@@ -694,13 +694,16 @@ feature is added or changed, update the matching entry here in the same change**
   `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
   (`Ctrl+Q` elsewhere) to quit from any focus.
-- **Behavior** — immediate-save appearance, confirm destructive actions, quit
-  confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits **cleanly** (an
-  abnormal exit always leaves a tombstone pane instead). The terminal
-  confirmation is skipped for an untouched **shell** pane — one sitting idle at
-  its prompt with no foreground command and no other tabs — since closing it
-  loses nothing.
+- **Behavior** — immediate-save appearance, confirm destructive actions,
+  per-kind close confirmation (terminal on, editor/diff off by default), and
+  auto-close a pane when its process exits **cleanly** (an abnormal exit always
+  leaves a tombstone pane instead). A terminal close confirmation names the pane
+  and whether it is working, needs input, is starting, or has unknown status.
+  Quitting the app is silent when no terminal has active work; otherwise the
+  confirmation lists every active terminal, its project, and its state. The
+  terminal confirmation is skipped for an untouched **shell** pane — one sitting
+  idle at its prompt with no foreground command and no other tabs — since closing
+  it loses nothing.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
@@ -721,11 +724,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
   remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
   pane, keeping the remote session reconnectable. Quitting the **app** leaves
-  sessions alive by design (they reattach next launch): when any exist, the quit
-  dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
-  kill remote tmux sessions** — both off by default; the kills are
-  fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
-  waits on a slow host.
+  sessions alive by design (they reattach next launch). When active work causes
+  the quit dialog to appear and tmux sessions exist, it offers two checkboxes —
+  **Also kill local tmux sessions** and **Also kill remote tmux sessions** — both
+  off by default; the kills are fire-and-forget (remote ones reuse the warm SSH
+  connection), so quitting never waits on a slow host.
 
 ## Localization
 

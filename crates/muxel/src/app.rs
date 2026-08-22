@@ -1251,21 +1251,7 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| {
-                // Quit outright when there's nothing to confirm: the first-run
-                // screens (nothing running yet), or a second Cmd+Q while the
-                // confirm modal is already up — same as clicking its Quit button.
-                if this.show_terms || this.show_workspace_selector || this.show_quit_confirm {
-                    if this.show_quit_confirm {
-                        this.kill_checked_tmux_sessions();
-                    }
-                    this.confirm_quit = true;
-                    cx.quit();
-                } else {
-                    this.quit_kill_tmux_local = false;
-                    this.quit_kill_tmux_remote = false;
-                    this.show_quit_confirm = true;
-                    cx.notify();
-                }
+                this.request_app_quit(cx);
             });
         }
     });
@@ -2441,6 +2427,8 @@ pub struct MuxelApp {
     pending_browser_redock: Vec<(Uuid, String, RedockAnchor)>,
     /// Whether the "Quit?" confirmation modal is shown (close was intercepted).
     show_quit_confirm: bool,
+    /// Active terminals that caused the current quit confirmation.
+    quit_interruptions: Vec<QuitInterruption>,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
     /// reset each time the dialog opens).
     quit_kill_tmux_local: bool,
@@ -2792,13 +2780,17 @@ impl PopoutView {
         }
     }
 
-    /// Heading + body for the close confirmation, which differs per pane kind
-    /// (only a terminal is actually terminated).
-    fn close_confirm_copy(&self) -> (&'static str, &'static str) {
+    /// Heading + body for the close confirmation, including why a live terminal
+    /// is unsafe to close without asking.
+    fn close_confirm_copy(&self, cx: &App) -> (SharedString, SharedString) {
         match &self.view {
-            PaneView::Terminal(_) => ("Close terminal?", "This terminal will be terminated."),
-            PaneView::Editor(_) => ("Close editor?", "Unsaved changes will be lost."),
-            PaneView::Browser(_) => ("Close browser?", "This browser pane will be closed."),
+            PaneView::Terminal(view) => {
+                let name = self.title(cx).to_string();
+                let reason = terminal_interruption(Some(view.read(cx).status()), true, false);
+                (t("Close terminal?"), terminal_close_message(&name, reason))
+            }
+            PaneView::Editor(_) => (t("Close editor?"), t("Unsaved changes will be lost.")),
+            PaneView::Browser(_) => (t("Close browser?"), t("This browser pane will be closed.")),
         }
     }
 }
@@ -2919,6 +2911,84 @@ impl Render for WorkspaceWindow {
             app.render_secondary_content(pid, &focus, window, cx)
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalInterruption {
+    Working,
+    Blocked,
+    Starting,
+    Unknown,
+}
+
+impl TerminalInterruption {
+    fn label(self) -> SharedString {
+        match self {
+            Self::Working => t("Working"),
+            Self::Blocked => t("Needs input"),
+            Self::Starting => t("Starting"),
+            Self::Unknown => t("Status unknown"),
+        }
+    }
+}
+
+fn terminal_interruption(
+    status: Option<AgentStatus>,
+    has_live_view: bool,
+    launching: bool,
+) -> Option<TerminalInterruption> {
+    if launching {
+        return Some(TerminalInterruption::Starting);
+    }
+    if !has_live_view {
+        return None;
+    }
+    match status {
+        Some(AgentStatus::Working) => Some(TerminalInterruption::Working),
+        Some(AgentStatus::Blocked) => Some(TerminalInterruption::Blocked),
+        Some(AgentStatus::Idle | AgentStatus::Done) => None,
+        None => Some(TerminalInterruption::Unknown),
+    }
+}
+
+fn terminal_close_message(name: &str, interruption: Option<TerminalInterruption>) -> SharedString {
+    match interruption {
+        Some(TerminalInterruption::Working) => tf(
+            "“{name}” is working. Closing it will terminate the process.",
+            &[("name", name)],
+        ),
+        Some(TerminalInterruption::Blocked) => tf(
+            "“{name}” needs input. Closing it will terminate the process.",
+            &[("name", name)],
+        ),
+        Some(TerminalInterruption::Starting) => tf(
+            "“{name}” is still starting. Closing it will terminate the process.",
+            &[("name", name)],
+        ),
+        Some(TerminalInterruption::Unknown) => tf(
+            "“{name}” may still be working. Closing it will terminate the process.",
+            &[("name", name)],
+        ),
+        None => tf("“{name}” will be terminated.", &[("name", name)]),
+    }
+    .into()
+}
+
+fn quit_active_work_message(count: usize) -> SharedString {
+    tn(
+        "{n} terminal has active work.",
+        "{n} terminals have active work.",
+        count,
+        &[("n", &count.to_string())],
+    )
+    .into()
+}
+
+#[derive(Clone)]
+struct QuitInterruption {
+    name: String,
+    project: String,
+    reason: TerminalInterruption,
 }
 
 /// A destructive action awaiting user confirmation.
@@ -3190,6 +3260,7 @@ impl DevLogEntry {
 impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title(cx);
+        let close_copy = self.show_close_confirm.then(|| self.close_confirm_copy(cx));
         // A native webview child draws above all gpui content, so it has to go
         // away while the close confirmation sits on top of it.
         if let PaneView::Browser(v) = &self.view {
@@ -3299,16 +3370,23 @@ impl Render for PopoutView {
                             .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
                             .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .child(t(self.close_confirm_copy().0)),
+                                div().text_lg().font_semibold().child(
+                                    close_copy
+                                        .as_ref()
+                                        .map(|(title, _)| title.clone())
+                                        .unwrap_or_default(),
+                                ),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(t(self.close_confirm_copy().1)),
+                                    .child(
+                                        close_copy
+                                            .as_ref()
+                                            .map(|(_, message)| message.clone())
+                                            .unwrap_or_default(),
+                                    ),
                             )
                             .child(
                                 div()
@@ -4399,6 +4477,7 @@ impl MuxelApp {
             pending_editor_redock: Vec::new(),
             pending_browser_redock: Vec::new(),
             show_quit_confirm: false,
+            quit_interruptions: Vec::new(),
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
             show_keys: false,
@@ -4544,11 +4623,16 @@ impl MuxelApp {
                             window.minimize_window();
                             return false;
                         }
-                        this.quit_kill_tmux_local = false;
-                        this.quit_kill_tmux_remote = false;
-                        this.show_quit_confirm = true;
-                        cx.notify();
-                        false
+                        let interruptions = this.interrupting_terminals(cx);
+                        if interruptions.is_empty() {
+                            this.quit_interruptions.clear();
+                            this.confirm_quit = true;
+                            cx.quit();
+                            true
+                        } else {
+                            this.open_quit_confirmation(interruptions, cx);
+                            false
+                        }
                     })
                 })
                 .unwrap_or(true)
@@ -5756,6 +5840,90 @@ impl MuxelApp {
             ),
             t("Agents were still running on the host with no pane — they're back.").to_string(),
         );
+    }
+
+    fn terminal_interruption_for(&self, iid: Uuid, cx: &App) -> Option<TerminalInterruption> {
+        let docked_status = self
+            .terminals
+            .get(&iid)
+            .map(|terminal| terminal.read(cx).status());
+        let popped_status = self
+            .popouts
+            .get(&iid)
+            .and_then(|popout| match &popout.view {
+                PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
+                PaneView::Editor(_) | PaneView::Browser(_) => None,
+            });
+        let has_live_view = docked_status.is_some() || popped_status.is_some();
+        terminal_interruption(
+            docked_status
+                .or(popped_status)
+                .or_else(|| self.last_status.get(&iid).copied()),
+            has_live_view,
+            self.terminal_launching.contains_key(&iid),
+        )
+    }
+
+    fn interrupting_terminals(&self, cx: &App) -> Vec<QuitInterruption> {
+        self.workspace
+            .instances
+            .iter()
+            .filter(|instance| instance.kind == InstanceKind::Terminal)
+            .filter_map(|instance| {
+                let reason = self.terminal_interruption_for(instance.id, cx)?;
+                let project = self
+                    .workspace
+                    .project(instance.project_id)
+                    .map(|project| project.name.clone())
+                    .unwrap_or_default();
+                Some(QuitInterruption {
+                    name: instance.display_name().to_string(),
+                    project,
+                    reason,
+                })
+            })
+            .collect()
+    }
+
+    fn open_quit_confirmation(
+        &mut self,
+        interruptions: Vec<QuitInterruption>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quit_interruptions = interruptions;
+        self.quit_kill_tmux_local = false;
+        self.quit_kill_tmux_remote = false;
+        self.show_quit_confirm = true;
+        cx.notify();
+    }
+
+    /// Request a real app quit. Returns true when a confirmation was opened.
+    fn request_app_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        // Preserve the existing second-shortcut behavior: pressing Cmd/Ctrl+Q
+        // again while the dialog is open is the same as clicking Quit.
+        if self.show_quit_confirm {
+            self.kill_checked_tmux_sessions();
+            self.quit_interruptions.clear();
+            self.confirm_quit = true;
+            cx.quit();
+            return false;
+        }
+        let interruptions = self.interrupting_terminals(cx);
+        if interruptions.is_empty() {
+            self.quit_interruptions.clear();
+            self.confirm_quit = true;
+            cx.quit();
+            false
+        } else {
+            self.open_quit_confirmation(interruptions, cx);
+            true
+        }
+    }
+
+    fn cancel_quit_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.show_quit_confirm = false;
+        self.quit_interruptions.clear();
+        cx.notify();
     }
 
     /// Every tmux session muxel has launched, `(project, session, is_remote)` —
@@ -13615,12 +13783,18 @@ impl MuxelApp {
                 .instance(iid)
                 .map(|i| i.display_name().to_string())
                 .unwrap_or_else(|| tf("this {noun}", &[("noun", &noun)]));
-            self.request_confirm(
-                tf("Close {noun}?", &[("noun", &noun)]),
+            let message = if kind == InstanceKind::Terminal {
+                terminal_close_message(&name, self.terminal_interruption_for(iid, cx))
+            } else {
                 tf(
                     "“{name}” will be {verb}.",
                     &[("name", &name), ("verb", &verb)],
-                ),
+                )
+                .into()
+            };
+            self.request_confirm(
+                tf("Close {noun}?", &[("noun", &noun)]),
+                message,
                 t("Close"),
                 ConfirmAction::CloseInstance(iid),
                 cx,
@@ -15106,8 +15280,9 @@ impl MuxelApp {
                 }
             }
             muxel_tray::TrayAction::Quit => {
-                self.confirm_quit = true;
-                cx.quit();
+                if self.request_app_quit(cx) {
+                    window.activate_window();
+                }
             }
         }
     }
@@ -19744,8 +19919,7 @@ impl MuxelApp {
                 if this.minimize_to_tray_active() {
                     window.minimize_window();
                 } else {
-                    this.show_quit_confirm = true;
-                    cx.notify();
+                    this.request_app_quit(cx);
                 }
             }))
             .child(
@@ -22359,17 +22533,76 @@ impl MuxelApp {
     }
 
     fn render_quit_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let interruptions = self.quit_interruptions.clone();
+        let count = interruptions.len();
+        let message = quit_active_work_message(count);
+        let interruption_list = div()
+            .id("quit-interruptions")
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .children(
+                interruptions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, interruption)| {
+                        let has_project = !interruption.project.is_empty();
+                        div()
+                            .id(("quit-interruption", index))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().secondary.opacity(0.5))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(interruption.name),
+                                    )
+                                    .children(has_project.then(|| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(interruption.project)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(interruption.reason.label()),
+                            )
+                    }),
+            );
+
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| {
-                    this.show_quit_confirm = false;
-                    cx.notify();
-                }),
+                cx.listener(|this, _ev, _w, cx| this.cancel_quit_confirmation(cx)),
             )
             .child(
                 div()
-                    .w(px(360.0))
+                    .w(px(440.0))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -22385,8 +22618,9 @@ impl MuxelApp {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(t("Running terminals will be closed.")),
+                            .child(message),
                     )
+                    .child(interruption_list)
                     // tmux-backed panes survive a quit by design; offer cleanup
                     // per scope (local vs remote sessions).
                     .children({
@@ -22443,8 +22677,7 @@ impl MuxelApp {
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.show_quit_confirm = false;
-                                        cx.notify();
+                                        this.cancel_quit_confirmation(cx)
                                     })),
                             )
                             .child(
@@ -22453,6 +22686,7 @@ impl MuxelApp {
                                     .label(t("Quit"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.kill_checked_tmux_sessions();
+                                        this.quit_interruptions.clear();
                                         this.confirm_quit = true;
                                         cx.quit();
                                     })),
@@ -26229,5 +26463,73 @@ mod split_resize_tests {
         });
 
         assert_eq!(ids, vec![terminal_a, terminal_b]);
+    }
+}
+
+#[cfg(test)]
+mod close_interruption_tests {
+    use super::{
+        TerminalInterruption, quit_active_work_message, terminal_close_message,
+        terminal_interruption,
+    };
+    use muxel_terminal::AgentStatus::{Blocked, Done, Idle, Working};
+
+    #[test]
+    fn only_active_or_uncertain_live_terminals_interrupt_quit() {
+        assert_eq!(
+            terminal_interruption(Some(Working), true, false),
+            Some(TerminalInterruption::Working)
+        );
+        assert_eq!(
+            terminal_interruption(Some(Blocked), true, false),
+            Some(TerminalInterruption::Blocked)
+        );
+        assert_eq!(terminal_interruption(Some(Idle), true, false), None);
+        assert_eq!(terminal_interruption(Some(Done), true, false), None);
+        assert_eq!(
+            terminal_interruption(None, true, false),
+            Some(TerminalInterruption::Unknown)
+        );
+        assert_eq!(terminal_interruption(Some(Working), false, false), None);
+    }
+
+    #[test]
+    fn launching_is_an_interruption_before_the_view_exists() {
+        assert_eq!(
+            terminal_interruption(None, false, true),
+            Some(TerminalInterruption::Starting)
+        );
+    }
+
+    #[test]
+    fn close_copy_names_the_interrupting_state() {
+        assert_eq!(
+            terminal_close_message("Codex", Some(TerminalInterruption::Working)).as_ref(),
+            "“Codex” is working. Closing it will terminate the process."
+        );
+        assert_eq!(
+            terminal_close_message("Claude", Some(TerminalInterruption::Blocked)).as_ref(),
+            "“Claude” needs input. Closing it will terminate the process."
+        );
+        assert_eq!(
+            terminal_close_message("Grok", Some(TerminalInterruption::Starting)).as_ref(),
+            "“Grok” is still starting. Closing it will terminate the process."
+        );
+        assert_eq!(
+            terminal_close_message("Agent", Some(TerminalInterruption::Unknown)).as_ref(),
+            "“Agent” may still be working. Closing it will terminate the process."
+        );
+    }
+
+    #[test]
+    fn app_quit_copy_reports_only_active_work() {
+        assert_eq!(
+            quit_active_work_message(1).as_ref(),
+            "1 terminal has active work."
+        );
+        assert_eq!(
+            quit_active_work_message(3).as_ref(),
+            "3 terminals have active work."
+        );
     }
 }
