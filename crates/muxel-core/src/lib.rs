@@ -31,9 +31,10 @@ pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
-    FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
-    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
+    FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, add_tab_inactive,
+    focus_in_direction, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
+    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, swap_instances,
+    swap_panes,
 };
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;

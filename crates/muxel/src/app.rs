@@ -27,12 +27,12 @@ use muxel_core::{
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
     RemoteHost, RemoteLayout, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth,
     StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
-    agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
-    file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
-    migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
-    resolve_launch_for_session, set_active_tab, set_split_sizes, set_tab_order, split,
-    split_beside, ssh, swap_instances, swap_panes, sync_agent_injection_modes,
-    sync_codex_approval_args,
+    add_tab_inactive, agent_activity_label, append_agent_instruction,
+    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
+    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
+    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
+    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -1767,6 +1767,18 @@ enum PlacementMode {
     /// Add the agent as a new tab in the target pane.
     Tab,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceActivation {
+    Foreground,
+    Background,
+}
+
+#[derive(Clone, Copy)]
+struct BrowserOpenOptions {
+    placement: Option<PlacementMode>,
+    activation: ResourceActivation,
+}
 fn nearest_kind_instance(
     instances: &[(Uuid, InstanceKind)],
     kind: InstanceKind,
@@ -3106,6 +3118,37 @@ impl Render for PopoutView {
                     v.read(cx).session().write_input(b"\x1b[Z");
                 }
             }))
+            .on_action(cx.listener(
+                |this, action: &crate::browser::OpenBrowserTab, _window, cx| {
+                    if this.iid != action.0 || !browser_popup_url_allowed(&action.1) {
+                        return;
+                    }
+                    let Some(app) = cx
+                        .try_global::<MuxelHandle>()
+                        .and_then(|handle| handle.0.upgrade())
+                    else {
+                        return;
+                    };
+                    let Some(main) = app.read(cx).main_window else {
+                        return;
+                    };
+                    let source = action.0;
+                    let url = action.1.clone();
+                    cx.defer(move |cx| {
+                        let _ = main.update(cx, |_, window, cx| {
+                            app.update(cx, |app, cx| {
+                                app.open_link_from(
+                                    &url,
+                                    Some(source),
+                                    ResourceActivation::Background,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        });
+                    });
+                },
+            ))
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -5912,7 +5955,7 @@ impl MuxelApp {
                         .instance(iid)
                         .and_then(|i| i.browser_url.clone())
                         .unwrap_or_else(|| "about:blank".to_string());
-                    let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                    let view = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
                     self.browsers.insert(iid, view);
                 }
             }
@@ -7663,7 +7706,6 @@ impl MuxelApp {
             let views: Vec<(Uuid, Entity<crate::browser::BrowserView>)> =
                 self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
             let mut changed = false;
-            let mut new_windows: Vec<(Uuid, String)> = Vec::new();
             for (iid, view) in views {
                 if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
                     && let Some(inst) = self.workspace.instance_mut(iid)
@@ -7687,16 +7729,6 @@ impl MuxelApp {
                         // next tick because pane and address state are settled.
                         view.read(cx).focus_native(cx);
                     }
-                }
-                new_windows.extend(
-                    view.update(cx, |v, _| v.take_new_window_requests())
-                        .into_iter()
-                        .map(|url| (iid, url)),
-                );
-            }
-            for (source, url) in new_windows {
-                if browser_popup_url_allowed(&url) {
-                    self.open_link_from(&url, Some(source), window, cx);
                 }
             }
             if changed {
@@ -8860,7 +8892,7 @@ impl MuxelApp {
         match kind {
             InstanceKind::Browser => {
                 let url = browser_url.unwrap_or_else(|| "about:blank".to_string());
-                let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                let view = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
                 self.browsers.insert(iid, view);
             }
             _ => self.spawn_terminal_deferred(iid, window, cx),
@@ -9045,15 +9077,22 @@ impl MuxelApp {
     /// otherwise macOS/Windows open an embedded browser pane and Linux spawns the
     /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_link_from(url, self.active_instance, window, cx);
+        self.open_link_from(
+            url,
+            self.active_instance,
+            ResourceActivation::Foreground,
+            window,
+            cx,
+        );
     }
 
-    /// Route relative to the pane that emitted the link. Native browser popup
-    /// events arrive on a later tick, when the globally active pane may differ.
+    /// Route relative to the pane that emitted the link. Native browser actions
+    /// carry their source because focus can change before GPUI dispatches them.
     fn open_link_from(
         &mut self,
         url: &str,
         source: Option<Uuid>,
+        activation: ResourceActivation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -9087,7 +9126,10 @@ impl MuxelApp {
                         pid,
                         canonical_url.clone(),
                         source,
-                        None,
+                        BrowserOpenOptions {
+                            placement: None,
+                            activation,
+                        },
                         window,
                         cx,
                     )
@@ -9098,8 +9140,14 @@ impl MuxelApp {
             }
             if target.path.is_file()
                 && let Some(pid) = source_project
-                && let Some(iid) =
-                    self.open_editor_at(pid, Some(target.path.clone()), source, window, cx)
+                && let Some(iid) = self.open_editor_at_with_activation(
+                    pid,
+                    Some(target.path.clone()),
+                    source,
+                    activation,
+                    window,
+                    cx,
+                )
             {
                 if let Some(line) = target.line
                     && let Some(editor) = self.editors.get(&iid)
@@ -9139,24 +9187,34 @@ impl MuxelApp {
         #[cfg(not(target_os = "linux"))]
         {
             if source_project.is_none_or(|pid| {
-                self.open_browser_in_project(pid, url.to_string(), source, None, window, cx)
-                    .is_none()
+                self.open_browser_in_project(
+                    pid,
+                    url.to_string(),
+                    source,
+                    BrowserOpenOptions {
+                        placement: None,
+                        activation,
+                    },
+                    window,
+                    cx,
+                )
+                .is_none()
             }) {
                 cx.open_url(url);
             }
         }
     }
 
-    /// Route a link normally, then restore the pane that initiated it. Used by
+    /// Open a resource without changing the active pane or tab. Used by
     /// middle-click so opening a reference does not interrupt terminal input.
     fn open_link_background(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let previous = self.active_instance;
-        self.open_link_from(url, previous, window, cx);
-        if let Some(previous) = previous
-            && self.workspace.instance(previous).is_some()
-        {
-            self.focus_instance(previous, window, cx);
-        }
+        self.open_link_from(
+            url,
+            self.active_instance,
+            ResourceActivation::Background,
+            window,
+            cx,
+        );
     }
 
     /// Open the embedded browser pane on `url` in the active project, splitting
@@ -9184,7 +9242,61 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
-        self.open_browser_in_project(pid, url, target, placement, window, cx)
+        let activation = if placement == Some(PlacementMode::Tab) {
+            ResourceActivation::Background
+        } else {
+            ResourceActivation::Foreground
+        };
+        self.open_browser_in_project(
+            pid,
+            url,
+            target,
+            BrowserOpenOptions {
+                placement,
+                activation,
+            },
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn browser_launch_context(
+        &self,
+        preferred: Option<Uuid>,
+        cx: &App,
+    ) -> crate::browser::BrowserLaunchContext {
+        if let Some(iid) = preferred {
+            if let Some(context) = self
+                .browsers
+                .get(&iid)
+                .and_then(|view| view.read(cx).launch_context(cx))
+            {
+                return context;
+            }
+            if let Some(context) = self.popouts.get(&iid).and_then(|popout| {
+                if let PaneView::Browser(view) = &popout.view {
+                    view.read(cx).launch_context(cx)
+                } else {
+                    None
+                }
+            }) {
+                return context;
+            }
+        }
+        self.browsers
+            .values()
+            .find_map(|view| view.read(cx).launch_context(cx))
+            .or_else(|| {
+                self.popouts.values().find_map(|popout| {
+                    if let PaneView::Browser(view) = &popout.view {
+                        view.read(cx).launch_context(cx)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -9193,10 +9305,14 @@ impl MuxelApp {
         pid: Uuid,
         url: String,
         target: Option<Uuid>,
-        placement: Option<PlacementMode>,
+        options: BrowserOpenOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
+        let BrowserOpenOptions {
+            placement,
+            activation,
+        } = options;
         // Web resources require an exact URL match. Local files reuse by decoded
         // path so raw/file URI spellings and source fragments share one pane.
         if let Some(iid) = self
@@ -9227,19 +9343,34 @@ impl MuxelApp {
                     }
                 });
             }
-            self.focus_instance(iid, window, cx);
+            if activation == ResourceActivation::Foreground {
+                self.focus_instance(iid, window, cx);
+            }
             self.persist();
             cx.notify();
             return Some(iid);
         }
         let instance = Instance::browser(pid, url.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, target, placement) {
+        if !self.place_resource_instance(pid, instance, target, placement, activation) {
             return None;
         }
-        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+        let launch_context = self.browser_launch_context(target, cx);
+        let initially_visible = activation == ResourceActivation::Foreground;
+        let view = cx.new(|cx| {
+            crate::browser::BrowserView::new_with_options(
+                iid,
+                url,
+                launch_context,
+                initially_visible,
+                window,
+                cx,
+            )
+        });
         self.browsers.insert(iid, view);
-        self.focus_instance(iid, window, cx);
+        if activation == ResourceActivation::Foreground {
+            self.focus_instance(iid, window, cx);
+        }
         self.persist();
         cx.notify();
         Some(iid)
@@ -9376,6 +9507,25 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
+        self.open_editor_at_with_activation(
+            pid,
+            path,
+            target,
+            ResourceActivation::Foreground,
+            window,
+            cx,
+        )
+    }
+
+    fn open_editor_at_with_activation(
+        &mut self,
+        pid: Uuid,
+        path: Option<PathBuf>,
+        target: Option<Uuid>,
+        activation: ResourceActivation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         let path = if self.workspace.project(pid).is_some_and(|p| p.is_remote()) {
             path
         } else {
@@ -9391,12 +9541,14 @@ impl MuxelApp {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
             }
-            self.focus_instance(iid, window, cx);
+            if activation == ResourceActivation::Foreground {
+                self.focus_instance(iid, window, cx);
+            }
             return Some(iid);
         }
         let instance = Instance::editor(pid, path.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, target, None) {
+        if !self.place_resource_instance(pid, instance, target, None, activation) {
             return None;
         }
         let config = self.editor_config();
@@ -9421,7 +9573,9 @@ impl MuxelApp {
             })
             .detach();
         }
-        self.focus_instance(iid, window, cx);
+        if activation == ResourceActivation::Foreground {
+            self.focus_instance(iid, window, cx);
+        }
         self.persist();
         cx.notify();
         Some(iid)
@@ -9502,7 +9656,13 @@ impl MuxelApp {
 
         let instance = Instance::diff(pid, dir.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, anchor, None) {
+        if !self.place_resource_instance(
+            pid,
+            instance,
+            anchor,
+            None,
+            ResourceActivation::Foreground,
+        ) {
             return;
         }
         let config = self.editor_config();
@@ -9522,6 +9682,7 @@ impl MuxelApp {
         instance: Instance,
         requested_anchor: Option<Uuid>,
         placement: Option<PlacementMode>,
+        activation: ResourceActivation,
     ) -> bool {
         let iid = instance.id;
         let kind = instance.kind;
@@ -9548,14 +9709,22 @@ impl MuxelApp {
         let placed = self.workspace.project_mut(pid).is_some_and(|project| {
             let fallback = || requested_anchor.or_else(|| project.first_instance());
             match placement {
-                Some(PlacementMode::Tab) => {
-                    fallback().is_some_and(|anchor| add_tab(&mut project.layout, anchor, iid))
-                }
+                Some(PlacementMode::Tab) => fallback().is_some_and(|anchor| match activation {
+                    ResourceActivation::Foreground => add_tab(&mut project.layout, anchor, iid),
+                    ResourceActivation::Background => {
+                        add_tab_inactive(&mut project.layout, anchor, iid)
+                    }
+                }),
                 Some(PlacementMode::Split(direction)) => fallback()
                     .is_some_and(|anchor| split(&mut project.layout, anchor, direction, iid)),
-                None if same_kind.is_some() => {
-                    add_tab(&mut project.layout, same_kind.unwrap(), iid)
-                }
+                None if same_kind.is_some() => match activation {
+                    ResourceActivation::Foreground => {
+                        add_tab(&mut project.layout, same_kind.unwrap(), iid)
+                    }
+                    ResourceActivation::Background => {
+                        add_tab_inactive(&mut project.layout, same_kind.unwrap(), iid)
+                    }
+                },
                 None => fallback().is_some_and(|anchor| {
                     split(&mut project.layout, anchor, SplitDirection::Horizontal, iid)
                 }),
@@ -12601,6 +12770,21 @@ impl MuxelApp {
                     this.toggle_dev_console(cx);
                 }
             }))
+            .on_action(cx.listener(
+                |this, action: &crate::browser::OpenBrowserTab, window, cx| {
+                    if this.workspace.instance(action.0).is_some()
+                        && browser_popup_url_allowed(&action.1)
+                    {
+                        this.open_link_from(
+                            &action.1,
+                            Some(action.0),
+                            ResourceActivation::Background,
+                            window,
+                            cx,
+                        );
+                    }
+                },
+            ))
             // A ctrl+clicked terminal link: URLs go to the built-in browser when
             // enabled (embedded pane / Linux browser window), files to the OS.
             .on_action(
@@ -12811,7 +12995,7 @@ impl MuxelApp {
                             PaneView::Editor(snap.build(config, window, cx))
                         }
                         PopoutContent::Browser(url) => PaneView::Browser(
-                            cx.new(|cx| crate::browser::BrowserView::new(url, window, cx)),
+                            cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx)),
                         ),
                     };
                     let fh = pane.focus_handle(cx);
@@ -12851,7 +13035,8 @@ impl MuxelApp {
                         self.editors.insert(iid, ed);
                     }
                     PopoutContent::Browser(url) => {
-                        let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                        let bv =
+                            cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
                         self.browsers.insert(iid, bv);
                     }
                 }
@@ -12924,7 +13109,7 @@ impl MuxelApp {
             return;
         }
         for (iid, url, redock) in std::mem::take(&mut self.pending_browser_redock) {
-            let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+            let bv = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
             self.browsers.insert(iid, bv);
             if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
                 self.redock_into_layout(iid, pid, redock, cx);

@@ -334,7 +334,9 @@ feature is added or changed, update the matching entry here in the same change**
   it the keyboard; muxel's own shortcuts keep working until you click into a page.
   The toolbar can open the current page in the system browser. Native page context
   menus remain usable, and WebView2 stores its profile under muxel's app-data
-  directory rather than beside the executable.
+  directory rather than beside the executable. New browser tabs stay in the
+  background, and Windows reuses the running WebView2 environment after the first
+  browser pane instead of starting another one for every tab.
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
@@ -413,8 +415,9 @@ feature is added or changed, update the matching entry here in the same change**
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
   terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs. Right-clicking a
-  terminal link opens link actions instead of copying or pasting through the PTY.
+  requests stay in the source project and open immediately as background Muxel
+  tabs. Right-clicking a terminal link opens link actions instead of copying or
+  pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can

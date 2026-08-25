@@ -17,6 +17,21 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
+/// Dispatched as soon as a native page requests another browsing context.
+/// Carry the source pane so the app can place the new tab in the right project
+/// even if focus changes before the action reaches the workspace root.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = muxel, no_json)]
+pub struct OpenBrowserTab(pub uuid::Uuid, pub String);
+
+/// Native browser state that can be reused when creating another tab. On
+/// Windows this avoids rebuilding the WebView2 environment for every tab.
+#[derive(Clone, Default)]
+pub struct BrowserLaunchContext {
+    #[cfg(target_os = "windows")]
+    environment: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+}
+
 /// Spawn the separate Linux browser window (`muxel --browser <url>`), returning
 /// whether the helper was launched (false → caller falls back to the OS browser).
 #[cfg(target_os = "linux")]
@@ -60,9 +75,18 @@ fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
 
+/// A hidden native child cannot own Muxel's active-pane focus. Keep blur events
+/// so the parent can settle, but reject a stale or spurious hidden gain.
+fn visible_native_focus(native_visible: bool, focused: Option<bool>) -> Option<bool> {
+    match focused {
+        Some(true) if !native_visible => None,
+        focused => focused,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_publish_url, tab_label};
+    use super::{should_publish_url, tab_label, visible_native_focus};
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -77,6 +101,13 @@ mod tests {
         assert!(should_publish_url(false, true));
         assert!(should_publish_url(true, false));
         assert!(!should_publish_url(false, false));
+    }
+
+    #[test]
+    fn hidden_browser_cannot_reclaim_focus() {
+        assert_eq!(visible_native_focus(false, Some(true)), None);
+        assert_eq!(visible_native_focus(true, Some(true)), Some(true));
+        assert_eq!(visible_native_focus(false, Some(false)), Some(false));
     }
 }
 
@@ -93,9 +124,9 @@ mod imp {
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
     #[cfg(target_os = "windows")]
     use webview2_com::FocusChangedEventHandler;
-    #[cfg(target_os = "windows")]
-    use wry::WebViewExtWindows as _;
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[cfg(target_os = "windows")]
+    use wry::{WebViewBuilderExtWindows as _, WebViewExtWindows as _};
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
     ///
@@ -163,6 +194,10 @@ mod imp {
         })();
     "#;
 
+    enum NativeBrowserEvent {
+        OpenTab(String),
+    }
+
     pub struct BrowserView {
         focus_handle: FocusHandle,
         webview: Option<Entity<gpui_wry::WebView>>,
@@ -179,13 +214,33 @@ mod imp {
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
         focus_events: std::sync::mpsc::Receiver<bool>,
-        /// URLs requested through target=_blank, window.open, Ctrl+click, or
-        /// middle-click. The app turns these into normal Muxel browser tabs.
-        new_window_events: std::sync::mpsc::Receiver<String>,
     }
 
     impl BrowserView {
-        pub fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        pub fn new(
+            instance_id: uuid::Uuid,
+            url: String,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            Self::new_with_options(
+                instance_id,
+                url,
+                BrowserLaunchContext::default(),
+                true,
+                window,
+                cx,
+            )
+        }
+
+        pub fn new_with_options(
+            instance_id: uuid::Uuid,
+            url: String,
+            launch_context: BrowserLaunchContext,
+            initially_visible: bool,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
             cx.subscribe_in(
                 &address,
@@ -243,23 +298,37 @@ mod imp {
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
-            let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
+            let (native_event_tx, native_events) = async_channel::unbounded();
 
             cx.spawn_in(window, async move |this, cx| {
+                #[cfg(not(target_os = "windows"))]
+                let _ = launch_context;
                 #[cfg(target_os = "windows")]
-                let mut web_context = muxel_store::data_dir().and_then(|dir| {
-                    let dir = dir.join("webview2");
-                    std::fs::create_dir_all(&dir)
-                        .ok()
-                        .map(|()| wry::WebContext::new(Some(dir)))
-                });
+                let shared_environment = launch_context.environment;
+                #[cfg(target_os = "windows")]
+                let mut web_context = if shared_environment.is_none() {
+                    muxel_store::data_dir().and_then(|dir| {
+                        let dir = dir.join("webview2");
+                        std::fs::create_dir_all(&dir)
+                            .ok()
+                            .map(|()| wry::WebContext::new(Some(dir)))
+                    })
+                } else {
+                    None
+                };
 
                 let built = match parent.as_ref() {
                     Some(parent) => {
                         #[cfg(target_os = "windows")]
-                        let Some(builder) = web_context
-                            .as_mut()
-                            .map(wry::WebViewBuilder::new_with_web_context)
+                        let Some(builder) = shared_environment
+                            .map(|environment| {
+                                wry::WebViewBuilder::new().with_environment(environment)
+                            })
+                            .or_else(|| {
+                                web_context
+                                    .as_mut()
+                                    .map(wry::WebViewBuilder::new_with_web_context)
+                            })
                         else {
                             let _ = this.update_in(cx, |this, _window, cx| {
                                 this.webview_failed = true;
@@ -270,13 +339,15 @@ mod imp {
                         #[cfg(target_os = "macos")]
                         let builder = wry::WebViewBuilder::new();
 
+                        let open_tab_tx = native_event_tx.clone();
                         let builder = builder
                             .with_url(&requested)
+                            .with_visible(initially_visible)
                             .with_initialization_script(COPY_SCRIPT)
                             .with_new_window_req_handler(move |url, _features| {
                                 // A dropped receiver means this BrowserView was already torn down;
                                 // still deny the native popup so no orphan OS window escapes.
-                                let _ = new_window_tx.send(url);
+                                let _ = open_tab_tx.try_send(NativeBrowserEvent::OpenTab(url));
                                 wry::NewWindowResponse::Deny
                             });
                         #[cfg(target_os = "macos")]
@@ -334,9 +405,8 @@ mod imp {
                     };
                     let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
                     // Re-apply whatever the pane changed while the build ran.
-                    if !this.native_visible {
-                        wv.update(cx, |wv, _| wv.hide());
-                    }
+                    let visible = this.native_visible;
+                    wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
                     if this.url != requested {
                         let current = this.url.clone();
                         wv.update(cx, |wv, _| wv.load_url(&current));
@@ -344,6 +414,22 @@ mod imp {
                     this.webview = Some(wv);
                     cx.notify();
                 });
+
+                drop(native_event_tx);
+                while let Ok(NativeBrowserEvent::OpenTab(url)) = native_events.recv().await {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.focus_handle.dispatch_action(
+                                &super::OpenBrowserTab(instance_id, url),
+                                window,
+                                cx,
+                            );
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             })
             .detach();
 
@@ -354,21 +440,19 @@ mod imp {
                 address,
                 url,
                 pending_navigation_from: None,
-                native_visible: true,
+                native_visible: initially_visible,
                 focus_events,
-                new_window_events,
             }
         }
 
-        /// Drain page requests for a separate browsing context. Keeping this at
-        /// the app boundary gives all browser entry points the same dedupe and
-        /// tab-placement policy.
-        pub fn take_new_window_requests(&mut self) -> Vec<String> {
-            let mut urls = Vec::new();
-            while let Ok(url) = self.new_window_events.try_recv() {
-                urls.push(url);
+        pub fn launch_context(&self, _cx: &App) -> Option<BrowserLaunchContext> {
+            #[cfg(target_os = "windows")]
+            if let Some(webview) = &self.webview {
+                return Some(BrowserLaunchContext {
+                    environment: Some(webview.read(_cx).raw().environment()),
+                });
             }
-            urls
+            None
         }
 
         /// Whether the page was clicked since the last check (drains the queue).
@@ -382,7 +466,7 @@ mod imp {
             while let Ok(next) = self.focus_events.try_recv() {
                 focused = Some(next);
             }
-            focused
+            visible_native_focus(self.native_visible, focused)
         }
 
         /// Hand the OS keyboard focus to the native webview, so typing (and paste)
@@ -524,6 +608,12 @@ mod imp {
             if self.native_visible == visible {
                 return;
             }
+            if visible {
+                // A GotFocus queued while hidden belongs to the old visibility
+                // generation. Drain it before showing so it cannot steal focus
+                // after the user later selects this tab.
+                while self.focus_events.try_recv().is_ok() {}
+            }
             self.native_visible = visible;
             if let Some(wv) = &self.webview {
                 wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
@@ -634,7 +724,12 @@ mod imp {
     }
 
     impl BrowserView {
-        pub fn new(url: String, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        pub fn new(
+            _instance_id: uuid::Uuid,
+            url: String,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
             Self {
                 focus_handle: cx.focus_handle(),
                 url,
@@ -652,11 +747,6 @@ mod imp {
 
         pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
             None
-        }
-
-        /// Linux has no embedded webview, so it cannot emit native popup requests.
-        pub fn take_new_window_requests(&mut self) -> Vec<String> {
-            Vec::new()
         }
 
         pub fn set_native_visible(&mut self, _visible: bool, _cx: &mut Context<Self>) {}
