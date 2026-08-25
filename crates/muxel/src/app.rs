@@ -21293,6 +21293,9 @@ impl MuxelApp {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("place-preset-{idx}")))
+                    .role(Role::Button)
+                    .accessibility_id(SharedString::from(format!("muxel.place-preset.{idx}")))
+                    .aria_label(name.clone())
                     .flex()
                     .items_center()
                     .gap_2()
