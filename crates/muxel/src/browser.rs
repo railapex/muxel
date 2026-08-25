@@ -17,13 +17,6 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
-/// Dispatched as soon as a native page requests another browsing context.
-/// Carry the source pane so the app can place the new tab in the right project
-/// even if focus changes before the action reaches the workspace root.
-#[derive(Action, Clone, PartialEq)]
-#[action(namespace = muxel, no_json)]
-pub struct OpenBrowserTab(pub uuid::Uuid, pub String);
-
 /// Native browser state that can be reused when creating another tab. On
 /// Windows this avoids rebuilding the WebView2 environment for every tab.
 #[derive(Clone, Default)]
@@ -127,6 +120,112 @@ mod imp {
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     #[cfg(target_os = "windows")]
     use wry::{WebViewBuilderExtWindows as _, WebViewExtWindows as _};
+
+    #[cfg(target_os = "windows")]
+    enum SharedEnvironment {
+        Empty,
+        Building(
+            Vec<
+                async_channel::Sender<
+                    Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+                >,
+            >,
+        ),
+        Ready(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment),
+    }
+
+    #[cfg(target_os = "windows")]
+    thread_local! {
+        /// One WebView2 environment per process/profile. Browser views are built
+        /// by interleaved foreground tasks; the Building marker prevents two
+        /// restored split panes from racing separate cold environments against
+        /// the same user-data directory.
+        static SHARED_ENVIRONMENT: std::cell::RefCell<SharedEnvironment> =
+            const { std::cell::RefCell::new(SharedEnvironment::Empty) };
+    }
+
+    #[cfg(target_os = "windows")]
+    enum EnvironmentClaim {
+        Ready(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment),
+        Build,
+        Wait(
+            async_channel::Receiver<
+                Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+            >,
+        ),
+    }
+
+    #[cfg(target_os = "windows")]
+    fn claim_environment() -> EnvironmentClaim {
+        SHARED_ENVIRONMENT.with(|state| {
+            let mut state = state.borrow_mut();
+            match &mut *state {
+                SharedEnvironment::Ready(environment) => {
+                    EnvironmentClaim::Ready(environment.clone())
+                }
+                SharedEnvironment::Building(waiters) => {
+                    let (sender, receiver) = async_channel::bounded(1);
+                    waiters.push(sender);
+                    EnvironmentClaim::Wait(receiver)
+                }
+                SharedEnvironment::Empty => {
+                    *state = SharedEnvironment::Building(Vec::new());
+                    EnvironmentClaim::Build
+                }
+            }
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    struct EnvironmentBuildGuard {
+        armed: bool,
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_environment(
+        environment: Option<
+            webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+        >,
+    ) {
+        let waiters = SHARED_ENVIRONMENT.with(|state| {
+            let next = environment
+                .clone()
+                .map_or(SharedEnvironment::Empty, SharedEnvironment::Ready);
+            match std::mem::replace(&mut *state.borrow_mut(), next) {
+                SharedEnvironment::Building(waiters) => waiters,
+                _ => Vec::new(),
+            }
+        });
+        for waiter in waiters {
+            let _ = waiter.try_send(environment.clone());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl EnvironmentBuildGuard {
+        fn new() -> Self {
+            Self { armed: true }
+        }
+
+        fn finish(
+            mut self,
+            environment: Option<
+                webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+            >,
+        ) {
+            finish_environment(environment);
+            self.armed = false;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for EnvironmentBuildGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                finish_environment(None);
+            }
+        }
+    }
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
     ///
@@ -297,14 +396,78 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
+            let build_queued = std::time::Instant::now();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
             let (native_event_tx, native_events) = async_channel::unbounded();
 
             cx.spawn_in(window, async move |this, cx| {
+                if crate::ui_profile::is_enabled() {
+                    crate::ui_profile::event(
+                        "browser",
+                        &format!(
+                            "native-controller-task pane={instance_id} initially_visible={initially_visible}"
+                        ),
+                    );
+                }
                 #[cfg(not(target_os = "windows"))]
                 let _ = launch_context;
                 #[cfg(target_os = "windows")]
-                let shared_environment = launch_context.environment;
+                let mut shared_environment = launch_context.environment;
+                #[cfg(target_os = "windows")]
+                let mut environment_build_guard = None;
+                #[cfg(target_os = "windows")]
+                if shared_environment.is_none() {
+                    loop {
+                        match claim_environment() {
+                            EnvironmentClaim::Ready(environment) => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-ready pane={instance_id}"),
+                                    );
+                                }
+                                shared_environment = Some(environment);
+                                break;
+                            }
+                            EnvironmentClaim::Build => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-build pane={instance_id}"),
+                                    );
+                                }
+                                environment_build_guard = Some(EnvironmentBuildGuard::new());
+                                break;
+                            }
+                            EnvironmentClaim::Wait(receiver) => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-wait pane={instance_id}"),
+                                    );
+                                }
+                                if let Ok(Some(environment)) = receiver.recv().await {
+                                    if crate::ui_profile::is_enabled() {
+                                        crate::ui_profile::event(
+                                            "browser",
+                                            &format!("environment-woken pane={instance_id}"),
+                                        );
+                                    }
+                                    shared_environment = Some(environment);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                let environment_kind = if environment_build_guard.is_some() {
+                    "cold"
+                } else {
+                    "shared"
+                };
+                #[cfg(target_os = "macos")]
+                let environment_kind = "platform";
                 #[cfg(target_os = "windows")]
                 let mut web_context = if shared_environment.is_none() {
                     muxel_store::data_dir().and_then(|dir| {
@@ -358,7 +521,31 @@ mod imp {
                                     let _ = focus_tx.send(true);
                                 }
                             });
+                        let controller_started = std::time::Instant::now();
+                        let queued_ms = build_queued.elapsed().as_millis();
+                        if crate::ui_profile::is_enabled() {
+                            crate::ui_profile::event(
+                                "browser",
+                                &format!(
+                                    "native-controller-await pane={instance_id} env={environment_kind} initially_visible={initially_visible} queued_ms={queued_ms}"
+                                ),
+                            );
+                        }
                         let built = builder.build_as_child_async(parent).await.ok();
+                        #[cfg(target_os = "windows")]
+                        if let Some(guard) = environment_build_guard.take() {
+                            guard.finish(built.as_ref().map(|webview| webview.environment()));
+                        }
+                        if crate::ui_profile::is_enabled() {
+                            crate::ui_profile::event(
+                                "browser",
+                                &format!(
+                                    "native-controller pane={instance_id} env={environment_kind} initially_visible={initially_visible} queued_ms={queued_ms} controller_ms={} ok={}",
+                                    controller_started.elapsed().as_millis(),
+                                    built.is_some()
+                                ),
+                            );
+                        }
 
                         #[cfg(target_os = "windows")]
                         if let Some(webview) = built.as_ref() {
@@ -417,18 +604,7 @@ mod imp {
 
                 drop(native_event_tx);
                 while let Ok(NativeBrowserEvent::OpenTab(url)) = native_events.recv().await {
-                    if this
-                        .update_in(cx, |this, window, cx| {
-                            this.focus_handle.dispatch_action(
-                                &super::OpenBrowserTab(instance_id, url),
-                                window,
-                                cx,
-                            );
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    crate::app::open_browser_tab_from_native(instance_id, url, cx);
                 }
             })
             .detach();

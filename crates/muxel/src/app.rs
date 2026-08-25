@@ -119,6 +119,26 @@ fn restore_move_size_active() -> bool {
     }
 }
 
+/// Whether `iid` is the tab currently shown in its leaf. Restored browser tabs
+/// that are not shown stay metadata-only until selection; visible split panes
+/// still build immediately.
+fn layout_shows_instance(layout: &PaneNode, iid: Uuid, active_instance: Option<Uuid>) -> bool {
+    match layout {
+        PaneNode::Leaf(leaf) => {
+            if !leaf.tabs.contains(&iid) || leaf.tabs.is_empty() {
+                return false;
+            }
+            let shown = active_instance
+                .filter(|active| leaf.tabs.contains(active))
+                .unwrap_or_else(|| leaf.active_instance());
+            shown == iid
+        }
+        PaneNode::Split { children, .. } => children
+            .iter()
+            .any(|child| layout_shows_instance(child, iid, active_instance)),
+    }
+}
+
 /// Status indicator color, taken from the active theme.
 fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -1121,6 +1141,44 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
 struct MuxelHandle(WeakEntity<MuxelApp>);
 impl Global for MuxelHandle {}
 
+/// Route a native `window.open` request through the app entity itself. A
+/// background BrowserView is not mounted in GPUI's element tree, so dispatching
+/// an action through that view's focus handle can silently miss the root.
+pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &mut AsyncApp) {
+    let target = cx.update(|cx| {
+        let app = cx
+            .try_global::<MuxelHandle>()
+            .and_then(|handle| handle.0.upgrade())?;
+        let window = {
+            let app_ref = app.read(cx);
+            let project_id = app_ref.workspace.instance(instance_id)?.project_id;
+            app_ref
+                .secondary_windows
+                .iter()
+                .find(|secondary| secondary.pid == project_id)
+                .map(|secondary| secondary.handle)
+                .or(app_ref.main_window)?
+        };
+        Some((app, window))
+    });
+    let Some((app, window_handle)) = target else {
+        return;
+    };
+    let _ = window_handle.update(cx, |_, window, cx| {
+        app.update(cx, |app, cx| {
+            if app.workspace.instance(instance_id).is_some() && browser_popup_url_allowed(&url) {
+                app.open_link_from(
+                    &url,
+                    Some(instance_id),
+                    ResourceActivation::Background,
+                    window,
+                    cx,
+                );
+            }
+        });
+    });
+}
+
 /// Set the active preset (by id) for new panes.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = muxel, no_json)]
@@ -1797,9 +1855,16 @@ fn nearest_kind_instance(
         .map(|(_, (candidate, _))| *candidate)
 }
 
+fn in_layout_anchor(
+    instances: &[(Uuid, InstanceKind)],
+    requested_anchor: Option<Uuid>,
+) -> Option<Uuid> {
+    requested_anchor.filter(|anchor| instances.iter().any(|(candidate, _)| candidate == anchor))
+}
+
 #[cfg(test)]
 mod resource_lane_tests {
-    use super::{InstanceKind, Uuid, nearest_kind_instance};
+    use super::{InstanceKind, Uuid, in_layout_anchor, nearest_kind_instance};
 
     #[test]
     fn chooses_same_kind_lane_nearest_the_requested_anchor() {
@@ -1822,6 +1887,19 @@ mod resource_lane_tests {
             nearest_kind_instance(&instances, InstanceKind::Browser, Some(left_terminal)),
             Some(left_browser)
         );
+    }
+
+    #[test]
+    fn a_popped_out_instance_cannot_anchor_a_new_layout_node() {
+        let in_layout = Uuid::new_v4();
+        let popped_out = Uuid::new_v4();
+        let instances = [(in_layout, InstanceKind::Terminal)];
+
+        assert_eq!(
+            in_layout_anchor(&instances, Some(in_layout)),
+            Some(in_layout)
+        );
+        assert_eq!(in_layout_anchor(&instances, Some(popped_out)), None);
     }
 }
 
@@ -3118,37 +3196,6 @@ impl Render for PopoutView {
                     v.read(cx).session().write_input(b"\x1b[Z");
                 }
             }))
-            .on_action(cx.listener(
-                |this, action: &crate::browser::OpenBrowserTab, _window, cx| {
-                    if this.iid != action.0 || !browser_popup_url_allowed(&action.1) {
-                        return;
-                    }
-                    let Some(app) = cx
-                        .try_global::<MuxelHandle>()
-                        .and_then(|handle| handle.0.upgrade())
-                    else {
-                        return;
-                    };
-                    let Some(main) = app.read(cx).main_window else {
-                        return;
-                    };
-                    let source = action.0;
-                    let url = action.1.clone();
-                    cx.defer(move |cx| {
-                        let _ = main.update(cx, |_, window, cx| {
-                            app.update(cx, |app, cx| {
-                                app.open_link_from(
-                                    &url,
-                                    Some(source),
-                                    ResourceActivation::Background,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        });
-                    });
-                },
-            ))
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -5949,7 +5996,13 @@ impl MuxelApp {
                 }
             }
             InstanceKind::Browser => {
-                if !self.browsers.contains_key(&iid) {
+                let shown = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|instance| self.workspace.project(instance.project_id))
+                    .and_then(|project| project.layout.as_ref())
+                    .is_some_and(|layout| layout_shows_instance(layout, iid, self.active_instance));
+                if shown && !self.browsers.contains_key(&iid) {
                     let url = self
                         .workspace
                         .instance(iid)
@@ -6505,6 +6558,14 @@ impl MuxelApp {
         {
             set_active_tab(&mut p.layout, iid);
             p.last_focused_instance = Some(iid);
+        }
+        if self
+            .workspace
+            .instance(iid)
+            .is_some_and(|instance| instance.kind == InstanceKind::Browser)
+            && !self.browsers.contains_key(&iid)
+        {
+            self.spawn_project_pane(iid, window, cx);
         }
         let runtime_completion = self
             .terminals
@@ -9705,6 +9766,9 @@ impl MuxelApp {
                     .map(|existing| (candidate, existing.kind))
             })
             .collect();
+        // A popped-out pane keeps instance metadata but is absent from this
+        // layout. It cannot anchor add_tab/split; fall back to an in-layout pane.
+        let requested_anchor = in_layout_anchor(&instances, requested_anchor);
         let same_kind = nearest_kind_instance(&instances, kind, requested_anchor);
         let placed = self.workspace.project_mut(pid).is_some_and(|project| {
             let fallback = || requested_anchor.or_else(|| project.first_instance());
@@ -12770,21 +12834,6 @@ impl MuxelApp {
                     this.toggle_dev_console(cx);
                 }
             }))
-            .on_action(cx.listener(
-                |this, action: &crate::browser::OpenBrowserTab, window, cx| {
-                    if this.workspace.instance(action.0).is_some()
-                        && browser_popup_url_allowed(&action.1)
-                    {
-                        this.open_link_from(
-                            &action.1,
-                            Some(action.0),
-                            ResourceActivation::Background,
-                            window,
-                            cx,
-                        );
-                    }
-                },
-            ))
             // A ctrl+clicked terminal link: URLs go to the built-in browser when
             // enabled (embedded pane / Linux browser window), files to the OS.
             .on_action(
@@ -25577,7 +25626,10 @@ mod shell_title_tests {
 
 #[cfg(test)]
 mod restore_wave_policy_tests {
-    use super::{RestoreWaveDecision, restore_wave_decision, restore_wave_delay};
+    use super::{
+        PaneNode, RestoreWaveDecision, SplitDirection, Uuid, layout_shows_instance,
+        restore_wave_decision, restore_wave_delay,
+    };
     use std::time::Duration;
 
     #[test]
@@ -25617,6 +25669,31 @@ mod restore_wave_policy_tests {
             restore_wave_decision(4, 6, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
+    }
+
+    #[test]
+    fn restored_hidden_tabs_are_lazy_but_visible_splits_are_not() {
+        let shown_tab = Uuid::new_v4();
+        let hidden_tab = Uuid::new_v4();
+        let split_browser = Uuid::new_v4();
+        let tabbed = PaneNode::Leaf(muxel_core::LeafData {
+            tabs: vec![shown_tab, hidden_tab],
+            active: 0,
+        });
+        let layout = PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![0.5, 0.5],
+            children: vec![tabbed, PaneNode::leaf(split_browser)],
+        };
+
+        assert!(layout_shows_instance(&layout, shown_tab, Some(shown_tab)));
+        assert!(!layout_shows_instance(&layout, hidden_tab, Some(shown_tab)));
+        assert!(layout_shows_instance(
+            &layout,
+            split_browser,
+            Some(shown_tab)
+        ));
+        assert!(layout_shows_instance(&layout, hidden_tab, Some(hidden_tab)));
     }
 }
 

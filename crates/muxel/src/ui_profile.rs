@@ -208,6 +208,15 @@ fn ensure_flusher() {
         .ok();
 }
 
+/// Record a low-volume, opt-in subsystem event beside the UI health counters.
+pub fn event(category: &str, event: &str) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    emit(&format!("ui-prof[{category}] {event}"));
+}
+
 fn working_set_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
