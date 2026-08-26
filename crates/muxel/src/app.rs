@@ -7777,20 +7777,33 @@ impl MuxelApp {
                 // Native WebView focus never reaches GPUI. Mirror it into Muxel's
                 // active-pane state, and blur a focused address input once.
                 let pane_active = self.active_instance == Some(iid);
-                if view.update(cx, |v, _| v.take_native_focus(pane_active)) == Some(true) {
-                    let address_focused = view.read(cx).address_focused(window, cx);
-                    if self.active_instance != Some(iid) || address_focused {
-                        if self.active_instance != Some(iid) {
-                            self.focus_instance(iid, window, cx);
-                        } else {
-                            let handle = view.read(cx).focus_handle(cx);
-                            window.focus(&handle, cx);
+                match view.update(cx, |v, _| v.take_native_focus(pane_active)) {
+                    Some(crate::browser::NativeFocusDecision::Activate) => {
+                        let address_focused = view.read(cx).address_focused(window, cx);
+                        if self.active_instance != Some(iid) || address_focused {
+                            if self.active_instance != Some(iid) {
+                                self.focus_instance(iid, window, cx);
+                            } else {
+                                let handle = view.read(cx).focus_handle(cx);
+                                window.focus(&handle, cx);
+                            }
+                            // GPUI focus bookkeeping may move OS focus to the parent.
+                            // Return it once; the resulting GotFocus event is ignored
+                            // next tick because pane and address state are settled.
+                            view.read(cx).focus_native(cx);
                         }
-                        // GPUI focus bookkeeping may move OS focus to the parent.
-                        // Return it once; the resulting GotFocus event is ignored
-                        // next tick because pane and address state are settled.
-                        view.read(cx).focus_native(cx);
                     }
+                    Some(crate::browser::NativeFocusDecision::RestoreActive)
+                        if self.window_active =>
+                    {
+                        // The rejected GotFocus already moved OS keyboard focus.
+                        // Put it back only while Muxel owns the active window;
+                        // otherwise this would steal focus from another app.
+                        if let Some(active) = self.active_instance {
+                            self.focus_instance_with_attendance(active, false, window, cx);
+                        }
+                    }
+                    _ => {}
                 }
             }
             if changed {

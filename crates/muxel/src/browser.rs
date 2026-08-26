@@ -75,6 +75,12 @@ enum NativeFocusEvent {
     Pointer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeFocusDecision {
+    Activate,
+    RestoreActive,
+}
+
 /// Only a real page pointer may activate a visible-but-inactive browser. Native
 /// controllers can report GotFocus later without a click (notably while an
 /// async WebView2 controller finishes), so treating every gain as intent lets a
@@ -84,7 +90,7 @@ fn native_focus_decision(
     native_visible: bool,
     pane_active: bool,
     events: &[NativeFocusEvent],
-) -> Option<bool> {
+) -> Option<NativeFocusDecision> {
     let mut focused = None;
     let mut trusted_pointer = false;
     for event in events {
@@ -101,16 +107,18 @@ fn native_focus_decision(
         }
     }
     match focused {
-        Some(true) if !native_visible => None,
-        Some(true) if pane_active || trusted_pointer => Some(true),
-        Some(true) => None,
-        other => other,
+        Some(true) if !native_visible => Some(NativeFocusDecision::RestoreActive),
+        Some(true) if pane_active || trusted_pointer => Some(NativeFocusDecision::Activate),
+        Some(true) => Some(NativeFocusDecision::RestoreActive),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeFocusEvent, native_focus_decision, should_publish_url, tab_label};
+    use super::{
+        NativeFocusDecision, NativeFocusEvent, native_focus_decision, should_publish_url, tab_label,
+    };
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -129,25 +137,32 @@ mod tests {
 
     #[test]
     fn native_focus_requires_visibility_and_current_intent() {
+        use NativeFocusDecision::{Activate, RestoreActive};
         use NativeFocusEvent::{Gained, Lost, Pointer};
 
-        assert_eq!(native_focus_decision(false, false, &[Gained]), None);
-        assert_eq!(native_focus_decision(true, false, &[Gained]), None);
-        assert_eq!(native_focus_decision(true, true, &[Gained]), Some(true));
-        assert_eq!(native_focus_decision(true, false, &[Pointer]), Some(true));
+        assert_eq!(
+            native_focus_decision(false, false, &[Gained]),
+            Some(RestoreActive)
+        );
+        assert_eq!(
+            native_focus_decision(true, false, &[Gained]),
+            Some(RestoreActive)
+        );
+        assert_eq!(native_focus_decision(true, true, &[Gained]), Some(Activate));
+        assert_eq!(
+            native_focus_decision(true, false, &[Pointer]),
+            Some(Activate)
+        );
         assert_eq!(
             native_focus_decision(true, false, &[Gained, Pointer]),
-            Some(true)
+            Some(Activate)
         );
         assert_eq!(
             native_focus_decision(true, false, &[Pointer, Gained]),
-            Some(true)
+            Some(Activate)
         );
-        assert_eq!(
-            native_focus_decision(true, false, &[Pointer, Lost]),
-            Some(false)
-        );
-        assert_eq!(native_focus_decision(false, false, &[Lost]), Some(false));
+        assert_eq!(native_focus_decision(true, false, &[Pointer, Lost]), None);
+        assert_eq!(native_focus_decision(false, false, &[Lost]), None);
     }
 }
 
@@ -718,16 +733,13 @@ mod imp {
         /// click never reaches gpui on its own, so without this the pane keeps its
         /// old highlight and keyboard actions (paste, restart, close) go to
         /// whichever pane was focused before.
-        pub fn take_native_focus(&mut self, pane_active: bool) -> Option<bool> {
+        pub fn take_native_focus(&mut self, pane_active: bool) -> Option<NativeFocusDecision> {
             let mut events = Vec::new();
             while let Ok(next) = self.focus_events.try_recv() {
                 events.push(next);
             }
             let decision = native_focus_decision(self.native_visible, pane_active, &events);
-            if decision.is_none()
-                && events.iter().any(|event| {
-                    matches!(event, NativeFocusEvent::Gained | NativeFocusEvent::Pointer)
-                })
+            if decision == Some(NativeFocusDecision::RestoreActive)
                 && crate::ui_profile::is_enabled()
             {
                 crate::ui_profile::event("browser", "discarded-unarmed-browser-gain");
@@ -1020,7 +1032,7 @@ mod imp {
         /// No embedded webview here, so clicks land on ordinary gpui elements and
         /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
         /// impl for why that isn't true there).
-        pub fn take_native_focus(&mut self, _pane_active: bool) -> Option<bool> {
+        pub fn take_native_focus(&mut self, _pane_active: bool) -> Option<NativeFocusDecision> {
             None
         }
 
