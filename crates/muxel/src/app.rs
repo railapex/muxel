@@ -7776,7 +7776,8 @@ impl MuxelApp {
                 }
                 // Native WebView focus never reaches GPUI. Mirror it into Muxel's
                 // active-pane state, and blur a focused address input once.
-                if view.update(cx, |v, _| v.take_native_focus()) == Some(true) {
+                let pane_active = self.active_instance == Some(iid);
+                if view.update(cx, |v, _| v.take_native_focus(pane_active)) == Some(true) {
                     let address_focused = view.read(cx).address_focused(window, cx);
                     if self.active_instance != Some(iid) || address_focused {
                         if self.active_instance != Some(iid) {

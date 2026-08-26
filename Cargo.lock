@@ -5037,6 +5037,7 @@ dependencies = [
  "webview2-com",
  "whisper-rs",
  "windows 0.57.0",
+ "windows 0.61.3",
  "winresource",
  "zip",
 ]
