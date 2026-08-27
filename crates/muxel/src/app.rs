@@ -139,6 +139,20 @@ fn layout_shows_instance(layout: &PaneNode, iid: Uuid, active_instance: Option<U
     }
 }
 
+fn instance_needs_live_view(
+    kind: InstanceKind,
+    browser_shown: bool,
+    terminal_live: bool,
+    editor_live: bool,
+    browser_live: bool,
+) -> bool {
+    match kind {
+        InstanceKind::Terminal => !terminal_live,
+        InstanceKind::Editor | InstanceKind::Diff => !editor_live,
+        InstanceKind::Browser => browser_shown && !browser_live,
+    }
+}
+
 /// Status indicator color, taken from the active theme.
 fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -2416,6 +2430,9 @@ pub struct MuxelApp {
     /// back from a secondary window. Unlike `pending_editor_redock` the instance
     /// is still in its layout — only the view is re-created.
     pending_editor_rebuild: Vec<(Uuid, EditorSnapshot)>,
+    /// Browsers to rebuild as native children of the main window after their
+    /// project moved back from a secondary window. The instance remains in place.
+    pending_browser_rebuild: Vec<(Uuid, String)>,
     /// Editors awaiting re-dock into the main window (rebuilt in `render`, which
     /// has the main window — gpui-component input focus is window-bound).
     pending_editor_redock: Vec<(Uuid, EditorSnapshot, RedockAnchor)>,
@@ -3766,9 +3783,93 @@ fn browser_popup_url_allowed(url: &str) -> bool {
     })
 }
 
+struct BrowserPollResult {
+    url: Option<String>,
+    activate: bool,
+}
+
+fn poll_browser_in_owning_window(
+    iid: Uuid,
+    view: &Entity<crate::browser::BrowserView>,
+    restore_browsers: &[(Uuid, Entity<crate::browser::BrowserView>)],
+    pane_active: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> BrowserPollResult {
+    // Native child focus does not update GPUI's focus path. Capture that exact
+    // path before draining native events so a rejected late gain can return to
+    // a palette, modal input, editor, or pane without guessing from app state.
+    let restore_focus = window.focused(cx);
+    let restore_native = restore_focus.as_ref().and_then(|focus| {
+        restore_browsers
+            .iter()
+            .find_map(|(candidate_iid, candidate)| {
+                if *candidate_iid == iid {
+                    return None;
+                }
+                let candidate_focus = candidate.read(cx).focus_handle(cx);
+                (&candidate_focus == focus).then(|| candidate.clone())
+            })
+    });
+    let url = view.update(cx, |view, cx| view.sync(window, cx));
+    let decision = view.update(cx, |view, _| view.take_native_focus(pane_active));
+    let activate = decision == Some(crate::browser::NativeFocusDecision::Activate);
+
+    match decision {
+        Some(crate::browser::NativeFocusDecision::Activate) => {
+            let address_focused = view.read(cx).address_focused(window, cx);
+            if !pane_active || address_focused {
+                let handle = view.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+                // GPUI focus bookkeeping may move OS focus to the parent.
+                // Return it once; settled native events are ignored next poll.
+                view.read(cx).focus_native(cx);
+            }
+        }
+        Some(crate::browser::NativeFocusDecision::RestoreActive) if window.is_window_active() => {
+            // Native focus does not alter GPUI's focus path, so focusing the same
+            // handle is otherwise a no-op. First evict the rejected webview child,
+            // then force GPUI to reassert its exact prior path. If that path was
+            // another browser root, return OS focus to that browser's native child.
+            let restored_path = restore_focus.is_some();
+            let restored_browser = restore_native.is_some();
+            view.read(cx).focus_parent(cx);
+            if let Some(handle) = restore_focus {
+                window.blur();
+                window.focus(&handle, cx);
+            }
+            if let Some(browser) = restore_native {
+                browser.read(cx).focus_native(cx);
+            }
+            if crate::ui_profile::is_enabled() {
+                let target = if restored_browser {
+                    "browser"
+                } else if restored_path {
+                    "gpui"
+                } else {
+                    "host"
+                };
+                crate::ui_profile::event(
+                    "browser",
+                    &format!("restored-rejected-native-gain target={target}"),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    BrowserPollResult {
+        url,
+        activate: activate && !pane_active,
+    }
+}
+
 #[cfg(test)]
 mod link_source_tests {
-    use super::{Instance, Project, Workspace, browser_popup_url_allowed, link_source_project};
+    use super::{
+        Instance, InstanceKind, Project, Workspace, browser_popup_url_allowed,
+        instance_needs_live_view, link_source_project,
+    };
 
     #[test]
     fn emitting_pane_beats_the_later_active_project() {
@@ -3797,6 +3898,31 @@ mod link_source_tests {
         assert!(!browser_popup_url_allowed("mailto:test@example.com"));
         assert!(!browser_popup_url_allowed("custom-protocol:payload"));
         assert!(!browser_popup_url_allowed("//example.com/scheme-relative"));
+    }
+
+    #[test]
+    fn hidden_lazy_browser_is_complete_until_selected() {
+        assert!(!instance_needs_live_view(
+            InstanceKind::Browser,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(instance_needs_live_view(
+            InstanceKind::Browser,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!instance_needs_live_view(
+            InstanceKind::Browser,
+            true,
+            false,
+            false,
+            true,
+        ));
     }
 }
 
@@ -4269,6 +4395,7 @@ impl MuxelApp {
             secondary_windows: Vec::new(),
             main_window: Some(window.window_handle()),
             pending_editor_rebuild: Vec::new(),
+            pending_browser_rebuild: Vec::new(),
             pending_editor_redock: Vec::new(),
             pending_browser_redock: Vec::new(),
             show_quit_confirm: false,
@@ -5332,6 +5459,29 @@ impl MuxelApp {
         self.ensure_project_terminals_with(pid, true, window, cx);
     }
 
+    fn project_active_instance(&self, pid: Uuid) -> Option<Uuid> {
+        self.active_instance
+            .filter(|iid| {
+                self.workspace
+                    .instance(*iid)
+                    .is_some_and(|instance| instance.project_id == pid)
+            })
+            .or_else(|| {
+                self.workspace
+                    .project(pid)
+                    .and_then(Project::preferred_instance)
+            })
+    }
+
+    fn browser_should_be_live(&self, pid: Uuid, iid: Uuid) -> bool {
+        self.workspace
+            .project(pid)
+            .and_then(|project| project.layout.as_ref())
+            .is_some_and(|layout| {
+                layout_shows_instance(layout, iid, self.project_active_instance(pid))
+            })
+    }
+
     fn ensure_project_terminals_with(
         &mut self,
         pid: Uuid,
@@ -5365,9 +5515,15 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .any(|iid| {
-                !self.terminals.contains_key(&iid)
-                    && !self.editors.contains_key(&iid)
-                    && !self.browsers.contains_key(&iid)
+                self.workspace.instance(iid).is_some_and(|instance| {
+                    instance_needs_live_view(
+                        instance.kind,
+                        self.browser_should_be_live(pid, iid),
+                        self.terminals.contains_key(&iid),
+                        self.editors.contains_key(&iid),
+                        self.browsers.contains_key(&iid),
+                    )
+                })
             });
         if !needs && !first_sync {
             return;
@@ -5999,9 +6155,7 @@ impl MuxelApp {
                 let shown = self
                     .workspace
                     .instance(iid)
-                    .and_then(|instance| self.workspace.project(instance.project_id))
-                    .and_then(|project| project.layout.as_ref())
-                    .is_some_and(|layout| layout_shows_instance(layout, iid, self.active_instance));
+                    .is_some_and(|instance| self.browser_should_be_live(instance.project_id, iid));
                 if shown && !self.browsers.contains_key(&iid) {
                     let url = self
                         .workspace
@@ -6090,6 +6244,7 @@ impl MuxelApp {
         // Editors just drop (unsaved changes lost on workspace switch).
         self.editors.clear();
         self.pending_editor_redock.clear();
+        self.pending_browser_rebuild.clear();
         self.pending_browser_redock.clear();
         // Drop the native webviews with their workspace. Left alive, they keep
         // instance ids the new workspace will reuse, and the orphaned WebView2
@@ -7760,55 +7915,91 @@ impl MuxelApp {
             self.persist();
         }
 
-        // Keep browser panes' URL fresh (the user clicks links inside the
-        // webview): syncs the address bar, tab label, and the persisted
-        // `Instance.browser_url` so a restart restores where they ended up.
-        if !self.browsers.is_empty() {
-            let views: Vec<(Uuid, Entity<crate::browser::BrowserView>)> =
-                self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
-            let mut changed = false;
-            for (iid, view) in views {
-                if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
-                    && let Some(inst) = self.workspace.instance_mut(iid)
-                {
-                    inst.browser_url = Some(url);
-                    changed = true;
-                }
-                // Native WebView focus never reaches GPUI. Mirror it into Muxel's
-                // active-pane state, and blur a focused address input once.
-                let pane_active = self.active_instance == Some(iid);
-                match view.update(cx, |v, _| v.take_native_focus(pane_active)) {
-                    Some(crate::browser::NativeFocusDecision::Activate) => {
-                        let address_focused = view.read(cx).address_focused(window, cx);
-                        if self.active_instance != Some(iid) || address_focused {
-                            if self.active_instance != Some(iid) {
-                                self.focus_instance(iid, window, cx);
-                            } else {
-                                let handle = view.read(cx).focus_handle(cx);
-                                window.focus(&handle, cx);
-                            }
-                            // GPUI focus bookkeeping may move OS focus to the parent.
-                            // Return it once; the resulting GotFocus event is ignored
-                            // next tick because pane and address state are settled.
-                            view.read(cx).focus_native(cx);
-                        }
-                    }
-                    Some(crate::browser::NativeFocusDecision::RestoreActive)
-                        if self.window_active =>
-                    {
-                        // The rejected GotFocus already moved OS keyboard focus.
-                        // Put it back only while Muxel owns the active window;
-                        // otherwise this would steal focus from another app.
-                        if let Some(active) = self.active_instance {
-                            self.focus_instance_with_attendance(active, false, window, cx);
-                        }
-                    }
-                    _ => {}
-                }
+        // Keep every browser fresh in the OS window that owns its native child.
+        // This includes secondary project windows and detached browser popouts;
+        // using the main Window here corrupts both GPUI and native focus state.
+        let mut browser_targets: Vec<(
+            Uuid,
+            Entity<crate::browser::BrowserView>,
+            AnyWindowHandle,
+            bool,
+            bool,
+        )> = self
+            .browsers
+            .iter()
+            .filter_map(|(iid, view)| {
+                self.browser_window_handle(*iid).map(|handle| {
+                    (
+                        *iid,
+                        view.clone(),
+                        handle,
+                        false,
+                        self.active_instance == Some(*iid),
+                    )
+                })
+            })
+            .collect();
+        browser_targets.extend(self.popouts.iter().filter_map(|(iid, popout)| {
+            let PaneView::Browser(view) = &popout.view else {
+                return None;
+            };
+            Some((*iid, view.clone(), popout.window.into(), true, true))
+        }));
+        let mut restore_browsers: HashMap<
+            WindowId,
+            Vec<(Uuid, Entity<crate::browser::BrowserView>)>,
+        > = HashMap::new();
+        for (iid, view, handle, _, _) in &browser_targets {
+            restore_browsers
+                .entry(handle.window_id())
+                .or_default()
+                .push((*iid, view.clone()));
+        }
+
+        let current_window_id = window.window_handle().window_id();
+        let mut browser_changed = false;
+        let mut browser_activation_changed = false;
+        for (iid, view, handle, popout, pane_active) in browser_targets {
+            let restore_candidates = restore_browsers
+                .get(&handle.window_id())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let result = if handle.window_id() == current_window_id {
+                Some(poll_browser_in_owning_window(
+                    iid,
+                    &view,
+                    restore_candidates,
+                    pane_active,
+                    window,
+                    cx,
+                ))
+            } else {
+                handle
+                    .update(cx, |_, owning_window, cx| {
+                        poll_browser_in_owning_window(
+                            iid,
+                            &view,
+                            restore_candidates,
+                            pane_active,
+                            owning_window,
+                            cx,
+                        )
+                    })
+                    .ok()
+            };
+            let Some(result) = result else { continue };
+            if let Some(url) = result.url
+                && let Some(instance) = self.workspace.instance_mut(iid)
+            {
+                instance.browser_url = Some(url);
+                browser_changed = true;
             }
-            if changed {
-                self.persist();
+            if result.activate && !popout {
+                browser_activation_changed |= self.activate_browser_from_native(iid, cx);
             }
+        }
+        if browser_changed || browser_activation_changed {
+            self.persist();
         }
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
@@ -12426,9 +12617,58 @@ impl MuxelApp {
         }
     }
 
+    fn browser_window_handle(&self, iid: Uuid) -> Option<AnyWindowHandle> {
+        if let Some(popout) = self.popouts.get(&iid) {
+            return Some(popout.window.into());
+        }
+        let pid = self.workspace.instance(iid)?.project_id;
+        self.secondary_windows
+            .iter()
+            .find(|secondary| secondary.pid == pid)
+            .map(|secondary| secondary.handle)
+            .or(self.main_window)
+    }
+
+    /// Remove this project's live native webviews and retain the exact URL each
+    /// one had at the handoff. Native webview children cannot be reparented; the
+    /// caller must rebuild these snapshots against the destination `Window`.
+    fn take_project_browsers(&mut self, pid: Uuid, cx: &App) -> Vec<(Uuid, String)> {
+        self.workspace
+            .project(pid)
+            .map(|project| project.instances())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|iid| {
+                self.browsers.remove(&iid).map(|browser| {
+                    let url = browser.read(cx).handoff_url(cx);
+                    (iid, url)
+                })
+            })
+            .collect()
+    }
+
+    fn activate_browser_from_native(&mut self, iid: Uuid, cx: &mut Context<Self>) -> bool {
+        if self.active_instance == Some(iid) || !self.browsers.contains_key(&iid) {
+            return false;
+        }
+        self.active_instance = Some(iid);
+        self.clear_notifications_for(iid);
+        if let Some(pid) = self
+            .workspace
+            .instance(iid)
+            .map(|instance| instance.project_id)
+            && let Some(project) = self.workspace.project_mut(pid)
+        {
+            set_active_tab(&mut project.layout, iid);
+            project.last_focused_instance = Some(iid);
+        }
+        cx.notify();
+        true
+    }
+
     /// Open project `pid` as a full workspace window on `display` (or raise its
-    /// existing window). The project leaves the main window; its editors are
-    /// rebuilt inside the new window (editor input focus is window-bound).
+    /// existing window). The project leaves the main window; its editors and
+    /// browsers are rebuilt inside the new window because both are window-bound.
     fn open_project_on_monitor(
         &mut self,
         pid: Uuid,
@@ -12456,6 +12696,7 @@ impl MuxelApp {
                     .map(|ed| (iid, EditorSnapshot::capture(&ed, cx)))
             })
             .collect();
+        let browser_snaps = self.take_project_browsers(pid, cx);
         // The main window falls back to another project when it was showing this one.
         if self.workspace.active_project == Some(pid) {
             self.workspace.active_project = self
@@ -12496,6 +12737,7 @@ impl MuxelApp {
         // holds the MuxelApp lease would double-lease and panic. Run after the
         // current update completes instead.
         cx.defer(move |cx| {
+            let browser_restore = browser_snaps.clone();
             let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<WorkspaceWindow>>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(None));
             let opened = cx.open_window(
@@ -12518,6 +12760,17 @@ impl MuxelApp {
                             if let Some(a) = app.upgrade() {
                                 a.update(cx, |a, _| {
                                     a.editors.insert(iid, ed);
+                                });
+                            }
+                        }
+                        // Native webviews must be constructed as children of THIS
+                        // window; rendering an old entity here cannot reparent it.
+                        for (iid, url) in browser_snaps {
+                            let browser =
+                                cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
+                            if let Some(app) = app.upgrade() {
+                                app.update(cx, |app, _| {
+                                    app.browsers.insert(iid, browser);
                                 });
                             }
                         }
@@ -12571,6 +12824,7 @@ impl MuxelApp {
                     cx.notify();
                 }
                 Err(e) => {
+                    this.pending_browser_rebuild.extend(browser_restore);
                     log::warn!("open project window failed: {e}");
                     this.add_event(
                         NotifKind::Error,
@@ -12597,7 +12851,7 @@ impl MuxelApp {
     }
 
     /// A secondary window is gone (user closed it, or bring-to-main): drop the
-    /// record + monitor pin and queue its editors to rebuild in the main window.
+    /// record + monitor pin and queue its window-bound views for the main window.
     fn handle_secondary_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         let Some(ix) = self
             .secondary_windows
@@ -12618,6 +12872,8 @@ impl MuxelApp {
                 self.pending_editor_rebuild.push((iid, snap));
             }
         }
+        let browser_snaps = self.take_project_browsers(sec.pid, cx);
+        self.pending_browser_rebuild.extend(browser_snaps);
         self.workspace.project_windows.remove(&sec.pid);
         // Next pop-out of this project starts with its sidebar hidden again.
         self.secondary_sidebar_shown.remove(&sec.pid);
@@ -12643,7 +12899,7 @@ impl MuxelApp {
     }
 
     /// Repoint a secondary window at a different project (its sidebar click).
-    /// The old project's editors are queued to rebuild in the main window.
+    /// Window-bound views are rebuilt against their destination windows.
     fn repoint_secondary_window(
         &mut self,
         window_id: WindowId,
@@ -12660,6 +12916,9 @@ impl MuxelApp {
         };
         let old_pid = sec.pid;
         let display_uuid = sec.display_uuid;
+        if old_pid == pid {
+            return;
+        }
         sec.pid = pid;
         sec.view.update(cx, |v, cx| {
             v.pid = pid;
@@ -12675,6 +12934,15 @@ impl MuxelApp {
                 let snap = EditorSnapshot::capture(&ed, cx);
                 self.pending_editor_rebuild.push((iid, snap));
             }
+        }
+        let old_browser_snaps = self.take_project_browsers(old_pid, cx);
+        self.pending_browser_rebuild.extend(old_browser_snaps);
+
+        // Incoming native webviews were children of the main window. Rebuild
+        // them against this secondary window before it renders the project.
+        for (iid, url) in self.take_project_browsers(pid, cx) {
+            let browser = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
+            self.browsers.insert(iid, browser);
         }
         let carried =
             self.workspace
@@ -13011,7 +13279,7 @@ impl MuxelApp {
         } else if let Some(ed) = self.editors.remove(&iid) {
             PopoutContent::Editor(EditorSnapshot::capture(&ed, cx))
         } else if let Some(bv) = self.browsers.remove(&iid) {
-            PopoutContent::Browser(bv.read(cx).url().to_string())
+            PopoutContent::Browser(bv.read(cx).handoff_url(cx))
         } else {
             self.redock_into_layout(iid, pid, redock, cx);
             return;
@@ -13133,7 +13401,7 @@ impl MuxelApp {
                 // Same deal, for the opposite reason: the native webview child is
                 // owned by the pop-out window, so it dies with it and the pane is
                 // rebuilt against the main window in `render`.
-                let url = bv.read(cx).url().to_string();
+                let url = bv.read(cx).handoff_url(cx);
                 self.pending_browser_redock.push((iid, url, popout.redock));
                 cx.notify();
             }
@@ -13168,8 +13436,11 @@ impl MuxelApp {
     /// Rebuild any browsers awaiting re-dock into the main window. Called from
     /// `render`, which holds the main window the new webview must be a child of.
     fn drain_browser_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_browser_redock.is_empty() {
-            return;
+        // Browsers whose project moved back to this window: rebuild only the
+        // native child. Their instances never left the existing layout.
+        for (iid, url) in std::mem::take(&mut self.pending_browser_rebuild) {
+            let browser = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));
+            self.browsers.insert(iid, browser);
         }
         for (iid, url, redock) in std::mem::take(&mut self.pending_browser_redock) {
             let bv = cx.new(|cx| crate::browser::BrowserView::new(iid, url, window, cx));

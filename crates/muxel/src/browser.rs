@@ -68,6 +68,20 @@ fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
 
+/// Resolve the URL used to rebuild a native webview during an immediate window
+/// handoff. The regular one-second sync may not have observed a clicked link yet,
+/// while a requested navigation can temporarily report the page being left.
+fn handoff_url(cached: &str, pending_from: Option<&str>, native: Option<&str>) -> String {
+    let Some(native) = native.filter(|url| !url.is_empty()) else {
+        return cached.to_string();
+    };
+    if (native == "about:blank" && cached != "about:blank") || pending_from == Some(native) {
+        cached.to_string()
+    } else {
+        native.to_string()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeFocusEvent {
     Gained,
@@ -117,7 +131,8 @@ fn native_focus_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFocusDecision, NativeFocusEvent, native_focus_decision, should_publish_url, tab_label,
+        NativeFocusDecision, NativeFocusEvent, handoff_url, native_focus_decision,
+        should_publish_url, tab_label,
     };
 
     #[test]
@@ -133,6 +148,35 @@ mod tests {
         assert!(should_publish_url(false, true));
         assert!(should_publish_url(true, false));
         assert!(!should_publish_url(false, false));
+    }
+
+    #[test]
+    fn window_handoff_uses_native_url_without_rolling_back_pending_navigation() {
+        assert_eq!(
+            handoff_url("https://old", None, Some("https://clicked")),
+            "https://clicked"
+        );
+        assert_eq!(
+            handoff_url(
+                "https://requested",
+                Some("https://old"),
+                Some("https://old")
+            ),
+            "https://requested"
+        );
+        assert_eq!(
+            handoff_url(
+                "https://requested",
+                Some("https://old"),
+                Some("https://requested")
+            ),
+            "https://requested"
+        );
+        assert_eq!(
+            handoff_url("https://requested", None, Some("about:blank")),
+            "https://requested"
+        );
+        assert_eq!(handoff_url("https://cached", None, None), "https://cached");
     }
 
     #[test]
@@ -760,6 +804,14 @@ mod imp {
             }
         }
 
+        /// Move OS focus out of this native child and back to its GPUI host.
+        /// GPUI's focus path does not change when WebView2/WKWebView gains focus.
+        pub fn focus_parent(&self, cx: &App) {
+            if let Some(wv) = &self.webview {
+                let _ = wv.read(cx).raw().focus_parent();
+            }
+        }
+
         pub fn address_focused(&self, window: &Window, cx: &App) -> bool {
             self.address.read(cx).focus_handle(cx).is_focused(window)
         }
@@ -814,6 +866,20 @@ mod imp {
         /// (pop-out / re-dock) rebuilds it from this rather than reparenting.
         pub fn url(&self) -> &str {
             &self.url
+        }
+
+        /// URL to carry across a native-window rebuild. Unlike `url()`, this
+        /// samples the native controller so a just-clicked link is not lost.
+        pub fn handoff_url(&self, cx: &App) -> String {
+            let native = self
+                .webview
+                .as_ref()
+                .and_then(|webview| webview.read(cx).url().ok());
+            super::handoff_url(
+                &self.url,
+                self.pending_navigation_from.as_deref(),
+                native.as_deref(),
+            )
         }
 
         /// Navigate the webview and remember the URL.
@@ -1023,6 +1089,10 @@ mod imp {
             &self.url
         }
 
+        pub fn handoff_url(&self, _cx: &App) -> String {
+            self.url.clone()
+        }
+
         pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
             None
         }
@@ -1038,6 +1108,8 @@ mod imp {
 
         /// No native child to focus.
         pub fn focus_native(&self, _cx: &App) {}
+
+        pub fn focus_parent(&self, _cx: &App) {}
 
         pub fn address_focused(&self, _window: &Window, _cx: &App) -> bool {
             false
