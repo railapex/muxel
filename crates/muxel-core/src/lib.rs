@@ -1303,6 +1303,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                 // An empty project: this instance seeds the layout.
                 None => {
                     project.layout = Some(PaneNode::Leaf(LeafData {
+                        pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
                     }))
@@ -2538,6 +2539,7 @@ mod remote_layout_tests {
         let wt2 = worktree(pid, "lone-reef", 1);
 
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
         }));
@@ -2590,6 +2592,7 @@ mod remote_layout_tests {
         let i1 = Instance::shell(proj.id);
         let id1 = i1.id;
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
         }));
@@ -2603,6 +2606,7 @@ mod remote_layout_tests {
         let i2 = Instance::shell(proj.id);
         let id2 = i2.id;
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
         }));
@@ -2617,6 +2621,7 @@ mod remote_layout_tests {
         let mut proj = remote_project("/srv/app");
         let instance = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
         }));
@@ -2639,6 +2644,7 @@ mod remote_layout_tests {
         let mut proj = remote_project("/srv/app");
         let i1 = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
         }));
