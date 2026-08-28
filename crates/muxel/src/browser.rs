@@ -785,9 +785,10 @@ mod imp {
                             let got_tx = focus_tx.clone();
                             let got_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
-                                    crate::ui_profile::focus_action_for_pane(
+                                    crate::ui_profile::native_focus_edge_for_pane(
                                         crate::ui_profile::FocusActionReason::NativeBrowserGain,
                                         instance_id,
+                                        true,
                                     );
                                     let _ = got_tx.send(NativeFocusEvent::Gained);
                                     Ok(())
@@ -795,6 +796,11 @@ mod imp {
                             let lost_tx = focus_tx.clone();
                             let lost_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    crate::ui_profile::native_focus_edge_for_pane(
+                                        crate::ui_profile::FocusActionReason::NativeBrowserLoss,
+                                        instance_id,
+                                        false,
+                                    );
                                     let _ = lost_tx.send(NativeFocusEvent::Lost);
                                     Ok(())
                                 }));

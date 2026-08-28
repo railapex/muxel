@@ -96,9 +96,11 @@ pub fn focus_changed(instance_id: Uuid, focused: bool) {
     if !focused {
         clear_pane_state(instance_id);
     }
-    emit_line(&format!(
-        "term-focus[v1] pane={instance_id} focused={focused}"
-    ));
+    defer(DeferredRecord::Focus {
+        instance_id,
+        focused,
+    });
+    touch();
 }
 
 pub(crate) fn pane_closed(instance_id: Uuid) {
@@ -155,18 +157,46 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+/// Prepare a bounded live log before it is opened. If rotation cannot replace
+/// the backup, truncate the live file; if neither operation succeeds, stop
+/// logging rather than append without a bound.
+fn prepare_log_path(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() < PROFILE_LOG_MAX_BYTES {
+        return true;
+    }
+    let rotated = rotated_log_path(path);
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    if std::fs::rename(path, &rotated).is_ok() {
+        return true;
+    }
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .is_ok()
+}
+
 fn open_log_file(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     // Append across restarts so a long session (or many short ones) builds a
     // corpus; rotate when large so a multi-day run cannot fill the disk.
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() >= PROFILE_LOG_MAX_BYTES
-    {
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    if !prepare_log_path(path) {
+        return None;
     }
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => Some(f),
@@ -177,6 +207,13 @@ fn open_log_file(path: &Path) -> Option<std::fs::File> {
             None
         }
     }
+}
+
+fn reopen_log_file(slot: &mut Option<std::fs::File>, path: &Path) {
+    // The explicit first assignment matters on Windows: an assignment whose
+    // RHS opens/rotates first would retain the old handle until too late.
+    *slot = None;
+    *slot = open_log_file(path);
 }
 
 fn emit_line(line: &str) {
@@ -206,7 +243,7 @@ fn emit_line(line: &str) {
                 .unwrap_or(false)
         });
         if needs_reopen {
-            *g = open_log_file(path);
+            reopen_log_file(&mut g, path);
         }
         if let Some(f) = g.as_mut() {
             let _ = writeln!(f, "{line}");
@@ -293,10 +330,39 @@ struct StartupRecord {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PointerRecord {
+    instance_id: Uuid,
+    event: &'static str,
+    mouse_reporting: bool,
+    shift: bool,
+}
+
+fn pointer_event_label(event: &str) -> &'static str {
+    match event {
+        "down" => "down",
+        "wheel" => "wheel",
+        _ => "other",
+    }
+}
+
+fn focus_line(instance_id: Uuid, focused: bool) -> String {
+    format!("term-focus[v1] pane={instance_id} focused={focused}")
+}
+
+fn pointer_line(pointer: PointerRecord) -> String {
+    format!(
+        "term-pointer[v1] pane={} event={} mouse_reporting={} shift={}",
+        pointer.instance_id, pointer.event, pointer.mouse_reporting, pointer.shift,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
 enum DeferredRecord {
     Startup(StartupRecord),
     SlowWrite(SlowWrite),
     SlowLatency(SlowLatency),
+    Focus { instance_id: Uuid, focused: bool },
+    Pointer(PointerRecord),
 }
 
 const MAX_PENDING_RECORDS: usize = 128;
@@ -640,9 +706,13 @@ fn flusher_loop(rx: Receiver<DeferredRecord>) {
     let mut records = Vec::with_capacity(MAX_PENDING_RECORDS);
     let mut last_dump = Instant::now();
     loop {
+        if records.len() == MAX_PENDING_RECORDS {
+            dump("capacity", &mut records);
+            last_dump = Instant::now();
+        }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(record) if records.len() < MAX_PENDING_RECORDS => records.push(record),
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(record) => records.push(record),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         while records.len() < MAX_PENDING_RECORDS {
@@ -849,6 +919,11 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
                     sample.min_interval_us / 1000,
                 ));
             }
+            DeferredRecord::Focus {
+                instance_id,
+                focused,
+            } => emit_line(&focus_line(instance_id, focused)),
+            DeferredRecord::Pointer(pointer) => emit_line(&pointer_line(pointer)),
         }
     }
 }
@@ -981,9 +1056,13 @@ pub fn pointer_routed(instance_id: Uuid, event: &str, mouse_reporting: bool, shi
     if !enabled() {
         return;
     }
-    emit_line(&format!(
-        "term-pointer[v1] pane={instance_id} event={event} mouse_reporting={mouse_reporting} shift={shift}"
-    ));
+    let event = pointer_event_label(event);
+    defer(DeferredRecord::Pointer(PointerRecord {
+        instance_id,
+        event,
+        mouse_reporting,
+        shift,
+    }));
     touch();
 }
 
@@ -1281,6 +1360,56 @@ mod tests {
         assert!(try_defer_to(Some(&tx), record));
         assert!(!try_defer_to(Some(&tx), record));
         assert!(!try_defer_to(None, record));
+    }
+
+    #[test]
+    fn pointer_and_focus_records_are_fixed_content_free_schemas() {
+        let pane = Uuid::nil();
+        let secret = "wheel path=C:/secret prompt=do-not-log";
+        let pointer = pointer_line(PointerRecord {
+            instance_id: pane,
+            event: pointer_event_label(secret),
+            mouse_reporting: true,
+            shift: false,
+        });
+        assert_eq!(
+            pointer,
+            "term-pointer[v1] pane=00000000-0000-0000-0000-000000000000 event=other mouse_reporting=true shift=false"
+        );
+        assert!(!pointer.contains(secret));
+        assert_eq!(
+            focus_line(pane, true),
+            "term-focus[v1] pane=00000000-0000-0000-0000-000000000000 focused=true"
+        );
+    }
+
+    #[test]
+    fn rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
+        let dir = std::env::temp_dir().join(format!("muxel-term-prof-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create rotation fixture");
+        let path = dir.join("term-prof.log");
+        let rotated = rotated_log_path(&path);
+        std::fs::write(&path, vec![b'x'; PROFILE_LOG_MAX_BYTES as usize + 1])
+            .expect("write oversized live log");
+        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
+        let mut slot = Some(
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("hold live log open"),
+        );
+
+        reopen_log_file(&mut slot, &path);
+
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("rotated log").len(),
+            PROFILE_LOG_MAX_BYTES + 1
+        );
+        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
+        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
+        drop(slot);
+        assert!(std::fs::metadata(&path).unwrap().len() < PROFILE_LOG_MAX_BYTES);
+        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
     }
 
     #[test]

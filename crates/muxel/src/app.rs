@@ -2825,23 +2825,62 @@ struct PopoutView {
     view: PaneView,
     iid: Uuid,
     show_close_confirm: bool,
+    /// Profiler-only correlation state. Keeping it on the root that owns the
+    /// pane prevents a popped-out terminal from affecting main-app lifecycle
+    /// bookkeeping or suppressing the first transition after re-dock.
+    profile_status: Option<AgentStatus>,
+    profile_window_active: bool,
 }
 
 impl PopoutView {
     fn new(view: PaneView, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
-        cx.observe_window_activation(window, |_this, window, cx| {
-            ui_profile::window_activation(
-                ui_profile::ProfileWindowKind::Popout,
-                window.is_window_active(),
-                window,
-            );
-            cx.notify();
-        })
-        .detach();
+        let profile_status = if ui_profile::is_enabled() {
+            match &view {
+                PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let profile_window_active = window.is_window_active();
+        if ui_profile::is_enabled() {
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.profile_window_active = window.is_window_active();
+                ui_profile::window_activation(
+                    ui_profile::ProfileWindowKind::Popout,
+                    window.is_window_active(),
+                    window,
+                );
+                cx.notify();
+            })
+            .detach();
+        }
         // Re-render (refresh the title) when the pane updates.
         match &view {
-            PaneView::Terminal(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
+            PaneView::Terminal(v) => cx
+                .observe(v, |this, terminal, cx| {
+                    if ui_profile::is_enabled() {
+                        let status = terminal.read(cx).status();
+                        if this.profile_status != Some(status) {
+                            let previous = this.profile_status.replace(status);
+                            if let Some(generation) = ui_profile::begin_status_dirty() {
+                                ui_profile::lifecycle_status_transition(
+                                    this.iid,
+                                    previous,
+                                    status,
+                                    status,
+                                    true,
+                                    this.profile_window_active,
+                                    generation,
+                                );
+                                ui_profile::status_dirty_root_notify(generation, 1);
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .detach(),
             PaneView::Editor(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
             PaneView::Browser(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
         }
@@ -2849,6 +2888,8 @@ impl PopoutView {
             view,
             iid,
             show_close_confirm: false,
+            profile_status,
+            profile_window_active,
         }
     }
 
