@@ -849,6 +849,12 @@ pub struct TerminalView {
     _drain: Task<()>,
 }
 
+/// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
+/// edge. Muxel injects it only while the opt-in profiler is enabled, keeping
+/// platform/window knowledge out of this crate without creating a dependency
+/// cycle.
+pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
+
 impl Drop for TerminalView {
     fn drop(&mut self) {
         profile::pane_closed(self.instance_id);
@@ -999,6 +1005,20 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_focus_observer(launch, instance_id, startup_started, None, window, cx)
+    }
+
+    /// [`Self::new`] with an optional app-owned diagnostic at the exact GPUI
+    /// focus edge. Kept separate so the normal public constructor remains
+    /// source-compatible for other workspace consumers.
+    pub fn new_with_focus_observer(
+        launch: TerminalLaunch,
+        instance_id: Uuid,
+        startup_started: Instant,
+        focus_observer: Option<TerminalFocusObserver>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let TerminalLaunch {
             spec,
             session,
@@ -1022,7 +1042,10 @@ impl TerminalView {
         {
             let s = session.clone();
             window
-                .on_focus_in(&focus_handle, cx, move |_w, _cx| {
+                .on_focus_in(&focus_handle, cx, move |w, cx| {
+                    if let Some(observer) = focus_observer {
+                        observer(instance_id, true, w, cx);
+                    }
                     profile::focus_changed(instance_id, true);
                     s.report_focus(true);
                 })
@@ -1031,7 +1054,10 @@ impl TerminalView {
         {
             let s = session.clone();
             window
-                .on_focus_out(&focus_handle, cx, move |_ev, _w, _cx| {
+                .on_focus_out(&focus_handle, cx, move |_ev, w, cx| {
+                    if let Some(observer) = focus_observer {
+                        observer(instance_id, false, w, cx);
+                    }
                     profile::focus_changed(instance_id, false);
                     s.report_focus(false);
                 })
