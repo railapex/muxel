@@ -4380,7 +4380,7 @@ fn poll_browser_in_owning_window(
             let restored_browser = restore_native.is_some();
             view.read(cx).focus_parent(cx);
             if let Some(handle) = restore_focus {
-                window.blur();
+                window.blur(cx);
                 window.focus(&handle, cx);
             }
             if let Some(browser) = restore_native {
