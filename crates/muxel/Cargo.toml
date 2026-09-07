@@ -127,6 +127,7 @@ core-foundation = "0.10"
 # Present pump (see `spawn_present_pump` in main.rs): the same `windows` crate
 # version gpui_windows already pins, so this adds nothing new to the tree.
 [target.'cfg(target_os = "windows")'.dependencies]
+async-channel = "2"
 webview2-com = "=0.38.2"
 windows-webview = { package = "windows", version = "0.61" }
 windows = { version = "0.57", features = [
@@ -139,6 +140,7 @@ windows = { version = "0.57", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]

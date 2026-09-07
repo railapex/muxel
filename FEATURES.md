@@ -699,7 +699,17 @@ feature is added or changed, update the matching entry here in the same change**
   directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
   changes", the project menu, or a worktree) rather than splitting off a new pane.
 - **Command palette / global search** — quick navigation and search across the
-  workspace.
+  workspace, including the existing navigation, layout and view actions with
+  their effective shortcuts. Palette New Tab uses the active pane's preset,
+  matching the direct shortcut.
+- **App actions sheet** — `Ctrl+Shift+Space` opens a persistent, configurable
+  command sheet. Choose a mnemonic or use arrows and Enter; Escape, click-away
+  or window deactivation dismisses it. Unknown keys stay inside the sheet.
+  The palette, shortcut sheet and binding settings share action names and
+  effective bindings; rebinding removes the prior app chord and preserves
+  component shortcuts. Windows native browser pages forward supported single
+  prefix chords. See [the keyboard contract](docs/actions-and-keyboard.md) for
+  window behavior and native-platform limits.
 - **Find in project** — search within the active project.
 
 ## Sidebar & projects
