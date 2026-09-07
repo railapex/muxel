@@ -115,7 +115,7 @@ mod imp {
     };
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
     #[cfg(target_os = "windows")]
-    use webview2_com::FocusChangedEventHandler;
+    use webview2_com::{AcceleratorKeyPressedEventHandler, FocusChangedEventHandler};
     #[cfg(target_os = "windows")]
     use wry::WebViewExtWindows as _;
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -216,6 +216,8 @@ mod imp {
         /// URLs requested through target=_blank, window.open, Ctrl+click, or
         /// middle-click. The app turns these into normal Muxel browser tabs.
         new_window_events: std::sync::mpsc::Receiver<String>,
+        #[cfg(target_os = "windows")]
+        action_sheet_focus: Option<isize>,
     }
 
     impl BrowserView {
@@ -285,6 +287,51 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
+            #[cfg(target_os = "windows")]
+            let shortcut = crate::native_action_shortcut::Shortcut::from_app(cx);
+            #[cfg(target_os = "windows")]
+            let (action_tx, action_rx) =
+                async_channel::bounded::<crate::native_action_shortcut::Request>(1);
+            #[cfg(target_os = "windows")]
+            {
+                let shortcut = shortcut.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(request) = action_rx.recv().await {
+                        let focus = this
+                            .update_in(cx, |this, window, _cx| {
+                                if !window.is_window_active()
+                                    || !this.native_visible
+                                    || this.webview.is_none()
+                                    || !shortcut.current(&request)
+                                {
+                                    return None;
+                                }
+                                this.action_sheet_focus = Some(request.focus);
+                                Some(this.focus_handle.clone())
+                            })
+                            .ok()
+                            .flatten();
+                        if let Some(focus) = focus {
+                            // End the BrowserView borrow before dispatching to
+                            // the app; its overlay policy reads browser views.
+                            let _ = cx.update(|window, cx| {
+                                if let Ok(handle) = HasWindowHandle::window_handle(&*window)
+                                    && let RawWindowHandle::Win32(handle) = handle.as_raw()
+                                {
+                                    unsafe {
+                                        windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(
+                                            windows::Win32::Foundation::HWND(handle.hwnd.get()),
+                                        );
+                                    }
+                                }
+                                window.focus(&focus, cx);
+                                focus.dispatch_action(&crate::app::ShowActionSheet, window, cx);
+                            });
+                        }
+                    }
+                })
+                .detach();
+            }
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
             let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
 
@@ -334,6 +381,50 @@ mod imp {
 
                         #[cfg(target_os = "windows")]
                         if let Some(webview) = built.as_ref() {
+                            let accelerator = AcceleratorKeyPressedEventHandler::create(Box::new(
+                                move |_, args| {
+                                    use webview2_com::Microsoft::Web::WebView2::Win32::{
+                                        COREWEBVIEW2_KEY_EVENT_KIND,
+                                        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+                                        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+                                        COREWEBVIEW2_PHYSICAL_KEY_STATUS,
+                                    };
+                                    let Some(args) = args else {
+                                        return Ok(());
+                                    };
+                                    let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+                                    let mut key = 0;
+                                    unsafe {
+                                        args.KeyEventKind(&mut kind)?;
+                                        args.VirtualKey(&mut key)?;
+                                    }
+                                    if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                                        && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                                    {
+                                        return Ok(());
+                                    }
+                                    let Some(request) = shortcut.capture(key) else {
+                                        return Ok(());
+                                    };
+                                    let mut status = COREWEBVIEW2_PHYSICAL_KEY_STATUS::default();
+                                    unsafe {
+                                        args.PhysicalKeyStatus(&mut status)?;
+                                        args.SetHandled(true)?;
+                                    }
+                                    if !status.WasKeyDown.as_bool() {
+                                        let _ = action_tx.try_send(request);
+                                    }
+                                    Ok(())
+                                },
+                            ));
+                            let mut accelerator_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .controller()
+                                    .add_AcceleratorKeyPressed(&accelerator, &mut accelerator_token)
+                            } {
+                                log::warn!("failed to bind WebView2 app actions: {error}");
+                            }
                             let got_tx = focus_tx.clone();
                             let got_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
@@ -444,6 +535,8 @@ mod imp {
                 last_profile_bounds: None,
                 focus_events,
                 new_window_events,
+                #[cfg(target_os = "windows")]
+                action_sheet_focus: None,
             }
         }
 
@@ -486,6 +579,27 @@ mod imp {
             );
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().focus();
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        pub fn take_action_sheet_focus(&mut self) -> Option<isize> {
+            self.action_sheet_focus.take()
+        }
+
+        #[cfg(target_os = "windows")]
+        pub fn restore_action_sheet_focus(&self, focus: isize, cx: &App) {
+            if !self.native_visible || self.webview.is_none() {
+                return;
+            }
+            let focus = windows::Win32::Foundation::HWND(focus);
+            // The caller retains this exact BrowserView and checks its current
+            // pane identity. Never revive a retired native child.
+            if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(focus) }.as_bool() {
+                self.focus_native(cx);
+                unsafe {
+                    windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(focus);
+                }
             }
         }
 

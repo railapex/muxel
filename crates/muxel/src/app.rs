@@ -1340,6 +1340,7 @@ actions!(
         FocusDown,
         // Show the keyboard-shortcut cheat sheet.
         ShowKeys,
+        ShowActionSheet,
         // Toggle the broadcast bar (send one line to every agent in the project).
         ToggleBroadcast,
         // Toggle speech-to-text dictation into the focused agent.
@@ -1381,48 +1382,53 @@ struct JumpToProject(usize);
 #[action(namespace = muxel, no_json)]
 struct NewAgent(usize);
 
-fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Option<KeyBinding> {
+fn action_for(action: &str) -> Option<Box<dyn Action>> {
     Some(match action {
-        "NewPane" => KeyBinding::new(keystroke, NewPane, context),
-        "NewTab" => KeyBinding::new(keystroke, NewTab, context),
-        "TabNext" => KeyBinding::new(keystroke, TabNext, context),
-        "TabPrev" => KeyBinding::new(keystroke, TabPrev, context),
-        "SplitRight" => KeyBinding::new(keystroke, SplitRight, context),
-        "SplitDown" => KeyBinding::new(keystroke, SplitDown, context),
-        "ClosePane" => KeyBinding::new(keystroke, ClosePane, context),
-        "FocusNext" => KeyBinding::new(keystroke, FocusNext, context),
-        "FocusPrev" => KeyBinding::new(keystroke, FocusPrev, context),
-        "ZoomIn" => KeyBinding::new(keystroke, ZoomIn, context),
-        "ZoomOut" => KeyBinding::new(keystroke, ZoomOut, context),
-        "ToggleSidebar" => KeyBinding::new(keystroke, ToggleSidebar, context),
-        "ToggleDashboard" => KeyBinding::new(keystroke, ToggleDashboard, context),
-        "ToggleSettings" => KeyBinding::new(keystroke, ToggleSettings, context),
-        "GlobalSearch" => KeyBinding::new(keystroke, GlobalSearch, context),
-        "FindInProject" => KeyBinding::new(keystroke, FindInProject, context),
-        "SearchTerminal" => KeyBinding::new(keystroke, SearchTerminal, context),
-        "SaveFile" => KeyBinding::new(keystroke, SaveFile, context),
-        "SaveFileAs" => KeyBinding::new(keystroke, SaveFileAs, context),
-        "ClearTerminal" => KeyBinding::new(keystroke, ClearTerminal, context),
-        "FocusAttention" => KeyBinding::new(keystroke, FocusAttention, context),
-        "FocusLeft" => KeyBinding::new(keystroke, FocusLeft, context),
-        "FocusRight" => KeyBinding::new(keystroke, FocusRight, context),
-        "FocusUp" => KeyBinding::new(keystroke, FocusUp, context),
-        "FocusDown" => KeyBinding::new(keystroke, FocusDown, context),
-        "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
-        "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
-        "ToggleSpeechToText" => KeyBinding::new(keystroke, ToggleSpeechToText, context),
-        "HoldSpeechToText" => KeyBinding::new(keystroke, HoldSpeechToText, context),
-        "ReadAloud" => KeyBinding::new(keystroke, ReadAloud, context),
-        "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
-        "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
-        "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
+        "Quit" => Box::new(Quit),
+        "SendTab" => Box::new(SendTab),
+        "SendBackTab" => Box::new(SendBackTab),
+        "CopySelection" => Box::new(CopySelection),
+        "NewPane" => Box::new(NewPane),
+        "NewTab" => Box::new(NewTab),
+        "TabNext" => Box::new(TabNext),
+        "TabPrev" => Box::new(TabPrev),
+        "SplitRight" => Box::new(SplitRight),
+        "SplitDown" => Box::new(SplitDown),
+        "ClosePane" => Box::new(ClosePane),
+        "FocusNext" => Box::new(FocusNext),
+        "FocusPrev" => Box::new(FocusPrev),
+        "ZoomIn" => Box::new(ZoomIn),
+        "ZoomOut" => Box::new(ZoomOut),
+        "ToggleSidebar" => Box::new(ToggleSidebar),
+        "ToggleDashboard" => Box::new(ToggleDashboard),
+        "ToggleSettings" => Box::new(ToggleSettings),
+        "GlobalSearch" => Box::new(GlobalSearch),
+        "FindInProject" => Box::new(FindInProject),
+        "SearchTerminal" => Box::new(SearchTerminal),
+        "SaveFile" => Box::new(SaveFile),
+        "SaveFileAs" => Box::new(SaveFileAs),
+        "ClearTerminal" => Box::new(ClearTerminal),
+        "FocusAttention" => Box::new(FocusAttention),
+        "FocusLeft" => Box::new(FocusLeft),
+        "FocusRight" => Box::new(FocusRight),
+        "FocusUp" => Box::new(FocusUp),
+        "FocusDown" => Box::new(FocusDown),
+        "ShowKeys" => Box::new(ShowKeys),
+        "ShowActionSheet" => Box::new(ShowActionSheet),
+        "ToggleBroadcast" => Box::new(ToggleBroadcast),
+        "ToggleSpeechToText" => Box::new(ToggleSpeechToText),
+        "HoldSpeechToText" => Box::new(HoldSpeechToText),
+        "ReadAloud" => Box::new(ReadAloud),
+        "ToggleWorktree" => Box::new(ToggleWorktree),
+        "ToggleFullScreen" => Box::new(ToggleFullScreen),
+        "ToggleDevConsole" => Box::new(ToggleDevConsole),
         // NewAgent1..9 — the trailing digit is the 1-based preset index.
         a if a.starts_with("NewAgent") => {
             match a
                 .strip_prefix("NewAgent")
                 .and_then(|n| n.parse::<usize>().ok())
             {
-                Some(n) => KeyBinding::new(keystroke, NewAgent(n), context),
+                Some(n) => Box::new(NewAgent(n)),
                 None => return None,
             }
         }
@@ -1432,7 +1438,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
                 .strip_prefix("JumpToTab")
                 .and_then(|n| n.parse::<usize>().ok())
             {
-                Some(n) => KeyBinding::new(keystroke, JumpToTab(n), context),
+                Some(n) => Box::new(JumpToTab(n)),
                 None => return None,
             }
         }
@@ -1442,7 +1448,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
                 .strip_prefix("JumpToProject")
                 .and_then(|n| n.parse::<usize>().ok())
             {
-                Some(n) => KeyBinding::new(keystroke, JumpToProject(n), context),
+                Some(n) => Box::new(JumpToProject(n)),
                 None => return None,
             }
         }
@@ -1450,80 +1456,100 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
     })
 }
 
+fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Option<KeyBinding> {
+    KeyBinding::load(
+        keystroke,
+        action_for(action)?,
+        context.map(|value| KeyBindingContextPredicate::parse(value).unwrap().into()),
+        false,
+        None,
+        &DummyKeyboardMapper,
+    )
+    .ok()
+}
+
 /// Bind default keybindings, applying any overrides from settings.
 pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
-    use std::collections::HashMap;
-    let overrides: HashMap<&str, &str> = settings
-        .keybindings
-        .iter()
-        .map(|k| (k.action.as_str(), k.keystroke.as_str()))
-        .collect();
-    // Extra chords under Settings → Keybindings → terminal passthrough.
-    let passthrough: Vec<&str> = settings
-        .terminal_passthrough_keys
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut bindings: Vec<KeyBinding> = settings_view::DEFAULT_KEYBINDINGS
-        .iter()
-        .filter_map(|(name, default, context)| {
-            let ks = overrides.get(name).copied().unwrap_or(default);
-            let ctx = resolve_binding_context(name, ks, *context, &passthrough);
-            keybinding_for(name, ks, ctx)
-        })
-        .collect();
-    // Tab / Shift+Tab go to the focused terminal (the "Terminal" key context is
-    // deeper than gpui-component Root's, so these shadow Root's focus-nav). These
-    // are fixed PTY routing, not rebindable commands.
-    bindings.push(KeyBinding::new("tab", SendTab, Some("Terminal")));
-    bindings.push(KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")));
-    // Ctrl+P opens the command palette too, but ONLY when no terminal is focused —
-    // so a focused agent (e.g. opencode, which uses Ctrl+P) receives it, while
-    // deselecting a pane (or focusing the sidebar/editor) routes Ctrl+P to muxel.
-    bindings.push(KeyBinding::new("ctrl-p", GlobalSearch, Some("!Terminal")));
-    // Own both Windows copy chords. The component-level binding was unreliable
-    // when selectable Markdown or a settings input lived below Muxel's root.
-    #[cfg(not(target_os = "macos"))]
-    for keystroke in ["ctrl-c", "ctrl-insert"] {
-        for context in ["Input", "TextView"] {
-            bindings.push(KeyBinding::new(keystroke, CopySelection, Some(context)));
-        }
-    }
-    // Cmd+Q (macOS) / Ctrl+Q (elsewhere) quits from any focus, including a
-    // focused terminal — `secondary` resolves to the platform's quit modifier.
-    bindings.push(KeyBinding::new("secondary-q", Quit, None));
+    #[cfg(target_os = "windows")]
+    crate::native_action_shortcut::install(settings, cx);
+    let bindings = replacement_keybindings(&cx.key_bindings().borrow(), settings);
+    cx.clear_key_bindings();
     cx.bind_keys(bindings);
 }
 
-/// Pick the gpui key context for a binding.
-///
-/// - Explicit context from the table wins (e.g. `Terminal`-only search).
-/// - User passthrough list forces `!Terminal`.
-/// - Plain `ctrl-<letter>` defaults to `!Terminal` so agents receive C0 chords
-///   (Ctrl+S stash, Ctrl+R, …), unless the action is in
-///   [`settings_view::KEEP_GLOBAL_WHILE_TERMINAL`].
-fn resolve_binding_context<'a>(
-    action: &str,
-    keystroke: &str,
-    explicit: Option<&'a str>,
-    passthrough: &[&str],
-) -> Option<&'a str> {
-    if let Some(ctx) = explicit {
-        return Some(ctx);
-    }
-    if passthrough
+fn replacement_keybindings(keymap: &Keymap, settings: &muxel_core::Settings) -> Vec<KeyBinding> {
+    // Preserve component/editor bindings and replace only this app's namespace.
+    // Merely appending leaves every former shortcut active after a rebind.
+    keymap
+        .bindings()
+        .filter(|binding| !binding.action().name().starts_with("muxel::"))
+        .cloned()
+        .chain(
+            crate::action_catalog::effective_bindings(settings)
+                .iter()
+                .filter_map(|binding| {
+                    keybinding_for(binding.action, binding.keystroke, binding.context)
+                }),
+        )
+        .collect()
+}
+
+#[derive(Default)]
+struct BindingIssues {
+    invalid: Vec<String>,
+    conflicts: Vec<String>,
+}
+
+fn binding_issues<'a>(draft: impl Iterator<Item = (&'a str, String)>) -> BindingIssues {
+    let defaults: HashMap<_, _> = crate::action_catalog::DEFAULT_KEYBINDINGS
         .iter()
-        .any(|p| p.eq_ignore_ascii_case(keystroke.trim()))
-    {
-        return Some("!Terminal");
+        .map(|&(id, key, _)| (id, key))
+        .collect();
+    let mut by_keys: HashMap<Vec<Keystroke>, Vec<(&str, bool)>> = HashMap::new();
+    let mut issues = BindingIssues::default();
+    for (id, value) in draft {
+        let value = value.trim();
+        let default = defaults.get(id).copied().unwrap_or_default();
+        let key = if value.is_empty() { default } else { value };
+        let parsed: Result<Vec<_>, _> = key.split_whitespace().map(Keystroke::parse).collect();
+        match parsed {
+            Ok(keys) if !keys.is_empty() => {
+                by_keys.entry(keys).or_default().push((id, key == default))
+            }
+            _ => issues
+                .invalid
+                .push(format!("{}: invalid shortcut", humanize_action(id))),
+        }
     }
-    if muxel_core::is_plain_ctrl_letter(keystroke)
-        && !settings_view::KEEP_GLOBAL_WHILE_TERMINAL.contains(&action)
-    {
-        return Some("!Terminal");
+    for (keys, actions) in by_keys {
+        if actions.len() < 2 {
+            continue;
+        }
+        // The terminal search explicitly overrides project search only in the
+        // Terminal context. Preserve that existing intentional default pair.
+        if actions.len() == 2
+            && actions.iter().all(|(id, unchanged)| {
+                *unchanged && matches!(*id, "FindInProject" | "SearchTerminal")
+            })
+        {
+            continue;
+        }
+        issues.conflicts.push(format!(
+            "{} is shared by {}. The more specific or later binding takes precedence.",
+            keys.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+            actions
+                .iter()
+                .map(|(id, _)| humanize_action(id))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ));
     }
-    None
+    issues.invalid.sort();
+    issues.conflicts.sort();
+    issues
 }
 
 /// The user's home directory (`HOME` on Unix, `USERPROFILE` on Windows).
@@ -1757,6 +1783,9 @@ fn session_id_bound_elsewhere(instances: &[Instance], owner: Uuid, session_id: &
 /// cheat-sheet. Splits before each uppercase letter and before a digit that
 /// starts a new run (so a trailing index reads as its own word).
 fn humanize_action(name: &str) -> String {
+    if let Some(descriptor) = crate::action_catalog::descriptor(name) {
+        return t(descriptor.label).into();
+    }
     let mut out = String::new();
     let mut prev: Option<char> = None;
     for ch in name.chars() {
@@ -2536,6 +2565,7 @@ pub struct MuxelApp {
     quit_kill_tmux_remote: bool,
     /// Whether the keyboard-shortcut cheat-sheet overlay is shown.
     show_keys: bool,
+    action_sheet: Option<Entity<crate::action_sheet::ActionSheet>>,
     /// Active terminal scrollback search (None = not searching).
     term_search: Option<TermSearch>,
     /// Reused input for the terminal search bar.
@@ -2634,6 +2664,8 @@ pub struct MuxelApp {
     /// Ctrl+P search palette (open files / jump to named instances).
     show_search_palette: bool,
     search_input: Entity<InputState>,
+    search_return_focus: Option<FocusHandle>,
+    search_origin: Option<ActionOrigin>,
     search_query: String,
     search_selected: usize,
     /// Current filtered palette results (recomputed on query change).
@@ -2678,24 +2710,162 @@ struct TermSearch {
     idx: usize,
 }
 
-/// An app action runnable from the Ctrl+P palette.
-#[derive(Clone, Copy)]
+/// Existing typed actions and project-specific palette commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaletteCommand {
-    SplitRight,
-    SplitDown,
-    NewTab,
-    ClosePane,
+    AppAction(&'static str),
     RestartAgent,
-    ClearScrollback,
-    ToggleWorktree,
-    FocusAttention,
-    ToggleSidebar,
-    ToggleDashboard,
-    OpenSettings,
     OpenMemory,
     ReadAloud,
     RunRunner(usize),
     SendSnippet(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActionOrigin {
+    workspace: Option<Uuid>,
+    project: Option<Uuid>,
+    instance: Option<Uuid>,
+    entity: Option<EntityId>,
+}
+
+fn action_binding_labels(settings: &muxel_core::Settings) -> HashMap<&'static str, String> {
+    let mut labels: HashMap<&'static str, String> = HashMap::new();
+    for binding in crate::action_catalog::effective_bindings(settings) {
+        let keys = binding.keystroke.replace(
+            "secondary",
+            if cfg!(target_os = "macos") {
+                "cmd"
+            } else {
+                "ctrl"
+            },
+        );
+        let context = match binding.context {
+            Some("!Terminal") => " (outside terminals)",
+            Some("Terminal") => " (terminal)",
+            _ => "",
+        };
+        let label = labels.entry(binding.action).or_default();
+        if !label.is_empty() {
+            label.push_str(" / ");
+        }
+        label.push_str(&format!("{}{context}", prettify_keys(&keys)));
+    }
+    labels
+}
+
+fn action_sheet_rows(
+    settings: &muxel_core::Settings,
+    selection: crate::action_catalog::Selection,
+    window: &Window,
+    cx: &App,
+) -> Vec<crate::action_sheet::Row> {
+    let labels = action_binding_labels(settings);
+    crate::action_catalog::ACTIONS
+        .iter()
+        .filter_map(|descriptor| {
+            let key = descriptor.sheet_key?;
+            let action = action_for(descriptor.id)?;
+            Some(crate::action_sheet::Row {
+                id: descriptor.id,
+                label: humanize_action(descriptor.id),
+                category: descriptor.category,
+                key,
+                binding: labels.get(descriptor.id).cloned().unwrap_or_default(),
+                unavailable: descriptor.unavailable(selection).or_else(|| {
+                    (!window.is_action_available(action.as_ref(), cx))
+                        .then_some("This action is unavailable in this window.")
+                }),
+                action,
+            })
+        })
+        .collect()
+}
+
+fn default_palette_commands() -> Vec<PaletteCommand> {
+    crate::action_catalog::ACTIONS
+        .iter()
+        // Hold-to-record depends on a physical key release; palette activation
+        // is a click/Enter command and uses ToggleSpeechToText instead.
+        .filter(|action| !matches!(action.id, "HoldSpeechToText" | "ReadAloud"))
+        .map(|action| PaletteCommand::AppAction(action.id))
+        .chain([PaletteCommand::ReadAloud, PaletteCommand::RestartAgent])
+        .collect()
+}
+
+#[cfg(test)]
+mod action_discovery_tests {
+    use super::{PaletteCommand, action_for, default_palette_commands};
+
+    #[test]
+    fn keybinding_draft_reports_conflicts_and_invalid_input_before_apply() {
+        let issues = super::binding_issues(
+            [
+                ("ShowActionSheet", "ctrl-shift-x".into()),
+                ("NewTab", "ctrl-shift-x".into()),
+                ("SaveFile", "not-a-modifier-s".into()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(issues.invalid.len(), 1);
+        assert_eq!(issues.conflicts.len(), 1);
+        let defaults = super::binding_issues(
+            crate::action_catalog::DEFAULT_KEYBINDINGS
+                .iter()
+                .map(|&(id, key, _)| (id, key.into())),
+        );
+        assert!(defaults.invalid.is_empty());
+        assert!(defaults.conflicts.is_empty());
+    }
+
+    #[test]
+    fn keyboard_navigation_is_discoverable_in_the_palette() {
+        assert!(default_palette_commands().contains(&PaletteCommand::AppAction("TabNext")));
+    }
+
+    #[test]
+    fn every_sheet_command_has_the_same_typed_action_in_the_palette() {
+        let commands = default_palette_commands();
+        for descriptor in crate::action_catalog::ACTIONS {
+            assert!(action_for(descriptor.id).is_some(), "{}", descriptor.id);
+            if descriptor.sheet_key.is_some() {
+                assert!(commands.contains(&PaletteCommand::AppAction(descriptor.id)));
+            }
+        }
+    }
+
+    #[test]
+    fn rebinding_removes_the_old_prefix_and_keeps_component_keys() {
+        use super::{ShowActionSheet, replacement_keybindings};
+        use gpui::{KeyBinding, Keymap};
+        let mut settings = muxel_core::Settings::default();
+        let component = KeyBinding::new("ctrl-c", gpui_component::input::Copy, Some("Input"));
+        let original = Keymap::new(vec![component]);
+        let first = Keymap::new(replacement_keybindings(&original, &settings));
+        settings.keybindings.push(muxel_core::KeyBindingCfg {
+            action: "ShowActionSheet".into(),
+            keystroke: "ctrl-shift-x".into(),
+        });
+        let second = Keymap::new(replacement_keybindings(&first, &settings));
+        assert_eq!(first.bindings().len(), second.bindings().len());
+        let prefix: Vec<_> = second.bindings_for_action(&ShowActionSheet).collect();
+        assert_eq!(prefix.len(), 1);
+        assert!(
+            prefix[0]
+                .match_keystrokes(&[gpui::Keystroke::parse("ctrl-shift-space").unwrap()])
+                .is_none()
+        );
+        assert_eq!(
+            prefix[0].match_keystrokes(&[gpui::Keystroke::parse("ctrl-shift-x").unwrap()]),
+            Some(false)
+        );
+        assert_eq!(
+            second
+                .bindings_for_action(&gpui_component::input::Copy)
+                .count(),
+            1
+        );
+    }
 }
 
 /// The live view backing a pane — a terminal, a code editor, or a browser. Lets
@@ -2708,6 +2878,14 @@ enum PaneView {
 }
 
 impl PaneView {
+    fn entity_id(&self) -> EntityId {
+        match self {
+            PaneView::Terminal(view) => view.entity_id(),
+            PaneView::Editor(view) => view.entity_id(),
+            PaneView::Browser(view) => view.entity_id(),
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             PaneView::Terminal(v) => v.read(cx).focus_handle(cx),
@@ -2856,6 +3034,7 @@ struct PopoutView {
     /// bookkeeping or suppressing the first transition after re-dock.
     profile_status: Option<AgentStatus>,
     profile_window_active: bool,
+    action_sheet: Option<Entity<crate::action_sheet::ActionSheet>>,
 }
 
 impl PopoutView {
@@ -2916,6 +3095,7 @@ impl PopoutView {
             show_close_confirm: false,
             profile_status,
             profile_window_active,
+            action_sheet: None,
         }
     }
 
@@ -2930,6 +3110,65 @@ impl PopoutView {
             PaneView::Editor(v) => v.read(cx).title().into(),
             PaneView::Browser(v) => v.read(cx).tab_title().into(),
         }
+    }
+
+    fn open_action_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_close_confirm || self.action_sheet.is_some() {
+            return;
+        }
+        let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .and_then(|handle| handle.0.upgrade())
+        else {
+            return;
+        };
+        let selection = crate::action_catalog::Selection {
+            project: true,
+            pane: true,
+            terminal: matches!(self.view, PaneView::Terminal(_)),
+            editor: matches!(&self.view, PaneView::Editor(editor) if !editor.read(cx).is_diff()),
+        };
+        let rows = action_sheet_rows(&app.read(cx).settings, selection, window, cx);
+        #[cfg(target_os = "windows")]
+        let native_origin = match &self.view {
+            PaneView::Browser(view) => view.update(cx, |view, _| view.take_action_sheet_focus()),
+            _ => None,
+        };
+        let iid = self.iid;
+        let entity = self.view.entity_id();
+        let owner = window.window_handle().window_id();
+        let weak = app.downgrade();
+        let sheet = crate::action_sheet::ActionSheet::open(
+            rows,
+            move |cx| {
+                weak.upgrade().is_some_and(|app| {
+                    app.read(cx).popouts.get(&iid).is_some_and(|pane| {
+                        pane.view.entity_id() == entity && pane.window.window_id() == owner
+                    })
+                })
+            },
+            window,
+            cx,
+        );
+        cx.subscribe(
+            &sheet,
+            move |this, _, event: &crate::action_sheet::Dismissed, cx| {
+                this.action_sheet = None;
+                if event.restore_focus {
+                    #[cfg(target_os = "windows")]
+                    if let (Some(focus), PaneView::Browser(view)) = (native_origin, &this.view) {
+                        view.update(cx, |view, cx| {
+                            view.set_native_visible(true, true, true, false, cx)
+                        });
+                        view.read(cx).restore_action_sheet_focus(focus, cx);
+                    }
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        self.action_sheet = Some(sheet);
+        cx.notify();
     }
 
     fn content(&self, cx: &App) -> AnyElement {
@@ -3346,10 +3585,10 @@ impl Render for PopoutView {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
         // A native webview child draws above all gpui content, so it has to go
-        // away while the close confirmation sits on top of it.
+        // away while an app-owned overlay sits on top of it.
         if let PaneView::Browser(v) = &self.view {
-            let (v, visible) = (v.clone(), !self.show_close_confirm);
-            let overlay = self.show_close_confirm;
+            let overlay = self.show_close_confirm || self.action_sheet.is_some();
+            let (v, visible) = (v.clone(), !overlay);
             v.update(cx, |b, cx| {
                 b.set_native_visible(visible, true, true, overlay, cx)
             });
@@ -3361,6 +3600,22 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|this, _: &ShowActionSheet, window, cx| {
+                this.open_action_sheet(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, _, cx| {
+                this.show_close_confirm = true;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClearTerminal, _, cx| {
+                if let PaneView::Terminal(view) = &this.view {
+                    view.read(cx).session().clear_scrollback();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|_, _: &ToggleFullScreen, window, _| {
+                window.toggle_fullscreen();
+            }))
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
                 if let PaneView::Terminal(v) = &this.view {
                     v.read(cx).session().write_input(b"\t");
@@ -3434,6 +3689,7 @@ impl Render for PopoutView {
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.content(cx)))
+            .children(self.action_sheet.clone())
             .children(self.show_close_confirm.then(|| {
                 modal_backdrop()
                     .on_mouse_down(
@@ -4190,6 +4446,14 @@ impl MuxelApp {
             .unwrap_or(0);
         let available_programs = installed_programs(&presets);
         let settings_ui = SettingsUi::new(window, cx);
+        for (_, input) in &settings_ui.keybinds {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let dispose_commit_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("Commit message (default: worktree name)"))
@@ -4473,6 +4737,7 @@ impl MuxelApp {
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
             show_keys: false,
+            action_sheet: None,
             term_search: None,
             term_search_input,
             broadcasting: false,
@@ -4565,6 +4830,8 @@ impl MuxelApp {
             _update_timer: update_timer,
             show_search_palette: false,
             search_input,
+            search_return_focus: None,
+            search_origin: None,
             search_query: String::new(),
             search_selected: 0,
             search_results: Vec::new(),
@@ -9319,17 +9586,6 @@ impl MuxelApp {
         }
     }
 
-    /// Create a new agent from the current preset as a tab in the active pane.
-    fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_tab_in(self.active_instance, window, cx);
-    }
-
-    /// Create a new agent as a tab in the pane holding `target` (the pane's `+`
-    /// button); `None` falls back to seeding the layout for an empty project.
-    fn new_tab_in(&mut self, target: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
-        self.place_with_preset(target, PlacementMode::Tab, self.current_preset, window, cx);
-    }
-
     /// The preset index of the active pane's instance — what the keyboard New
     /// Tab / New Pane shortcuts clone, so a new pane matches whatever you're on
     /// rather than the toolbar's "new agent" selector. `None` when there's no
@@ -9996,6 +10252,7 @@ impl MuxelApp {
     /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
     fn any_overlay_open(&self, cx: &App) -> bool {
         self.show_settings
+            || self.action_sheet.is_some()
             || self.show_search_palette
             || self.show_find_panel
             || self.show_update_modal
@@ -10461,7 +10718,114 @@ impl MuxelApp {
 
     // ===== Ctrl+P search palette =====
 
+    fn action_origin(&self) -> ActionOrigin {
+        let entity = self.active_instance.and_then(|id| {
+            self.terminals
+                .get(&id)
+                .map(Entity::entity_id)
+                .or_else(|| self.editors.get(&id).map(Entity::entity_id))
+                .or_else(|| self.browsers.get(&id).map(Entity::entity_id))
+        });
+        ActionOrigin {
+            workspace: self.current_workspace,
+            project: self.workspace.active_project,
+            instance: self.active_instance,
+            entity,
+        }
+    }
+
+    fn action_selection(&self, cx: &App) -> crate::action_catalog::Selection {
+        crate::action_catalog::Selection {
+            project: self.workspace.active_project.is_some(),
+            pane: self
+                .active_instance
+                .is_some_and(|id| self.workspace.instance(id).is_some()),
+            terminal: self
+                .active_instance
+                .is_some_and(|id| self.terminals.contains_key(&id)),
+            editor: self
+                .active_instance
+                .and_then(|id| self.editors.get(&id))
+                .is_some_and(|editor| !editor.read(cx).is_diff()),
+        }
+    }
+
+    fn open_action_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Existing modal policy owns its input. The prefix is consumed without
+        // replacing a confirmation, search, settings input, or an active sheet.
+        if self.any_overlay_open(cx) {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        let native_origin = {
+            let browser = self
+                .browsers
+                .iter()
+                .find(|(_, view)| view.read(cx).focus_handle(cx).is_focused(window))
+                .map(|(&id, view)| (id, view.clone()));
+            browser.and_then(|(id, view)| {
+                view.update(cx, |view, _| view.take_action_sheet_focus())
+                    .map(|focus| {
+                        self.focus_instance(id, window, cx);
+                        (view, focus)
+                    })
+            })
+        };
+        let rows = action_sheet_rows(&self.settings, self.action_selection(cx), window, cx);
+        let origin = self.action_origin();
+        let weak = cx.weak_entity();
+        let sheet = crate::action_sheet::ActionSheet::open(
+            rows,
+            move |cx| {
+                weak.upgrade().is_some_and(|app| {
+                    let app = app.read(cx);
+                    origin == app.action_origin()
+                        && origin
+                            .instance
+                            .is_none_or(|id| app.workspace.instance(id).is_some())
+                })
+            },
+            window,
+            cx,
+        );
+        cx.subscribe(
+            &sheet,
+            move |this, _, event: &crate::action_sheet::Dismissed, cx| {
+                this.action_sheet = None;
+                this.sync_browser_visibility(cx);
+                if event.restore_focus {
+                    #[cfg(target_os = "windows")]
+                    if this.action_origin() == origin
+                        && let Some((view, focus)) = &native_origin
+                    {
+                        view.read(cx).restore_action_sheet_focus(*focus, cx);
+                    }
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        self.action_sheet = Some(sheet);
+        self.sync_browser_visibility(cx);
+        cx.notify();
+    }
+
+    fn action_sheet_for(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<crate::action_sheet::ActionSheet>> {
+        self.action_sheet
+            .as_ref()
+            .filter(|sheet| sheet.read(cx).owner() == window.window_handle().window_id())
+            .cloned()
+    }
+
     fn open_search_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_search_palette {
+            self.search_return_focus = window.focused(cx);
+            self.search_origin = Some(self.action_origin());
+        }
         self.show_search_palette = true;
         self.search_selected = 0;
         self.search_input
@@ -10486,20 +10850,7 @@ impl MuxelApp {
     /// Commands offered in the Ctrl+P palette (plus one per runner).
     fn palette_commands(&self) -> Vec<PaletteCommand> {
         use PaletteCommand::*;
-        let mut cmds = vec![
-            SplitRight,
-            SplitDown,
-            NewTab,
-            ClosePane,
-            RestartAgent,
-            ClearScrollback,
-            ToggleWorktree,
-            FocusAttention,
-            ToggleSidebar,
-            ToggleDashboard,
-            OpenSettings,
-            ReadAloud,
-        ];
+        let mut cmds = default_palette_commands();
         // Only meaningful with an active project to open the memory for.
         if self.workspace.active_project.is_some() {
             cmds.push(OpenMemory);
@@ -10518,17 +10869,8 @@ impl MuxelApp {
 
     fn palette_command_label(&self, cmd: PaletteCommand) -> String {
         match cmd {
-            PaletteCommand::SplitRight => t("Split pane right").into(),
-            PaletteCommand::SplitDown => t("Split pane down").into(),
-            PaletteCommand::NewTab => t("New tab").into(),
-            PaletteCommand::ClosePane => "Close pane".into(),
+            PaletteCommand::AppAction(id) => humanize_action(id),
             PaletteCommand::RestartAgent => "Restart agent".into(),
-            PaletteCommand::ClearScrollback => "Clear scrollback".into(),
-            PaletteCommand::ToggleWorktree => t("Toggle git worktree for new agents").into(),
-            PaletteCommand::FocusAttention => t("Focus next agent needing attention").into(),
-            PaletteCommand::ToggleSidebar => "Toggle sidebar".into(),
-            PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
-            PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
             PaletteCommand::ReadAloud if self.read_aloud.is_some() => {
                 t("Stop reading aloud").into()
@@ -10554,17 +10896,36 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         match cmd {
-            PaletteCommand::SplitRight => self.add_agent(SplitDirection::Horizontal, window, cx),
-            PaletteCommand::SplitDown => self.add_agent(SplitDirection::Vertical, window, cx),
-            PaletteCommand::NewTab => self.new_tab(window, cx),
-            PaletteCommand::ClosePane => self.close_active(window, cx),
+            PaletteCommand::AppAction(id) => {
+                if crate::action_catalog::descriptor(id)
+                    .and_then(|action| action.unavailable(self.action_selection(cx)))
+                    .is_some()
+                {
+                    return;
+                }
+                let Some(origin) = self.search_origin.take() else {
+                    return;
+                };
+                let Some(focus) = self.search_return_focus.take() else {
+                    return;
+                };
+                if let Some(action) = action_for(id) {
+                    let weak = cx.weak_entity();
+                    let handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            if weak
+                                .upgrade()
+                                .is_some_and(|app| app.read(cx).action_origin() == origin)
+                            {
+                                window.focus(&focus, cx);
+                                focus.dispatch_action(action.as_ref(), window, cx);
+                            }
+                        });
+                    });
+                }
+            }
             PaletteCommand::RestartAgent => self.restart_active(window, cx),
-            PaletteCommand::ClearScrollback => self.clear_active_terminal(cx),
-            PaletteCommand::ToggleWorktree => self.toggle_worktree(cx),
-            PaletteCommand::FocusAttention => self.focus_attention(window, cx),
-            PaletteCommand::ToggleSidebar => self.toggle_sidebar(window, cx),
-            PaletteCommand::ToggleDashboard => self.toggle_dashboard(cx),
-            PaletteCommand::OpenSettings => self.toggle_settings(window, cx),
             PaletteCommand::OpenMemory => {
                 if let Some(pid) = self.workspace.active_project {
                     self.open_memory_panel(pid, window, cx);
@@ -13583,6 +13944,9 @@ impl MuxelApp {
                 this.show_keys = !this.show_keys;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ShowActionSheet, window, cx| {
+                this.open_action_sheet(window, cx);
+            }))
             .on_action(
                 cx.listener(|this, _: &SearchTerminal, window, cx| {
                     this.open_term_search(window, cx)
@@ -13747,6 +14111,7 @@ impl MuxelApp {
         let root = self.attach_workspace_actions(root, cx);
         root.child(self.render_secondary_titlebar(sidebar_hidden, cx))
             .child(div().flex_1().min_h_0().flex().child(body))
+            .children(self.action_sheet_for(window, cx))
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {
                 div()
                     .absolute()
@@ -20165,6 +20530,7 @@ impl MuxelApp {
     /// The Ctrl+P search palette: a filter box + a results list (files in the
     /// active project, named instances, and a "create new file" entry).
     fn render_search_palette(&self, cx: &mut Context<Self>) -> AnyElement {
+        let bindings = action_binding_labels(&self.settings);
         let active_root = self.workspace.active().map(|p| p.root_path.clone());
         let muted = cx.theme().muted_foreground;
         let mut list = v_flex().w_full().gap(px(1.0));
@@ -20246,7 +20612,13 @@ impl MuxelApp {
                     )
                 }
                 SearchItem::RunCommand(cmd) => {
-                    (self.palette_command_label(*cmd), "command".to_string())
+                    let detail = match cmd {
+                        PaletteCommand::AppAction(id) => {
+                            bindings.get(id).cloned().unwrap_or_default()
+                        }
+                        _ => "command".to_string(),
+                    };
+                    (self.palette_command_label(*cmd), detail)
                 }
             };
             let item_clone = item.clone();
@@ -22886,6 +23258,18 @@ impl MuxelApp {
     }
 
     fn apply_keybindings(&mut self, cx: &mut Context<Self>) {
+        if !binding_issues(
+            self.settings_ui
+                .keybinds
+                .iter()
+                .map(|(id, input)| (id.as_str(), input.read(cx).value().to_string())),
+        )
+        .invalid
+        .is_empty()
+        {
+            cx.notify();
+            return;
+        }
         let mut cfgs = Vec::new();
         for (name, input) in &self.settings_ui.keybinds {
             let ks = input.read(cx).value().trim().to_string();
@@ -24088,32 +24472,23 @@ impl MuxelApp {
 
     /// The keyboard-shortcut cheat sheet (toggled by `ShowKeys`).
     fn render_keys_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
-        let overrides: std::collections::HashMap<&str, &str> = self
-            .settings
-            .keybindings
+        let bindings = action_binding_labels(&self.settings);
+        let mut rows: Vec<(String, String)> = crate::action_catalog::ACTIONS
             .iter()
-            .map(|k| (k.action.as_str(), k.keystroke.as_str()))
-            .collect();
-        let mut rows: Vec<(String, String)> = settings_view::DEFAULT_KEYBINDINGS
-            .iter()
-            .map(|(name, default, _ctx)| {
-                let ks = overrides.get(name).copied().unwrap_or(default);
-                (humanize_action(name), prettify_keys(ks))
+            .map(|action| {
+                (
+                    humanize_action(action.id),
+                    bindings.get(action.id).cloned().unwrap_or_default(),
+                )
             })
             .collect();
-        rows.push((
-            t("Send Tab / Shift+Tab to terminal").into(),
-            t("Tab / Shift+Tab").into(),
-        ));
-        rows.push((
-            t("Quit muxel").into(),
-            if cfg!(target_os = "macos") {
-                "Cmd+Q"
-            } else {
-                "Ctrl+Q"
-            }
-            .into(),
-        ));
+        for (id, label) in [
+            ("SendTab", "Send Tab to terminal"),
+            ("SendBackTab", "Send Shift+Tab to terminal"),
+            ("Quit", "Quit muxel"),
+        ] {
+            rows.push((label.into(), bindings.get(id).cloned().unwrap_or_default()));
+        }
 
         let list = rows
             .into_iter()
@@ -26468,6 +26843,12 @@ impl MuxelApp {
     }
 
     fn render_settings_keybindings(&self, content_w: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let issues = binding_issues(
+            self.settings_ui
+                .keybinds
+                .iter()
+                .map(|(id, input)| (id.as_str(), input.read(cx).value().to_string())),
+        );
         // gpui-component `Input`s only size reliably with an ABSOLUTE width here:
         // inside the settings `overflow_y_scroll` pane, percentage/flex widths
         // collapse to a tiny square (this is exactly how the new-remote dialog's
@@ -26489,11 +26870,20 @@ impl MuxelApp {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().w(name_w).flex_none().text_sm().child(name.clone()))
+                    .child(
+                        div()
+                            .w(name_w)
+                            .flex_none()
+                            .text_sm()
+                            .child(humanize_action(name)),
+                    )
                     .child(div().w(input_w).child(Input::new(input))),
             );
         }
         let form = form
+            .children(issues.invalid.iter().chain(&issues.conflicts).map(|issue| {
+                div().text_sm().child(issue.clone())
+            }))
             .child(
                 div()
                     .pt_2()
@@ -26516,6 +26906,7 @@ impl MuxelApp {
                 div().pt_2().flex().items_center().gap_3().child(
                     Button::new("apply-keys")
                         .primary()
+                        .disabled(!issues.invalid.is_empty())
                         .label(t("Apply keybindings"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_keybindings(cx))),
                 ),
@@ -26894,6 +27285,7 @@ impl Render for MuxelApp {
         let root = root
             .child(self.render_titlebar(active_name, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
+            .children(self.action_sheet_for(window, cx))
             .children(
                 self.show_settings
                     .then(|| self.render_settings_modal(window, cx)),
@@ -27379,12 +27771,15 @@ mod humanize_tests {
     use super::humanize_action;
 
     #[test]
-    fn splits_camel_case_and_trailing_index() {
-        assert_eq!(humanize_action("NewPane"), "New Pane");
-        assert_eq!(humanize_action("ToggleWorktree"), "Toggle Worktree");
-        // A trailing index reads as its own word, and stays one number.
-        assert_eq!(humanize_action("NewAgent1"), "New Agent 1");
-        assert_eq!(humanize_action("JumpToProject9"), "Jump To Project 9");
+    fn catalogue_labels_precede_the_camel_case_fallback() {
+        assert_eq!(humanize_action("NewPane"), "New pane");
+        assert_eq!(
+            humanize_action("ToggleWorktree"),
+            "Toggle git worktree for new agents"
+        );
+        assert_eq!(humanize_action("NewAgent1"), "New agent 1");
+        assert_eq!(humanize_action("JumpToProject9"), "Go to project 9");
+        assert_eq!(humanize_action("UnknownAction12"), "Unknown Action 12");
     }
 }
 
