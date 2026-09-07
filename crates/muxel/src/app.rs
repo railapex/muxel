@@ -10842,8 +10842,14 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn close_search_palette(&mut self, cx: &mut Context<Self>) {
+    fn close_search_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_search_palette = false;
+        if self.search_origin.take() == Some(self.action_origin())
+            && let Some(focus) = self.search_return_focus.take()
+        {
+            window.focus(&focus, cx);
+        }
+        self.search_return_focus = None;
         cx.notify();
     }
 
@@ -11017,6 +11023,18 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let SearchItem::RunCommand(PaletteCommand::AppAction(id)) = &item
+            && (crate::action_catalog::descriptor(id)
+                .and_then(|action| action.unavailable(self.action_selection(cx)))
+                .is_some()
+                || self.search_origin != Some(self.action_origin())
+                || !self.search_return_focus.as_ref().is_some_and(|focus| {
+                    action_for(id)
+                        .is_some_and(|action| window.is_action_available_in(action.as_ref(), focus))
+                }))
+        {
+            return;
+        }
         self.show_search_palette = false;
         match item {
             SearchItem::FocusInstance(iid) => {
@@ -11035,6 +11053,8 @@ impl MuxelApp {
             }
             SearchItem::RunCommand(cmd) => self.run_palette_command(cmd, window, cx),
         }
+        self.search_origin = None;
+        self.search_return_focus = None;
         cx.notify();
     }
 
@@ -20613,9 +20633,10 @@ impl MuxelApp {
                 }
                 SearchItem::RunCommand(cmd) => {
                     let detail = match cmd {
-                        PaletteCommand::AppAction(id) => {
-                            bindings.get(id).cloned().unwrap_or_default()
-                        }
+                        PaletteCommand::AppAction(id) => crate::action_catalog::descriptor(id)
+                            .and_then(|action| action.unavailable(self.action_selection(cx)))
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| bindings.get(id).cloned().unwrap_or_default()),
                         _ => "command".to_string(),
                     };
                     (self.palette_command_label(*cmd), detail)
@@ -20662,11 +20683,11 @@ impl MuxelApp {
         palette_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _e, _w, cx| this.close_search_palette(cx)),
+                cx.listener(|this, _e, window, cx| this.close_search_palette(window, cx)),
             )
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
-                    "escape" => this.close_search_palette(cx),
+                    "escape" => this.close_search_palette(window, cx),
                     "down" => this.move_search_selection(1, cx),
                     "up" => this.move_search_selection(-1, cx),
                     "enter" => this.confirm_search(window, cx),
