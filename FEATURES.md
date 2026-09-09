@@ -41,6 +41,15 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **Recoverable resource close** — clean editors, diffs, and browsers close into a
+  bounded **Recently closed** list in Search and reopen in their project.
+  Dirty editors use the conventional **Save / Don't Save / Cancel** decision first;
+  closed resource views are recreated rather than retained in memory.
+- **Recoverable terminal close** — idle/done terminals retain their live process
+  for 15 seconds behind an inline title-bar Undo control; its close button finishes
+  immediately. Working, blocked, launching, and unknown terminals honor the normal
+  destructive-confirmation setting, and a retained terminal that becomes active
+  is restored instead of killed when the grace period ends.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -334,7 +343,9 @@ feature is added or changed, update the matching entry here in the same change**
   it the keyboard; muxel's own shortcuts keep working until you click into a page.
   The toolbar can open the current page in the system browser. Native page context
   menus remain usable, and WebView2 stores its profile under muxel's app-data
-  directory rather than beside the executable.
+  directory rather than beside the executable. New browser tabs stay in the
+  background, and Windows reuses the running WebView2 environment after the first
+  browser pane instead of starting another one for every tab.
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
@@ -413,8 +424,9 @@ feature is added or changed, update the matching entry here in the same change**
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
   terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs. Right-clicking a
-  terminal link opens link actions instead of copying or pasting through the PTY.
+  requests stay in the source project and open immediately as background Muxel
+  tabs. Right-clicking a terminal link opens link actions instead of copying or
+  pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -698,13 +710,16 @@ feature is added or changed, update the matching entry here in the same change**
   `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
   (`Ctrl+Q` elsewhere) to quit from any focus.
-- **Behavior** — immediate-save appearance, confirm destructive actions, quit
-  confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits **cleanly** (an
-  abnormal exit always leaves a tombstone pane instead). The terminal
-  confirmation is skipped for an untouched **shell** pane — one sitting idle at
-  its prompt with no foreground command and no other tabs — since closing it
-  loses nothing.
+- **Behavior** — immediate-save appearance, confirm destructive actions,
+  per-kind close confirmation (terminal on, editor/diff off by default), and
+  auto-close a pane when its process exits **cleanly** (an abnormal exit always
+  leaves a tombstone pane instead). A terminal close confirmation names the pane
+  and whether it is working, needs input, is starting, or has unknown status.
+  Quitting the app is silent when no terminal has active work; otherwise the
+  confirmation lists every active terminal, its project, and its state. The
+  terminal confirmation is skipped for an untouched **shell** pane — one sitting
+  idle at its prompt with no foreground command and no other tabs — since closing
+  it loses nothing.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
@@ -725,11 +740,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
   remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
   pane, keeping the remote session reconnectable. Quitting the **app** leaves
-  sessions alive by design (they reattach next launch): when any exist, the quit
-  dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
-  kill remote tmux sessions** — both off by default; the kills are
-  fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
-  waits on a slow host.
+  sessions alive by design (they reattach next launch). When active work causes
+  the quit dialog to appear and tmux sessions exist, it offers two checkboxes —
+  **Also kill local tmux sessions** and **Also kill remote tmux sessions** — both
+  off by default; the kills are fire-and-forget (remote ones reuse the warm SSH
+  connection), so quitting never waits on a slow host.
 
 ## Localization
 

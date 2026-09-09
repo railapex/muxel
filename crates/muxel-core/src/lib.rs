@@ -32,9 +32,10 @@ pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
-    FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
-    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
+    FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, add_tab_inactive,
+    focus_in_direction, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
+    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, swap_instances,
+    swap_panes,
 };
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;
@@ -1767,12 +1768,10 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
     /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on (they hold a running process); editors/diffs default off (cheap to
-    /// reopen, nothing is lost).
+    /// on because they hold a running process; diffs default off because they are
+    /// cheap to reopen. Dirty editors always use Save / Don't Save / Cancel.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
-    #[serde(default)]
-    pub confirm_close_editor: bool,
     #[serde(default)]
     pub confirm_close_diff: bool,
     /// Highest Terms/Privacy version the user has accepted (0 = never). When this
@@ -2144,7 +2143,6 @@ impl Default for Settings {
             browser_enabled: true,
             close_on_exit: true,
             confirm_close_terminal: true,
-            confirm_close_editor: false,
             confirm_close_diff: false,
             accepted_terms_version: 0,
             preset_seed_version: PRESET_SEED_VERSION,
@@ -2339,6 +2337,14 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn legacy_editor_close_confirmation_is_ignored() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"confirm_close_editor":true}"#).expect("parse");
+        let serialized = serde_json::to_value(settings).expect("serialize");
+        assert!(serialized.get("confirm_close_editor").is_none());
     }
 
     #[test]

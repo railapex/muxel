@@ -35,7 +35,13 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("TabPrev", "ctrl-shift-tab", None),
     ("SplitRight", "ctrl-shift-l", None),
     ("SplitDown", "ctrl-shift-j", None),
-    ("ClosePane", "ctrl-shift-w", None),
+    // Platform-standard tab close. On Windows/Linux plain Ctrl+W is
+    // automatically scoped to !Terminal so Readline/Vim receive it there;
+    // install_keybindings adds explicit terminal and Windows aliases.
+    #[cfg(target_os = "macos")]
+    ("ClosePane", "cmd-w", None),
+    #[cfg(not(target_os = "macos"))]
+    ("ClosePane", "ctrl-w", None),
     ("FocusNext", "ctrl-shift-]", None),
     ("FocusPrev", "ctrl-shift-[", None),
     ("FocusLeft", "ctrl-alt-left", None),

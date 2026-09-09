@@ -851,6 +851,26 @@ pub fn add_tab(tree: &mut Option<PaneNode>, target: Uuid, new_instance: Uuid) ->
     add_tab_at(tree, target, new_instance, usize::MAX)
 }
 
+/// Add `new_instance` as the last tab of the pane holding `target` without
+/// changing which tab is active. Returns `false` if `target` isn't present or
+/// `new_instance` is already somewhere in the tree.
+pub fn add_tab_inactive(tree: &mut Option<PaneNode>, target: Uuid, new_instance: Uuid) -> bool {
+    let Some(root) = tree.as_mut() else {
+        return false;
+    };
+    if root.find_path(new_instance).is_some() {
+        return false;
+    }
+    let Some(path) = root.find_path(target) else {
+        return false;
+    };
+    let Some(PaneNode::Leaf(ld)) = root.get_at_path_mut(&path) else {
+        return false;
+    };
+    ld.tabs.push(new_instance);
+    true
+}
+
 /// Insert `new_instance` as a tab at `index` (clamped to `0..=len`) in the pane
 /// holding `target`, and make it active. Returns `false` if `target` isn't
 /// present or `new_instance` is already somewhere in the tree.
@@ -1792,6 +1812,17 @@ mod tests {
         assert!(add_tab(&mut tree, a, b));
         assert_eq!(tree.as_ref().unwrap().tabs(), Some((&[a, b][..], 1)));
         assert_eq!(tree.as_ref().unwrap().collect_instances(), vec![a, b]);
+    }
+
+    #[test]
+    fn add_tab_inactive_appends_without_switching() {
+        let (a, b, c, missing) = (id(), id(), id(), id());
+        let mut tree = Some(PaneNode::leaf(a));
+        assert!(add_tab(&mut tree, a, b));
+        assert!(!add_tab_inactive(&mut tree, missing, c));
+        assert!(!add_tab_inactive(&mut tree, b, a));
+        assert!(add_tab_inactive(&mut tree, b, c));
+        assert_eq!(tree.as_ref().unwrap().tabs(), Some((&[a, b, c][..], 1)));
     }
 
     #[test]

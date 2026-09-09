@@ -46,6 +46,8 @@ pub enum FocusActionReason {
     NativeBrowserLoss,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     NativeBrowserAccepted,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    NativeBrowserRestore,
     WindowActivated,
     WindowDeactivated,
 }
@@ -63,6 +65,8 @@ impl FocusActionReason {
             Self::NativeBrowserLoss => "native-browser-loss",
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::NativeBrowserAccepted => "native-browser-accepted",
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Self::NativeBrowserRestore => "native-browser-restore",
             Self::WindowActivated => "window-activated",
             Self::WindowDeactivated => "window-deactivated",
         }

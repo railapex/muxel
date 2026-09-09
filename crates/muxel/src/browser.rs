@@ -17,6 +17,20 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
+const PAGE_CLOSE_MSG: &str = "muxel:close-pane";
+
+fn is_page_close_message(body: &str) -> bool {
+    body == PAGE_CLOSE_MSG
+}
+
+/// Native browser state that can be reused when creating another tab. On
+/// Windows this avoids rebuilding the WebView2 environment for every tab.
+#[derive(Clone, Default)]
+pub struct BrowserLaunchContext {
+    #[cfg(target_os = "windows")]
+    environment: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+}
+
 /// Spawn the separate Linux browser window (`muxel --browser <url>`), returning
 /// whether the helper was launched (false → caller falls back to the OS browser).
 #[cfg(target_os = "linux")]
@@ -60,6 +74,66 @@ fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
 
+/// Resolve the URL used to rebuild a native webview during an immediate window
+/// handoff. The regular one-second sync may not have observed a clicked link yet,
+/// while a requested navigation can temporarily report the page being left.
+fn handoff_url(cached: &str, pending_from: Option<&str>, native: Option<&str>) -> String {
+    let Some(native) = native.filter(|url| !url.is_empty()) else {
+        return cached.to_string();
+    };
+    if (native == "about:blank" && cached != "about:blank") || pending_from == Some(native) {
+        cached.to_string()
+    } else {
+        native.to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeFocusEvent {
+    Gained,
+    Lost,
+    Pointer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeFocusDecision {
+    Activate,
+    RestoreActive,
+}
+
+/// Only a real page pointer may activate a visible-but-inactive browser. Native
+/// controllers can report GotFocus later without a click (notably while an
+/// async WebView2 controller finishes), so treating every gain as intent lets a
+/// browser steal focus back from a terminal. An already-active browser may
+/// still accept GotFocus to settle address-bar/parent focus bookkeeping.
+fn native_focus_decision(
+    native_visible: bool,
+    pane_active: bool,
+    events: &[NativeFocusEvent],
+) -> Option<NativeFocusDecision> {
+    let mut focused = None;
+    let mut trusted_pointer = false;
+    for event in events {
+        match event {
+            NativeFocusEvent::Gained => focused = Some(true),
+            NativeFocusEvent::Lost => {
+                focused = Some(false);
+                trusted_pointer = false;
+            }
+            NativeFocusEvent::Pointer => {
+                focused = Some(true);
+                trusted_pointer = true;
+            }
+        }
+    }
+    match focused {
+        Some(true) if !native_visible => Some(NativeFocusDecision::RestoreActive),
+        Some(true) if pane_active || trusted_pointer => Some(NativeFocusDecision::Activate),
+        Some(true) => Some(NativeFocusDecision::RestoreActive),
+        _ => None,
+    }
+}
+
 #[cfg(any(test, target_os = "windows"))]
 fn should_sample_native_visibility(
     visibility_changed: bool,
@@ -75,7 +149,10 @@ fn should_sample_native_visibility(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_publish_url, should_sample_native_visibility, tab_label};
+    use super::{
+        NativeFocusDecision, NativeFocusEvent, handoff_url, is_page_close_message,
+        native_focus_decision, should_publish_url, should_sample_native_visibility, tab_label,
+    };
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -90,6 +167,72 @@ mod tests {
         assert!(should_publish_url(false, true));
         assert!(should_publish_url(true, false));
         assert!(!should_publish_url(false, false));
+    }
+
+    #[test]
+    fn window_handoff_uses_native_url_without_rolling_back_pending_navigation() {
+        assert_eq!(
+            handoff_url("https://old", None, Some("https://clicked")),
+            "https://clicked"
+        );
+        assert_eq!(
+            handoff_url(
+                "https://requested",
+                Some("https://old"),
+                Some("https://old")
+            ),
+            "https://requested"
+        );
+        assert_eq!(
+            handoff_url(
+                "https://requested",
+                Some("https://old"),
+                Some("https://requested")
+            ),
+            "https://requested"
+        );
+        assert_eq!(
+            handoff_url("https://requested", None, Some("about:blank")),
+            "https://requested"
+        );
+        assert_eq!(handoff_url("https://cached", None, None), "https://cached");
+    }
+
+    #[test]
+    fn page_close_message_is_exact() {
+        assert!(is_page_close_message("muxel:close-pane"));
+        assert!(!is_page_close_message("close-pane"));
+        assert!(!is_page_close_message("muxel:close-pane-now"));
+    }
+
+    #[test]
+    fn native_focus_requires_visibility_and_current_intent() {
+        use NativeFocusDecision::{Activate, RestoreActive};
+        use NativeFocusEvent::{Gained, Lost, Pointer};
+
+        assert_eq!(
+            native_focus_decision(false, false, &[Gained]),
+            Some(RestoreActive)
+        );
+        assert_eq!(
+            native_focus_decision(true, false, &[Gained]),
+            Some(RestoreActive)
+        );
+        assert_eq!(native_focus_decision(true, true, &[Gained]), Some(Activate));
+        assert_eq!(
+            native_focus_decision(true, false, &[Pointer]),
+            Some(Activate)
+        );
+        assert_eq!(
+            native_focus_decision(true, false, &[Gained, Pointer]),
+            Some(Activate)
+        );
+        assert_eq!(
+            native_focus_decision(true, false, &[Pointer, Gained]),
+            Some(Activate)
+        );
+        assert_eq!(native_focus_decision(true, false, &[Pointer, Lost]), None);
+        assert_eq!(native_focus_decision(false, false, &[Lost]), None);
     }
 
     #[test]
@@ -115,10 +258,116 @@ mod imp {
     };
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
     #[cfg(target_os = "windows")]
-    use webview2_com::FocusChangedEventHandler;
-    #[cfg(target_os = "windows")]
-    use wry::WebViewExtWindows as _;
+    use webview2_com::{CoTaskMemPWSTR, FocusChangedEventHandler, WebMessageReceivedEventHandler};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[cfg(target_os = "windows")]
+    use wry::{WebViewBuilderExtWindows as _, WebViewExtWindows as _};
+
+    #[cfg(target_os = "windows")]
+    enum SharedEnvironment {
+        Empty,
+        Building(
+            Vec<
+                async_channel::Sender<
+                    Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+                >,
+            >,
+        ),
+        Ready(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment),
+    }
+
+    #[cfg(target_os = "windows")]
+    thread_local! {
+        /// One WebView2 environment per process/profile. Browser views are built
+        /// by interleaved foreground tasks; the Building marker prevents two
+        /// restored split panes from racing separate cold environments against
+        /// the same user-data directory.
+        static SHARED_ENVIRONMENT: std::cell::RefCell<SharedEnvironment> =
+            const { std::cell::RefCell::new(SharedEnvironment::Empty) };
+    }
+
+    #[cfg(target_os = "windows")]
+    enum EnvironmentClaim {
+        Ready(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment),
+        Build,
+        Wait(
+            async_channel::Receiver<
+                Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+            >,
+        ),
+    }
+
+    #[cfg(target_os = "windows")]
+    fn claim_environment() -> EnvironmentClaim {
+        SHARED_ENVIRONMENT.with(|state| {
+            let mut state = state.borrow_mut();
+            match &mut *state {
+                SharedEnvironment::Ready(environment) => {
+                    EnvironmentClaim::Ready(environment.clone())
+                }
+                SharedEnvironment::Building(waiters) => {
+                    let (sender, receiver) = async_channel::bounded(1);
+                    waiters.push(sender);
+                    EnvironmentClaim::Wait(receiver)
+                }
+                SharedEnvironment::Empty => {
+                    *state = SharedEnvironment::Building(Vec::new());
+                    EnvironmentClaim::Build
+                }
+            }
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    struct EnvironmentBuildGuard {
+        armed: bool,
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_environment(
+        environment: Option<
+            webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+        >,
+    ) {
+        let waiters = SHARED_ENVIRONMENT.with(|state| {
+            let next = environment
+                .clone()
+                .map_or(SharedEnvironment::Empty, SharedEnvironment::Ready);
+            match std::mem::replace(&mut *state.borrow_mut(), next) {
+                SharedEnvironment::Building(waiters) => waiters,
+                _ => Vec::new(),
+            }
+        });
+        for waiter in waiters {
+            let _ = waiter.try_send(environment.clone());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl EnvironmentBuildGuard {
+        fn new() -> Self {
+            Self { armed: true }
+        }
+
+        fn finish(
+            mut self,
+            environment: Option<
+                webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+            >,
+        ) {
+            finish_environment(environment);
+            self.armed = false;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for EnvironmentBuildGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                finish_environment(None);
+            }
+        }
+    }
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
     ///
@@ -137,10 +386,7 @@ mod imp {
         }
     }
 
-    /// IPC message the page posts when it is clicked. Namespaced so it can't
-    /// collide with a site that uses `window.ipc` for its own purposes.
-    #[cfg(target_os = "macos")]
-    const CLICK_MSG: &str = "muxel:page-click";
+    const CLICK_MSG_PLACEHOLDER: &str = "__MUXEL_PAGE_CLICK_MESSAGE__";
 
     /// Injected into every page (and every frame) before its own scripts run.
     ///
@@ -150,15 +396,19 @@ mod imp {
     /// and why the clicked pane never became the active one. The page itself is the
     /// only thing that *can* see the click, so it tells us. Capture phase, so a
     /// page that stops propagation on its own handlers can't hide the click.
-    #[cfg(target_os = "macos")]
     const PAGE_CLICK_SCRIPT: &str = r#"
         (function () {
           window.addEventListener('mousedown', function (event) {
-            if (event.button === 0 &&
-                (window.location.protocol === 'http:' ||
-                 window.location.protocol === 'https:')) {
-              try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
-            }
+            if (event.button !== 0 || !event.isTrusted) return;
+            try {
+              if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage('__MUXEL_PAGE_CLICK_MESSAGE__');
+              } else if (window.ipc &&
+                         (window.location.protocol === 'http:' ||
+                          window.location.protocol === 'https:')) {
+                window.ipc.postMessage('__MUXEL_PAGE_CLICK_MESSAGE__');
+              }
+            } catch (e) {}
           }, true);
         })();
     "#;
@@ -186,6 +436,40 @@ mod imp {
         })();
     "#;
 
+    /// A focused native child receives keys before GPUI. Forward the platform
+    /// tab-close chord to the host's state-aware close path.
+    const CLOSE_SCRIPT: &str = r#"
+        (function () {
+          window.addEventListener('keydown', function (event) {
+            const key = String(event.key || '').toLowerCase();
+            const macOS = /mac/i.test(String(navigator.platform || ''));
+            const primary = macOS
+              ? (event.metaKey && !event.ctrlKey)
+              : (event.ctrlKey && !event.metaKey);
+            const closeW = !event.altKey && !event.shiftKey && key === 'w' && primary;
+            const closeF4 = !macOS && !event.altKey && !event.shiftKey &&
+              event.ctrlKey && !event.metaKey && (key === 'f4' || event.code === 'F4');
+            const platformClose = closeW || closeF4;
+            if (platformClose) {
+              try {
+                if (window.chrome && window.chrome.webview) {
+                  window.chrome.webview.postMessage('muxel:close-pane');
+                } else if (window.ipc) {
+                  window.ipc.postMessage('muxel:close-pane');
+                }
+                event.preventDefault();
+                event.stopPropagation();
+              } catch (e) {}
+            }
+          }, true);
+        })();
+    "#;
+
+    enum NativeBrowserEvent {
+        OpenTab(String),
+        ClosePane,
+    }
+
     pub struct BrowserView {
         instance_id: uuid::Uuid,
         #[cfg(target_os = "windows")]
@@ -212,10 +496,7 @@ mod imp {
         last_profile_bounds: Option<Bounds<Pixels>>,
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
-        focus_events: std::sync::mpsc::Receiver<bool>,
-        /// URLs requested through target=_blank, window.open, Ctrl+click, or
-        /// middle-click. The app turns these into normal Muxel browser tabs.
-        new_window_events: std::sync::mpsc::Receiver<String>,
+        focus_events: std::sync::mpsc::Receiver<NativeFocusEvent>,
     }
 
     impl BrowserView {
@@ -223,6 +504,26 @@ mod imp {
             instance_id: uuid::Uuid,
             project_id: uuid::Uuid,
             url: String,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            Self::new_with_options(
+                instance_id,
+                project_id,
+                url,
+                BrowserLaunchContext::default(),
+                true,
+                window,
+                cx,
+            )
+        }
+
+        pub fn new_with_options(
+            instance_id: uuid::Uuid,
+            project_id: uuid::Uuid,
+            url: String,
+            launch_context: BrowserLaunchContext,
+            initially_visible: bool,
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Self {
@@ -285,24 +586,102 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
+            let build_queued = std::time::Instant::now();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
-            let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
+            let (native_event_tx, native_events) = async_channel::unbounded();
 
             cx.spawn_in(window, async move |this, cx| {
+                if crate::ui_profile::is_enabled() {
+                    crate::ui_profile::event(
+                        "browser",
+                        &format!(
+                            "native-controller-task pane={instance_id} initially_visible={initially_visible}"
+                        ),
+                    );
+                }
+                #[cfg(not(target_os = "windows"))]
+                let _ = launch_context;
                 #[cfg(target_os = "windows")]
-                let mut web_context = muxel_store::data_dir().and_then(|dir| {
-                    let dir = dir.join("webview2");
-                    std::fs::create_dir_all(&dir)
-                        .ok()
-                        .map(|()| wry::WebContext::new(Some(dir)))
-                });
+                let mut shared_environment = launch_context.environment;
+                #[cfg(target_os = "windows")]
+                let mut environment_build_guard = None;
+                #[cfg(target_os = "windows")]
+                if shared_environment.is_none() {
+                    loop {
+                        match claim_environment() {
+                            EnvironmentClaim::Ready(environment) => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-ready pane={instance_id}"),
+                                    );
+                                }
+                                shared_environment = Some(environment);
+                                break;
+                            }
+                            EnvironmentClaim::Build => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-build pane={instance_id}"),
+                                    );
+                                }
+                                environment_build_guard = Some(EnvironmentBuildGuard::new());
+                                break;
+                            }
+                            EnvironmentClaim::Wait(receiver) => {
+                                if crate::ui_profile::is_enabled() {
+                                    crate::ui_profile::event(
+                                        "browser",
+                                        &format!("environment-wait pane={instance_id}"),
+                                    );
+                                }
+                                if let Ok(Some(environment)) = receiver.recv().await {
+                                    if crate::ui_profile::is_enabled() {
+                                        crate::ui_profile::event(
+                                            "browser",
+                                            &format!("environment-woken pane={instance_id}"),
+                                        );
+                                    }
+                                    shared_environment = Some(environment);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                let environment_kind = if environment_build_guard.is_some() {
+                    "cold"
+                } else {
+                    "shared"
+                };
+                #[cfg(target_os = "macos")]
+                let environment_kind = "platform";
+                #[cfg(target_os = "windows")]
+                let mut web_context = if shared_environment.is_none() {
+                    muxel_store::data_dir().and_then(|dir| {
+                        let dir = dir.join("webview2");
+                        std::fs::create_dir_all(&dir)
+                            .ok()
+                            .map(|()| wry::WebContext::new(Some(dir)))
+                    })
+                } else {
+                    None
+                };
 
                 let built = match parent.as_ref() {
                     Some(parent) => {
                         #[cfg(target_os = "windows")]
-                        let Some(builder) = web_context
-                            .as_mut()
-                            .map(wry::WebViewBuilder::new_with_web_context)
+                        let Some(builder) = shared_environment
+                            .map(|environment| {
+                                wry::WebViewBuilder::new().with_environment(environment)
+                            })
+                            .or_else(|| {
+                                web_context
+                                    .as_mut()
+                                    .map(wry::WebViewBuilder::new_with_web_context)
+                            })
                         else {
                             let _ = this.update_in(cx, |this, _window, cx| {
                                 this.webview_failed = true;
@@ -313,27 +692,104 @@ mod imp {
                         #[cfg(target_os = "macos")]
                         let builder = wry::WebViewBuilder::new();
 
+                        // A per-view nonce makes this a user-pointer signal, not a
+                        // public command arbitrary page JavaScript can replay by
+                        // knowing Muxel's fixed source string.
+                        let click_message = format!("muxel:page-click:{}", uuid::Uuid::new_v4());
+                        let page_click_script =
+                            PAGE_CLICK_SCRIPT.replace(CLICK_MSG_PLACEHOLDER, &click_message);
+                        let open_tab_tx = native_event_tx.clone();
                         let builder = builder
                             .with_url(&requested)
+                            .with_visible(initially_visible)
+                            .with_initialization_script(&page_click_script)
                             .with_initialization_script(COPY_SCRIPT)
+                            .with_initialization_script(CLOSE_SCRIPT)
                             .with_new_window_req_handler(move |url, _features| {
                                 // A dropped receiver means this BrowserView was already torn down;
                                 // still deny the native popup so no orphan OS window escapes.
-                                let _ = new_window_tx.send(url);
+                                let _ = open_tab_tx.try_send(NativeBrowserEvent::OpenTab(url));
                                 wry::NewWindowResponse::Deny
                             });
                         #[cfg(target_os = "macos")]
-                        let builder = builder
-                            .with_initialization_script(PAGE_CLICK_SCRIPT)
-                            .with_ipc_handler(move |req| {
-                                if req.body().as_str() == CLICK_MSG {
-                                    let _ = focus_tx.send(true);
-                                }
-                            });
+                        let page_event_tx = native_event_tx.clone();
+                        #[cfg(target_os = "macos")]
+                        let builder = builder.with_ipc_handler(move |req| {
+                            let body = req.body().as_str();
+                            if body == click_message {
+                                let _ = focus_tx.send(NativeFocusEvent::Pointer);
+                            }
+                            if super::is_page_close_message(body) {
+                                let _ = page_event_tx.try_send(NativeBrowserEvent::ClosePane);
+                            }
+                        });
+                        let controller_started = std::time::Instant::now();
+                        let queued_ms = build_queued.elapsed().as_millis();
+                        if crate::ui_profile::is_enabled() {
+                            crate::ui_profile::event(
+                                "browser",
+                                &format!(
+                                    "native-controller-await pane={instance_id} env={environment_kind} initially_visible={initially_visible} queued_ms={queued_ms}"
+                                ),
+                            );
+                        }
                         let built = builder.build_as_child_async(parent).await.ok();
+                        #[cfg(target_os = "windows")]
+                        if let Some(guard) = environment_build_guard.take() {
+                            guard.finish(built.as_ref().map(|webview| webview.environment()));
+                        }
+                        if crate::ui_profile::is_enabled() {
+                            crate::ui_profile::event(
+                                "browser",
+                                &format!(
+                                    "native-controller pane={instance_id} env={environment_kind} initially_visible={initially_visible} queued_ms={queued_ms} controller_ms={} ok={}",
+                                    controller_started.elapsed().as_millis(),
+                                    built.is_some()
+                                ),
+                            );
+                        }
 
                         #[cfg(target_os = "windows")]
                         if let Some(webview) = built.as_ref() {
+                            // Wry's IPC wrapper parses the page URL as an
+                            // `http::Uri`; a valid Windows file:/// URL can trip
+                            // that conversion. Read WebView2's string message
+                            // directly instead.
+                            let pointer_tx = focus_tx.clone();
+                            let pointer_message = click_message;
+                            let page_event_tx = native_event_tx.clone();
+                            let web_message =
+                                WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+                                    if let Some(args) = args {
+                                        let mut raw = windows_webview::core::PWSTR::null();
+                                        let result =
+                                            unsafe { args.TryGetWebMessageAsString(&mut raw) };
+                                        let body = CoTaskMemPWSTR::from(raw).to_string();
+                                        if result.is_ok() {
+                                            if body == pointer_message {
+                                                crate::ui_profile::focus_action_for_pane(
+                                                    crate::ui_profile::FocusActionReason::PanePointer,
+                                                    instance_id,
+                                                );
+                                                let _ = pointer_tx.send(NativeFocusEvent::Pointer);
+                                            }
+                                            if super::is_page_close_message(&body) {
+                                                let _ = page_event_tx
+                                                    .try_send(NativeBrowserEvent::ClosePane);
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                }));
+                            let mut message_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .webview()
+                                    .add_WebMessageReceived(&web_message, &mut message_token)
+                            } {
+                                log::warn!("failed to observe WebView2 page messages: {error}");
+                            }
+
                             let got_tx = focus_tx.clone();
                             let got_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
@@ -342,7 +798,7 @@ mod imp {
                                         instance_id,
                                         true,
                                     );
-                                    let _ = got_tx.send(true);
+                                    let _ = got_tx.send(NativeFocusEvent::Gained);
                                     Ok(())
                                 }));
                             let lost_tx = focus_tx.clone();
@@ -353,7 +809,7 @@ mod imp {
                                         instance_id,
                                         false,
                                     );
-                                    let _ = lost_tx.send(false);
+                                    let _ = lost_tx.send(NativeFocusEvent::Lost);
                                     Ok(())
                                 }));
                             let mut got_token = 0;
@@ -388,9 +844,7 @@ mod imp {
                     let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
                     // Re-apply whatever the pane changed while the build ran.
                     let visible = this.native_visible;
-                    if !visible {
-                        wv.update(cx, |wv, _| wv.hide());
-                    }
+                    wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
                     #[cfg(target_os = "windows")]
                     if crate::ui_profile::is_enabled() {
                         let bounds = wv.read(cx).bounds();
@@ -420,6 +874,18 @@ mod imp {
                     this.webview = Some(wv);
                     cx.notify();
                 });
+
+                drop(native_event_tx);
+                while let Ok(event) = native_events.recv().await {
+                    match event {
+                        NativeBrowserEvent::OpenTab(url) => {
+                            crate::app::open_browser_tab_from_native(instance_id, url, cx);
+                        }
+                        NativeBrowserEvent::ClosePane => {
+                            crate::app::close_browser_pane_from_native(instance_id, cx);
+                        }
+                    }
+                }
             })
             .detach();
 
@@ -433,29 +899,27 @@ mod imp {
                 address,
                 url,
                 pending_navigation_from: None,
-                native_visible: true,
+                native_visible: initially_visible,
                 #[cfg(target_os = "windows")]
                 profile_project_active: true,
                 #[cfg(target_os = "windows")]
-                profile_pane_active: true,
+                profile_pane_active: initially_visible,
                 #[cfg(target_os = "windows")]
                 profile_overlay: false,
                 #[cfg(target_os = "windows")]
                 last_profile_bounds: None,
                 focus_events,
-                new_window_events,
             }
         }
 
-        /// Drain page requests for a separate browsing context. Keeping this at
-        /// the app boundary gives all browser entry points the same dedupe and
-        /// tab-placement policy.
-        pub fn take_new_window_requests(&mut self) -> Vec<String> {
-            let mut urls = Vec::new();
-            while let Ok(url) = self.new_window_events.try_recv() {
-                urls.push(url);
+        pub fn launch_context(&self, _cx: &App) -> Option<BrowserLaunchContext> {
+            #[cfg(target_os = "windows")]
+            if let Some(webview) = &self.webview {
+                return Some(BrowserLaunchContext {
+                    environment: Some(webview.read(_cx).raw().environment()),
+                });
             }
-            urls
+            None
         }
 
         /// Whether the page was clicked since the last check (drains the queue).
@@ -464,12 +928,18 @@ mod imp {
         /// click never reaches gpui on its own, so without this the pane keeps its
         /// old highlight and keyboard actions (paste, restart, close) go to
         /// whichever pane was focused before.
-        pub fn take_native_focus(&mut self) -> Option<bool> {
-            let mut focused = None;
+        pub fn take_native_focus(&mut self, pane_active: bool) -> Option<NativeFocusDecision> {
+            let mut events = Vec::new();
             while let Ok(next) = self.focus_events.try_recv() {
-                focused = Some(next);
+                events.push(next);
             }
-            focused
+            let decision = native_focus_decision(self.native_visible, pane_active, &events);
+            if decision == Some(NativeFocusDecision::RestoreActive)
+                && crate::ui_profile::is_enabled()
+            {
+                crate::ui_profile::event("browser", "discarded-unarmed-browser-gain");
+            }
+            decision
         }
 
         /// Hand the OS keyboard focus to the native webview, so typing (and paste)
@@ -486,6 +956,18 @@ mod imp {
             );
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().focus();
+            }
+        }
+
+        /// Move OS focus out of this native child and back to its GPUI host.
+        /// GPUI's focus path does not change when WebView2/WKWebView gains focus.
+        pub fn focus_parent(&self, cx: &App) {
+            crate::ui_profile::focus_action_for_pane(
+                crate::ui_profile::FocusActionReason::NativeBrowserRestore,
+                self.instance_id,
+            );
+            if let Some(wv) = &self.webview {
+                let _ = wv.read(cx).raw().focus_parent();
             }
         }
 
@@ -543,6 +1025,20 @@ mod imp {
         /// (pop-out / re-dock) rebuilds it from this rather than reparenting.
         pub fn url(&self) -> &str {
             &self.url
+        }
+
+        /// URL to carry across a native-window rebuild. Unlike `url()`, this
+        /// samples the native controller so a just-clicked link is not lost.
+        pub fn handoff_url(&self, cx: &App) -> String {
+            let native = self
+                .webview
+                .as_ref()
+                .and_then(|webview| webview.read(cx).url().ok());
+            super::handoff_url(
+                &self.url,
+                self.pending_navigation_from.as_deref(),
+                native.as_deref(),
+            )
         }
 
         /// Navigate the webview and remember the URL.
@@ -620,6 +1116,10 @@ mod imp {
             cx: &mut Context<Self>,
         ) {
             let visibility_changed = self.native_visible != visible;
+            if visibility_changed && visible {
+                // Discard focus events from the previous hidden state before showing.
+                while self.focus_events.try_recv().is_ok() {}
+            }
             if visibility_changed {
                 self.native_visible = visible;
                 if let Some(wv) = &self.webview {
@@ -814,13 +1314,12 @@ mod imp {
             &self.url
         }
 
-        pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
-            None
+        pub fn handoff_url(&self, _cx: &App) -> String {
+            self.url.clone()
         }
 
-        /// Linux has no embedded webview, so it cannot emit native popup requests.
-        pub fn take_new_window_requests(&mut self) -> Vec<String> {
-            Vec::new()
+        pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
+            None
         }
 
         pub fn set_native_visible(
@@ -836,12 +1335,14 @@ mod imp {
         /// No embedded webview here, so clicks land on ordinary gpui elements and
         /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
         /// impl for why that isn't true there).
-        pub fn take_native_focus(&mut self) -> Option<bool> {
+        pub fn take_native_focus(&mut self, _pane_active: bool) -> Option<NativeFocusDecision> {
             None
         }
 
         /// No native child to focus.
         pub fn focus_native(&self, _cx: &App) {}
+
+        pub fn focus_parent(&self, _cx: &App) {}
 
         pub fn address_focused(&self, _window: &Window, _cx: &App) -> bool {
             false

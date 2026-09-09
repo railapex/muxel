@@ -1286,6 +1286,18 @@ fn ensure_flusher() {
         .ok();
 }
 
+/// Record a low-volume, opt-in subsystem event beside the UI health counters.
+pub fn event(category: &str, event: &str) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: format!("ui-prof[{category}] {event}"),
+    });
+}
+
 /// Begin one synchronous profiler phase. The returned guard writes its end
 /// boundary on drop. `category` and `phase` must be fixed labels; `pane` is the
 /// only correlation value, keeping command lines, paths, and session ids out of
