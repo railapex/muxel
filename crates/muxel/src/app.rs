@@ -24,12 +24,13 @@ use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
+use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
-    RemoteHost, RemoteLayout, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth,
-    StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
-    add_tab_inactive, agent_activity_label, append_agent_instruction,
+    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection,
+    SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab,
+    add_tab_at, add_tab_inactive, agent_activity_label, append_agent_instruction,
     codex_developer_instructions_override, file_link_instruction, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
     move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
@@ -71,6 +72,93 @@ fn same_browser_resource(existing: &str, requested: &str) -> bool {
         _ => false,
     }
 }
+
+/// Where the maximize goes when the user selects `target`. While a maximized
+/// pane is on screen it follows the selection, so picking another agent shows
+/// that agent full-size instead of focusing a pane hidden behind the maximized
+/// one. A maximize parked in a project that isn't shown stays put, as does one
+/// when the target has no place in a layout (popped out). Pure.
+fn maximize_after_select(
+    maximized: Option<Uuid>,
+    on_screen: bool,
+    target: Uuid,
+    target_in_layout: bool,
+) -> Option<Uuid> {
+    match maximized {
+        Some(max) if max != target && on_screen && target_in_layout => Some(target),
+        other => other,
+    }
+}
+
+/// The maximize anchor once the `leaving` tabs go (closed, popped out, dropped by
+/// a peer). The maximize covers the anchor's whole tab group (`group`), so when
+/// the anchor leaves but a groupmate stays, it re-anchors there and the group
+/// stays maximized; with the whole group gone nothing is maximized. Pure.
+fn maximize_anchor_after_leave(
+    maximized: Option<Uuid>,
+    group: &[Uuid],
+    leaving: &[Uuid],
+) -> Option<Uuid> {
+    let max = maximized?;
+    if !leaving.contains(&max) {
+        return Some(max);
+    }
+    group.iter().copied().find(|t| !leaving.contains(t))
+}
+
+#[cfg(test)]
+mod maximize_follow_tests {
+    use super::{maximize_after_select, maximize_anchor_after_leave};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_leaving_anchor_hands_the_maximize_to_its_group() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // The anchor leaves but a groupmate stays: the group stays maximized.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[a]), Some(b));
+        // Another tab leaving doesn't move the anchor.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[b]), Some(a));
+        // The whole group leaves (or it was a lone tab): nothing is maximized.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[a, b]), None);
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a], &[a]), None);
+        // Nothing maximized stays that way.
+        assert_eq!(maximize_anchor_after_leave(None, &[a, b], &[c]), None);
+    }
+
+    #[test]
+    fn follows_the_selection_while_on_screen() {
+        let (max, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            maximize_after_select(Some(max), true, other, true),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn stays_put_otherwise() {
+        let (max, other) = (Uuid::new_v4(), Uuid::new_v4());
+        // Nothing maximized: selecting never maximizes.
+        assert_eq!(maximize_after_select(None, false, other, true), None);
+        // Maximized pane not on screen (another project is shown).
+        assert_eq!(
+            maximize_after_select(Some(max), false, other, true),
+            Some(max)
+        );
+        // Target is popped out, so it can't fill the pane area.
+        assert_eq!(
+            maximize_after_select(Some(max), true, other, false),
+            Some(max)
+        );
+        // Re-selecting the maximized pane keeps it maximized.
+        assert_eq!(maximize_after_select(Some(max), true, max, true), Some(max));
+    }
+}
+
+/// How long to wait before each attempt at killing a closed pane's remote tmux
+/// session (the first is immediate). Short enough that a blip or a control socket
+/// that died with the pane's own ssh is ridden out within the minute; anything
+/// longer-lived is left to the next connect — see `MuxelApp::reap_remote_session`.
+const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
@@ -2395,6 +2483,16 @@ pub struct MuxelApp {
     layout_keys: HashMap<Uuid, String>,
     /// Pending debounced layout pushes: project id → earliest time to push.
     remote_push_due: HashMap<Uuid, Instant>,
+    /// Content key of each synced project's `.muxel/workspace.json` as this machine
+    /// last wrote or adopted it. A live poll that reads any other key is looking at
+    /// a peer's write (see `muxel_core::peer_layout_action`).
+    layout_synced_keys: HashMap<Uuid, String>,
+    /// Projects with a layout push in flight — one at a time each, so a slow host
+    /// never has two pushes racing over the same file.
+    remote_push_inflight: HashSet<Uuid>,
+    /// Projects whose last layout push failed. Reported once per failing streak,
+    /// not on every retry; cleared by the next successful push.
+    layout_push_failing: HashSet<Uuid>,
     /// Per-project generation for deferred pane fleets. Starting a newer restore
     /// cancels the older task before it can launch or focus another pane.
     deferred_activation_generation: HashMap<Uuid, u64>,
@@ -5041,6 +5139,9 @@ impl MuxelApp {
             remote_connecting: HashSet::new(),
             layout_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
+            layout_synced_keys: HashMap::new(),
+            remote_push_inflight: HashSet::new(),
+            layout_push_failing: HashSet::new(),
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
@@ -5268,7 +5369,9 @@ impl MuxelApp {
         resolved: &ResolvedLaunch,
     ) -> (String, Vec<String>, Vec<(String, String)>) {
         let control_path = Self::control_path_for(host.id);
-        let use_tmux = host.default_use_tmux || inst.is_some_and(|i| i.use_tmux);
+        // `RemoteHost::use_tmux` is the single gate: it also answers "never" for a
+        // Windows host, which has no tmux to attach to.
+        let use_tmux = host.use_tmux(inst.is_some_and(|i| i.use_tmux));
         // The session recorded on the instance wins — it is what the iOS app
         // launches from, and what a previous run left running on the host. See
         // `tmux::session_for`.
@@ -5407,8 +5510,11 @@ impl MuxelApp {
             }
             // Proactive resume: if we'd `--resume` an already-started session but its
             // transcript is gone from disk (deleted/expired), start a *fresh* session
-            // instead of a doomed resume that just hangs.
-            if inst.session_started
+            // instead of a doomed resume that just hangs. Local projects only: a
+            // remote agent's transcript is on its host, so its absence from this disk
+            // says nothing — checking here reset every remote pane's conversation.
+            if local
+                && inst.session_started
                 && let Some(sid) = inst.session_id.clone()
                 && {
                     let _phase =
@@ -5737,8 +5843,9 @@ impl MuxelApp {
         self.install_terminal_spawn(meta, result, window, cx);
     }
 
-    fn mark_terminal_session_started(&mut self, instance_id: Uuid) -> bool {
-        let resume_capable = self.workspace.instance(instance_id).is_some_and(|inst| {
+    /// Whether `iid` runs a preset that can reopen its conversation (`resume_flag`).
+    fn resume_capable(&self, iid: Uuid) -> bool {
+        self.workspace.instance(iid).is_some_and(|inst| {
             inst.preset_id
                 .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
                 .or_else(|| {
@@ -5747,8 +5854,11 @@ impl MuxelApp {
                         .find(|preset| preset.name == inst.preset)
                 })
                 .is_some_and(|preset| preset.resume_flag.is_some())
-        });
-        if resume_capable
+        })
+    }
+
+    fn mark_terminal_session_started(&mut self, instance_id: Uuid) -> bool {
+        if self.resume_capable(instance_id)
             && let Some(inst) = self.workspace.instance_mut(instance_id)
             && !inst.session_started
         {
@@ -6194,6 +6304,10 @@ impl MuxelApp {
                             // After the sync, so a session the layout accounts for is
                             // not adopted a second time.
                             if let Some(sessions) = sessions {
+                                // Finish any close whose kill never landed *first*,
+                                // so a session the user closed is reaped rather than
+                                // adopted back as a pane.
+                                this.reap_closed_sessions(pid, &sessions, cx);
                                 this.adopt_remote_sessions(pid, &sessions, window, cx);
                             }
                         }
@@ -6308,8 +6422,11 @@ impl MuxelApp {
             .filter(|i| i.project_id == pid)
             .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host_name, i.id))
             .collect();
+        // A pane the user closed whose kill is still unconfirmed must not come back
+        // as a pane — `reap_closed_sessions` is still working on it.
+        let closed = project.closed_sessions.clone();
 
-        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned);
+        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
         if orphans.is_empty() {
             return;
         }
@@ -7340,6 +7457,21 @@ impl MuxelApp {
         if dir.is_empty() {
             return;
         }
+        // Refuse a second copy of an open project; keep the wizard up to say why.
+        let os = self
+            .remotes
+            .iter()
+            .find(|h| h.id == host_id)
+            .map(|h| h.os)
+            .unwrap_or_default();
+        if let Some(open) = self.workspace.remote_project_at(host_id, &dir, os) {
+            self.nr_verify = RemoteTestState::Failed(tf(
+                "“{name}” is already open in this workspace.",
+                &[("name", &open.name)],
+            ));
+            cx.notify();
+            return;
+        }
         let mut name = self.nr_name.read(cx).value().trim().to_string();
         if name.is_empty() {
             // Default to the remote directory's last component.
@@ -7369,6 +7501,15 @@ impl MuxelApp {
             {
                 let name = Self::project_name_from(&dir);
                 let _ = this.update_in(cx, |this, window, cx| {
+                    if let Some(open) = this.workspace.local_project_at(&dir) {
+                        let msg = tf(
+                            "“{name}” is already open in this workspace.",
+                            &[("name", &open.name)],
+                        );
+                        this.add_event(NotifKind::Error, t("Project already open"), msg);
+                        cx.notify();
+                        return;
+                    }
                     this.create_project_at(dir, name, window, cx);
                 });
             }
@@ -7498,6 +7639,11 @@ impl MuxelApp {
         {
             set_active_tab(&mut p.layout, iid);
             p.last_focused_instance = Some(iid);
+        }
+        // Keep the maximize anchored on the tab its group is showing, so dragging
+        // a background tab out of the group leaves the maximize where it is.
+        if self.maximized.is_some_and(|m| m != iid) && self.maximized_group().contains(&iid) {
+            self.maximized = Some(iid);
         }
         if self
             .workspace
@@ -8392,21 +8538,22 @@ impl MuxelApp {
     }
 
     /// Re-fetch the shared `.muxel/workspace.json` for each already-reconciled synced
-    /// project and adopt a peer's instance renames live (see `reconcile_remote_names`),
-    /// off the UI thread. Runs on the same ~5s throttle as branch polling. This is the
-    /// live counterpart to the connect-time `apply_remote_layout_sync`, but surgical:
-    /// it never tears panes down (structural changes still reconcile on next connect).
-    fn fetch_remote_layouts(&mut self, cx: &mut Context<Self>) {
+    /// project, off the UI thread, and apply a peer's changes live (see
+    /// `poll_peer_layout`). Runs on the same ~5s throttle as branch polling — the
+    /// live counterpart to the connect-time `apply_remote_layout_sync`.
+    fn fetch_remote_layouts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
         let jobs: Vec<(Uuid, integrations::RepoLoc)> = synced
             .into_iter()
             .filter(|pid| self.project_syncs_layout(*pid))
+            // Mid-push, the file may be half written; the next poll reads it whole.
+            .filter(|pid| !self.remote_push_inflight.contains(pid))
             .filter_map(|pid| self.repo_loc(pid).map(|loc| (pid, loc)))
             .collect();
         if jobs.is_empty() {
             return;
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let results = cx
                 .background_executor()
                 .spawn(async move {
@@ -8415,67 +8562,194 @@ impl MuxelApp {
                         .collect::<Vec<_>>()
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                let mut changed = false;
+            let _ = this.update_in(cx, |this, window, cx| {
                 for (pid, json) in results {
                     if let Some(json) = json {
-                        changed |= this.reconcile_remote_names(pid, &json);
+                        this.poll_peer_layout(pid, &json, window, cx);
                     }
-                }
-                if changed {
-                    cx.notify();
                 }
             });
         })
         .detach();
     }
 
-    /// Adopt just the peer-set instance names (`custom_name`) from a fetched remote
-    /// layout, in place — no teardown/respawn (unlike a full `pull_remote_layout`).
-    /// Only existing instances (matched by id) are touched; new/removed panes are left
-    /// to the connect-time reconcile. Returns whether anything changed. Guarded by the
-    /// top-level `updated_at` so a not-yet-pushed local rename isn't clobbered.
-    fn reconcile_remote_names(&mut self, pid: Uuid, json: &str) -> bool {
+    /// Act on one polled layout file: adopt a peer's write, or just note that the
+    /// file already matches this machine (see `muxel_core::peer_layout_action`).
+    fn poll_peer_layout(
+        &mut self,
+        pid: Uuid,
+        json: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(proj) = self.workspace.project(pid) else {
-            return false;
+            return;
         };
         let layout_root = match &proj.remote {
             Some(r) => r.remote_root.clone(),
             None => proj.root_path.display().to_string(),
         };
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-        let local_rev = proj.layout_updated_at.unwrap_or(0);
         let Some(remote) = RemoteLayout::parse(json, &layout_root) else {
-            return false;
+            return;
         };
-        // Only adopt a strictly-newer, actually-different remote, so a desktop rename
-        // we haven't pushed yet isn't overwritten by a stale read.
-        if remote.updated_at <= local_rev || remote.content_key() == local.content_key() {
-            return false;
-        }
-        let mut changed = false;
-        for r in &remote.instances {
-            if let Some(inst) = self.workspace.instance_mut(r.id)
-                && inst.custom_name != r.custom_name
-            {
-                inst.custom_name = r.custom_name.clone();
-                changed = true;
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let local_key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
+        let local_rev = proj.layout_updated_at.unwrap_or(0);
+        let remote_key = remote.content_key();
+        match muxel_core::peer_layout_action(
+            &remote_key,
+            remote.updated_at,
+            self.layout_synced_keys.get(&pid).map(String::as_str),
+            &local_key,
+            local_rev,
+        ) {
+            muxel_core::PeerLayoutAction::Ignore => {}
+            muxel_core::PeerLayoutAction::InSync => {
+                self.layout_synced_keys.insert(pid, remote_key);
             }
+            muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
         }
-        if !changed {
-            return false;
+    }
+
+    /// Apply a peer's layout live, in place: panes it added appear (attached to their
+    /// running tmux sessions), panes it closed go away, and every pane both sides
+    /// share keeps its live terminal. Unlike the connect-time
+    /// [`Self::pull_remote_layout`] nothing is torn down and respawned, so a peer
+    /// starting one agent never interrupts the others.
+    fn adopt_peer_layout(
+        &mut self,
+        pid: Uuid,
+        remote: RemoteLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let name = project.name.clone();
+        let before = project.instances();
+        let local: Vec<Instance> = before
+            .iter()
+            .filter_map(|id| self.workspace.instance(*id).cloned())
+            .collect();
+        let remote_key = remote.content_key();
+        let RemoteLayout {
+            layout,
+            instances,
+            worktrees,
+            updated_at,
+            memory_enabled,
+            ..
+        } = remote;
+        let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
+        self.bind_peer_sessions(pid, &mut instances);
+        let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
+        let closed: Vec<Uuid> = before
+            .iter()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        let added = instances.iter().filter(|i| !before.contains(&i.id)).count();
+        // A pane the peer closed: drop only this side's view. Closing it on the peer
+        // already tore down its tmux session and worktree.
+        self.release_maximize(&closed);
+        for &iid in &closed {
+            ui_profile::unregister_focus_pane(iid);
+            self.terminal_launching.remove(&iid);
+            self.clear_notifications_for(iid);
+            if let Some(view) = self.terminals.remove(&iid) {
+                view.read(cx).session().kill();
+            }
+            self.editors.remove(&iid);
+            self.browsers.remove(&iid);
+            self.last_status.remove(&iid);
+            self.failed_launches.remove(&iid);
+            self.workspace.remove_instance_meta(iid);
+        }
+        for instance in instances {
+            self.workspace.remove_instance_meta(instance.id);
+            self.workspace.add_instance(instance);
+        }
+        for mut wt in worktrees {
+            wt.project_id = pid;
+            self.workspace.remove_worktree_meta(wt.id);
+            self.workspace.add_worktree(wt);
         }
         if let Some(p) = self.workspace.project_mut(pid) {
-            p.layout_updated_at = Some(remote.updated_at);
+            p.layout = layout;
+            p.layout_updated_at = Some(updated_at);
+            if let Some(enabled) = memory_enabled {
+                p.memory_enabled = enabled;
+            }
         }
-        // Reseed change detection so we don't immediately push the adopted names back.
-        if let Some(p) = self.workspace.project(pid) {
-            let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
-            self.layout_keys.insert(pid, key);
+        self.seed_adopted_layout(pid, remote_key);
+        if self.active_instance.is_some_and(|a| closed.contains(&a)) {
+            self.active_instance = self
+                .workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance());
         }
         self.persist();
-        true
+        muxel_store::append_event_log(&format!(
+            "layout: adopted peer layout for \"{name}\" (+{added} -{})",
+            closed.len()
+        ));
+        // The peer's new panes attach to their sessions (`tmux new-session -A`).
+        self.spawn_project_terminals_now(pid, window, cx);
+        cx.notify();
+    }
+
+    /// After adopting a peer's layout: re-seed change detection so the adoption
+    /// isn't pushed straight back, and remember the file as synced. Whatever this
+    /// machine had to add (a session binding the peer never recorded) makes the
+    /// content differ from the file; that is pushed, so the peer learns it too.
+    fn seed_adopted_layout(&mut self, pid: Uuid, remote_key: String) {
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let Some(p) = self.workspace.project(pid) else {
+            return;
+        };
+        let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
+        self.remote_push_due.remove(&pid);
+        if key != remote_key {
+            if let Some(p) = self.workspace.project_mut(pid) {
+                p.layout_updated_at = Some(now_epoch);
+            }
+            self.remote_push_due
+                .insert(pid, Instant::now() + Duration::from_secs(2));
+        }
+        self.layout_keys.insert(pid, key);
+        self.layout_synced_keys.insert(pid, remote_key);
+    }
+
+    /// Bind a local project's terminal panes that a peer created without recording
+    /// a tmux session (another desktop relying on its host's tmux default) to the
+    /// session they actually run in, found by pane id — so this machine attaches to
+    /// that agent instead of launching a second one beside it. With no such session
+    /// running, the pane gets this project's canonical name and starts there.
+    fn bind_peer_sessions(&self, pid: Uuid, instances: &mut [Instance]) {
+        if !self.tmux_available {
+            return;
+        }
+        let Some(project) = self.workspace.project(pid).filter(|p| p.remote.is_none()) else {
+            return;
+        };
+        let unbound = |i: &Instance| {
+            i.kind == InstanceKind::Terminal
+                && i.tmux_session
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+        };
+        if !instances.iter().any(unbound) {
+            return;
+        }
+        let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
+        for instance in instances.iter_mut().filter(|i| unbound(i)) {
+            let session = muxel_core::tmux::session_by_suffix(&sessions, instance.id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| muxel_core::tmux::session_name(&project.name, instance.id));
+            instance.tmux_session = Some(session);
+            instance.use_tmux = true;
+        }
     }
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
@@ -8801,7 +9075,7 @@ impl MuxelApp {
         // Throttle remote (ssh) branch polling + layout re-fetch to every ~5s.
         if self.remote_poll_count == 0 {
             self.poll_remote_branches(cx);
-            self.fetch_remote_layouts(cx);
+            self.fetch_remote_layouts(window, cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         // Session switches happen inside Grok without replacing the PTY child.
@@ -10631,13 +10905,6 @@ impl MuxelApp {
         let Some(project) = self.workspace.active() else {
             return Vec::new();
         };
-        if let Some(max) = self.maximized {
-            return if self.browsers.contains_key(&max) {
-                vec![max]
-            } else {
-                Vec::new()
-            };
-        }
         fn walk(
             node: &PaneNode,
             active_instance: Option<Uuid>,
@@ -10675,7 +10942,12 @@ impl MuxelApp {
         }
         let mut out = Vec::new();
         if let Some(layout) = &project.layout {
-            walk(layout, self.active_instance, &self.browsers, &mut out);
+            // A maximized pane's window shows only its tab group, as render does.
+            let root = self
+                .maximized
+                .and_then(|m| layout.leaf_containing(m))
+                .unwrap_or(layout);
+            walk(root, self.active_instance, &self.browsers, &mut out);
         }
         // Projects shown in secondary (per-monitor) windows render there.
         for sec in &self.secondary_windows {
@@ -10684,7 +10956,11 @@ impl MuxelApp {
                 .project(sec.pid)
                 .and_then(|p| p.layout.as_ref())
             {
-                walk(layout, self.active_instance, &self.browsers, &mut out);
+                let root = self
+                    .maximized
+                    .and_then(|m| layout.leaf_containing(m))
+                    .unwrap_or(layout);
+                walk(root, self.active_instance, &self.browsers, &mut out);
             }
         }
         out
@@ -12353,23 +12629,30 @@ impl MuxelApp {
     /// Tear down a just-closed instance's tmux session (local **or** remote) and
     /// dispose its worktree. Call after `remove_instance_meta`, with the captured
     /// fields (the project meta must still exist).
-    #[allow(clippy::too_many_arguments)]
     fn teardown_closed_instance(
         &mut self,
         iid: Uuid,
         project_id: Uuid,
-        use_tmux: bool,
         // The session name recorded on the instance, if it had one (`tmux_session`).
         recorded_session: Option<String>,
         worktree_path: Option<PathBuf>,
         worktree_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
+        let is_remote = self
+            .workspace
+            .project(project_id)
+            .is_some_and(|p| p.is_remote());
         // Remote tmux session: closing a pane always tears its session down —
         // a *dropped* SSH connection never reaches here (an abnormal exit leaves
         // a tombstone pane instead of auto-closing), so reconnectability is
         // preserved where it matters. Killed over ssh in the background
         // (reuses the host's still-warm ControlMaster).
+        //
+        // Gated on the host having tmux *at all*, not on tmux being its current
+        // default: a host whose default was switched off since the pane launched
+        // still has that pane's session running, and skipping it here would both
+        // strand the agent and aim the local kill below at a remote session name.
         let remote_host = self
             .workspace
             .project(project_id)
@@ -12380,33 +12663,25 @@ impl MuxelApp {
                     .find(|h| h.id == r.host_id)
                     .map(|h| h.effective(&self.identities))
             })
-            .filter(|host| host.default_use_tmux || use_tmux);
-        // A remote instance's session lives on the host, not here; killing the
-        // recorded name locally would be a no-op at best.
-        if remote_host.is_none()
-            && let Some(session) = recorded_session.clone()
-        {
-            integrations::kill_tmux_session(&session);
-        }
-        if let Some(host) = remote_host {
+            .filter(|host| !host.os.is_windows());
+        match remote_host {
             // The same name the pane was launched with — a recomputed one would
             // leave the session it was actually running alive on the host forever.
-            let session =
-                muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
-            let control_path = Self::control_path_for(host.id);
-            let password = (host.auth == SshAuth::Password)
-                .then(|| self.remote_password(&host))
-                .flatten();
-            cx.background_executor()
-                .spawn(async move {
-                    integrations::kill_remote_tmux(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                    );
-                })
-                .detach();
+            // A pane that never had a session confirms as already gone, so aiming
+            // at one costs a single round trip and nothing else.
+            Some(host) => {
+                let session =
+                    muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
+                self.reap_remote_session(project_id, iid, host, session, cx);
+            }
+            // A remote instance's session lives on the host, not here; killing the
+            // recorded name locally would be a no-op at best.
+            None if !is_remote => {
+                if let Some(session) = recorded_session {
+                    integrations::kill_tmux_session(&session);
+                }
+            }
+            None => {}
         }
         // Worktree disposed only when its last instance is gone.
         let root = self
@@ -12421,13 +12696,158 @@ impl MuxelApp {
         }
     }
 
+    /// Kill the tmux session a closed pane left on a remote host, and keep at it
+    /// until the host confirms the session is gone.
+    ///
+    /// One ssh round trip is not a guarantee: it can lose a race with the control
+    /// socket the pane's own ssh just took down, hit a blip, or reach a host that is
+    /// busy. Unconfirmed, that failure used to be invisible *and* self-reversing —
+    /// the agent kept running and the next connect adopted it back into a pane, so
+    /// closing a remote agent looked like it had worked until muxel restarted.
+    ///
+    /// So the close is written down first ([`Project::remember_closed_session`]),
+    /// retried a few times with a widening gap, and only forgotten once a kill comes
+    /// back confirmed. Anything the retries don't finish is finished at the next
+    /// connect by [`Self::reap_closed_sessions`], which has the host's real session
+    /// list to work from; until then the entry keeps the pane from being adopted
+    /// back.
+    fn reap_remote_session(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        host: RemoteHost,
+        session: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(p) = self.workspace.project_mut(project_id) {
+            p.remember_closed_session(session.clone(), iid);
+        }
+        let control_path = Self::control_path_for(host.id);
+        let password = (host.auth == SshAuth::Password)
+            .then(|| self.remote_password(&host))
+            .flatten();
+        cx.spawn(async move |this, cx| {
+            // Immediately, then backing off — a control socket that went down with
+            // the pane, or a momentary network stall, is usually over in seconds.
+            let mut err = None;
+            for (attempt, wait) in RETRY_REMOTE_KILL_SECS.iter().enumerate() {
+                if attempt > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(*wait))
+                        .await;
+                }
+                let (host, control_path, session, password) = (
+                    host.clone(),
+                    control_path.clone(),
+                    session.clone(),
+                    password.clone(),
+                );
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        integrations::kill_remote_tmux(
+                            &host,
+                            &control_path,
+                            password.as_deref(),
+                            &session,
+                        )
+                    })
+                    .await;
+                match res {
+                    Ok(()) => {
+                        err = None;
+                        break;
+                    }
+                    Err(e) => err = Some(format!("{e}")),
+                }
+            }
+            let _ = this.update(cx, |this, cx| match err {
+                None => this.finish_closed_session(project_id, iid),
+                Some(msg) => {
+                    // Not an error dialog: the session is remembered, the pane stays
+                    // closed, and the next connect to the host finishes the job.
+                    muxel_store::append_event_log(&format!(
+                        "close: “{session}” not confirmed dead on “{}” — {msg}",
+                        host.name
+                    ));
+                    this.dev_log.push(DevLogEntry {
+                        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        kind: NotifKind::Error,
+                        title: t("Remote session").to_string(),
+                        detail: format!("{session}: {msg}"),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A confirmed kill: drop the ledger entry so the session can be adopted again
+    /// if the host ever hands out that name once more.
+    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid) {
+        if let Some(p) = self.workspace.project_mut(project_id)
+            && p.forget_closed_session(iid)
+        {
+            self.persist();
+        }
+    }
+
+    /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
+    /// remembered closes against what is actually running on its host.
+    ///
+    /// The host's session list is the authority muxel lacked at close time. A close
+    /// with nothing left running is finished, whatever became of its kill. One with a
+    /// session still there gets another kill — aimed at the name the session actually
+    /// has, which a derived name may no longer match (a renamed host, a session a
+    /// peer created under its own slug).
+    ///
+    /// Runs before adoption, so a close that finished here doesn't keep a pane away.
+    fn reap_closed_sessions(
+        &mut self,
+        pid: Uuid,
+        sessions: &[muxel_core::tmux::RemoteSession],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        if project.closed_sessions.is_empty() {
+            return;
+        }
+        let pending: Vec<(Uuid, Option<String>)> = project
+            .closed_sessions
+            .iter()
+            .map(|c| {
+                (
+                    c.instance,
+                    muxel_core::tmux::live_closed_session(sessions, c).map(|s| s.name.clone()),
+                )
+            })
+            .collect();
+        let Some(host) = self.remote_host_for_project(pid) else {
+            return;
+        };
+        for (iid, live) in pending {
+            match live {
+                Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
+                None => self.finish_closed_session(pid, iid),
+            }
+        }
+    }
+
     /// Manually close an instance (kills its tmux session, local or remote).
     fn close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         self.close_instance_inner(iid, "close", cx);
     }
 
-    /// Close an instance. `kill_remote_session` is false for auto-close-on-exit,
-    /// so a dropped remote connection doesn't tear down a still-running session.
+    /// Close an instance: drop its pane, kill the process, and tear down its tmux
+    /// session — local, or remote via [`Self::reap_remote_session`]. `reason` is the
+    /// word that lands in the event log.
+    ///
+    /// Reached only by a deliberate close and by auto-close on a *clean* exit; a
+    /// dropped remote connection exits abnormally and tombstones the pane instead,
+    /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
         ui_profile::unregister_focus_pane(iid);
         // Invalidate a PTY still being created. Its eventual result sees the
@@ -12460,6 +12880,8 @@ impl MuxelApp {
                 .and_then(|p| p.layout.as_ref())
                 .and_then(|l| l.surviving_active_after_remove(iid))
         });
+        // Before the layout changes: a groupmate inherits the maximize.
+        self.release_maximize(&[iid]);
         if let Some(pid) = pid
             && let Some(project) = self.workspace.project_mut(pid)
         {
@@ -12480,15 +12902,13 @@ impl MuxelApp {
                 i.worktree_path.clone(),
                 i.worktree_id,
                 i.project_id,
-                i.use_tmux,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id, use_tmux)) = info {
+        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
             self.teardown_closed_instance(
                 iid,
                 project_id,
-                use_tmux,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -12497,9 +12917,6 @@ impl MuxelApp {
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
-        if self.maximized == Some(iid) {
-            self.maximized = None;
-        }
 
         // If the closed tab was active, retarget to its pane's surviving tab if
         // the pane lives on, else the active project's first instance.
@@ -13095,6 +13512,12 @@ impl MuxelApp {
         if !self.project_syncs_layout(pid) || self.has_pending_terminal_close_for_project(pid) {
             return;
         }
+        // One push per project at a time: go again once the one in flight lands.
+        if self.remote_push_inflight.contains(&pid) {
+            self.remote_push_due
+                .insert(pid, Instant::now() + Duration::from_secs(1));
+            return;
+        }
         let Some(loc) = self.repo_loc(pid) else {
             return;
         };
@@ -13102,21 +13525,45 @@ impl MuxelApp {
         let Some(proj) = self.workspace.project(pid) else {
             return;
         };
-        let json = RemoteLayout::capture(proj, &self.workspace, now_epoch).to_json();
+        let name = proj.name.clone();
+        let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let key = doc.content_key();
+        let json = doc.to_json();
+        self.remote_push_inflight.insert(pid);
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { integrations::push_remote_layout(&loc, &json) })
                 .await;
-            if let Err(e) = res {
-                let _ = this.update(cx, |this, cx| {
-                    let msg = format!("{e}");
-                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                        this.add_event(NotifKind::Error, t("Layout sync"), msg);
+            let _ = this.update(cx, |this, cx| {
+                this.remote_push_inflight.remove(&pid);
+                match res {
+                    Ok(()) => {
+                        this.layout_synced_keys.insert(pid, key);
+                        this.layout_push_failing.remove(&pid);
                     }
-                    cx.notify();
-                });
-            }
+                    Err(e) => {
+                        // Retry quietly: a peer must eventually see this layout even
+                        // if nothing else changes here.
+                        this.remote_push_due
+                            .entry(pid)
+                            .or_insert_with(|| Instant::now() + Duration::from_secs(30));
+                        let msg = format!("{e}");
+                        // Report a failing host once per streak — each retry, and every
+                        // later layout change, would otherwise raise it again.
+                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx)
+                            && this.layout_push_failing.insert(pid)
+                        {
+                            this.add_event(
+                                NotifKind::Error,
+                                t("Layout sync"),
+                                format!("{name}: {msg}"),
+                            );
+                            cx.notify();
+                        }
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -13164,7 +13611,8 @@ impl MuxelApp {
             }
             // Already in sync → just arm change detection.
             Some(r) if r.content_key() == local_key => {
-                self.layout_keys.insert(pid, local_key);
+                self.layout_keys.insert(pid, local_key.clone());
+                self.layout_synced_keys.insert(pid, local_key);
             }
             // Local is newer, or there's no usable remote doc → push local up.
             _ => {
@@ -13203,12 +13651,8 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let local_auto_names: HashMap<Uuid, String> = local
-            .instances
-            .iter()
-            .filter_map(|instance| instance.auto_name.clone().map(|name| (instance.id, name)))
-            .collect();
         self.backup_local_layout(pid, &local, remote.updated_at);
+        let remote_key = remote.content_key();
 
         // Light teardown: drop the local views (kill the ssh client / local PTY),
         // but don't mutate the layout or dispose worktrees — we replace wholesale.
@@ -13229,7 +13673,7 @@ impl MuxelApp {
 
         let RemoteLayout {
             layout,
-            mut instances,
+            instances,
             mut worktrees,
             updated_at,
             memory_enabled,
@@ -13243,15 +13687,10 @@ impl MuxelApp {
         {
             project.memory_enabled = enabled;
         }
-        for inst in &mut instances {
-            inst.project_id = pid;
-            // auto_name is local observation state and is excluded from layout
-            // conflict detection. A structural pull must not replace a newer
-            // local observation with stale peer JSON.
-            if let Some(name) = local_auto_names.get(&inst.id) {
-                inst.auto_name = Some(name.clone());
-            }
-        }
+        // What this machine observed of each pane (program title, grid, activity) is
+        // its own; a structural pull must not replace it with the peer's.
+        let mut instances = muxel_core::merge_peer_instances(&local.instances, instances, pid);
+        self.bind_peer_sessions(pid, &mut instances);
         for wt in &mut worktrees {
             wt.project_id = pid;
         }
@@ -13267,12 +13706,7 @@ impl MuxelApp {
             p.layout = layout;
             p.layout_updated_at = Some(updated_at);
         }
-        // Re-seed change detection so the adoption itself isn't seen as a change.
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        if let Some(p) = self.workspace.project(pid) {
-            let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
-            self.layout_keys.insert(pid, key);
-        }
+        self.seed_adopted_layout(pid, remote_key);
         self.active_instance = self
             .workspace
             .project(pid)
@@ -14221,10 +14655,53 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Toggle a terminal filling the pane area (transient; not persisted).
+    /// Toggle the pane holding `iid` filling the pane area, its whole tab group
+    /// included (transient; not persisted).
     fn toggle_maximize(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        self.maximized = (self.maximized != Some(iid)).then_some(iid);
+        let unmaximize = self.maximized_group().contains(&iid);
+        self.maximized = (!unmaximize).then_some(iid);
         cx.notify();
+    }
+
+    /// The tabs sharing a pane with the maximized instance: the tab group the
+    /// maximize covers. Empty when nothing is maximized or it left the layout.
+    fn maximized_group(&self) -> Vec<Uuid> {
+        let Some(max) = self.maximized else {
+            return Vec::new();
+        };
+        self.workspace
+            .instance(max)
+            .and_then(|i| self.workspace.project(i.project_id))
+            .and_then(|p| p.layout.as_ref())
+            .and_then(|l| l.tab_group(max))
+            .map(<[Uuid]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// `leaving` tabs are about to leave their panes (closed, dropped by a peer).
+    /// Call before the layout changes, so the maximize can re-anchor on a tab
+    /// that stays (see [`maximize_anchor_after_leave`]).
+    fn release_maximize(&mut self, leaving: &[Uuid]) {
+        let group = self.maximized_group();
+        self.maximized = maximize_anchor_after_leave(self.maximized, &group, leaving);
+    }
+
+    /// Whether the maximized pane, if any, is what a window shows right now: its
+    /// project is the main window's (dashboard closed) or a secondary window's.
+    fn maximize_on_screen(&self) -> bool {
+        let Some(max) = self.maximized else {
+            return false;
+        };
+        let Some(pid) = self.workspace.instance(max).map(|i| i.project_id) else {
+            return false;
+        };
+        let shown = (self.workspace.active_project == Some(pid) && !self.show_dashboard)
+            || self.secondary_windows.iter().any(|s| s.pid == pid);
+        shown
+            && self
+                .workspace
+                .project(pid)
+                .is_some_and(|p| p.instances().contains(&max))
     }
 
     /// Whether `window` is the main muxel window.
@@ -14812,11 +15289,12 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let layout = self.workspace.project(pid).and_then(|p| p.layout.clone());
-        let maximized_here = self.maximized.filter(|id| {
+        let maximized_here = self.maximized.and_then(|max| {
             self.workspace
                 .project(pid)
-                .map(|p| p.instances().contains(id))
-                .unwrap_or(false)
+                .and_then(|p| p.layout.as_ref())
+                .and_then(|l| l.leaf_containing(max))
+                .cloned()
         });
         let failed_remote = self
             .remote_connect_failed
@@ -14825,8 +15303,8 @@ impl MuxelApp {
             .cloned();
         let main_content: AnyElement = if let Some(msg) = failed_remote {
             self.render_remote_connect_failed(pid, &msg, cx)
-        } else if let Some(iid) = maximized_here {
-            self.render_pane(&PaneNode::leaf(iid), cx)
+        } else if let Some(leaf) = maximized_here {
+            self.render_pane(&leaf, cx)
         } else {
             match layout {
                 Some(root) => self.render_pane_root(pid, &root, cx),
@@ -14939,6 +15417,8 @@ impl MuxelApp {
             iid,
         );
         // Remove from the pane tree but KEEP the instance metadata + the view.
+        // The maximize's tab group is read first: a groupmate may inherit it.
+        let max_group = self.maximized_group();
         if let Some(project) = self.workspace.project_mut(pid) {
             remove(&mut project.layout, iid);
         }
@@ -14953,9 +15433,7 @@ impl MuxelApp {
             self.redock_into_layout(iid, pid, redock, cx);
             return;
         };
-        if self.maximized == Some(iid) {
-            self.maximized = None;
-        }
+        self.maximized = maximize_anchor_after_leave(self.maximized, &max_group, &[iid]);
         if self.active_instance == Some(iid) {
             self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
         }
@@ -15177,16 +15655,14 @@ impl MuxelApp {
                 i.worktree_path.clone(),
                 i.worktree_id,
                 i.project_id,
-                i.use_tmux,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id, use_tmux)) = info {
+        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
             self.teardown_closed_instance(
                 iid,
                 project_id,
-                use_tmux,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -15893,28 +16369,112 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Whether the active pane is a code editor (not an agent/terminal). Uses
-    /// the persisted instance kind (authoritative), not the live `editors` map.
-    fn active_is_editor(&self) -> bool {
+    /// Whether the active pane runs a process (an agent/terminal, not an editor,
+    /// diff or browser). Uses the persisted instance kind (authoritative), not the
+    /// live `terminals` map — a tombstoned or failed pane still counts.
+    fn active_is_terminal(&self) -> bool {
         self.active_instance
             .and_then(|iid| self.workspace.instance(iid))
-            .map(|i| i.kind == InstanceKind::Editor)
-            .unwrap_or(false)
+            .is_some_and(|i| i.kind == InstanceKind::Terminal)
     }
 
     fn restart_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.active_instance else {
+        if let Some(active) = self.active_instance {
+            self.restart_agent(active, window, cx);
+        }
+    }
+
+    /// Restart a terminal pane (toolbar Restart, palette, tab menu): stop its
+    /// process *and* its tmux session — a plain respawn would just reattach to the
+    /// old process — then relaunch, so `new-session -A` starts a fresh session and
+    /// a resume-capable agent comes back on its saved conversation (e.g. to pick
+    /// up an updated harness binary). Other programs (shells, …) start over.
+    fn restart_agent(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(inst) = self.workspace.instance(iid) else {
             return;
         };
-        // Editors have no process to restart (restarting would spawn a shell).
-        if self.workspace.instance(active).map(|i| i.kind) == Some(InstanceKind::Editor) {
+        // Editors, diffs and browsers have no process (respawning would put a
+        // shell over them).
+        if inst.kind != InstanceKind::Terminal {
             return;
         }
-        if let Some(view) = self.terminals.remove(&active) {
+        let recorded_session = inst.tmux_session.clone();
+        muxel_store::append_event_log(&format!("restart: \"{}\" [{iid}]", inst.display_name()));
+        self.terminal_launching.remove(&iid);
+        self.failed_launches.remove(&iid);
+        if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
-        self.spawn_terminal(active, window, cx);
-        self.focus_instance(active, window, cx);
+        // Same session resolution and same gate as closing a pane
+        // (`teardown_closed_instance`): the host having tmux, not tmux being its
+        // current default — a default switched off since the pane launched must not
+        // leave the old session running for `new-session -A` to reattach.
+        let remote_host = self
+            .remote_host_for_instance(iid)
+            .filter(|host| !host.os.is_windows());
+        let Some(host) = remote_host else {
+            if let Some(session) = recorded_session {
+                integrations::kill_tmux_session(&session);
+            }
+            self.spawn_terminal(iid, window, cx);
+            self.focus_instance(iid, window, cx);
+            cx.notify();
+            return;
+        };
+        // The session lives on the host: respawn only once it is gone, or
+        // `new-session -A` would reattach the old agent.
+        let session = muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
+        let control_path = Self::control_path_for(host.id);
+        let password = (host.auth == SshAuth::Password)
+            .then(|| self.remote_password(&host))
+            .flatten();
+        let host_name = host.name.clone();
+        let label = session.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let killed = cx
+                .background_executor()
+                .spawn(async move {
+                    integrations::kill_remote_tmux(
+                        &host,
+                        &control_path,
+                        password.as_deref(),
+                        &session,
+                    )
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.workspace.instance(iid).is_none() {
+                    return; // closed while the kill was in flight
+                }
+                // Say so rather than letting it pass as a restart: the respawn below
+                // is `new-session -A`, so a session that survived is *reattached* —
+                // the same agent, looking like a restart that did nothing.
+                if let Err(e) = killed {
+                    this.add_event(
+                        NotifKind::Error,
+                        tf(
+                            "Couldn't restart on “{host}”",
+                            &[("host", &host_name.to_string())],
+                        ),
+                        tf(
+                            "{session} is still running, so the pane reattached to it: {err}",
+                            &[("session", &label), ("err", &format!("{e}"))],
+                        ),
+                    );
+                }
+                // A project restore may have reattached the old session meanwhile.
+                if let Some(view) = this.terminals.remove(&iid) {
+                    view.read(cx).session().kill();
+                }
+                this.spawn_terminal(iid, window, cx);
+                if this.active_instance == Some(iid) {
+                    this.focus_instance(iid, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.focus_instance(iid, window, cx);
         cx.notify();
     }
 
@@ -16811,9 +17371,20 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Focus an instance, switching to its project first if needed.
+    /// Focus an instance, switching to its project first if needed. A maximize on
+    /// screen moves to it (see [`maximize_after_select`]).
     fn select_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
+        let target_pid = self.workspace.instance(iid).map(|i| i.project_id);
+        let target_in_layout = target_pid
+            .and_then(|pid| self.workspace.project(pid))
+            .is_some_and(|p| p.instances().contains(&iid));
+        self.maximized = maximize_after_select(
+            self.maximized,
+            self.maximize_on_screen(),
+            iid,
+            target_in_layout,
+        );
+        if let Some(pid) = target_pid
             && self.workspace.active_project != Some(pid)
         {
             // The target pane is attended below. Do not consume the first pane's
@@ -18164,7 +18735,7 @@ impl MuxelApp {
                 // tab drag or focus change.
                 let sid = iid.simple();
                 let kind = inst.map(|i| i.kind).unwrap_or_default();
-                let max_icon = if self.maximized == Some(iid) {
+                let max_icon = if self.maximized.is_some_and(|m| tabs.contains(&m)) {
                     IconName::Minimize
                 } else {
                     IconName::Maximize
@@ -18368,6 +18939,7 @@ impl MuxelApp {
                         let tab_wt_id = self.workspace.instance(tab).and_then(|i| i.worktree_id);
                         let tab_is_terminal = self.workspace.instance(tab).map(|i| i.kind)
                             == Some(InstanceKind::Terminal);
+                        let tab_resumable = tab_is_terminal && self.resume_capable(tab);
                         let tab_pinned = self
                             .workspace
                             .instance(tab)
@@ -18518,6 +19090,22 @@ impl MuxelApp {
                                                     move |this, _, _w, cx| this.toggle_pin(tab, cx),
                                                 )),
                                         );
+                                    // Relaunch on the saved conversation (resume-capable
+                                    // agents only), e.g. after the harness updates.
+                                    let menu = if tab_resumable {
+                                        menu.item(
+                                            PopupMenuItem::new(t("Restart agent"))
+                                                .icon(IconName::Play)
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.restart_agent(tab, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                    } else {
+                                        menu
+                                    };
                                     // Clear scrollback (terminals only).
                                     let menu = if tab_is_terminal {
                                         menu.item(
@@ -21172,7 +21760,7 @@ impl MuxelApp {
                 Button::new("restart")
                     .ghost()
                     .icon(IconName::Play)
-                    .disabled(self.active_is_editor())
+                    .disabled(!self.active_is_terminal())
                     .tooltip(t("Restart agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.restart_active(window, cx))),
             )
@@ -22922,6 +23510,8 @@ impl MuxelApp {
         self.settings_ui.s_forward_agent = h.forward_agent;
         self.settings_ui.s_compression = h.compression;
         self.settings_ui.s_use_tmux = h.default_use_tmux;
+        self.settings_ui.s_remote_os = h.os;
+        self.settings_ui.s_windows_shell = h.windows_shell;
         let set =
             |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
                 inp.update(cx, |s, cx| s.set_value(v, window, cx));
@@ -23033,6 +23623,8 @@ impl MuxelApp {
         let forward_agent = ui.s_forward_agent;
         let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
+        let remote_os = ui.s_remote_os;
+        let windows_shell = ui.s_windows_shell;
         let identity_id = ui.s_identity_id;
         let host_id = self.remotes.get(idx).map(|h| h.id);
         if let Some(h) = self.remotes.get_mut(idx) {
@@ -23051,6 +23643,8 @@ impl MuxelApp {
             h.keepalive_secs = keepalive;
             h.extra_options = extra;
             h.default_use_tmux = use_tmux;
+            h.os = remote_os;
+            h.windows_shell = windows_shell;
             h.identity_id = identity_id;
         }
         if let Some(id) = host_id {
@@ -26553,7 +27147,41 @@ impl MuxelApp {
         let forward = ui.s_forward_agent;
         let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
+        let remote_os = ui.s_remote_os;
+        let win_shell = ui.s_windows_shell;
+        let os_btn = |label: &'static str, val: RemoteOs, id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .selected(remote_os == val)
+                .label(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.settings_ui.s_remote_os = val;
+                    cx.notify();
+                }))
+        };
+        let shell_btn = |label: &'static str, val: WindowsShell, id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .selected(win_shell == val)
+                .label(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.settings_ui.s_windows_shell = val;
+                    cx.notify();
+                }))
+        };
         form = form
+            .child(self.settings_label(&t("Remote operating system"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(os_btn(
+                        "Unix (Linux/macOS)",
+                        RemoteOs::Unix,
+                        "remote-os-unix",
+                    ))
+                    .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
+            )
             .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_jump)))
             .child(
@@ -26577,8 +27205,37 @@ impl MuxelApp {
                         })),
                     &t("Enable compression (-C) — helps on slow or high-latency links"),
                 ),
-            )
-            .child(
+            );
+
+        // Persistence and the pane shell are the two places the families really
+        // differ, so the form asks a different question for each.
+        if remote_os == RemoteOs::Windows {
+            form = form
+                .child(self.settings_label(&t("Pane shell"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(shell_btn(
+                            "PowerShell",
+                            WindowsShell::PowerShell,
+                            "win-shell-ps",
+                        ))
+                        .child(shell_btn("pwsh 7+", WindowsShell::Pwsh, "win-shell-pwsh"))
+                        .child(shell_btn("cmd.exe", WindowsShell::Cmd, "win-shell-cmd")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t(
+                            "Windows has no tmux, so a pane here lasts as long as its SSH \
+                     connection. On reconnect muxel relaunches the pane and the agent \
+                     resumes its saved conversation.",
+                        )),
+                );
+        } else {
+            form = form.child(
                 self.check_row(
                     Checkbox::new("remote-tmux")
                         .checked(use_tmux)
@@ -26588,7 +27245,10 @@ impl MuxelApp {
                         })),
                     &t("Run remote panes in a persistent tmux session (survives disconnects)"),
                 ),
-            )
+            );
+        }
+
+        form = form
             .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_strict)))
             .child(self.settings_label(
@@ -27359,12 +28019,14 @@ impl Render for MuxelApp {
             .unwrap_or_default();
         let active_layout = self.workspace.active().and_then(|p| p.layout.clone());
 
-        // A maximized terminal (in the active project) fills the pane area.
-        let maximized_here = self.maximized.filter(|id| {
+        // A maximized pane (in the active project) fills the pane area, its whole
+        // tab group included so the other tabs stay one click away.
+        let maximized_here = self.maximized.and_then(|max| {
             self.workspace
                 .active()
-                .map(|p| p.instances().contains(id))
-                .unwrap_or(false)
+                .and_then(|p| p.layout.as_ref())
+                .and_then(|l| l.leaf_containing(max))
+                .cloned()
         });
         let failed_remote = self.workspace.active_project.and_then(|pid| {
             self.remote_connect_failed
@@ -27376,8 +28038,8 @@ impl Render for MuxelApp {
             self.render_dashboard(cx)
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
-        } else if let Some(iid) = maximized_here {
-            self.render_pane(&PaneNode::leaf(iid), cx)
+        } else if let Some(leaf) = maximized_here {
+            self.render_pane(&leaf, cx)
         } else {
             match (active_layout, self.workspace.active_project) {
                 (Some(root), Some(pid)) => self.render_pane_root(pid, &root, cx),

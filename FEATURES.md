@@ -33,7 +33,12 @@ feature is added or changed, update the matching entry here in the same change**
   positions.
 - **Per-project focus** — switching away from a project and back restores the
   pane that was last focused there, falling back safely if that pane was removed.
-- **Maximize** — temporarily expand one pane to fill the work area.
+- **Maximize** — temporarily expand one pane to fill the work area. The whole tab
+  group comes along: every tab stays in the tab bar and switching tabs keeps the
+  pane maximized, as does closing or popping out the tab being shown while others
+  remain. While a pane is maximized, selecting another agent (sidebar,
+  notification, tray) moves the maximize to it, so that agent comes up full-size
+  instead of hiding behind.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 
@@ -60,10 +65,16 @@ feature is added or changed, update the matching entry here in the same change**
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when
   dragged past unpinned tabs.
-- **Tab context menu** — right-click a tab to Rename, Duplicate, Pin/Unpin, Close
-  tabs to the left / right, Close others, or Close. Duplicate clears copied
-  conversation state so a harness can mint a new session instead of deliberately
-  resuming the source.
+- **Tab context menu** — right-click a tab to Rename, Duplicate, Pin/Unpin, Restart
+  agent, Close tabs to the left / right, Close others, or Close. Duplicate clears
+  copied conversation state so a harness can mint a new session instead of
+  deliberately resuming the source. **Restart agent** (resume-capable agents only)
+  does what the toolbar Restart does for that tab.
+- **Restart** — the toolbar Restart (also the tab menu's *Restart agent* and the
+  palette's *Restart agent*) stops the pane's process *and* its tmux session,
+  local or remote, then relaunches in place in a fresh session. A resume-capable
+  agent comes back on its saved conversation, so an updated harness binary takes
+  effect without losing it; a shell or other program starts over.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -442,7 +453,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
-  (plus a desktop notification when unattended), and Restart relaunches in place.
+  (plus a desktop notification when unattended), and Restart relaunches in place
+  (resuming a resume-capable agent's conversation).
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
   is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
@@ -581,6 +593,12 @@ feature is added or changed, update the matching entry here in the same change**
   ("Close terminal?", "Close other tabs?") opens in the window showing that
   pane, and raises it, so the prompt is never stranded on another monitor.
 - **No auto-created project** — start empty; add projects via a folder picker.
+- **No duplicate projects** — opening a folder that's already a project in this
+  workspace is refused with an “already open” error instead of adding a second
+  copy. The same goes for remote projects (same host + directory): the
+  new-remote-project wizard stays open and says so inline. Symlinked or
+  trailing-slash spellings of the same path count as the same project, and on
+  Windows hosts so do differences in case or separator.
 - **Startup agents** — save the project's open agents as a startup set (preset +
   worktree flag) and relaunch them in one click from the project menu.
 
@@ -593,12 +611,36 @@ feature is added or changed, update the matching entry here in the same change**
   settings.
 - **Running agents are picked back up** — opening a remote project looks for muxel
   tmux sessions still alive on the host in that project's tree, and re-attaches a
-  pane to any the workspace no longer has an instance for. An agent whose pane was
-  closed (or whose workspace was lost) keeps running on the host with nothing
-  pointing at it; this brings it back mid-conversation, exactly where it was,
-  rather than starting a second one beside it. It adopts only muxel's own sessions,
-  only within the project, and never one a pane already owns — your own tmux is left
+  pane to any the workspace no longer has an instance for. An agent whose workspace
+  was lost keeps running on the host with nothing pointing at it; this brings it
+  back mid-conversation, exactly where it was, rather than starting a second one
+  beside it. It adopts only muxel's own sessions, only within the project, and never
+  one a pane already owns or one you deliberately closed — your own tmux is left
   alone.
+- **Closing a remote agent really stops it** — closing a remote pane kills its tmux
+  session on the host, and muxel *confirms* the session is gone rather than assuming
+  the kill landed. A kill that fails (a blip, a control socket that went down with
+  the pane's own ssh, a host that is briefly unreachable) is retried over the
+  following half-minute, and anything still unfinished is finished on the next
+  connect to that host — aimed at the session's real name, even if the host has been
+  renamed since. Until it is confirmed dead, the close is remembered, so a session
+  whose kill is still in flight is never adopted back into a pane: a closed agent
+  stays closed across a muxel restart. Unconfirmed closes are listed in the
+  developer log.
+- **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
+  speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
+  layout sync, the memory file, project scan, remote git, and the connection test
+  all work the same as on a Linux host. Every command muxel sends is encoded so it
+  reads identically whether the host's OpenSSH `DefaultShell` is `cmd.exe` (the
+  Windows default) or PowerShell — there is nothing to configure on the far side
+  beyond enabling the SSH server. Interactive panes run PowerShell, pwsh 7+, or
+  `cmd.exe`, chosen per host, and load your profile so agents installed by npm or
+  winget are on `PATH`.
+  The one real difference: Windows has no tmux, so a pane there lasts as long as
+  its SSH connection rather than outliving it. On reconnect muxel relaunches the
+  pane and the agent resumes its saved conversation, so the thread survives even
+  though the process does not — and the tmux options are hidden for Windows hosts
+  rather than offered and quietly ignored.
 - **Scan for remote projects** — in the new-remote-project wizard, "Scan for
   projects" searches the host for existing muxel projects (`.muxel/workspace.json`
   markers, heavy dirs pruned) and lists the found roots; clicking one fills in the
@@ -659,16 +701,23 @@ feature is added or changed, update the matching entry here in the same change**
   still-running agents). muxel pushes the layout as you rearrange panes and, on
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
   kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required. **Renaming a pane** also syncs live between peers: while connected,
-  each side re-reads the shared file every few seconds and adopts a peer's renamed
-  pane label in place (no teardown), so a rename on desktop or iOS shows up on both.
-  (Structural changes — adding/removing panes — still reconcile on the next connect.)
+  setup required. **Changes sync live**: while connected, each side re-reads the
+  shared file every few seconds and applies a peer's changes in place — panes a peer
+  adds appear, attached to their running tmux sessions; panes it closes go away;
+  renames carry over — without restarting any pane both sides share. Only real
+  layout changes are pushed: a pane's size and agent status are per-machine and never
+  trigger one. A failing push is reported once (not on every retry) and retried in
+  the background.
 - **Shareable local projects** — a *local* project also mirrors its layout to
   `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
   so its panes are tmux sessions a peer can attach to. The iOS companion app can
   then SSH into the machine, read that file, and bring up / drive the same panes —
   the desktop didn't need to be opened as a "remote" project. The shared
   `tmux_session` name keeps a pane addressing the same session from either side.
+  Panes a peer creates over SSH — the iOS app, or muxel on another machine that
+  opened this one as a remote project — show up in the local window within a few
+  seconds, attached to the peer's tmux session (found by the pane id at the end of
+  the session name when the peer didn't record one).
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**

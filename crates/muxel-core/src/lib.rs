@@ -12,12 +12,14 @@ mod gui_path;
 pub mod locale;
 pub mod memory;
 mod pane;
+pub mod remote_ops;
 mod shell;
 pub mod ssh;
 pub mod stt;
 pub mod tmux;
 pub mod tts;
 pub mod url;
+pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
@@ -44,7 +46,7 @@ pub use url::{normalize_url, same_resource_url};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 pub use uuid::Uuid;
 
 /// What a pane holds. Defaults to `Terminal` so instances persisted before
@@ -713,6 +715,31 @@ pub enum SshAuth {
     Password,
 }
 
+/// The operating system on the far side of an SSH connection.
+///
+/// muxel builds every remote command as a shell line, and the two families share
+/// no vocabulary: `test -f` against `Test-Path`, `mkdir -p` against `New-Item`,
+/// POSIX single-quoting against PowerShell's. A host therefore has to say which
+/// it is — there is no probe cheap or reliable enough to do it per command, and
+/// guessing wrong produces confusing half-failures rather than a clean error.
+///
+/// `Unix` is the default and the serde fallback, so every host saved before this
+/// existed keeps its exact current behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteOs {
+    /// Linux, macOS, BSD — anything with a POSIX shell.
+    #[default]
+    Unix,
+    /// Windows reached through its OpenSSH server.
+    Windows,
+}
+
+impl RemoteOs {
+    pub fn is_windows(self) -> bool {
+        self == RemoteOs::Windows
+    }
+}
+
 /// A saved SSH remote host: connection settings for remote development. The
 /// password (when `auth == Password`) is stored in the OS keychain keyed by `id`,
 /// never in this struct.
@@ -757,9 +784,18 @@ pub struct RemoteHost {
     /// Extra raw `-o KEY=VALUE` ssh options.
     #[serde(default)]
     pub extra_options: Vec<String>,
-    /// Default new remote panes here to a persistent tmux session.
+    /// Default new remote panes here to a persistent tmux session. Ignored for
+    /// [`RemoteOs::Windows`] hosts, which have no tmux — see [`Self::use_tmux`].
     #[serde(default = "default_true")]
     pub default_use_tmux: bool,
+    /// Which OS is on the far side. Decides the entire remote command vocabulary.
+    #[serde(default)]
+    pub os: RemoteOs,
+    /// Shell an interactive pane runs on a Windows host. Unused when `os` is Unix
+    /// (that side asks the host for `$SHELL`), and never used for muxel's own
+    /// commands, which always go through `powershell.exe`.
+    #[serde(default)]
+    pub windows_shell: crate::winshell::WindowsShell,
 }
 
 impl RemoteHost {
@@ -778,6 +814,8 @@ impl RemoteHost {
             strict_host_key: String::new(),
             keepalive_secs: None,
             compression: false,
+            os: RemoteOs::default(),
+            windows_shell: crate::winshell::WindowsShell::default(),
             extra_options: Vec::new(),
             default_use_tmux: true,
         }
@@ -789,6 +827,18 @@ impl RemoteHost {
     /// fields are used unchanged. `id`, `identity_id`, and every transport field
     /// (port, jump, keepalive, extra options, …) are preserved — so the argv builders
     /// in [`crate::ssh`] and the per-host ControlMaster socket keep working verbatim.
+    /// Whether a pane on this host should run inside tmux, given the instance's
+    /// own preference.
+    ///
+    /// The single gate for the decision, because Windows has no tmux and a stray
+    /// `true` there produces a pane that dies on `tmux: command not found`. A
+    /// host saved as Unix with tmux on and later switched to Windows keeps that
+    /// stale `true` on disk, and an `Instance` carries its own flag as well — so
+    /// this answers for both rather than trusting either.
+    pub fn use_tmux(&self, instance_prefers: bool) -> bool {
+        !self.os.is_windows() && (self.default_use_tmux || instance_prefers)
+    }
+
     pub fn effective(&self, identities: &[Identity]) -> RemoteHost {
         let mut h = self.clone();
         if let Some(iid) = self.identity_id
@@ -851,6 +901,22 @@ pub struct RemoteRef {
     pub remote_root: String,
 }
 
+/// A remote root in comparable form: no trailing separator, and on Windows hosts
+/// `\`-separated and lowercased (their paths are case- and separator-blind).
+fn normalize_remote_root(root: &str, os: RemoteOs) -> String {
+    let root = root.trim();
+    match os {
+        RemoteOs::Unix => root.trim_end_matches('/').to_string(),
+        RemoteOs::Windows => root
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase(),
+    }
+}
+
+/// How many unconfirmed closes a project keeps. See [`Project::remember_closed_session`].
+const MAX_CLOSED_SESSIONS: usize = 64;
+
 /// A project: a named workspace rooted at a directory, with a pane layout.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -882,6 +948,12 @@ pub struct Project {
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
     #[serde(default)]
     pub layout_updated_at: Option<u64>,
+    /// Panes closed on this project's host whose tmux session muxel has not yet
+    /// confirmed dead. Persisted because the confirmation may have to wait for the
+    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// the synced layout doc.
+    #[serde(default)]
+    pub closed_sessions: Vec<tmux::ClosedSession>,
 }
 
 /// One agent in a project's saved startup set.
@@ -908,12 +980,40 @@ impl Project {
             remote: None,
             memory_enabled: false,
             layout_updated_at: None,
+            closed_sessions: Vec::new(),
         }
     }
 
     /// Whether this project runs on a remote host over SSH.
     pub fn is_remote(&self) -> bool {
         self.remote.is_some()
+    }
+
+    /// Remember that `session` was closed and must not come back as a pane until
+    /// the host confirms it is gone. Idempotent per instance: closing, failing to
+    /// confirm, and closing again leaves one entry.
+    ///
+    /// Capped, oldest first: a host that is never reachable again would otherwise
+    /// grow the ledger without bound, and an entry that old has long stopped
+    /// protecting anything — its instance is gone from the workspace.
+    pub fn remember_closed_session(&mut self, session: String, instance: Uuid) {
+        self.closed_sessions.retain(|c| c.instance != instance);
+        self.closed_sessions.push(tmux::ClosedSession {
+            name: session,
+            instance,
+        });
+        let over = self
+            .closed_sessions
+            .len()
+            .saturating_sub(MAX_CLOSED_SESSIONS);
+        self.closed_sessions.drain(..over);
+    }
+
+    /// Forget a close whose session the host has confirmed gone.
+    pub fn forget_closed_session(&mut self, instance: Uuid) -> bool {
+        let before = self.closed_sessions.len();
+        self.closed_sessions.retain(|c| c.instance != instance);
+        self.closed_sessions.len() != before
     }
 
     /// All instance ids referenced by this project's layout.
@@ -1039,6 +1139,30 @@ impl Workspace {
             self.active_project = Some(id);
         }
         id
+    }
+
+    /// The local project already rooted at `root`, if any, so opening the same
+    /// folder twice can be refused. Symlinked / trailing-separator spellings match.
+    pub fn local_project_at(&self, root: &Path) -> Option<&Project> {
+        self.projects
+            .iter()
+            .find(|p| !p.is_remote() && agent::paths_loosely_equal(&p.root_path, root))
+    }
+
+    /// The remote project already open at `remote_root` on `host_id`, if any,
+    /// compared per the host's path rules (see [`normalize_remote_root`]).
+    pub fn remote_project_at(
+        &self,
+        host_id: Uuid,
+        remote_root: &str,
+        os: RemoteOs,
+    ) -> Option<&Project> {
+        let want = normalize_remote_root(remote_root, os);
+        self.projects.iter().find(|p| {
+            p.remote.as_ref().is_some_and(|r| {
+                r.host_id == host_id && normalize_remote_root(&r.remote_root, os) == want
+            })
+        })
     }
 
     /// Move project `id` one slot toward the front (`up`) or back of the sidebar
@@ -1204,28 +1328,101 @@ impl RemoteLayout {
     /// ignores `version`/`updated_at`, for "did anything change" and "are these in
     /// sync" checks. Relies on [`capture`](Self::capture)'s canonical ordering and
     /// serde_json's deterministic (sorted-key) object encoding.
+    ///
+    /// Per-machine state is left out, so it never reads as a layout change: the
+    /// owning project's id (every machine has its own id for the same project) and
+    /// what this machine observes of a pane — its program-supplied title, terminal
+    /// grid and agent activity. Counting those pushed the layout on every resize
+    /// and agent turn, and made two peers look out of sync when nothing differed.
     pub fn content_key(&self) -> String {
-        // Program-supplied titles are local display state. Retitling an active
-        // agent must not schedule a remote layout push.
         let instances: Vec<Instance> = self
             .instances
             .iter()
             .cloned()
             .map(|mut instance| {
+                instance.project_id = Uuid::nil();
                 instance.auto_name = None;
+                instance.grid = None;
+                instance.activity = AgentActivity::default();
                 instance
+            })
+            .collect();
+        let worktrees: Vec<Worktree> = self
+            .worktrees
+            .iter()
+            .cloned()
+            .map(|mut worktree| {
+                worktree.project_id = Uuid::nil();
+                worktree
             })
             .collect();
         serde_json::json!({
             "layout": self.layout.as_ref().map(pane::SemanticPane),
             "instances": instances,
-            "worktrees": self.worktrees,
+            "worktrees": worktrees,
             // In the key, so flipping the toggle counts as a change and is pushed to
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
         })
         .to_string()
     }
+}
+
+/// What a live poll should do with the shared `.muxel/workspace.json` it just read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerLayoutAction {
+    /// Nothing new: the file is what this machine last wrote or adopted.
+    Ignore,
+    /// The file already matches this machine's layout.
+    InSync,
+    /// A peer wrote a different layout; apply it.
+    Adopt,
+}
+
+/// Decide a live poll from content keys ([`RemoteLayout::content_key`]) and
+/// revisions (`updated_at`). `synced` is the key of the file as this machine last
+/// wrote or adopted it, so a file with any other key was written by a peer (the
+/// iOS app, or muxel on another machine). The peer's layout is adopted unless this
+/// machine also has a change it hasn't pushed yet (`local` differs from `synced`)
+/// that is at least as new — then that pending push wins, the same newer-wins rule
+/// as the connect-time sync.
+pub fn peer_layout_action(
+    remote_key: &str,
+    remote_rev: u64,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> PeerLayoutAction {
+    if remote_key == local_key {
+        PeerLayoutAction::InSync
+    } else if synced == Some(remote_key) || (synced != Some(local_key) && remote_rev <= local_rev) {
+        PeerLayoutAction::Ignore
+    } else {
+        PeerLayoutAction::Adopt
+    }
+}
+
+/// A peer layout's instances as this machine should hold them: every one the peer
+/// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
+/// pane this machine already has — keeping what this machine observed of it (its
+/// program-supplied title, terminal grid and agent activity), which is per-machine
+/// and never part of the shared content.
+pub fn merge_peer_instances(
+    local: &[Instance],
+    peer: Vec<Instance>,
+    project_id: Uuid,
+) -> Vec<Instance> {
+    peer.into_iter()
+        .map(|mut instance| {
+            instance.project_id = project_id;
+            if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
+                instance.auto_name = mine.auto_name.clone();
+                instance.grid = mine.grid;
+                instance.activity = mine.activity.clone();
+            }
+            instance
+        })
+        .collect()
 }
 
 /// Drop instances that duplicate another one — the same id twice, or a second
@@ -2499,6 +2696,53 @@ mod settings_tests {
 }
 
 #[cfg(test)]
+mod closed_session_tests {
+    use super::{MAX_CLOSED_SESSIONS, Project};
+    use uuid::Uuid;
+
+    #[test]
+    fn closing_the_same_pane_twice_leaves_one_entry() {
+        let mut p = Project::new("app", "/srv/app");
+        let iid = Uuid::new_v4();
+        p.remember_closed_session("muxel_app_1".into(), iid);
+        p.remember_closed_session("muxel_app_1".into(), iid);
+        assert_eq!(p.closed_sessions.len(), 1);
+        assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
+        assert!(p.closed_sessions.is_empty());
+        assert!(
+            !p.forget_closed_session(iid),
+            "and clearing twice is a no-op"
+        );
+    }
+
+    /// A host that never comes back must not grow the ledger without bound; the
+    /// newest closes — the ones whose panes could still be adopted back — survive.
+    #[test]
+    fn the_ledger_is_capped_oldest_first() {
+        let mut p = Project::new("app", "/srv/app");
+        let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
+            .map(|n| {
+                let iid = Uuid::new_v4();
+                p.remember_closed_session(format!("muxel_app_{n}"), iid);
+                iid
+            })
+            .collect();
+        let last = *ids.last().unwrap();
+        assert_eq!(p.closed_sessions.len(), MAX_CLOSED_SESSIONS);
+        assert_eq!(p.closed_sessions.last().unwrap().instance, last);
+    }
+
+    /// Old `workspace.json` files predate the ledger and must still load.
+    #[test]
+    fn a_project_without_the_field_still_loads() {
+        let mut v = serde_json::to_value(Project::new("app", "/srv/app")).unwrap();
+        v.as_object_mut().unwrap().remove("closed_sessions");
+        let p: Project = serde_json::from_value(v).unwrap();
+        assert!(p.closed_sessions.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod remote_layout_tests {
     use super::*;
 
@@ -2656,6 +2900,172 @@ mod remote_layout_tests {
         ws.instances[0].custom_name = Some("My title".into());
         let renamed = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(original.content_key(), renamed.content_key());
+    }
+
+    #[test]
+    fn content_key_ignores_per_machine_state() {
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let wt = worktree(proj.id, "swift-pine", 0);
+        let mut instance = Instance::shell(proj.id);
+        instance.worktree_id = Some(wt.id);
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![instance.id],
+            active: 0,
+        }));
+        ws.instances = vec![instance];
+        ws.worktrees = vec![wt];
+        ws.projects = vec![proj.clone()];
+        let original = RemoteLayout::capture(&proj, &ws, 1);
+
+        // A resize and an agent turn are this machine's observation, not layout.
+        ws.instances[0].grid = Some((120, 40));
+        ws.instances[0].activity.completed_at = Some(1_700_000_000);
+        ws.instances[0].activity.last_state = Some(AgentActivityState::Done);
+        let observed = RemoteLayout::capture(&proj, &ws, 1);
+        assert_eq!(original.content_key(), observed.content_key());
+
+        // The same project on another machine carries that machine's project id.
+        let mut peer = original.clone();
+        let other = Uuid::new_v4();
+        peer.instances.iter_mut().for_each(|i| i.project_id = other);
+        peer.worktrees.iter_mut().for_each(|w| w.project_id = other);
+        assert_eq!(original.content_key(), peer.content_key());
+    }
+
+    #[test]
+    fn peer_layout_action_adopts_only_peer_writes() {
+        use PeerLayoutAction::{Adopt, Ignore, InSync};
+        // Same content either way: nothing to apply, just record it.
+        assert_eq!(peer_layout_action("a", 5, Some("x"), "a", 9), InSync);
+        // Our own last write (or what we last adopted) is not news.
+        assert_eq!(peer_layout_action("a", 5, Some("a"), "b", 9), Ignore);
+        // A peer wrote while nothing is pending here: adopt, whatever its clock says.
+        assert_eq!(peer_layout_action("p", 1, Some("a"), "a", 9), Adopt);
+        // Both sides changed: the newer one wins.
+        assert_eq!(peer_layout_action("p", 10, Some("a"), "b", 9), Adopt);
+        assert_eq!(peer_layout_action("p", 9, Some("a"), "b", 9), Ignore);
+        // Nothing recorded yet: only a strictly newer peer layout is taken.
+        assert_eq!(peer_layout_action("p", 10, None, "b", 9), Adopt);
+        assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
+    }
+
+    #[test]
+    fn merge_peer_instances_keeps_local_observation() {
+        let local_pid = Uuid::new_v4();
+        let mut kept = Instance::shell(local_pid);
+        kept.grid = Some((100, 30));
+        kept.auto_name = Some("Fixing tests".into());
+        kept.activity.last_state = Some(AgentActivityState::Working);
+        let closed = Instance::shell(local_pid);
+
+        let peer_pid = Uuid::new_v4();
+        let mut peer_kept = kept.clone();
+        peer_kept.project_id = peer_pid;
+        peer_kept.grid = Some((40, 20));
+        peer_kept.auto_name = None;
+        peer_kept.activity = AgentActivity::default();
+        peer_kept.custom_name = Some("Reviewer".into());
+        let mut added = Instance::shell(peer_pid);
+        added.tmux_session = Some("muxel_proj_12345678".into());
+
+        let merged = merge_peer_instances(
+            &[kept.clone(), closed.clone()],
+            vec![peer_kept, added.clone()],
+            local_pid,
+        );
+        // The pane the peer closed is gone; the rest belong to this project.
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|i| i.project_id == local_pid));
+        assert!(merged.iter().all(|i| i.id != closed.id));
+
+        let k = merged.iter().find(|i| i.id == kept.id).unwrap();
+        assert_eq!(k.custom_name.as_deref(), Some("Reviewer")); // shared: the peer's
+        assert_eq!(k.grid, Some((100, 30))); // per-machine: ours
+        assert_eq!(k.auto_name.as_deref(), Some("Fixing tests"));
+        assert_eq!(k.activity.last_state, Some(AgentActivityState::Working));
+
+        let a = merged.iter().find(|i| i.id == added.id).unwrap();
+        assert_eq!(a.tmux_session, added.tmux_session);
+    }
+
+    /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
+    /// its coding keys (no `pane_id`).
+    fn as_ios_pane(node: &mut serde_json::Value) {
+        const IOS_KEYS: [&str; 7] = [
+            "kind",
+            "tabs",
+            "active",
+            "instance",
+            "direction",
+            "sizes",
+            "children",
+        ];
+        if let Some(obj) = node.as_object_mut() {
+            obj.retain(|k, _| IOS_KEYS.contains(&k.as_str()));
+            if let Some(children) = obj.get_mut("children").and_then(|c| c.as_array_mut()) {
+                children.iter_mut().for_each(as_ios_pane);
+            }
+        }
+    }
+
+    #[test]
+    fn ios_write_back_is_not_a_layout_change() {
+        // The iOS app's models have no `grid`, `activity` or leaf `pane_id`, so every
+        // layout it writes back drops them. That must read as the same layout here —
+        // or each phone save would look like a peer change — and adopting it must
+        // keep this machine's own grid and activity.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let mut a = Instance::shell(proj.id);
+        a.grid = Some((120, 40));
+        a.activity.last_state = Some(AgentActivityState::Working);
+        a.tmux_session = Some("muxel_studio_1a2b3c4d".into());
+        let b = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![1.0, 1.0],
+            children: vec![
+                PaneNode::Leaf(LeafData {
+                    pane_id: Uuid::new_v4(),
+                    tabs: vec![a.id],
+                    active: 0,
+                }),
+                PaneNode::Leaf(LeafData {
+                    pane_id: Uuid::new_v4(),
+                    tabs: vec![b.id],
+                    active: 0,
+                }),
+            ],
+        });
+        ws.instances = vec![a.clone(), b];
+        ws.projects = vec![proj.clone()];
+        let desktop = RemoteLayout::capture(&proj, &ws, 10);
+
+        // The same document as the iOS encoder writes it.
+        let mut doc: serde_json::Value = serde_json::from_str(&desktop.to_json()).unwrap();
+        for inst in doc["instances"].as_array_mut().unwrap() {
+            let inst = inst.as_object_mut().unwrap();
+            inst.remove("grid");
+            inst.remove("activity");
+        }
+        as_ios_pane(&mut doc["layout"]);
+        doc["updated_at"] = 11.into();
+        let ios = RemoteLayout::parse(&doc.to_string(), "/local/proj").expect("iOS doc parses");
+
+        let key = desktop.content_key();
+        assert_eq!(ios.content_key(), key);
+        assert_eq!(
+            peer_layout_action(&ios.content_key(), 11, Some(key.as_str()), &key, 10),
+            PeerLayoutAction::InSync
+        );
+
+        let merged = merge_peer_instances(&ws.instances, ios.instances, proj.id);
+        let a2 = merged.iter().find(|i| i.id == a.id).unwrap();
+        assert_eq!(a2.grid, Some((120, 40)));
+        assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
+        assert_eq!(a2.tmux_session, a.tmux_session);
     }
 
     #[test]
@@ -2837,8 +3247,74 @@ mod project_order_tests {
 }
 
 #[cfg(test)]
+mod open_project_tests {
+    use super::{Project, RemoteOs, RemoteRef, Uuid, Workspace};
+    use std::path::Path;
+
+    fn remote(host_id: Uuid, root: &str) -> Project {
+        let mut p = Project::new("r", root);
+        p.remote = Some(RemoteRef {
+            host_id,
+            remote_root: root.to_string(),
+        });
+        p
+    }
+
+    #[test]
+    fn local_project_at_matches_the_same_folder() {
+        let dir = std::env::temp_dir();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(Project::new("tmp", &dir));
+        assert_eq!(ws.local_project_at(&dir).map(|p| p.id), Some(id));
+        // Missing-on-disk paths fall back to a trailing-separator-blind compare.
+        let gone = ws.add_project(Project::new("gone", "/muxel-nope/proj"));
+        assert_eq!(
+            ws.local_project_at(Path::new("/muxel-nope/proj/"))
+                .map(|p| p.id),
+            Some(gone)
+        );
+        assert!(
+            ws.local_project_at(Path::new("/muxel-nope/other"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_project_at_ignores_remote_projects() {
+        // A remote project's root_path is cosmetic; it must not block a local open.
+        let mut ws = Workspace::default();
+        ws.add_project(remote(Uuid::new_v4(), "/muxel-nope/srv"));
+        assert!(ws.local_project_at(Path::new("/muxel-nope/srv")).is_none());
+    }
+
+    #[test]
+    fn remote_project_at_matches_host_and_root() {
+        let host = Uuid::new_v4();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(remote(host, "/home/me/app"));
+        let found = |h, root: &str| ws.remote_project_at(h, root, RemoteOs::Unix).map(|p| p.id);
+        assert_eq!(found(host, "/home/me/app"), Some(id));
+        assert_eq!(found(host, "/home/me/app/"), Some(id));
+        // Unix paths are case-sensitive; other hosts are other projects.
+        assert_eq!(found(host, "/home/me/App"), None);
+        assert_eq!(found(Uuid::new_v4(), "/home/me/app"), None);
+    }
+
+    #[test]
+    fn remote_project_at_is_case_and_separator_blind_on_windows() {
+        let host = Uuid::new_v4();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(remote(host, r"C:\Users\me\app"));
+        let found = ws
+            .remote_project_at(host, "c:/users/ME/app/", RemoteOs::Windows)
+            .map(|p| p.id);
+        assert_eq!(found, Some(id));
+    }
+}
+
+#[cfg(test)]
 mod identity_tests {
-    use super::{Identity, RemoteHost, SshAuth};
+    use super::{Identity, RemoteHost, RemoteOs, SshAuth};
     use std::path::PathBuf;
 
     fn host_referencing(id: uuid::Uuid) -> RemoteHost {
@@ -2857,6 +3333,45 @@ mod identity_tests {
         i.auth = SshAuth::Key;
         i.identity_file = Some(PathBuf::from("/keys/id_ed25519"));
         i
+    }
+
+    /// A host saved before Windows support existed must load as Unix and keep
+    /// its exact behavior — the back-compat rule for every persisted struct.
+    #[test]
+    fn host_saved_without_an_os_field_loads_as_unix() {
+        let json = r#"{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "dev",
+            "hostname": "example.com",
+            "user": "ryan",
+            "auth": "Agent",
+            "default_use_tmux": true
+        }"#;
+        let h: RemoteHost = serde_json::from_str(json).unwrap();
+        assert_eq!(h.os, RemoteOs::Unix);
+        assert_eq!(h.windows_shell, crate::winshell::WindowsShell::PowerShell);
+        // And the tmux decision it had before is untouched.
+        assert!(h.use_tmux(false));
+    }
+
+    #[test]
+    fn host_os_round_trips() {
+        let mut h = RemoteHost::new("win", "win.example.com");
+        h.os = RemoteOs::Windows;
+        h.windows_shell = crate::winshell::WindowsShell::Pwsh;
+        let back: RemoteHost = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!(back.os, RemoteOs::Windows);
+        assert_eq!(back.windows_shell, crate::winshell::WindowsShell::Pwsh);
+    }
+
+    /// Switching a host to Windows must not have to also clear `default_use_tmux`
+    /// — the gate answers for the stale value.
+    #[test]
+    fn windows_host_ignores_a_stale_saved_tmux_preference() {
+        let mut h = RemoteHost::new("win", "w");
+        h.default_use_tmux = true;
+        h.os = RemoteOs::Windows;
+        assert!(!h.use_tmux(true));
     }
 
     #[test]

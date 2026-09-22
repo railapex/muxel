@@ -5,6 +5,107 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-22
+
+### Fixed
+- **A remote agent you close stays closed** — closing a remote pane told the host to
+  kill the pane's tmux session and never checked the result, and that one instruction
+  cannot answer the question on its own: it fails the same way whether the session was
+  already gone or the request never landed at all. A kill that lost a race with the
+  connection the pane was tearing down, or hit a brief network blip, left the agent
+  running on the host with nothing pointing at it — and the next time muxel connected
+  to that host it found a muxel session no pane owned and adopted it straight back into
+  a pane. The close looked like it had worked right up until muxel restarted and undid
+  it. muxel now confirms with the host that the session is really gone. A close it
+  cannot confirm is remembered and retried over the following half-minute, and anything
+  still unfinished is finished on the next connect to that host, aimed at the session's
+  real name even if you renamed the host in between. Until a close is confirmed, muxel
+  refuses to adopt that session back into a pane, so an agent you closed stays closed
+  across a restart even if the host never becomes reachable again. Unconfirmed closes
+  are listed in the developer log.
+- **Restarting a remote agent no longer reattaches the one already running** — closing
+  and restarting both decided whether to stop the agent on the host by looking at
+  whether that host was *currently* set to run its panes in tmux. Turning that setting
+  off after a pane had already launched skipped the remote stop entirely and aimed the
+  local one at a session name that only ever existed on the host, so nothing was
+  stopped anywhere. muxel now decides from whether the host has tmux at all, which
+  cannot change out from under a running pane. Restart also says when it could not stop
+  the agent, rather than reattaching to the agent that was still running and presenting
+  it as a fresh start.
+
+## [0.2.1] — 2026-09-15
+
+### Added
+- **Remote projects can live on a Windows machine** — muxel's remote support
+  assumed Linux or macOS on the far side, so pointing it at a Windows PC running
+  OpenSSH failed everywhere: panes closed the moment they opened, the file browser
+  came back empty, and layout sync failed without saying so. A remote host can now
+  be marked as Windows, and panes, the file browser, editing and saving files,
+  layout sync, project memory, the project scan, git, and the connection test all
+  work there as they do on Linux. Nothing needs setting up on the Windows side
+  beyond turning on its SSH server, whichever shell that server hands commands to.
+  Panes run PowerShell, pwsh, or Cmd, chosen per host, with your profile loaded so
+  tools installed through npm or winget are on the path. Windows has no tmux, so a
+  pane there lasts as long as its connection; when muxel reconnects it relaunches
+  the pane and the agent picks up its saved conversation. Hosts you already had
+  keep behaving exactly as before. Windows host support is new, so reports from
+  real Windows setups are welcome.
+
+### Fixed
+- **Restart really restarts an agent running in tmux** — Restart stopped only the
+  terminal's connection to tmux, not the agent inside it, so the agent kept running
+  in its session and the relaunch simply reattached to it. Nothing restarted, and an
+  updated agent never took effect. Restart now stops the agent and its tmux session,
+  on this machine or a remote host, and relaunches in place: an agent that can
+  resume comes back on the same conversation, while shells and other programs start
+  fresh. It is also on a tab's right-click menu as **Restart agent** for agents that
+  can resume, and the toolbar's Restart is now disabled on editor, diff, and browser
+  panes, where it would have covered them with a terminal.
+- **Panes started from another device show up without a restart** — an agent
+  started from the iOS app, or from muxel on another machine opening this one as a
+  remote project, didn't appear in this window until the next launch, and one
+  closed elsewhere lingered. Changes from other devices now arrive within a few
+  seconds: new panes appear attached to their running sessions, closed ones go
+  away, and every pane both sides share keeps its live terminal. A pane another
+  machine started is attached to the session it is already running in, instead of
+  launching a second copy of the agent beside it.
+- **"Layout sync" errors stop piling up** — a remote project's layout was pushed to
+  the host after every resize and every agent turn, and each failed push raised an
+  error of its own. Two machines on the same project also never looked in sync, so
+  they kept pushing at each other. Pushes now happen only when the layout really
+  changes, a run of failures is reported once, and retries carry on quietly in the
+  background.
+- **Remote Claude panes keep their conversation** — before resuming, muxel looked
+  for a remote Claude pane's conversation on this machine's disk rather than the
+  host's, never found it, and started the pane on a new conversation. The check now
+  runs only for local projects.
+- **Opening a project that is already open no longer adds a second copy** — picking
+  a folder that was already a project in the workspace, or creating a remote project
+  for a host and directory already open, quietly added a duplicate beside the
+  original. muxel now refuses and says the project is already open: in the
+  notification feed for a folder, and inline in the new remote project dialog, which
+  stays open so you can pick a different directory. A symlinked or trailing-slash
+  spelling of the same folder counts as the same project, and on a Windows host so
+  do differences in letter case or slash direction.
+- **Selecting an agent while a pane is maximized brings that agent up** — with a
+  pane maximized, choosing another agent in the sidebar focused it behind the
+  maximized pane, out of sight, so your typing went somewhere you couldn't see. The
+  maximize now moves to the agent you pick — from the sidebar, a notification, or
+  the tray, in the same project or another.
+- **A maximized pane keeps all its tabs** — maximizing a pane with several tabs
+  showed only one of them in its tab bar, so reaching the others meant restoring
+  first. The whole tab group now comes along: every tab stays in the bar, switching
+  tabs keeps the pane maximized, and closing or popping out the tab you're looking
+  at leaves the pane maximized on the next one. Browser panes in other windows also
+  stop disappearing while something is maximized.
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- Panes started on the desktop now appear on the phone within about six seconds
+  instead of up to fifteen, and a pane closed on the desktop drops its terminal on
+  the phone rather than lingering until the app quits.
+
+## [0.2.0] — 2026-09-10
+
 ### Fixed
 - **A long-running window stops running out of file handles** — after a day of
   use, panes could fail to start with "Too many open files", and once that
@@ -16,6 +117,45 @@ All notable changes to muxel are documented here. This project adheres to
   now release everything when their pane closes. muxel also raises its own
   open-file limit at startup, because macOS starts apps launched from Finder or
   the Dock with a limit far below what a workspace full of panes needs.
+- **Splits keep their proportions when tabs come and go** — adding, reordering, or
+  closing a tab could rebuild the pane it lived in, snapping a carefully sized split
+  back to its defaults — including a narrow column kept aside for files and diffs.
+  Resizing the window was no kinder: sidebars stretched and shrank along with the
+  panes, and making the window small for a moment could save the squeezed width as
+  if you had chosen it. Tab changes now leave the surrounding layout alone. The
+  project, file, and tool sidebars keep the width you gave them while the center
+  splits share out the remaining space in proportion, and a sidebar squeezed by a
+  small window returns to its own width once there is room again. Dragging a divider
+  is still how you change a size, and double-clicking a center divider still evens
+  out its split.
+- **Claude panes in narrow splits stop reporting Done while background work runs** —
+  newer versions of Claude keep working after the main line says it has finished,
+  listing the shells and helper agents still running in a footer at the bottom of
+  the screen. In a narrow pane, such as a tmux split, that footer wraps across lines
+  and muxel missed it: the pane dropped to Done while the work carried on, then
+  flipped back to Working with a second notification as soon as more output arrived.
+  muxel now reads the footer even when it wraps, and keeps the pane Working until it
+  no longer reports anything running. Claude's progress line is also recognized when
+  a narrow pane cuts off the end of it.
+- **Reopening a Codex pane no longer freezes muxel** — before resuming a saved Codex
+  conversation, muxel checks that it still exists. When it couldn't find the
+  conversation by name, it opened and read through every conversation Codex had ever
+  saved — on a history of around 900 conversations and 2 GB, the whole window
+  stopped responding for more than ten seconds while the pane started. The check now
+  looks at names only and finishes in a fraction of a second, so a missing or stale
+  conversation is no longer the slowest case.
+
+### Changed
+- **Freeze and typing-lag reports can show where the time went** — the opt-in
+  profiler (`MUXEL_PROFILE=1`) could say that a keystroke was slow to appear or that
+  the window stalled, but not why. It now breaks a slow keystroke into its stages —
+  the program answering, muxel reading and parsing the output, and the redraw — and
+  names what the app was busy with during a freeze: restoring the workspace,
+  switching projects, launching an agent, or drawing the window. On Windows it also
+  records which window held keyboard focus, embedded browser panes included, so a
+  report can show where your typing went when it seemed to vanish. The logs hold
+  timings and counts only — no keystrokes, terminal text, commands, URLs, titles, or
+  file paths — and nothing is recorded unless profiling is switched on.
 
 ## [0.1.9] — 2026-08-28
 
