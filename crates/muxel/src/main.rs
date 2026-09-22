@@ -7,6 +7,8 @@
 // logs stay visible during development.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod action_catalog;
+mod action_sheet;
 mod app;
 mod browser;
 #[cfg(target_os = "linux")]
@@ -15,6 +17,8 @@ mod editor;
 mod filetree;
 mod i18n;
 mod integrations;
+#[cfg(target_os = "windows")]
+mod native_action_shortcut;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod secrets;
