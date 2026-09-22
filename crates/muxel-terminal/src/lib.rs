@@ -26,6 +26,7 @@ pub use profile::startup_event;
 pub use session::{CommandSpec, PtyChunk, TerminalSession};
 pub use view::{
     AgentStatus, OpenLink, OpenLinkBackground, TerminalFocusObserver, TerminalFocusProfile,
-    TerminalLaunch, TerminalMouseMode, TerminalNotifyCause, TerminalView, clean_agent_title,
+    TerminalLaunch, TerminalMouseMode, TerminalNotifyCause, TerminalRuntimeSnapshot,
+    TerminalStatusCoverage, TerminalStatusReason, TerminalView, clean_agent_title,
     paste_clipboard_into_session,
 };

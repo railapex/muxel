@@ -7,7 +7,7 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::{TerminalPalette, index_to_rgb};
-use crate::listener::{MuxelListener, SharedWriter};
+use crate::listener::{MuxelListener, SharedWriter, TitleEventBuffer};
 use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -277,6 +277,14 @@ struct ResizeState {
     since: Instant,
 }
 
+fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
+    if !has_bytes {
+        previous
+    } else {
+        !submission_pending
+    }
+}
+
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
 /// buffer line (negative = history, so the underline scrolls with the content)
 /// plus the URI a click would open.
@@ -323,7 +331,9 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    title_events: Arc<Mutex<TitleEventBuffer>>,
     title_generation: Arc<AtomicU64>,
+    binding_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
@@ -367,6 +377,16 @@ pub struct TerminalSession {
     /// Set once Muxel deliberately submits a turn with Enter. Startup title
     /// activity alone is not evidence that a turn completed.
     turn_submitted: AtomicBool,
+    submission_pending: AtomicBool,
+    /// Serialized input-owner revision and conservative draft bit in one atomic
+    /// word, so consumers cannot observe a revision paired with another write's
+    /// draft state. The low bit is the draft flag; the remaining bits are the
+    /// revision advanced before bytes enter the ordered PTY writer.
+    input_state: AtomicU64,
+    /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
+    /// burst of keys/resizes one reconciliation request instead of an event log.
+    runtime_trigger: async_channel::Sender<()>,
+    runtime_events: async_channel::Receiver<()>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -696,7 +716,9 @@ impl TerminalSession {
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let title_events = Arc::new(Mutex::new(TitleEventBuffer::default()));
         let title_generation = Arc::new(AtomicU64::new(0));
+        let binding_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
@@ -704,7 +726,9 @@ impl TerminalSession {
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
+            title_events: title_events.clone(),
             title_generation: title_generation.clone(),
+            binding_generation: binding_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
@@ -723,6 +747,8 @@ impl TerminalSession {
             listener,
         );
 
+        let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
             term: Arc::new(Mutex::new(term)),
@@ -732,7 +758,9 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            title_events,
             title_generation,
+            binding_generation,
             title_changed_at,
             session_id_hint,
             bell,
@@ -755,6 +783,10 @@ impl TerminalSession {
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
+            submission_pending: AtomicBool::new(false),
+            input_state: AtomicU64::new(0),
+            runtime_trigger,
+            runtime_events,
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -926,6 +958,18 @@ impl TerminalSession {
             }
         }
         if !data.is_empty() {
+            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
+            let _ = self
+                .input_state
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                    let revision = (state >> 1).wrapping_add(1) & (u64::MAX >> 1);
+                    let previous_draft = state & 1 != 0;
+                    let draft = draft_after_input(previous_draft, submitted_enter, true);
+                    Some((revision << 1) | u64::from(draft))
+                });
+            if submitted_enter {
+                self.trigger_runtime();
+            }
             // A TUI reaction will follow; prioritize output during this short
             // interaction window even if stream output is already queued.
             self.mark_interactive();
@@ -935,10 +979,26 @@ impl TerminalSession {
 
     pub fn mark_turn_submitted(&self) {
         self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
     }
 
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Input-owner facts used by conditional host operations. The revision is
+    /// advanced before the corresponding bytes are admitted to the PTY writer.
+    pub fn input_snapshot(&self) -> (u64, bool) {
+        let state = self.input_state.load(Ordering::Relaxed);
+        (state >> 1, state & 1 != 0)
+    }
+
+    pub(crate) fn runtime_events(&self) -> async_channel::Receiver<()> {
+        self.runtime_events.clone()
+    }
+
+    fn trigger_runtime(&self) {
+        let _ = self.runtime_trigger.try_send(());
     }
 
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
@@ -1111,6 +1171,7 @@ impl TerminalSession {
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
         self.bump_content();
+        self.trigger_runtime();
         false
     }
 
@@ -1372,6 +1433,10 @@ impl TerminalSession {
         )
     }
 
+    pub(crate) fn take_title_events(&self) -> (Vec<Option<String>>, bool) {
+        self.title_events.lock().take()
+    }
+
     /// Age of the latest title event. Title-derived lifecycle claims must expire
     /// rather than treating a cached spinner frame as permanent Working.
     pub fn title_age(&self) -> Option<Duration> {
@@ -1381,16 +1446,27 @@ impl TerminalSession {
     /// Drop a provider title that belongs to a conversation the running TUI has
     /// switched away from. The next OSC title repopulates it.
     pub fn clear_title(&self) {
+        let mut title_events = self.title_events.lock();
+        title_events.take();
+        title_events.push(None);
+        drop(title_events);
         *self.title.lock() = None;
         self.title_generation.fetch_add(1, Ordering::Relaxed);
+        self.binding_generation.fetch_add(1, Ordering::Relaxed);
         *self.title_changed_at.lock() = Some(Instant::now());
         self.bump_content();
+        self.trigger_runtime();
     }
 
     /// Latest UUID-shaped OSC title retained when an agent replaces it with a
     /// display name. Muxel uses this as an exact agent session identity hint.
     pub fn session_id_hint(&self) -> Option<String> {
         self.session_id_hint.lock().clone()
+    }
+
+    /// Revision of the provider conversation bound to this live PTY launch.
+    pub fn binding_revision(&self) -> u64 {
+        self.binding_generation.load(Ordering::Relaxed)
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -1426,6 +1502,7 @@ impl TerminalSession {
     /// Clear the bell (e.g. once the user focuses the pane).
     pub fn clear_bell(&self) {
         self.bell.store(false, Ordering::Relaxed);
+        self.trigger_runtime();
     }
 
     /// Time since output was last processed (for idle detection).
@@ -2641,6 +2718,65 @@ mod immediate_color_tests {
         let (mut responder, rx) = responder();
         responder.advance(b"\x1b]0;Review changes\x07");
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod runtime_fact_tests {
+    use super::{CommandSpec, RESIZE_SETTLE, TerminalSession, draft_after_input};
+    use async_channel::TryRecvError;
+    use std::time::Duration;
+
+    #[test]
+    fn draft_state_changes_only_for_admitted_input_or_submission() {
+        assert!(!draft_after_input(false, false, false));
+        assert!(draft_after_input(false, false, true));
+        assert!(!draft_after_input(true, true, true));
+        assert!(draft_after_input(true, false, true));
+    }
+
+    #[test]
+    fn runtime_invalidations_are_bounded_and_input_facts_are_atomic() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let events = session.runtime_events();
+
+        session.write_input(b"x");
+        assert_eq!(session.input_snapshot(), (1, true));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // A soft newline is ordinary draft input; the view deliberately does
+        // not mark it as a turn submission.
+        session.write_input(b"\x1b\r");
+        assert_eq!(session.input_snapshot(), (2, true));
+
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert_eq!(session.input_snapshot(), (3, false));
+        assert_eq!(events.try_recv(), Ok(()));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        session.process_probe_output(b"\x1b]0;stale title\x07");
+        session.clear_title();
+        let (titles, overflowed) = session.take_title_events();
+        assert_eq!(titles, vec![None]);
+        assert!(!overflowed);
+        assert_eq!(events.try_recv(), Ok(()));
+        session.clear_bell();
+        assert_eq!(events.try_recv(), Ok(()));
+
+        assert!(session.resize(81, 24));
+        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        assert!(!session.resize(81, 24));
+        assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
     }
 }
 

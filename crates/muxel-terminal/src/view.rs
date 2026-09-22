@@ -35,6 +35,10 @@ const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
 /// Working→Done→Working lifecycle and duplicate completion notifications.
 const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
 
+/// Visible lifecycle parsing is independent from paint cadence, but it still
+/// must not allocate a full grid string for every PTY read under stream load.
+const STATUS_SCREEN_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
 pub(crate) fn paint_min_interval(focused: bool, interactive: bool, stop: bool) -> Duration {
@@ -103,6 +107,96 @@ pub enum AgentStatus {
     Blocked,
     /// Finished a turn (rang the bell) or the process exited.
     Done,
+}
+
+/// Strongest visible fact behind the current lifecycle badge. This is evidence,
+/// not a close/steer decision: A1 deliberately has no hidden-work hook coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStatusReason {
+    ProcessExit,
+    BlockedMarker,
+    WorkingMarker,
+    ProviderTitle,
+    ProviderScreen,
+    Bell,
+    RecentOutput,
+    Quiet,
+}
+
+/// Scope of the no-hook evidence used by the runtime reducer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStatusCoverage {
+    /// Only PTY activity/bell/exit is available; quiet does not prove no work.
+    ActivityOnly,
+    /// Configured markers add visible-grid semantics, but not hidden-work proof.
+    VisibleMarkers,
+    /// A provider-owned title/screen contract is active, still visible-only.
+    ProviderVisible,
+}
+
+/// Immutable per-launch facts. Reads never scan the grid or advance lifecycle
+/// state; output/input/resize/deadline events reconcile the owning view first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalRuntimeSnapshot {
+    pub status: AgentStatus,
+    pub reason: TerminalStatusReason,
+    pub coverage: TerminalStatusCoverage,
+    pub launch_id: Uuid,
+    pub binding_rev: u64,
+    pub snapshot_seq: u64,
+    pub input_rev: u64,
+    pub draft_latched: bool,
+    pub completion_ready: bool,
+}
+
+struct RuntimeStatusState {
+    status: AgentStatus,
+    reason: TerminalStatusReason,
+    coverage: TerminalStatusCoverage,
+    snapshot_seq: u64,
+    binding_rev: u64,
+    content_generation: u64,
+    last_screen_capture: Option<Instant>,
+    working_marker: bool,
+    blocked_marker: bool,
+    provider_screen: Option<AgentStatus>,
+    prev_raw: Option<AgentStatus>,
+    done_latch: bool,
+    completion_armed: bool,
+    provider_settled: bool,
+    completion_ready: bool,
+    semantic_title_status: Option<AgentStatus>,
+    grok_blocked_at: Option<Instant>,
+    grok_screen_working_at: Option<Instant>,
+    deadline: Option<Instant>,
+    timer_generation: u64,
+}
+
+impl RuntimeStatusState {
+    fn new(coverage: TerminalStatusCoverage) -> Self {
+        Self {
+            status: AgentStatus::Idle,
+            reason: TerminalStatusReason::Quiet,
+            coverage,
+            snapshot_seq: 0,
+            binding_rev: 0,
+            content_generation: 0,
+            last_screen_capture: None,
+            working_marker: false,
+            blocked_marker: false,
+            provider_screen: None,
+            prev_raw: None,
+            done_latch: false,
+            completion_armed: false,
+            provider_settled: false,
+            completion_ready: false,
+            semantic_title_status: None,
+            grok_blocked_at: None,
+            grok_screen_working_at: None,
+            deadline: None,
+            timer_generation: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +385,24 @@ fn title_status(
     _age: Option<Duration>,
 ) -> Option<AgentStatus> {
     parse_agent_title(provider, title).and_then(|frame| frame.status)
+}
+
+fn title_status_trace(provider: TitleProvider, titles: &[Option<String>]) -> Vec<AgentStatus> {
+    titles
+        .iter()
+        .filter_map(|title| title_status(provider, title.as_deref(), None))
+        .collect()
+}
+
+fn has_working_to_nonworking_edge(statuses: &[AgentStatus]) -> bool {
+    let mut saw_working = false;
+    for status in statuses {
+        if saw_working && *status != AgentStatus::Working {
+            return true;
+        }
+        saw_working |= *status == AgentStatus::Working;
+    }
+    false
 }
 
 /// Once a provider proves its semantic title protocol, an unrelated OSC title
@@ -693,6 +805,24 @@ fn hold_grok_screen_working(observed: bool, last_seen_age: Option<Duration>) -> 
     observed || last_seen_age.is_some_and(|age| age <= GROK_SCREEN_WORKING_HOLD)
 }
 
+fn grok_screen_working_state(
+    base_working: bool,
+    provider_working: bool,
+    last_seen: Option<Instant>,
+    now: Instant,
+) -> (bool, Option<Instant>, Option<Instant>) {
+    if provider_working {
+        return (true, Some(now), None);
+    }
+    let age = last_seen.map(|at| now.saturating_duration_since(at));
+    if hold_grok_screen_working(false, age) {
+        let deadline = last_seen.map(|at| at + GROK_SCREEN_WORKING_HOLD + Duration::from_millis(1));
+        (true, last_seen, deadline)
+    } else {
+        (base_working, None, None)
+    }
+}
+
 /// Remove provider lifecycle decoration before a title is considered for the
 /// pane's persisted automatic name. A title containing only state is not a name.
 pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
@@ -706,6 +836,7 @@ pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
 /// exit wins; then on-screen markers (working spinner, blocked prompt); then a
 /// rung bell means a finished turn; then recent output is an opt-in fallback
 /// for unknown terminals only.
+#[cfg(test)]
 fn classify(
     exited: bool,
     screen: &str,
@@ -715,15 +846,33 @@ fn classify(
     activity_fallback: bool,
     idle: Duration,
 ) -> AgentStatus {
+    classify_facts(
+        exited,
+        working.iter().any(|m| screen.contains(m)),
+        blocked.iter().any(|m| screen.contains(m)),
+        bell,
+        activity_fallback && working.is_empty(),
+        idle,
+    )
+}
+
+fn classify_facts(
+    exited: bool,
+    working: bool,
+    blocked: bool,
+    bell: bool,
+    activity_fallback: bool,
+    idle: Duration,
+) -> AgentStatus {
     if exited {
         return AgentStatus::Done;
     }
-    if blocked.iter().any(|m| screen.contains(m)) {
+    if blocked {
         return AgentStatus::Blocked;
     }
     // User-actionable input wins when a provider leaves its working marker on
     // screen behind an approval prompt.
-    if working.iter().any(|m| screen.contains(m)) {
+    if working {
         return AgentStatus::Working;
     }
     if bell {
@@ -731,7 +880,7 @@ fn classify(
     }
     // Raw PTY churn is useful only for unknown terminals. Known providers own
     // semantic signals; using echoed typing here would forge Working.
-    if activity_fallback && working.is_empty() && idle < Duration::from_secs(2) {
+    if activity_fallback && idle < Duration::from_secs(2) {
         return AgentStatus::Working;
     }
     AgentStatus::Idle
@@ -794,6 +943,115 @@ fn provider_settled_after_title(
     submitted: bool,
 ) -> bool {
     settled || submitted || observed_title == Some(AgentStatus::Idle)
+}
+
+fn status_reason(
+    status: AgentStatus,
+    exited: bool,
+    bell: bool,
+    title: Option<AgentStatus>,
+    provider_screen: Option<AgentStatus>,
+    working_marker: bool,
+    blocked_marker: bool,
+) -> TerminalStatusReason {
+    if exited {
+        return TerminalStatusReason::ProcessExit;
+    }
+    match status {
+        AgentStatus::Blocked if provider_screen == Some(AgentStatus::Blocked) => {
+            TerminalStatusReason::ProviderScreen
+        }
+        AgentStatus::Blocked if title == Some(AgentStatus::Blocked) => {
+            TerminalStatusReason::ProviderTitle
+        }
+        AgentStatus::Blocked if blocked_marker => TerminalStatusReason::BlockedMarker,
+        AgentStatus::Working if provider_screen == Some(AgentStatus::Working) => {
+            TerminalStatusReason::ProviderScreen
+        }
+        AgentStatus::Working if working_marker => TerminalStatusReason::WorkingMarker,
+        AgentStatus::Working if title == Some(AgentStatus::Working) => {
+            TerminalStatusReason::ProviderTitle
+        }
+        AgentStatus::Working => TerminalStatusReason::RecentOutput,
+        AgentStatus::Done if bell => TerminalStatusReason::Bell,
+        AgentStatus::Done if title.is_some() => TerminalStatusReason::ProviderTitle,
+        AgentStatus::Idle if title.is_some() => TerminalStatusReason::ProviderTitle,
+        AgentStatus::Done | AgentStatus::Idle => TerminalStatusReason::Quiet,
+        AgentStatus::Blocked => TerminalStatusReason::BlockedMarker,
+    }
+}
+
+fn status_coverage(
+    provider: TitleProvider,
+    working_markers: &[String],
+    blocked_markers: &[String],
+) -> TerminalStatusCoverage {
+    if provider != TitleProvider::Other {
+        TerminalStatusCoverage::ProviderVisible
+    } else if !working_markers.is_empty() || !blocked_markers.is_empty() {
+        TerminalStatusCoverage::VisibleMarkers
+    } else {
+        TerminalStatusCoverage::ActivityOnly
+    }
+}
+
+fn should_capture_status_screen(
+    previous_generation: u64,
+    current_generation: u64,
+    has_visible_sources: bool,
+) -> bool {
+    has_visible_sources && previous_generation != current_generation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusScreenCapture {
+    None,
+    Now,
+    At(Instant),
+}
+
+fn status_screen_capture_plan(
+    previous_generation: u64,
+    current_generation: u64,
+    has_visible_sources: bool,
+    last_capture: Option<Instant>,
+    now: Instant,
+) -> StatusScreenCapture {
+    if !should_capture_status_screen(previous_generation, current_generation, has_visible_sources) {
+        return StatusScreenCapture::None;
+    }
+    if let Some(deadline) = last_capture.map(|at| at + STATUS_SCREEN_SCAN_INTERVAL)
+        && now < deadline
+    {
+        return StatusScreenCapture::At(deadline);
+    }
+    StatusScreenCapture::Now
+}
+
+fn fallback_status_deadline(
+    now: Instant,
+    idle: Duration,
+    status: AgentStatus,
+    provider: TitleProvider,
+    has_working_markers: bool,
+) -> Option<Instant> {
+    (status == AgentStatus::Working
+        && provider == TitleProvider::Other
+        && !has_working_markers
+        && idle < Duration::from_secs(2))
+    .then(|| now + (Duration::from_secs(2) - idle))
+}
+
+fn runtime_timer_is_current(current: u64, callback: u64) -> bool {
+    current == callback
+}
+
+fn runtime_timer_delay(deadline: Instant, now: Instant) -> Option<Duration> {
+    (deadline > now).then(|| deadline.duration_since(now))
+}
+
+fn is_submission_input(bytes: &[u8]) -> bool {
+    bytes == b"\r"
 }
 
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
@@ -892,27 +1150,7 @@ pub struct TerminalView {
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
     title_provider: TitleProvider,
-    /// Latches `Done` from a working→finished transition so a completed turn shows
-    /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
-    /// the previous *raw* classification; the latch clears when the agent works
-    /// again.
-    prev_raw: std::cell::Cell<Option<AgentStatus>>,
-    done_latch: std::cell::Cell<bool>,
-    /// Ready/Idle must be observed once, or a turn submitted, before a
-    /// Working→Idle edge can mean Done. This rejects startup spinners.
-    completion_armed: std::cell::Cell<bool>,
-    /// A provider-owned Ready/Idle title, unlike fallback PTY quiet, proves the
-    /// restored CLI has finished booting. This bounds startup-state suppression.
-    provider_settled: std::cell::Cell<bool>,
-    /// Last provider-owned title state. Foreign OSC titles cannot erase it or
-    /// reactivate the weak PTY activity fallback.
-    semantic_title_status: std::cell::Cell<Option<AgentStatus>>,
-    /// Grok's action-required title item intentionally blinks when unfocused.
-    /// Retain the last positive edge briefly so the sidebar does not blink too.
-    grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
-    /// Grok redraws its exact foreground background-work row. Retain a positive
-    /// observation briefly so an off-frame cannot forge completion.
-    grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
+    runtime: RuntimeStatusState,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// Profiler correlation only: advances once per output-driven `cx.notify()`.
@@ -925,9 +1163,8 @@ pub struct TerminalView {
     /// brings the deadline forward.
     pending_paint_deadline: std::cell::Cell<Option<std::time::Instant>>,
     paint_timer_generation: std::cell::Cell<u64>,
-    /// Cached agent status for the current grid and OSC-title generations.
-    status_cache: std::cell::Cell<Option<(u64, u64, AgentStatus)>>,
     _drain: Task<()>,
+    _runtime_events: Task<()>,
 }
 
 /// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
@@ -1380,6 +1617,7 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
+                        view.refresh_runtime(cx);
                         // Priority scheduler (see docs/terminal-paint-architecture.md):
                         // Recent input ≫ stream; every throttled batch gets one
                         // trailing-edge notify if no later output arrives.
@@ -1395,7 +1633,20 @@ impl TerminalView {
             }
         });
 
-        Self {
+        let runtime_events = session.runtime_events();
+        let runtime_event_task = cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            while runtime_events.recv().await.is_ok() {
+                if view
+                    .update(cx, |view, cx| view.refresh_runtime(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let coverage = status_coverage(title_provider, &working_markers, &blocked_markers);
+        let mut view = Self {
             instance_id,
             session,
             focus_handle,
@@ -1412,22 +1663,18 @@ impl TerminalView {
             working_markers,
             blocked_markers,
             title_provider,
-            prev_raw: std::cell::Cell::new(None),
-            done_latch: std::cell::Cell::new(false),
-            completion_armed: std::cell::Cell::new(false),
-            provider_settled: std::cell::Cell::new(false),
-            semantic_title_status: std::cell::Cell::new(None),
-            grok_blocked_at: std::cell::Cell::new(None),
-            grok_screen_working_at: std::cell::Cell::new(None),
+            runtime: RuntimeStatusState::new(coverage),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             profile_notify_generation: std::cell::Cell::new(0),
             profile_last_notify_cause: std::cell::Cell::new(None),
             profile_focus: focus_observer.is_some(),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
-            status_cache: std::cell::Cell::new(None),
             _drain: drain,
-        }
+            _runtime_events: runtime_event_task,
+        };
+        view.refresh_runtime(cx);
+        view
     }
 
     pub fn session(&self) -> &Arc<TerminalSession> {
@@ -1483,128 +1730,285 @@ impl TerminalView {
         }
     }
 
-    /// The agent's lifecycle state, from its per-agent on-screen markers, the
-    /// bell, output activity, and process exit (see [`classify`]). Agents with no
-    /// markers fall back to the bell + activity heuristic.
-    pub fn status(&self) -> AgentStatus {
-        // Cache against content gen so sidebar/tick don't re-scan the grid every
-        // frame while the agent is idle. Bell and idle-time still force a recheck.
-        let content_gen = self.session.content_generation();
-        let (title_gen, title_text) = self.session.title_snapshot();
-        let bell = self.session.has_bell();
-        if !bell
-            && let Some((cached_gen, cached_title_gen, cached)) = self.status_cache.get()
-            && cached_gen == content_gen
-            && cached_title_gen == title_gen
-            && !self.exited
-        {
-            // Idle duration can advance Working→Idle without a content gen bump
-            // (no new output). Recompute when the activity heuristic might flip.
-            if !matches!(cached, AgentStatus::Working) {
-                return cached;
-            }
+    /// Reconcile runtime state at an actual observation edge. This is the only
+    /// place that scans the visible grid or advances the lifecycle reducer.
+    fn refresh_runtime(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let binding_rev = self.session.binding_revision();
+        let binding_changed = binding_rev != self.runtime.binding_rev;
+        if binding_changed {
+            // A new provider conversation cannot inherit lifecycle evidence or
+            // visible facts from the retired binding. The current generation is
+            // recaptured below; the current semantic title is handled separately.
+            self.runtime.semantic_title_status = None;
+            self.runtime.prev_raw = None;
+            self.runtime.done_latch = false;
+            self.runtime.completion_armed = false;
+            self.runtime.provider_settled = false;
+            self.runtime.grok_blocked_at = None;
+            self.runtime.grok_screen_working_at = None;
+            self.runtime.last_screen_capture = None;
+            self.runtime.working_marker = false;
+            self.runtime.blocked_marker = false;
+            self.runtime.provider_screen = None;
         }
 
+        let (title_events, title_overflowed) = self.session.take_title_events();
+        let (_, title_text) = self.session.title_snapshot();
         let observed_title = title_status(
             self.title_provider,
             title_text.as_deref(),
             self.session.title_age(),
         );
         let submitted_turn = self.session.has_submitted_turn();
-        self.provider_settled.set(provider_settled_after_title(
-            self.provider_settled.get(),
+        if title_overflowed {
+            // Missing an ordered title edge invalidates this source. Rebuild from
+            // the retained final title without manufacturing a completion edge.
+            self.runtime.semantic_title_status = None;
+            self.runtime.prev_raw = None;
+        }
+
+        let mut working_to_nonworking = false;
+        if !title_overflowed {
+            let statuses = title_status_trace(self.title_provider, &title_events);
+            working_to_nonworking = has_working_to_nonworking_edge(&statuses);
+            for status in statuses {
+                self.runtime.provider_settled = provider_settled_after_title(
+                    self.runtime.provider_settled,
+                    Some(status),
+                    submitted_turn,
+                );
+                self.runtime.semantic_title_status = Some(status);
+            }
+        }
+        self.runtime.provider_settled = provider_settled_after_title(
+            self.runtime.provider_settled,
             observed_title,
             submitted_turn,
-        ));
+        );
         if let Some(status) = observed_title {
-            self.semantic_title_status.set(Some(status));
+            self.runtime.semantic_title_status = Some(status);
         }
-        let mut title = sticky_title_status(self.semantic_title_status.get(), observed_title);
-        // Provider-owned titles and visible UI are independent strong evidence.
-        // Titles prevent PTY noise from forging state; they do not suppress a
-        // current permission form or background-work row.
+        if working_to_nonworking {
+            // The parser may receive several OSC title frames in one coalesced
+            // PTY batch. Retain the semantic Working edge so the final Idle can
+            // complete an armed turn instead of disappearing into the batch.
+            self.runtime.prev_raw = Some(AgentStatus::Working);
+            self.runtime.done_latch = false;
+        }
+        let mut title = sticky_title_status(self.runtime.semantic_title_status, observed_title);
+
         let working_markers = self.working_markers.as_slice();
-        // Claude's title does not distinguish Idle from a visible permission
-        // prompt. Claude and Grok can both retain Idle titles while their
-        // foreground UI reports live background work.
         let needs_provider_screen_scan = matches!(
             self.title_provider,
             TitleProvider::Claude | TitleProvider::Grok
         );
-        let screen = if working_markers.is_empty()
-            && self.blocked_markers.is_empty()
-            && !needs_provider_screen_scan
-        {
-            String::new()
-        } else {
-            self.session.visible_text()
-        };
-        let base = classify(
+        let content_generation = self.session.content_generation();
+        let has_visible_sources = !working_markers.is_empty()
+            || !self.blocked_markers.is_empty()
+            || needs_provider_screen_scan;
+        let mut next_deadline = None;
+        match status_screen_capture_plan(
+            self.runtime.content_generation,
+            content_generation,
+            has_visible_sources,
+            self.runtime.last_screen_capture,
+            now,
+        ) {
+            StatusScreenCapture::Now => {
+                self.runtime.content_generation = content_generation;
+                self.runtime.last_screen_capture = Some(now);
+                let screen = self.session.visible_text();
+                self.runtime.working_marker =
+                    working_markers.iter().any(|marker| screen.contains(marker));
+                self.runtime.blocked_marker = self
+                    .blocked_markers
+                    .iter()
+                    .any(|marker| screen.contains(marker));
+                self.runtime.provider_screen = provider_screen_status(self.title_provider, &screen);
+            }
+            StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
+            StatusScreenCapture::None if !has_visible_sources => {
+                // Keep the generation current without allocating a screen snapshot;
+                // this prevents a later unrelated event from treating it as new.
+                self.runtime.content_generation = content_generation;
+                self.runtime.working_marker = false;
+                self.runtime.blocked_marker = false;
+                self.runtime.provider_screen = None;
+            }
+            StatusScreenCapture::None => {}
+        }
+        let bell = self.session.has_bell();
+        let idle = self.session.idle_for();
+        let base = classify_facts(
             self.exited,
-            &screen,
-            working_markers,
-            &self.blocked_markers,
+            self.runtime.working_marker,
+            self.runtime.blocked_marker,
             bell,
-            self.title_provider == TitleProvider::Other,
-            self.session.idle_for(),
+            self.title_provider == TitleProvider::Other && working_markers.is_empty(),
+            idle,
         );
-        let provider_screen = provider_screen_status(self.title_provider, &screen);
-        let mut screen_working = working_markers.iter().any(|marker| screen.contains(marker))
-            || provider_screen == Some(AgentStatus::Working);
+        let provider_screen = self.runtime.provider_screen;
+        let working_marker = self.runtime.working_marker;
+        let blocked_marker = self.runtime.blocked_marker;
+        let mut screen_working = working_marker || provider_screen == Some(AgentStatus::Working);
+
         if self.title_provider == TitleProvider::Grok {
-            if title == Some(AgentStatus::Blocked) {
-                self.grok_blocked_at.set(Some(std::time::Instant::now()));
+            if observed_title == Some(AgentStatus::Blocked) {
+                self.runtime.grok_blocked_at = Some(now);
             } else {
-                let blocked_age = self.grok_blocked_at.get().map(|at| at.elapsed());
+                let blocked_age = self
+                    .runtime
+                    .grok_blocked_at
+                    .map(|at| now.saturating_duration_since(at));
                 title = hold_grok_blocked(title, blocked_age);
+                if title == Some(AgentStatus::Blocked)
+                    && let Some(at) = self.runtime.grok_blocked_at
+                {
+                    let deadline = at + Duration::from_millis(751);
+                    next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+                }
                 if matches!(title, Some(AgentStatus::Idle))
                     || blocked_age.is_some_and(|age| age > Duration::from_millis(750))
                 {
-                    self.grok_blocked_at.set(None);
+                    self.runtime.grok_blocked_at = None;
                 }
             }
 
-            if provider_screen == Some(AgentStatus::Working) {
-                self.grok_screen_working_at
-                    .set(Some(std::time::Instant::now()));
-            } else {
-                let working_age = self.grok_screen_working_at.get().map(|at| at.elapsed());
-                screen_working = hold_grok_screen_working(screen_working, working_age);
-                if !screen_working {
-                    self.grok_screen_working_at.set(None);
-                }
+            let (working, last_seen, hold_deadline) = grok_screen_working_state(
+                screen_working,
+                provider_screen == Some(AgentStatus::Working),
+                self.runtime.grok_screen_working_at,
+                now,
+            );
+            screen_working = working;
+            self.runtime.grok_screen_working_at = last_seen;
+            if let Some(deadline) = hold_deadline {
+                next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
             }
         }
         if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
             title = provider_screen;
         }
+
         let raw = combine_title_status(self.exited, base, title, screen_working);
-        // Marker-less providers may latch only after proving that their semantic
-        // title protocol is live. Older/custom CLIs otherwise infer Working from
-        // typing echo and turn two seconds of quiet into a false completion.
         let can_latch = can_latch_completion(
             !self.working_markers.is_empty(),
-            self.semantic_title_status.get().is_some(),
+            self.runtime.semantic_title_status.is_some(),
         );
         let (status, latch, armed) = latch_done_after_readiness(
-            self.prev_raw.replace(Some(raw)),
+            self.runtime.prev_raw,
             raw,
-            self.done_latch.get(),
+            self.runtime.done_latch,
             can_latch,
-            self.completion_armed.get(),
+            self.runtime.completion_armed,
             submitted_turn,
         );
-        self.done_latch.set(latch);
-        self.completion_armed.set(armed);
-        self.status_cache
-            .set(Some((content_gen, title_gen, status)));
-        status
+        self.runtime.prev_raw = Some(raw);
+        self.runtime.done_latch = latch;
+        self.runtime.completion_armed = armed;
+
+        if let Some(deadline) = fallback_status_deadline(
+            now,
+            idle,
+            status,
+            self.title_provider,
+            !working_markers.is_empty(),
+        ) {
+            next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+        }
+
+        let reason = status_reason(
+            status,
+            self.exited,
+            bell,
+            title,
+            provider_screen,
+            working_marker,
+            blocked_marker,
+        );
+        if self.exited {
+            next_deadline = None;
+        }
+        let completion_ready = self.runtime.provider_settled || submitted_turn;
+        let public_changed = status != self.runtime.status
+            || reason != self.runtime.reason
+            || binding_changed
+            || completion_ready != self.runtime.completion_ready;
+        if public_changed {
+            self.runtime.snapshot_seq = self.runtime.snapshot_seq.wrapping_add(1);
+        }
+        self.runtime.status = status;
+        self.runtime.reason = reason;
+        self.runtime.binding_rev = binding_rev;
+        self.runtime.completion_ready = completion_ready;
+        self.schedule_runtime_deadline(next_deadline, binding_changed, cx);
+        if public_changed {
+            crate::present_flag::mark_present_needed();
+            cx.notify();
+        }
+    }
+
+    fn schedule_runtime_deadline(
+        &mut self,
+        deadline: Option<Instant>,
+        identity_changed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !identity_changed {
+            match (self.runtime.deadline, deadline) {
+                (current, next) if current == next => return,
+                (Some(current), Some(next)) if current <= next => return,
+                _ => {}
+            }
+        }
+        self.runtime.timer_generation = self.runtime.timer_generation.wrapping_add(1);
+        let generation = self.runtime.timer_generation;
+        self.runtime.deadline = deadline;
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let Some(delay) = runtime_timer_delay(deadline, Instant::now()) else {
+            self.runtime.deadline = None;
+            return;
+        };
+        cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = view.update(cx, |view, cx| {
+                if !runtime_timer_is_current(view.runtime.timer_generation, generation) {
+                    return;
+                }
+                view.runtime.deadline = None;
+                view.refresh_runtime(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn runtime_snapshot(&self) -> TerminalRuntimeSnapshot {
+        let (input_rev, draft_latched) = self.session.input_snapshot();
+        TerminalRuntimeSnapshot {
+            status: self.runtime.status,
+            reason: self.runtime.reason,
+            coverage: self.runtime.coverage,
+            launch_id: self.session.id,
+            binding_rev: self.runtime.binding_rev,
+            snapshot_seq: self.runtime.snapshot_seq,
+            input_rev,
+            draft_latched,
+            completion_ready: self.runtime.completion_ready,
+        }
+    }
+
+    /// Pure immutable projection used by render/sidebar callers.
+    pub fn status(&self) -> AgentStatus {
+        self.runtime.status
     }
 
     /// Whether this terminal has observed provider-owned Ready/Idle or a
     /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
     pub fn completion_ready(&self) -> bool {
-        self.provider_settled.get() || self.session.has_submitted_turn()
+        self.runtime_snapshot().completion_ready
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -1763,7 +2167,7 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if event.keystroke.key.eq_ignore_ascii_case("enter") {
+            if is_submission_input(&bytes) {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);
@@ -1906,16 +2310,135 @@ mod tests {
     // macro, not gpui's glob-imported `test` attribute.
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
-        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
-        can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
-        hold_grok_screen_working, latch_done, latch_done_after_readiness, next_paint_schedule,
-        paint_min_interval, provider_screen_status, provider_settled_after_title,
-        sticky_title_status, title_status,
+        FOCUSED_STREAM_INTERVAL, GROK_SCREEN_WORKING_HOLD, PaintSchedule,
+        STATUS_SCREEN_SCAN_INTERVAL, StatusScreenCapture, TerminalMouseMode,
+        TerminalStatusCoverage, TerminalStatusReason, TitleProvider, can_latch_completion,
+        classify, clean_agent_title, combine_title_status, fallback_status_deadline,
+        grok_screen_working_state, has_working_to_nonworking_edge, hold_grok_blocked,
+        hold_grok_screen_working, is_submission_input, latch_done, latch_done_after_readiness,
+        next_paint_schedule, paint_min_interval, provider_screen_status,
+        provider_settled_after_title, runtime_timer_delay, runtime_timer_is_current,
+        should_capture_status_screen, status_coverage, status_reason, status_screen_capture_plan,
+        sticky_title_status, title_status, title_status_trace,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn m(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn activity_fallback_has_one_exact_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::from_millis(1250),
+                AgentStatus::Working,
+                TitleProvider::Other,
+                false,
+            ),
+            Some(now + Duration::from_millis(750))
+        );
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::from_secs(2),
+                AgentStatus::Working,
+                TitleProvider::Other,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::ZERO,
+                AgentStatus::Working,
+                TitleProvider::Claude,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn superseded_runtime_timer_is_rejected() {
+        assert!(runtime_timer_is_current(9, 9));
+        assert!(!runtime_timer_is_current(10, 9));
+        let now = Instant::now();
+        assert_eq!(runtime_timer_delay(now, now), None);
+        assert_eq!(
+            runtime_timer_delay(now - Duration::from_millis(1), now),
+            None
+        );
+        assert_eq!(
+            runtime_timer_delay(now + Duration::from_millis(1), now),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn expired_grok_provider_hold_does_not_schedule_behind_a_working_marker() {
+        let now = Instant::now();
+        let last_seen = now - GROK_SCREEN_WORKING_HOLD - Duration::from_millis(1);
+        let (working, retained_at, deadline) =
+            grok_screen_working_state(true, false, Some(last_seen), now);
+        assert!(working, "the configured marker remains valid evidence");
+        assert_eq!(retained_at, None, "the expired provider hold is retired");
+        assert_eq!(deadline, None, "no past timer may be re-armed");
+    }
+
+    #[test]
+    fn only_plain_enter_marks_a_submission() {
+        assert!(is_submission_input(b"\r"));
+        assert!(!is_submission_input(b"\x1b\r"));
+        assert!(!is_submission_input(b"\n"));
+    }
+
+    #[test]
+    fn unchanged_runtime_generation_never_recaptures_the_screen() {
+        assert!(should_capture_status_screen(8, 9, true));
+        assert!(!should_capture_status_screen(9, 9, true));
+        assert!(!should_capture_status_screen(8, 9, false));
+
+        let now = Instant::now();
+        assert_eq!(
+            status_screen_capture_plan(8, 9, true, Some(now), now),
+            StatusScreenCapture::At(now + STATUS_SCREEN_SCAN_INTERVAL)
+        );
+        assert_eq!(
+            status_screen_capture_plan(8, 9, true, Some(now - STATUS_SCREEN_SCAN_INTERVAL), now,),
+            StatusScreenCapture::Now
+        );
+    }
+
+    #[test]
+    fn snapshot_evidence_does_not_claim_hidden_work_coverage() {
+        assert_eq!(
+            status_coverage(TitleProvider::Other, &[], &[]),
+            TerminalStatusCoverage::ActivityOnly
+        );
+        assert_eq!(
+            status_coverage(TitleProvider::Other, &m(&["busy"]), &[]),
+            TerminalStatusCoverage::VisibleMarkers
+        );
+        assert_eq!(
+            status_coverage(TitleProvider::Codex, &[], &[]),
+            TerminalStatusCoverage::ProviderVisible
+        );
+        assert_eq!(
+            status_reason(
+                AgentStatus::Working,
+                false,
+                false,
+                Some(AgentStatus::Working),
+                None,
+                false,
+                false,
+            ),
+            TerminalStatusReason::ProviderTitle
+        );
     }
 
     #[test]
@@ -2437,6 +2960,17 @@ mod tests {
             latch_done(Some(AgentStatus::Idle), typed, false, true),
             (AgentStatus::Idle, false)
         );
+    }
+
+    #[test]
+    fn coalesced_title_frames_keep_the_working_to_idle_edge() {
+        let titles = vec![
+            Some("Thread | Working ⠋".to_string()),
+            Some("Thread | Ready".to_string()),
+        ];
+        let statuses = title_status_trace(TitleProvider::Codex, &titles);
+        assert_eq!(statuses, vec![AgentStatus::Working, AgentStatus::Idle]);
+        assert!(has_working_to_nonworking_edge(&statuses));
     }
 
     #[test]

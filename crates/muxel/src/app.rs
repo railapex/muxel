@@ -7972,7 +7972,14 @@ impl MuxelApp {
             .collect();
         let mut changed = false;
         for (iid, cwd) in candidates {
-            changed |= self.adopt_claude_session_binding(iid, &cwd);
+            if self.adopt_claude_session_binding(iid, &cwd) {
+                if let Some(view) = self.terminals.get(&iid) {
+                    // The persisted binding and the live PTY changed together.
+                    // Retire the prior title and advance the runtime binding token.
+                    view.read(cx).clear_title();
+                }
+                changed = true;
+            }
         }
         if changed {
             cx.notify();
@@ -8702,6 +8709,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(autopilot::AUTO_CONTINUE_MESSAGE.as_bytes());
+            session.mark_turn_submitted();
             session.write_input(b"\r");
         }
     }
@@ -14728,7 +14736,9 @@ impl MuxelApp {
         let payload = format!("{line}\r");
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
-                view.read(cx).session().write_input(payload.as_bytes());
+                let session = view.read(cx).session();
+                session.mark_turn_submitted();
+                session.write_input(payload.as_bytes());
             }
         }
         self.broadcast_input
@@ -14760,6 +14770,7 @@ impl MuxelApp {
         };
         session.paste(&snip.text);
         if snip.submit {
+            session.mark_turn_submitted();
             session.write_input(b"\r");
         }
         self.focus_instance(iid, window, cx);
@@ -15080,6 +15091,7 @@ impl MuxelApp {
         };
         session.paste(text);
         if submit {
+            session.mark_turn_submitted();
             session.write_input(b"\r");
         }
         self.focus_instance(iid, window, cx);
