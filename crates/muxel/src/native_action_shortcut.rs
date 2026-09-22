@@ -24,6 +24,17 @@ pub struct Request {
     chord: Chord,
 }
 
+fn request_is_current(
+    request: &Request,
+    now: Instant,
+    focus: isize,
+    current_chord: Option<&Chord>,
+) -> bool {
+    now.saturating_duration_since(request.received) <= Duration::from_millis(250)
+        && focus == request.focus
+        && current_chord == Some(&request.chord)
+}
+
 fn chord(source: &str) -> Option<Chord> {
     if source.split_whitespace().count() != 1 {
         return None;
@@ -103,18 +114,18 @@ impl Shortcut {
     }
 
     pub fn current(&self, request: &Request) -> bool {
-        request.received.elapsed() <= Duration::from_millis(250)
-            && unsafe { GetFocus() }.0 == request.focus
-            && self
-                .0
-                .read()
-                .is_ok_and(|chord| chord.as_ref() == Some(&request.chord))
+        let now = Instant::now();
+        let focus = unsafe { GetFocus() }.0;
+        self.0
+            .read()
+            .is_ok_and(|chord| request_is_current(request, now, focus, chord.as_ref()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::chord;
+    use super::{Request, chord, request_is_current};
+    use std::time::{Duration, Instant};
     #[test]
     fn native_prefix_tracks_supported_single_chords_without_guessing_layout_punctuation() {
         let default = chord("ctrl-shift-space").unwrap();
@@ -123,5 +134,32 @@ mod tests {
         assert_eq!(chord("ctrl-shift-x").unwrap().key, b'X' as u32);
         assert!(chord("ctrl-k ctrl-s").is_none());
         assert!(chord("ctrl-;").is_none());
+    }
+
+    #[test]
+    fn native_request_expires_on_age_focus_or_rebind() {
+        let received = Instant::now();
+        let original = chord("ctrl-shift-space").unwrap();
+        let rebound = chord("ctrl-shift-x").unwrap();
+        let request = Request {
+            focus: 42,
+            received,
+            chord: original.clone(),
+        };
+
+        assert!(request_is_current(
+            &request,
+            received + Duration::from_millis(250),
+            42,
+            Some(&original),
+        ));
+        assert!(!request_is_current(
+            &request,
+            received + Duration::from_millis(251),
+            42,
+            Some(&original),
+        ));
+        assert!(!request_is_current(&request, received, 43, Some(&original),));
+        assert!(!request_is_current(&request, received, 42, Some(&rebound),));
     }
 }
