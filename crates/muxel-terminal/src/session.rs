@@ -7,7 +7,7 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::TerminalPalette;
-use crate::listener::{MuxelListener, SharedWriter};
+use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
 use crate::profile;
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 /// Identity and timestamp attached to one PTY read while profiling is enabled.
@@ -58,17 +58,53 @@ pub enum PtyChunk {
 }
 
 /// Internal reader envelope. It preserves the exact public [`PtyChunk`] shape
-/// while carrying opt-in timing from the PTY reader to the GPUI drain path.
+/// while carrying when each read arrived, and opt-in profiling timing, from the
+/// PTY reader to the GPUI drain path.
 pub(crate) enum ProfiledPtyChunk {
     Output {
         bytes: Vec<u8>,
         timing: Option<PtyReadTiming>,
+        /// When the reader received these bytes. Lifecycle evidence they carry
+        /// is stamped with this, not with when the drain parses them.
+        read_at: SystemTime,
     },
     Exit {
         code: Option<i32>,
         signal: Option<String>,
         read_error: Option<String>,
     },
+}
+
+/// PTY output drained for one parse, with when the reader received each chunk.
+#[derive(Default)]
+pub(crate) struct PtyOutput {
+    bytes: Vec<u8>,
+    /// For each chunk in order: where it ends in `bytes`, and when it was read.
+    reads: Vec<(usize, SystemTime)>,
+}
+
+impl PtyOutput {
+    pub(crate) fn push(&mut self, bytes: &[u8], read_at: SystemTime) {
+        self.bytes.extend_from_slice(bytes);
+        self.reads.push((self.bytes.len(), read_at));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = (&[u8], SystemTime)> {
+        let mut start = 0;
+        self.reads.iter().map(move |&(end, read_at)| {
+            let chunk = &self.bytes[start..end];
+            start = end;
+            (chunk, read_at)
+        })
+    }
 }
 
 enum PtyChunkSender {
@@ -81,11 +117,20 @@ impl PtyChunkSender {
         matches!(self, Self::Profiled(_))
     }
 
-    fn send_output(&self, bytes: Vec<u8>, timing: Option<PtyReadTiming>) -> bool {
+    fn send_output(
+        &self,
+        bytes: Vec<u8>,
+        timing: Option<PtyReadTiming>,
+        read_at: SystemTime,
+    ) -> bool {
         match self {
             Self::Public(tx) => tx.send_blocking(PtyChunk::Output(bytes)).is_ok(),
             Self::Profiled(tx) => tx
-                .send_blocking(ProfiledPtyChunk::Output { bytes, timing })
+                .send_blocking(ProfiledPtyChunk::Output {
+                    bytes,
+                    timing,
+                    read_at,
+                })
                 .is_ok(),
         }
     }
@@ -278,6 +323,27 @@ struct ResizeState {
     since: Instant,
 }
 
+fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
+    if !has_bytes {
+        previous
+    } else {
+        !submission_pending
+    }
+}
+
+/// The input word (see `TerminalSession::input_state`) after one non-empty
+/// write. The revision always advances. Typed input latches the draft, or
+/// clears it when it carries a submission (`Some(true)`); a mouse or wheel
+/// report (`None`) is input but not text, so the draft stays as it was.
+fn next_input_state(state: u64, submitted: Option<bool>) -> u64 {
+    let revision = (state >> 1).wrapping_add(1) & (u64::MAX >> 1);
+    let previous_draft = state & 1 != 0;
+    let draft = submitted.map_or(previous_draft, |submitted| {
+        draft_after_input(previous_draft, submitted, true)
+    });
+    (revision << 1) | u64::from(draft)
+}
+
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
 /// buffer line (negative = history, so the underline scrolls with the content)
 /// plus the URI a click would open.
@@ -324,6 +390,7 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    evidence: Arc<Mutex<LifecycleEvidence>>,
     title_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
@@ -365,12 +432,24 @@ pub struct TerminalSession {
     output_seen: AtomicBool,
     /// Whether this terminal currently has keyboard focus (UI thread + drain).
     focused: AtomicBool,
-    /// Set once Muxel deliberately submits a turn with Enter. Startup title
-    /// activity alone is not evidence that a turn completed.
+    /// Set once Muxel deliberately submits a turn with Enter, for this whole
+    /// launch. Startup title activity alone is not evidence that a turn
+    /// completed. The runtime reducer uses the submission recorded in
+    /// `evidence` instead, which counts only within its provider binding.
     turn_submitted: AtomicBool,
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
+    submission_pending: AtomicBool,
+    /// The input revision and a conservative draft bit in one atomic word, so
+    /// a reader never sees one write's revision paired with another write's
+    /// draft bit. The low bit is the draft flag; the remaining bits are the
+    /// revision, advanced before each input write's bytes reach the PTY writer.
+    input_state: AtomicU64,
+    /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
+    /// burst of keys/resizes one reconciliation request instead of an event log.
+    runtime_trigger: async_channel::Sender<()>,
+    runtime_events: async_channel::Receiver<()>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -693,6 +772,7 @@ impl TerminalSession {
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let evidence = Arc::new(Mutex::new(LifecycleEvidence::default()));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
@@ -701,6 +781,7 @@ impl TerminalSession {
         let listener = MuxelListener {
             replies,
             title: title.clone(),
+            evidence: evidence.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
@@ -714,6 +795,8 @@ impl TerminalSession {
             listener,
         );
 
+        let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
             term: Arc::new(Mutex::new(term)),
@@ -723,6 +806,7 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            evidence,
             title_generation,
             title_changed_at,
             session_id_hint,
@@ -747,6 +831,10 @@ impl TerminalSession {
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
             last_user_input: Mutex::new(None),
+            submission_pending: AtomicBool::new(false),
+            input_state: AtomicU64::new(0),
+            runtime_trigger,
+            runtime_events,
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -767,20 +855,42 @@ impl TerminalSession {
         Ok(session)
     }
 
-    /// Feed PTY output through the VTE parser into the terminal grid.
-    ///
+    /// Feed PTY output through the VTE parser into the terminal grid. Evidence
+    /// it raises (a title, a bell) is stamped as read now; the view's drain uses
+    /// [`Self::process_drained`], which stamps it with when it was read.
+    pub(crate) fn process_output(&self, data: &[u8]) {
+        self.parse([(data, SystemTime::now())]);
+    }
+
+    /// Feed a drained batch through the parser chunk by chunk, so the evidence
+    /// each chunk raises is stamped with when the reader received it. A batch
+    /// can wait in the queue and the drain's coalescing delay, so its parse
+    /// time can fall after a provider switch its bytes preceded.
+    pub(crate) fn process_drained(&self, output: &PtyOutput) {
+        self.parse(output.chunks());
+    }
+
     /// Collects alacritty damage for the next paint (partial row rebuild) and
     /// for paint-priority scheduling (recent interaction vs stream).
-    pub(crate) fn process_output(&self, data: &[u8]) {
+    fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
-        processor.advance(&mut *term, data);
+        let mut parsed = false;
+        for (bytes, read_at) in chunks {
+            if bytes.is_empty() {
+                continue;
+            }
+            self.evidence.lock().begin_read(read_at);
+            processor.advance(&mut *term, bytes);
+            parsed = true;
+        }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
         // BSU/ESU instead of applying it, and expiring a stuck window is the
         // embedder's job (alacritty services this in its event loop; vte's
         // deadline is 150ms). Without this check, an app that opens a window
         // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap.
+        // Checking here bounds the freeze to deadline + one batch gap. What it
+        // applies was read by the last chunk at the latest, and is stamped so.
         if processor
             .sync_timeout()
             .sync_timeout()
@@ -789,7 +899,8 @@ impl TerminalSession {
             processor.stop_sync(&mut *term);
             profile::sync_expired();
         }
-        if !data.is_empty() {
+        self.evidence.lock().end_read();
+        if parsed {
             let screen = term.screen_lines() as i32;
             let dmg = match term.damage() {
                 TermDamage::Full => ContentDamage::Full,
@@ -918,6 +1029,11 @@ impl TerminalSession {
             }
         }
         if !data.is_empty() {
+            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
+            self.advance_input(Some(submitted_enter));
+            if submitted_enter {
+                self.trigger_runtime();
+            }
             // A TUI reaction will follow; prioritize output during this short
             // interaction window even if stream output is already queued.
             self.mark_interactive();
@@ -944,12 +1060,50 @@ impl TerminalSession {
         *self.last_user_input.lock()
     }
 
-    pub fn mark_turn_submitted(&self) {
-        self.turn_submitted.store(true, Ordering::Relaxed);
+    fn advance_input(&self, submitted: Option<bool>) {
+        let _ = self
+            .input_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                Some(next_input_state(state, submitted))
+            });
     }
 
+    /// Announce that the next input write submits a turn. Call it just before
+    /// writing the Enter (or the text ending in one).
+    pub fn mark_turn_submitted(&self) {
+        self.evidence.lock().record_submission(SystemTime::now());
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Whether any turn was submitted in this launch, in any conversation.
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    /// The input revision and draft bit. The revision advances before the
+    /// bytes of every non-empty input write (keys, pastes, sends, and mouse
+    /// and wheel reports) reach the PTY writer; focus reports and the
+    /// terminal's own replies to the program don't count. The draft bit is set
+    /// by typed input and cleared by a submission.
+    pub fn input_snapshot(&self) -> (u64, bool) {
+        let state = self.input_state.load(Ordering::Relaxed);
+        (state >> 1, state & 1 != 0)
+    }
+
+    /// Lifecycle evidence for the runtime reducer: title edges after `cursor`
+    /// (`None`: from the current binding's start) and whether a turn was
+    /// submitted in the current binding.
+    pub(crate) fn runtime_evidence(&self, cursor: Option<u64>) -> EvidenceRead {
+        self.evidence.lock().read(cursor)
+    }
+
+    pub(crate) fn runtime_events(&self) -> async_channel::Receiver<()> {
+        self.runtime_events.clone()
+    }
+
+    fn trigger_runtime(&self) {
+        let _ = self.runtime_trigger.try_send(());
     }
 
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
@@ -982,6 +1136,16 @@ impl TerminalSession {
         }
         text.push(' ');
         self.paste(&text);
+    }
+
+    /// Send a mouse or wheel report. It reaches the program as input, so it
+    /// advances the input revision, but it isn't text: the draft bit and the
+    /// scroll position stay as they were.
+    fn write_pointer(&self, data: &[u8]) {
+        if !data.is_empty() {
+            self.advance_input(None);
+        }
+        self.write_raw(data);
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
@@ -1060,7 +1224,7 @@ impl TerminalSession {
                 for _ in 0..count {
                     push_wheel_report(&mut buf, lines > 0, col, row, sgr);
                 }
-                self.write_raw(&buf);
+                self.write_pointer(&buf);
             }
             Wheel::Arrows { app_cursor } => {
                 let seq: &[u8] = match (lines > 0, app_cursor) {
@@ -1070,7 +1234,7 @@ impl TerminalSession {
                     (false, false) => b"\x1b[B",
                 };
                 for _ in 0..count {
-                    self.write_raw(seq);
+                    self.write_pointer(seq);
                 }
             }
         }
@@ -1124,6 +1288,7 @@ impl TerminalSession {
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
         self.bump_content();
+        self.trigger_runtime();
         false
     }
 
@@ -1439,19 +1604,49 @@ impl TerminalSession {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
     }
 
-    /// Drop a provider title that belongs to a conversation the running TUI has
-    /// switched away from. The next OSC title repopulates it.
-    pub fn clear_title(&self) {
-        *self.title.lock() = None;
-        self.title_generation.fetch_add(1, Ordering::Relaxed);
-        *self.title_changed_at.lock() = Some(Instant::now());
+    /// The running TUI switched provider conversations at some instant in
+    /// `[from, to]` (one instant when the report carries its own time), as
+    /// reported out of band: a session hook's record or a registry row, read on
+    /// a later tick. Its clock can't be ordered exactly against PTY output, so
+    /// a new binding begins with an ambiguity window around the switch. The
+    /// current title stays as level state unless it was read before the switch
+    /// could have happened (the next OSC title repopulates it), and the bell is
+    /// cleared. Output read inside the window forms no completion edge and
+    /// rings no bell; the reducer waits for evidence read after it.
+    pub fn provider_switched(&self, from: SystemTime, to: SystemTime) {
+        self.provider_switched_at(from, to, SystemTime::now());
+    }
+
+    pub(crate) fn provider_switched_at(
+        &self,
+        from: SystemTime,
+        to: SystemTime,
+        learned_at: SystemTime,
+    ) {
+        let evidence = &mut *self.evidence.lock();
+        let switch = evidence.switch_binding(from, to, learned_at);
+        if switch.bell {
+            self.bell.store(false, Ordering::Relaxed);
+        }
+        if switch.title && self.title.lock().take().is_some() {
+            self.title_generation.fetch_add(1, Ordering::Relaxed);
+            *self.title_changed_at.lock() = Some(Instant::now());
+        }
+        // The reducer's screen facts reset with the binding; a new content
+        // generation makes it recapture them.
         self.bump_content();
+        self.trigger_runtime();
     }
 
     /// Latest UUID-shaped OSC title retained when an agent replaces it with a
     /// display name. Muxel uses this as an exact agent session identity hint.
     pub fn session_id_hint(&self) -> Option<String> {
         self.session_id_hint.lock().clone()
+    }
+
+    /// Revision of the provider conversation bound to this live PTY launch.
+    pub fn binding_revision(&self) -> u64 {
+        self.evidence.lock().binding_rev()
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -1487,6 +1682,7 @@ impl TerminalSession {
     /// Clear the bell (e.g. once the user focuses the pane).
     pub fn clear_bell(&self) {
         self.bell.store(false, Ordering::Relaxed);
+        self.trigger_runtime();
     }
 
     /// Time since output was last processed (for idle detection).
@@ -1557,7 +1753,7 @@ impl TerminalSession {
         let mut buf = Vec::with_capacity(24);
         push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
         self.mark_user_input();
-        self.write_raw(&buf);
+        self.write_pointer(&buf);
         // Remember an outstanding press so the matching release is guaranteed.
         self.mouse_pressed_button.store(
             if pressed { button } else { NO_MOUSE_PRESS },
@@ -1614,7 +1810,7 @@ impl TerminalSession {
         // Motion is always "press" encoding in SGR (`M`).
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
         self.mark_user_input();
-        self.write_raw(&buf);
+        self.write_pointer(&buf);
     }
 }
 
@@ -2023,6 +2219,7 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                let read_at = SystemTime::now();
                 let timing = profile_reads.then(|| {
                     read_sequence = read_sequence.wrapping_add(1).max(1);
                     profile::pty_read(n, read_sequence)
@@ -2030,7 +2227,7 @@ fn read_loop(
                 // Before the bytes reach the UI: replies that wait on the UI's
                 // drain can miss the asker's window and be read as typing.
                 immediate_replies.advance(&buf[..n]);
-                if !tx.send_output(buf[..n].to_vec(), timing) {
+                if !tx.send_output(buf[..n].to_vec(), timing, read_at) {
                     // Receiver dropped — UI is gone. Still fall through to reap
                     // the child, or it lingers as a zombie.
                     ui_gone = true;
@@ -2324,15 +2521,18 @@ mod profiler_transport_tests {
             sequence: 7,
             read_at_us: 11,
         };
-        assert!(sender.send_output(vec![4, 5], Some(timing)));
+        let read_at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        assert!(sender.send_output(vec![4, 5], Some(timing), read_at));
         match rx.try_recv().expect("profiled output") {
             ProfiledPtyChunk::Output {
                 bytes,
                 timing: Some(received),
+                read_at: received_at,
             } => {
                 assert_eq!(bytes, [4, 5]);
                 assert_eq!(received.sequence, timing.sequence);
                 assert_eq!(received.read_at_us, timing.read_at_us);
+                assert_eq!(received_at, read_at);
             }
             _ => panic!("expected timed output"),
         }
@@ -2558,6 +2758,121 @@ mod windows_spawn_resolve {
             output.contains("codex-cli"),
             "Codex did not reach its public CLI: {output:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_fact_tests {
+    use super::{
+        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+    };
+    use async_channel::TryRecvError;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn draft_state_changes_only_for_admitted_input_or_submission() {
+        assert!(!draft_after_input(false, false, false));
+        assert!(draft_after_input(false, false, true));
+        assert!(!draft_after_input(true, true, true));
+        assert!(draft_after_input(true, false, true));
+    }
+
+    #[test]
+    fn every_input_write_advances_the_revision_and_only_text_moves_the_draft() {
+        let state = |rev: u64, draft: bool| (rev << 1) | u64::from(draft);
+        assert_eq!(
+            next_input_state(state(4, false), Some(false)),
+            state(5, true)
+        );
+        assert_eq!(
+            next_input_state(state(4, true), Some(true)),
+            state(5, false)
+        );
+        // A mouse or wheel report leaves the draft as it was.
+        assert_eq!(next_input_state(state(4, true), None), state(5, true));
+        assert_eq!(next_input_state(state(4, false), None), state(5, false));
+    }
+
+    #[test]
+    fn runtime_invalidations_are_bounded_and_input_facts_are_atomic() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let events = session.runtime_events();
+
+        session.write_input(b"x");
+        assert_eq!(session.input_snapshot(), (1, true));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // A soft newline is ordinary draft input; the view deliberately does
+        // not mark it as a turn submission.
+        session.write_input(b"\x1b\r");
+        assert_eq!(session.input_snapshot(), (2, true));
+
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert_eq!(session.input_snapshot(), (3, false));
+        assert_eq!(events.try_recv(), Ok(()));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // Read long before the provider switched; then the switch is reported.
+        let now = SystemTime::now();
+        let mut stale = PtyOutput::default();
+        stale.push(b"\x1b]0;stale title\x07\x07", now - Duration::from_secs(10));
+        session.process_drained(&stale);
+        assert!(session.has_bell());
+        session.provider_switched(now, now);
+        // The retired conversation's bell goes with its title.
+        assert!(!session.has_bell());
+        assert_eq!(session.title(), None);
+        let read = session.runtime_evidence(None);
+        assert!(read.titles.is_empty());
+        assert!(!read.overflowed);
+        assert!(!read.submitted);
+        assert_eq!(events.try_recv(), Ok(()));
+        session.clear_bell();
+        assert_eq!(events.try_recv(), Ok(()));
+
+        assert!(session.resize(81, 24));
+        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        assert!(!session.resize(81, 24));
+        assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    fn fixture() -> std::sync::Arc<TerminalSession> {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        TerminalSession::spawn(spec, 80, 24)
+            .expect("spawn fixture")
+            .0
+    }
+
+    #[test]
+    fn pointer_reports_advance_the_input_revision_but_not_the_draft() {
+        let session = fixture();
+        session.write_input(b"x");
+        let (typed, draft) = session.input_snapshot();
+        assert!(draft);
+        session.report_mouse_button(0, 0, 0, true, false, false, false);
+        session.report_mouse_button(0, 0, 0, false, false, false, false);
+        assert_eq!(session.input_snapshot(), (typed + 2, true));
+        // A wheel turn that only scrolls muxel's own scrollback never reaches
+        // the program.
+        session.scroll_wheel(-40.0, 20.0, 0, 0);
+        assert_eq!(session.input_snapshot(), (typed + 2, true));
+        session.kill();
     }
 }
 

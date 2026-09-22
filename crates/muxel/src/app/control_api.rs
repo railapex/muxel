@@ -106,6 +106,41 @@ fn state_name(state: AgentState) -> String {
         .unwrap_or_default()
 }
 
+/// Control decisions use live facts, never the attention record held through a switch.
+fn runtime_control_state(
+    runtime: muxel_terminal::TerminalRuntimeSnapshot,
+    binding_rev: u64,
+) -> AgentState {
+    if !runtime.is_attributable_to(binding_rev) {
+        return AgentState::Working;
+    }
+    match runtime.status {
+        AgentStatus::Working => AgentState::Working,
+        AgentStatus::Idle => AgentState::Idle,
+        AgentStatus::Blocked => AgentState::Blocked,
+        AgentStatus::Done => AgentState::Done,
+    }
+}
+
+fn check_send_state(state: Option<AgentState>, force: bool) -> Result<(), String> {
+    if !force {
+        match state {
+            Some(AgentState::Working) => {
+                return Err("the agent is working: `wait` for it to finish (or pass \
+                            --force to type the prompt anyway)"
+                    .into());
+            }
+            Some(AgentState::Blocked) => {
+                return Err("the agent is waiting on a question: see `show`, then \
+                            `answer` it or press `keys`"
+                    .into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl MuxelApp {
     /// Start or stop the control server to match the setting. Idempotent; called
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
@@ -642,18 +677,7 @@ impl MuxelApp {
             } else if view.exited() {
                 AgentState::Exited
             } else {
-                // The status the sidebar shows (refreshed each tick).
-                match self
-                    .last_status
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_else(|| view.status())
-                {
-                    AgentStatus::Working => AgentState::Working,
-                    AgentStatus::Idle => AgentState::Idle,
-                    AgentStatus::Blocked => AgentState::Blocked,
-                    AgentStatus::Done => AgentState::Done,
-                }
+                runtime_control_state(view.runtime_snapshot(), view.session().binding_revision())
             }
         } else if self.terminal_launching.contains_key(&id) {
             AgentState::Starting
@@ -992,21 +1016,7 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|inst| self.control_state(inst, cx));
-        if !force {
-            match state {
-                Some(AgentState::Working) => {
-                    return Err("the agent is working: `wait` for it to finish (or pass \
-                                --force to type the prompt anyway)"
-                        .into());
-                }
-                Some(AgentState::Blocked) => {
-                    return Err("the agent is waiting on a question: see `show`, then \
-                                `answer` it or press `keys`"
-                        .into());
-                }
-                _ => {}
-            }
-        }
+        check_send_state(state, force)?;
         let turn = Turn {
             prompt: Some(text.clone()),
             grace_ms: ctl::REPLY_GRACE_MS,
@@ -1296,4 +1306,99 @@ fn show_value(
         "last_reply": reply.map(|text| json!({ "text": text, "source": reply_from })),
         "question": question,
     })
+}
+
+#[cfg(test)]
+mod runtime_control_tests {
+    use super::{AgentState, AgentStatus, check_send_state, ctl, runtime_control_state};
+    use muxel_core::AgentActivity;
+    use muxel_terminal::{
+        CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
+        TerminalStatusReason,
+    };
+    use std::time::SystemTime;
+
+    #[test]
+    fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let revision = session.binding_revision();
+        let activity = AgentActivity::default();
+        let cached = TerminalRuntimeSnapshot {
+            status: AgentStatus::Done,
+            attributable: true,
+            reason: TerminalStatusReason::Quiet,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: session.id,
+            binding_rev: revision,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+        };
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        for old_status in [AgentStatus::Idle, AgentStatus::Done] {
+            let runtime = TerminalRuntimeSnapshot {
+                status: old_status,
+                ..cached
+            };
+            let before = runtime_control_state(runtime, revision);
+            assert!(check_send_state(Some(before), false).is_ok());
+            assert_eq!(
+                ctl::wait_outcome(Some(before), false),
+                Some(ctl::WaitOutcome::Finished)
+            );
+
+            // The same facts cannot authorize send or finish wait after adoption,
+            // even before the runtime event has been processed.
+            let state = runtime_control_state(runtime, session.binding_revision());
+            assert_eq!(state, AgentState::Working);
+            assert!(check_send_state(Some(state), false).is_err());
+            assert!(check_send_state(Some(state), true).is_ok());
+            let awaiting = ctl::awaiting_reply(
+                Some(100),
+                ctl::REPLY_GRACE_MS,
+                Some(state),
+                &activity,
+                100_000,
+            );
+            assert!(awaiting);
+            assert_eq!(ctl::wait_outcome(Some(state), awaiting), None);
+            assert_eq!(ctl::wait_outcome(Some(state), false), None);
+        }
+        // A reconciled but uncertain level state is equally conservative.
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Idle,
+        ] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                attributable: false,
+                binding_rev: session.binding_revision(),
+                ..cached
+            };
+            let state = runtime_control_state(runtime, session.binding_revision());
+            assert!(check_send_state(Some(state), false).is_err());
+            assert_eq!(ctl::wait_outcome(Some(state), false), None);
+        }
+        let fresh = TerminalRuntimeSnapshot {
+            binding_rev: session.binding_revision(),
+            ..cached
+        };
+        let state = runtime_control_state(fresh, session.binding_revision());
+        assert_eq!(state, AgentState::Done);
+        assert!(check_send_state(Some(state), false).is_ok());
+        assert_eq!(
+            ctl::wait_outcome(Some(state), false),
+            Some(ctl::WaitOutcome::Finished)
+        );
+    }
 }

@@ -276,6 +276,18 @@ feature is added or changed, update the matching entry here in the same change**
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
   pane) can't fake a finished turn.
+- **Event-driven status snapshots** — terminal output, semantic titles, bells,
+  process exit, resize invalidation, and exact quiet/debounce deadlines update one
+  per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
+  or mutate lifecycle state. When an agent switches conversations in place (a
+  `/resume`), evidence from around the switch can't complete a turn or notify:
+  the pane shows the agent's current state until the new conversation's own
+  evidence arrives, and the Enter that picked the conversation doesn't count as
+  a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
+  sends are refused and `wait` keeps waiting; `send --force` retains its override.
+  The snapshot carries a launch id and
+  provider-binding, input and sequence revisions; without provider hooks its coverage remains
+  explicitly limited to visible terminal evidence.
 - **Auto-continue** — an agent that lays out a multi-phase plan sometimes finishes
   the first phase and just stops, waiting, with the todo list still half-unchecked.
   Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
