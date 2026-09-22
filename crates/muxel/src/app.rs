@@ -10795,10 +10795,23 @@ impl MuxelApp {
                 this.sync_browser_visibility(cx);
                 if event.restore_focus {
                     #[cfg(target_os = "windows")]
-                    if this.action_origin() == origin
-                        && let Some((view, focus)) = &native_origin
-                    {
-                        view.read(cx).restore_action_sheet_focus(*focus, cx);
+                    if let Some((view, focus)) = native_origin.clone() {
+                        // `sync_browser_visibility` applies native visibility in
+                        // a deferred update after the render pass. Queue focus
+                        // restoration behind it so BrowserView is visible before
+                        // it accepts the saved WebView2 child HWND.
+                        let app = cx.weak_entity();
+                        cx.defer(move |cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                if this.action_origin() == origin
+                                    && origin
+                                        .instance
+                                        .is_none_or(|id| this.workspace.instance(id).is_some())
+                                {
+                                    view.read(cx).restore_action_sheet_focus(focus, cx);
+                                }
+                            });
+                        });
                     }
                 }
                 cx.notify();
@@ -13770,6 +13783,17 @@ impl MuxelApp {
         else {
             return;
         };
+        if self
+            .action_sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.read(cx).owner() == window_id)
+        {
+            // OS-level window closure can bypass the sheet's focus/deactivate
+            // dismissal. Do not leave the app-wide overlay flag hiding every
+            // native browser after its owner is gone.
+            self.action_sheet = None;
+            self.sync_browser_visibility(cx);
+        }
         let sec = self.secondary_windows.remove(ix);
         for iid in self
             .workspace
