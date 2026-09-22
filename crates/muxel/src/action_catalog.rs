@@ -220,6 +220,7 @@ mod tests {
             .map(|&(id, key, context)| (id, (key, context)))
             .collect();
         assert_eq!(original.len(), 59);
+        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 1);
         for (id, key, context) in original {
             assert_eq!(
                 current.get(id.as_str()),
