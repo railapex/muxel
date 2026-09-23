@@ -381,12 +381,17 @@ mod imp {
 
                         #[cfg(target_os = "windows")]
                         if let Some(webview) = built.as_ref() {
+                            let accelerator_key =
+                                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                             let accelerator = AcceleratorKeyPressedEventHandler::create(Box::new(
                                 move |_, args| {
+                                    use std::sync::atomic::Ordering;
                                     use webview2_com::Microsoft::Web::WebView2::Win32::{
                                         COREWEBVIEW2_KEY_EVENT_KIND,
                                         COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+                                        COREWEBVIEW2_KEY_EVENT_KIND_KEY_UP,
                                         COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+                                        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_UP,
                                         COREWEBVIEW2_PHYSICAL_KEY_STATUS,
                                     };
                                     let Some(args) = args else {
@@ -397,6 +402,22 @@ mod imp {
                                     unsafe {
                                         args.KeyEventKind(&mut kind)?;
                                         args.VirtualKey(&mut key)?;
+                                    }
+                                    if kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_UP
+                                        || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_UP
+                                    {
+                                        if accelerator_key
+                                            .compare_exchange(
+                                                key,
+                                                0,
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            )
+                                            .is_ok()
+                                        {
+                                            unsafe { args.SetHandled(true)? };
+                                        }
+                                        return Ok(());
                                     }
                                     if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
                                         && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
@@ -412,6 +433,11 @@ mod imp {
                                         args.SetHandled(true)?;
                                     }
                                     if !status.WasKeyDown.as_bool() {
+                                        // WebView2 sends the matching key-up after
+                                        // this callback moves focus to GPUI. Letting
+                                        // a letter chord's key-up through can reclaim
+                                        // native focus and blur the just-opened sheet.
+                                        accelerator_key.store(key, Ordering::Release);
                                         let _ = action_tx.try_send(request);
                                     }
                                     Ok(())
