@@ -65,6 +65,7 @@ catalogue! {
     ("ToggleBroadcast", "Toggle broadcast", "View", Project, None, "ctrl-shift-i", None),
     ("ToggleSpeechToText", "Toggle speech to text", "View", Terminal, None, "ctrl-shift-m", None),
     ("HoldSpeechToText", "Hold speech to text", "View", Terminal, None, "ctrl-shift-h", None),
+    ("ReadAloud", "Read the last reply aloud", "Agent", Terminal, None, "ctrl-shift-r", None),
     ("ToggleWorktree", "Toggle git worktree for new agents", "Layout", App, None, "ctrl-shift-g", None),
     ("ToggleFullScreen", "Toggle fullscreen", "View", App, Some("v"), "f11", None),
     ("ToggleDevConsole", "Toggle developer console", "View", App, None, "f12", None),
@@ -235,7 +236,7 @@ mod tests {
             .map(|&(id, key, context)| (id, (key, context)))
             .collect();
         assert_eq!(original.len(), 59);
-        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 1);
+        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 2);
         for (id, key, context) in original {
             let expected_key = if id == "ClosePane" {
                 if cfg!(target_os = "macos") {
@@ -252,6 +253,11 @@ mod tests {
                 "{id}"
             );
         }
+        assert_eq!(
+            current.get("ShowActionSheet"),
+            Some(&("ctrl-shift-space", None))
+        );
+        assert_eq!(current.get("ReadAloud"), Some(&("ctrl-shift-r", None)));
     }
 
     #[test]

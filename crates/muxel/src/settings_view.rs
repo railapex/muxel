@@ -28,6 +28,7 @@ pub enum SettingsSection {
     Editor,
     Behavior,
     Speech,
+    ReadAloud,
     Agents,
     Runners,
     Snippets,
@@ -149,6 +150,15 @@ pub struct SettingsUi {
     /// Whether a provider API key is stored (cached so render doesn't hit the
     /// keychain every frame).
     pub stt_has_key: bool,
+
+    // Read aloud (text-to-speech).
+    /// OS voice name, typed — for systems muxel can't list voices on (Linux).
+    pub tts_system_voice: Entity<InputState>,
+    pub tts_provider_voice: Entity<InputState>,
+    pub tts_provider_model: Entity<InputState>,
+    /// The OS voices, `(name, locale)`, listed once in the background the first
+    /// time Settings opens (`None` until then).
+    pub tts_system_voices: Option<Vec<(String, String)>>,
 
     // Keybindings (action name -> keystroke input).
     pub keybinds: Vec<(String, Entity<InputState>)>,
@@ -297,6 +307,15 @@ impl SettingsUi {
                     .placeholder(muxel_core::stt::DEFAULT_WAKE_PHRASE.to_string())
             }),
             stt_has_key: false,
+            tts_system_voice: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("OS default voice"))),
+            tts_provider_voice: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(muxel_core::tts::DEFAULT_TTS_VOICE)
+            }),
+            tts_provider_model: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(muxel_core::tts::DEFAULT_TTS_PROVIDER_MODEL)
+            }),
+            tts_system_voices: None,
             keybinds: DEFAULT_KEYBINDINGS
                 .iter()
                 .map(|(name, default, _ctx)| {
