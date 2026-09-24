@@ -50,11 +50,6 @@ feature is added or changed, update the matching entry here in the same change**
   bounded **Recently closed** list in Search and reopen in their project.
   Dirty editors use the conventional **Save / Don't Save / Cancel** decision first;
   closed resource views are recreated rather than retained in memory.
-- **Recoverable terminal close** — idle/done terminals retain their live process
-  for 15 seconds behind an inline title-bar Undo control; its close button finishes
-  immediately. Working, blocked, launching, and unknown terminals honor the normal
-  destructive-confirmation setting, and a retained terminal that becomes active
-  is restored instead of killed when the grace period ends.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -76,6 +71,11 @@ feature is added or changed, update the matching entry here in the same change**
   agent comes back on its saved conversation, so an updated harness binary takes
   effect without losing it; a shell or other program starts over.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
+- **Recoverable terminal close** — closing a terminal removes its tab immediately
+  but keeps the live process for 15 seconds. Undo in the title bar or `Ctrl+Alt+Z`
+  restores it without restarting; a changed work state pauses finalization until
+  you decide. Active or uncertain work asks before close, and dirty editors keep
+  Save / Don't Save / Cancel in mixed batches.
 
 ## Pop-out windows
 
@@ -84,8 +84,9 @@ feature is added or changed, update the matching entry here in the same change**
   at the same URL (a native webview belongs to the window that built it).
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location.
-- **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation). Editors and browser panes just close.
+- **Recoverable pop-out close** — closing a terminal pop-out follows the same
+  confirmation and 15-second live Undo as a docked tab. Editors and browser panes
+  close after their applicable confirmation.
 
 ## Agents
 

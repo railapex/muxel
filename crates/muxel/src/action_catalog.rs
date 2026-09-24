@@ -44,6 +44,7 @@ catalogue! {
     ("ClosePane", "Close pane", "Close", Pane, Some("w"), "cmd-w", None),
     #[cfg(not(target_os = "macos"))]
     ("ClosePane", "Close pane", "Close", Pane, Some("w"), "ctrl-w", None),
+    ("UndoClose", "Undo terminal close", "Close", App, None, "ctrl-alt-z", None),
     ("FocusNext", "Focus next pane", "Navigate", Pane, Some("f"), "ctrl-shift-]", None),
     ("FocusPrev", "Focus previous pane", "Navigate", Pane, None, "ctrl-shift-[", None),
     ("FocusLeft", "Focus pane left", "Navigate", Pane, None, "ctrl-alt-left", None),
@@ -238,7 +239,7 @@ mod tests {
             .map(|&(id, key, context)| (id, (key, context)))
             .collect();
         assert_eq!(original.len(), 59);
-        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 2);
+        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 3);
         for (id, key, context) in original {
             let expected_key = if id == "ClosePane" {
                 if cfg!(target_os = "macos") {
@@ -260,6 +261,7 @@ mod tests {
             Some(&("ctrl-shift-space", None))
         );
         assert_eq!(current.get("ReadAloud"), Some(&("ctrl-shift-r", None)));
+        assert_eq!(current.get("UndoClose"), Some(&("ctrl-alt-z", None)));
     }
 
     #[test]
