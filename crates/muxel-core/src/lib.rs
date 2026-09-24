@@ -2817,26 +2817,19 @@ mod settings_tests {
     fn legacy_close_preferences_keep_their_serialized_values() {
         let settings = Settings {
             confirm_close_terminal: false,
-            confirm_close_editor: true,
             confirm_close_diff: true,
             ..Settings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         let restored: Settings = serde_json::from_str(&json).unwrap();
         assert!(!restored.confirm_close_terminal);
-        assert!(restored.confirm_close_editor);
         assert!(restored.confirm_close_diff);
         let mut old = serde_json::to_value(settings).unwrap();
-        for key in [
-            "confirm_close_terminal",
-            "confirm_close_editor",
-            "confirm_close_diff",
-        ] {
+        for key in ["confirm_close_terminal", "confirm_close_diff"] {
             old.as_object_mut().unwrap().remove(key);
         }
         let restored: Settings = serde_json::from_value(old).unwrap();
         assert!(restored.confirm_close_terminal);
-        assert!(!restored.confirm_close_editor);
         assert!(!restored.confirm_close_diff);
     }
 }
