@@ -13,6 +13,7 @@ mod app;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
+mod close_policy;
 mod editor;
 mod filetree;
 mod i18n;

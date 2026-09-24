@@ -2009,9 +2009,8 @@ pub struct Settings {
     /// Close a pane automatically when its process exits.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
-    /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on because they hold a running process; diffs default off because they are
-    /// cheap to reopen. Dirty editors always use Save / Don't Save / Cancel.
+    /// Legacy serialized preferences. Kept for settings round-trips; the close
+    /// policy now uses current work evidence and does not consult these flags.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
     #[serde(default)]
@@ -2812,6 +2811,33 @@ mod settings_tests {
                 .terminal_mouse,
             "copy_on_select"
         );
+    }
+
+    #[test]
+    fn legacy_close_preferences_keep_their_serialized_values() {
+        let settings = Settings {
+            confirm_close_terminal: false,
+            confirm_close_editor: true,
+            confirm_close_diff: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.confirm_close_terminal);
+        assert!(restored.confirm_close_editor);
+        assert!(restored.confirm_close_diff);
+        let mut old = serde_json::to_value(settings).unwrap();
+        for key in [
+            "confirm_close_terminal",
+            "confirm_close_editor",
+            "confirm_close_diff",
+        ] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert!(restored.confirm_close_terminal);
+        assert!(!restored.confirm_close_editor);
+        assert!(!restored.confirm_close_diff);
     }
 }
 

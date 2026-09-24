@@ -3,6 +3,7 @@
 //! renders the active project's pane tree. Live terminals are kept in
 //! `terminals`, keyed by instance id.
 
+use crate::close_policy::{self, CloseEvidence, CloseTarget, CloseToken, TerminalEvidence};
 use crate::editor::{
     DiskChange, DiskStamp, EditorConfig, EditorView, ExternalChange, read_disk_change,
 };
@@ -1385,7 +1386,7 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| {
-                this.request_app_quit(cx);
+                this.request_quit(cx);
             });
         }
     });
@@ -2725,6 +2726,9 @@ pub struct MuxelApp {
     waking: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
+    /// Exact work set approved by the quit dialog.
+    quit_close_token: Option<CloseToken>,
+    workspace_switch_approval: Option<(Uuid, CloseToken)>,
     /// When set, the agent picker is shown: (target, placement, anchor point).
     place_menu: Option<(Uuid, PlacementMode, Point<Pixels>)>,
     /// While dragging a tab over a pane: (leaf anchor, insertion index) for the
@@ -2738,10 +2742,9 @@ pub struct MuxelApp {
     /// Bounded, in-memory resource reopen history keyed by workspace id.
     recently_closed: HashMap<Uuid, VecDeque<RecentlyClosedGroup>>,
     next_recently_closed_generation: u64,
-    /// Dirty editors being saved serially before their close request resumes.
-    pending_close_save: Option<PendingCloseSave>,
-    /// Monotonic token rejecting stale asynchronous close-save completions.
-    next_close_save_generation: u64,
+    approved_popout_closes: HashMap<Uuid, CloseToken>,
+    close_save_in_progress: Option<u64>,
+    close_save_generation: u64,
     /// Dirty worktrees awaiting a Commit/Discard/Keep decision (modal shows front).
     pending_worktree_dispose: std::collections::VecDeque<WorktreeDispose>,
     /// Reused commit-message input for the worktree dispose modal.
@@ -3178,6 +3181,7 @@ struct PopoutView {
     view: PaneView,
     iid: Uuid,
     show_close_confirm: bool,
+    close_token: Option<CloseToken>,
     /// Profiler-only correlation state. Keeping it on the root that owns the
     /// pane prevents a popped-out terminal from affecting main-app lifecycle
     /// bookkeeping or suppressing the first transition after re-dock.
@@ -3189,6 +3193,20 @@ struct PopoutView {
 impl PopoutView {
     fn new(view: PaneView, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            if cx
+                .try_global::<MuxelHandle>()
+                .and_then(|h| h.0.upgrade())
+                .is_some_and(|app| app.read(cx).confirm_quit)
+            {
+                return true;
+            }
+            if let Some(popout) = weak.upgrade() {
+                popout.update(cx, |this, cx| this.request_close(window, cx));
+            }
+            false
+        });
         let profile_status = if ui_profile::is_enabled() {
             match &view {
                 PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
@@ -3242,6 +3260,7 @@ impl PopoutView {
             view,
             iid,
             show_close_confirm: false,
+            close_token: None,
             profile_status,
             profile_window_active,
             action_sheet: None,
@@ -3328,50 +3347,64 @@ impl PopoutView {
         }
     }
 
-    /// Heading + body for the close confirmation, including why a live terminal
-    /// is unsafe to close without asking.
-    fn close_confirm_copy(&self, cx: &App) -> (SharedString, SharedString) {
+    /// Heading + body for the close confirmation, which differs per pane kind
+    /// (only a terminal is actually terminated).
+    fn close_confirm_copy(&self) -> (&'static str, &'static str) {
         match &self.view {
-            PaneView::Terminal(view) => {
-                let name = self.title(cx).to_string();
-                let reason = terminal_interruption(Some(view.read(cx).status()), true, false);
-                (t("Close terminal?"), terminal_close_message(&name, reason))
-            }
-            PaneView::Editor(_) => (t("Close editor?"), t("Unsaved changes will be lost.")),
-            PaneView::Browser(_) => (t("Close browser?"), t("This browser pane will be closed.")),
+            PaneView::Terminal(_) => ("Close terminal?", "This terminal will be terminated."),
+            PaneView::Editor(_) => ("Close editor?", "Unsaved changes will be lost."),
+            PaneView::Browser(_) => ("Close browser?", "This browser pane will be closed."),
         }
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dirty_editor = matches!(
-            &self.view,
-            PaneView::Editor(editor) if editor.read(cx).is_dirty()
-        );
-        let app = cx
-            .try_global::<MuxelHandle>()
-            .and_then(|handle| handle.0.upgrade());
-        let terminal_disposition = app.as_ref().and_then(|app| {
-            matches!(self.view, PaneView::Terminal(_))
-                .then(|| app.read(cx).terminal_close_disposition_for(self.iid, cx))
-        });
-        let needs_confirm =
-            dirty_editor || terminal_disposition == Some(TerminalCloseDisposition::Confirm);
-        if needs_confirm {
+        let Some(app) = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade()) else {
+            return;
+        };
+        let token = app.read(cx).close_token_for_ids([self.iid], cx);
+        if token.needs_confirmation() {
+            self.close_token = Some(token);
             self.show_close_confirm = true;
             cx.notify();
-        } else if let Some(app) = app {
-            let iid = self.iid;
-            let recoverable = terminal_disposition == Some(TerminalCloseDisposition::Recoverable);
-            app.update(cx, |app, cx| {
-                if recoverable {
-                    app.redock_popout(iid, cx);
-                }
-                app.execute_close_group(vec![iid], cx);
+        } else if app.read(cx).close_token_for_ids([self.iid], cx) == token {
+            app.update(cx, |app, _| {
+                app.approved_popout_closes.insert(self.iid, token);
             });
-            if recoverable {
-                window.remove_window();
-            }
+            window.remove_window();
         }
+    }
+
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(app) = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade()) else {
+            return;
+        };
+        if app.read(cx).close_save_in_progress.is_some() {
+            return;
+        }
+        let Some(expected) = self.close_token.take() else {
+            return;
+        };
+        let current = app.read(cx).close_token_for_ids([self.iid], cx);
+        if current != expected {
+            self.close_token = Some(current);
+            self.show_close_confirm = true;
+            cx.notify();
+            return;
+        }
+        app.update(cx, |app, _| {
+            app.approved_popout_closes.insert(self.iid, expected);
+        });
+        window.remove_window();
+    }
+
+    fn close_reason_message(&self, cx: &App) -> String {
+        let Some(app) = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade()) else {
+            return String::new();
+        };
+        self.close_token
+            .as_ref()
+            .map(|token| app.read(cx).close_reasons(token))
+            .unwrap_or_default()
     }
 }
 
@@ -3581,6 +3614,7 @@ struct QuitInterruption {
 #[derive(Clone)]
 enum ConfirmAction {
     DeleteWorkspace(Uuid),
+    EnterWorkspace(Uuid),
     DeletePreset(usize),
     DeleteProject(Uuid),
     DeleteRunner(usize),
@@ -3588,20 +3622,13 @@ enum ConfirmAction {
     DeleteLoop(usize),
     DeleteRemote(usize),
     DeleteIdentity(usize),
-    /// Save dirty editors before continuing the requested close.
-    SaveDirtyAndContinue {
-        ids: Vec<Uuid>,
-        restore_focus: Uuid,
-    },
-    /// Discard dirty buffers before continuing the requested close.
-    DiscardDirtyAndContinue {
-        ids: Vec<Uuid>,
-        restore_focus: Uuid,
-    },
-    /// Continue a close after its normal destructive confirmation.
-    CloseGroup {
-        ids: Vec<Uuid>,
-        restore_focus: Uuid,
+    CloseInstance(Uuid),
+    /// Close every other tab in the pane holding this instance (keeps it).
+    CloseOtherTabs(Uuid),
+    /// Close the tabs to one side of `anchor` (keeps it).
+    CloseTabsSide {
+        anchor: Uuid,
+        right: bool,
     },
     /// Switch the project's git branch (warned — it touches the working tree).
     SwitchBranch {
@@ -3642,9 +3669,8 @@ impl ConfirmAction {
     /// The pane whose owning window should show this confirmation.
     fn pane_instance(&self) -> Option<Uuid> {
         match self {
-            Self::SaveDirtyAndContinue { restore_focus, .. }
-            | Self::DiscardDirtyAndContinue { restore_focus, .. }
-            | Self::CloseGroup { restore_focus, .. } => Some(*restore_focus),
+            Self::CloseInstance(iid) | Self::CloseOtherTabs(iid) => Some(*iid),
+            Self::CloseTabsSide { anchor, .. } => Some(*anchor),
             _ => None,
         }
     }
@@ -3685,13 +3711,6 @@ struct RecentlyClosedGroup {
     generation: u64,
     project_id: Uuid,
     items: Vec<RecentlyClosedResource>,
-}
-
-struct PendingCloseSave {
-    ids: Vec<Uuid>,
-    restore_focus: Uuid,
-    remaining: Vec<Uuid>,
-    generation: u64,
 }
 
 fn push_recently_closed_group(
@@ -3884,12 +3903,68 @@ struct PendingConfirm {
     title: SharedString,
     message: SharedString,
     confirm_label: SharedString,
-    confirm_danger: bool,
-    alternate: Option<(SharedString, ConfirmAction)>,
     /// Optional label/value rows rendered in mono between the message and the
     /// buttons (host-key fingerprints); empty for plain confirms.
     details: Vec<(SharedString, SharedString)>,
     action: ConfirmAction,
+    /// Work identity and exact membership authorized by this dialog, if it
+    /// closes panes. Recomputed at confirmation and before each removal.
+    close_token: Option<CloseToken>,
+}
+
+#[derive(Clone, Copy)]
+enum CloseSaveIntent {
+    Confirm,
+    Quit,
+    Popout(Uuid),
+}
+
+struct CloseEditorSave {
+    iid: Uuid,
+    path: PathBuf,
+    text: String,
+    remote: Option<integrations::RepoLoc>,
+}
+
+fn write_close_editor_jobs(jobs: &[CloseEditorSave]) -> Result<(), String> {
+    jobs.iter().try_for_each(|job| {
+        if let Some(remote) = &job.remote {
+            integrations::write_remote_file(remote, &job.path.to_string_lossy(), &job.text)
+                .map_err(|e| format!("{}: {e:#}", job.path.display()))
+        } else {
+            std::fs::write(&job.path, &job.text).map_err(|e| format!("{}: {e}", job.path.display()))
+        }
+    })
+}
+
+#[cfg(test)]
+mod close_save_tests {
+    use super::{CloseEditorSave, write_close_editor_jobs};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_failed_save_stops_the_remaining_batch() {
+        let dir = std::env::temp_dir().join(format!("muxel-close-save-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let paths = [
+            dir.join("first"),
+            dir.join("missing").join("second"),
+            dir.join("third"),
+        ];
+        let jobs: Vec<_> = paths
+            .iter()
+            .map(|path| CloseEditorSave {
+                iid: Uuid::new_v4(),
+                path: path.clone(),
+                text: "draft".into(),
+                remote: None,
+            })
+            .collect();
+        assert!(write_close_editor_jobs(&jobs).is_err());
+        assert!(paths[0].exists());
+        assert!(!paths[2].exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// A single-input git modal (commit message / new branch name) for a project.
@@ -4064,11 +4139,10 @@ impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
-        let close_copy = self.show_close_confirm.then(|| self.close_confirm_copy(cx));
-        let dirty_editor = matches!(
-            &self.view,
-            PaneView::Editor(editor) if editor.read(cx).is_dirty()
-        );
+        let dirty_editor = self
+            .close_token
+            .as_ref()
+            .is_some_and(CloseToken::has_dirty_editors);
         // A native webview child draws above all gpui content, so it has to go
         // away while an app-owned overlay sits on top of it.
         if let PaneView::Browser(v) = &self.view {
@@ -4117,9 +4191,9 @@ impl Render for PopoutView {
                     cx.notify();
                 }
             }))
-            .on_action(
-                cx.listener(|this, _: &ClosePane, window, cx| this.request_close(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
+                this.request_close(window, cx);
+            }))
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -4130,9 +4204,9 @@ impl Render for PopoutView {
                 // selectable popped-out content (e.g. a rendered-markdown editor).
                 // The mouse-down on the title-content row below claims the press.
                 TitleBar::new()
-                    .on_close_window(
-                        cx.listener(|this, _ev, window, cx| this.request_close(window, cx)),
-                    )
+                    .on_close_window(cx.listener(|this, _ev, window, cx| {
+                        this.request_close(window, cx);
+                    }))
                     .child(
                         div()
                             .w_full()
@@ -4189,6 +4263,12 @@ impl Render for PopoutView {
                         MouseButton::Left,
                         cx.listener(|this, _ev, _w, cx| {
                             this.show_close_confirm = false;
+                            this.close_token = None;
+                            if let Some(app) =
+                                cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                            {
+                                app.update(cx, |app, _| app.cancel_close_save());
+                            }
                             cx.notify();
                         }),
                     )
@@ -4205,26 +4285,17 @@ impl Render for PopoutView {
                             .rounded(cx.theme().radius_lg)
                             .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                            .child(div().text_lg().font_semibold().child(if dirty_editor {
-                                t("Save changes before closing?")
-                            } else {
-                                close_copy
-                                    .as_ref()
-                                    .map(|(title, _)| title.clone())
-                                    .unwrap_or_default()
-                            }))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_semibold()
+                                    .child(t(self.close_confirm_copy().0)),
+                            )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if dirty_editor {
-                                        t("This editor has unsaved changes.")
-                                    } else {
-                                        close_copy
-                                            .as_ref()
-                                            .map(|(_, message)| message.clone())
-                                            .unwrap_or_default()
-                                    }),
+                                    .child(self.close_reason_message(cx)),
                             )
                             .child(
                                 div()
@@ -4238,64 +4309,50 @@ impl Render for PopoutView {
                                             .label(t("Cancel"))
                                             .on_click(cx.listener(|this, _e, _w, cx| {
                                                 this.show_close_confirm = false;
+                                                this.close_token = None;
+                                                if let Some(app) = cx
+                                                    .try_global::<MuxelHandle>()
+                                                    .and_then(|h| h.0.upgrade())
+                                                {
+                                                    app.update(cx, |app, _| {
+                                                        app.cancel_close_save()
+                                                    });
+                                                }
                                                 cx.notify();
                                             })),
                                     )
                                     .children(dirty_editor.then(|| {
-                                        Button::new("popout-close-discard")
-                                            .danger()
-                                            .label(t("Don't Save"))
-                                            .on_click(cx.listener(|this, _e, _window, cx| {
-                                                let iid = this.iid;
-                                                if let Some(app) = cx
-                                                    .try_global::<MuxelHandle>()
-                                                    .and_then(|handle| handle.0.upgrade())
+                                        Button::new("popout-close-save")
+                                            .primary()
+                                            .label(t("Save"))
+                                            .on_click(cx.listener(|this, _e, window, cx| {
+                                                if let Some(token) = this.close_token.clone()
+                                                    && let Some(app) = cx
+                                                        .try_global::<MuxelHandle>()
+                                                        .and_then(|h| h.0.upgrade())
                                                 {
+                                                    let iid = this.iid;
                                                     app.update(cx, |app, cx| {
-                                                        app.execute_close_group(vec![iid], cx)
+                                                        app.save_then_close(
+                                                            CloseSaveIntent::Popout(iid),
+                                                            token,
+                                                            window,
+                                                            cx,
+                                                        )
                                                     });
                                                 }
                                             }))
                                     }))
                                     .child(
                                         Button::new("popout-close-ok")
-                                            .when(dirty_editor, |button| button.primary())
-                                            .when(!dirty_editor, |button| button.danger())
+                                            .danger()
                                             .label(if dirty_editor {
-                                                t("Save")
+                                                t("Don't Save & Close")
                                             } else {
                                                 t("Close")
                                             })
-                                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                                if dirty_editor {
-                                                    this.show_close_confirm = false;
-                                                    let iid = this.iid;
-                                                    if let Some(app) = cx
-                                                        .try_global::<MuxelHandle>()
-                                                        .and_then(|handle| handle.0.upgrade())
-                                                    {
-                                                        app.update(cx, |app, cx| {
-                                                            app.begin_save_dirty_and_continue(
-                                                                vec![iid],
-                                                                iid,
-                                                                cx,
-                                                            )
-                                                        });
-                                                    }
-                                                    cx.notify();
-                                                } else {
-                                                    let iid = this.iid;
-                                                    if let Some(app) = cx
-                                                        .try_global::<MuxelHandle>()
-                                                        .and_then(|handle| handle.0.upgrade())
-                                                    {
-                                                        app.update(cx, |app, cx| {
-                                                            app.execute_close_group(vec![iid], cx)
-                                                        });
-                                                    } else {
-                                                        window.remove_window();
-                                                    }
-                                                }
+                                            .on_click(cx.listener(|this, _e, window, cx| {
+                                                this.confirm_close(window, cx)
                                             })),
                                     ),
                             ),
@@ -5428,14 +5485,17 @@ impl MuxelApp {
             read_aloud_generation: 0,
             waking: false,
             confirm_quit: false,
+            quit_close_token: None,
+            workspace_switch_approval: None,
             place_menu: None,
             tab_drop: None,
             pane_drop: None,
             confirm: None,
             recently_closed: HashMap::new(),
             next_recently_closed_generation: 0,
-            pending_close_save: None,
-            next_close_save_generation: 0,
+            approved_popout_closes: HashMap::new(),
+            close_save_in_progress: None,
+            close_save_generation: 0,
             pending_worktree_dispose: std::collections::VecDeque::new(),
             dispose_commit_input,
             git_modal: None,
@@ -5563,7 +5623,7 @@ impl MuxelApp {
                 .map(|app| {
                     app.update(cx, |this, cx| {
                         if this.confirm_quit {
-                            this.pending_close_save = None;
+                            this.cancel_close_save();
                             return true;
                         }
                         // Minimize-to-tray: iconify and keep running (the tray is
@@ -5572,16 +5632,8 @@ impl MuxelApp {
                             window.minimize_window();
                             return false;
                         }
-                        let interruptions = this.interrupting_terminals(cx);
-                        if interruptions.is_empty() {
-                            this.quit_interruptions.clear();
-                            this.confirm_quit = true;
-                            cx.quit();
-                            true
-                        } else {
-                            this.open_quit_confirmation(interruptions, cx);
-                            false
-                        }
+                        this.request_quit(cx);
+                        false
                     })
                 })
                 .unwrap_or(true)
@@ -7389,6 +7441,18 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        let departure = self.quit_token(cx);
+        let approved = self.workspace_switch_approval.take();
+        if departure.needs_confirmation() && approved.as_ref() != Some(&(id, departure.clone())) {
+            self.request_confirm(
+                t("Switch workspace?"),
+                t("Leaving this workspace will close its panes."),
+                t("Switch"),
+                ConfirmAction::EnterWorkspace(id),
+                cx,
+            );
+            return;
+        }
         // Take the per-workspace lock *before* tearing anything down. If another
         // muxel process already has this workspace open, refuse: keep the current
         // workspace intact and flag it in the selector. A failed lock leaves our
@@ -7415,8 +7479,16 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        // Cancel an asynchronous editor-save continuation owned by the old workspace.
-        self.pending_close_save = None;
+        if self.quit_token(cx) != departure {
+            self.request_confirm(
+                t("Switch workspace?"),
+                t("The work in this workspace changed. Review it before switching."),
+                t("Switch"),
+                ConfirmAction::EnterWorkspace(id),
+                cx,
+            );
+            return;
+        }
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
@@ -12473,235 +12545,27 @@ impl MuxelApp {
                         .unwrap_or_else(|| "Untitled".to_string());
                 }
                 this.persist();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn begin_save_dirty_and_continue(
-        &mut self,
-        ids: Vec<Uuid>,
-        restore_focus: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        let remaining = ids
-            .iter()
-            .copied()
-            .filter(|iid| {
-                self.editor_for(*iid)
-                    .as_ref()
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
-            })
-            .collect();
-        self.next_close_save_generation = self.next_close_save_generation.wrapping_add(1);
-        self.pending_close_save = Some(PendingCloseSave {
-            ids,
-            restore_focus,
-            remaining,
-            generation: self.next_close_save_generation,
-        });
-        self.save_next_pending_close_editor(cx);
-    }
-
-    fn save_next_pending_close_editor(&mut self, cx: &mut Context<Self>) {
-        let iid = loop {
-            let Some(pending) = self.pending_close_save.as_mut() else {
-                return;
-            };
-            let Some(iid) = pending.remaining.pop() else {
-                let pending = self
-                    .pending_close_save
-                    .take()
-                    .expect("pending close save disappeared");
-                self.request_close_group_after_dirty(pending.ids, pending.restore_focus, cx);
-                return;
-            };
-            if self
-                .editor_for(iid)
-                .as_ref()
-                .is_some_and(|editor| editor.read(cx).is_dirty())
-            {
-                break iid;
-            }
-        };
-        let generation = self
-            .pending_close_save
-            .as_ref()
-            .map(|pending| pending.generation)
-            .unwrap_or_default();
-        let Some(editor) = self.editor_for(iid) else {
-            self.save_next_pending_close_editor(cx);
-            return;
-        };
-        if editor.read(cx).is_diff() {
-            self.save_next_pending_close_editor(cx);
-            return;
-        }
-        let Some(project_id) = self
-            .workspace
-            .instance(iid)
-            .map(|instance| instance.project_id)
-        else {
-            self.pending_close_save = None;
-            return;
-        };
-        let path = editor.read(cx).path().map(Path::to_path_buf);
-        let text = editor.read(cx).text(cx);
-        let remote = self
-            .workspace
-            .project(project_id)
-            .is_some_and(Project::is_remote);
-
-        if let Some(path) = path {
-            if remote {
-                let Some(location) = self.repo_loc(project_id) else {
-                    self.pending_close_save = None;
-                    return;
-                };
-                let absolute = path.to_string_lossy().into_owned();
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let saved_text = text.clone();
-                cx.spawn(async move |view, cx| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            integrations::write_remote_file(&location, &absolute, &text)
-                        })
-                        .await;
-                    let _ = view.update(cx, |this, cx| {
-                        if this
-                            .pending_close_save
-                            .as_ref()
-                            .map(|pending| pending.generation)
-                            != Some(generation)
-                        {
-                            return;
-                        }
-                        match result {
-                            Ok(()) => {
-                                let Some(editor) = this.editor_for(iid) else {
-                                    this.pending_close_save = None;
-                                    return;
-                                };
-                                if editor.read(cx).text(cx) != saved_text {
-                                    this.pending_close_save = None;
-                                    this.add_event(
-                                        NotifKind::Error,
-                                        t("Close cancelled"),
-                                        tf(
-                                            "{name} changed while it was being saved. Close it again to save the latest changes.",
-                                            &[("name", &name)],
-                                        ),
-                                    );
-                                    cx.notify();
-                                    return;
-                                }
-                                editor.update(cx, |editor, cx| editor.mark_saved(cx));
-                                this.save_next_pending_close_editor(cx);
-                            }
-                            Err(error) => {
-                                this.pending_close_save = None;
-                                this.add_event(
-                                    NotifKind::Error,
-                                    tf("Couldn't save {name}", &[("name", &name)]),
-                                    format!("{error:#}"),
-                                );
-                                cx.notify();
-                            }
-                        }
-                    });
-                })
-                .detach();
-                return;
-            }
-            if let Err(error) = std::fs::write(&path, text) {
-                self.pending_close_save = None;
-                self.add_event(
-                    NotifKind::Error,
-                    t("Save failed"),
-                    format!("{}: {error}", path.display()),
-                );
-                cx.notify();
-                return;
-            }
-            editor.update(cx, |editor, cx| editor.mark_saved(cx));
-            self.save_next_pending_close_editor(cx);
-            return;
-        }
-
-        if remote {
-            self.pending_close_save = None;
-            self.add_event(
-                NotifKind::Error,
-                t("Save As unavailable"),
-                t("Choose a remote path before closing this untitled editor.").to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let directory = self
-            .workspace
-            .project(project_id)
-            .map(|project| project.root_path.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let receiver = cx.prompt_for_new_path(&directory, None);
-        cx.spawn(async move |view, cx| {
-            let Ok(Ok(Some(path))) = receiver.await else {
-                let _ = view.update(cx, |this, cx| {
-                    if this
-                        .pending_close_save
-                        .as_ref()
-                        .map(|pending| pending.generation)
-                        == Some(generation)
-                    {
-                        this.pending_close_save = None;
-                        cx.notify();
-                    }
-                });
-                return;
-            };
-            let _ = view.update(cx, |this, cx| {
                 if this
-                    .pending_close_save
+                    .confirm
                     .as_ref()
-                    .map(|pending| pending.generation)
-                    != Some(generation)
+                    .and_then(|pending| pending.close_token.as_ref())
+                    .is_some_and(|token| {
+                        matches!(
+                            token.evidence_for(iid),
+                            Some(CloseEvidence::Editor {
+                                dirty_text: Some(_)
+                            })
+                        )
+                    })
                 {
-                    return;
+                    this.refresh_close_after_save(CloseSaveIntent::Confirm, cx);
                 }
-                let Some(editor) = this.editor_for(iid) else {
-                    this.pending_close_save = None;
-                    return;
-                };
-                let text = editor.read(cx).text(cx);
-                if let Err(error) = std::fs::write(&path, text) {
-                    this.pending_close_save = None;
-                    this.add_event(
-                        NotifKind::Error,
-                        t("Save failed"),
-                        format!("{}: {error}", path.display()),
-                    );
-                    cx.notify();
-                    return;
-                }
-                editor.update(cx, |editor, cx| editor.set_path(path.clone(), cx));
-                if let Some(instance) = this.workspace.instance_mut(iid) {
-                    instance.editor_path = Some(path.clone());
-                    instance.title = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Untitled".to_string());
-                }
-                this.persist();
-                this.save_next_pending_close_editor(cx);
+                cx.notify();
             });
         })
         .detach();
     }
+
     /// Open the run-dialog for a runner (collect details before launching).
     fn open_run_dialog(&mut self, idx: usize, cx: &mut Context<Self>) {
         self.runners_menu = None;
@@ -13359,6 +13223,12 @@ impl MuxelApp {
 
     /// Manually close an instance (kills its tmux session, local or remote).
     fn close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if let Some(popout) = self.popouts.get(&iid) {
+            let handle = popout.window;
+            self.finish_popout_close(iid, cx);
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            return;
+        }
         self.close_instance_inner(iid, "close", cx);
     }
 
@@ -16216,10 +16086,12 @@ impl MuxelApp {
         }
     }
 
-    /// When a popped-out window closes, terminate its terminal and drop the
-    /// instance (it's already out of the main layout). Called from the app-wide
-    /// `on_window_closed` hook. (The confirmation happens in the pop-out window.)
+    /// When a popped-out window closes, require the same current evidence token
+    /// used by docked tabs. Unexpected native closes re-dock the pane intact.
     fn close_popout(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self.confirm_quit {
+            return;
+        }
         let Some((&iid, _)) = self
             .popouts
             .iter()
@@ -16227,6 +16099,15 @@ impl MuxelApp {
         else {
             return;
         };
+        let approved = self.approved_popout_closes.remove(&iid);
+        if approved.as_ref() != Some(&self.close_token_for_ids([iid], cx)) {
+            self.redock_popout(iid, cx);
+            return;
+        }
+        self.finish_popout_close(iid, cx);
+    }
+
+    fn finish_popout_close(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         let Some(popout) = self.popouts.remove(&iid) else {
             return;
         };
@@ -16259,6 +16140,7 @@ impl MuxelApp {
             );
         }
         self.last_status.remove(&iid);
+        self.failed_launches.remove(&iid);
         self.persist();
         cx.notify();
     }
@@ -16328,292 +16210,448 @@ impl MuxelApp {
         }
     }
 
-    fn confirm_close_for(&self, kind: InstanceKind) -> bool {
-        match kind {
-            InstanceKind::Terminal => self.settings.confirm_close_terminal,
-            InstanceKind::Diff => self.settings.confirm_close_diff,
-            // Dirty editors use the standard Save / Don't Save / Cancel choice.
-            // Clean editors and browsers are cheap to reopen from history.
-            InstanceKind::Editor | InstanceKind::Browser => false,
+    fn quit_token(&self, cx: &App) -> CloseToken {
+        self.close_token_for_ids(self.workspace.instances.iter().map(|i| i.id), cx)
+    }
+
+    fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.show_quit_confirm {
+            // Repeated Ctrl+Q is never a force-quit shortcut.
+            return;
+        }
+        let token = self.quit_token(cx);
+        if token.needs_confirmation() {
+            self.quit_close_token = Some(token);
+            self.quit_kill_tmux_local = false;
+            self.quit_kill_tmux_remote = false;
+            self.show_quit_confirm = true;
+            cx.notify();
+        } else if self.quit_token(cx) == token {
+            self.confirm_quit = true;
+            cx.quit();
+        }
+    }
+
+    fn confirm_quit_if_current(&mut self, cx: &mut Context<Self>) {
+        if self.close_save_in_progress.is_some() {
+            return;
+        }
+        let Some(token) = &self.quit_close_token else {
+            return;
+        };
+        if self.quit_token(cx) != *token {
+            self.quit_close_token = None;
+            self.show_quit_confirm = false;
+            self.request_quit(cx);
+            return;
+        }
+        self.kill_checked_tmux_sessions();
+        if self.quit_token(cx) != *token {
+            self.quit_close_token = None;
+            self.show_quit_confirm = false;
+            self.request_quit(cx);
+            return;
+        }
+        self.confirm_quit = true;
+        cx.quit();
+    }
+
+    fn close_target(&self, iid: Uuid, cx: &App) -> Option<CloseTarget> {
+        let inst = self.workspace.instance(iid)?;
+        let popout = self.popouts.get(&iid).map(|p| &p.view);
+        let evidence = match inst.kind {
+            InstanceKind::Terminal => {
+                let view = self.terminals.get(&iid).or(match popout {
+                    Some(PaneView::Terminal(v)) => Some(v),
+                    _ => None,
+                });
+                if let Some(view) = view {
+                    let view = view.read(cx);
+                    CloseEvidence::Terminal {
+                        snapshot: TerminalEvidence::from(view.runtime_snapshot()),
+                        plain_shell: inst.program.is_none(),
+                        idle_foreground: inst.program.is_none()
+                            && view.session().is_idle_foreground(),
+                    }
+                } else if let Some(generation) = self.terminal_launching.get(&iid) {
+                    CloseEvidence::Launching(*generation)
+                } else {
+                    CloseEvidence::UnknownTerminal
+                }
+            }
+            InstanceKind::Editor => {
+                let view = self.editors.get(&iid).or(match popout {
+                    Some(PaneView::Editor(v)) => Some(v),
+                    _ => None,
+                });
+                CloseEvidence::Editor {
+                    dirty_text: view
+                        .and_then(|v| {
+                            let editor = v.read(cx);
+                            editor.is_dirty().then(|| editor.text(cx))
+                        })
+                        .or_else(|| {
+                            self.pending_editor_redock
+                                .iter()
+                                .find(|(id, _, _)| *id == iid)
+                                .map(|(_, snapshot, _)| snapshot)
+                                .or_else(|| {
+                                    self.pending_editor_rebuild
+                                        .iter()
+                                        .find(|(id, _)| *id == iid)
+                                        .map(|(_, snapshot)| snapshot)
+                                })
+                                .and_then(|snapshot| snapshot.dirty.then(|| snapshot.text.clone()))
+                        }),
+                }
+            }
+            InstanceKind::Browser | InstanceKind::Diff => CloseEvidence::Other,
+        };
+        Some(CloseTarget { id: iid, evidence })
+    }
+
+    fn close_token_for_ids(&self, ids: impl IntoIterator<Item = Uuid>, cx: &App) -> CloseToken {
+        close_policy::assess(
+            ids.into_iter()
+                .filter_map(|id| self.close_target(id, cx))
+                .collect(),
+        )
+    }
+
+    fn close_action_ids(&self, action: &ConfirmAction) -> Option<Vec<Uuid>> {
+        match action {
+            ConfirmAction::CloseInstance(iid) => Some(vec![*iid]),
+            ConfirmAction::CloseOtherTabs(keep) => Some(self.other_tabs_in_pane(*keep)),
+            ConfirmAction::CloseTabsSide { anchor, right } => {
+                Some(self.tabs_to_side(*anchor, *right))
+            }
+            ConfirmAction::DeleteProject(pid) => Some(
+                self.workspace
+                    .instances
+                    .iter()
+                    .filter(|i| i.project_id == *pid)
+                    .map(|i| i.id)
+                    .collect(),
+            ),
+            ConfirmAction::DeleteWorkspace(id) if self.current_workspace == Some(*id) => {
+                Some(self.workspace.instances.iter().map(|i| i.id).collect())
+            }
+            ConfirmAction::EnterWorkspace(_) if self.current_workspace.is_some() => {
+                Some(self.workspace.instances.iter().map(|i| i.id).collect())
+            }
+            ConfirmAction::EnterWorkspace(_) => Some(Vec::new()),
+            ConfirmAction::DeleteWorkspace(_) => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
+    fn close_action_token(&self, action: &ConfirmAction, cx: &App) -> Option<CloseToken> {
+        Some(self.close_token_for_ids(self.close_action_ids(action)?, cx))
+    }
+
+    fn close_reasons(&self, token: &CloseToken) -> String {
+        token
+            .concerns
+            .iter()
+            .map(|concern| {
+                let name = self
+                    .workspace
+                    .instance(concern.id)
+                    .map(|i| i.display_name().to_string())
+                    .unwrap_or_else(|| concern.id.to_string());
+                format!("“{name}”: {}", concern.reason.description())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn current_save_scope_token(&self, intent: CloseSaveIntent, cx: &App) -> Option<CloseToken> {
+        match intent {
+            CloseSaveIntent::Confirm => self
+                .confirm
+                .as_ref()
+                .and_then(|pending| self.close_action_token(&pending.action, cx)),
+            CloseSaveIntent::Quit if self.show_quit_confirm => Some(self.quit_token(cx)),
+            CloseSaveIntent::Popout(iid) if self.popouts.contains_key(&iid) => {
+                Some(self.close_token_for_ids([iid], cx))
+            }
+            _ => None,
+        }
+    }
+
+    fn cancel_close_save(&mut self) {
+        self.close_save_generation = self.close_save_generation.wrapping_add(1);
+        self.close_save_in_progress = None;
+    }
+
+    /// Save every dirty editor in the approved close set before removing any
+    /// pane. The existing local/SSH write functions run sequentially off the UI
+    /// thread. A failed write leaves every pane in place, even if earlier files
+    /// in the sequence reached disk.
+    fn save_then_close(
+        &mut self,
+        intent: CloseSaveIntent,
+        token: CloseToken,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.close_save_in_progress.is_some() {
+            return;
+        }
+        if self.current_save_scope_token(intent, cx).as_ref() != Some(&token) {
+            self.refresh_close_after_save(intent, cx);
+            return;
+        }
+        if matches!(intent, CloseSaveIntent::Confirm)
+            && self.confirm.as_ref().and_then(|p| p.close_token.as_ref()) != Some(&token)
+        {
+            return;
+        }
+        if matches!(intent, CloseSaveIntent::Quit) && self.quit_close_token.as_ref() != Some(&token)
+        {
+            return;
+        }
+        let mut jobs = Vec::new();
+        for concern in token
+            .concerns
+            .iter()
+            .filter(|c| c.reason == close_policy::CloseReason::DirtyEditor)
+        {
+            let iid = concern.id;
+            let Some(CloseEvidence::Editor {
+                dirty_text: Some(text),
+            }) = token.evidence_for(iid)
+            else {
+                return;
+            };
+            let view =
+                self.editors
+                    .get(&iid)
+                    .or_else(|| match self.popouts.get(&iid).map(|p| &p.view) {
+                        Some(PaneView::Editor(v)) => Some(v),
+                        _ => None,
+                    });
+            let path = view
+                .and_then(|v| v.read(cx).path().map(Path::to_path_buf))
+                .or_else(|| {
+                    self.workspace
+                        .instance(iid)
+                        .and_then(|i| i.editor_path.clone())
+                });
+            let Some(path) = path else {
+                // The existing Save As picker owns untitled files. Keep the close
+                // decision open; after the picker completes, Save can be retried.
+                let remote = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|i| self.workspace.project(i.project_id))
+                    .is_some_and(|project| project.is_remote());
+                if remote {
+                    self.add_event(NotifKind::Error, t("Save As required"),
+                        t("Save As for an untitled remote editor is unavailable. Keep this editor open."));
+                } else if self.editors.contains_key(&iid) {
+                    self.active_instance = Some(iid);
+                    self.save_as_active_editor(window, cx);
+                } else {
+                    self.add_event(
+                        NotifKind::Error,
+                        t("Save As required"),
+                        t("Dock this untitled editor and save it before closing."),
+                    );
+                }
+                return;
+            };
+            let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+                return;
+            };
+            let remote = if self.workspace.project(pid).is_some_and(|p| p.is_remote()) {
+                match self.repo_loc(pid) {
+                    Some(loc) => Some(loc),
+                    None => {
+                        self.add_event(
+                            NotifKind::Error,
+                            t("Save failed"),
+                            t("Remote project connection is unavailable."),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            jobs.push(CloseEditorSave {
+                iid,
+                path,
+                text: text.clone(),
+                remote,
+            });
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let expected_after = token.after_editor_save();
+        self.close_save_generation = self.close_save_generation.wrapping_add(1);
+        let generation = self.close_save_generation;
+        self.close_save_in_progress = Some(generation);
+        cx.spawn_in(window, async move |this, cx| {
+            let (jobs, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = write_close_editor_jobs(&jobs);
+                    (jobs, result)
+                })
+                .await;
+            let _ =
+                this.update_in(cx, |this, window, cx| {
+                    if this.close_save_in_progress != Some(generation) {
+                        return;
+                    }
+                    this.close_save_in_progress = None;
+                    if this.close_save_generation != generation {
+                        return;
+                    }
+                    if let Err(error) = result {
+                        this.add_event(NotifKind::Error, t("Save failed"), error);
+                        cx.notify();
+                        return;
+                    }
+                    if this.current_save_scope_token(intent, cx).as_ref() != Some(&token) {
+                        this.refresh_close_after_save(intent, cx);
+                        return;
+                    }
+                    for job in &jobs {
+                        if let Some(editor) = this.editors.get(&job.iid).cloned().or_else(|| {
+                            match this.popouts.get(&job.iid).map(|p| &p.view) {
+                                Some(PaneView::Editor(v)) => Some(v.clone()),
+                                _ => None,
+                            }
+                        }) {
+                            editor.update(cx, |editor, cx| editor.mark_saved(cx));
+                        } else if let Some((_, snapshot, _)) = this
+                            .pending_editor_redock
+                            .iter_mut()
+                            .find(|(id, _, _)| *id == job.iid)
+                        {
+                            snapshot.dirty = false;
+                        } else if let Some((_, snapshot)) = this
+                            .pending_editor_rebuild
+                            .iter_mut()
+                            .find(|(id, _)| *id == job.iid)
+                        {
+                            snapshot.dirty = false;
+                        }
+                    }
+                    if this.current_save_scope_token(intent, cx).as_ref() != Some(&expected_after) {
+                        this.refresh_close_after_save(intent, cx);
+                        return;
+                    }
+                    match intent {
+                        CloseSaveIntent::Confirm => {
+                            if let Some(pending) = this.confirm.as_mut() {
+                                pending.close_token = Some(expected_after);
+                            }
+                            this.run_confirm(window, cx);
+                        }
+                        CloseSaveIntent::Quit => {
+                            this.quit_close_token = Some(expected_after);
+                            this.confirm_quit_if_current(cx);
+                        }
+                        CloseSaveIntent::Popout(iid) => {
+                            if let Some(popout) = this.popouts.get(&iid) {
+                                let handle = popout.window;
+                                this.approved_popout_closes.insert(iid, expected_after);
+                                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                            }
+                        }
+                    }
+                });
+        })
+        .detach();
+    }
+
+    fn refresh_close_after_save(&mut self, intent: CloseSaveIntent, cx: &mut Context<Self>) {
+        match intent {
+            CloseSaveIntent::Confirm => {
+                if let Some(pending) = self.confirm.take() {
+                    self.request_confirm_with_details(
+                        pending.title,
+                        "Work changed while saving. Review it before closing.",
+                        pending.confirm_label,
+                        pending.details,
+                        pending.action,
+                        cx,
+                    );
+                }
+            }
+            CloseSaveIntent::Quit => {
+                self.quit_close_token = Some(self.quit_token(cx));
+                cx.notify();
+            }
+            CloseSaveIntent::Popout(_) => cx.notify(),
         }
     }
 
     fn request_close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.instance(iid).is_none() {
+            return;
+        }
         if let Some(popout) = self.popouts.get(&iid) {
             let handle = popout.window;
-            let _ = handle.update(cx, |_root, window, cx| {
-                window.activate_window();
+            let _ = handle.update(cx, |_, window, cx| {
                 window.dispatch_action(Box::new(ClosePane), cx);
             });
             return;
         }
-        self.request_close_group(vec![iid], iid, cx);
+        let action = ConfirmAction::CloseInstance(iid);
+        let token = self.close_action_token(&action, cx).expect("close action");
+        if token.needs_confirmation() {
+            self.request_confirm(
+                t("Close pane?"),
+                t("Closing this pane affects current work."),
+                t("Close"),
+                action,
+                cx,
+            );
+        } else if self.close_action_token(&action, cx).as_ref() == Some(&token) {
+            self.close_instance(iid, cx);
+        }
     }
 
-    fn request_close_group(&mut self, ids: Vec<Uuid>, restore_focus: Uuid, cx: &mut Context<Self>) {
-        if ids.is_empty()
-            || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
-            || ids
-                .iter()
-                .any(|iid| self.workspace.instance(*iid).is_none())
+    /// The last gate before dropping an entity or killing its process. The token
+    /// also binds membership, checked for the whole action at dialog acceptance.
+    fn close_one_if_current(
+        &mut self,
+        iid: Uuid,
+        token: &CloseToken,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .close_target(iid, cx)
+            .as_ref()
+            .map(|target| &target.evidence)
+            != token.evidence_for(iid)
         {
-            return;
+            return false;
         }
-        let dirty: Vec<Uuid> = ids
-            .iter()
-            .copied()
-            .filter(|iid| {
-                self.editors
-                    .get(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
-            })
-            .collect();
-        if dirty.is_empty() {
-            self.request_close_group_after_dirty(ids, restore_focus, cx);
-            return;
-        }
-
-        let title = if dirty.len() == 1 {
-            t("Save changes before closing?")
-        } else {
-            t("Save changes before closing tabs?")
-        };
-        let message = if dirty.len() == 1 {
-            let name = self
-                .workspace
-                .instance(dirty[0])
-                .map(|instance| instance.display_name().to_string())
-                .unwrap_or_else(|| t("This editor").to_string());
-            tf("“{name}” has unsaved changes.", &[("name", &name)])
-        } else {
-            tn(
-                "{n} editor has unsaved changes.",
-                "{n} editors have unsaved changes.",
-                dirty.len(),
-                &[("n", &dirty.len().to_string())],
-            )
-        };
-        let save_label = if dirty.len() == 1 {
-            t("Save")
-        } else {
-            t("Save all")
-        };
-        let discard_label = if dirty.len() == 1 {
-            t("Don't Save")
-        } else {
-            t("Don't Save All")
-        };
-        self.set_confirm(
-            PendingConfirm {
-                title,
-                message: message.into(),
-                confirm_label: save_label,
-                confirm_danger: false,
-                alternate: Some((
-                    discard_label,
-                    ConfirmAction::DiscardDirtyAndContinue {
-                        ids: ids.clone(),
-                        restore_focus,
-                    },
-                )),
-                details: Vec::new(),
-                action: ConfirmAction::SaveDirtyAndContinue { ids, restore_focus },
-            },
-            cx,
-        );
-    }
-
-    fn request_close_group_after_dirty(
-        &mut self,
-        ids: Vec<Uuid>,
-        restore_focus: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        let single = ids.len() == 1;
-        let needs_confirm: Vec<(Uuid, InstanceKind)> = ids
-            .iter()
-            .filter_map(|iid| {
-                let kind = self.workspace.instance(*iid)?.kind;
-                let needs_confirm = if kind == InstanceKind::Terminal {
-                    self.terminal_close_disposition_for(*iid, cx)
-                        == TerminalCloseDisposition::Confirm
-                } else {
-                    self.confirm_close_for(kind)
-                };
-                needs_confirm.then_some((*iid, kind))
-            })
-            .collect();
-        if needs_confirm.is_empty() {
-            self.execute_terminal_aware_close_group(ids, restore_focus, false, cx);
-            return;
-        }
-        let terminal_count = needs_confirm
-            .iter()
-            .filter(|(_, kind)| *kind == InstanceKind::Terminal)
-            .count();
-        let (title, message, label) = if single {
-            let kind = needs_confirm[0].1;
-            let noun = if kind == InstanceKind::Terminal {
-                t("terminal")
-            } else {
-                t("diff")
-            };
-            let verb = if kind == InstanceKind::Terminal {
-                t("terminated")
-            } else {
-                t("closed")
-            };
-            let name = self
-                .workspace
-                .instance(needs_confirm[0].0)
-                .map(|instance| instance.display_name().to_string())
-                .unwrap_or_else(|| tf("this {noun}", &[("noun", &noun)]));
-            let message = if kind == InstanceKind::Terminal {
-                terminal_close_message(
-                    &name,
-                    self.terminal_interruption_for(needs_confirm[0].0, cx),
-                )
-            } else {
-                tf(
-                    "\"{name}\" will be {verb}.",
-                    &[("name", &name), ("verb", &verb)],
-                )
-                .into()
-            };
-            (tf("Close {noun}?", &[("noun", &noun)]), message, t("Close"))
-        } else {
-            let count = ids.len();
-            let message = if terminal_count == 0 {
-                tn(
-                    "{n} tab will be closed.",
-                    "{n} tabs will be closed.",
-                    count,
-                    &[("n", &count.to_string())],
-                )
-            } else {
-                tn(
-                    "{n} tab will be closed. Terminal processes will be terminated.",
-                    "{n} tabs will be closed. Terminal processes will be terminated.",
-                    count,
-                    &[("n", &count.to_string())],
-                )
-            };
-            (t("Close tabs").to_string(), message.into(), t("Close tabs"))
-        };
-        self.request_confirm(
-            title,
-            message,
-            label,
-            ConfirmAction::CloseGroup { ids, restore_focus },
-            cx,
-        );
-    }
-
-    fn execute_close_group(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
-        let restore_focus = ids.first().copied().unwrap_or_default();
-        self.execute_terminal_aware_close_group(ids, restore_focus, true, cx);
-    }
-
-    fn close_group_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        let popout_window = self.popouts.remove(&iid).map(|popout| {
-            if let PaneView::Terminal(terminal) = &popout.view {
-                terminal.read(cx).session().kill();
-            }
-            popout.window
-        });
         self.close_instance(iid, cx);
-        if let Some(handle) = popout_window {
-            cx.defer(move |cx| {
-                let _ = handle.update(cx, |_root, window, _cx| window.remove_window());
-            });
-        }
+        true
     }
 
-    fn record_recently_closed_resources(&mut self, ids: &[Uuid], cx: &App) -> Option<u64> {
-        let workspace_id = self.current_workspace?;
-        let project_id = ids
-            .first()
-            .and_then(|iid| self.workspace.instance(*iid))
-            .map(|instance| instance.project_id)?;
-        let items: Vec<RecentlyClosedResource> = ids
-            .iter()
-            .filter_map(|iid| {
-                let instance = self.workspace.instance(*iid)?;
-                (instance.kind != InstanceKind::Terminal).then(|| RecentlyClosedResource {
-                    project_id: instance.project_id,
-                    kind: instance.kind,
-                    title: instance.display_name().to_string(),
-                    path: instance.editor_path.clone(),
-                    url: if instance.kind == InstanceKind::Browser {
-                        recently_closed_browser_url(
-                            instance.browser_url.clone(),
-                            self.browsers
-                                .get(iid)
-                                .map(|browser| browser.read(cx).handoff_url(cx)),
-                            self.popouts.get(iid).and_then(|popout| match &popout.view {
-                                PaneView::Browser(browser) => {
-                                    Some(browser.read(cx).handoff_url(cx))
-                                }
-                                PaneView::Terminal(_) | PaneView::Editor(_) => None,
-                            }),
-                        )
-                    } else {
-                        instance.browser_url.clone()
-                    },
-                })
-            })
-            .collect();
-        if items.is_empty() {
-            return None;
-        }
-        self.next_recently_closed_generation = self.next_recently_closed_generation.wrapping_add(1);
-        let generation = self.next_recently_closed_generation;
-        let group = RecentlyClosedGroup {
-            generation,
-            project_id,
-            items,
-        };
-        let history = self.recently_closed.entry(workspace_id).or_default();
-        push_recently_closed_group(history, group);
-        Some(generation)
-    }
-
-    fn execute_terminal_aware_close_group(
+    fn close_ids_if_current(
         &mut self,
         ids: Vec<Uuid>,
-        restore_focus: Uuid,
-        active_confirmed: bool,
+        token: &CloseToken,
         cx: &mut Context<Self>,
-    ) {
-        let mut recoverable = Vec::new();
-        let mut immediate = Vec::new();
-        for iid in ids {
-            let Some(kind) = self.workspace.instance(iid).map(|instance| instance.kind) else {
-                continue;
-            };
-            if kind != InstanceKind::Terminal {
-                immediate.push(iid);
-                continue;
-            }
-            match self.terminal_close_disposition_for(iid, cx) {
-                TerminalCloseDisposition::Recoverable => recoverable.push(iid),
-                TerminalCloseDisposition::Immediate => immediate.push(iid),
-                TerminalCloseDisposition::Confirm if active_confirmed => immediate.push(iid),
-                TerminalCloseDisposition::Confirm => return,
+    ) -> bool {
+        if self.close_token_for_ids(ids.iter().copied(), cx) != *token {
+            return false;
+        }
+        for id in ids {
+            if !self.close_one_if_current(id, token, cx) {
+                return false;
             }
         }
-        let all_ids: Vec<Uuid> = recoverable
-            .iter()
-            .chain(immediate.iter())
-            .copied()
-            .collect();
-        self.record_recently_closed_resources(&all_ids, cx);
-        if !recoverable.is_empty() {
-            self.soft_close_terminals(recoverable, restore_focus, cx);
-        }
-        for iid in immediate {
-            self.close_group_instance(iid, cx);
-        }
+        true
     }
 
     /// Which window the pending confirm dialog belongs in: `Some(pid)` for the
@@ -16653,22 +16691,28 @@ impl MuxelApp {
         action: ConfirmAction,
         cx: &mut Context<Self>,
     ) {
-        self.set_confirm(
-            PendingConfirm {
-                title: title.into(),
-                message: message.into(),
-                confirm_label: confirm_label.into(),
-                confirm_danger: true,
-                alternate: None,
-                details,
-                action,
-            },
-            cx,
-        );
-    }
-
-    fn set_confirm(&mut self, pending: PendingConfirm, cx: &mut Context<Self>) {
-        self.confirm = Some(pending);
+        self.close_save_generation = self.close_save_generation.wrapping_add(1);
+        let close_token = self.close_action_token(&action, cx);
+        let mut message: String = message.into().to_string();
+        if let Some(token) = &close_token
+            && token.needs_confirmation()
+        {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(&self.close_reasons(token));
+        }
+        self.confirm = Some(PendingConfirm {
+            title: title.into(),
+            message: message.into(),
+            confirm_label: confirm_label.into(),
+            details,
+            action,
+            close_token,
+        });
+        // The dialog renders in the window owning the pane, which may be a project
+        // window on another monitor — and the action can be triggered from the main
+        // window's sidebar. Raise it, or the dialog is drawn where nobody's looking.
         if let Some(pid) = self.confirm_window_pid()
             && let Some(secondary) = self
                 .secondary_windows
@@ -16683,52 +16727,71 @@ impl MuxelApp {
     }
 
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        self.cancel_close_save();
         self.confirm = None;
-        cx.notify();
-    }
-
-    fn run_alternate_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, action)) = self.confirm.take().and_then(|pending| pending.alternate) else {
-            return;
-        };
-        self.run_confirm_action(action, window, cx);
         cx.notify();
     }
 
     /// Execute the pending confirmed action.
     fn run_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_save_in_progress.is_some() {
+            return;
+        }
         let Some(pending) = self.confirm.take() else {
             return;
         };
-        self.run_confirm_action(pending.action, window, cx);
-        cx.notify();
-    }
-
-    fn run_confirm_action(
-        &mut self,
-        action: ConfirmAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            ConfirmAction::DeleteWorkspace(id) => self.delete_workspace(id, cx),
+        if let Some(expected) = &pending.close_token
+            && self.close_action_token(&pending.action, cx).as_ref() != Some(expected)
+        {
+            // The approved target set or relevant work changed while the modal
+            // was open. Keep every pane and show the current reasons instead.
+            self.request_confirm_with_details(
+                pending.title,
+                "Close targets changed. Review the current work before closing.",
+                pending.confirm_label,
+                pending.details,
+                pending.action,
+                cx,
+            );
+            return;
+        }
+        match pending.action {
+            ConfirmAction::DeleteWorkspace(id) => {
+                self.delete_workspace(id, pending.close_token.as_ref(), window, cx)
+            }
+            ConfirmAction::EnterWorkspace(id) => {
+                if let Some(token) = pending.close_token {
+                    self.workspace_switch_approval = Some((id, token));
+                    self.enter_workspace(id, window, cx);
+                }
+            }
             ConfirmAction::DeletePreset(idx) => self.delete_preset(idx, cx),
-            ConfirmAction::DeleteProject(pid) => self.delete_project(pid, cx),
+            ConfirmAction::DeleteProject(pid) => {
+                self.delete_project(pid, pending.close_token.as_ref(), cx)
+            }
             ConfirmAction::DeleteRunner(idx) => self.delete_runner(idx, cx),
             ConfirmAction::DeleteSnippet(idx) => self.delete_snippet(idx, cx),
             ConfirmAction::DeleteLoop(idx) => self.delete_loop(idx, cx),
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
             ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
-            ConfirmAction::SaveDirtyAndContinue { ids, restore_focus } => {
-                self.begin_save_dirty_and_continue(ids, restore_focus, cx)
+            ConfirmAction::CloseInstance(iid) => {
+                if pending
+                    .close_token
+                    .as_ref()
+                    .is_some_and(|token| self.close_one_if_current(iid, token, cx))
+                    && let Some(next) = self.active_instance
+                {
+                    self.focus_instance(next, window, cx);
+                }
             }
-            ConfirmAction::DiscardDirtyAndContinue { ids, restore_focus } => {
-                self.request_close_group_after_dirty(ids, restore_focus, cx)
+            ConfirmAction::CloseOtherTabs(keep) => {
+                if let Some(token) = &pending.close_token {
+                    self.close_other_tabs_now(keep, token, window, cx);
+                }
             }
-            ConfirmAction::CloseGroup { ids, restore_focus } => {
-                self.execute_terminal_aware_close_group(ids, restore_focus, true, cx);
-                if let Some(focus) = self.active_instance {
-                    self.focus_instance(focus, window, cx);
+            ConfirmAction::CloseTabsSide { anchor, right } => {
+                if let Some(token) = &pending.close_token {
+                    self.close_tabs_side_now(anchor, right, token, window, cx);
                 }
             }
             ConfirmAction::SwitchBranch { pid, branch } => {
@@ -16929,9 +16992,37 @@ impl MuxelApp {
 
     /// Delete a workspace: remove it from the index + delete its workspace file.
     /// Never deletes the last remaining workspace.
-    fn delete_workspace(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    fn delete_workspace(
+        &mut self,
+        id: Uuid,
+        token: Option<&CloseToken>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspaces.workspaces.len() <= 1 {
             return;
+        }
+        if self.current_workspace == Some(id) {
+            let Some(next) = self
+                .workspaces
+                .workspaces
+                .iter()
+                .find(|w| w.id != id)
+                .map(|w| w.id)
+            else {
+                return;
+            };
+            let Some(token) = token else {
+                return;
+            };
+            if self.quit_token(cx) != *token {
+                return;
+            }
+            self.workspace_switch_approval = Some((next, token.clone()));
+            self.enter_workspace(next, window, cx);
+            if self.current_workspace != Some(next) {
+                return;
+            }
         }
         self.workspaces.workspaces.retain(|p| p.id != id);
         if self.workspaces.current == Some(id) {
@@ -17132,13 +17223,44 @@ impl MuxelApp {
             .unwrap_or_default()
     }
 
-    /// Close every other tab in `keep`'s pane (pinned included).
+    /// Close every other tab in `keep`'s pane (pinned included), leaving only
+    /// `keep`. Assess the entire batch before touching any tab.
     fn close_other_tabs(&mut self, keep: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let others = self.other_tabs_in_pane(keep);
         if others.is_empty() {
             return;
         }
-        self.request_close_group(others, keep, cx);
+        let token = self.close_token_for_ids(others.iter().copied(), cx);
+        if token.needs_confirmation() {
+            let n = others.len();
+            self.request_confirm(
+                t("Close other tabs?"),
+                tn(
+                    "{n} other tab in this pane will be terminated.",
+                    "{n} other tabs in this pane will be terminated.",
+                    n,
+                    &[("n", &n.to_string())],
+                ),
+                t("Close others"),
+                ConfirmAction::CloseOtherTabs(keep),
+                cx,
+            );
+        } else {
+            self.close_other_tabs_now(keep, &token, window, cx);
+        }
+    }
+
+    /// Close the other tabs directly (no per-tab prompt), then focus `keep`.
+    fn close_other_tabs_now(
+        &mut self,
+        keep: Uuid,
+        token: &CloseToken,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.close_ids_if_current(self.other_tabs_in_pane(keep), token, cx) {
+            return;
+        }
         self.focus_instance(keep, window, cx);
     }
 
@@ -17177,7 +17299,38 @@ impl MuxelApp {
         if ids.is_empty() {
             return;
         }
-        self.request_close_group(ids, anchor, cx);
+        let token = self.close_token_for_ids(ids.iter().copied(), cx);
+        if token.needs_confirmation() {
+            let n = ids.len();
+            let side = if right { "right" } else { "left" };
+            self.request_confirm(
+                t("Close tabs?"),
+                tn(
+                    "{n} tab to the {side} will be terminated.",
+                    "{n} tabs to the {side} will be terminated.",
+                    n,
+                    &[("n", &n.to_string()), ("side", side)],
+                ),
+                t("Close tabs"),
+                ConfirmAction::CloseTabsSide { anchor, right },
+                cx,
+            );
+        } else {
+            self.close_tabs_side_now(anchor, right, &token, window, cx);
+        }
+    }
+
+    fn close_tabs_side_now(
+        &mut self,
+        anchor: Uuid,
+        right: bool,
+        token: &CloseToken,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.close_ids_if_current(self.tabs_to_side(anchor, right), token, cx) {
+            return;
+        }
         self.focus_instance(anchor, window, cx);
     }
 
@@ -18370,9 +18523,7 @@ impl MuxelApp {
                 }
             }
             muxel_tray::TrayAction::Quit => {
-                if self.request_app_quit(cx) {
-                    window.activate_window();
-                }
+                self.request_quit(cx);
             }
         }
     }
@@ -20492,9 +20643,7 @@ impl MuxelApp {
                     .border_color(cx.theme().border)
                     .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
                         cx.listener(|this, _e, _w, cx| {
-                            this.pending_close_save = None;
-                            this.confirm_quit = true;
-                            cx.quit();
+                            this.request_quit(cx);
                         }),
                     ))
                     .child(
@@ -20666,9 +20815,7 @@ impl MuxelApp {
                         .ghost()
                         .label(t("Quit"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.pending_close_save = None;
-                            this.confirm_quit = true;
-                            cx.quit();
+                            this.request_quit(cx);
                         })),
                 )
                 .children(self.current_workspace.is_some().then(|| {
@@ -22952,10 +23099,7 @@ impl MuxelApp {
     /// [`Self::render_secondary_titlebar`] instead.
     fn render_minimal_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Self::minimal_titlebar().on_close_window(cx.listener(|this, _ev, _window, cx| {
-            // Nothing is running yet — quit directly (no confirm needed).
-            this.pending_close_save = None;
-            this.confirm_quit = true;
-            cx.quit();
+            this.request_quit(cx);
         }))
     }
 
@@ -23031,7 +23175,7 @@ impl MuxelApp {
                 if this.minimize_to_tray_active() {
                     window.minimize_window();
                 } else {
-                    this.request_app_quit(cx);
+                    this.request_quit(cx);
                 }
             }))
             .child(
@@ -25297,14 +25441,20 @@ impl MuxelApp {
         .detach();
     }
 
-    fn delete_project(&mut self, pid: Uuid, cx: &mut Context<Self>) {
-        let iids = self
+    fn delete_project(&mut self, pid: Uuid, token: Option<&CloseToken>, cx: &mut Context<Self>) {
+        let iids: Vec<_> = self
             .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default();
-        for iid in iids {
-            self.close_instance(iid, cx);
+            .instances
+            .iter()
+            .filter(|i| i.project_id == pid)
+            .map(|i| i.id)
+            .collect();
+        if let Some(token) = token {
+            if !self.close_ids_if_current(iids, token, cx) {
+                return;
+            }
+        } else {
+            return;
         }
         self.workspace.projects.retain(|p| p.id != pid);
         if self.workspace.active_project == Some(pid) {
@@ -26094,17 +26244,16 @@ impl MuxelApp {
         };
         let title = pending.title.clone();
         let message = pending.message.clone();
-        let confirm_label = pending.confirm_label.clone();
-        let confirm_danger = pending.confirm_danger;
-        let alternate_label = pending.alternate.as_ref().map(|(label, _)| label.clone());
-        let details = pending.details.clone();
-        let confirm_button = if confirm_danger {
-            Button::new("confirm-ok").danger()
+        let dirty_editor = pending
+            .close_token
+            .as_ref()
+            .is_some_and(CloseToken::has_dirty_editors);
+        let confirm_label = if dirty_editor {
+            t("Don't Save & Close")
         } else {
-            Button::new("confirm-ok").primary()
-        }
-        .label(confirm_label)
-        .on_click(cx.listener(|this, _event, window, cx| this.run_confirm(window, cx)));
+            pending.confirm_label.clone()
+        };
+        let details = pending.details.clone();
         // Fingerprint rows need width; plain confirms keep the compact card.
         let width = if details.is_empty() { 360.0 } else { 480.0 };
         let mono = cx.theme().mono_font_family.clone();
@@ -26166,15 +26315,33 @@ impl MuxelApp {
                                         cx.listener(|this, _e, _w, cx| this.cancel_confirm(cx)),
                                     ),
                             )
-                            .children(alternate_label.map(|label| {
-                                Button::new("confirm-alternate")
-                                    .danger()
-                                    .label(label)
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.run_alternate_confirm(window, cx)
+                            .children(dirty_editor.then(|| {
+                                Button::new("confirm-save")
+                                    .primary()
+                                    .label(t("Save"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        if let Some(token) = this
+                                            .confirm
+                                            .as_ref()
+                                            .and_then(|pending| pending.close_token.clone())
+                                        {
+                                            this.save_then_close(
+                                                CloseSaveIntent::Confirm,
+                                                token,
+                                                window,
+                                                cx,
+                                            );
+                                        }
                                     }))
                             }))
-                            .child(confirm_button),
+                            .child(
+                                Button::new("confirm-ok")
+                                    .danger()
+                                    .label(confirm_label)
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.run_confirm(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -26305,72 +26472,19 @@ impl MuxelApp {
     }
 
     fn render_quit_modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        let interruptions = self.quit_interruptions.clone();
-        let count = interruptions.len();
-        let message = quit_active_work_message(count);
-        let interruption_list = div()
-            .id("quit-interruptions")
-            .max_h(px(220.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .children(
-                interruptions
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, interruption)| {
-                        let has_project = !interruption.project.is_empty();
-                        div()
-                            .id(("quit-interruption", index))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .px_3()
-                            .py_2()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().secondary.opacity(0.5))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(interruption.name),
-                                    )
-                                    .children(has_project.then(|| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(interruption.project)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(interruption.reason.label()),
-                            )
-                    }),
-            );
-
+        let dirty_editor = self
+            .quit_close_token
+            .as_ref()
+            .is_some_and(CloseToken::has_dirty_editors);
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| this.cancel_quit_confirmation(cx)),
+                cx.listener(|this, _ev, _w, cx| {
+                    this.show_quit_confirm = false;
+                    this.quit_close_token = None;
+                    this.cancel_close_save();
+                    cx.notify();
+                }),
             )
             .child(
                 div()
@@ -26390,9 +26504,13 @@ impl MuxelApp {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(message),
+                            .child(
+                                self.quit_close_token
+                                    .as_ref()
+                                    .map(|token| self.close_reasons(token))
+                                    .unwrap_or_default(),
+                            ),
                     )
-                    .child(interruption_list)
                     // tmux-backed panes survive a quit by design; offer cleanup
                     // per scope (local vs remote sessions).
                     .children({
@@ -26449,19 +26567,37 @@ impl MuxelApp {
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.cancel_quit_confirmation(cx)
+                                        this.show_quit_confirm = false;
+                                        this.quit_close_token = None;
+                                        this.cancel_close_save();
+                                        cx.notify();
                                     })),
                             )
+                            .children(dirty_editor.then(|| {
+                                Button::new("quit-save")
+                                    .primary()
+                                    .label(t("Save"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        if let Some(token) = this.quit_close_token.clone() {
+                                            this.save_then_close(
+                                                CloseSaveIntent::Quit,
+                                                token,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                            }))
                             .child(
                                 Button::new("quit-confirm")
                                     .danger()
-                                    .label(t("Quit"))
+                                    .label(if dirty_editor {
+                                        t("Don't Save & Quit")
+                                    } else {
+                                        t("Quit")
+                                    })
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.kill_checked_tmux_sessions();
-                                        this.quit_interruptions.clear();
-                                        this.pending_close_save = None;
-                                        this.confirm_quit = true;
-                                        cx.quit();
+                                        this.confirm_quit_if_current(cx);
                                     })),
                             ),
                     ),
@@ -27583,30 +27719,6 @@ impl MuxelApp {
                             cx.listener(|this, c: &bool, _w, cx| this.set_close_on_exit(*c, cx)),
                         ),
                     &t("Close a pane when its process exits cleanly (a crash leaves the pane open)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-confirm-close-term")
-                        .checked(self.settings.confirm_close_terminal)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.confirm_close_terminal = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Confirm before closing a terminal"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-confirm-close-diff")
-                        .checked(self.settings.confirm_close_diff)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.confirm_close_diff = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Confirm before closing a git-diff pane"),
                 ),
             )
             .child(
@@ -29322,7 +29434,8 @@ impl Render for MuxelApp {
                         .flex_1()
                         .min_h_0()
                         .relative()
-                        .child(self.render_terms_screen(cx)),
+                        .child(self.render_terms_screen(cx))
+                        .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx))),
                 )
                 .into_any_element();
             return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
@@ -29344,7 +29457,8 @@ impl Render for MuxelApp {
                             self.confirm
                                 .is_some()
                                 .then(|| self.render_confirm_modal(cx)),
-                        ),
+                        )
+                        .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx))),
                 )
                 .into_any_element();
             return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
