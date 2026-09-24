@@ -21,6 +21,8 @@
 //!
 //! `MUXEL_PROFILE_STDERR=1` also echoes dump lines to stderr (default: file only
 //! — keeps GUI launches quiet and avoids console I/O on the hot path).
+//! `MUXEL_PROFILE_CHAINS=1` emits every completed focused latency chain instead
+//! of only slow chains. This is intended for bounded measurement runs.
 //!
 //! Example (PowerShell, second instance / sandbox):
 //! ```text
@@ -52,6 +54,7 @@ use crate::session::{PtyOutputQueueStats, PtyReadTiming};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_STDERR: OnceLock<bool> = OnceLock::new();
+static LOG_CHAINS: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
@@ -138,6 +141,10 @@ fn enabled() -> bool {
 
 fn log_stderr() -> bool {
     *LOG_STDERR.get_or_init(|| env_truthy("MUXEL_PROFILE_STDERR").unwrap_or(false))
+}
+
+fn log_chains() -> bool {
+    *LOG_CHAINS.get_or_init(|| env_truthy("MUXEL_PROFILE_CHAINS").unwrap_or(false))
 }
 
 fn log_path() -> &'static PathBuf {
@@ -1192,7 +1199,8 @@ pub fn paint_with_phases(
             c.process_paint_lat_max
                 .fetch_max(sample.process_paint_us, Ordering::Relaxed);
             c.process_paint_lat_n.fetch_add(1, Ordering::Relaxed);
-            if sample.key_read_us >= 50_000
+            if log_chains()
+                || sample.key_read_us >= 50_000
                 || sample.read_process_us >= 50_000
                 || sample.process_paint_us >= 50_000
                 || sample.read_drain_us.is_some_and(|us| us >= 30_000)
