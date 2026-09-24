@@ -125,7 +125,14 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                     if let Some(input) = action["input"].as_str() {
-                        input_session.write_input(input.as_bytes());
+                        if let Err(error) = input_session.write_input(input.as_bytes()) {
+                            record(
+                                &input_log,
+                                started,
+                                json!({ "event": "input-rejected", "error": error.to_string() }),
+                            );
+                            break;
+                        }
                         record(
                             &input_log,
                             started,
@@ -146,7 +153,14 @@ fn main() -> anyhow::Result<()> {
                     if count == 0 {
                         break;
                     }
-                    input_session.write_input(&bytes[..count]);
+                    if let Err(error) = input_session.write_input(&bytes[..count]) {
+                        record(
+                            &input_log,
+                            started,
+                            json!({ "event": "input-rejected", "error": error.to_string() }),
+                        );
+                        break;
+                    }
                     record(
                         &input_log,
                         started,

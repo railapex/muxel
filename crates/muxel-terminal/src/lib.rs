@@ -10,6 +10,7 @@
 
 mod colors;
 mod element;
+mod input;
 mod keymap;
 mod links;
 mod listener;
@@ -20,6 +21,10 @@ mod session;
 mod view;
 
 pub use colors::TerminalPalette;
+pub use input::{
+    INPUT_MAX_BULK_BYTES, INPUT_QUEUE_CAPACITY_BYTES, INPUT_QUEUE_CAPACITY_CHUNKS,
+    INPUT_WRITE_CHUNK_BYTES, InputAdmissionError, PtyInputQueueStats,
+};
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;

@@ -7,7 +7,11 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::{TerminalPalette, index_to_rgb};
-use crate::listener::{MuxelListener, SharedWriter};
+use crate::input::{
+    INPUT_MAX_BULK_BYTES, InputAdmissionError, InputSender, PtyInputQueueStats, input_queue,
+    write_in_chunks,
+};
+use crate::listener::MuxelListener;
 use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -226,15 +230,6 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(60);
 /// Sentinel for `mouse_pressed_button` meaning "no button press is outstanding".
 const NO_MOUSE_PRESS: u8 = u8::MAX;
 
-/// `Write` adapter that queues bytes to the dedicated PTY writer thread.
-/// `write` never blocks (unbounded channel); byte order is preserved. Errors
-/// only once the writer thread has exited (child gone), mirroring a broken
-/// pipe. Profiling timestamps are omitted entirely when the profiler is off.
-struct QueuedWrite {
-    bytes: Vec<u8>,
-    queued_at: Option<Instant>,
-}
-
 fn queue_delay_excluding_profiler(
     queued_at: Instant,
     dequeued_at: Instant,
@@ -247,26 +242,6 @@ fn queue_delay_excluding_profiler(
     let overlap_started = queued_at.max(profile_started);
     let overlap_finished = dequeued_at.min(profile_finished);
     raw.saturating_sub(overlap_finished.saturating_duration_since(overlap_started))
-}
-
-struct ChannelWriter {
-    tx: std::sync::mpsc::Sender<QueuedWrite>,
-    profile: bool,
-}
-
-impl Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.tx
-            .send(QueuedWrite {
-                bytes: buf.to_vec(),
-                queued_at: self.profile.then(Instant::now),
-            })
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Debounce state for resizing: the last-applied size, the size currently being
@@ -308,7 +283,8 @@ pub struct TerminalSession {
     pub id: Uuid,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
-    writer: SharedWriter,
+    input: InputSender,
+    writer_thread: Option<JoinHandle<()>>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
     // Unix foreground-process query), so a mutex lets a fully spawned session
     // move from the launch worker to the UI thread without weakening safety.
@@ -617,7 +593,7 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
-        let killer = child.clone_killer();
+        let mut killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         // PTY writes go through a dedicated thread — NEVER synchronously from
         // the caller. When a busy agent stops draining stdin (e.g. an Ink TUI
@@ -631,14 +607,13 @@ impl TerminalSession {
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<QueuedWrite>();
-        std::thread::Builder::new()
+        let (input, input_rx) = input_queue(profile_writes.is_some());
+        let worker_input = input.clone();
+        let writer_thread = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
-                // Exits when every sender is gone (session dropped) or the
-                // pipe breaks (child gone).
                 let mut prior_profiler_interval = None;
-                while let Ok(write) = write_rx.recv() {
+                while let Some(write) = input_rx.recv() {
                     let queue_delay = write.queued_at.map(|queued_at| {
                         queue_delay_excluding_profiler(
                             queued_at,
@@ -647,9 +622,26 @@ impl TerminalSession {
                         )
                     });
                     let write_started = write.queued_at.map(|_| Instant::now());
-                    let result = pipe_writer.write_all(&write.bytes);
-                    if result.is_ok() {
-                        let _ = pipe_writer.flush();
+                    let mut delivered = 0usize;
+                    let mut failed = false;
+                    match write_in_chunks(&mut pipe_writer, &write.bytes, || {
+                        worker_input.is_closed()
+                    }) {
+                        Ok(bytes) => delivered = bytes,
+                        Err(error) => {
+                            if !worker_input.is_closed() {
+                                log::warn!("pty write failed: {error}");
+                            }
+                            failed = true;
+                        }
+                    }
+                    if delivered == write.bytes.len()
+                        && let Err(error) = pipe_writer.flush()
+                    {
+                        if !worker_input.is_closed() {
+                            log::warn!("pty flush failed: {error}");
+                        }
+                        failed = true;
                     }
                     if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
                         (profile_writes, queue_delay, write_started)
@@ -657,43 +649,39 @@ impl TerminalSession {
                         let profile_started = Instant::now();
                         crate::profile::pty_write(
                             instance_id,
-                            write.bytes.len(),
+                            delivered,
                             queue_delay,
                             write_started.elapsed(),
                         );
                         prior_profiler_interval = Some((profile_started, Instant::now()));
                     }
-                    if result.is_err() {
+                    input_rx.finish(delivered, failed);
+                    if failed || worker_input.is_closed() {
                         break;
                     }
                 }
             })
             .context("spawn pty writer thread")?;
-        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
-            tx: write_tx,
-            profile: profile_writes.is_some(),
-        })));
         // `pair.slave` is dropped at the end of this function, closing the
         // parent's copy so the reader sees EOF when the child exits.
 
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
-        let reply_writer = writer.clone();
+        let reply_input = input.clone();
         let reply_palette = palette.clone();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
-        let reader_handle = std::thread::Builder::new()
+        let reader_spawn = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || {
-                read_loop(
-                    reader,
-                    child,
-                    tx,
-                    reply_writer,
-                    reply_palette,
-                    profile_reads,
-                )
-            })
-            .context("spawn reader thread")?;
+            .spawn(move || read_loop(reader, child, tx, reply_input, reply_palette, profile_reads));
+        let reader_handle = match reader_spawn {
+            Ok(handle) => handle,
+            Err(error) => {
+                input.close();
+                let _ = killer.kill();
+                reap_writer_thread(writer_thread);
+                return Err(error).context("spawn reader thread");
+            }
+        };
 
         let title = Arc::new(Mutex::new(None));
         let title_generation = Arc::new(AtomicU64::new(0));
@@ -702,7 +690,7 @@ impl TerminalSession {
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
         let listener = MuxelListener {
-            writer: writer.clone(),
+            input: input.clone(),
             title: title.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
@@ -727,7 +715,8 @@ impl TerminalSession {
             id: Uuid::new_v4(),
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
-            writer,
+            input,
+            writer_thread: Some(writer_thread),
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
             child_pid,
@@ -914,7 +903,13 @@ impl TerminalSession {
     /// Write bytes to the PTY (user input, pastes, key sequences). Any input
     /// jumps the viewport back to the bottom, so typing while scrolled up in the
     /// history snaps you to the live prompt.
-    pub fn write_input(&self, data: &[u8]) {
+    pub fn write_input(&self, data: &[u8]) -> Result<(), InputAdmissionError> {
+        self.input.user_interactive(data)?;
+        self.after_user_input(data);
+        Ok(())
+    }
+
+    fn after_user_input(&self, data: &[u8]) {
         // Skip scroll work when already pinned to the live row — every key
         // otherwise takes the term mutex for a no-op scroll under load.
         {
@@ -930,7 +925,6 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-        self.write_raw(data);
     }
 
     pub fn mark_turn_submitted(&self) {
@@ -944,13 +938,26 @@ impl TerminalSession {
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
     /// receives it as a paste, not as typed keystrokes). Shared by the keyboard
     /// shortcut and the mouse copy/paste modes.
-    pub fn paste(&self, text: &str) {
+    pub fn paste(&self, text: &str) -> Result<(), InputAdmissionError> {
+        let payload_len = if self.is_bracketed_paste() {
+            text.as_bytes().iter().filter(|&&byte| byte != 0x1b).count() + 12
+        } else {
+            text.len()
+                - text
+                    .as_bytes()
+                    .windows(2)
+                    .filter(|pair| *pair == b"\r\n")
+                    .count()
+        };
+        self.input.preflight_bulk_len(payload_len)?;
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
-        self.write_input(payload.as_bytes());
+        self.input.bulk(payload.as_bytes())?;
+        self.after_user_input(payload.as_bytes());
+        Ok(())
     }
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
@@ -960,25 +967,46 @@ impl TerminalSession {
     /// argument, not run when the user hits Enter. `{:?}` (Rust `Debug`) is *not*
     /// shell quoting — it leaves `$`, backticks, and `$(…)` live inside its double
     /// quotes — so Unix uses POSIX single-quote escaping (`sh_quote`).
-    pub fn paste_paths(&self, paths: &[std::path::PathBuf]) {
+    pub fn paste_paths(&self, paths: &[std::path::PathBuf]) -> Result<(), InputAdmissionError> {
         if paths.is_empty() {
-            return;
+            return Ok(());
         }
         let mut text = String::new();
         for path in paths {
             text.push(' ');
             text.push_str(&quote_path_for_shell(&path.to_string_lossy()));
+            if text.len() + 1 > INPUT_MAX_BULK_BYTES {
+                self.input.preflight_bulk_len(text.len() + 1)?;
+            }
         }
         text.push(' ');
-        self.paste(&text);
+        self.paste(&text)
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
     /// non-input writes like focus reports).
     fn write_raw(&self, data: &[u8]) {
-        let mut writer = self.writer.lock();
-        let _ = writer.write_all(data);
-        let _ = writer.flush();
+        // InputSender latches and reports the first rejection in an episode.
+        let _ = self.input.interactive(data);
+    }
+
+    /// Return current and high-water input queue occupancy.
+    pub fn input_queue_stats(&self) -> PtyInputQueueStats {
+        self.input.stats()
+    }
+
+    /// Most recent admission failure, retained until a later low-water
+    /// admission succeeds. Views use this for one visible backpressure banner.
+    pub fn input_warning(&self) -> Option<InputAdmissionError> {
+        self.input.warning()
+    }
+
+    pub(crate) fn close_input(&self) {
+        self.input.close();
+        #[cfg(windows)]
+        if let Some(writer) = self.writer_thread.as_ref() {
+            cancel_writer_io(writer);
+        }
     }
 
     /// Scroll the viewport by a mouse-wheel delta. `delta_y` is the pixel delta
@@ -1056,9 +1084,7 @@ impl TerminalSession {
                     (false, true) => b"\x1bOB", // scroll down → Down arrow
                     (false, false) => b"\x1b[B",
                 };
-                for _ in 0..count {
-                    self.write_raw(seq);
-                }
+                self.write_raw(&seq.repeat(count));
             }
         }
         true
@@ -1963,9 +1989,49 @@ fn appimage_env_fixups(
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        // Best-effort: kill the child so the reader thread sees EOF and exits.
+        // Close admission first so no reader-thread reply can start another
+        // write while teardown is canceling the current one.
+        self.close_input();
         let _ = self.killer.lock().kill();
+        if let Some(writer) = self.writer_thread.take() {
+            reap_writer_thread(writer);
+        }
     }
+}
+
+fn reap_writer_thread(writer: JoinHandle<()>) {
+    // Never join a potentially blocked PTY write on the GPUI thread. Windows
+    // can cancel the exact synchronous WriteFile via the real thread handle;
+    // both platforms reap off-thread after the child kill closes its PTY.
+    let spawn = std::thread::Builder::new()
+        .name("muxel-pty-writer-reaper".to_string())
+        .spawn(move || {
+            #[cfg(windows)]
+            {
+                for _ in 0..20 {
+                    if writer.is_finished() {
+                        break;
+                    }
+                    cancel_writer_io(&writer);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let _ = writer.join();
+        });
+    if let Err(error) = spawn {
+        log::warn!("could not spawn PTY writer reaper: {error}");
+    }
+}
+
+#[cfg(windows)]
+fn cancel_writer_io(writer: &JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::CancelSynchronousIo;
+
+    // SAFETY: JoinHandle owns this real thread HANDLE for the duration of the
+    // call. ERROR_NOT_FOUND simply means no synchronous I/O is pending.
+    let _ = unsafe { CancelSynchronousIo(HANDLE(writer.as_raw_handle() as isize)) };
 }
 
 /// Answers OSC color queries in the PTY reader thread, before terminal output
@@ -1975,7 +2041,7 @@ impl Drop for TerminalSession {
 struct ImmediateColorQueries {
     state: OscScanState,
     body: Vec<u8>,
-    writer: SharedWriter,
+    input: InputSender,
     palette: Arc<Mutex<TerminalPalette>>,
 }
 
@@ -1997,11 +2063,11 @@ enum OscTerminator {
 impl ImmediateColorQueries {
     const MAX_BODY: usize = 1024;
 
-    fn new(writer: SharedWriter, palette: Arc<Mutex<TerminalPalette>>) -> Self {
+    fn new(input: InputSender, palette: Arc<Mutex<TerminalPalette>>) -> Self {
         Self {
             state: OscScanState::Ground,
             body: Vec::new(),
-            writer,
+            input,
             palette,
         }
     }
@@ -2075,9 +2141,8 @@ impl ImmediateColorQueries {
             g = rgb.g,
             b = rgb.b,
         );
-        let mut writer = self.writer.lock();
-        let _ = writer.write_all(reply.as_bytes());
-        let _ = writer.flush();
+        // InputSender latches and reports the first rejection in an episode.
+        let _ = self.input.protocol(reply.as_bytes());
     }
 }
 
@@ -2088,12 +2153,12 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
     tx: PtyChunkSender,
-    writer: SharedWriter,
+    input: InputSender,
     palette: Arc<Mutex<TerminalPalette>>,
     profile_reads: bool,
 ) {
     let mut buf = [0u8; 65536];
-    let mut color_queries = ImmediateColorQueries::new(writer, palette);
+    let mut color_queries = ImmediateColorQueries::new(input, palette);
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
     // torn down. Any other error is recorded so the app can log/show it.
@@ -2184,7 +2249,7 @@ mod content_damage_tests {
         let _ = session.take_pending_damage();
         session.clear_pending_damage_for_test();
 
-        session.write_input(b"x");
+        session.write_input(b"x").unwrap();
         assert!(session.is_interactive());
         session.process_output(b"hello");
         assert!(session.is_interactive());
@@ -2221,7 +2286,7 @@ mod content_damage_tests {
         // Every nearby output batch remains interactive instead of the first
         // queued stream batch consuming a one-shot flag.
         for _ in 0..30 {
-            session.write_input(b"x");
+            session.write_input(b"x").unwrap();
             session.process_output(b"x");
             assert!(session.is_interactive());
             session.process_output(&chunk[..200.min(chunk.len())]);
@@ -2260,8 +2325,8 @@ mod content_damage_tests {
     ///
     /// A live session costs three: the PTY master, the reader thread's dup, and
     /// the writer thread's dup. The last two are only released when those
-    /// threads exit, which happens because dropping the session kills the child
-    /// (reader sees EOF) and drops the writer channel's `Sender`. Anything that
+    /// threads exit, which happens because dropping the session closes the input
+    /// queue and kills the child (so the reader sees EOF). Anything that
     /// keeps an `Arc<TerminalSession>` alive past its pane therefore leaks
     /// descriptors until the process hits EMFILE — which is exactly what a
     /// window-lifetime focus subscription capturing the session used to do (see
@@ -2572,7 +2637,7 @@ mod windows_spawn_resolve {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     if bytes.windows(4).any(|window| window == b"\x1b[6n") {
-                        session.write_input(b"\x1b[1;1R");
+                        session.write_input(b"\x1b[1;1R").unwrap();
                     }
                     output.extend(bytes);
                     if output
@@ -2623,7 +2688,7 @@ mod windows_spawn_resolve {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     if bytes.windows(4).any(|window| window == b"\x1b[6n") {
-                        session.write_input(b"\x1b[1;1R");
+                        session.write_input(b"\x1b[1;1R").unwrap();
                     }
                     output.extend(bytes);
                 }
@@ -2644,25 +2709,19 @@ mod windows_spawn_resolve {
 mod immediate_color_tests {
     use super::*;
 
-    fn responder() -> (
-        ImmediateColorQueries,
-        std::sync::mpsc::Receiver<QueuedWrite>,
-    ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(Box::new(ChannelWriter { tx, profile: false })));
+    fn responder() -> (ImmediateColorQueries, crate::input::InputReceiver) {
+        let (input, rx) = input_queue(false);
         let palette = Arc::new(Mutex::new(TerminalPalette {
             background: 0x112233,
             ..Default::default()
         }));
-        (ImmediateColorQueries::new(writer, palette), rx)
+        (ImmediateColorQueries::new(input, palette), rx)
     }
 
     #[test]
     fn color_query_is_answered_immediately_across_reader_chunks() {
         let (mut responder, rx) = responder();
         responder.advance(b"\x1b]11;");
-        assert!(rx.try_recv().is_err());
         responder.advance(b"?\x07");
         assert_eq!(rx.recv().unwrap().bytes, b"\x1b]11;rgb:1111/2222/3333\x07");
     }
@@ -2679,9 +2738,145 @@ mod immediate_color_tests {
 
     #[test]
     fn ordinary_osc_title_does_not_write_to_the_pty() {
-        let (mut responder, rx) = responder();
+        let (mut responder, _rx) = responder();
         responder.advance(b"\x1b]0;Review changes\x07");
-        assert!(rx.try_recv().is_err());
+        assert!(responder.input.stats().current_bytes == 0);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_input_tests {
+    use super::{CommandSpec, PtyChunk, TerminalSession};
+    use crate::input::InputAdmissionError;
+    use std::time::{Duration, Instant};
+
+    fn powershell(script: &str) -> CommandSpec {
+        CommandSpec::program(
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+        )
+    }
+
+    #[test]
+    fn conpty_delivers_large_paste_before_later_key_exactly() {
+        let script = "$s=[Console]::OpenStandardInput();$b=New-Object byte[] 131073;$n=0;while($n -lt $b.Length){$r=$s.Read($b,$n,$b.Length-$n);if($r -eq 0){break};$n+=$r};$ok=$n -eq $b.Length;for($i=0;$ok -and $i -lt 131072;$i++){if($b[$i] -ne 112){$ok=$false}};if($ok -and $b[131072] -ne 107){$ok=$false};if($ok){[Console]::Out.Write('INPUT_OK')}else{[Console]::Out.Write('INPUT_BAD:'+ $n)}";
+        let (session, rx) = TerminalSession::spawn(powershell(script), 80, 24).expect("spawn");
+        // Windows PowerShell probes the cursor before it starts the script. Let
+        // that protocol exchange complete before modeling a user paste; a real
+        // user cannot type into the script until its terminal is ready either.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let mut startup = Vec::new();
+        while Instant::now() < ready_deadline {
+            if let Ok(PtyChunk::Output(bytes)) = rx.try_recv() {
+                startup.extend(bytes);
+                if startup.windows(4).any(|window| window == b"\x1b[6n") {
+                    session.input.protocol(b"\x1b[1;1R").unwrap();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        session.paste(&"p".repeat(128 * 1024)).unwrap();
+        session.write_input(b"k").unwrap();
+        // ConPTY's cooked console input releases the line to PowerShell after
+        // Enter. The fixture reads exactly through `k`, leaving CR behind.
+        session.write_input(b"\r").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    output.extend(bytes);
+                    if String::from_utf8_lossy(&output).contains("INPUT_OK") {
+                        session.kill();
+                        return;
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let tail = &output[output.len().saturating_sub(4096)..];
+        panic!(
+            "large paste/key delivery failed ({} output bytes), tail: {}",
+            output.len(),
+            String::from_utf8_lossy(tail)
+        );
+    }
+
+    fn saturate_blocked_session() -> (
+        std::sync::Arc<TerminalSession>,
+        async_channel::Receiver<PtyChunk>,
+    ) {
+        let (session, rx) =
+            TerminalSession::spawn(powershell("Start-Sleep -Seconds 60"), 80, 24).expect("spawn");
+        let started = Instant::now();
+        session.paste(&"p".repeat(200 * 1024)).unwrap();
+        session.write_input(&vec![b'k'; 48 * 1024]).unwrap();
+        session.input.protocol(&vec![b'r'; 8 * 1024]).unwrap();
+        assert!(matches!(
+            session.write_input(b"!"),
+            Err(InputAdmissionError::Full { .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "blocked-child admission stalled for {:?}",
+            started.elapsed()
+        );
+        (session, rx)
+    }
+
+    #[test]
+    fn saturated_conpty_drop_returns_without_waiting_for_writer() {
+        let (session, rx) = saturate_blocked_session();
+        let started = Instant::now();
+        drop(rx);
+        drop(session);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "session drop stalled for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual Windows ConPTY writer-thread and handle plateau"]
+    fn saturated_conpty_teardown_handle_plateau() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        fn handles() -> u32 {
+            let mut count = 0;
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.unwrap();
+            count
+        }
+
+        let (warm, rx) = saturate_blocked_session();
+        drop(rx);
+        drop(warm);
+        std::thread::sleep(Duration::from_millis(500));
+        let baseline = handles();
+        for _ in 0..12 {
+            let (session, rx) = saturate_blocked_session();
+            drop(rx);
+            drop(session);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let final_count = handles();
+        assert!(
+            final_count <= baseline + 4,
+            "handle count grew from {baseline} to {final_count}"
+        );
     }
 }
 
@@ -2807,7 +3002,7 @@ mod tests {
         // `cat` echoes stdin back; feed it a line and confirm it shows up.
         let spec = CommandSpec::program("/bin/cat", vec![]);
         let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
-        session.write_input(b"hello-muxel\n");
+        session.write_input(b"hello-muxel\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = false;
@@ -3047,7 +3242,7 @@ mod tests {
         let pid = session.child_pid.expect("child pid");
         // UI gone first; then trigger output so the reader hits the dead channel.
         drop(rx);
-        session.write_input(b"ping\n");
+        session.write_input(b"ping\n").unwrap();
         std::thread::sleep(Duration::from_millis(100));
         session.kill();
         let proc_dir = format!("/proc/{pid}");

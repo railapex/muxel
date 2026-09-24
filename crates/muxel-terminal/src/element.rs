@@ -205,6 +205,7 @@ impl Element for TerminalElement {
             TerminalInputHandler {
                 instance_id: self.instance_id,
                 session: self.session.clone(),
+                view_id: self.view_id,
             },
             cx,
         );
@@ -1293,6 +1294,7 @@ struct BgRect {
 pub struct TerminalInputHandler {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    view_id: EntityId,
 }
 
 impl InputHandler for TerminalInputHandler {
@@ -1331,12 +1333,15 @@ impl InputHandler for TerminalInputHandler {
         _replacement_range: Option<std::ops::Range<usize>>,
         text: &str,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
         if !text.is_empty() {
             let t0 = Instant::now();
             profile::key_started(self.instance_id, t0);
-            self.session.write_input(text.as_bytes());
+            let had_input_warning = self.session.input_warning().is_some();
+            if self.session.write_input(text.as_bytes()).is_err() || had_input_warning {
+                cx.notify(self.view_id);
+            }
             // InputHandler has no is_held; key-repeat for letters often lands here.
             profile::key_finished(false, t0.elapsed());
         }
@@ -1348,10 +1353,13 @@ impl InputHandler for TerminalInputHandler {
         new_text: &str,
         _new_selected_range: Option<std::ops::Range<usize>>,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
         if !new_text.is_empty() {
-            self.session.write_input(new_text.as_bytes());
+            let had_input_warning = self.session.input_warning().is_some();
+            if self.session.write_input(new_text.as_bytes()).is_err() || had_input_warning {
+                cx.notify(self.view_id);
+            }
         }
     }
 
@@ -1829,13 +1837,23 @@ impl TerminalElement {
                             session.clear_selection();
                             cx.notify(view_id);
                         } else {
-                            crate::view::paste_clipboard_into_session(&session, cx);
+                            let had_input_warning = session.input_warning().is_some();
+                            if crate::view::paste_clipboard_into_session(&session, cx).is_err()
+                                || had_input_warning
+                            {
+                                cx.notify(view_id);
+                            }
                         }
                     }
                     // The selection already auto-copied; right-click pastes and
                     // drops the (now stale) selection highlight.
                     TerminalMouseMode::CopyOnSelect => {
-                        crate::view::paste_clipboard_into_session(&session, cx);
+                        let had_input_warning = session.input_warning().is_some();
+                        if crate::view::paste_clipboard_into_session(&session, cx).is_err()
+                            || had_input_warning
+                        {
+                            cx.notify(view_id);
+                        }
                         if session.clear_selection() {
                             cx.notify(view_id);
                         }
