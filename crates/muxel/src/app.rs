@@ -1292,23 +1292,33 @@ pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &
 /// through the same state-aware close path as tabs and GPUI keybindings.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn close_browser_pane_from_native(instance_id: Uuid, cx: &mut AsyncApp) {
-    let app = cx.update(|cx| {
+    let target = cx.update(|cx| {
         let app = cx
             .try_global::<MuxelHandle>()
             .and_then(|handle| handle.0.upgrade())?;
-        Some(app)
+        let window = {
+            let app_ref = app.read(cx);
+            let project_id = app_ref.workspace.instance(instance_id)?.project_id;
+            app_ref
+                .secondary_windows
+                .iter()
+                .find(|secondary| secondary.pid == project_id)
+                .map(|secondary| secondary.handle)
+                .or(app_ref.main_window)?
+        };
+        Some((app, window))
     });
-    let Some(app) = app else {
+    let Some((app, window_handle)) = target else {
         return;
     };
-    cx.update(|cx| {
+    let _ = window_handle.update(cx, |_, window, cx| {
         app.update(cx, |app, cx| {
             if app
                 .workspace
                 .instance(instance_id)
                 .is_some_and(|instance| instance.kind == InstanceKind::Browser)
             {
-                app.request_close_instance(instance_id, cx);
+                app.request_close_instance(instance_id, window, cx);
             }
         });
     });
@@ -16807,9 +16817,9 @@ impl MuxelApp {
         }
     }
 
-    fn close_active(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(active) = self.active_instance {
-            self.request_close_instance(active, cx);
+            self.request_close_instance(active, window, cx);
         }
     }
 
@@ -17306,7 +17316,7 @@ impl MuxelApp {
         }
     }
 
-    fn request_close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+    fn request_close_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.instance(iid).is_none() {
             return;
         }
@@ -17327,8 +17337,11 @@ impl MuxelApp {
                 action,
                 cx,
             );
-        } else if self.close_action_token(&action, cx).as_ref() == Some(&token) {
-            self.close_ids_if_current(vec![iid], &token, cx);
+        } else if self.close_action_token(&action, cx).as_ref() == Some(&token)
+            && self.close_ids_if_current(vec![iid], &token, cx)
+            && let Some(next) = self.active_instance
+        {
+            self.focus_instance(next, window, cx);
         }
     }
 
@@ -17514,7 +17527,7 @@ impl MuxelApp {
                 if pending
                     .close_token
                     .as_ref()
-                    .is_some_and(|token| self.close_one_if_current(iid, token, cx))
+                    .is_some_and(|token| self.close_ids_if_current(vec![iid], token, cx))
                     && let Some(next) = self.active_instance
                 {
                     self.focus_instance(next, window, cx);
@@ -20683,8 +20696,8 @@ impl MuxelApp {
                             .xsmall()
                             .icon(IconName::Close)
                             .tooltip(t("Close"))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.request_close_instance(iid, cx)
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.request_close_instance(iid, window, cx)
                             })),
                     );
 
@@ -20789,8 +20802,8 @@ impl MuxelApp {
                             // Middle-click closes the tab, like a browser.
                             .on_mouse_down(
                                 MouseButton::Middle,
-                                cx.listener(move |this, _e, _w, cx| {
-                                    this.request_close_instance(tab, cx)
+                                cx.listener(move |this, _e, window, cx| {
+                                    this.request_close_instance(tab, window, cx)
                                 }),
                             )
                             // Drag a single tab to move it into another pane.
@@ -20979,8 +20992,8 @@ impl MuxelApp {
                                                 .icon(IconName::Close)
                                                 .on_click(window.listener_for(
                                                     &entity,
-                                                    move |this, _, _w, cx| {
-                                                        this.request_close_instance(tab, cx)
+                                                    move |this, _, window, cx| {
+                                                        this.request_close_instance(tab, window, cx)
                                                     },
                                                 )),
                                         )
@@ -21030,8 +21043,8 @@ impl MuxelApp {
                                         .icon(IconName::Close)
                                         .tooltip(t("Close tab"))
                                         .on_click(
-                                            cx.listener(move |this, _e, _w, cx| {
-                                                this.request_close_instance(tab, cx)
+                                            cx.listener(move |this, _e, window, cx| {
+                                                this.request_close_instance(tab, window, cx)
                                             }),
                                         ),
                                     ),
@@ -23328,8 +23341,8 @@ impl MuxelApp {
                                             .icon(IconName::CircleX)
                                             .on_click(window.listener_for(
                                                 &entity,
-                                                move |this, _, _window, cx| {
-                                                    this.request_close_instance(iid, cx)
+                                                move |this, _, window, cx| {
+                                                    this.request_close_instance(iid, window, cx)
                                                 },
                                             )),
                                     )
