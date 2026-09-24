@@ -48,7 +48,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::session::PtyReadTiming;
+use crate::session::{PtyOutputQueueStats, PtyReadTiming};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_STDERR: OnceLock<bool> = OnceLock::new();
@@ -383,6 +383,8 @@ struct Counters {
     read_drain_us: AtomicU64,
     read_drain_max_us: AtomicU64,
     read_drain_n: AtomicU64,
+    read_queue_bytes_high: AtomicU64,
+    read_queue_chunks_high: AtomicU64,
     notify: AtomicU64,
     process_batches: AtomicU64,
     process_bytes: AtomicU64,
@@ -440,6 +442,8 @@ fn counters() -> &'static Counters {
         read_drain_us: AtomicU64::new(0),
         read_drain_max_us: AtomicU64::new(0),
         read_drain_n: AtomicU64::new(0),
+        read_queue_bytes_high: AtomicU64::new(0),
+        read_queue_chunks_high: AtomicU64::new(0),
         notify: AtomicU64::new(0),
         process_batches: AtomicU64::new(0),
         process_bytes: AtomicU64::new(0),
@@ -783,6 +787,8 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
     let read_drain_us = c.read_drain_us.swap(0, Ordering::Relaxed);
     let read_drain_max = c.read_drain_max_us.swap(0, Ordering::Relaxed);
     let read_drain_n = c.read_drain_n.swap(0, Ordering::Relaxed);
+    let read_queue_bytes_high = c.read_queue_bytes_high.swap(0, Ordering::Relaxed);
+    let read_queue_chunks_high = c.read_queue_chunks_high.swap(0, Ordering::Relaxed);
     let notify = c.notify.swap(0, Ordering::Relaxed);
     let batches = c.process_batches.swap(0, Ordering::Relaxed);
     let bytes = c.process_bytes.swap(0, Ordering::Relaxed);
@@ -889,6 +895,7 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
          writer={writes}/{write_bytes}B queue_avg={write_queue_avg}µs queue_max={write_queue_max}µs \
          write_avg={write_avg}µs write_max={write_max}µs \
          reader={reads}/{read_bytes}B drain_avg={read_drain_avg}µs drain_max={read_drain_max}µs \
+         queue_high={read_queue_bytes_high}B/{read_queue_chunks_high}chunks \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
          paint={paints} (focus={paints_f} bg={paints_bg} full={paint_full} replay={paint_replay}, ~{paint_hz}/s) \
@@ -1030,7 +1037,7 @@ pub(crate) fn pty_read(bytes: usize, sequence: u64) -> PtyReadTiming {
 /// Record when one identified reader batch leaves the async channel. Every
 /// batch contributes to the reader→drain aggregate; the sequence also attaches
 /// the exact post-key batch to its per-pane latency chain.
-pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
+pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming, queue: PtyOutputQueueStats) {
     if !enabled() {
         return;
     }
@@ -1040,6 +1047,10 @@ pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
     c.read_drain_us.fetch_add(elapsed, Ordering::Relaxed);
     c.read_drain_max_us.fetch_max(elapsed, Ordering::Relaxed);
     c.read_drain_n.fetch_add(1, Ordering::Relaxed);
+    c.read_queue_bytes_high
+        .fetch_max(queue.queued_bytes as u64, Ordering::Relaxed);
+    c.read_queue_chunks_high
+        .fetch_max(queue.queued_chunks as u64, Ordering::Relaxed);
     // Background output has no per-key chain to correlate. Keep aggregate
     // counters, but do not contend on the pane map for every PTY batch.
     if !PANE_LATENCY_ACTIVE.load(Ordering::Acquire) {
