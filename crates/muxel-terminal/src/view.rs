@@ -6,7 +6,7 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
-use crate::session::{CommandSpec, ProfiledPtyChunk, TerminalSession};
+use crate::session::{CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
@@ -832,7 +832,7 @@ struct ExitInfo {
 /// at an Exit event or once [`MAX_BYTES_PER_TURN`] is buffered (the rest stays
 /// queued for the next drain turn).
 fn coalesce_pending(
-    rx: &async_channel::Receiver<ProfiledPtyChunk>,
+    rx: &ProfiledPtyReceiver,
     instance_id: Uuid,
     output: &mut Vec<u8>,
     exit: &mut Option<ExitInfo>,
@@ -841,7 +841,7 @@ fn coalesce_pending(
         match more {
             ProfiledPtyChunk::Output { bytes, timing } => {
                 if let Some(timing) = timing {
-                    profile::output_drained(instance_id, timing);
+                    profile::output_drained(instance_id, timing, rx.stats());
                 }
                 output.extend_from_slice(&bytes);
             }
@@ -968,9 +968,18 @@ impl Drop for TerminalView {
 /// is what lets a total launch failure surface as an error instead of a panic.
 pub struct TerminalLaunch {
     spec: CommandSpec,
+    rx: ProfiledPtyReceiver,
     session: Arc<TerminalSession>,
-    rx: async_channel::Receiver<ProfiledPtyChunk>,
     launch_error: Option<String>,
+}
+
+/// Owns the two resources captured by the output-drain task in teardown order.
+/// Rust drops struct fields in declaration order: closing the receiver first
+/// wakes a backpressured PTY reader before the final session owner closes the
+/// platform PTY.
+struct DrainTransport {
+    rx: ProfiledPtyReceiver,
+    session: Arc<TerminalSession>,
 }
 
 impl TerminalLaunch {
@@ -1281,12 +1290,15 @@ impl TerminalView {
             .detach();
         }
 
-        let drain_session = session.clone();
+        let drain_transport = DrainTransport {
+            rx,
+            session: session.clone(),
+        };
         let drain = cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            let session = drain_session;
+            let transport = drain_transport;
             let mut first_output = true;
             loop {
-                let chunk = match rx.recv().await {
+                let chunk = match transport.rx.recv().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
@@ -1296,7 +1308,7 @@ impl TerminalView {
                 match chunk {
                     ProfiledPtyChunk::Output { bytes, timing } => {
                         if let Some(timing) = timing {
-                            profile::output_drained(instance_id, timing);
+                            profile::output_drained(instance_id, timing, transport.rx.stats());
                         }
                         output.extend_from_slice(&bytes);
                     }
@@ -1312,11 +1324,11 @@ impl TerminalView {
                         });
                     }
                 }
-                coalesce_pending(&rx, instance_id, &mut output, &mut exit);
+                coalesce_pending(&transport.rx, instance_id, &mut output, &mut exit);
 
                 // Coalesce before taking the UI lock: bg agents always; focused
                 // stream bursts too (interaction priority is decided after parsing).
-                let focused_hint = session.is_focused();
+                let focused_hint = transport.session.is_focused();
                 if exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
                     let wait = if !focused_hint {
                         Some(BACKGROUND_PAINT_INTERVAL)
@@ -1327,7 +1339,7 @@ impl TerminalView {
                     };
                     if let Some(d) = wait {
                         cx.background_executor().timer(d).await;
-                        coalesce_pending(&rx, instance_id, &mut output, &mut exit);
+                        coalesce_pending(&transport.rx, instance_id, &mut output, &mut exit);
                     }
                 }
 

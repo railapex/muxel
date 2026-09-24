@@ -106,6 +106,17 @@ channel drain, intentional coalescing, UI-update queueing, notify, and paint. A
 `term-write[v1]` line names the pane when queueing or the ConPTY write itself
 exceeds 50 ms.
 
+The reader-to-UI queue is bounded independently per pane at 256 KiB and 64
+events. The PTY reader waits when either limit is full, propagating pressure to
+the child instead of retaining unlimited output in Muxel. The UI may separately
+hold one drain batch (256 KiB plus at most one 64 KiB read) while parsing it.
+Dequeueing returns the exact byte permit; no terminal bytes are merged or
+dropped, and Exit stays behind all preceding output.
+`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v8]` reports the largest
+post-dequeue occupancy observed during that log interval. The public
+`PtyReceiver::stats()` and `TerminalSession::output_queue_stats()` expose current
+and high-water occupancy to diagnostics without terminal content.
+
 **UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
 and 1m / 15m / hourly snapshots (working set). Use this for settings typing and
 cursor starvation (term-prof cannot see non-terminal keys). Spikes:

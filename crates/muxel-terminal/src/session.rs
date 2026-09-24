@@ -16,7 +16,7 @@ use alacritty_terminal::term::{
 };
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -56,6 +56,253 @@ pub enum PtyChunk {
     },
 }
 
+/// Maximum terminal output retained between the PTY reader and its consumer.
+///
+/// This matches one UI drain turn. Once a pane reaches the limit, its reader
+/// blocks and lets the operating system's PTY backpressure reach the child.
+pub const PTY_OUTPUT_QUEUE_BYTE_CAPACITY: usize = 256 * 1024;
+
+/// Maximum number of output/exit envelopes retained for one terminal.
+pub const PTY_OUTPUT_QUEUE_CHUNK_CAPACITY: usize = 64;
+
+const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
+const _: () = assert!(PTY_READ_BUFFER_BYTES <= PTY_OUTPUT_QUEUE_BYTE_CAPACITY);
+
+/// A point-in-time view of one terminal's output queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtyOutputQueueStats {
+    /// Output bytes admitted by the reader but not yet received by the consumer.
+    pub queued_bytes: usize,
+    /// Output or exit envelopes admitted but not yet received.
+    pub queued_chunks: usize,
+    /// Largest observed value of [`Self::queued_bytes`].
+    pub high_water_bytes: usize,
+    /// Largest observed value of [`Self::queued_chunks`].
+    pub high_water_chunks: usize,
+}
+
+#[derive(Default)]
+struct OutputQueueCounters {
+    queued_bytes: usize,
+    queued_chunks: usize,
+    high_water_bytes: usize,
+    high_water_chunks: usize,
+    receiver_closed: bool,
+}
+
+struct OutputQueueState {
+    counters: Mutex<OutputQueueCounters>,
+    space_available: Condvar,
+    byte_capacity: usize,
+    chunk_capacity: usize,
+}
+
+impl OutputQueueState {
+    fn admit(&self, bytes: usize) -> bool {
+        let mut counters = self.counters.lock();
+        while !counters.receiver_closed
+            && ((bytes > self.byte_capacity && counters.queued_bytes > 0)
+                || (bytes <= self.byte_capacity
+                    && counters.queued_bytes + bytes > self.byte_capacity)
+                || counters.queued_chunks == self.chunk_capacity)
+        {
+            self.space_available.wait(&mut counters);
+        }
+        if counters.receiver_closed {
+            return false;
+        }
+        counters.queued_bytes += bytes;
+        counters.queued_chunks += 1;
+        counters.high_water_bytes = counters.high_water_bytes.max(counters.queued_bytes);
+        counters.high_water_chunks = counters.high_water_chunks.max(counters.queued_chunks);
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut counters = self.counters.lock();
+        if counters.receiver_closed {
+            return;
+        }
+        counters.queued_bytes = counters
+            .queued_bytes
+            .checked_sub(bytes)
+            .expect("released more PTY output bytes than the queue retained");
+        counters.queued_chunks = counters
+            .queued_chunks
+            .checked_sub(1)
+            .expect("released an event from an empty PTY output queue");
+        self.space_available.notify_one();
+    }
+
+    fn close_receiver(&self) {
+        let mut counters = self.counters.lock();
+        counters.receiver_closed = true;
+        counters.queued_bytes = 0;
+        counters.queued_chunks = 0;
+        self.space_available.notify_all();
+    }
+
+    fn stats(&self) -> PtyOutputQueueStats {
+        let counters = self.counters.lock();
+        PtyOutputQueueStats {
+            queued_bytes: counters.queued_bytes,
+            queued_chunks: counters.queued_chunks,
+            high_water_bytes: counters.high_water_bytes,
+            high_water_chunks: counters.high_water_chunks,
+        }
+    }
+}
+
+pub(crate) trait OutputQueueItem {
+    fn output_bytes(&self) -> usize;
+}
+
+impl OutputQueueItem for PtyChunk {
+    fn output_bytes(&self) -> usize {
+        match self {
+            Self::Output(bytes) => bytes.len(),
+            Self::Exit { .. } => 0,
+        }
+    }
+}
+
+struct OutputQueueSender<T> {
+    tx: async_channel::Sender<T>,
+    state: Arc<OutputQueueState>,
+}
+
+impl<T: OutputQueueItem> OutputQueueSender<T> {
+    fn send_blocking(&self, item: T) -> bool {
+        let bytes = item.output_bytes();
+        if !self.state.admit(bytes) {
+            return false;
+        }
+        if self.tx.send_blocking(item).is_err() {
+            self.state.release(bytes);
+            return false;
+        }
+        true
+    }
+}
+
+struct OutputQueueReceiverInner<T> {
+    rx: async_channel::Receiver<T>,
+    state: Arc<OutputQueueState>,
+}
+
+impl<T> Drop for OutputQueueReceiverInner<T> {
+    fn drop(&mut self) {
+        self.rx.close();
+        self.state.close_receiver();
+    }
+}
+
+pub(crate) struct OutputQueueReceiver<T> {
+    inner: Arc<OutputQueueReceiverInner<T>>,
+}
+
+impl<T> Clone for OutputQueueReceiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: OutputQueueItem> OutputQueueReceiver<T> {
+    pub(crate) async fn recv(&self) -> Result<T, async_channel::RecvError> {
+        let item = self.inner.rx.recv().await?;
+        self.inner.state.release(item.output_bytes());
+        Ok(item)
+    }
+
+    pub(crate) fn recv_blocking(&self) -> Result<T, async_channel::RecvError> {
+        let item = self.inner.rx.recv_blocking()?;
+        self.inner.state.release(item.output_bytes());
+        Ok(item)
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<T, async_channel::TryRecvError> {
+        let item = self.inner.rx.try_recv()?;
+        self.inner.state.release(item.output_bytes());
+        Ok(item)
+    }
+
+    pub(crate) fn stats(&self) -> PtyOutputQueueStats {
+        self.inner.state.stats()
+    }
+}
+
+fn output_queue<T>(
+    byte_capacity: usize,
+    chunk_capacity: usize,
+) -> (OutputQueueSender<T>, OutputQueueReceiver<T>) {
+    assert!(byte_capacity > 0);
+    assert!(chunk_capacity > 0);
+    let (tx, rx) = async_channel::unbounded();
+    let state = Arc::new(OutputQueueState {
+        counters: Mutex::new(OutputQueueCounters::default()),
+        space_available: Condvar::new(),
+        byte_capacity,
+        chunk_capacity,
+    });
+    (
+        OutputQueueSender {
+            tx,
+            state: state.clone(),
+        },
+        OutputQueueReceiver {
+            inner: Arc::new(OutputQueueReceiverInner { rx, state }),
+        },
+    )
+}
+
+/// Receiver for a terminal's bounded output stream.
+///
+/// Clones compete for events from the same queue; they do not broadcast them.
+/// Dropping a clone cancels the producer only after the last clone is gone.
+pub struct PtyReceiver {
+    inner: OutputQueueReceiver<PtyChunk>,
+}
+
+impl Clone for PtyReceiver {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PtyReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyReceiver")
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PtyReceiver {
+    /// Wait asynchronously for the next output or exit event.
+    pub async fn recv(&self) -> Result<PtyChunk, async_channel::RecvError> {
+        self.inner.recv().await
+    }
+
+    /// Wait synchronously for the next output or exit event.
+    pub fn recv_blocking(&self) -> Result<PtyChunk, async_channel::RecvError> {
+        self.inner.recv_blocking()
+    }
+
+    /// Receive the next event immediately, if one is ready.
+    pub fn try_recv(&self) -> Result<PtyChunk, async_channel::TryRecvError> {
+        self.inner.try_recv()
+    }
+
+    /// Return current and high-water queue occupancy.
+    pub fn stats(&self) -> PtyOutputQueueStats {
+        self.inner.stats()
+    }
+}
+
 /// Internal reader envelope. It preserves the exact public [`PtyChunk`] shape
 /// while carrying opt-in timing from the PTY reader to the GPUI drain path.
 pub(crate) enum ProfiledPtyChunk {
@@ -70,36 +317,52 @@ pub(crate) enum ProfiledPtyChunk {
     },
 }
 
+impl OutputQueueItem for ProfiledPtyChunk {
+    fn output_bytes(&self) -> usize {
+        match self {
+            Self::Output { bytes, .. } => bytes.len(),
+            Self::Exit { .. } => 0,
+        }
+    }
+}
+
+pub(crate) type ProfiledPtyReceiver = OutputQueueReceiver<ProfiledPtyChunk>;
+
 enum PtyChunkSender {
-    Public(async_channel::Sender<PtyChunk>),
-    Profiled(async_channel::Sender<ProfiledPtyChunk>),
+    Public(OutputQueueSender<PtyChunk>),
+    Profiled(OutputQueueSender<ProfiledPtyChunk>),
 }
 
 impl PtyChunkSender {
+    fn queue_state(&self) -> Arc<OutputQueueState> {
+        match self {
+            Self::Public(tx) => tx.state.clone(),
+            Self::Profiled(tx) => tx.state.clone(),
+        }
+    }
+
     fn carries_timing(&self) -> bool {
         matches!(self, Self::Profiled(_))
     }
 
     fn send_output(&self, bytes: Vec<u8>, timing: Option<PtyReadTiming>) -> bool {
         match self {
-            Self::Public(tx) => tx.send_blocking(PtyChunk::Output(bytes)).is_ok(),
-            Self::Profiled(tx) => tx
-                .send_blocking(ProfiledPtyChunk::Output { bytes, timing })
-                .is_ok(),
+            Self::Public(tx) => tx.send_blocking(PtyChunk::Output(bytes)),
+            Self::Profiled(tx) => tx.send_blocking(ProfiledPtyChunk::Output { bytes, timing }),
         }
     }
 
     fn send_exit(&self, code: Option<i32>, signal: Option<String>, read_error: Option<String>) {
         match self {
             Self::Public(tx) => {
-                let _ = tx.send_blocking(PtyChunk::Exit {
+                tx.send_blocking(PtyChunk::Exit {
                     code,
                     signal,
                     read_error,
                 });
             }
             Self::Profiled(tx) => {
-                let _ = tx.send_blocking(ProfiledPtyChunk::Exit {
+                tx.send_blocking(ProfiledPtyChunk::Exit {
                     code,
                     signal,
                     read_error,
@@ -309,6 +572,7 @@ pub struct TerminalSession {
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     writer: SharedWriter,
+    output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
     // Unix foreground-process query), so a mutex lets a fully spawned session
     // move from the launch worker to the UI thread without weakening safety.
@@ -488,14 +752,13 @@ pub(crate) struct PaintDrawList {
 impl TerminalSession {
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
-    pub fn spawn(
-        spec: CommandSpec,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
-        let (tx, rx) = async_channel::unbounded();
+    pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
+        let (tx, rx) = output_queue(
+            PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+            PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+        );
         let session = Self::spawn_inner(spec, cols, rows, None, PtyChunkSender::Public(tx))?;
-        Ok((session, rx))
+        Ok((session, PtyReceiver { inner: rx }))
     }
 
     /// Spawn with phase timings attributed to one Muxel pane.
@@ -504,8 +767,11 @@ impl TerminalSession {
         cols: u16,
         rows: u16,
         instance_id: uuid::Uuid,
-    ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
-        let (tx, rx) = async_channel::unbounded();
+    ) -> Result<(Arc<Self>, PtyReceiver)> {
+        let (tx, rx) = output_queue(
+            PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+            PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+        );
         let session = Self::spawn_inner(
             spec,
             cols,
@@ -513,7 +779,7 @@ impl TerminalSession {
             Some(instance_id),
             PtyChunkSender::Public(tx),
         )?;
-        Ok((session, rx))
+        Ok((session, PtyReceiver { inner: rx }))
     }
 
     pub(crate) fn spawn_internal(
@@ -521,8 +787,11 @@ impl TerminalSession {
         cols: u16,
         rows: u16,
         instance_id: Option<uuid::Uuid>,
-    ) -> Result<(Arc<Self>, async_channel::Receiver<ProfiledPtyChunk>)> {
-        let (tx, rx) = async_channel::unbounded();
+    ) -> Result<(Arc<Self>, ProfiledPtyReceiver)> {
+        let (tx, rx) = output_queue(
+            PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+            PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+        );
         let session =
             Self::spawn_inner(spec, cols, rows, instance_id, PtyChunkSender::Profiled(tx))?;
         Ok((session, rx))
@@ -679,6 +948,7 @@ impl TerminalSession {
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let reply_writer = writer.clone();
         let reply_palette = palette.clone();
+        let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
         let reader_handle = std::thread::Builder::new()
@@ -728,6 +998,7 @@ impl TerminalSession {
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             writer,
+            output_queue,
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
             child_pid,
@@ -909,6 +1180,11 @@ impl TerminalSession {
     /// Whether the child has produced any output yet.
     pub fn has_output(&self) -> bool {
         self.output_seen.load(Ordering::Relaxed)
+    }
+
+    /// Return current and high-water reader-to-consumer queue occupancy.
+    pub fn output_queue_stats(&self) -> PtyOutputQueueStats {
+        self.output_queue.stats()
     }
 
     /// Write bytes to the PTY (user input, pastes, key sequences). Any input
@@ -2092,7 +2368,7 @@ fn read_loop(
     palette: Arc<Mutex<TerminalPalette>>,
     profile_reads: bool,
 ) {
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; PTY_READ_BUFFER_BYTES];
     let mut color_queries = ImmediateColorQueries::new(writer, palette);
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
@@ -2104,22 +2380,36 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                if ui_gone {
+                    // Keep the PTY output pipe moving while owned teardown kills
+                    // the child and closes ConPTY. ClosePseudoConsole may wait
+                    // on an undrained pipe on Windows; discarded bytes need no
+                    // allocation, parsing, timing, or UI delivery.
+                    continue;
+                }
                 let timing = profile_reads.then(|| {
                     read_sequence = read_sequence.wrapping_add(1).max(1);
                     profile::pty_read(n, read_sequence)
                 });
                 color_queries.advance(&buf[..n]);
                 if !tx.send_output(buf[..n].to_vec(), timing) {
-                    // Receiver dropped — UI is gone. Still fall through to reap
-                    // the child, or it lingers as a zombie.
+                    // Receiver dropped — no consumer remains. Stop the child,
+                    // then keep draining on Windows until EOF so ConPTY
+                    // teardown cannot block on a full output pipe. Unix PTYs
+                    // must release the reader immediately: a HUP-ignoring
+                    // descendant can otherwise hold the slave open forever.
                     ui_gone = true;
+                    let _ = child.kill();
+                    #[cfg(unix)]
                     break;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log::warn!("pty read failed (treating as session end): {e}");
-                read_error = Some(format!("{:?}: {e}", e.kind()));
+                if !ui_gone {
+                    log::warn!("pty read failed (treating as session end): {e}");
+                    read_error = Some(format!("{:?}: {e}", e.kind()));
+                }
                 break;
             }
         }
@@ -2397,7 +2687,7 @@ mod profiler_transport_tests {
 
     #[test]
     fn private_output_envelope_keeps_reader_timing_with_bytes() {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = output_queue(16, 1);
         let sender = PtyChunkSender::Profiled(tx);
         let timing = PtyReadTiming {
             sequence: 7,
@@ -2415,6 +2705,172 @@ mod profiler_transport_tests {
             }
             _ => panic!("expected timed output"),
         }
+    }
+
+    #[test]
+    fn output_queue_blocks_at_byte_limit_and_preserves_order() {
+        let (tx, rx) = output_queue::<PtyChunk>(5, 2);
+        assert!(tx.send_blocking(PtyChunk::Output(vec![1, 2, 3])));
+        assert!(tx.send_blocking(PtyChunk::Output(vec![4, 5])));
+        assert_eq!(
+            rx.stats(),
+            PtyOutputQueueStats {
+                queued_bytes: 5,
+                queued_chunks: 2,
+                high_water_bytes: 5,
+                high_water_chunks: 2,
+            }
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).expect("report sender start");
+            assert!(tx.send_blocking(PtyChunk::Output(vec![6])));
+            assert!(tx.send_blocking(PtyChunk::Exit {
+                code: Some(0),
+                signal: None,
+                read_error: None,
+            }));
+            done_tx.send(()).expect("report sender completion");
+        });
+        started_rx.recv().expect("sender started");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "sender passed a full queue"
+        );
+
+        let mut output = Vec::new();
+        loop {
+            match rx.recv_blocking().expect("queued event") {
+                PtyChunk::Output(bytes) => output.extend(bytes),
+                PtyChunk::Exit { code, .. } => {
+                    assert_eq!(code, Some(0));
+                    break;
+                }
+            }
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sender should resume as the receiver drains");
+        sender.join().expect("sender thread");
+        assert_eq!(output, [1, 2, 3, 4, 5, 6]);
+        let stats = rx.stats();
+        assert_eq!(stats.queued_bytes, 0);
+        assert_eq!(stats.queued_chunks, 0);
+        assert_eq!(stats.high_water_bytes, 5);
+        assert_eq!(stats.high_water_chunks, 2);
+    }
+
+    #[test]
+    fn fragmented_stream_is_byte_exact_through_repeated_backpressure() {
+        let expected: Vec<u8> = (0..128 * 1024).map(|index| (index % 251) as u8).collect();
+        let producer_bytes = expected.clone();
+        let (tx, rx) = output_queue::<PtyChunk>(1024, 8);
+        let producer = std::thread::spawn(move || {
+            let fragment_sizes = [1, 2, 7, 63, 511, 1024];
+            let mut offset = 0;
+            let mut fragment = 0;
+            while offset < producer_bytes.len() {
+                let end = (offset + fragment_sizes[fragment % fragment_sizes.len()])
+                    .min(producer_bytes.len());
+                assert!(tx.send_blocking(PtyChunk::Output(producer_bytes[offset..end].to_vec())));
+                offset = end;
+                fragment += 1;
+            }
+            assert!(tx.send_blocking(PtyChunk::Exit {
+                code: Some(0),
+                signal: None,
+                read_error: None,
+            }));
+        });
+
+        let mut actual = Vec::with_capacity(expected.len());
+        while let PtyChunk::Output(bytes) = rx.recv_blocking().expect("fragmented event") {
+            actual.extend(bytes);
+        }
+        producer.join().expect("fragment producer");
+        assert_eq!(actual, expected);
+        assert!(rx.stats().high_water_bytes <= 1024);
+        assert!(rx.stats().high_water_chunks <= 8);
+    }
+
+    #[test]
+    fn dropping_receiver_cancels_a_blocked_sender() {
+        let (tx, rx) = output_queue::<PtyChunk>(4, 1);
+        let state = tx.state.clone();
+        assert!(tx.send_blocking(PtyChunk::Output(vec![1, 2, 3, 4])));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).expect("report sender start");
+            done_tx
+                .send(tx.send_blocking(PtyChunk::Output(vec![5])))
+                .expect("report sender completion");
+        });
+
+        started_rx.recv().expect("sender started");
+        drop(rx);
+        assert!(
+            !done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("receiver drop should wake the sender")
+        );
+        sender.join().expect("sender thread");
+        let stats = state.stats();
+        assert_eq!(stats.queued_bytes, 0);
+        assert_eq!(stats.queued_chunks, 0);
+    }
+
+    #[test]
+    fn oversized_item_waits_for_an_empty_queue_instead_of_panicking() {
+        let (tx, rx) = output_queue::<PtyChunk>(4, 2);
+        assert!(tx.send_blocking(PtyChunk::Output(vec![1])));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).expect("report sender start");
+            done_tx
+                .send(tx.send_blocking(PtyChunk::Output(vec![2; 5])))
+                .expect("report oversized send");
+        });
+        started_rx.recv().expect("sender started");
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(matches!(
+            rx.recv_blocking(),
+            Ok(PtyChunk::Output(bytes)) if bytes == [1]
+        ));
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("oversized item should enter an empty queue")
+        );
+        sender.join().expect("sender thread");
+        assert_eq!(rx.stats().queued_bytes, 5);
+    }
+
+    #[test]
+    fn fifty_pane_model_has_a_fixed_aggregate_bound() {
+        const PANES: usize = 50;
+        let mut queues = Vec::with_capacity(PANES);
+        for _ in 0..PANES {
+            let (tx, rx) = output_queue::<PtyChunk>(
+                PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+                PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+            );
+            for _ in 0..4 {
+                assert!(tx.send_blocking(PtyChunk::Output(vec![0; 64 * 1024])));
+            }
+            queues.push((tx, rx));
+        }
+
+        let queued_bytes: usize = queues.iter().map(|(_, rx)| rx.stats().queued_bytes).sum();
+        assert_eq!(queued_bytes, PANES * PTY_OUTPUT_QUEUE_BYTE_CAPACITY);
+        assert!(queues.iter().all(|(_, rx)| {
+            let stats = rx.stats();
+            stats.queued_bytes == PTY_OUTPUT_QUEUE_BYTE_CAPACITY
+                && stats.queued_chunks <= PTY_OUTPUT_QUEUE_CHUNK_CAPACITY
+        }));
     }
 
     #[test]
@@ -2440,6 +2896,317 @@ mod profiler_transport_tests {
             ),
             Duration::from_millis(5)
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_output_pty_tests {
+    use super::*;
+    use std::io::Write;
+
+    const FIXTURE_ENV: &str = "MUXEL_PTY_OUTPUT_FIXTURE_CHILD";
+    const START_MARKER: &[u8] = b"<MUXEL-PTY-OUTPUT-START>";
+    const END_MARKER: &[u8] = b"<MUXEL-PTY-OUTPUT-END>";
+    const RECORD_PREFIX: &[u8] = b"MUXEL_REC:";
+
+    fn fixture_payload() -> Vec<u8> {
+        let motif = b"ascii|\xc2\xb5|\xe4\xb8\xad|0123456789abcdef0123456789abcdef|\r\n";
+        let mut payload = Vec::with_capacity(384 * 1024);
+        let mut sequence = 0u32;
+        while payload.len() < 384 * 1024 {
+            payload.extend_from_slice(format!("MUXEL_REC:{sequence:08x}|").as_bytes());
+            payload.extend_from_slice(motif);
+            sequence = sequence.wrapping_add(1);
+        }
+        payload
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn record_sequences(output: &[u8]) -> Vec<u32> {
+        let mut sequences = Vec::new();
+        let mut offset = 0;
+        while let Some(relative) = find_bytes(&output[offset..], RECORD_PREFIX) {
+            let record = offset + relative + RECORD_PREFIX.len();
+            let Some(hex) = output.get(record..record + 8) else {
+                break;
+            };
+            if output.get(record + 8) == Some(&b'|') && hex.iter().all(u8::is_ascii_hexdigit) {
+                let hex = std::str::from_utf8(hex).expect("ASCII fixture sequence");
+                sequences.push(u32::from_str_radix(hex, 16).expect("hex fixture sequence"));
+            }
+            offset = record + 8;
+        }
+        sequences
+    }
+
+    fn spawn_fixture_to_start() -> (Arc<TerminalSession>, PtyReceiver, Vec<u8>) {
+        let test_exe = std::env::current_exe().expect("resolve current test executable");
+        let mut spec = CommandSpec::program(
+            test_exe.to_string_lossy(),
+            vec![
+                "bounded_output_pty_tests::real_pty_fixture_child".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+        );
+        spec.env.push((FIXTURE_ENV.to_string(), "1".to_string()));
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY fixture");
+
+        // ConPTY asks for the cursor position while attaching some console
+        // programs. Complete that handshake, then stop draining as soon as the
+        // fixture marker arrives so the payload itself can saturate the queue.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        while find_bytes(&output, START_MARKER).is_none() {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                    output.extend(bytes);
+                }
+                Ok(PtyChunk::Exit { read_error, .. }) => {
+                    panic!("fixture exited before its start marker: {read_error:?}")
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture did not reach its start marker"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(async_channel::TryRecvError::Closed) => {
+                    panic!("fixture transport closed before its start marker")
+                }
+            }
+        }
+        (session, rx, output)
+    }
+
+    fn wait_for_saturation(rx: &PtyReceiver) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = rx.stats();
+            if stats.queued_chunks == PTY_OUTPUT_QUEUE_CHUNK_CAPACITY
+                || stats.queued_bytes
+                    >= PTY_OUTPUT_QUEUE_BYTE_CAPACITY.saturating_sub(PTY_READ_BUFFER_BYTES)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not saturate bounded transport: {stats:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The parent test starts this exact test binary inside a real platform
+    /// PTY. Normal test discovery takes the no-op branch.
+    #[test]
+    fn real_pty_fixture_child() {
+        if std::env::var_os(FIXTURE_ENV).is_none() {
+            return;
+        }
+
+        let payload = fixture_payload();
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(START_MARKER).expect("write start marker");
+        // Some older ConPTY hosts can inject repaint sequences between writes.
+        // Keep each record token in one write so decoration cannot split the
+        // sequence number, while deliberately fragmenting early record bodies
+        // to retain coverage for arbitrary UTF-8/output chunk boundaries.
+        const RECORD_TOKEN_BYTES: usize = RECORD_PREFIX.len() + 8 + 1;
+        const FRAGMENTED_RECORDS: usize = 32;
+        let fragment_sizes = [1, 2, 7, 63];
+        let mut offset = 0;
+        for record in payload
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(FRAGMENTED_RECORDS)
+        {
+            assert!(record.len() >= RECORD_TOKEN_BYTES);
+            stdout
+                .write_all(&record[..RECORD_TOKEN_BYTES])
+                .expect("write atomic fixture token");
+            let mut body_offset = RECORD_TOKEN_BYTES;
+            let mut fragment = 0;
+            while body_offset < record.len() {
+                let end = (body_offset + fragment_sizes[fragment % fragment_sizes.len()])
+                    .min(record.len());
+                stdout
+                    .write_all(&record[body_offset..end])
+                    .expect("write fixture body fragment");
+                body_offset = end;
+                fragment += 1;
+            }
+            offset += record.len();
+        }
+        stdout
+            .write_all(&payload[offset..])
+            .expect("write fixture payload tail");
+        stdout.write_all(END_MARKER).expect("write end marker");
+        stdout.flush().expect("flush fixture output");
+    }
+
+    #[test]
+    fn real_pty_saturation_preserves_records_and_exit_order() {
+        let (session, rx, mut transport_output) = spawn_fixture_to_start();
+        let mut session = Some(session);
+        wait_for_saturation(&rx);
+
+        let saturated = rx.stats();
+        assert!(saturated.queued_bytes <= PTY_OUTPUT_QUEUE_BYTE_CAPACITY);
+        assert!(saturated.queued_chunks <= PTY_OUTPUT_QUEUE_CHUNK_CAPACITY);
+
+        let receive_deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_exit = false;
+        let mut teardown_requested = false;
+        while Instant::now() < receive_deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n")
+                        && let Some(session) = &session
+                    {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                    transport_output.extend(bytes);
+                    if !teardown_requested && find_bytes(&transport_output, END_MARKER).is_some() {
+                        // ConPTY may retain the console host after the test body
+                        // has finished. Owned teardown must still cancel it and
+                        // deliver Exit after every preceding output byte.
+                        #[cfg(windows)]
+                        drop(session.take());
+                        teardown_requested = true;
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) => {
+                    saw_exit = true;
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(async_channel::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(
+            saw_exit,
+            "fixture exit was not delivered after its output: bytes={}, end_marker={}, stats={:?}",
+            transport_output.len(),
+            find_bytes(&transport_output, END_MARKER).is_some(),
+            rx.stats()
+        );
+
+        let payload_start = find_bytes(&transport_output, START_MARKER)
+            .map(|index| index + START_MARKER.len())
+            .expect("start marker in PTY output");
+        let payload_end = find_bytes(&transport_output[payload_start..], END_MARKER)
+            .map(|index| payload_start + index)
+            .expect("end marker in PTY output");
+        let expected_sequences = record_sequences(&fixture_payload());
+        let actual_sequences = record_sequences(&transport_output[payload_start..payload_end]);
+        assert_eq!(
+            actual_sequences, expected_sequences,
+            "PTY transport lost, duplicated, or reordered fixture records"
+        );
+
+        let drained = rx.stats();
+        assert_eq!(drained.queued_bytes, 0);
+        assert_eq!(drained.queued_chunks, 0);
+        assert!(drained.high_water_bytes <= PTY_OUTPUT_QUEUE_BYTE_CAPACITY);
+        assert!(drained.high_water_chunks <= PTY_OUTPUT_QUEUE_CHUNK_CAPACITY);
+    }
+
+    #[test]
+    fn saturated_real_pty_teardown_returns_promptly() {
+        let (session, rx, _output) = spawn_fixture_to_start();
+        wait_for_saturation(&rx);
+
+        let started = Instant::now();
+        drop(rx);
+        drop(session);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dropping a saturated PTY blocked its owner"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saturated_real_pty_session_first_teardown_returns_promptly() {
+        let (session, rx, _output) = spawn_fixture_to_start();
+        wait_for_saturation(&rx);
+
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let teardown = std::thread::spawn(move || {
+            let started = Instant::now();
+            drop(session);
+            let elapsed = started.elapsed();
+            let _ = done_tx.send(elapsed);
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(2));
+        // Also release a failed run cleanly: receiver closure wakes the
+        // backpressured reader, allowing the teardown thread to finish.
+        drop(rx);
+        teardown.join().expect("session teardown thread panicked");
+        let elapsed = elapsed.expect("dropping the session first blocked on a saturated PTY");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dropping a saturated PTY session blocked before its receiver"
+        );
+    }
+
+    #[cfg(windows)]
+    fn process_handle_count() -> u32 {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetProcessHandleCount(process: *mut std::ffi::c_void, handle_count: *mut u32)
+            -> i32;
+        }
+
+        let mut count = 0;
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle;
+        // `count` remains live and writable for the duration of the call.
+        let succeeded = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+        assert_ne!(succeeded, 0, "GetProcessHandleCount failed");
+        count
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "controlled resource-plateau trial; run alone with --test-threads=1"]
+    fn repeated_real_pty_saturation_plateaus_process_handles() {
+        const ROUNDS: usize = 12;
+        const HANDLE_SLACK: u32 = 4;
+
+        // Warm process-global ConPTY/test machinery before taking the baseline.
+        real_pty_saturation_preserves_records_and_exit_order();
+        saturated_real_pty_teardown_returns_promptly();
+        saturated_real_pty_session_first_teardown_returns_promptly();
+        let baseline = process_handle_count();
+        for _ in 0..ROUNDS {
+            real_pty_saturation_preserves_records_and_exit_order();
+            saturated_real_pty_teardown_returns_promptly();
+            saturated_real_pty_session_first_teardown_returns_promptly();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut handles = process_handle_count();
+        while handles > baseline + HANDLE_SLACK && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            handles = process_handle_count();
+        }
+        assert!(
+            handles <= baseline + HANDLE_SLACK,
+            "{ROUNDS} real-PTY saturation/teardown rounds retained process handles: baseline={baseline}, final={handles}"
+        );
+        eprintln!("real-PTY handle plateau: rounds={ROUNDS}, baseline={baseline}, final={handles}");
     }
 }
 
@@ -2896,7 +3663,7 @@ mod tests {
     /// child's stdin is echoed back by the tty/cat). Non-blocking receive with a
     /// hard deadline — `cat` never exits, so a blocking recv would hang the test
     /// binary forever if the reply never arrives.
-    fn wait_for_reply(rx: &async_channel::Receiver<PtyChunk>, needle: &[u8]) -> bool {
+    fn wait_for_reply(rx: &PtyReceiver, needle: &[u8]) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen: Vec<u8> = Vec::new();
         while Instant::now() < deadline {
