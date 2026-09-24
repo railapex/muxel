@@ -17,8 +17,10 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 const PAGE_CLOSE_MSG: &str = "muxel:close-pane";
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn is_page_close_message(body: &str) -> bool {
     body == PAGE_CLOSE_MSG
 }
@@ -955,7 +957,8 @@ mod imp {
                     None => None,
                 };
 
-                let _ = this.update_in(cx, |this, window, cx| {
+                if this
+                    .update_in(cx, |this, window, cx| {
                     let Some(wv) = built else {
                         this.webview_failed = true;
                         cx.notify();
@@ -992,8 +995,12 @@ mod imp {
                         wv.update(cx, |wv, _| wv.load_url(&current));
                     }
                     this.webview = Some(wv);
-                    cx.notify();
-                });
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
 
                 drop(native_event_tx);
                 while let Ok(event) = native_events.recv().await {

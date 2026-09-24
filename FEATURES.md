@@ -805,7 +805,9 @@ feature is added or changed, update the matching entry here in the same change**
   the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
   `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  (`Ctrl+Q` elsewhere) to quit from any focus. Pane close follows the platform:
+  `Cmd+W` on macOS and `Ctrl+W` elsewhere, with `Ctrl+F4` on Windows; terminal
+  `Ctrl+W` still reaches the shell, while `Ctrl+Shift+W` closes its pane.
 - **Behavior** — immediate-save appearance, confirm destructive actions, and
   auto-close a pane when its process exits **cleanly** (an abnormal exit leaves
   a tombstone pane). Closing a tab, tab group, project, workspace, or the app

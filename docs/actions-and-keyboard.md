@@ -15,8 +15,11 @@ input and the existing terminal passthrough rules remain unchanged.
 
 `action_catalog` owns stable IDs, labels, categories, target kinds, defaults and
 sheet mnemonics. The palette, key sheet and binding settings use those names and
-effective bindings. Existing persisted action IDs and all 59 v0.1.9 defaults are
-preserved. Fixed terminal Tab/Shift+Tab, nonterminal Ctrl+P, copy and quit aliases
+effective bindings. Existing persisted action IDs and 58 of the 59 v0.1.9
+defaults are preserved. Close Pane deliberately moves to the platform tab-close
+chord: Cmd+W on macOS and Ctrl+W elsewhere, with Ctrl+F4 as a Windows alias.
+Terminal Ctrl+W remains PTY input and its existing Ctrl+Shift+W close chord stays
+available. Fixed terminal Tab/Shift+Tab, nonterminal Ctrl+P, copy and quit aliases
 remain present. Applying bindings replaces the app's prior bindings while
 retaining component bindings; invalid input is rejected and overlapping app
 bindings are shown before applying.

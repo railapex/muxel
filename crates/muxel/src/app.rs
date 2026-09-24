@@ -1291,6 +1291,7 @@ pub(crate) fn open_browser_tab_from_native(instance_id: Uuid, url: String, cx: &
 
 /// Route the platform-standard close chord from a focused native browser child
 /// through the same state-aware close path as tabs and GPUI keybindings.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn close_browser_pane_from_native(instance_id: Uuid, cx: &mut AsyncApp) {
     let app = cx.update(|cx| {
         let app = cx

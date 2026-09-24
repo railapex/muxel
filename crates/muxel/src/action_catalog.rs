@@ -156,6 +156,8 @@ pub fn effective_bindings(settings: &muxel_core::Settings) -> Vec<EffectiveBindi
             context: None,
         },
     ]);
+    // Plain Ctrl+W remains terminal input for Readline/Vim. Keep the existing
+    // terminal close chord and add Windows' close-active-document alias.
     #[cfg(not(target_os = "macos"))]
     bindings.push(EffectiveBinding {
         action: "ClosePane",
@@ -261,6 +263,36 @@ mod tests {
     }
 
     #[test]
+    fn platform_close_bindings_preserve_terminal_ctrl_w() {
+        let settings = muxel_core::Settings::default();
+        let bindings = effective_bindings(&settings);
+        let primary = bindings
+            .iter()
+            .find(|binding| binding.action == "ClosePane")
+            .unwrap();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!((primary.keystroke, primary.context), ("cmd-w", None));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            (primary.keystroke, primary.context),
+            ("ctrl-w", Some("!Terminal"))
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(bindings.iter().any(|binding| {
+            binding.action == "ClosePane"
+                && binding.keystroke == "ctrl-shift-w"
+                && binding.context == Some("Terminal")
+        }));
+        #[cfg(target_os = "windows")]
+        assert!(bindings.iter().any(|binding| {
+            binding.action == "ClosePane"
+                && binding.keystroke == "ctrl-f4"
+                && binding.context.is_none()
+        }));
+    }
+
+    #[test]
     fn saved_overrides_and_terminal_passthrough_remain_effective() {
         let settings = muxel_core::Settings {
             keybindings: vec![
@@ -276,6 +308,10 @@ mod tests {
                     action: "ShowActionSheet".into(),
                     keystroke: "ctrl-shift-x".into(),
                 },
+                muxel_core::KeyBindingCfg {
+                    action: "ClosePane".into(),
+                    keystroke: "alt-w".into(),
+                },
             ],
             terminal_passthrough_keys: vec![" CTRL-SHIFT-X ".into()],
             ..Default::default()
@@ -288,6 +324,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(binding("NewTab").keystroke, "ctrl-alt-t");
+        assert_eq!(binding("ClosePane").keystroke, "alt-w");
         assert_eq!(binding("ShowActionSheet").context, Some("!Terminal"));
         assert_eq!(binding("SaveFile").context, Some("!Terminal"));
         assert_eq!(binding("SearchTerminal").context, Some("Terminal"));
