@@ -431,6 +431,12 @@ feature is added or changed, update the matching entry here in the same change**
   pane drains; terminal bytes and the final exit event stay in order rather than
   being dropped to protect memory. The UI separately holds one bounded drain
   batch while parsing it.
+- **Bounded PTY input** — each pane admits input without blocking the UI into a
+  fixed 256 KiB queue, then writes it to the PTY in 8 KiB chunks. A paste is one
+  ordered transaction, so later keys and terminal-protocol replies cannot split
+  it. Oversized or saturated input is rejected before any byte is accepted and a
+  banner keeps the failure visible; small interactive and protocol writes retain
+  reserved capacity behind bulk pastes.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —

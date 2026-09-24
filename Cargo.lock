@@ -5056,6 +5056,7 @@ dependencies = [
  "portable-pty",
  "serde_json",
  "uuid",
+ "windows 0.57.0",
 ]
 
 [[package]]

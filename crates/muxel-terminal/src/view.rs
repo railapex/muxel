@@ -4,11 +4,13 @@
 
 use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
+use crate::input::InputAdmissionError;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
 use crate::session::{CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1491,17 +1493,26 @@ impl TerminalView {
                     0,
                 );
                 for _ in 0..auto_mode_presses {
-                    session.write_input(SHIFT_TAB);
+                    if let Err(error) = session.write_input(SHIFT_TAB) {
+                        log::warn!("startup mode input was not admitted: {error}");
+                        return;
+                    }
                     timer(KEY_GAP_MS).await;
                 }
                 // Confirm the mode switch with a single Enter.
                 if auto_mode_presses > 0 {
-                    session.write_input(b"\r");
+                    if let Err(error) = session.write_input(b"\r") {
+                        log::warn!("startup mode submit was not admitted: {error}");
+                        return;
+                    }
                     timer(KEY_GAP_MS).await;
                 }
                 if let Some(input) = startup_input {
                     timer(PRE_TYPE_MS).await;
-                    session.paste(&input);
+                    if let Err(error) = session.paste(&input) {
+                        log::warn!("startup prompt was not admitted: {error}");
+                        return;
+                    }
                     profile::startup_event(
                         instance_id,
                         &automation_program,
@@ -1512,8 +1523,10 @@ impl TerminalView {
                     // On restore, leave the prompt typed but unsubmitted.
                     if submit {
                         timer(SUBMIT_DELAY_MS).await;
-                        session.mark_turn_submitted();
-                        session.write_input(b"\r");
+                        if let Err(error) = session.write_submission(b"\r") {
+                            log::warn!("startup prompt submit was not admitted: {error}");
+                            return;
+                        }
                         profile::startup_event(
                             instance_id,
                             &automation_program,
@@ -1624,6 +1637,7 @@ impl TerminalView {
                         }
                         let stop = exit.is_some();
                         if let Some(info) = exit.take() {
+                            view.session.close_input();
                             view.exited = true;
                             view.exit_code = info.code;
                             view.exit_signal = info.signal;
@@ -2126,7 +2140,7 @@ impl TerminalView {
                 return;
             }
             if m.shift && !m.control && !m.alt {
-                paste_clipboard_into_session(&self.session, cx);
+                let _ = paste_clipboard_into_session(&self.session, cx);
                 self.session.clear_selection();
                 cx.notify();
                 cx.stop_propagation();
@@ -2136,7 +2150,7 @@ impl TerminalView {
         // Plain Ctrl+V — smart paste (see above). Must run before key_to_bytes
         // would turn it into C0 0x16 unconditionally.
         if key == "v" && m.control && !m.shift && !m.alt && !m.platform {
-            paste_clipboard_into_session(&self.session, cx);
+            let _ = paste_clipboard_into_session(&self.session, cx);
             self.session.clear_selection();
             cx.notify();
             cx.stop_propagation();
@@ -2156,7 +2170,7 @@ impl TerminalView {
                     return;
                 }
                 "v" => {
-                    paste_clipboard_into_session(&self.session, cx);
+                    let _ = paste_clipboard_into_session(&self.session, cx);
                     self.session.clear_selection();
                     cx.notify();
                     cx.stop_propagation();
@@ -2185,12 +2199,22 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if is_submission_input(&bytes) {
-                self.session.mark_turn_submitted();
-            }
+            let had_input_warning = self.session.input_warning().is_some();
             profile::key_started(self.instance_id, t0);
-            self.session.write_input(&bytes);
+            let admission = if is_submission_input(&bytes) {
+                self.session.write_submission(&bytes)
+            } else {
+                self.session.write_input(&bytes)
+            };
+            match admission {
+                Ok(()) => {}
+                Err(_) => cx.notify(),
+            }
             if cleared {
+                cx.notify();
+            } else if had_input_warning {
+                // A successful low-water admission clears the warning. Repaint
+                // even when the child does not echo this key.
                 cx.notify();
             }
             // Key path: gpui may sync-draw without presenting — arm the pump.
@@ -2204,29 +2228,31 @@ impl TerminalView {
 /// Paste from the system clipboard into the PTY.
 /// Image → forward Ctrl+V (0x16) so the agent reads the OS clipboard.
 /// File paths → shell-quoted paths. Text → bracketed paste.
-pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
+pub fn paste_clipboard_into_session(
+    session: &TerminalSession,
+    cx: &App,
+) -> Result<(), InputAdmissionError> {
     let Some(item) = cx.read_from_clipboard() else {
-        return;
+        return Ok(());
     };
     for entry in item.entries() {
         match entry {
             ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
-                session.write_input(&[0x16]);
-                return;
+                return session.write_input(&[0x16]);
             }
             ClipboardEntry::ExternalPaths(paths) => {
                 let paths: Vec<_> = paths.paths().to_vec();
                 if !paths.is_empty() {
-                    session.paste_paths(&paths);
-                    return;
+                    return session.paste_paths(&paths);
                 }
             }
             _ => {}
         }
     }
     if let Some(text) = item.text() {
-        session.paste(&text);
+        return session.paste(&text);
     }
+    Ok(())
 }
 
 /// Land an OSC-52 copy on the system clipboard — the primary selection where
@@ -2254,14 +2280,19 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input_warning = (!self.exited)
+            .then(|| self.session.input_warning())
+            .flatten()
+            .map(|error| error.to_string());
         div()
+            .relative()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
             // OS file drops (Explorer → pane) arrive as an internal gpui drag of
             // ExternalPaths, not as FileDropEvent listeners. Same path Zed uses.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.session.paste_paths(paths.paths());
+                let _ = this.session.paste_paths(paths.paths());
                 this.session.clear_selection();
                 cx.notify();
             }))
@@ -2281,6 +2312,21 @@ impl Render for TerminalView {
                 px(self.font_size),
                 self.mouse_mode,
             ))
+            .when_some(input_warning, |root, warning| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .px_2()
+                        .py_1()
+                        .bg(rgba(0x7f1d1dcc))
+                        .text_color(rgba(0xffe4e6ff))
+                        .text_xs()
+                        .child(warning),
+                )
+            })
     }
 }
 

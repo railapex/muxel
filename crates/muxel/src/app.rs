@@ -1187,7 +1187,12 @@ fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &Ap
             .item(PopupMenuItem::new(t("Paste")).on_click(window.listener_for(
                 &view,
                 |this, _e, _w, cx| {
-                    muxel_terminal::paste_clipboard_into_session(this.session(), cx);
+                    if let Err(error) =
+                        muxel_terminal::paste_clipboard_into_session(this.session(), cx)
+                    {
+                        log::warn!("clipboard paste was not admitted: {error}");
+                        cx.notify();
+                    }
                 },
             )))
         })
@@ -4097,13 +4102,19 @@ impl Render for PopoutView {
                 window.toggle_fullscreen();
             }))
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
-                    v.read(cx).session().write_input(b"\t");
+                if let PaneView::Terminal(v) = &this.view
+                    && let Err(error) = v.read(cx).session().write_input(b"\t")
+                {
+                    log::warn!("terminal Tab was not admitted: {error}");
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|this, _: &SendBackTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
-                    v.read(cx).session().write_input(b"\x1b[Z");
+                if let PaneView::Terminal(v) = &this.view
+                    && let Err(error) = v.read(cx).session().write_input(b"\x1b[Z")
+                {
+                    log::warn!("terminal Shift+Tab was not admitted: {error}");
+                    cx.notify();
                 }
             }))
             .on_action(
@@ -8066,8 +8077,15 @@ impl MuxelApp {
     fn send_to_active(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if let Some(iid) = self.active_instance
             && let Some(view) = self.terminals.get(&iid)
+            && let Err(error) = view.read(cx).session().write_input(bytes)
         {
-            view.read(cx).session().write_input(bytes);
+            log::warn!("focused terminal input was not admitted: {error}");
+            self.add_event(
+                NotifKind::Error,
+                t("Terminal input rejected"),
+                error.to_string(),
+            );
+            cx.notify();
         }
     }
 
@@ -9969,9 +9987,10 @@ impl MuxelApp {
             .get(&iid)
             .map(|v| v.read(cx).session().clone())
         {
-            session.write_input(autopilot::AUTO_CONTINUE_MESSAGE.as_bytes());
-            session.mark_turn_submitted();
-            session.write_input(b"\r");
+            let payload = format!("{}\r", autopilot::AUTO_CONTINUE_MESSAGE);
+            if let Err(error) = session.write_submission(payload.as_bytes()) {
+                log::warn!("auto-continue input was not admitted: {error}");
+            }
         }
     }
 
@@ -17283,7 +17302,7 @@ impl MuxelApp {
     }
 
     /// Live terminal panes in the active project (broadcast targets).
-    fn broadcast_targets(&self) -> Vec<Uuid> {
+    fn broadcast_targets(&self, cx: &App) -> Vec<Uuid> {
         let Some(pid) = self.workspace.active_project else {
             return Vec::new();
         };
@@ -17293,7 +17312,9 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .filter(|iid| {
-                self.terminals.contains_key(iid)
+                self.terminals
+                    .get(iid)
+                    .is_some_and(|view| !view.read(cx).exited())
                     && self.workspace.instance(*iid).map(|i| i.kind) == Some(InstanceKind::Terminal)
             })
             .collect()
@@ -17306,12 +17327,22 @@ impl MuxelApp {
             return;
         }
         let payload = format!("{line}\r");
-        for iid in self.broadcast_targets() {
-            if let Some(view) = self.terminals.get(&iid) {
-                let session = view.read(cx).session();
-                session.mark_turn_submitted();
-                session.write_input(payload.as_bytes());
+        let mut failure = None;
+        for iid in self.broadcast_targets(cx) {
+            if let Some(view) = self.terminals.get(&iid)
+                && let Err(error) = view.read(cx).session().write_submission(payload.as_bytes())
+            {
+                failure.get_or_insert(error);
             }
+        }
+        if let Some(error) = failure {
+            self.add_event(
+                NotifKind::Error,
+                t("Broadcast not sent to every terminal"),
+                error.to_string(),
+            );
+            cx.notify();
+            return;
         }
         self.broadcast_input
             .update(cx, |s, cx| s.set_value("", window, cx));
@@ -17340,10 +17371,23 @@ impl MuxelApp {
         else {
             return;
         };
-        session.paste(&snip.text);
-        if snip.submit {
-            session.mark_turn_submitted();
-            session.write_input(b"\r");
+        if let Err(error) = session.paste(&snip.text) {
+            self.add_event(
+                NotifKind::Error,
+                t("Snippet was not pasted"),
+                error.to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if snip.submit
+            && let Err(error) = session.write_submission(b"\r")
+        {
+            self.add_event(
+                NotifKind::Error,
+                t("Snippet was pasted but not submitted"),
+                error.to_string(),
+            );
         }
         self.focus_instance(iid, window, cx);
     }
@@ -17843,10 +17887,21 @@ impl MuxelApp {
         else {
             return;
         };
-        session.paste(text);
-        if submit {
-            session.mark_turn_submitted();
-            session.write_input(b"\r");
+        if let Err(error) = session.paste(text) {
+            self.add_event(
+                NotifKind::Error,
+                t("Transcript was not pasted"),
+                error.to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if submit && let Err(error) = session.write_submission(b"\r") {
+            self.add_event(
+                NotifKind::Error,
+                t("Transcript was pasted but not submitted"),
+                error.to_string(),
+            );
         }
         self.focus_instance(iid, window, cx);
     }
@@ -26484,7 +26539,7 @@ impl MuxelApp {
     /// The broadcast bar: type a line, Enter (or Send) writes it to every agent
     /// in the active project.
     fn render_broadcast_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let n = self.broadcast_targets().len();
+        let n = self.broadcast_targets(cx).len();
         div()
             .absolute()
             .bottom(px(16.0))

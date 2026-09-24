@@ -2,17 +2,14 @@
 //! copies, answers color queries, and writes PTY responses (cursor-position
 //! reports, query replies) back to the child.
 
+use crate::input::InputSender;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-
-/// Shared, thread-safe handle to the PTY's input side.
-pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 const MAX_TITLE_EVENTS: usize = 64;
 const MAX_TITLE_EVENT_BYTES: usize = 16 * 1024;
@@ -60,7 +57,7 @@ impl TitleEventBuffer {
 /// and while the `Term` mutex is held, so it must never call back into the
 /// session; it only touches its own shared state and the PTY writer.
 pub(crate) struct MuxelListener {
-    pub writer: SharedWriter,
+    pub input: InputSender,
     pub title: Arc<Mutex<Option<String>>>,
     pub title_events: Arc<Mutex<TitleEventBuffer>>,
     /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
@@ -89,9 +86,8 @@ fn uuid_thread_field(title: &str) -> Option<&str> {
 
 impl MuxelListener {
     fn write_reply(&self, reply: &str) {
-        let mut writer = self.writer.lock();
-        let _ = writer.write_all(reply.as_bytes());
-        let _ = writer.flush();
+        // InputSender latches and reports the first rejection in an episode.
+        let _ = self.input.protocol(reply.as_bytes());
     }
 }
 
@@ -161,7 +157,7 @@ mod tests {
     fn uuid_title_hint_keeps_only_complete_thread_candidates() {
         let hint = Arc::new(Mutex::new(None));
         let listener = MuxelListener {
-            writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+            input: crate::input::input_queue(false).0,
             title: Arc::new(Mutex::new(None)),
             title_events: Arc::new(Mutex::new(TitleEventBuffer::default())),
             title_generation: Arc::new(AtomicU64::new(0)),
