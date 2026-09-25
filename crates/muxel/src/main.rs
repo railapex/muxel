@@ -14,6 +14,7 @@ mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
 mod close_policy;
+mod control;
 mod editor;
 mod filetree;
 mod i18n;
@@ -217,6 +218,11 @@ fn main() {
     if let Err(error) = configure_uat_root() {
         eprintln!("{error}");
         std::process::exit(2);
+    }
+    // `muxel ctl …` talks to the running app and exits; it never opens a window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("ctl") {
+        std::process::exit(control::run_cli(&args[1..]));
     }
     match session_binding::hook_instance_from_args(
         std::env::args_os().skip(1),
