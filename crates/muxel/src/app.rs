@@ -44,6 +44,7 @@ use muxel_terminal::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -2914,6 +2915,7 @@ pub struct MuxelApp {
     terminal_close_timer_generation: u64,
     terminal_close_timer: Option<Task<()>>,
     close_save_in_progress: Option<u64>,
+    close_save_cancel: Option<Arc<AtomicBool>>,
     close_save_generation: u64,
     /// Dirty worktrees awaiting a Commit/Discard/Keep decision (modal shows front).
     pending_worktree_dispose: std::collections::VecDeque<WorktreeDispose>,
@@ -4467,8 +4469,22 @@ struct CloseEditorSave {
     remote: Option<integrations::RepoLoc>,
 }
 
-fn write_close_editor_jobs(jobs: &[CloseEditorSave]) -> Result<(), String> {
-    jobs.iter().try_for_each(|job| {
+fn write_close_editor_jobs_with(
+    jobs: &[CloseEditorSave],
+    cancelled: &AtomicBool,
+    mut write: impl FnMut(&CloseEditorSave) -> Result<(), String>,
+) -> Result<(), String> {
+    for job in jobs {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        write(job)?;
+    }
+    Ok(())
+}
+
+fn write_close_editor_jobs(jobs: &[CloseEditorSave], cancelled: &AtomicBool) -> Result<(), String> {
+    write_close_editor_jobs_with(jobs, cancelled, |job| {
         if let Some(remote) = &job.remote {
             integrations::write_remote_file(remote, &job.path.to_string_lossy(), &job.text)
                 .map_err(|e| format!("{}: {e:#}", job.path.display()))
@@ -4480,7 +4496,9 @@ fn write_close_editor_jobs(jobs: &[CloseEditorSave]) -> Result<(), String> {
 
 #[cfg(test)]
 mod close_save_tests {
-    use super::{CloseEditorSave, write_close_editor_jobs};
+    use super::{CloseEditorSave, write_close_editor_jobs, write_close_editor_jobs_with};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
 
     #[test]
@@ -4501,10 +4519,32 @@ mod close_save_tests {
                 remote: None,
             })
             .collect();
-        assert!(write_close_editor_jobs(&jobs).is_err());
+        assert!(write_close_editor_jobs(&jobs, &AtomicBool::new(false)).is_err());
         assert!(paths[0].exists());
         assert!(!paths[2].exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_stops_before_the_next_file() {
+        let jobs: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| CloseEditorSave {
+                iid: Uuid::new_v4(),
+                path: name.into(),
+                text: "draft".into(),
+                remote: None,
+            })
+            .collect();
+        let cancelled = AtomicBool::new(false);
+        let mut written = Vec::new();
+        write_close_editor_jobs_with(&jobs, &cancelled, |job| {
+            written.push(job.path.clone());
+            cancelled.store(true, Ordering::Release);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(written, vec![PathBuf::from("first")]);
     }
 }
 
@@ -6039,6 +6079,7 @@ impl MuxelApp {
             terminal_close_timer_generation: 0,
             terminal_close_timer: None,
             close_save_in_progress: None,
+            close_save_cancel: None,
             close_save_generation: 0,
             pending_worktree_dispose: std::collections::VecDeque::new(),
             dispose_commit_input,
@@ -13052,6 +13093,15 @@ impl MuxelApp {
     }
 
     fn save_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_save_in_progress.is_some() {
+            self.add_event(
+                NotifKind::Error,
+                t("Save still finishing"),
+                t("Wait for the canceled close-save to finish before saving this editor."),
+            );
+            cx.notify();
+            return;
+        }
         let Some((iid, ed)) = self.active_editor() else {
             return;
         };
@@ -17449,7 +17499,9 @@ impl MuxelApp {
 
     fn cancel_close_save(&mut self) {
         self.close_save_generation = self.close_save_generation.wrapping_add(1);
-        self.close_save_in_progress = None;
+        if let Some(cancel) = &self.close_save_cancel {
+            cancel.store(true, Ordering::Release);
+        }
     }
 
     /// Save every dirty editor in the approved close set before removing any
@@ -17567,11 +17619,13 @@ impl MuxelApp {
         self.close_save_generation = self.close_save_generation.wrapping_add(1);
         let generation = self.close_save_generation;
         self.close_save_in_progress = Some(generation);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.close_save_cancel = Some(cancelled.clone());
         cx.spawn_in(window, async move |this, cx| {
             let (jobs, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = write_close_editor_jobs(&jobs);
+                    let result = write_close_editor_jobs(&jobs, &cancelled);
                     (jobs, result)
                 })
                 .await;
@@ -17581,6 +17635,7 @@ impl MuxelApp {
                         return;
                     }
                     this.close_save_in_progress = None;
+                    this.close_save_cancel = None;
                     if this.close_save_generation != generation {
                         return;
                     }
@@ -17600,7 +17655,10 @@ impl MuxelApp {
                                 _ => None,
                             }
                         }) {
-                            editor.update(cx, |editor, cx| editor.mark_saved(cx));
+                            let unchanged = editor.read(cx).text(cx) == job.text;
+                            if unchanged {
+                                editor.update(cx, |editor, cx| editor.mark_saved(cx));
+                            }
                         } else if let Some((_, snapshot, _)) = this
                             .pending_editor_redock
                             .iter_mut()
