@@ -3424,6 +3424,40 @@ fn refresh_pending_close_stack(
     }
 }
 
+fn continuation_allows_delete(
+    continuation: &PendingCloseContinuation,
+    remaining_project_ids: &[Uuid],
+) -> bool {
+    match continuation {
+        PendingCloseContinuation::DeleteProject(pid) => {
+            !remaining_project_ids.iter().any(|id| id == pid)
+        }
+        PendingCloseContinuation::DeleteWorkspace(_) => remaining_project_ids.is_empty(),
+        PendingCloseContinuation::None | PendingCloseContinuation::DiscardWorktree(_) => true,
+    }
+}
+
+fn cancel_workspace_delete_continuations(
+    groups: &mut [PendingTerminalClose],
+    workspace_id: Uuid,
+) -> bool {
+    let mut changed = false;
+    for group in groups {
+        if matches!(group.continuation, PendingCloseContinuation::DeleteWorkspace(id) if id == workspace_id)
+        {
+            group.continuation = PendingCloseContinuation::None;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn surviving_focus_after_remove(layout: &Option<PaneNode>, removing: Uuid) -> Option<Uuid> {
+    let root = layout.as_ref()?;
+    root.surviving_active_after_remove(removing)
+        .or_else(|| root.neighbor_of(removing).map(|(iid, _, _)| iid))
+}
+
 /// Restore against the current tree only. Replaying a captured whole layout would
 /// overwrite splits and tabs created after the close.
 fn restore_terminal_item(layout: &mut Option<PaneNode>, item: &PendingCloseItem) {
@@ -3604,10 +3638,11 @@ mod live_close_tests {
     use super::{
         AgentStatus, CloseEvidence, CloseTarget, PaneNode, PendingCloseContinuation,
         PendingCloseItem, PendingCloseState, PendingTerminalClose, Project, RedockAnchor,
-        SplitDirection, TERMINAL_CLOSE_GRACE, TerminalEvidence, Workspace, add_tab, close_policy,
+        SplitDirection, TERMINAL_CLOSE_GRACE, TerminalEvidence, Workspace, add_tab,
+        cancel_workspace_delete_continuations, close_policy, continuation_allows_delete,
         pending_close_authorized, pending_groups_fit_action, refresh_pending_close_stack, remove,
-        restore_terminal_group, set_active_tab, split, terminal_close_anchor,
-        workspace_with_pending_restored,
+        restore_terminal_group, set_active_tab, split, surviving_focus_after_remove,
+        terminal_close_anchor, workspace_with_pending_restored,
     };
     use muxel_terminal::{TerminalStatusCoverage, TerminalStatusReason};
     use std::{collections::HashSet, path::PathBuf, time::Instant};
@@ -3756,6 +3791,50 @@ mod live_close_tests {
         assert!(!pending_groups_fit_action(&groups, &[first]));
         assert!(!pending_groups_fit_action(&groups, &[second]));
         assert!(pending_groups_fit_action(&groups, &[outside]));
+    }
+
+    #[test]
+    fn new_work_invalidates_deferred_project_and_workspace_deletion() {
+        let (wid, pid, other_pid, iid) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        assert!(continuation_allows_delete(
+            &PendingCloseContinuation::DeleteProject(pid),
+            &[]
+        ));
+        assert!(!continuation_allows_delete(
+            &PendingCloseContinuation::DeleteProject(pid),
+            &[other_pid, pid]
+        ));
+        assert!(continuation_allows_delete(
+            &PendingCloseContinuation::DeleteWorkspace(wid),
+            &[]
+        ));
+        assert!(!continuation_allows_delete(
+            &PendingCloseContinuation::DeleteWorkspace(wid),
+            &[other_pid]
+        ));
+
+        let mut groups = [group(wid, item(iid, pid, RedockAnchor::Floating))];
+        groups[0].continuation = PendingCloseContinuation::DeleteWorkspace(wid);
+        assert!(cancel_workspace_delete_continuations(&mut groups, wid));
+        assert!(matches!(
+            groups[0].continuation,
+            PendingCloseContinuation::None
+        ));
+    }
+
+    #[test]
+    fn closing_the_active_middle_tab_focuses_its_layout_survivor() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut layout = Some(PaneNode::leaf(a));
+        assert!(add_tab(&mut layout, a, b));
+        assert!(add_tab(&mut layout, a, c));
+        assert!(set_active_tab(&mut layout, b));
+        assert_eq!(surviving_focus_after_remove(&layout, b), Some(c));
     }
 
     #[test]
@@ -4588,6 +4667,7 @@ enum PasswordAction {
 /// (uncommitted changes and/or unmerged commits), awaiting a Commit / Merge /
 /// Discard / Keep decision (shown in the dispose modal).
 struct WorktreeDispose {
+    workspace_id: Uuid,
     wid: Uuid,
     name: String,
     color: u8,
@@ -8005,6 +8085,7 @@ impl MuxelApp {
         // Re-entering the current workspace is a no-op except for closing the
         // selector — don't tear it down and re-lock (we already hold the lock).
         if self.current_workspace == Some(id) {
+            cancel_workspace_delete_continuations(&mut self.pending_terminal_closes, id);
             self.workspace_busy = None;
             self.show_workspace_selector = false;
             cx.notify();
@@ -8065,6 +8146,9 @@ impl MuxelApp {
             );
             return;
         }
+        // Re-entering a workspace is new intent after approving its deletion.
+        // Keep its retained closes, but revoke the metadata-deletion continuation.
+        cancel_workspace_delete_continuations(&mut self.pending_terminal_closes, id);
         let retained = self.pending_workspace_owners.remove(&id);
         let (retained_workspace, retained_terminals, lock) = match retained {
             Some(PendingWorkspaceOwner {
@@ -11987,7 +12071,7 @@ impl MuxelApp {
             || self.loops_menu.is_some()
             || self.snippets_menu.is_some()
             || self.term_search.is_some()
-            || !self.pending_worktree_dispose.is_empty()
+            || self.current_worktree_dispose().is_some()
             || cx.has_active_drag()
     }
 
@@ -13701,6 +13785,8 @@ impl MuxelApp {
         if closing.len() != ids.len() {
             return false;
         }
+        let restore_focus = self.active_instance.filter(|id| closing.contains(id));
+        let mut next_focus = restore_focus;
         let mut items = Vec::with_capacity(ids.len());
         let mut after: HashMap<Uuid, Option<PaneNode>> = HashMap::new();
         for &iid in &ids {
@@ -13743,9 +13829,14 @@ impl MuxelApp {
             });
             if !self.popouts.contains_key(&iid) {
                 let entry = after.entry(project_id).or_insert(layout);
+                if next_focus == Some(iid) {
+                    next_focus = surviving_focus_after_remove(entry, iid);
+                }
                 if !remove(entry, iid) {
                     return false;
                 }
+            } else if next_focus == Some(iid) {
+                next_focus = None;
             }
         }
         let decision = close_policy::assess(
@@ -13780,9 +13871,10 @@ impl MuxelApp {
             }
         }
         self.release_maximize(&ids);
-        let restore_focus = self.active_instance.filter(|id| ids.contains(id));
         if restore_focus.is_some() {
-            self.active_instance = self.workspace.active().and_then(Project::first_instance);
+            self.active_instance = next_focus
+                .filter(|iid| !closing.contains(iid))
+                .or_else(|| self.workspace.active().and_then(Project::first_instance));
         }
         self.next_terminal_close_generation = self.next_terminal_close_generation.wrapping_add(1);
         let deadline = Instant::now() + TERMINAL_CLOSE_GRACE;
@@ -13959,13 +14051,20 @@ impl MuxelApp {
         continuation: &PendingCloseContinuation,
         cx: &mut Context<Self>,
     ) {
+        let remaining_project_ids: Vec<Uuid> = self
+            .workspace
+            .instances
+            .iter()
+            .map(|instance| instance.project_id)
+            .collect();
         match continuation {
             PendingCloseContinuation::None => {}
             PendingCloseContinuation::DeleteProject(pid) => {
                 if !self.pending_terminal_closes.iter().any(|group| {
                     group.generation != generation
                         && group.items.iter().any(|item| item.project_id == *pid)
-                }) {
+                }) && continuation_allows_delete(continuation, &remaining_project_ids)
+                {
                     self.delete_project_meta(*pid, cx);
                 }
             }
@@ -13974,6 +14073,7 @@ impl MuxelApp {
                     .pending_terminal_closes
                     .iter()
                     .any(|group| group.generation != generation && group.workspace_id == *id)
+                    && continuation_allows_delete(continuation, &remaining_project_ids)
                 {
                     self.delete_workspace_meta(*id, cx);
                 }
@@ -14181,6 +14281,9 @@ impl MuxelApp {
     /// worktree (clean tree + nothing unmerged); otherwise queue the dispose modal
     /// so uncommitted changes / unmerged commits aren't lost silently.
     fn dispose_worktree_if_orphaned(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.current_workspace else {
+            return;
+        };
         if self.pending_terminal_closes.iter().any(|group| {
             group.state == PendingCloseState::Finalizing
                 && matches!(&group.continuation, PendingCloseContinuation::DiscardWorktree(id) if *id == wid)
@@ -14218,6 +14321,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            workspace_id,
             wid,
             name,
             color,
@@ -14235,6 +14339,9 @@ impl MuxelApp {
     /// user can commit / merge / discard it from the sidebar. A fully-landed
     /// worktree (clean + merged) is just removed.
     fn review_worktree(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.current_workspace else {
+            return;
+        };
         if self.pending_worktree_dispose.iter().any(|d| d.wid == wid) {
             return; // already queued
         }
@@ -14266,6 +14373,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            workspace_id,
             wid,
             name,
             color,
@@ -14279,10 +14387,27 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Commit the front pending worktree (message = the input, or its name), then
+    fn current_worktree_dispose(&self) -> Option<&WorktreeDispose> {
+        let workspace_id = self.current_workspace?;
+        self.pending_worktree_dispose
+            .iter()
+            .find(|dispose| dispose.workspace_id == workspace_id)
+    }
+
+    fn take_current_worktree_dispose(&mut self) -> Option<WorktreeDispose> {
+        let workspace_id = self.current_workspace?;
+        let index = self
+            .pending_worktree_dispose
+            .iter()
+            .position(|dispose| dispose.workspace_id == workspace_id)?;
+        self.pending_worktree_dispose.remove(index)
+    }
+
+    /// Commit the visible workspace's pending worktree (message = the input, or
+    /// its name), then
     /// remove it. On commit failure, keep it on disk so no work is lost.
     fn dispose_worktree_commit(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_current_worktree_dispose() else {
             return;
         };
         let typed = self
@@ -14312,10 +14437,10 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Discard the front pending worktree: force-remove it AND delete its branch,
+    /// Discard the visible workspace's pending worktree: force-remove it AND delete its branch,
     /// throwing away both uncommitted changes and any commits.
     fn dispose_worktree_discard(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_current_worktree_dispose() else {
             return;
         };
         integrations::remove_worktree(&d.root, &d.path);
@@ -14325,11 +14450,11 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Merge the front pending worktree's branch into the base, then remove the
+    /// Merge the visible workspace's pending worktree branch into the base, then remove the
     /// worktree + its (now-merged) branch. Commits any uncommitted changes first.
     /// On merge failure (e.g. conflicts) keep the worktree and toast the error.
     fn dispose_worktree_merge(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_current_worktree_dispose() else {
             return;
         };
         // Land any uncommitted changes onto the branch first, so the merge
@@ -14380,9 +14505,9 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Keep the front pending worktree on disk (detached, resumable later).
+    /// Keep the visible workspace's pending worktree on disk (detached, resumable later).
     fn dispose_worktree_keep(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_current_worktree_dispose() else {
             return;
         };
         if let Some(w) = self.workspace.worktree_mut(d.wid) {
@@ -27756,7 +27881,7 @@ impl MuxelApp {
 
     /// Commit / Discard / Keep for a dirty worktree whose last instance closed.
     fn render_worktree_dispose_modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(d) = self.pending_worktree_dispose.front() else {
+        let Some(d) = self.current_worktree_dispose() else {
             return div().into_any_element();
         };
         let color = worktree_color(d.color);
@@ -31139,7 +31264,8 @@ impl Render for MuxelApp {
             .children(self.broadcasting.then(|| self.render_broadcast_bar(cx)))
             .children((self.stt_state != SttState::Idle).then(|| self.render_stt_bar(cx)))
             .children(
-                (!self.pending_worktree_dispose.is_empty())
+                self.current_worktree_dispose()
+                    .is_some()
                     .then(|| self.render_worktree_dispose_modal(cx)),
             )
             .children(
