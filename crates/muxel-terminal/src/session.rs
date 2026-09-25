@@ -617,7 +617,6 @@ pub struct TerminalSession {
     /// Set once Muxel deliberately submits a turn with Enter. Startup title
     /// activity alone is not evidence that a turn completed.
     turn_submitted: AtomicBool,
-    submission_pending: AtomicBool,
     /// Serialized input-owner revision and conservative draft bit in one atomic
     /// word, so consumers cannot observe a revision paired with another write's
     /// draft state. The low bit is the draft flag; the remaining bits are the
@@ -1043,7 +1042,6 @@ impl TerminalSession {
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
-            submission_pending: AtomicBool::new(false),
             input_state: AtomicU64::new(0),
             runtime_trigger,
             runtime_events,
@@ -1230,7 +1228,6 @@ impl TerminalSession {
         if data.is_empty() {
             return;
         }
-        let submitted = submitted || self.submission_pending.swap(false, Ordering::AcqRel);
         if submitted {
             self.turn_submitted.store(true, Ordering::Relaxed);
         }
@@ -1263,11 +1260,6 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-    }
-
-    pub fn mark_turn_submitted(&self) {
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
     }
 
     pub fn has_submitted_turn(&self) -> bool {
@@ -1341,9 +1333,10 @@ impl TerminalSession {
 
     /// Write bytes to the PTY without touching the scroll position (used for
     /// non-input writes like focus reports).
-    fn write_raw(&self, data: &[u8]) {
-        // InputSender latches and reports the first rejection in an episode.
-        let _ = self.input.interactive(data);
+    fn write_raw(&self, data: &[u8]) -> Result<(), InputAdmissionError> {
+        // Reports are bounded below the interactive reserve. InputSender latches
+        // and reports the first rejection in an episode.
+        self.input.report(data)
     }
 
     /// Return current and high-water input queue occupancy.
@@ -1431,7 +1424,7 @@ impl TerminalSession {
                 for _ in 0..count {
                     push_wheel_report(&mut buf, lines > 0, col, row, sgr);
                 }
-                self.write_raw(&buf);
+                let _ = self.write_raw(&buf);
             }
             Wheel::Arrows { app_cursor } => {
                 let seq: &[u8] = match (lines > 0, app_cursor) {
@@ -1440,7 +1433,7 @@ impl TerminalSession {
                     (false, true) => b"\x1bOB", // scroll down → Down arrow
                     (false, false) => b"\x1b[B",
                 };
-                self.write_raw(&seq.repeat(count));
+                let _ = self.write_raw(&seq.repeat(count));
             }
         }
         true
@@ -1766,7 +1759,7 @@ impl TerminalSession {
         if self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
             // Raw write: a focus report must not yank the viewport to the bottom
             // (e.g. clicking a scrolled-up pane to read its history).
-            self.write_raw(if focused { b"\x1b[I" } else { b"\x1b[O" });
+            let _ = self.write_raw(if focused { b"\x1b[I" } else { b"\x1b[O" });
         }
     }
 
@@ -1935,12 +1928,15 @@ impl TerminalSession {
             + (if control { 16 } else { 0 });
         let mut buf = Vec::with_capacity(24);
         push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
-        self.write_raw(&buf);
-        // Remember an outstanding press so the matching release is guaranteed.
-        self.mouse_pressed_button.store(
-            if pressed { button } else { NO_MOUSE_PRESS },
-            Ordering::Relaxed,
-        );
+        // Buttons are user input, not best-effort motion. They may use the
+        // interactive reserve, and bookkeeping changes only when the exact
+        // report was admitted.
+        if self.input.interactive(&buf).is_ok() {
+            self.mouse_pressed_button.store(
+                if pressed { button } else { NO_MOUSE_PRESS },
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// The button (0/1/2) whose press was forwarded and not yet released, if any.
@@ -1991,7 +1987,7 @@ impl TerminalSession {
         let mut buf = Vec::with_capacity(24);
         // Motion is always "press" encoding in SGR (`M`).
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
-        self.write_raw(&buf);
+        let _ = self.write_raw(&buf);
     }
 }
 
@@ -3862,6 +3858,18 @@ mod tests {
         assert_eq!(session.mouse_press_pending(), Some(0));
         session.report_mouse_button(3, 4, 0, false, false, false, false);
         assert_eq!(session.mouse_press_pending(), None);
+    }
+
+    #[test]
+    fn rejected_mouse_release_keeps_pending_press() {
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        session.report_mouse_button(3, 4, 0, true, false, false, false);
+        assert_eq!(session.mouse_press_pending(), Some(0));
+        session.close_input();
+        session.report_mouse_button(3, 4, 0, false, false, false, false);
+        assert_eq!(session.mouse_press_pending(), Some(0));
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output

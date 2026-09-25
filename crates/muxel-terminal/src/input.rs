@@ -26,6 +26,7 @@ pub const INPUT_MAX_BULK_BYTES: usize =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputClass {
     Bulk,
+    Report,
     Interactive,
     Protocol,
 }
@@ -33,7 +34,7 @@ pub(crate) enum InputClass {
 impl InputClass {
     fn limits(self) -> (usize, usize) {
         match self {
-            Self::Bulk => (
+            Self::Bulk | Self::Report => (
                 INPUT_MAX_BULK_BYTES,
                 INPUT_QUEUE_CAPACITY_CHUNKS - INTERACTIVE_RESERVE_CHUNKS - PROTOCOL_RESERVE_CHUNKS,
             ),
@@ -173,6 +174,13 @@ impl InputSender {
 
     pub(crate) fn interactive(&self, bytes: &[u8]) -> Result<(), InputAdmissionError> {
         self.admit(bytes, InputClass::Interactive, false, || {})
+    }
+
+    /// Best-effort terminal reports (focus, pointer motion, wheel). These share
+    /// bulk's limits so a stalled child cannot let many tiny reports consume the
+    /// transaction slots reserved for actual keystrokes.
+    pub(crate) fn report(&self, bytes: &[u8]) -> Result<(), InputAdmissionError> {
+        self.admit(bytes, InputClass::Report, false, || {})
     }
 
     #[cfg(test)]
@@ -512,6 +520,39 @@ mod tests {
             assert_eq!(transaction.bytes, expected);
             rx.finish(transaction.bytes.len(), false);
         }
+    }
+
+    #[test]
+    fn reports_cannot_consume_interactive_chunk_reserve() {
+        let (tx, _rx) = input_queue(false);
+        let report_limit =
+            INPUT_QUEUE_CAPACITY_CHUNKS - INTERACTIVE_RESERVE_CHUNKS - PROTOCOL_RESERVE_CHUNKS;
+        for _ in 0..report_limit {
+            tx.report(b"r").unwrap();
+        }
+        assert!(matches!(
+            tx.report(b"r"),
+            Err(InputAdmissionError::Full { .. })
+        ));
+        for _ in 0..INTERACTIVE_RESERVE_CHUNKS {
+            tx.interactive(b"k").unwrap();
+        }
+        tx.protocol(b"p").unwrap();
+        assert_eq!(tx.stats().current_chunks, INPUT_QUEUE_CAPACITY_CHUNKS);
+    }
+
+    #[test]
+    fn rejected_submission_does_not_run_admission_hook() {
+        let (tx, _rx) = input_queue(false);
+        for _ in 0..(INPUT_QUEUE_CAPACITY_CHUNKS - PROTOCOL_RESERVE_CHUNKS) {
+            tx.interactive(b"k").unwrap();
+        }
+        let mut admitted = false;
+        assert!(matches!(
+            tx.user_interactive_with(b"\r", || admitted = true),
+            Err(InputAdmissionError::Full { .. })
+        ));
+        assert!(!admitted);
     }
 
     #[test]

@@ -903,6 +903,9 @@ impl MuxelApp {
 
     /// The session outside control may type into, or why it may not.
     fn control_writable(&self, iid: Uuid, cx: &App) -> Result<Arc<TerminalSession>, String> {
+        if self.is_pending_terminal_close(iid) {
+            return Err("that agent is closing; undo the close before typing into it".into());
+        }
         let inst = self
             .workspace
             .instance(iid)
@@ -1126,28 +1129,59 @@ impl MuxelApp {
         let session = self.control_writable(typing.iid, cx)?;
         match typing.input {
             Input::Prompt(text) => {
-                session.paste(&text);
-                cx.spawn(async move |_this: WeakEntity<Self>, cx| {
+                session
+                    .paste(&text)
+                    .map_err(|error| format!("agent input was not admitted: {error}"))?;
+                let iid = typing.iid;
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    session.mark_turn_submitted();
-                    session.write_input(b"\r");
+                    // Revalidate and enqueue on the UI thread, serialized with
+                    // soft close. A retained hidden process must never receive
+                    // this delayed Enter after the user closes its pane.
+                    let _ = this.update(cx, |app, cx| {
+                        let current = app.control_writable(iid, cx)?;
+                        if !Arc::ptr_eq(&current, &session) {
+                            return Err("that agent session has changed".to_string());
+                        }
+                        current
+                            .write_submission(b"\r")
+                            .map_err(|error| format!("agent input was not admitted: {error}"))
+                    });
                 })
                 .detach();
             }
             Input::Keys(presses) => {
-                cx.spawn(async move |_this: WeakEntity<Self>, cx| {
+                let iid = typing.iid;
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     for (i, (bytes, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(KEY_GAP_MS))
                                 .await;
                         }
-                        if submit {
-                            session.mark_turn_submitted();
+                        // Each delayed key is admitted only while this exact
+                        // session is still the visible, writable pane.
+                        let admitted = this
+                            .update(cx, |app, cx| {
+                                let current = app.control_writable(iid, cx)?;
+                                if !Arc::ptr_eq(&current, &session) {
+                                    return Err("that agent session has changed".to_string());
+                                }
+                                let result = if submit {
+                                    current.write_submission(&bytes)
+                                } else {
+                                    current.write_input(&bytes)
+                                };
+                                result.map_err(|error| {
+                                    format!("agent input was not admitted: {error}")
+                                })
+                            })
+                            .is_ok_and(|result| result.is_ok());
+                        if !admitted {
+                            break;
                         }
-                        session.write_input(&bytes);
                     }
                 })
                 .detach();

@@ -10643,7 +10643,7 @@ impl MuxelApp {
     /// Typed as literal keystrokes (not a bracketed paste): it's a one-word command,
     /// and typing it is exactly what the user would do, with no paste-mode markers
     /// for an agent's input box to mishandle.
-    fn send_continue(&self, iid: Uuid, cx: &App) {
+    fn send_continue(&self, iid: Uuid, cx: &App) -> bool {
         if let Some(session) = self
             .terminals
             .get(&iid)
@@ -10652,8 +10652,10 @@ impl MuxelApp {
             let payload = format!("{}\r", autopilot::AUTO_CONTINUE_MESSAGE);
             if let Err(error) = session.write_submission(payload.as_bytes()) {
                 log::warn!("auto-continue input was not admitted: {error}");
+                return false;
             }
         }
+        true
     }
 
     /// Auto-continue pass, run each `tick`. For every armed pane, feed its current
@@ -10684,6 +10686,7 @@ impl MuxelApp {
             .collect();
 
         for (iid, activity, screen) in inputs {
+            let before = self.auto.get(&iid).cloned();
             let action = self
                 .auto
                 .get_mut(&iid)
@@ -10691,7 +10694,15 @@ impl MuxelApp {
                 .unwrap_or(AutoAction::None);
             match action {
                 AutoAction::None => {}
-                AutoAction::Continue => self.send_continue(iid, cx),
+                AutoAction::Continue => {
+                    if !self.send_continue(iid, cx)
+                        && let Some(before) = before
+                    {
+                        // A rejected nudge never reached the child, so it cannot
+                        // consume cooldown or count toward the stalled limit.
+                        self.auto.insert(iid, before);
+                    }
+                }
                 // Both stops already disabled the state machine; drop the entry so
                 // the toolbar button reflects "off".
                 AutoAction::StopStalled => {
