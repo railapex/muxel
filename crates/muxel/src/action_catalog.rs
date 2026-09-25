@@ -67,6 +67,8 @@ catalogue! {
     ("ToggleSpeechToText", "Toggle speech to text", "View", Terminal, None, "ctrl-shift-m", None),
     ("HoldSpeechToText", "Hold speech to text", "View", Terminal, None, "ctrl-shift-h", None),
     ("ReadAloud", "Read the last reply aloud", "Agent", Terminal, None, "ctrl-shift-r", None),
+    ("ReadAloudRestart", "Start reading aloud over", "Agent", Terminal, None, "ctrl-alt-r", None),
+    ("ReadAloudStop", "Stop reading aloud", "Agent", Terminal, None, "ctrl-alt-s", None),
     ("ToggleWorktree", "Toggle git worktree for new agents", "Layout", App, None, "ctrl-shift-g", None),
     ("ToggleFullScreen", "Toggle fullscreen", "View", App, Some("v"), "f11", None),
     ("ToggleDevConsole", "Toggle developer console", "View", App, None, "f12", None),
@@ -239,7 +241,7 @@ mod tests {
             .map(|&(id, key, context)| (id, (key, context)))
             .collect();
         assert_eq!(original.len(), 59);
-        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 3);
+        assert_eq!(super::DEFAULT_KEYBINDINGS.len(), original.len() + 5);
         for (id, key, context) in original {
             let expected_key = if id == "ClosePane" {
                 if cfg!(target_os = "macos") {
@@ -261,6 +263,8 @@ mod tests {
             Some(&("ctrl-shift-space", None))
         );
         assert_eq!(current.get("ReadAloud"), Some(&("ctrl-shift-r", None)));
+        assert_eq!(current.get("ReadAloudRestart"), Some(&("ctrl-alt-r", None)));
+        assert_eq!(current.get("ReadAloudStop"), Some(&("ctrl-alt-s", None)));
         assert_eq!(current.get("UndoClose"), Some(&("ctrl-alt-z", None)));
     }
 
