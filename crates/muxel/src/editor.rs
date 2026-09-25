@@ -88,6 +88,24 @@ fn disk_stamp(path: &Path) -> Option<DiskStamp> {
     })
 }
 
+/// Return the stamp only while the path still contains the bytes this save
+/// wrote. A newer external revision must remain visible as a conflict.
+pub(crate) fn saved_disk_stamp(path: &Path, saved_text: &str) -> Option<DiskStamp> {
+    saved_disk_stamp_with(path, saved_text, || {})
+}
+
+fn saved_disk_stamp_with(
+    path: &Path,
+    saved_text: &str,
+    after_read: impl FnOnce(),
+) -> Option<DiskStamp> {
+    let before = disk_stamp(path)?;
+    let current = std::fs::read_to_string(path).ok()?;
+    after_read();
+    let after = disk_stamp(path)?;
+    (before == after && current == saved_text).then_some(after)
+}
+
 /// Poll one text file. Metadata is cheap; content is read only after its stamp changes.
 pub(crate) fn read_disk_change(path: &Path, known: Option<DiskStamp>) -> Option<DiskChange> {
     let Some(stamp) = disk_stamp(path) else {
@@ -498,6 +516,32 @@ impl EditorView {
         }
     }
 
+    /// Observe completion of a write that began from `saved_text`. A user edit
+    /// made while the write was in flight stays dirty, but the disk stamp still
+    /// advances so the file watcher does not report our own completed write as
+    /// an external conflict.
+    pub(crate) fn observe_completed_save(
+        &mut self,
+        saved_text: &str,
+        verified: bool,
+        disk_stamp: Option<DiskStamp>,
+        cx: &mut Context<Self>,
+    ) {
+        if !verified {
+            return;
+        }
+        let unchanged = &*self.input.read(cx).value() == saved_text;
+        let was_dirty = self.dirty;
+        let changed = self.external_change.take().is_some();
+        self.disk_stamp = disk_stamp;
+        if unchanged {
+            self.dirty = false;
+        }
+        if was_dirty != self.dirty || changed {
+            cx.notify();
+        }
+    }
+
     /// Replace the buffer contents (used after an async remote read), keeping the
     /// path/language, and clear the dirty flag.
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -701,7 +745,10 @@ pub fn language_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskChange, disk_stamp, language_for_path, read_disk_change};
+    use super::{
+        DiskChange, disk_stamp, language_for_path, read_disk_change, saved_disk_stamp,
+        saved_disk_stamp_with,
+    };
     use std::path::Path;
 
     #[test]
@@ -762,6 +809,42 @@ mod tests {
             read_disk_change(&path, Some(initial)),
             Some(DiskChange::Unavailable { .. })
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_save_stamp_refuses_a_newer_external_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "muxel-editor-save-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("notes.md");
+        std::fs::write(&path, "saved").unwrap();
+        assert!(saved_disk_stamp(&path, "saved").is_some());
+
+        std::fs::write(&path, "external revision").unwrap();
+        assert!(saved_disk_stamp(&path, "saved").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_save_stamp_refuses_replacement_between_read_and_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "muxel-editor-save-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("notes.md");
+        std::fs::write(&path, "saved").unwrap();
+
+        let stamp = saved_disk_stamp_with(&path, "saved", || {
+            std::fs::write(&path, "external revision").unwrap();
+        });
+
+        assert!(stamp.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }

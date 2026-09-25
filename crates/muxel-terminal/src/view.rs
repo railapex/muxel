@@ -1501,7 +1501,7 @@ impl TerminalView {
                 }
                 // Confirm the mode switch with a single Enter.
                 if auto_mode_presses > 0 {
-                    if let Err(error) = session.write_input(b"\r") {
+                    if let Err(error) = session.write_submission(b"\r") {
                         log::warn!("startup mode submit was not admitted: {error}");
                         return;
                     }

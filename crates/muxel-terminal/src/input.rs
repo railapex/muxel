@@ -17,17 +17,22 @@ pub const INPUT_QUEUE_CAPACITY_CHUNKS: usize = 64;
 pub const INPUT_WRITE_CHUNK_BYTES: usize = 8 * 1024;
 
 const INTERACTIVE_RESERVE_BYTES: usize = 16 * 1024;
+const MOUSE_RELEASE_RESERVE_BYTES: usize = 8 * 1024;
 const PROTOCOL_RESERVE_BYTES: usize = 8 * 1024;
 const INTERACTIVE_RESERVE_CHUNKS: usize = 2;
+const MOUSE_RELEASE_RESERVE_CHUNKS: usize = 1;
 const PROTOCOL_RESERVE_CHUNKS: usize = 1;
-pub const INPUT_MAX_BULK_BYTES: usize =
-    INPUT_QUEUE_CAPACITY_BYTES - INTERACTIVE_RESERVE_BYTES - PROTOCOL_RESERVE_BYTES;
+pub const INPUT_MAX_BULK_BYTES: usize = INPUT_QUEUE_CAPACITY_BYTES
+    - INTERACTIVE_RESERVE_BYTES
+    - MOUSE_RELEASE_RESERVE_BYTES
+    - PROTOCOL_RESERVE_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputClass {
     Bulk,
     Report,
     Interactive,
+    MouseRelease,
     Protocol,
 }
 
@@ -36,13 +41,24 @@ impl InputClass {
         match self {
             Self::Bulk | Self::Report => (
                 INPUT_MAX_BULK_BYTES,
-                INPUT_QUEUE_CAPACITY_CHUNKS - INTERACTIVE_RESERVE_CHUNKS - PROTOCOL_RESERVE_CHUNKS,
+                INPUT_QUEUE_CAPACITY_CHUNKS
+                    - INTERACTIVE_RESERVE_CHUNKS
+                    - MOUSE_RELEASE_RESERVE_CHUNKS
+                    - PROTOCOL_RESERVE_CHUNKS,
             ),
             Self::Interactive => (
-                INPUT_QUEUE_CAPACITY_BYTES - PROTOCOL_RESERVE_BYTES,
-                INPUT_QUEUE_CAPACITY_CHUNKS - PROTOCOL_RESERVE_CHUNKS,
+                INPUT_QUEUE_CAPACITY_BYTES - MOUSE_RELEASE_RESERVE_BYTES - PROTOCOL_RESERVE_BYTES,
+                INPUT_QUEUE_CAPACITY_CHUNKS
+                    - MOUSE_RELEASE_RESERVE_CHUNKS
+                    - PROTOCOL_RESERVE_CHUNKS,
             ),
-            Self::Protocol => (INPUT_QUEUE_CAPACITY_BYTES, INPUT_QUEUE_CAPACITY_CHUNKS),
+            Self::MouseRelease => (INPUT_QUEUE_CAPACITY_BYTES, INPUT_QUEUE_CAPACITY_CHUNKS),
+            // Protocol traffic may use its own reserve but never the final slot
+            // held for a mouse release whose press was already admitted.
+            Self::Protocol => (
+                INPUT_QUEUE_CAPACITY_BYTES - MOUSE_RELEASE_RESERVE_BYTES,
+                INPUT_QUEUE_CAPACITY_CHUNKS - MOUSE_RELEASE_RESERVE_CHUNKS,
+            ),
         }
     }
 }
@@ -174,6 +190,13 @@ impl InputSender {
 
     pub(crate) fn interactive(&self, bytes: &[u8]) -> Result<(), InputAdmissionError> {
         self.admit(bytes, InputClass::Interactive, false, || {})
+    }
+
+    /// A release paired with an already-admitted mouse press. One transaction
+    /// slot is kept beyond ordinary interactive input so a stalled child cannot
+    /// be left believing the button is held forever.
+    pub(crate) fn mouse_release(&self, bytes: &[u8]) -> Result<(), InputAdmissionError> {
+        self.admit(bytes, InputClass::MouseRelease, false, || {})
     }
 
     /// Best-effort terminal reports (focus, pointer motion, wheel). These share
@@ -411,7 +434,7 @@ mod tests {
     #[test]
     fn oversized_bulk_rejects_atomically() {
         let (tx, rx) = input_queue(false);
-        let limit = INPUT_QUEUE_CAPACITY_BYTES - INTERACTIVE_RESERVE_BYTES - PROTOCOL_RESERVE_BYTES;
+        let limit = INPUT_MAX_BULK_BYTES;
         assert!(matches!(
             tx.bulk(&vec![b'x'; limit + 1]),
             Err(InputAdmissionError::Oversized { .. })
@@ -424,8 +447,7 @@ mod tests {
     #[test]
     fn admission_hook_runs_only_for_an_accepted_transaction() {
         let (tx, _rx) = input_queue(false);
-        let bulk_limit =
-            INPUT_QUEUE_CAPACITY_BYTES - INTERACTIVE_RESERVE_BYTES - PROTOCOL_RESERVE_BYTES;
+        let bulk_limit = INPUT_MAX_BULK_BYTES;
         let mut admitted = 0;
 
         assert!(matches!(
@@ -473,8 +495,7 @@ mod tests {
     #[test]
     fn admission_is_bounded_and_reserves_interactive_and_protocol_space() {
         let (tx, _rx) = input_queue(false);
-        let bulk_limit =
-            INPUT_QUEUE_CAPACITY_BYTES - INTERACTIVE_RESERVE_BYTES - PROTOCOL_RESERVE_BYTES;
+        let bulk_limit = INPUT_MAX_BULK_BYTES;
         tx.bulk(&vec![b'p'; bulk_limit]).unwrap();
         assert!(matches!(
             tx.bulk(b"x"),
@@ -483,6 +504,8 @@ mod tests {
         tx.interactive(&vec![b'k'; INTERACTIVE_RESERVE_BYTES])
             .unwrap();
         tx.protocol(&vec![b'r'; PROTOCOL_RESERVE_BYTES]).unwrap();
+        tx.mouse_release(&vec![b'u'; MOUSE_RELEASE_RESERVE_BYTES])
+            .unwrap();
         let stats = tx.stats();
         assert_eq!(stats.current_bytes, INPUT_QUEUE_CAPACITY_BYTES);
         assert_eq!(stats.high_water_bytes, INPUT_QUEUE_CAPACITY_BYTES);
@@ -525,8 +548,10 @@ mod tests {
     #[test]
     fn reports_cannot_consume_interactive_chunk_reserve() {
         let (tx, _rx) = input_queue(false);
-        let report_limit =
-            INPUT_QUEUE_CAPACITY_CHUNKS - INTERACTIVE_RESERVE_CHUNKS - PROTOCOL_RESERVE_CHUNKS;
+        let report_limit = INPUT_QUEUE_CAPACITY_CHUNKS
+            - INTERACTIVE_RESERVE_CHUNKS
+            - MOUSE_RELEASE_RESERVE_CHUNKS
+            - PROTOCOL_RESERVE_CHUNKS;
         for _ in 0..report_limit {
             tx.report(b"r").unwrap();
         }
@@ -538,13 +563,17 @@ mod tests {
             tx.interactive(b"k").unwrap();
         }
         tx.protocol(b"p").unwrap();
+        tx.mouse_release(b"u").unwrap();
         assert_eq!(tx.stats().current_chunks, INPUT_QUEUE_CAPACITY_CHUNKS);
     }
 
     #[test]
     fn rejected_submission_does_not_run_admission_hook() {
         let (tx, _rx) = input_queue(false);
-        for _ in 0..(INPUT_QUEUE_CAPACITY_CHUNKS - PROTOCOL_RESERVE_CHUNKS) {
+        for _ in 0..(INPUT_QUEUE_CAPACITY_CHUNKS
+            - MOUSE_RELEASE_RESERVE_CHUNKS
+            - PROTOCOL_RESERVE_CHUNKS)
+        {
             tx.interactive(b"k").unwrap();
         }
         let mut admitted = false;
@@ -553,6 +582,30 @@ mod tests {
             Err(InputAdmissionError::Full { .. })
         ));
         assert!(!admitted);
+    }
+
+    #[test]
+    fn admitted_mouse_press_always_leaves_room_for_release() {
+        let (tx, rx) = input_queue(false);
+        for _ in 0..(INPUT_QUEUE_CAPACITY_CHUNKS
+            - MOUSE_RELEASE_RESERVE_CHUNKS
+            - PROTOCOL_RESERVE_CHUNKS)
+        {
+            tx.interactive(b"k").unwrap();
+        }
+        assert!(matches!(
+            tx.interactive(b"more"),
+            Err(InputAdmissionError::Full { .. })
+        ));
+        tx.protocol(b"protocol").unwrap();
+        tx.mouse_release(b"release").unwrap();
+        assert_eq!(tx.stats().current_chunks, INPUT_QUEUE_CAPACITY_CHUNKS);
+
+        for _ in 0..INPUT_QUEUE_CAPACITY_CHUNKS {
+            let transaction = rx.recv().unwrap();
+            rx.finish(transaction.bytes.len(), false);
+        }
+        assert_eq!(tx.stats().current_chunks, 0);
     }
 
     #[test]

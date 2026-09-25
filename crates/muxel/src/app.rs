@@ -3002,6 +3002,12 @@ pub struct MuxelApp {
     control_failed: bool,
     /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
     control_turns: HashMap<Uuid, control_api::ControlTurn>,
+    /// Per-pane generation for delayed outside-control writes. Soft close bumps
+    /// it so Undo cannot revive an Enter/key sequence queued for the old intent.
+    control_input_generations: HashMap<Uuid, u64>,
+    /// Monotonic source for control generations. A dormant pane whose map entry
+    /// was pruned can never reuse an outstanding request's old generation.
+    next_control_input_generation: u64,
 }
 
 /// One content-search match (file + 0-based line + the matched line text).
@@ -3274,6 +3280,20 @@ impl EditorSnapshot {
             )
         })
     }
+
+    fn observe_completed_save(
+        &mut self,
+        saved_text: &str,
+        verified: bool,
+        disk_stamp: Option<DiskStamp>,
+    ) {
+        if !verified || self.text != saved_text {
+            return;
+        }
+        self.disk_stamp = disk_stamp;
+        self.external_change = None;
+        self.dirty = false;
+    }
 }
 
 /// What was detached when a pane was popped out (so it can be rebuilt in the new
@@ -3435,6 +3455,32 @@ fn continuation_allows_delete(
         PendingCloseContinuation::DeleteWorkspace(_) => remaining_project_ids.is_empty(),
         PendingCloseContinuation::None | PendingCloseContinuation::DiscardWorktree(_) => true,
     }
+}
+
+fn workspace_delete_resource_ids(workspace: &Workspace) -> Vec<Uuid> {
+    workspace
+        .instances
+        .iter()
+        .filter(|instance| instance.kind != InstanceKind::Terminal)
+        .map(|instance| instance.id)
+        .collect()
+}
+
+fn pending_close_restore_project(group: &PendingTerminalClose) -> Option<Uuid> {
+    let iid = group.restore_focus?;
+    group
+        .items
+        .iter()
+        .find(|item| item.iid == iid)
+        .map(|item| item.project_id)
+}
+
+fn undo_requires_main_window(
+    current_workspace: Option<Uuid>,
+    target_workspace: Uuid,
+    is_main_window: bool,
+) -> bool {
+    current_workspace != Some(target_workspace) && !is_main_window
 }
 
 fn cancel_workspace_delete_continuations(
@@ -3636,13 +3682,14 @@ fn pending_close_authorized(
 #[cfg(test)]
 mod live_close_tests {
     use super::{
-        AgentStatus, CloseEvidence, CloseTarget, PaneNode, PendingCloseContinuation,
+        AgentStatus, CloseEvidence, CloseTarget, Instance, PaneNode, PendingCloseContinuation,
         PendingCloseItem, PendingCloseState, PendingTerminalClose, Project, RedockAnchor,
         SplitDirection, TERMINAL_CLOSE_GRACE, TerminalEvidence, Workspace, add_tab,
         cancel_workspace_delete_continuations, close_policy, continuation_allows_delete,
-        pending_close_authorized, pending_groups_fit_action, refresh_pending_close_stack, remove,
-        restore_terminal_group, set_active_tab, split, surviving_focus_after_remove,
-        terminal_close_anchor, workspace_with_pending_restored,
+        pending_close_authorized, pending_close_restore_project, pending_groups_fit_action,
+        refresh_pending_close_stack, remove, restore_terminal_group, set_active_tab, split,
+        surviving_focus_after_remove, terminal_close_anchor, undo_requires_main_window,
+        workspace_delete_resource_ids, workspace_with_pending_restored,
     };
     use muxel_terminal::{TerminalStatusCoverage, TerminalStatusReason};
     use std::{collections::HashSet, path::PathBuf, time::Instant};
@@ -3825,6 +3872,54 @@ mod live_close_tests {
             groups[0].continuation,
             PendingCloseContinuation::None
         ));
+    }
+
+    #[test]
+    fn workspace_delete_closes_resources_before_waiting_for_terminal_undo() {
+        let mut workspace = Workspace::default();
+        let project = Project::new("project", PathBuf::from("test-root"));
+        let pid = project.id;
+        workspace.add_project(project);
+        let terminal = Instance::shell(pid);
+        let terminal_id = terminal.id;
+        let editor = Instance::editor(pid, Some(PathBuf::from("test.txt")));
+        let editor_id = editor.id;
+        workspace.add_instance(terminal);
+        workspace.add_instance(editor);
+
+        assert_eq!(workspace_delete_resource_ids(&workspace), vec![editor_id]);
+        workspace.remove_instance_meta(editor_id);
+        assert!(!continuation_allows_delete(
+            &PendingCloseContinuation::DeleteWorkspace(Uuid::new_v4()),
+            &[pid]
+        ));
+        workspace.remove_instance_meta(terminal_id);
+        assert!(continuation_allows_delete(
+            &PendingCloseContinuation::DeleteWorkspace(Uuid::new_v4()),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn undo_focus_selects_the_restored_panes_project() {
+        let (wid, first_pid, focused_pid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let first = item(Uuid::new_v4(), first_pid, RedockAnchor::Floating);
+        let focused = item(Uuid::new_v4(), focused_pid, RedockAnchor::Floating);
+        let focused_iid = focused.iid;
+        let mut pending = group(wid, first);
+        pending.items.push(focused);
+        pending.restore_focus = Some(focused_iid);
+
+        assert_eq!(pending_close_restore_project(&pending), Some(focused_pid));
+    }
+
+    #[test]
+    fn cross_workspace_undo_always_routes_a_secondary_window_to_main() {
+        let current = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        assert!(undo_requires_main_window(Some(current), target, false));
+        assert!(!undo_requires_main_window(Some(target), target, false));
+        assert!(!undo_requires_main_window(Some(current), target, true));
     }
 
     #[test]
@@ -4148,6 +4243,14 @@ impl PopoutView {
             return;
         };
         if app.read(cx).close_save_in_progress.is_some() {
+            app.update(cx, |app, cx| {
+                app.add_event(
+                    NotifKind::Error,
+                    t("Save still finishing"),
+                    t("Wait for the current save to finish before closing this window."),
+                );
+                cx.notify();
+            });
             return;
         }
         let Some(expected) = self.close_token.take() else {
@@ -4542,27 +4645,81 @@ enum CloseSaveIntent {
 }
 
 struct CloseEditorSave {
-    iid: Uuid,
+    iids: Vec<Uuid>,
     path: PathBuf,
     text: String,
     remote: Option<integrations::RepoLoc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CloseEditorSaveDestination {
+    Local(String),
+    Remote(Uuid, String),
+}
+
+fn close_editor_save_destination(job: &CloseEditorSave) -> CloseEditorSaveDestination {
+    match &job.remote {
+        Some(integrations::RepoLoc::Remote(connection)) => {
+            let mut path = job.path.to_string_lossy().replace('\\', "/");
+            if connection.host.os.is_windows() {
+                path.make_ascii_lowercase();
+            }
+            CloseEditorSaveDestination::Remote(connection.host.id, path)
+        }
+        Some(integrations::RepoLoc::Local(_)) | None => {
+            let path = std::fs::canonicalize(&job.path).unwrap_or_else(|_| job.path.clone());
+            let mut key = path.to_string_lossy().into_owned();
+            #[cfg(windows)]
+            key.make_ascii_lowercase();
+            CloseEditorSaveDestination::Local(key)
+        }
+    }
+}
+
+fn coalesce_close_editor_jobs(jobs: Vec<CloseEditorSave>) -> Result<Vec<CloseEditorSave>, String> {
+    let mut coalesced: Vec<CloseEditorSave> = Vec::new();
+    let mut by_destination: HashMap<CloseEditorSaveDestination, usize> = HashMap::new();
+    for mut job in jobs {
+        let destination = close_editor_save_destination(&job);
+        if let Some(index) = by_destination.get(&destination).copied() {
+            let existing = &mut coalesced[index];
+            if existing.text != job.text {
+                return Err(format!(
+                    "two dirty editors contain different versions of {}: save or close one first",
+                    job.path.display()
+                ));
+            }
+            existing.iids.append(&mut job.iids);
+        } else {
+            by_destination.insert(destination, coalesced.len());
+            coalesced.push(job);
+        }
+    }
+    Ok(coalesced)
 }
 
 fn write_close_editor_jobs_with(
     jobs: &[CloseEditorSave],
     cancelled: &AtomicBool,
     mut write: impl FnMut(&CloseEditorSave) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<usize, (usize, String)> {
+    let mut completed = 0;
     for job in jobs {
         if cancelled.load(Ordering::Acquire) {
             break;
         }
-        write(job)?;
+        if let Err(error) = write(job) {
+            return Err((completed, error));
+        }
+        completed += 1;
     }
-    Ok(())
+    Ok(completed)
 }
 
-fn write_close_editor_jobs(jobs: &[CloseEditorSave], cancelled: &AtomicBool) -> Result<(), String> {
+fn write_close_editor_jobs(
+    jobs: &[CloseEditorSave],
+    cancelled: &AtomicBool,
+) -> Result<usize, (usize, String)> {
     write_close_editor_jobs_with(jobs, cancelled, |job| {
         if let Some(remote) = &job.remote {
             integrations::write_remote_file(remote, &job.path.to_string_lossy(), &job.text)
@@ -4575,7 +4732,11 @@ fn write_close_editor_jobs(jobs: &[CloseEditorSave], cancelled: &AtomicBool) -> 
 
 #[cfg(test)]
 mod close_save_tests {
-    use super::{CloseEditorSave, write_close_editor_jobs, write_close_editor_jobs_with};
+    use super::{
+        CloseEditorSave, EditorSnapshot, coalesce_close_editor_jobs, write_close_editor_jobs,
+        write_close_editor_jobs_with,
+    };
+    use crate::editor::ExternalChange;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
@@ -4592,7 +4753,7 @@ mod close_save_tests {
         let jobs: Vec<_> = paths
             .iter()
             .map(|path| CloseEditorSave {
-                iid: Uuid::new_v4(),
+                iids: vec![Uuid::new_v4()],
                 path: path.clone(),
                 text: "draft".into(),
                 remote: None,
@@ -4609,7 +4770,7 @@ mod close_save_tests {
         let jobs: Vec<_> = ["first", "second"]
             .into_iter()
             .map(|name| CloseEditorSave {
-                iid: Uuid::new_v4(),
+                iids: vec![Uuid::new_v4()],
                 path: name.into(),
                 text: "draft".into(),
                 remote: None,
@@ -4617,13 +4778,77 @@ mod close_save_tests {
             .collect();
         let cancelled = AtomicBool::new(false);
         let mut written = Vec::new();
-        write_close_editor_jobs_with(&jobs, &cancelled, |job| {
+        let completed = write_close_editor_jobs_with(&jobs, &cancelled, |job| {
             written.push(job.path.clone());
             cancelled.store(true, Ordering::Release);
             Ok(())
         })
         .unwrap();
+        assert_eq!(completed, 1);
         assert_eq!(written, vec![PathBuf::from("first")]);
+    }
+
+    #[test]
+    fn identical_destinations_coalesce_but_conflicting_buffers_refuse() {
+        let path = PathBuf::from("same.txt");
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let job = |iid, text: &str| CloseEditorSave {
+            iids: vec![iid],
+            path: path.clone(),
+            text: text.into(),
+            remote: None,
+        };
+        let merged = coalesce_close_editor_jobs(vec![job(first, "same"), job(second, "same")])
+            .expect("identical buffers share one write");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].iids, vec![first, second]);
+        assert!(coalesce_close_editor_jobs(vec![job(first, "one"), job(second, "two")]).is_err());
+    }
+
+    #[test]
+    fn local_path_aliases_are_one_save_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "muxel-close-save-alias-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("same.txt");
+        std::fs::write(&path, "disk").unwrap();
+        let alias = root.join(".").join("same.txt");
+        let job = |path, text: &str| CloseEditorSave {
+            iids: vec![Uuid::new_v4()],
+            path,
+            text: text.into(),
+            remote: None,
+        };
+
+        assert!(coalesce_close_editor_jobs(vec![job(path, "one"), job(alias, "two")]).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_save_does_not_clean_a_newer_detached_snapshot() {
+        let mut snapshot = EditorSnapshot {
+            text: "newer edit".into(),
+            path: None,
+            language: "text".into(),
+            cursor: None,
+            dirty: true,
+            external_change: Some(ExternalChange::Deleted),
+            disk_stamp: None,
+            show_rendered: false,
+            diff_dir: None,
+        };
+
+        snapshot.observe_completed_save("older save", true, None);
+
+        assert!(snapshot.dirty);
+        assert!(matches!(
+            snapshot.external_change,
+            Some(ExternalChange::Deleted)
+        ));
     }
 }
 
@@ -6254,6 +6479,8 @@ impl MuxelApp {
             control_task: None,
             control_failed: false,
             control_turns: HashMap::new(),
+            control_input_generations: HashMap::new(),
+            next_control_input_generation: 0,
         };
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
@@ -12227,10 +12454,14 @@ impl MuxelApp {
         };
         // Reuse an already-open editor for this exact path.
         if let Some(p) = &path
-            && let Some(iid) = self
-                .editors
-                .iter()
-                .find_map(|(iid, ed)| (ed.read(cx).path() == Some(p.as_path())).then_some(*iid))
+            && let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
+                (ed.read(cx).path() == Some(p.as_path())
+                    && self
+                        .workspace
+                        .instance(*iid)
+                        .is_some_and(|instance| instance.project_id == pid))
+                .then_some(*iid)
+            })
         {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
@@ -12332,20 +12563,25 @@ impl MuxelApp {
         anchor: Option<Uuid>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<Uuid> {
         if dir.as_os_str().is_empty() {
-            return;
+            return None;
         }
         // Reuse an already-open diff pane for the same directory: refresh + focus.
         if let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
             let ed = ed.read(cx);
-            (ed.diff_dir() == Some(dir.as_path())).then_some(*iid)
+            (ed.diff_dir() == Some(dir.as_path())
+                && self
+                    .workspace
+                    .instance(*iid)
+                    .is_some_and(|instance| instance.project_id == pid))
+            .then_some(*iid)
         }) {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
             }
             self.focus_instance(iid, window, cx);
-            return;
+            return Some(iid);
         }
 
         let instance = Instance::diff(pid, dir.clone());
@@ -12357,7 +12593,7 @@ impl MuxelApp {
             None,
             ResourceActivation::Foreground,
         ) {
-            return;
+            return None;
         }
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
@@ -12365,6 +12601,7 @@ impl MuxelApp {
         self.focus_instance(iid, window, cx);
         self.persist();
         cx.notify();
+        Some(iid)
     }
 
     /// Place a non-agent resource. Explicit New Tab/New Pane commands keep their
@@ -12615,31 +12852,25 @@ impl MuxelApp {
             });
             return;
         }
-        let group = {
-            let Some(history) = self.recently_closed.get_mut(&workspace_id) else {
-                return;
-            };
-            let Some(index) = history
-                .iter()
-                .position(|group| group.generation == generation)
-            else {
-                return;
-            };
-            let Some(group) = history.remove(index) else {
-                return;
-            };
-            group
+        let Some(group) = self
+            .recently_closed
+            .get(&workspace_id)
+            .and_then(|history| history.iter().find(|group| group.generation == generation))
+            .cloned()
+        else {
+            return;
         };
         if self.workspace.project(group.project_id).is_none() {
-            cx.notify();
             return;
         }
         if self.workspace.active_project != Some(group.project_id) {
             self.select_project(group.project_id, window, cx);
         }
 
+        let mut restored_all = true;
         for item in group.items {
             if self.workspace.project(item.project_id).is_none() {
+                restored_all = false;
                 continue;
             }
             let target = self.active_instance.filter(|iid| {
@@ -12649,13 +12880,18 @@ impl MuxelApp {
             });
             match item.kind {
                 InstanceKind::Editor => {
-                    self.open_editor_at(item.project_id, item.path, target, window, cx);
+                    restored_all &= self
+                        .open_editor_at(item.project_id, item.path, target, window, cx)
+                        .is_some();
                 }
                 InstanceKind::Diff => {
                     let Some(directory) = item.path else {
+                        restored_all = false;
                         continue;
                     };
-                    self.open_diff_for_dir(item.project_id, directory, target, window, cx);
+                    restored_all &= self
+                        .open_diff_for_dir(item.project_id, directory, target, window, cx)
+                        .is_some();
                 }
                 InstanceKind::Browser => {
                     let url = item.url.unwrap_or_else(|| "about:blank".to_string());
@@ -12667,21 +12903,31 @@ impl MuxelApp {
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
-                        self.open_browser_in_project(
-                            item.project_id,
-                            url,
-                            target,
-                            BrowserOpenOptions {
-                                placement: None,
-                                activation: ResourceActivation::Foreground,
-                            },
-                            window,
-                            cx,
-                        );
+                        restored_all &= self
+                            .open_browser_in_project(
+                                item.project_id,
+                                url,
+                                target,
+                                BrowserOpenOptions {
+                                    placement: None,
+                                    activation: ResourceActivation::Foreground,
+                                },
+                                window,
+                                cx,
+                            )
+                            .is_some();
                     }
                 }
                 InstanceKind::Terminal => {}
             }
+        }
+        if restored_all
+            && let Some(history) = self.recently_closed.get_mut(&workspace_id)
+            && let Some(index) = history
+                .iter()
+                .position(|group| group.generation == generation)
+        {
+            history.remove(index);
         }
         self.persist();
         cx.notify();
@@ -13254,6 +13500,15 @@ impl MuxelApp {
     }
 
     fn save_as_active_editor(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_save_in_progress.is_some() {
+            self.add_event(
+                NotifKind::Error,
+                t("Save still finishing"),
+                t("Wait for the canceled close-save to finish before saving this editor."),
+            );
+            cx.notify();
+            return;
+        }
         let Some((iid, ed)) = self.active_editor() else {
             return;
         };
@@ -13276,6 +13531,17 @@ impl MuxelApp {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
+                // The picker is asynchronous. Re-check at the actual write
+                // boundary so an older close-save cannot land after Save As.
+                if this.close_save_in_progress.is_some() {
+                    this.add_event(
+                        NotifKind::Error,
+                        t("Save still finishing"),
+                        t("Wait for the canceled close-save to finish before saving this editor."),
+                    );
+                    cx.notify();
+                    return;
+                }
                 let Some(ed) = this.editors.get(&iid).cloned() else {
                     return;
                 };
@@ -13870,6 +14136,9 @@ impl MuxelApp {
                     .update(cx, |_, window, _| window.remove_window());
             }
         }
+        for iid in &ids {
+            self.invalidate_control_input(*iid);
+        }
         self.release_maximize(&ids);
         if restore_focus.is_some() {
             self.active_instance = next_focus
@@ -14021,12 +14290,25 @@ impl MuxelApp {
             std::mem::swap(&mut self.workspace, &mut owner.workspace);
             std::mem::swap(&mut self.terminals, &mut owner.terminals);
             std::mem::swap(&mut self.workspace_lock, &mut owner.lock);
+            // `persist()` below is intentionally aimed at the dormant document,
+            // but its debounce/error bookkeeping belongs to the visible one.
+            let visible_auto_name_save_due = self.auto_name_save_due;
+            let visible_workspace_save_error = self.save_errors.remove(&SaveTarget::Workspace);
             let visible_workspace = self.current_workspace.replace(group.workspace_id);
             for iid in group.ids() {
                 self.close_instance_inner(iid, reason, cx);
             }
             self.complete_terminal_close_continuation(group.generation, &group.continuation, cx);
             self.current_workspace = visible_workspace;
+            self.auto_name_save_due = visible_auto_name_save_due;
+            match visible_workspace_save_error {
+                Some(error) => {
+                    self.save_errors.insert(SaveTarget::Workspace, error);
+                }
+                None => {
+                    self.save_errors.remove(&SaveTarget::Workspace);
+                }
+            }
             std::mem::swap(&mut self.workspace_lock, &mut owner.lock);
             std::mem::swap(&mut self.terminals, &mut owner.terminals);
             std::mem::swap(&mut self.workspace, &mut owner.workspace);
@@ -14069,12 +14351,33 @@ impl MuxelApp {
                 }
             }
             PendingCloseContinuation::DeleteWorkspace(id) => {
-                if !self
+                let last_group = !self
                     .pending_terminal_closes
                     .iter()
-                    .any(|group| group.generation != generation && group.workspace_id == *id)
-                    && continuation_allows_delete(continuation, &remaining_project_ids)
-                {
+                    .any(|group| group.generation != generation && group.workspace_id == *id);
+                if last_group {
+                    // A dormant owner still contains the resources and ordinary
+                    // terminals it had when the workspace was switched away.
+                    // Keep them intact while Undo is possible; once the last
+                    // approved group finalizes, tear down that baseline before
+                    // deleting the workspace metadata.
+                    let remaining: Vec<Uuid> = self
+                        .workspace
+                        .instances
+                        .iter()
+                        .map(|instance| instance.id)
+                        .collect();
+                    for iid in remaining {
+                        self.close_instance_inner(iid, "delete-workspace", cx);
+                    }
+                }
+                let remaining_project_ids: Vec<Uuid> = self
+                    .workspace
+                    .instances
+                    .iter()
+                    .map(|instance| instance.project_id)
+                    .collect();
+                if last_group && continuation_allows_delete(continuation, &remaining_project_ids) {
                     self.delete_workspace_meta(*id, cx);
                 }
             }
@@ -14096,6 +14399,59 @@ impl MuxelApp {
             return;
         };
         let workspace_id = self.pending_terminal_closes[index].workspace_id;
+        if undo_requires_main_window(
+            self.current_workspace,
+            workspace_id,
+            self.is_main_window(window),
+        ) && let Some(handle) = self.main_window
+        {
+            let app = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let _ = app.update(cx, |this, cx| {
+                        this.undo_terminal_close(generation, window, cx)
+                    });
+                });
+            });
+            return;
+        }
+        let focus_project = pending_close_restore_project(&self.pending_terminal_closes[index]);
+        if let Some(pid) = focus_project {
+            let this_window = window.window_handle().window_id();
+            if let Some(secondary) = self
+                .secondary_windows
+                .iter()
+                .find(|secondary| secondary.pid == pid && secondary.window_id != this_window)
+            {
+                let handle = secondary.handle;
+                let app = cx.weak_entity();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        let _ = app.update(cx, |this, cx| {
+                            this.undo_terminal_close(generation, window, cx)
+                        });
+                    });
+                });
+                return;
+            }
+            if !self.is_main_window(window)
+                && self.workspace.active_project == Some(pid)
+                && let Some(handle) = self.main_window
+            {
+                let app = cx.weak_entity();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        let _ = app.update(cx, |this, cx| {
+                            this.undo_terminal_close(generation, window, cx)
+                        });
+                    });
+                });
+                return;
+            }
+        }
         if self.current_workspace != Some(workspace_id) {
             self.pending_undo_after_switch = Some(generation);
             self.enter_workspace(workspace_id, window, cx);
@@ -14124,7 +14480,6 @@ impl MuxelApp {
                 other.continuation = PendingCloseContinuation::None;
             }
         }
-        let focus_project = group.items.first().map(|item| item.project_id);
         let mut by_project: HashMap<Uuid, Vec<PendingCloseItem>> = HashMap::new();
         let ids: Vec<Uuid> = group.items.iter().map(|item| item.iid).collect();
         for item in group.items {
@@ -14135,8 +14490,10 @@ impl MuxelApp {
                 restore_terminal_group(&mut project.layout, &items);
             }
         }
+        if let Some(pid) = focus_project {
+            self.select_project_with_attendance(pid, false, window, cx);
+        }
         if let Some(iid) = group.restore_focus {
-            self.workspace.active_project = focus_project;
             self.active_instance = Some(iid);
             self.focus_instance_with_attendance(iid, false, window, cx);
         }
@@ -14210,6 +14567,7 @@ impl MuxelApp {
         // Invalidate a PTY still being created. Its eventual result sees the
         // missing token, drops, and kills the child instead of becoming invisible.
         self.terminal_launching.remove(&iid);
+        self.invalidate_control_input(iid);
         self.clear_notifications_for(iid);
         // Durable trace of every close: with stderr often discarded, this log is
         // what distinguishes "I closed it" from "it vanished" after the fact.
@@ -17428,6 +17786,12 @@ impl MuxelApp {
 
     fn confirm_quit_if_current(&mut self, cx: &mut Context<Self>) {
         if self.close_save_in_progress.is_some() {
+            self.add_event(
+                NotifKind::Error,
+                t("Save still finishing"),
+                t("Wait for the current save to finish before quitting."),
+            );
+            cx.notify();
             return;
         }
         let Some(token) = &self.quit_close_token else {
@@ -17641,6 +18005,12 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         if self.close_save_in_progress.is_some() {
+            self.add_event(
+                NotifKind::Error,
+                t("Save still finishing"),
+                t("Wait for the current save to finish before closing."),
+            );
+            cx.notify();
             return;
         }
         if self.current_save_scope_token(intent, cx).as_ref() != Some(&token) {
@@ -17731,7 +18101,7 @@ impl MuxelApp {
                 None
             };
             jobs.push(CloseEditorSave {
-                iid,
+                iids: vec![iid],
                 path,
                 text: text.clone(),
                 remote,
@@ -17740,13 +18110,22 @@ impl MuxelApp {
         if jobs.is_empty() {
             return;
         }
+        let jobs = match coalesce_close_editor_jobs(jobs) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                self.add_event(NotifKind::Error, t("Save failed"), error);
+                cx.notify();
+                return;
+            }
+        };
         let expected_after = token.after_editor_save();
         self.close_save_generation = self.close_save_generation.wrapping_add(1);
         let generation = self.close_save_generation;
         self.close_save_in_progress = Some(generation);
         let cancelled = Arc::new(AtomicBool::new(false));
         self.close_save_cancel = Some(cancelled.clone());
-        cx.spawn_in(window, async move |this, cx| {
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
             let (jobs, result) = cx
                 .background_executor()
                 .spawn(async move {
@@ -17754,64 +18133,83 @@ impl MuxelApp {
                     (jobs, result)
                 })
                 .await;
-            let _ =
-                this.update_in(cx, |this, window, cx| {
+            let run_confirm = this
+                .update(cx, |this, cx| {
                     if this.close_save_in_progress != Some(generation) {
-                        return;
+                        return false;
                     }
                     this.close_save_in_progress = None;
                     this.close_save_cancel = None;
-                    if this.close_save_generation != generation {
-                        return;
+                    let (completed, error) = match result {
+                        Ok(completed) => (completed, None),
+                        Err((completed, error)) => (completed, Some(error)),
+                    };
+                    let scope_was_current =
+                        this.current_save_scope_token(intent, cx).as_ref() == Some(&token);
+                    for job in jobs.iter().take(completed) {
+                        let local_stamp = job
+                            .remote
+                            .is_none()
+                            .then(|| crate::editor::saved_disk_stamp(&job.path, &job.text))
+                            .flatten();
+                        let verified = job.remote.is_some() || local_stamp.is_some();
+                        for iid in &job.iids {
+                            if let Some(editor) = this.editors.get(iid).cloned().or_else(|| {
+                                match this.popouts.get(iid).map(|p| &p.view) {
+                                    Some(PaneView::Editor(v)) => Some(v.clone()),
+                                    _ => None,
+                                }
+                            }) {
+                                editor.update(cx, |editor, cx| {
+                                    editor.observe_completed_save(
+                                        &job.text,
+                                        verified,
+                                        local_stamp,
+                                        cx,
+                                    )
+                                });
+                            } else if let Some((_, snapshot, _)) = this
+                                .pending_editor_redock
+                                .iter_mut()
+                                .find(|(id, _, _)| id == iid)
+                            {
+                                snapshot.observe_completed_save(&job.text, verified, local_stamp);
+                            } else if let Some((_, snapshot)) = this
+                                .pending_editor_rebuild
+                                .iter_mut()
+                                .find(|(id, _)| id == iid)
+                            {
+                                snapshot.observe_completed_save(&job.text, verified, local_stamp);
+                            }
+                        }
                     }
-                    if let Err(error) = result {
+                    if this.close_save_generation != generation {
+                        return false;
+                    }
+                    if let Some(error) = error {
                         this.add_event(NotifKind::Error, t("Save failed"), error);
                         cx.notify();
-                        return;
+                        return false;
                     }
-                    if this.current_save_scope_token(intent, cx).as_ref() != Some(&token) {
+                    if !scope_was_current {
                         this.refresh_close_after_save(intent, cx);
-                        return;
-                    }
-                    for job in &jobs {
-                        if let Some(editor) = this.editors.get(&job.iid).cloned().or_else(|| {
-                            match this.popouts.get(&job.iid).map(|p| &p.view) {
-                                Some(PaneView::Editor(v)) => Some(v.clone()),
-                                _ => None,
-                            }
-                        }) {
-                            let unchanged = editor.read(cx).text(cx) == job.text;
-                            if unchanged {
-                                editor.update(cx, |editor, cx| editor.mark_saved(cx));
-                            }
-                        } else if let Some((_, snapshot, _)) = this
-                            .pending_editor_redock
-                            .iter_mut()
-                            .find(|(id, _, _)| *id == job.iid)
-                        {
-                            snapshot.dirty = false;
-                        } else if let Some((_, snapshot)) = this
-                            .pending_editor_rebuild
-                            .iter_mut()
-                            .find(|(id, _)| *id == job.iid)
-                        {
-                            snapshot.dirty = false;
-                        }
+                        return false;
                     }
                     if this.current_save_scope_token(intent, cx).as_ref() != Some(&expected_after) {
                         this.refresh_close_after_save(intent, cx);
-                        return;
+                        return false;
                     }
                     match intent {
                         CloseSaveIntent::Confirm => {
                             if let Some(pending) = this.confirm.as_mut() {
                                 pending.close_token = Some(expected_after);
                             }
-                            this.run_confirm(window, cx);
+                            true
                         }
                         CloseSaveIntent::Quit => {
                             this.quit_close_token = Some(expected_after);
                             this.confirm_quit_if_current(cx);
+                            false
                         }
                         CloseSaveIntent::Popout(iid) => {
                             if let Some(popout) = this.popouts.get(&iid) {
@@ -17819,9 +18217,22 @@ impl MuxelApp {
                                 this.approved_popout_closes.insert(iid, expected_after);
                                 let _ = handle.update(cx, |_, window, _| window.remove_window());
                             }
+                            false
                         }
                     }
+                })
+                .unwrap_or(false);
+            if run_confirm
+                && window_handle
+                    .update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| this.run_confirm(window, cx));
+                    })
+                    .is_err()
+            {
+                let _ = this.update(cx, |this, cx| {
+                    this.refresh_close_after_save(CloseSaveIntent::Confirm, cx)
                 });
+            }
         })
         .detach();
     }
@@ -18016,6 +18427,12 @@ impl MuxelApp {
     /// Execute the pending confirmed action.
     fn run_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_save_in_progress.is_some() {
+            self.add_event(
+                NotifKind::Error,
+                t("Save still finishing"),
+                t("Wait for the current save to finish before confirming."),
+            );
+            cx.notify();
             return;
         }
         let Some(pending) = self.confirm.take() else {
@@ -18353,8 +18770,17 @@ impl MuxelApp {
                 })
                 .map(|instance| instance.id)
                 .collect();
+            let resources = workspace_delete_resource_ids(&self.workspace);
             if !self.soft_close_panes(&new_terminals, token, cx) {
                 return;
+            }
+            // Terminal metadata remains until live Undo expires. Resources have
+            // no such owner, so remove them now; otherwise the continuation sees
+            // a non-empty workspace and can never complete its deletion.
+            for iid in resources {
+                if !self.close_one_if_current(iid, token, cx) {
+                    return;
+                }
             }
             self.workspace_switch_approval = Some((next, self.workspace_departure_token(cx)));
             self.enter_workspace_with_lock(next, prelocked, window, cx);
@@ -18378,6 +18804,11 @@ impl MuxelApp {
     }
 
     fn delete_workspace_meta(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        // A dirty orphaned worktree may have queued a decision while this
+        // workspace finalized off-screen. Once its workspace is deleted that
+        // modal can never be rendered; the worktree itself remains safe on disk.
+        self.pending_worktree_dispose
+            .retain(|dispose| dispose.workspace_id != id);
         self.workspaces.workspaces.retain(|p| p.id != id);
         if self.workspaces.current == Some(id) {
             self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);

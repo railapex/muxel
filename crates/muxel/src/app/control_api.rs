@@ -60,6 +60,8 @@ struct ClaimSite {
 /// Typing into an agent, already checked against the agent's own state.
 struct Typing {
     iid: Uuid,
+    session: Arc<TerminalSession>,
+    generation: u64,
     input: Input,
     /// `None` for keys that start no turn (`esc`, arrows): no claim either.
     turn: Option<Turn>,
@@ -85,6 +87,19 @@ const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
 const SUBMIT_DELAY_MS: u64 = 400;
 /// Pause between the keys of one `keys` request.
 const KEY_GAP_MS: u64 = 80;
+/// Keeps one `keys` request comfortably inside the control transport's 30s
+/// reply lifetime even after a remote claim handshake.
+const MAX_KEYS_PER_REQUEST: usize = 200;
+
+fn validate_control_key_count(count: usize) -> Result<(), String> {
+    if count > MAX_KEYS_PER_REQUEST {
+        Err(format!(
+            "too many keys in one request ({count}; maximum {MAX_KEYS_PER_REQUEST})"
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -491,26 +506,26 @@ impl MuxelApp {
     }
 
     fn answer_control(&mut self, incoming: crate::control::Incoming, cx: &mut Context<Self>) {
-        let crate::control::Incoming { command, reply } = incoming;
-        let respond = |result: Result<Value, String>| match result {
-            Ok(value) => ctl::Response::ok(value),
-            Err(error) => ctl::Response::err(error),
-        };
+        let crate::control::Incoming {
+            command,
+            reply,
+            deadline,
+        } = incoming;
         match self.control_command(command, cx) {
             Answer::Now(result) => {
-                let _ = reply.send(respond(result));
+                let _ = reply.send(control_response(result));
             }
             Answer::Later(job) => {
                 cx.background_executor()
                     .spawn(async move {
-                        let _ = reply.send(respond(job()));
+                        let _ = reply.send(control_response(job()));
                     })
                     .detach();
             }
             Answer::Type(mut typing) => {
                 let Some((site, turn)) = typing.site.take().zip(typing.turn.as_ref()) else {
                     // No tmux session (so nothing to share), or keys that start no turn.
-                    let _ = reply.send(respond(self.control_press(*typing, None, cx)));
+                    self.start_control_press(*typing, reply, deadline, cx);
                     return;
                 };
                 let (grace_ms, lead_ms) = (turn.grace_ms, turn.lead_ms);
@@ -526,11 +541,28 @@ impl MuxelApp {
                             )
                         })
                         .await;
-                    let result = claimed.and_then(|at| {
-                        this.update(cx, |app, cx| app.control_press(*typing, Some(at), cx))
-                            .unwrap_or_else(|_| Err("muxel is shutting down".into()))
-                    });
-                    let _ = reply.send(respond(result));
+                    match claimed {
+                        Ok(_) => {
+                            if Instant::now() >= deadline {
+                                let _ = reply.send(ctl::Response::err(
+                                    "muxel control request expired before input admission",
+                                ));
+                                return;
+                            }
+                            if this
+                                .update(cx, |app, cx| {
+                                    app.start_control_press(*typing, reply, deadline, cx)
+                                })
+                                .is_err()
+                            {
+                                // The app is already gone; the socket-side timeout
+                                // supplies the shutdown error to the caller.
+                            }
+                        }
+                        Err(error) => {
+                            let _ = reply.send(ctl::Response::err(error));
+                        }
+                    }
                 })
                 .detach();
             }
@@ -545,6 +577,8 @@ impl MuxelApp {
         }
         let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
         self.control_turns.retain(|id, _| live.contains(id));
+        self.control_input_generations
+            .retain(|id, _| live.contains(id));
         let now = now_ms();
         match command {
             Command::Projects => Answer::Now(Ok(self.control_projects(cx))),
@@ -960,7 +994,7 @@ impl MuxelApp {
 
     /// Typing into `iid`, checked against its state, with its claim site.
     fn control_typing(
-        &self,
+        &mut self,
         iid: Uuid,
         input: Input,
         turn: Option<Turn>,
@@ -968,12 +1002,16 @@ impl MuxelApp {
         reply: Value,
         cx: &App,
     ) -> Result<Typing, String> {
+        let session = self.control_writable(iid, cx)?;
+        let generation = self.begin_control_input(iid);
         let inst = self
             .workspace
             .instance(iid)
             .ok_or("that agent has just closed")?;
         Ok(Typing {
             iid,
+            session,
+            generation,
             input,
             turn,
             site: self.control_claim_site(inst),
@@ -1082,6 +1120,7 @@ impl MuxelApp {
         keys: &[String],
         cx: &mut Context<Self>,
     ) -> Result<Typing, String> {
+        validate_control_key_count(keys.len())?;
         let session = self.control_writable(iid, cx)?;
         let app_cursor = session.is_app_cursor_mode();
         let presses: Vec<(Vec<u8>, bool)> = keys
@@ -1117,22 +1156,91 @@ impl MuxelApp {
         self.control_typing(iid, Input::Keys(presses), turn, false, reply, cx)
     }
 
-    /// Type `typing` into its agent, and note the turn it starts at `at` (when a
-    /// claim fixed it) or now.
-    fn control_press(
+    fn begin_control_input(&mut self, iid: Uuid) -> u64 {
+        if let Some(generation) = self.control_input_generations.get(&iid) {
+            return *generation;
+        }
+        self.next_control_input_generation = self.next_control_input_generation.wrapping_add(1);
+        let generation = self.next_control_input_generation;
+        self.control_input_generations.insert(iid, generation);
+        generation
+    }
+
+    pub(super) fn invalidate_control_input(&mut self, iid: Uuid) {
+        self.next_control_input_generation = self.next_control_input_generation.wrapping_add(1);
+        self.control_input_generations
+            .insert(iid, self.next_control_input_generation);
+    }
+
+    fn control_input_session(
+        &self,
+        iid: Uuid,
+        generation: u64,
+        expected: &Arc<TerminalSession>,
+        cx: &App,
+    ) -> Result<Arc<TerminalSession>, String> {
+        if self.control_input_generations.get(&iid) != Some(&generation) {
+            return Err("that agent input was canceled".into());
+        }
+        let current = self.control_writable(iid, cx)?;
+        if !Arc::ptr_eq(&current, expected) {
+            return Err("that agent session has changed".into());
+        }
+        Ok(current)
+    }
+
+    fn record_control_turn(&mut self, iid: Uuid, turn: &Turn) {
+        let sent_at = now_ms();
+        let entry = self.control_turns.entry(iid).or_insert(ControlTurn {
+            prompt: None,
+            sent_at,
+            grace_ms: turn.grace_ms,
+        });
+        entry.sent_at = sent_at;
+        entry.grace_ms = turn.grace_ms;
+        if turn.prompt.is_some() {
+            entry.prompt = turn.prompt.clone();
+        }
+    }
+
+    /// Type `typing` into its agent. The CLI reply and turn record are delayed
+    /// until the queued input is actually admitted.
+    fn start_control_press(
         &mut self,
         typing: Typing,
-        at: Option<i64>,
+        reply: std::sync::mpsc::Sender<ctl::Response>,
+        deadline: Instant,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
-        // The pane may have closed while another muxel's claim was checked.
-        let session = self.control_writable(typing.iid, cx)?;
+    ) {
+        let session = typing.session;
+        let generation = typing.generation;
+        // The pane may have closed while another muxel's claim was checked. The
+        // session and generation were captured before that wait, so Undo cannot
+        // turn an old request into new intent.
+        match self.control_input_session(typing.iid, generation, &session, cx) {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = reply.send(ctl::Response::err(error));
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = reply.send(ctl::Response::err(
+                "muxel control request expired before input admission",
+            ));
+            return;
+        }
+        let iid = typing.iid;
+        let response = typing.reply;
+        let turn = typing.turn;
         match typing.input {
             Input::Prompt(text) => {
-                session
-                    .paste(&text)
-                    .map_err(|error| format!("agent input was not admitted: {error}"))?;
-                let iid = typing.iid;
+                if let Err(error) = session.paste(&text) {
+                    let _ = reply.send(ctl::Response::err(format!(
+                        "agent input was not admitted: {error}"
+                    )));
+                    return;
+                }
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
@@ -1140,21 +1248,36 @@ impl MuxelApp {
                     // Revalidate and enqueue on the UI thread, serialized with
                     // soft close. A retained hidden process must never receive
                     // this delayed Enter after the user closes its pane.
-                    let _ = this.update(cx, |app, cx| {
-                        let current = app.control_writable(iid, cx)?;
-                        if !Arc::ptr_eq(&current, &session) {
-                            return Err("that agent session has changed".to_string());
-                        }
-                        current
-                            .write_submission(b"\r")
-                            .map_err(|error| format!("agent input was not admitted: {error}"))
-                    });
+                    let result = this
+                        .update(cx, |app, cx| {
+                            if Instant::now() >= deadline {
+                                return Err::<(), String>("the control request expired".into());
+                            }
+                            let current =
+                                app.control_input_session(iid, generation, &session, cx)?;
+                            current.write_submission(b"\r").map_err(|error| {
+                                format!("agent input was not admitted: {error}")
+                            })?;
+                            if let Some(turn) = turn.as_ref() {
+                                app.record_control_turn(iid, turn);
+                            }
+                            Ok(())
+                        })
+                        .unwrap_or_else(|_| Err("muxel is shutting down".into()))
+                        .map_err(|error| {
+                            format!(
+                                "agent prompt was pasted, but its Enter was not admitted ({error}); inspect the pane before retrying"
+                            )
+                        });
+                    let result = result.map(|()| response);
+                    let _ = reply.send(control_response(result));
                 })
                 .detach();
             }
             Input::Keys(presses) => {
-                let iid = typing.iid;
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    let total = presses.len();
+                    let mut result = Ok(());
                     for (i, (bytes, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
@@ -1163,44 +1286,49 @@ impl MuxelApp {
                         }
                         // Each delayed key is admitted only while this exact
                         // session is still the visible, writable pane.
-                        let admitted = this
+                        result = this
                             .update(cx, |app, cx| {
-                                let current = app.control_writable(iid, cx)?;
-                                if !Arc::ptr_eq(&current, &session) {
-                                    return Err("that agent session has changed".to_string());
+                                if Instant::now() >= deadline {
+                                    return Err(
+                                        "muxel control request expired before all keys were admitted"
+                                            .into(),
+                                    );
                                 }
-                                let result = if submit {
+                                let current =
+                                    app.control_input_session(iid, generation, &session, cx)?;
+                                if submit {
                                     current.write_submission(&bytes)
                                 } else {
                                     current.write_input(&bytes)
-                                };
-                                result.map_err(|error| {
+                                }
+                                .map_err(|error| {
                                     format!("agent input was not admitted: {error}")
-                                })
+                                })?;
+                                if (submit || i + 1 == total)
+                                    && let Some(turn) = turn.as_ref()
+                                {
+                                    app.record_control_turn(iid, turn);
+                                }
+                                Ok(())
                             })
-                            .is_ok_and(|result| result.is_ok());
-                        if !admitted {
+                            .unwrap_or_else(|_| Err("muxel is shutting down".into()));
+                        if result.is_err() {
                             break;
                         }
                     }
+                    let result = result.map(|()| response);
+                    let _ = reply.send(control_response(result));
                 })
                 .detach();
             }
         }
-        if let Some(turn) = typing.turn {
-            let sent_at = at.unwrap_or_else(|| now_ms() + turn.lead_ms);
-            let entry = self.control_turns.entry(typing.iid).or_insert(ControlTurn {
-                prompt: None,
-                sent_at,
-                grace_ms: turn.grace_ms,
-            });
-            entry.sent_at = sent_at;
-            entry.grace_ms = turn.grace_ms;
-            if turn.prompt.is_some() {
-                entry.prompt = turn.prompt;
-            }
-        }
-        Ok(typing.reply)
+    }
+}
+
+fn control_response(result: Result<Value, String>) -> ctl::Response {
+    match result {
+        Ok(value) => ctl::Response::ok(value),
+        Err(error) => ctl::Response::err(error),
     }
 }
 
@@ -1338,4 +1466,16 @@ fn show_value(
         "last_reply": reply.map(|text| json!({ "text": text, "source": reply_from })),
         "question": question,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KEY_GAP_MS, MAX_KEYS_PER_REQUEST, validate_control_key_count};
+
+    #[test]
+    fn key_batches_are_bounded_well_inside_the_transport_deadline() {
+        assert!(validate_control_key_count(MAX_KEYS_PER_REQUEST).is_ok());
+        assert!(validate_control_key_count(MAX_KEYS_PER_REQUEST + 1).is_err());
+        assert!(KEY_GAP_MS * (MAX_KEYS_PER_REQUEST.saturating_sub(1) as u64) < 16_000);
+    }
 }

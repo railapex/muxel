@@ -44,6 +44,9 @@ const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open 
 pub struct Incoming {
     pub command: Command,
     pub reply: std::sync::mpsc::Sender<Response>,
+    /// Hard request lifetime shared with delayed UI-side typing. Once the socket
+    /// can no longer receive success, no detached key task may keep typing.
+    pub deadline: Instant,
 }
 
 /// The listening side, alive while outside control is on. Dropping it stops
@@ -168,6 +171,7 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
     let incoming = Incoming {
         command: request.command,
         reply,
+        deadline: Instant::now() + REPLY_TIMEOUT,
     };
     if tx.send_blocking(incoming).is_err() {
         return Response::err("muxel is shutting down");

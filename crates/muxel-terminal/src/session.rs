@@ -1931,7 +1931,12 @@ impl TerminalSession {
         // Buttons are user input, not best-effort motion. They may use the
         // interactive reserve, and bookkeeping changes only when the exact
         // report was admitted.
-        if self.input.interactive(&buf).is_ok() {
+        let admitted = if pressed {
+            self.input.interactive(&buf)
+        } else {
+            self.input.mouse_release(&buf)
+        };
+        if admitted.is_ok() {
             self.mouse_pressed_button.store(
                 if pressed { button } else { NO_MOUSE_PRESS },
                 Ordering::Relaxed,
@@ -3679,8 +3684,9 @@ mod windows_input_tests {
             TerminalSession::spawn(powershell("Start-Sleep -Seconds 60"), 80, 24).expect("spawn");
         let started = Instant::now();
         session.paste(&"p".repeat(200 * 1024)).unwrap();
-        session.write_input(&vec![b'k'; 48 * 1024]).unwrap();
+        session.write_input(&vec![b'k'; 32 * 1024]).unwrap();
         session.input.protocol(&vec![b'r'; 8 * 1024]).unwrap();
+        session.input.mouse_release(&vec![b'u'; 8 * 1024]).unwrap();
         assert!(matches!(
             session.write_input(b"!"),
             Err(InputAdmissionError::Full { .. })
@@ -3870,6 +3876,28 @@ mod tests {
         session.close_input();
         session.report_mouse_button(3, 4, 0, false, false, false, false);
         assert_eq!(session.mouse_press_pending(), Some(0));
+    }
+
+    #[test]
+    fn saturated_interactive_queue_still_admits_matching_mouse_release() {
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        // Leave exactly one ordinary-interactive transaction for the press.
+        for _ in 0..(crate::input::INPUT_QUEUE_CAPACITY_CHUNKS - 3) {
+            session.input.interactive(b"k").unwrap();
+        }
+        session.report_mouse_button(3, 4, 0, true, false, false, false);
+        assert_eq!(session.mouse_press_pending(), Some(0));
+        assert!(session.input.interactive(b"full").is_err());
+
+        session.input.protocol(b"reply").unwrap();
+        session.report_mouse_button(3, 4, 0, false, false, false, false);
+        assert_eq!(session.mouse_press_pending(), None);
+        assert_eq!(
+            session.input.stats().current_chunks,
+            crate::input::INPUT_QUEUE_CAPACITY_CHUNKS
+        );
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
