@@ -252,20 +252,16 @@ pub(crate) fn claude_session_id_from_binding(
     data_dir: &Path,
     instance_id: Uuid,
     home: &Path,
-    cwd: &Path,
 ) -> Option<String> {
     let event: Value =
         serde_json::from_slice(&std::fs::read(claude_binding_path(data_dir, instance_id)).ok()?)
             .ok()?;
     validate_claude_event(&event).ok()?;
     let session_id = event.get("session_id")?.as_str()?;
-    let event_cwd = Path::new(event.get("cwd")?.as_str()?);
     let transcript = Path::new(event.get("transcript_path")?.as_str()?);
-    if !paths_loosely_equal(event_cwd, cwd) {
-        return None;
-    }
-    let expected = muxel_core::claude_session_path(home, cwd, session_id);
-    if !paths_loosely_equal(transcript, &expected) || !transcript.is_file() {
+    let projects = home.join(".claude").join("projects");
+    let transcript_root = transcript.parent()?.parent()?;
+    if !paths_loosely_equal(transcript_root, &projects) || !transcript.is_file() {
         return None;
     }
     Some(session_id.to_string())
@@ -320,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_resume_event_round_trips_only_for_its_exact_cwd_and_transcript() {
+    fn valid_resume_event_accepts_a_transcript_from_another_claude_project() {
         let root = temp_dir();
         let data = root.join("data");
         let home = root.join("home");
@@ -328,7 +324,8 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let instance_id = Uuid::new_v4();
         let session_id = Uuid::new_v4().to_string();
-        let transcript = muxel_core::claude_session_path(&home, &cwd, &session_id);
+        let transcript_cwd = root.join("moved-worktree");
+        let transcript = muxel_core::claude_session_path(&home, &transcript_cwd, &session_id);
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         std::fs::write(&transcript, "{}\n").unwrap();
         let event = json!({
@@ -346,16 +343,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home, &cwd).as_deref(),
+            claude_session_id_from_binding(&data, instance_id, &home).as_deref(),
             Some(session_id.as_str())
         );
+
+        let outside = root.join(format!("{session_id}.jsonl"));
+        std::fs::write(&outside, "{}\n").unwrap();
+        let outside_event = json!({
+            "session_id": session_id,
+            "transcript_path": outside,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+            "source": "resume"
+        });
+        write_claude_binding_from_reader(
+            &data,
+            instance_id,
+            std::io::Cursor::new(outside_event.to_string()),
+        )
+        .unwrap();
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home, &root.join("other")),
+            claude_session_id_from_binding(&data, instance_id, &home),
             None
         );
+
+        write_claude_binding_from_reader(
+            &data,
+            instance_id,
+            std::io::Cursor::new(event.to_string()),
+        )
+        .unwrap();
         std::fs::remove_file(&transcript).unwrap();
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home, &cwd),
+            claude_session_id_from_binding(&data, instance_id, &home),
             None
         );
         clear_claude_binding(&data, instance_id);

@@ -620,6 +620,53 @@ pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf
         .join(format!("{session_id}.jsonl"))
 }
 
+/// Find Claude's transcript by its durable session UUID, preferring the pane's
+/// configured cwd but allowing Claude's `/cd` and worktree flows to have moved
+/// the conversation into another project directory.
+///
+/// A failed scan is distinct from a confirmed miss: callers deciding whether to
+/// discard a saved resume id must preserve it on I/O errors.
+pub fn find_claude_session_path(
+    home: &Path,
+    preferred_cwd: Option<&Path>,
+    session_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let Ok(session_id) = Uuid::parse_str(session_id) else {
+        return Ok(None);
+    };
+    let filename = format!("{}.jsonl", session_id.hyphenated());
+    if let Some(cwd) = preferred_cwd {
+        let preferred = claude_session_path(home, cwd, &session_id.to_string());
+        match std::fs::metadata(&preferred) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(preferred)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let projects = home.join(".claude").join("projects");
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = entry.path().join(&filename);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 /// Whether a Codex rollout filename under `~/.codex/sessions` carries
 /// `session_id`. Used to decide if a stored id is still resumable before
 /// `codex resume <id>` without opening rollout contents on the activation path.
@@ -1535,6 +1582,37 @@ mod tests {
             w,
             Path::new("/h/.claude/projects/-home-ryan--local-share-x/id.jsonl")
         );
+    }
+
+    #[test]
+    fn claude_session_lookup_survives_a_cross_project_cwd_move() {
+        let root = std::env::temp_dir().join(format!("muxel-claude-find-{}", Uuid::new_v4()));
+        let home = root.join("home");
+        let original = root.join("original");
+        let moved = root.join("moved-worktree");
+        let session_id = Uuid::new_v4().to_string();
+        let moved_transcript = super::claude_session_path(&home, &moved, &session_id);
+        std::fs::create_dir_all(moved_transcript.parent().unwrap()).unwrap();
+        std::fs::write(&moved_transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            super::find_claude_session_path(&home, Some(&original), &session_id).unwrap(),
+            Some(moved_transcript.clone())
+        );
+
+        let preferred_transcript = super::claude_session_path(&home, &original, &session_id);
+        std::fs::create_dir_all(preferred_transcript.parent().unwrap()).unwrap();
+        std::fs::write(&preferred_transcript, "{}\n").unwrap();
+        assert_eq!(
+            super::find_claude_session_path(&home, Some(&original), &session_id).unwrap(),
+            Some(preferred_transcript)
+        );
+        assert!(
+            super::find_claude_session_path(&home, None, "not-a-session-id")
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
