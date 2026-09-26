@@ -140,10 +140,17 @@ feature is added or changed, update the matching entry here in the same change**
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
   pane; Codex panes learn it from a later OSC title. Both are accepted only after the
-  new UUID's own on-disk session proves it belongs to this pane's directory and that no
-  sibling pane already owns it — terminal titles carry no sender identity, so an
-  unverified one cannot rebind a pane. Remote Claude panes keep their starter binding.
-  If the saved session is gone, the pane quietly starts fresh.
+  new UUID's own on-disk session proves it real and no sibling pane already owns it —
+  terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
+  A Claude conversation is matched by UUID across Claude's whole store rather than only
+  the pane's own directory, so one moved by `/cd`, a worktree change, or a `/resume`
+  that reached into another project is still found and still resumes; it has to sit
+  directly inside that store, which is what stops a stray path from rebinding a pane,
+  and `/clear` or a fork may announce its new UUID before Claude has written the first
+  record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
+  starter binding. A saved conversation is abandoned only once muxel has confirmed it
+  is really gone — a session store it couldn't read leaves the pane's resume id alone —
+  and the pane then quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -740,6 +747,29 @@ feature is added or changed, update the matching entry here in the same change**
   optionally verify it). Shells and agents then run on the remote, in a pane that
   behaves exactly like a local one. Local muxel still owns the UI, layout, and
   settings.
+- **Import an agent you started outside muxel** — a project's right-click menu has
+  **Import…**, which scans for agents running, or last run, outside muxel and lists
+  what this project can take over. A **tmux session** is the best case: muxel
+  attaches a pane to it, the agent keeps running exactly as it is, and the pane
+  survives a restart — this works for any program, including opencode and Amp,
+  which can't resume a conversation. An agent **running outside tmux** can't have
+  its terminal taken over at all, so muxel offers to resume its conversation in a
+  new pane instead and says plainly in the row that the one you started keeps
+  running on it too. A **past conversation** with nothing running on it is the clean
+  case: muxel starts the agent and resumes where it left off. Rows are ordered with
+  the project's own first, then the ones muxel can genuinely attach to, then the
+  most recently used; sessions elsewhere on the machine are still listed, tagged
+  "outside this project", so you can pull one in deliberately. Each row says what
+  that agent was working on, which is what tells two sessions in the same directory
+  apart: a live pane's own title (`Quest changes review`), or, for a conversation,
+  the summary the agent wrote for it — falling back to the prompt it opened with,
+  unwrapped from the slash command that carried it. A pane that hasn't been given
+  anything to do yet says nothing, rather than filling the row with the agent's own
+  name. Anything a pane
+  already holds — a session or a conversation — is left out, so importing can never
+  put two panes on one agent. Works for remote projects over their existing SSH
+  connection; Windows hosts have no tmux and no conversations to find.
+
 - **Running agents are picked back up** — opening a remote project looks for muxel
   tmux sessions still alive on the host in that project's tree, and re-attaches a
   pane to any the workspace no longer has an instance for. An agent whose workspace
