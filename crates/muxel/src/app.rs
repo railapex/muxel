@@ -164,9 +164,13 @@ mod maximize_follow_tests {
 const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
+const RESTORE_WINDOWS_LAUNCH_CONCURRENCY: usize = 2;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
 const RESTORE_WAVE_YIELD_MS: u64 = 1;
 const RESTORE_MOVE_SIZE_POLL_MS: u64 = 50;
+const RESTORE_STARTUP_POLL_MS: u64 = 50;
+const RESTORE_STARTUP_SETTLE_MS: u64 = 1_000;
+const RESTORE_STARTUP_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestoreWaveDecision {
@@ -183,9 +187,18 @@ fn restore_wave_delay(wave_start: usize, target_is_windows: bool) -> Duration {
     })
 }
 
+fn restore_launch_concurrency(target_is_windows: bool) -> usize {
+    if target_is_windows {
+        RESTORE_WINDOWS_LAUNCH_CONCURRENCY
+    } else {
+        RESTORE_LAUNCH_CONCURRENCY
+    }
+}
+
 fn restore_wave_decision(
     wave_start: usize,
     instance_count: usize,
+    launch_concurrency: usize,
     activation_is_current: bool,
     project_is_visible: bool,
     move_size_active: bool,
@@ -196,9 +209,39 @@ fn restore_wave_decision(
         RestoreWaveDecision::Pause
     } else {
         RestoreWaveDecision::Launch {
-            wave_end: (wave_start + RESTORE_LAUNCH_CONCURRENCY).min(instance_count),
+            wave_end: (wave_start + launch_concurrency).min(instance_count),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestoreStartupState {
+    provider_ready: bool,
+    has_visible_content: bool,
+    idle_for: Duration,
+}
+
+fn restore_wave_member_startup_state(state: Option<RestoreStartupState>) -> RestoreStartupState {
+    // The spawn task has already finished before admission reaches this gate. If
+    // its view is gone, another launch superseded it or the pane was removed; it
+    // must not strand the rest of the project's restore waves.
+    state.unwrap_or(RestoreStartupState {
+        provider_ready: true,
+        has_visible_content: false,
+        idle_for: Duration::ZERO,
+    })
+}
+
+fn restore_wave_startup_settled(
+    states: impl IntoIterator<Item = RestoreStartupState>,
+    elapsed: Duration,
+) -> bool {
+    elapsed >= Duration::from_millis(RESTORE_STARTUP_TIMEOUT_MS)
+        || states.into_iter().all(|state| {
+            state.provider_ready
+                || (state.has_visible_content
+                    && state.idle_for >= Duration::from_millis(RESTORE_STARTUP_SETTLE_MS))
+        })
 }
 
 fn restore_move_size_active() -> bool {
@@ -8377,7 +8420,9 @@ impl MuxelApp {
             .unwrap_or_default();
         // Start the pane the user can see first. Admit terminal processes in
         // bounded waves: enough parallelism to avoid a long fleet tail without
-        // firing the entire workspace at Windows in one burst.
+        // firing the entire workspace at Windows in one burst. Windows provider
+        // startups are especially expensive, so each wave must also settle before
+        // the next one starts.
         if let Some(active) = self.active_instance
             && let Some(index) = instances.iter().position(|iid| *iid == active)
         {
@@ -8411,6 +8456,7 @@ impl MuxelApp {
                             restore_wave_decision(
                                 wave_start,
                                 instances.len(),
+                                restore_launch_concurrency(cfg!(target_os = "windows")),
                                 this.deferred_activation_generation.get(&pid) == Some(&generation),
                                 this.project_is_shown_in_window(pid, window),
                                 restore_move_size_active(),
@@ -8471,7 +8517,8 @@ impl MuxelApp {
                 if cancelled {
                     break;
                 }
-                // All four workers are already running. Awaiting their handles in
+                let launched: Vec<Uuid> = launches.iter().map(|(_, iid, _, _)| *iid).collect();
+                // The wave's workers are already running. Awaiting their handles in
                 // pane order controls admission/focus order, not concurrency.
                 for (index, iid, meta, task) in launches {
                     let result = task.await;
@@ -8505,6 +8552,75 @@ impl MuxelApp {
                     if !keep_going {
                         cancelled = true;
                         break;
+                    }
+                }
+                if cancelled {
+                    break;
+                }
+                // PTY creation finishing is not provider startup finishing: a
+                // Claude/Codex/Grok process can keep loading and repainting for
+                // seconds afterward. Before admitting another Windows wave, wait
+                // until this wave has either published provider readiness or gone
+                // quiet after drawing its first visible screen. The timeout keeps
+                // silent/custom tools from blocking the remainder of the project
+                // forever. Switching projects cancels the wait and all
+                // not-yet-started panes.
+                if cfg!(target_os = "windows") && wave_end < instances.len() && !launched.is_empty()
+                {
+                    let settle_started = Instant::now();
+                    loop {
+                        let settled = this
+                            .update_in(cx, |this, window, cx| {
+                                let _phase = ui_profile::phase("activation", "wave-settle", None);
+                                if this.deferred_activation_generation.get(&pid)
+                                    != Some(&generation)
+                                    || !this.project_is_shown_in_window(pid, window)
+                                {
+                                    return None;
+                                }
+                                let states: Vec<RestoreStartupState> = launched
+                                    .iter()
+                                    .map(|iid| {
+                                        if this.failed_launches.contains_key(iid)
+                                            || this.workspace.instance(*iid).is_none()
+                                        {
+                                            return restore_wave_member_startup_state(None);
+                                        }
+                                        let state = this.terminals.get(iid).map(|view| {
+                                            let view = view.read(cx);
+                                            // Refresh the provider-owned title signal. The
+                                            // cached readiness bit is otherwise advanced only
+                                            // by ordinary status consumers, which can lag this
+                                            // 50 ms admission poll by a full root tick.
+                                            let _ = view.status();
+                                            RestoreStartupState {
+                                                provider_ready: view.completion_ready()
+                                                    || view.exited(),
+                                                has_visible_content: view.has_visible_content(),
+                                                idle_for: view.session().idle_for(),
+                                            }
+                                        });
+                                        restore_wave_member_startup_state(state)
+                                    })
+                                    .collect();
+                                Some(restore_wave_startup_settled(
+                                    states,
+                                    settle_started.elapsed(),
+                                ))
+                            })
+                            .unwrap_or(None);
+                        match settled {
+                            None => {
+                                cancelled = true;
+                                break;
+                            }
+                            Some(true) => break,
+                            Some(false) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(RESTORE_STARTUP_POLL_MS))
+                                    .await;
+                            }
+                        }
                     }
                 }
                 if cancelled {
@@ -32770,22 +32886,23 @@ mod shell_title_tests {
 #[cfg(test)]
 mod restore_wave_policy_tests {
     use super::{
-        PaneNode, RestoreWaveDecision, SplitDirection, Uuid, layout_shows_instance,
-        restore_wave_decision, restore_wave_delay,
+        PaneNode, RestoreStartupState, RestoreWaveDecision, SplitDirection, Uuid,
+        layout_shows_instance, restore_launch_concurrency, restore_wave_decision,
+        restore_wave_delay, restore_wave_member_startup_state, restore_wave_startup_settled,
     };
     use std::time::Duration;
 
     #[test]
     fn only_the_first_windows_wave_gets_the_resize_debounce() {
         assert_eq!(restore_wave_delay(0, true), Duration::from_millis(250));
-        assert_eq!(restore_wave_delay(4, true), Duration::from_millis(1));
+        assert_eq!(restore_wave_delay(2, true), Duration::from_millis(1));
         assert_eq!(restore_wave_delay(0, false), Duration::from_millis(1));
     }
 
     #[test]
     fn an_active_move_size_loop_pauses_before_admission() {
         assert_eq!(
-            restore_wave_decision(0, 8, true, true, true),
+            restore_wave_decision(0, 8, 2, true, true, true),
             RestoreWaveDecision::Pause
         );
     }
@@ -32793,23 +32910,29 @@ mod restore_wave_policy_tests {
     #[test]
     fn stale_or_hidden_activations_cancel_even_while_paused() {
         assert_eq!(
-            restore_wave_decision(0, 8, false, true, true),
+            restore_wave_decision(0, 8, 2, false, true, true),
             RestoreWaveDecision::Cancel
         );
         assert_eq!(
-            restore_wave_decision(0, 8, true, false, true),
+            restore_wave_decision(0, 8, 2, true, false, true),
             RestoreWaveDecision::Cancel
         );
     }
 
     #[test]
-    fn launch_admission_stays_four_wide_and_caps_the_final_wave() {
+    fn windows_launches_two_wide_while_other_platforms_stay_four_wide() {
+        assert_eq!(restore_launch_concurrency(true), 2);
+        assert_eq!(restore_launch_concurrency(false), 4);
         assert_eq!(
-            restore_wave_decision(0, 6, true, true, false),
+            restore_wave_decision(0, 6, 2, true, true, false),
+            RestoreWaveDecision::Launch { wave_end: 2 }
+        );
+        assert_eq!(
+            restore_wave_decision(0, 6, 4, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 4 }
         );
         assert_eq!(
-            restore_wave_decision(4, 6, true, true, false),
+            restore_wave_decision(4, 6, 4, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
     }
@@ -32838,6 +32961,53 @@ mod restore_wave_policy_tests {
             Some(shown_tab)
         ));
         assert!(layout_shows_instance(&layout, hidden_tab, Some(hidden_tab)));
+    }
+
+    #[test]
+    fn a_wave_waits_for_every_startup_but_has_a_bounded_escape() {
+        let quiet = RestoreStartupState {
+            provider_ready: false,
+            has_visible_content: true,
+            idle_for: Duration::from_millis(1_000),
+        };
+        let ready = RestoreStartupState {
+            provider_ready: true,
+            has_visible_content: true,
+            idle_for: Duration::ZERO,
+        };
+        let busy = RestoreStartupState {
+            provider_ready: false,
+            has_visible_content: true,
+            idle_for: Duration::from_millis(999),
+        };
+        let silent = RestoreStartupState {
+            provider_ready: false,
+            has_visible_content: false,
+            idle_for: Duration::from_secs(30),
+        };
+
+        assert!(restore_wave_startup_settled(
+            [quiet, ready],
+            Duration::from_secs(1)
+        ));
+        assert!(!restore_wave_startup_settled(
+            [quiet, busy],
+            Duration::from_millis(4_999)
+        ));
+        assert!(!restore_wave_startup_settled(
+            [silent],
+            Duration::from_millis(4_999)
+        ));
+        assert!(restore_wave_startup_settled(
+            [silent],
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn a_missing_view_cannot_strand_remaining_waves() {
+        let missing = restore_wave_member_startup_state(None);
+        assert!(restore_wave_startup_settled([missing], Duration::ZERO));
     }
 }
 
