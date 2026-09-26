@@ -228,26 +228,6 @@ fn validate_claude_event(event: &Value) -> Result<()> {
     Ok(())
 }
 
-fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
-    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
-        return a == b;
-    }
-    #[cfg(windows)]
-    {
-        let normalize = |path: &Path| {
-            path.to_string_lossy()
-                .replace('/', "\\")
-                .trim_end_matches('\\')
-                .to_ascii_lowercase()
-        };
-        normalize(a) == normalize(b)
-    }
-    #[cfg(not(windows))]
-    {
-        a.to_string_lossy().trim_end_matches('/') == b.to_string_lossy().trim_end_matches('/')
-    }
-}
-
 pub(crate) fn claude_session_id_from_binding(
     data_dir: &Path,
     instance_id: Uuid,
@@ -258,11 +238,27 @@ pub(crate) fn claude_session_id_from_binding(
             .ok()?;
     validate_claude_event(&event).ok()?;
     let session_id = event.get("session_id")?.as_str()?;
+    let source = event.get("source")?.as_str()?;
     let transcript = Path::new(event.get("transcript_path")?.as_str()?);
-    let projects = home.join(".claude").join("projects");
-    let transcript_root = transcript.parent()?.parent()?;
-    if !paths_loosely_equal(transcript_root, &projects) || !transcript.is_file() {
+    let projects = home.join(".claude").join("projects").canonicalize().ok()?;
+    let expected_name = format!("{session_id}.jsonl");
+    if transcript.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
         return None;
+    }
+
+    // `/clear` and `/fork` may announce the new UUID before Claude writes its
+    // first transcript record. Validate the existing project directory in that
+    // case; resumed sessions must already have a real transcript.
+    let project = transcript.parent()?.canonicalize().ok()?;
+    if project.parent()? != projects {
+        return None;
+    }
+    match transcript.canonicalize() {
+        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(source, "clear" | "fork") => {}
+        _ => return None,
     }
     Some(session_id.to_string())
 }
@@ -378,6 +374,27 @@ mod tests {
             claude_session_id_from_binding(&data, instance_id, &home),
             None
         );
+
+        for source in ["clear", "fork"] {
+            let pending_event = json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "cwd": cwd,
+                "hook_event_name": "SessionStart",
+                "source": source
+            });
+            write_claude_binding_from_reader(
+                &data,
+                instance_id,
+                std::io::Cursor::new(pending_event.to_string()),
+            )
+            .unwrap();
+            assert_eq!(
+                claude_session_id_from_binding(&data, instance_id, &home).as_deref(),
+                Some(session_id.as_str()),
+                "{source} should bind before Claude writes the first transcript record"
+            );
+        }
         clear_claude_binding(&data, instance_id);
         assert!(!claude_binding_path(&data, instance_id).exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -413,6 +430,77 @@ mod tests {
                 .is_err()
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_transcript_paths_that_escape_or_nest_below_the_project_store() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let projects = home.join(".claude/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let instance_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4().to_string();
+        let cwd = root.join("project");
+
+        let outside = home.join(".claude").join(format!("{session_id}.jsonl"));
+        std::fs::write(&outside, "{}\n").unwrap();
+        let traversal = projects.join("..").join(format!("{session_id}.jsonl"));
+
+        let nested = projects
+            .join("project")
+            .join("nested")
+            .join(format!("{session_id}.jsonl"));
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "{}\n").unwrap();
+
+        for transcript in [traversal, nested] {
+            let event = json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "cwd": cwd,
+                "hook_event_name": "SessionStart",
+                "source": "resume"
+            });
+            write_claude_binding_from_reader(
+                &data,
+                instance_id,
+                std::io::Cursor::new(event.to_string()),
+            )
+            .unwrap();
+            assert_eq!(
+                claude_session_id_from_binding(&data, instance_id, &home),
+                None
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let escaped = root.join("escaped-project");
+            std::fs::create_dir_all(&escaped).unwrap();
+            std::fs::write(escaped.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+            let linked = projects.join("linked-project");
+            std::os::unix::fs::symlink(&escaped, &linked).unwrap();
+            let event = json!({
+                "session_id": session_id,
+                "transcript_path": linked.join(format!("{session_id}.jsonl")),
+                "cwd": cwd,
+                "hook_event_name": "SessionStart",
+                "source": "resume"
+            });
+            write_claude_binding_from_reader(
+                &data,
+                instance_id,
+                std::io::Cursor::new(event.to_string()),
+            )
+            .unwrap();
+            assert_eq!(
+                claude_session_id_from_binding(&data, instance_id, &home),
+                None
+            );
+        }
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

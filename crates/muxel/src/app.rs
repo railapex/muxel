@@ -2455,13 +2455,17 @@ const READ_ALOUD_LINES: usize = 2000;
 const READ_ALOUD_TRANSCRIPT_BYTES: u64 = 4 << 20;
 
 /// Everything needed to find a pane's last reply, gathered on the UI thread so
-/// the slow part — reading a transcript, asking tmux for its scrollback — runs
-/// off it.
+/// the slow part — reading a transcript off disk — runs off it.
 struct ReplySource {
-    /// The pane's buffer as muxel's own terminal holds it.
+    /// The pane's text, straight from muxel's own terminal — screen and
+    /// scrollback, soft wraps rejoined. muxel keeps 10,000 lines per pane, five
+    /// times the most any caller here asks for, so this is the whole answer: no
+    /// caller shells out to `tmux capture-pane` for deeper history. That call is a
+    /// subprocess per poll, and on some tmux builds it aborts the server and takes
+    /// every local session — every agent — down with it. What it alone could add
+    /// is history from before muxel attached to an adopted session, which fills in
+    /// again as the pane produces output. Remote panes have always read this way.
     screen: String,
-    /// The local tmux session behind the pane, which holds the real scrollback.
-    tmux_session: Option<String>,
     /// Claude's transcript for the pane's session, when it is on this machine.
     transcript: Option<PathBuf>,
     /// Said before the reply when announcing is on ("Claude says:").
@@ -2477,11 +2481,7 @@ impl ReplySource {
         opts: &muxel_core::readaloud::SpeakOptions,
     ) -> Option<String> {
         use muxel_core::readaloud;
-        let screen = self
-            .tmux_session
-            .as_deref()
-            .and_then(|session| integrations::tmux_capture(session, READ_ALOUD_LINES))
-            .unwrap_or(self.screen);
+        let screen = self.screen;
         // The transcript is exact — the model's own markdown, with every tool call
         // a separate entry — but only while it is the conversation on screen: a
         // stale session binding must never read out some other conversation.
@@ -10130,8 +10130,9 @@ impl MuxelApp {
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
     /// The hook record is keyed by pane id and accepted only when its UUID and
-    /// transcript path identify a real transcript in Claude's own store. The cwd
-    /// may differ after `/cd` or an all-project `/resume`.
+    /// transcript path identify a direct child of Claude's own store. Resume
+    /// records require a real transcript; clear/fork records may precede their
+    /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
     fn adopt_claude_session_binding(&mut self, iid: Uuid) -> bool {
         let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
             return false;
@@ -19654,7 +19655,6 @@ impl MuxelApp {
         };
         Some(ReplySource {
             screen: view.read(cx).recent_text(READ_ALOUD_LINES),
-            tmux_session: inst.tmux_session.clone().filter(|_| local),
             transcript,
             announce: self
                 .settings

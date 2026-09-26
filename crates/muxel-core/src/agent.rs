@@ -605,9 +605,8 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
 /// `<home>/.claude/projects/<slug>/<session_id>.jsonl`, where `slug` is `cwd` with
 /// every non-ASCII-alphanumeric character replaced by `-` — Claude's project-dir
 /// encoding (e.g. `/home/u/Proj` → `-home-u-Proj`, `/home/u/.local` →
-/// `-home-u--local`). Pure path-building; the caller does the existence check. The
-/// caller must start a *fresh* session id when the file is missing, never reuse the
-/// old one (that would collide with a still-live session — see `session_resume_args`).
+/// `-home-u--local`). Pure path-building; use [`find_claude_session_path`] when
+/// deciding whether a durable session UUID still exists after a cwd change.
 pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
     let slug: String = cwd
         .to_string_lossy()
@@ -1611,6 +1610,25 @@ mod tests {
             super::find_claude_session_path(&home, None, "not-a-session-id")
                 .unwrap()
                 .is_none()
+        );
+        let nested_id = Uuid::new_v4().to_string();
+        let nested = home
+            .join(".claude/projects/project/nested")
+            .join(format!("{nested_id}.jsonl"));
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "{}\n").unwrap();
+        assert_eq!(
+            super::find_claude_session_path(&home, None, &nested_id).unwrap(),
+            None,
+            "the global lookup must not recurse below direct project directories"
+        );
+
+        let broken_home = root.join("broken-home");
+        std::fs::create_dir_all(broken_home.join(".claude")).unwrap();
+        std::fs::write(broken_home.join(".claude/projects"), "not a directory").unwrap();
+        assert!(
+            super::find_claude_session_path(&broken_home, None, &session_id).is_err(),
+            "an unreadable session store must not look like a confirmed miss"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
