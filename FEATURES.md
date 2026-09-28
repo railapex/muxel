@@ -963,6 +963,10 @@ feature is added or changed, update the matching entry here in the same change**
   package-managed installs get the right upgrade command instead. The update
   dialog shows the release's full changelog rendered as markdown, and is
   resizable.
+- **Visible build identity** — the title bar, native window title, and update
+  dialog show the running version, source commit, build profile, and dogfood
+  channel when supplied by a launcher. `muxel --build-info-json` exposes the
+  same embedded identity for launchers and release tooling to validate.
 - **Windows installer** — a basic per-user Inno Setup installer (`.exe`, no
   admin) with a Start Menu shortcut and an uninstaller; it installs to a
   user-writable location so the in-app auto-updater keeps working without

@@ -11,6 +11,7 @@ mod app;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
+mod build_info;
 mod control;
 mod editor;
 mod filetree;
@@ -188,6 +189,14 @@ fn raise_open_file_limit() {
 fn main() {
     // `muxel ctl …` talks to the running app and exits; it never opens a window.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--build-info-json"] {
+        println!("{}", build_info::json_value());
+        return;
+    }
+    if args.as_slice() == ["--version"] {
+        println!("muxel {}", build_info::compact_label());
+        return;
+    }
     if args.first().map(String::as_str) == Some("ctl") {
         std::process::exit(control::run_cli(&args[1..]));
     }
@@ -364,7 +373,7 @@ fn main() {
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
                     // shows "Unknown" in the title bar / window switcher.
-                    window.set_window_title("muxel");
+                    window.set_window_title(&format!("muxel — {}", build_info::compact_label()));
                     let view = cx.new(|cx| MuxelApp::new(window, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })

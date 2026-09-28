@@ -21509,6 +21509,12 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
+                            .child(crate::build_info::compact_label()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
                             .child(workspace_name),
                     )
                     .child(div().flex_1())
@@ -25368,8 +25374,8 @@ impl MuxelApp {
 
         let mut body = v_flex().gap_3().w_full().flex_1().min_h_0().child(
             div().text_sm().text_color(muted).child(tf(
-                "Current version: {version}",
-                &[("version", crate::update::APP_VERSION)],
+                "Current build: {version}",
+                &[("version", &crate::build_info::compact_label())],
             )),
         );
 
