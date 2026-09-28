@@ -373,7 +373,7 @@ fn main() {
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
                     // shows "Unknown" in the title bar / window switcher.
-                    window.set_window_title(&format!("muxel — {}", build_info::compact_label()));
+                    window.set_window_title(&build_info::native_window_title());
                     let view = cx.new(|cx| MuxelApp::new(window, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })

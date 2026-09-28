@@ -21505,12 +21505,12 @@ impl MuxelApp {
                             ),
                     ))
                     .child(div().font_semibold().child(t("muxel")))
-                    .child(
+                    .children(crate::build_info::title_identity().map(|identity| {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(crate::build_info::compact_label()),
-                    )
+                            .child(identity)
+                    }))
                     .child(
                         div()
                             .text_xs()

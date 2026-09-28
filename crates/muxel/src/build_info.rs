@@ -61,6 +61,25 @@ pub fn compact_label() -> String {
     }
 }
 
+pub fn title_identity() -> Option<String> {
+    title_identity_for(cfg!(debug_assertions))
+}
+
+pub fn native_window_title() -> String {
+    native_window_title_for(cfg!(debug_assertions))
+}
+
+fn title_identity_for(debug: bool) -> Option<String> {
+    debug.then(compact_label)
+}
+
+fn native_window_title_for(debug: bool) -> String {
+    match title_identity_for(debug) {
+        Some(identity) => format!("muxel — {identity}"),
+        None => "muxel".to_string(),
+    }
+}
+
 pub fn json_value() -> Value {
     json!({
         "version": VERSION,
@@ -76,7 +95,7 @@ pub fn json_value() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMIT, compact_label, json_value, short_commit};
+    use super::{COMMIT, compact_label, json_value, native_window_title_for, short_commit};
 
     #[test]
     fn compact_identity_contains_exact_embedded_build() {
@@ -91,5 +110,11 @@ mod tests {
         let value = json_value();
         assert_eq!(value["commit"], COMMIT);
         assert_eq!(value["shortCommit"], short_commit());
+    }
+
+    #[test]
+    fn detailed_window_title_is_debug_only() {
+        assert!(native_window_title_for(true).contains(short_commit()));
+        assert_eq!(native_window_title_for(false), "muxel");
     }
 }
