@@ -25,6 +25,7 @@ pub struct SessionDiscoveryKey {
     pub binding_generation: u64,
     pub binding: Option<String>,
     pub binding_path: Option<PathBuf>,
+    pub binding_hook: Option<String>,
     pub cwd: PathBuf,
     /// Canonical provider identity hint, excluding title activity/spinners.
     pub hint: Option<String>,
@@ -317,6 +318,7 @@ mod tests {
             binding_generation: 7,
             binding: None,
             binding_path: None,
+            binding_hook: None,
             cwd: PathBuf::from("project"),
             hint: Some("thread hint".to_string()),
             tmux_session: None,
