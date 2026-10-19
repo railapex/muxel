@@ -17,7 +17,7 @@ impl Drop for TempRoot {
     }
 }
 
-fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::env::temp_dir().join(format!("muxel-codex-capture-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
@@ -71,7 +71,11 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
         }));
         window
             .update(cx, |app, window, cx| {
-                let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, _) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(!meta.was_resume);
                 assert!(!spec.args.iter().any(|arg| arg == "resume"));
                 assert!(app.workspace.instance(pane).unwrap().session_id.is_none());

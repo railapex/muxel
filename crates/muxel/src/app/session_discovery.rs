@@ -479,6 +479,18 @@ fn discover_sessions(
     home: &Path,
     data_dir: Option<&Path>,
 ) -> Vec<DiscoveryResult> {
+    let claude_panes = requests
+        .iter()
+        .filter(|request| request.key.provider == SessionProvider::Claude)
+        .map(|request| request.key.pane)
+        .collect::<std::collections::HashSet<_>>();
+    let claude_bindings = if claude_panes.is_empty() {
+        None
+    } else {
+        data_dir.and_then(|data| {
+            session_binding::claude_bindings_for_batch(data, &claude_panes, home).ok()
+        })
+    };
     #[cfg(windows)]
     let mut grok_snapshot = None;
     requests
@@ -541,9 +553,11 @@ fn discover_sessions(
                         candidate
                     })
                 }
-                SessionProvider::Claude => data_dir.and_then(|data_dir| {
-                    session_binding::claude_session_id_from_binding(data_dir, key.pane, home)
-                        .map(|id| SessionCandidate { id, path: None })
+                SessionProvider::Claude => claude_bindings.as_ref().and_then(|bindings| {
+                    bindings.get(&key.pane).map(|binding| SessionCandidate {
+                        id: binding.id.clone(),
+                        path: Some(binding.path.clone()),
+                    })
                 }),
                 SessionProvider::Grok => {
                     #[cfg(windows)]
