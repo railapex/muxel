@@ -314,6 +314,7 @@ fn validate_claude_event(event: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn claude_session_id_from_binding(
     data_dir: &Path,
     instance_id: Uuid,
@@ -322,11 +323,79 @@ pub(crate) fn claude_session_id_from_binding(
     let event: Value =
         serde_json::from_slice(&std::fs::read(claude_binding_path(data_dir, instance_id)).ok()?)
             .ok()?;
+    let projects = home.join(".claude").join("projects").canonicalize().ok()?;
+    validated_claude_binding(event, &projects).map(|binding| binding.id)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeBinding {
+    pub id: String,
+    pub path: PathBuf,
+    pub pending_write: bool,
+    pub cwd: PathBuf,
+}
+
+/// One directory snapshot, including no file opens for panes without a record.
+/// Keep records after async reads: deleting by name could erase a newer hook.
+pub(crate) fn claude_bindings_for_batch(
+    data_dir: &Path,
+    panes: &std::collections::HashSet<Uuid>,
+    home: &Path,
+) -> std::io::Result<std::collections::HashMap<Uuid, ClaudeBinding>> {
+    let mut result = std::collections::HashMap::new();
+    #[cfg(test)]
+    BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("directory"));
+    let entries = match std::fs::read_dir(data_dir.join(CLAUDE_BINDING_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error),
+    };
+    let mut projects = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        if !panes.contains(&id) {
+            continue;
+        }
+        #[cfg(test)]
+        BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("read"));
+        let mut bytes = Vec::new();
+        match std::fs::File::open(entry.path()) {
+            Ok(file) => {
+                file.take(MAX_HOOK_INPUT_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
+            continue;
+        }
+        let Ok(event) = serde_json::from_slice(&bytes) else {
+            continue;
+        };
+        if projects.is_none() {
+            projects = Some(home.join(".claude/projects").canonicalize()?);
+        }
+        if let Some(binding) = validated_claude_binding(event, projects.as_ref().unwrap()) {
+            result.insert(id, binding);
+        }
+    }
+    Ok(result)
+}
+
+fn validated_claude_binding(event: Value, projects: &Path) -> Option<ClaudeBinding> {
     validate_claude_event(&event).ok()?;
     let session_id = event.get("session_id")?.as_str()?;
     let source = event.get("source")?.as_str()?;
     let transcript = Path::new(event.get("transcript_path")?.as_str()?);
-    let projects = home.join(".claude").join("projects").canonicalize().ok()?;
     let expected_name = format!("{session_id}.jsonl");
     if transcript.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
         return None;
@@ -339,16 +408,30 @@ pub(crate) fn claude_session_id_from_binding(
     if project.parent()? != projects {
         return None;
     }
-    match transcript.canonicalize() {
-        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => {}
+    let pending_write = match transcript.canonicalize() {
+        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => false,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(source, "clear" | "fork") => {}
+                && matches!(source, "clear" | "fork") =>
+        {
+            true
+        }
         _ => return None,
-    }
-    Some(session_id.to_string())
+    };
+    Some(ClaudeBinding {
+        id: session_id.to_string(),
+        path: transcript.to_path_buf(),
+        pending_write,
+        cwd: PathBuf::from(event.get("cwd")?.as_str()?),
+    })
 }
 
+#[cfg(test)]
+thread_local! {
+    static BINDING_BATCH_OPERATIONS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
 pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
     let _ = std::fs::remove_file(claude_binding_path(data_dir, instance_id));
 }
@@ -357,6 +440,64 @@ pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
 mod tests {
     use super::*;
     use muxel_core::tmux::Socket;
+
+    #[test]
+    fn missing_claude_pane_bindings_share_one_directory_read() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join(CLAUDE_BINDING_DIR)).unwrap();
+        let panes = (0..20).map(|_| Uuid::new_v4()).collect();
+        BINDING_BATCH_OPERATIONS.with_borrow_mut(Vec::clear);
+        assert!(
+            claude_bindings_for_batch(&root, &panes, &root)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            BINDING_BATCH_OPERATIONS.with_borrow(Clone::clone),
+            vec!["directory"]
+        );
+    }
+
+    #[test]
+    fn claude_batch_preserves_pending_clear_path_and_a_newer_record() {
+        let root = temp_dir();
+        let home = root.join("home");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let pane = Uuid::new_v4();
+        let old_id = Uuid::new_v4().to_string();
+        let old_path = muxel_core::claude_session_path(&home, &cwd, &old_id);
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        let event = json!({"hook_event_name":"SessionStart","source":"clear","session_id":old_id,"transcript_path":old_path,"cwd":cwd});
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(event.to_string()))
+            .unwrap();
+        let panes = std::collections::HashSet::from([pane]);
+        let old = claude_bindings_for_batch(&root, &panes, &home)
+            .unwrap()
+            .remove(&pane)
+            .unwrap();
+        assert_eq!(old.id, old_id);
+        assert_eq!(old.path, old_path);
+        assert!(old.pending_write);
+        let new_id = Uuid::new_v4().to_string();
+        let new_path = muxel_core::claude_session_path(&home, &cwd, &new_id);
+        std::fs::write(&new_path, "{}\n").unwrap();
+        let newer = json!({"hook_event_name":"SessionStart","source":"resume","session_id":new_id,"transcript_path":new_path,"cwd":cwd});
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(newer.to_string()))
+            .unwrap();
+        let new = claude_bindings_for_batch(&root, &panes, &home)
+            .unwrap()
+            .remove(&pane)
+            .unwrap();
+        assert_eq!(new.id, new_id);
+        assert_eq!(new.path, new_path);
+        assert!(!new.pending_write);
+        assert!(
+            claude_binding_path(&root, pane).is_file(),
+            "async read deleted the hook record"
+        );
+        assert_eq!(old.id, old_id, "older snapshot changed after replacement");
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-claude-binding-{}", Uuid::new_v4()));
