@@ -174,14 +174,17 @@ feature is added or changed, update the matching entry here in the same change**
   transcripts share one fallback search per launch batch, with the found path saved
   for later launches. Hook polling lists its binding directory once per batch instead
   of probing a missing file for every pane. Read-aloud and control reads use the saved
-  transcript path. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned hint waits until that ownership or binding changes. Launch,
-  directory, hint or binding changes reset the delay. The name index is reread
-  in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or expired conversation. A
+  missing Claude store permits fresh launches; a hook read error affects only
+  that pane. Each pane keeps one pending lookup across pop-out and docking.
+  Failed Codex hints retry with a delay that grows from one to thirty seconds,
+  even while the day directory changes. A sibling-owned hint waits until that
+  ownership or binding changes. Launch, directory, hint or binding changes reset
+  the delay. The name index is reread in full on a worker when its size or
+  modification time changes; unchanged indexes take one stat. Claude and Grok
+  retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved Codex conversation is abandoned only when its validated saved rollout

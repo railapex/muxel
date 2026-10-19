@@ -638,6 +638,7 @@ fn w8lm_codex_capture_retries_after_a_missing_rollout_appears() {
         binding_generation: 0,
         binding: None,
         binding_path: None,
+        binding_hook: None,
         cwd: cwd.clone(),
         hint: Some(id.into()),
         tmux_session: None,
