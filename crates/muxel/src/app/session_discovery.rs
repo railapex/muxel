@@ -212,11 +212,13 @@ struct SessionBindingUpdate {
     previous_path: Option<PathBuf>,
     previous_started: bool,
     previous_auto_name: Option<String>,
+    previous_hook: Option<String>,
 }
 
 struct SessionCandidate {
     id: String,
     path: Option<PathBuf>,
+    hook_record: Option<String>,
 }
 
 enum DiscoveryCandidate {
@@ -309,6 +311,7 @@ impl MuxelApp {
             binding_generation: self.session_discoveries.binding_generation(iid),
             binding: instance.session_id.clone(),
             binding_path: instance.session_path.clone(),
+            binding_hook: instance.claude_hook_record.clone(),
             cwd: instance
                 .worktree_path
                 .as_ref()
@@ -418,7 +421,10 @@ impl MuxelApp {
         let path = candidate
             .path
             .or_else(|| same_id.then(|| instance.session_path.clone()).flatten());
-        if same_id && instance.session_path == path {
+        let hook_record = candidate
+            .hook_record
+            .or_else(|| instance.claude_hook_record.clone());
+        if same_id && instance.session_path == path && instance.claude_hook_record == hook_record {
             return None;
         }
         let update = SessionBindingUpdate {
@@ -428,9 +434,11 @@ impl MuxelApp {
             previous_path: instance.session_path.clone(),
             previous_started: instance.session_started,
             previous_auto_name: instance.auto_name.clone(),
+            previous_hook: instance.claude_hook_record.clone(),
         };
         instance.session_id = Some(candidate.id);
         instance.session_path = path;
+        instance.claude_hook_record = hook_record;
         instance.session_started = true;
         if !same_id {
             instance.auto_name = None;
@@ -468,6 +476,7 @@ impl MuxelApp {
                 instance.session_path = update.previous_path;
                 instance.session_started = update.previous_started;
                 instance.auto_name = update.previous_auto_name;
+                instance.claude_hook_record = update.previous_hook;
                 self.bump_session_binding_generation(update.pane);
             }
         }
@@ -555,6 +564,7 @@ fn discover_sessions(
                         .map(|session| SessionCandidate {
                             id: session.id,
                             path: Some(session.path),
+                            hook_record: None,
                         });
                         if candidate.is_none() {
                             miss = Some(stamp);
@@ -563,9 +573,23 @@ fn discover_sessions(
                     })
                 }
                 SessionProvider::Claude => claude_bindings.as_ref().and_then(|bindings| {
-                    bindings.get(&key.pane).map(|binding| SessionCandidate {
+                    let snapshot = bindings.get(&key.pane)?;
+                    let record = snapshot.record.as_ref().ok()?.as_ref()?;
+                    if key.binding_hook.as_ref() == Some(record) {
+                        return None;
+                    }
+                    let binding = snapshot.binding.as_ref().ok()?.as_ref()?;
+                    if binding.pending_write
+                        && binding.legacy
+                        && key.binding_hook.is_none()
+                        && key.binding.as_deref() == Some(binding.id.as_str())
+                    {
+                        return None;
+                    }
+                    Some(SessionCandidate {
                         id: binding.id.clone(),
                         path: Some(binding.path.clone()),
+                        hook_record: Some(record.clone()),
                     })
                 }),
                 SessionProvider::Grok => {
@@ -576,7 +600,11 @@ fn discover_sessions(
                         });
                         key.child_pid
                             .and_then(|pid| active_grok_session_for_process(pid, active, parents))
-                            .map(|id| SessionCandidate { id, path: None })
+                            .map(|id| SessionCandidate {
+                                id,
+                                path: None,
+                                hook_record: None,
+                            })
                     }
                     #[cfg(not(windows))]
                     {
@@ -674,6 +702,7 @@ mod w8lm_tests {
             binding_generation: 0,
             binding: None,
             binding_path: None,
+            binding_hook: None,
             cwd: root.join("project"),
             hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
             tmux_session: None,
