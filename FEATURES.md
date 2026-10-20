@@ -290,7 +290,10 @@ feature is added or changed, update the matching entry here in the same change**
   permission forms report **blocked**, while positive background counts displayed
   by Claude and Grok remain **working** even when their titles look idle. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
-  pane truncates the usual interrupt marker. Brief
+  pane truncates the usual interrupt marker. All six observed spinner frames
+  count, including the early row before elapsed time and tokens appear when it
+  sits above Claude's live footer. Quoted spinner text in the input does not
+  change status. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID, so child commands

@@ -348,10 +348,17 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
 }
 
 fn claude_screen_has_current_work(screen: &str) -> bool {
-    let mut newer_rows = [None, None];
-    for line in screen.lines().rev() {
-        if is_claude_live_task_footer(line, newer_rows)
-            || is_claude_live_foreground_row(line)
+    // Claude's input sits between two horizontal rules. A pasted spinner in
+    // that input is user text even when it has the shape of a live status row.
+    let composer_from_bottom = screen
+        .lines()
+        .rev()
+        .position(|line| line.contains('❯') && is_claude_composer_divider(line));
+    let mut newer_rows = [None, None, None];
+    for (from_bottom, line) in screen.lines().rev().enumerate() {
+        if is_claude_live_task_footer(line, [newer_rows[0], newer_rows[1]])
+            || (composer_from_bottom.is_none_or(|top| from_bottom > top)
+                && is_claude_live_foreground_row(line, newer_rows))
             || is_claude_live_background_row(line)
         {
             return true;
@@ -359,8 +366,7 @@ fn claude_screen_has_current_work(screen: &str) -> bool {
         if is_claude_completed_foreground_row(line) {
             return false;
         }
-        newer_rows[1] = newer_rows[0];
-        newer_rows[0] = Some(line);
+        newer_rows = [Some(line), newer_rows[0], newer_rows[1]];
     }
     false
 }
@@ -435,13 +441,38 @@ fn is_claude_live_task_count(task: &str) -> bool {
     )
 }
 
-fn is_claude_live_foreground_row(line: &str) -> bool {
-    let Some(status) = line.trim().strip_prefix("✻ ") else {
+fn is_claude_composer_divider(line: &str) -> bool {
+    line.trim_start().chars().take_while(|&c| c == '─').count() >= 8
+}
+
+fn is_claude_live_foreground_footer(newer_rows: [Option<&str>; 3]) -> bool {
+    newer_rows
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|row| !row.is_empty())
+        .is_some_and(|row| {
+            is_claude_composer_divider(row)
+                || row
+                    .strip_prefix('⎿')
+                    .is_some_and(|rest| rest.trim_start().starts_with("Tip:"))
+        })
+}
+
+fn is_claude_live_foreground_row(line: &str, newer_rows: [Option<&str>; 3]) -> bool {
+    let Some((glyph, status)) = line.trim().split_once(' ') else {
         return false;
     };
-    let Some((activity, metrics)) = status.rsplit_once(" (") else {
+    // Observed in live Claude 2.1.304 screens. The frame rotates through all
+    // six glyphs, while a completed turn uses a separate "for … · done" row.
+    if !matches!(glyph, "✻" | "✶" | "✢" | "✽" | "*" | "·") {
         return false;
-    };
+    }
+    let (activity, metrics) = status
+        .rsplit_once(" (")
+        .map_or((status, None), |(activity, metrics)| {
+            (activity, Some(metrics))
+        });
     if activity
         .trim_end()
         .strip_suffix('…')
@@ -449,6 +480,11 @@ fn is_claude_live_foreground_row(line: &str) -> bool {
     {
         return false;
     }
+    let Some(metrics) = metrics else {
+        // Before Claude has elapsed/token counts, only the active status row
+        // immediately above its tip or input rule is strong enough evidence.
+        return is_claude_live_foreground_footer(newer_rows);
+    };
     let Some(metrics) = metrics.strip_suffix(')') else {
         return false;
     };
@@ -2465,6 +2501,75 @@ mod tests {
             provider_screen_status(TitleProvider::Claude, &live_background_above_long_output),
             Some(AgentStatus::Working),
             "live background work must not disappear beyond an arbitrary row window"
+        );
+    }
+
+    #[test]
+    fn claude_live_spinner_frames_work_before_and_after_metrics() {
+        for glyph in ["✻", "✶", "✢", "✽", "*", "·"] {
+            let early = format!(
+                "{glyph} Interrogating…\n⎿ Tip: Hit shift+tab to change mode\n\n────────❯\n────────"
+            );
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, &early),
+                Some(AgentStatus::Working),
+                "early Claude frame {glyph}"
+            );
+            let without_tip = format!("{glyph} Interrogating…\n\n────────❯\n────────");
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, &without_tip),
+                Some(AgentStatus::Working),
+                "early Claude frame without tip {glyph}"
+            );
+            let measured = format!("{glyph} Rummaging… (11m 31s · ↓ 26.6k tokens)");
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, &measured),
+                Some(AgentStatus::Working),
+                "measured Claude frame {glyph}"
+            );
+        }
+        for completed in [
+            "✻ Worked for 24s · done 11:22 AM",
+            "✻ Baked for 1m 2s · done 11:22 AM",
+        ] {
+            let provider = provider_screen_status(TitleProvider::Claude, completed);
+            assert_eq!(
+                provider, None,
+                "completed Claude row looked live: {completed}"
+            );
+            assert_eq!(
+                combine_title_status(false, AgentStatus::Idle, provider, false),
+                AgentStatus::Idle
+            );
+        }
+        for quoted in [
+            "❯ Quote this line: ✽ Interrogating…\nClaude: That's a spinner.\n────────❯",
+            "❯ Quote this line:\n  ✽ Interrogating…\nClaude: That's a spinner.\n────────❯",
+            "────────❯\n  ✽ Interrogating…\n────────",
+            "────────❯\n  ✢ Rummaging… (11m 31s · ↓ 26.6k tokens)\n────────",
+            "✽ Interrogating…",
+        ] {
+            let provider = provider_screen_status(TitleProvider::Claude, quoted);
+            assert_eq!(
+                provider, None,
+                "quoted or detached Claude frame looked live: {quoted:?}"
+            );
+            assert_eq!(
+                combine_title_status(false, AgentStatus::Idle, provider, false),
+                AgentStatus::Idle
+            );
+        }
+        let long_composer = format!(
+            "────────❯\n{}\n  ✽ Interrogating…\n────────",
+            (0..12)
+                .map(|line| format!("  ordinary prompt line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(
+            provider_screen_status(TitleProvider::Claude, &long_composer),
+            None,
+            "a long quoted prompt hid its composer boundary"
         );
     }
 
