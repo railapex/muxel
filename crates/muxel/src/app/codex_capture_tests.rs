@@ -217,7 +217,11 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
         let document = window
             .update(cx, |app, window, cx| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
-                let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, size) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(meta.was_resume);
                 assert!(spec.args.iter().any(|arg| arg == "resume"));
                 #[cfg(windows)]
