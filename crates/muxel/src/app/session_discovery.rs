@@ -533,6 +533,7 @@ fn discover_sessions(
                             return Some(SessionCandidate {
                                 id: cached_id.clone(),
                                 path: None,
+                                hook_record: None,
                             });
                         }
                         let stamp = CodexHintMiss::capture(home, &hint, started);
