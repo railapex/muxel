@@ -110,7 +110,8 @@ fn codex_tmux_title(session: &str, socket: Option<Socket>) -> Option<String> {
     if let Some(reader) = CODEX_TMUX_TITLE_TEST_READER.lock().unwrap().clone() {
         return reader(session, socket);
     }
-    let socket = socket.unwrap_or_else(|| integrations::local_tmux_socket(session));
+    let target = muxel_core::tmux::SessionTarget::new(session, socket);
+    let socket = integrations::local_tmux_socket(&target);
     let output = Command::new("tmux")
         .args(socket.args())
         .args([
