@@ -351,9 +351,26 @@ impl MuxelApp {
     ) -> Option<TerminalPreparation> {
         let mut key = request.key.clone();
         if !launch_token_current(&self.terminal_launching, key.pane, key.token)
-            || self.claude_launch_key(key.pane, key.token).as_ref() != Some(&key)
+            || self.current_workspace != key.workspace
+            || self.workspace.instance(key.pane).is_none_or(|instance| {
+                instance.project_id != key.project || instance.kind != InstanceKind::Terminal
+            })
+            || self
+                .workspace
+                .project(key.project)
+                .is_none_or(|project| project.remote.is_some())
         {
             return None;
+        }
+        let current = self.claude_launch_key(key.pane, key.token);
+        if current.as_ref() != Some(&key) {
+            // Refresh a still-owned local launch instead of leaving its caller
+            // without a terminal. Reuse the captured store roots and deadline.
+            return if current.is_some() {
+                self.prepare_claude_launch_for(key.pane, key.token, request.home, request.data)
+            } else {
+                self.prepare_reserved_terminal_spawn(key.pane, key.token, cx)
+            };
         }
         // Attach the worker's actual receipt identity to its captured context,
         // then compare it with the latest own-data receipt before applying it.
@@ -525,6 +542,166 @@ mod tests {
         app.presets.push(preset);
         app.current_workspace = Some(Uuid::new_v4());
         id
+    }
+
+    fn run_preparation(
+        cx: &mut gpui::TestAppContext,
+        app: gpui::WeakEntity<MuxelApp>,
+        prepared: super::TerminalPreparation,
+    ) -> Option<(
+        crate::app::TerminalSpawnMeta,
+        anyhow::Result<muxel_terminal::TerminalLaunch>,
+    )> {
+        let (done, result) = std::sync::mpsc::channel();
+        cx.spawn(move |mut cx| async move {
+            let ready = MuxelApp::run_terminal_preparation(&app, prepared, &mut cx).await;
+            let _ = done.send(ready);
+        })
+        .detach();
+        let cap = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            if let Ok(result) = result.try_recv() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < cap,
+                "preparation runner never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn claude_refresh_preset_edit_finishes_the_original_runner() {
+        for action in ["preset", "closed", "superseded"] {
+            with_app(|cx, window| {
+                let home = muxel_store::data_dir()
+                    .unwrap()
+                    .join(format!("preset-owned-home-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+                let (id, mut prepared) = window
+                    .update(cx, |app, window, cx| {
+                        let id = pane(app);
+                        let preset = app
+                            .presets
+                            .iter_mut()
+                            .find(|p| Some(p.id) == app.workspace.instance(id).unwrap().preset_id)
+                            .unwrap();
+                        // Keep Claude preflight but make the eventual owned child
+                        // a harmless cmd-more fixture, with no provider executable.
+                        preset.session_id_flag = None;
+                        let row = app.workspace.instance_mut(id).unwrap();
+                        row.program = Some("cmd.exe".into());
+                        row.injection = muxel_core::InjectionMode::None;
+                        row.args = vec!["/d".into(), "/q".into(), "/c".into(), "more".into()];
+                        (id, app.prepare_terminal_spawn(id, window, cx).unwrap())
+                    })
+                    .unwrap();
+                let original_token = prepared.meta.token;
+                let original_since = prepared.meta.started;
+                let pending = prepared.pending.as_mut().unwrap();
+                pending.request.home = Some(home);
+                pending.request.data = muxel_store::data_dir();
+                let request = pending.request.clone();
+                let sender = pending.sender.take().unwrap();
+                let (started, observed) = std::sync::mpsc::channel();
+                let (release, wait) = async_channel::bounded(1);
+                *crate::app::CLAUDE_LAUNCH_TEST_LOOKUP.lock().unwrap() =
+                    Some(std::sync::Arc::new(move || {
+                        started.send(()).unwrap();
+                        wait.recv_blocking().unwrap();
+                    }));
+                struct Worker {
+                    release: async_channel::Sender<()>,
+                    worker: Option<std::thread::JoinHandle<()>>,
+                }
+                impl Drop for Worker {
+                    fn drop(&mut self) {
+                        let _ = self.release.try_send(());
+                        if let Some(worker) = self.worker.take() {
+                            let _ = worker.join();
+                        }
+                        *crate::app::CLAUDE_LAUNCH_TEST_LOOKUP.lock().unwrap() = None;
+                    }
+                }
+                let mut worker = Worker {
+                    release,
+                    worker: Some(std::thread::spawn(move || {
+                        resolve_batch(vec![(request, sender)])
+                    })),
+                };
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                window
+                    .update(cx, |app, _, _| match action {
+                        "preset" => {
+                            let preset_id = app.workspace.instance(id).unwrap().preset_id;
+                            app.presets
+                                .iter_mut()
+                                .find(|p| Some(p.id) == preset_id)
+                                .unwrap()
+                                .model = Some("edited-during-lookup".into());
+                            app.persist_settings();
+                        }
+                        "closed" => app.workspace.instances.retain(|row| row.id != id),
+                        "superseded" => app.terminal_launching.get_mut(&id).unwrap().token += 1,
+                        _ => unreachable!(),
+                    })
+                    .unwrap();
+                worker.release.try_send(()).unwrap();
+                worker.worker.take().unwrap().join().unwrap();
+                drop(worker);
+                let app = window.entity(cx).unwrap().downgrade();
+                let result = run_preparation(cx, app, prepared);
+                if action != "preset" {
+                    assert!(result.is_none(), "cancelled {action} launch restarted");
+                    window
+                        .read_with(cx, |app, _| {
+                            assert!(!app.terminals.contains_key(&id));
+                            if action == "superseded" {
+                                assert_ne!(app.terminal_launching[&id].token, original_token);
+                            } else {
+                                assert!(!app.terminal_launching.contains_key(&id));
+                            }
+                        })
+                        .unwrap();
+                    return;
+                }
+                let (meta, launch) =
+                    result.expect("preset edit stranded the valid launch reservation");
+                assert_eq!(meta.token, original_token);
+                assert_eq!(meta.started, original_since);
+                assert!(
+                    !meta.was_resume,
+                    "stale result bypassed the new missing-transcript lookup"
+                );
+                let session = window
+                    .update(cx, |app, window, cx| {
+                        app.finish_terminal_spawn(meta, launch, window, cx);
+                        app.terminals[&id].read(cx).session().clone()
+                    })
+                    .unwrap();
+                struct Stop(std::sync::Arc<muxel_terminal::TerminalSession>);
+                impl Drop for Stop {
+                    fn drop(&mut self) {
+                        self.0.kill();
+                    }
+                }
+                let _stop = Stop(session.clone());
+                assert!(
+                    session.child_pid().is_some(),
+                    "automatic retry never launched its owned PTY"
+                );
+                window
+                    .read_with(cx, |app, _| {
+                        assert!(!app.failed_launches.contains_key(&id));
+                        assert!(!app.terminal_launching.contains_key(&id));
+                    })
+                    .unwrap();
+            });
+        }
     }
 
     #[test]
