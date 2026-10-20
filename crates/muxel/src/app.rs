@@ -10433,65 +10433,6 @@ impl MuxelApp {
         );
     }
 
-    /// Adopt the exact Claude conversation selected by an in-process `/resume`.
-    /// The hook record is keyed by pane id and accepted only when its UUID and
-    /// transcript path identify a direct child of Claude's own store. Resume
-    /// records require a real transcript; clear/fork records may precede their
-    /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
-    fn adopt_claude_session_binding(&mut self, iid: Uuid) -> bool {
-        let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
-            return false;
-        };
-        let binding_path = crate::session_binding::claude_binding_path(&data_dir, iid);
-        if !binding_path.is_file() {
-            return false;
-        }
-        let Some(session_id) =
-            crate::session_binding::claude_session_id_from_binding(&data_dir, iid, &home)
-        else {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
-        };
-        if session_id_bound_elsewhere(&self.workspace.instances, iid, &session_id) {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
-        }
-        if self
-            .workspace
-            .instance(iid)
-            .and_then(|instance| instance.session_id.as_deref())
-            == Some(session_id.as_str())
-        {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
-        }
-        let Some(instance) = self.workspace.instance_mut(iid) else {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
-        };
-        let previous_session_id = instance.session_id.clone();
-        let previous_session_started = instance.session_started;
-        let previous_auto_name = instance.auto_name.clone();
-        instance.session_id = Some(session_id);
-        instance.session_started = true;
-        instance.auto_name = None;
-        self.bump_session_binding_generation(iid);
-        if self.try_persist() {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            true
-        } else {
-            let instance = self
-                .workspace
-                .instance_mut(iid)
-                .expect("Claude binding owner disappeared during persistence");
-            instance.session_id = previous_session_id;
-            instance.session_started = previous_session_started;
-            instance.auto_name = previous_auto_name;
-            self.bump_session_binding_generation(iid);
-            false
-        }
-    }
-
     fn resume_program(&self, iid: Uuid) -> Option<&str> {
         self.workspace.instance(iid).and_then(|instance| {
             instance
