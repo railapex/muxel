@@ -75,7 +75,7 @@ impl TerminalPreparation {
             pending: None,
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(super) fn ready_parts(self) -> Option<Ready> {
         self.ready.map(|(spec, size)| (self.meta, spec, size))
     }
@@ -468,7 +468,7 @@ impl MuxelApp {
             .map(TerminalPreparation::ready)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn apply_claude_launch(
         &mut self,
         request: Request,
