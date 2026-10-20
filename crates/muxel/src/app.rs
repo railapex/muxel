@@ -1037,14 +1037,26 @@ fn default_markers(program: Option<&str>) -> (Vec<String>, Vec<String>) {
     let base = program.map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p));
     let to = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     match base {
-        Some(p) if p.contains("claude") => (
-            to(&["esc to interrupt"]),
-            to(&["❯ 1.", "Do you want to proceed"]),
-        ),
+        // Claude's prompt chrome needs the live-form check in muxel-terminal.
+        // These phrases also occur in echoed user tasks and scrollback.
+        Some(p) if p.contains("claude") => (to(&["esc to interrupt"]), Vec::new()),
         Some(p) if p.contains("opencode") => (to(&["esc interrupt"]), to(&["Permission required"])),
         // hermes / ollama / pi: no recognized TUI markers — heuristic only
         // (users can add markers per preset in the agent editor).
         _ => (Vec::new(), Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod default_marker_tests {
+    use super::default_markers;
+
+    #[test]
+    fn claude_default_does_not_match_quoted_permission_text() {
+        let (working, blocked) = default_markers(Some("C:/bin/claude.exe"));
+        assert_eq!(working, ["esc to interrupt"]);
+        assert!(blocked.is_empty());
+        assert_eq!(default_markers(Some("opencode")).1, ["Permission required"]);
     }
 }
 

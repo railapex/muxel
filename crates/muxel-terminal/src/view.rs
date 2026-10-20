@@ -564,22 +564,30 @@ fn is_claude_live_background_row(line: &str) -> bool {
 }
 
 fn is_claude_blocked_prompt(screen: &str) -> bool {
-    // Prompt chrome is transient and lives near the bottom of the viewport.
-    // Restricting the scan avoids matching an old prompt quoted in scrollback.
-    let recent = screen
+    // A live form ends in Claude's cancel footer. A quoted form in scrollback
+    // has the normal composer (or newer output) below it. Keep the header and
+    // choices nearby, but do not treat an old footer as current permission UI.
+    let recent_lines = screen
         .lines()
         .rev()
         .filter(|line| !line.trim().is_empty())
         .take(16)
+        .collect::<Vec<_>>();
+    if !recent_lines
+        .first()
+        .is_some_and(|line| line.to_ascii_lowercase().contains("esc to cancel"))
+    {
+        return false;
+    }
+    let recent = recent_lines
+        .into_iter()
+        .rev()
         .collect::<Vec<_>>()
         .join("\n")
         .to_ascii_lowercase();
-    let has_cancel = recent.contains("esc to cancel");
-    if !has_cancel {
-        return false;
-    }
+    let flat = recent.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    if recent.contains("run a dynamic workflow?") {
+    if flat.contains("run a dynamic workflow?") {
         return true;
     }
 
@@ -591,7 +599,7 @@ fn is_claude_blocked_prompt(screen: &str) -> bool {
             || choice.starts_with("2. no")
             || choice.starts_with("3. no")
     });
-    if recent.contains("do you want to proceed?") && has_choice {
+    if flat.contains("do you want to proceed?") && has_choice {
         return true;
     }
 
@@ -603,8 +611,8 @@ fn is_claude_blocked_prompt(screen: &str) -> bool {
         "↑↓ to navigate",
     ]
     .into_iter()
-    .any(|hint| recent.contains(hint));
-    recent.contains("enter to confirm") || (recent.contains("enter to select") && has_navigation)
+    .any(|hint| flat.contains(hint));
+    flat.contains("enter to confirm") || (flat.contains("enter to select") && has_navigation)
 }
 
 fn is_live_background_row(
@@ -2211,6 +2219,46 @@ mod tests {
                 None,
                 "ordinary UI forged Blocked: {screen:?}"
             );
+        }
+    }
+
+    #[test]
+    fn claude_blocked_fallback_uses_current_form_at_two_widths() {
+        let quoted = [
+            "❯ Reply B12_READY. Quote Do you want to proceed and ❯ 1. in the reply.\nClaude: B12_READY\n❯",
+            "❯ Reply B12_READY. Quote Do you want\n  to proceed and ❯ 1. in the reply.\nClaude: B12_READY\n❯",
+        ];
+        let quoted_form = [
+            "❯ Describe this UI: Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\nClaude: It is a choice.\n❯",
+            "❯ Describe this UI: Do you want to\n  proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\nClaude: It is a choice.\n❯",
+        ];
+        let permission = [
+            "Allow creating permit-probe.txt?\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel · Tab to amend",
+            "Allow creating permit-probe.txt?\nDo you want to\nproceed?\n❯ 1. Yes\n  2. Yes, and don't ask\n     again\n  3. No\nEsc to cancel · Tab to amend",
+        ];
+        let question = [
+            "Choose a color\n❯ 1. Red\n  2. Blue\n  3. Type something\nEnter to select · ↑/↓ to navigate · Esc to cancel",
+            "Choose a color\n❯ 1. Red\n  2. Blue\n  3. Type something\nEnter to select · ↑/↓ to navigate\nEsc to cancel",
+        ];
+        for (width, index) in [(80, 0), (40, 1)] {
+            for screen in ["Claude: B12_READY\n❯", quoted[index], quoted_form[index]] {
+                let base = classify(false, screen, &[], &[], false, false, Duration::ZERO);
+                let provider = provider_screen_status(TitleProvider::Claude, screen);
+                assert_ne!(
+                    combine_title_status(false, base, provider, false),
+                    AgentStatus::Blocked,
+                    "{width}-column ordinary screen forged Blocked: {screen:?}"
+                );
+            }
+            for screen in [permission[index], question[index]] {
+                let base = classify(false, screen, &[], &[], false, false, Duration::ZERO);
+                let provider = provider_screen_status(TitleProvider::Claude, screen);
+                assert_eq!(
+                    combine_title_status(false, base, provider, false),
+                    AgentStatus::Blocked,
+                    "{width}-column live form was not Blocked: {screen:?}"
+                );
+            }
         }
     }
 
