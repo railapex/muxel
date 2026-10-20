@@ -37,4 +37,5 @@ jobs:
         run: |
           xcodebuild test -project Muxel.xcodeproj -scheme Muxel \
             -destination "id=${{ steps.sim.outputs.udid }}" \
+            -skipPackagePluginValidation -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tail -300
