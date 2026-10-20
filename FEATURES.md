@@ -178,8 +178,9 @@ feature is added or changed, update the matching entry here in the same change**
   Grok's process lookup run in the background. A newer Claude hook supersedes an
   older pending launch, and consumed hook records cannot revive a discarded or
   expired conversation. A missing Claude store permits fresh launches; a hook
-  read error affects only that pane. Each pane keeps one pending lookup across
-  pop-out and docking. Failed Codex hints retry with a delay that grows from
+  read error affects only that pane. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
   one to thirty seconds, even while the day directory changes. A sibling-owned
   tmux title is reread under backoff so a later unowned title can bind; its
   rollout validation is cached only while the same sibling owns it. Other
