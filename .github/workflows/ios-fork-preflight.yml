@@ -5,8 +5,13 @@ name: ios-fork-preflight
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
+    inputs:
+      pr:
+        description: Fork pull request number whose merge ref to build
+        required: true
+
+run-name: ios preflight ${{ inputs.pr && format('PR {0}', inputs.pr) || github.ref_name }}
 
 jobs:
   ios:
@@ -18,6 +23,9 @@ jobs:
         working-directory: ios
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+      - run: git log -1 --format='%H %s' && git log -1 --format='%H' HEAD^2 2>/dev/null || true
       - run: brew install xcodegen
       - run: xcodegen generate
       - name: Pick an iPhone simulator
