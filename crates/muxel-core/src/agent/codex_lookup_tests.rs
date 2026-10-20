@@ -325,6 +325,7 @@ fn r2_key(root: &Path) -> crate::session_discovery::SessionDiscoveryKey {
         binding_generation: 0,
         binding: None,
         binding_path: None,
+        binding_hook: None,
         cwd: root.join("project"),
         hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
         tmux_session: None,
