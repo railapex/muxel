@@ -6928,7 +6928,7 @@ impl MuxelApp {
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
             return;
         }
-        if self.resolve_remote_tmux_owner(instance_id, window, cx) {
+        if self.resolve_remote_tmux_owner(instance_id, reason, window, cx) {
             return;
         }
         // Whether this launch will `--resume` a saved session (true on every
@@ -7049,6 +7049,21 @@ impl MuxelApp {
         if reason != muxel_core::TerminalLaunchReason::NewPane {
             self.cancel_control_startup(instance_id);
         }
+        if let Some(host) = self.remote_host_for_instance(instance_id)
+            && host.auth == SshAuth::Password
+            && self.remote_password(&host).is_none()
+            && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
+        {
+            self.terminal_launching.remove(&instance_id);
+            self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
+            return None;
+        }
+        if self.resolve_remote_tmux_owner(instance_id, reason, window, cx) {
+            return None;
+        }
+        // Owner discovery only reserves lookup admission. Claim startup input
+        // once a real terminal can be prepared, so dropping a discovery ticket
+        // cannot cancel the first task of a newly created remote pane.
         let startup = self.claim_control_startup(instance_id);
         self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
         let token = self.next_terminal_launch_token;
@@ -7061,18 +7076,6 @@ impl MuxelApp {
             },
         );
         self.reset_terminal_runtime(instance_id);
-        if let Some(host) = self.remote_host_for_instance(instance_id)
-            && host.auth == SshAuth::Password
-            && self.remote_password(&host).is_none()
-            && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
-        {
-            self.terminal_launching.remove(&instance_id);
-            self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
-            return None;
-        }
-        if self.resolve_remote_tmux_owner(instance_id, window, cx) {
-            return None;
-        }
         Some(token)
     }
 
@@ -7082,6 +7085,7 @@ impl MuxelApp {
     fn resolve_remote_tmux_owner(
         &mut self,
         iid: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -7143,7 +7147,7 @@ impl MuxelApp {
                     Socket::Private,
                 );
                 this.persist();
-                this.spawn_terminal_deferred(iid, window, cx);
+                this.spawn_terminal_deferred(iid, reason, window, cx);
             });
             if landed.is_none() {
                 Self::release_unlanded_launch(&this, iid, token, cx);
@@ -10615,11 +10619,7 @@ impl MuxelApp {
             return;
         }
         let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
-        for instance in instances.iter_mut().filter(|i| i.needs_peer_session()) {
-            instance.use_tmux = true;
-        }
-        let eligible = instances.iter_mut().filter(|i| i.needs_peer_session());
-        muxel_core::tmux::bind_session_owners(&project.name, eligible, &sessions, Socket::Private);
+        muxel_core::tmux::bind_peer_sessions(&project.name, instances, &sessions);
     }
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
