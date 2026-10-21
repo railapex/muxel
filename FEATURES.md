@@ -151,16 +151,24 @@ feature is added or changed, update the matching entry here in the same change**
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
     launches with `--session-id` the first time and `--resume` on restart.
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
-    muxel captures the UUID Codex publishes for that pane, validates it against
-    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. The immutable
+    muxel captures the UUID Codex publishes for that pane and stores its rollout path.
+    Local tmux panes read their own `pane_title` from the recorded tmux socket on a
+    background worker because tmux does not forward that title to the terminal view.
+    Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
+    A started pane
+    without a saved UUID starts a fresh conversation; restore never scans history
+    to guess which conversation belonged to it. The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
-    UUIDs resolve only when exactly one rollout matches the pane's directory. Multiple Codex
+    UUIDs resolve in their timestamp's local day directory, with one neighboring day
+    checked near a date boundary. Only matching filenames are opened to validate the
+    pane's directory and top-level thread identity; subagent rollouts never rebind
+    a pane. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
-  pane; Codex panes learn it from a later OSC title. Both are accepted only after the
+  pane; directly launched Codex panes learn it from a later OSC title. Both are accepted only after the
   new UUID's own on-disk session proves it real and no sibling pane already owns it —
   terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
   A Claude conversation is matched by UUID across Claude's whole store rather than only
@@ -169,14 +177,34 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking, and unresolved results retry with backoff.
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Hook polling lists its binding directory once per batch instead
+  of probing a missing file for every pane. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  read error affects only that pane. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
+  directory, hint or binding changes reset the delay. The name index is reread
+  in full on a worker when its size or modification time changes; unchanged
+  indexes take one stat. Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
-  A saved conversation is abandoned only once muxel has confirmed it
-  is really gone — a session store it couldn't read leaves the pane's resume id alone —
-  and the pane then quietly starts fresh.
+  A saved Codex conversation is abandoned when its validated saved rollout
+  path and compression sibling are both absent or non-files, or when Codex itself
+  reports that the exact resumed ID is missing soon after launch. An invalid path,
+  unreadable store, dated lookup miss, or unrelated early exit keeps the id and
+  attempts resume.
+  Remote Codex panes never check the local session store. Archived Codex sessions
+  require unarchiving in Codex before they can resume.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -333,7 +361,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
-  from its session index by the pane's captured session UUID, so child commands
+  from its session index by the pane's captured session UUID. The index is checked
+  for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
   such as `npm` cannot replace the session name or forge a title-derived state
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers

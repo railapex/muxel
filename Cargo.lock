@@ -5043,6 +5043,7 @@ dependencies = [
  "rust-embed",
  "self-replace",
  "serde_json",
+ "sha2",
  "sys-locale",
  "tokio",
  "ureq 2.12.1",
@@ -5061,6 +5062,7 @@ name = "muxel-core"
 version = "0.3.2"
 dependencies = [
  "base64",
+ "chrono",
  "serde",
  "serde_json",
  "toml 1.1.2+spec-1.1.0",

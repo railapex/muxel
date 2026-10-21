@@ -2,6 +2,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
@@ -293,20 +294,24 @@ fn write_claude_binding_from_reader(
     if input.len() as u64 > MAX_HOOK_INPUT_BYTES {
         bail!("Claude SessionStart input exceeds {MAX_HOOK_INPUT_BYTES} bytes");
     }
-    let event: Value = serde_json::from_str(&input).context("parsing Claude SessionStart input")?;
+    let mut event: Value =
+        serde_json::from_str(&input).context("parsing Claude SessionStart input")?;
     validate_claude_event(&event)?;
+    event["muxel_record_id"] = Value::String(Uuid::new_v4().to_string());
+    let record = serde_json::to_vec(&event).context("serializing Claude SessionStart record")?;
+    if record.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        bail!("Claude SessionStart record exceeds {MAX_HOOK_INPUT_BYTES} bytes");
+    }
 
     let path = claude_binding_path(data_dir, instance_id);
     let parent = path.parent().context("Claude binding path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating Claude binding directory {}", parent.display()))?;
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temp, input.as_bytes())
+    std::fs::write(&temp, &record)
         .with_context(|| format!("writing Claude binding {}", temp.display()))?;
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("replacing Claude binding {}", path.display()))?;
-    }
+    // Rename replaces a file atomically; unlinking first exposes an empty slot
+    // to a concurrent launch's final hook check.
     std::fs::rename(&temp, &path)
         .with_context(|| format!("installing Claude binding {}", path.display()))?;
     Ok(())
@@ -350,6 +355,7 @@ fn validate_claude_event(event: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn claude_session_id_from_binding(
     data_dir: &Path,
     instance_id: Uuid,
@@ -358,11 +364,141 @@ pub(crate) fn claude_session_id_from_binding(
     let event: Value =
         serde_json::from_slice(&std::fs::read(claude_binding_path(data_dir, instance_id)).ok()?)
             .ok()?;
+    let projects = home.join(".claude").join("projects").canonicalize().ok()?;
+    validated_claude_binding(event, &projects).map(|binding| binding.id)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeBinding {
+    pub id: String,
+    pub path: PathBuf,
+    pub pending_write: bool,
+    /// Old producers did not assign each publication a distinct record id.
+    pub legacy: bool,
+    pub cwd: PathBuf,
+}
+
+pub(crate) type ClaudeHookIdentity = std::result::Result<Option<String>, String>;
+
+pub(crate) struct ClaudeBindingSnapshot {
+    pub record: ClaudeHookIdentity,
+    pub binding: std::result::Result<Option<ClaudeBinding>, String>,
+}
+
+struct ClaudeRecord {
+    identity: String,
+    bytes: Vec<u8>,
+}
+
+fn read_claude_record(path: &Path) -> std::result::Result<Option<ClaudeRecord>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let modified = file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .modified()
+        .ok();
+    let mut bytes = Vec::new();
+    file.take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        return Err(format!(
+            "Claude hook record exceeds {MAX_HOOK_INPUT_BYTES} bytes"
+        ));
+    }
+    let (sign, time) = match modified.map(|time| time.duration_since(std::time::UNIX_EPOCH)) {
+        None => (0_u8, std::time::Duration::ZERO),
+        Some(Ok(time)) => (1, time),
+        Some(Err(error)) => (2, error.duration()),
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"muxel-claude-hook-v1\0");
+    hash.update([sign]);
+    hash.update(time.as_secs().to_le_bytes());
+    hash.update(time.subsec_nanos().to_le_bytes());
+    hash.update(&bytes);
+    Ok(Some(ClaudeRecord {
+        identity: format!("v1:{:x}", hash.finalize()),
+        bytes,
+    }))
+}
+
+/// A bounded own-data receipt check. Transcript validation stays on the worker.
+pub(crate) fn claude_hook_identity(data: &Path, pane: Uuid) -> ClaudeHookIdentity {
+    read_claude_record(&claude_binding_path(data, pane))
+        .map(|record| record.map(|record| record.identity))
+}
+
+/// One directory snapshot, including no file opens for panes without a record.
+/// Keep records after async reads: deleting by name could erase a newer hook.
+pub(crate) fn claude_bindings_for_batch(
+    data_dir: &Path,
+    panes: &std::collections::HashSet<Uuid>,
+    home: &Path,
+) -> std::io::Result<std::collections::HashMap<Uuid, ClaudeBindingSnapshot>> {
+    let mut result = std::collections::HashMap::new();
+    #[cfg(test)]
+    BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("directory"));
+    let entries = match std::fs::read_dir(data_dir.join(CLAUDE_BINDING_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error),
+    };
+    let mut projects = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        if !panes.contains(&id) {
+            continue;
+        }
+        #[cfg(test)]
+        BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("read"));
+        let snapshot = match read_claude_record(&entry.path()) {
+            Ok(None) => continue,
+            Err(error) => ClaudeBindingSnapshot {
+                record: Err(error.clone()),
+                binding: Err(error),
+            },
+            Ok(Some(record)) => {
+                let binding = match serde_json::from_slice(&record.bytes) {
+                    Err(_) => Ok(None),
+                    Ok(event) => {
+                        let projects = projects
+                            .get_or_insert_with(|| home.join(".claude/projects").canonicalize());
+                        match projects {
+                            Ok(projects) => Ok(validated_claude_binding(event, projects)),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                };
+                ClaudeBindingSnapshot {
+                    record: Ok(Some(record.identity)),
+                    binding,
+                }
+            }
+        };
+        result.insert(id, snapshot);
+    }
+    Ok(result)
+}
+
+fn validated_claude_binding(event: Value, projects: &Path) -> Option<ClaudeBinding> {
     validate_claude_event(&event).ok()?;
     let session_id = event.get("session_id")?.as_str()?;
     let source = event.get("source")?.as_str()?;
     let transcript = Path::new(event.get("transcript_path")?.as_str()?);
-    let projects = home.join(".claude").join("projects").canonicalize().ok()?;
     let expected_name = format!("{session_id}.jsonl");
     if transcript.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
         return None;
@@ -375,16 +511,35 @@ pub(crate) fn claude_session_id_from_binding(
     if project.parent()? != projects {
         return None;
     }
-    match transcript.canonicalize() {
-        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => {}
+    let pending_write = match transcript.canonicalize() {
+        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => false,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(source, "clear" | "fork") => {}
+                && matches!(source, "clear" | "fork") =>
+        {
+            true
+        }
         _ => return None,
-    }
-    Some(session_id.to_string())
+    };
+    Some(ClaudeBinding {
+        id: session_id.to_string(),
+        path: transcript.to_path_buf(),
+        pending_write,
+        legacy: event
+            .get("muxel_record_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_none(),
+        cwd: PathBuf::from(event.get("cwd")?.as_str()?),
+    })
 }
 
+#[cfg(test)]
+thread_local! {
+    static BINDING_BATCH_OPERATIONS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
 pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
     let _ = std::fs::remove_file(claude_binding_path(data_dir, instance_id));
 }
@@ -393,6 +548,92 @@ pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
 mod tests {
     use super::*;
     use muxel_core::tmux::Socket;
+
+    #[test]
+    fn w8lm_identical_hook_payloads_are_distinct_even_with_the_same_mtime() {
+        let root = temp_dir();
+        let pane = Uuid::new_v4();
+        let id = Uuid::new_v4().to_string();
+        let cwd = root.join("project");
+        let transcript = muxel_core::claude_session_path(&root, &cwd, &id);
+        let event=json!({"hook_event_name":"SessionStart","source":"resume","session_id":id,"transcript_path":transcript,"cwd":cwd}).to_string();
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(&event)).unwrap();
+        let path = claude_binding_path(&root, pane);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let first = claude_hook_identity(&root, pane).unwrap().unwrap();
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(&event)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_ne!(claude_hook_identity(&root, pane).unwrap().unwrap(), first);
+    }
+
+    #[test]
+    fn missing_claude_pane_bindings_share_one_directory_read() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join(CLAUDE_BINDING_DIR)).unwrap();
+        let panes = (0..20).map(|_| Uuid::new_v4()).collect();
+        BINDING_BATCH_OPERATIONS.with_borrow_mut(Vec::clear);
+        assert!(
+            claude_bindings_for_batch(&root, &panes, &root)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            BINDING_BATCH_OPERATIONS.with_borrow(Clone::clone),
+            vec!["directory"]
+        );
+    }
+
+    #[test]
+    fn claude_batch_preserves_pending_clear_path_and_a_newer_record() {
+        let root = temp_dir();
+        let home = root.join("home");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let pane = Uuid::new_v4();
+        let old_id = Uuid::new_v4().to_string();
+        let old_path = muxel_core::claude_session_path(&home, &cwd, &old_id);
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        let event = json!({"hook_event_name":"SessionStart","source":"clear","session_id":old_id,"transcript_path":old_path,"cwd":cwd});
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(event.to_string()))
+            .unwrap();
+        let panes = std::collections::HashSet::from([pane]);
+        let old = claude_bindings_for_batch(&root, &panes, &home)
+            .unwrap()
+            .remove(&pane)
+            .unwrap()
+            .binding
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.id, old_id);
+        assert_eq!(old.path, old_path);
+        assert!(old.pending_write);
+        let new_id = Uuid::new_v4().to_string();
+        let new_path = muxel_core::claude_session_path(&home, &cwd, &new_id);
+        std::fs::write(&new_path, "{}\n").unwrap();
+        let newer = json!({"hook_event_name":"SessionStart","source":"resume","session_id":new_id,"transcript_path":new_path,"cwd":cwd});
+        write_claude_binding_from_reader(&root, pane, std::io::Cursor::new(newer.to_string()))
+            .unwrap();
+        let new = claude_bindings_for_batch(&root, &panes, &home)
+            .unwrap()
+            .remove(&pane)
+            .unwrap()
+            .binding
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.id, new_id);
+        assert_eq!(new.path, new_path);
+        assert!(!new.pending_write);
+        assert!(
+            claude_binding_path(&root, pane).is_file(),
+            "async read deleted the hook record"
+        );
+        assert_eq!(old.id, old_id, "older snapshot changed after replacement");
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-claude-binding-{}", Uuid::new_v4()));
