@@ -526,8 +526,12 @@ impl RuntimeStatusState {
             .saturating_sub(self.program_idle_completions);
         self.program_explicit_completions = program_status.explicit_completions;
         self.program_idle_completions = program_status.idle_completions;
+        // Codex can receive an automated startup prompt before its first UUID
+        // title arrives. A PSP Working edge in that first binding confirms the
+        // work; later binding switches still require a new submission.
+        let codex_submitted_turn = submitted_turn || session.initial_unbound_submission();
         let codex_idle_completion = title_provider == TitleProvider::Codex
-            && submitted_turn
+            && codex_submitted_turn
             && program_root.is_some_and(|root| root.state == ProgramState::Idle)
             && program_status.working_to_idle_revision > program_status.clear_revision
             && new_idle > 0;
@@ -4196,6 +4200,49 @@ mod provider_switch_tests {
         assert_eq!(switched.root, None);
         assert_eq!(switched.idle_completions, 0);
         after.kill();
+
+        let (synchronized, _receiver) = fixture();
+        synchronized.process_output(
+            b"\x1b[?2026h\x1b]0;019f95d7-db31-7db0-904d-9e08330e0003 | Ready\x07\x1b]7501;state=working\x07\x1b[?2026l",
+        );
+        assert_eq!(synchronized.binding_revision(), 1);
+        assert_eq!(
+            synchronized.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        synchronized.kill();
+
+        let (retired, _receiver) = fixture();
+        retired.process_output(
+            b"\x1b[?2026h\x1b]7501;state=working\x07\x1b]0;019f95d7-db31-7db0-904d-9e08330e0004 | Ready\x07\x1b[?2026l",
+        );
+        assert_eq!(retired.binding_revision(), 1);
+        assert_eq!(retired.program_status_snapshot().root, None);
+        retired.kill();
+
+        let (split, _receiver) = fixture();
+        split.process_output(b"\x1b[?2026h\x1b]0;019f95d7-db31-7db0-904d-9e08330e0005 | Ready\x07");
+        split.process_output(b"\x1b]7501;state=working\x07");
+        assert_eq!(split.binding_revision(), 0);
+        assert_eq!(split.program_status_snapshot().root, None);
+        split.process_output(b"\x1b[?2026l");
+        assert_eq!(split.binding_revision(), 1);
+        assert_eq!(
+            split.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        split.kill();
+
+        let (twice, _receiver) = fixture();
+        twice.process_output(
+            b"\x1b[?2026h\x1b]0;019f95d7-db31-7db0-904d-9e08330e0006 | Ready\x07\x1b]7501;state=working\x07\x1b]0;019f95d7-db31-7db0-904d-9e08330e0007 | Ready\x07\x1b]7501;state=blocked\x07\x1b[?2026l",
+        );
+        assert_eq!(twice.binding_revision(), 2);
+        assert_eq!(
+            twice.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Blocked
+        );
+        twice.kill();
     }
 
     #[test]
@@ -4352,6 +4399,51 @@ mod provider_switch_tests {
         );
         assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
         session.kill();
+    }
+
+    #[test]
+    fn codex_initial_title_after_submission_keeps_only_its_own_protocol_completion() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.paste("A real prompt");
+        session.mark_turn_submitted();
+        session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0011 | Ready\x07");
+        assert_eq!(session.binding_revision(), 1);
+        assert!(!session.runtime_evidence(None).submitted);
+        assert_eq!(session.first_submission_binding(), None);
+        session.test_program_status(
+            b"\x1b]7501;state=working\x07\x1b]7501;state=blocked\x07\x1b]7501;state=idle\x07",
+        );
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+        let first = runtime.snapshot(&session);
+        assert_eq!(first.status, AgentStatus::Done);
+        assert_eq!(first.completion_revision, 1);
+        assert_eq!(session.first_submission_binding(), None);
+
+        session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0012 | Ready\x07");
+        session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(1),
+        );
+        let switched = runtime.snapshot(&session);
+        assert_eq!(switched.status, AgentStatus::Idle);
+        assert_eq!(switched.completion_revision, 0);
+        session.kill();
+
+        let (selector, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        selector.mark_turn_submitted(); // Bare Enter selecting a resumed session.
+        selector.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0013 | Ready\x07");
+        selector.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(&selector, TitleProvider::Codex, &[], &[], false, now);
+        assert_eq!(runtime.snapshot(&selector).status, AgentStatus::Idle);
+        selector.kill();
     }
 
     #[test]

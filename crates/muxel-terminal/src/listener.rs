@@ -156,6 +156,9 @@ pub(crate) struct LifecycleEvidence {
     /// The latest bell. Acknowledging it clears the session's flag, not this.
     bell: Option<EvidenceMark>,
     submitted: Option<EvidenceMark>,
+    /// A prompt with draft text was submitted before the first title bound it.
+    /// A bare Enter can be a resume selector and does not establish this fact.
+    initial_unbound_prompt: bool,
     /// The first submitted turn owns an unattended loop run. Later input must
     /// never transfer that ownership to a replacement conversation. Revision
     /// zero means its recipient was unknown and stays unknown for this run.
@@ -218,8 +221,25 @@ impl LifecycleEvidence {
         self.first_submission.get_or_insert(self.binding_rev);
     }
 
+    pub(crate) fn record_prompt_submission(&mut self, at: SystemTime) {
+        if self.binding_rev == 0 {
+            self.initial_unbound_prompt = true;
+        }
+        self.record_submission(at);
+    }
+
     pub(crate) fn first_submission_binding(&self) -> Option<u64> {
         self.first_submission.filter(|rev| *rev != 0)
+    }
+
+    /// An initial prompt can reach a provider before its first UUID title.
+    /// This is only a completion hint for that first title binding; it never
+    /// transfers unattended-loop ownership or crosses a later switch.
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.binding_rev == 1
+            && self.first_submission == Some(0)
+            && self.initial_unbound_prompt
+            && self.window.is_none()
     }
 
     pub(crate) fn binding_rev(&self) -> u64 {
@@ -337,8 +357,9 @@ pub(crate) struct MuxelListener {
     /// publishes a different UUID-shaped thread (or the app reports a switch);
     /// ordinary spinner/title frames for the same conversation do not churn it.
     pub evidence: Arc<Mutex<LifecycleEvidence>>,
-    /// Cleared at a title-driven conversation boundary in VTE output order.
+    /// Cleared at a title-driven conversation boundary in PTY output order.
     pub program_status: Arc<Mutex<ProgramStatusSnapshot>>,
+    pub program_status_titles: Arc<Mutex<ProgramStatusTitleStream>>,
     /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
     /// use it to distinguish a repeated title event from an unchanged snapshot.
     pub title_generation: Arc<AtomicU64>,
@@ -370,6 +391,53 @@ fn session_thread_field(title: &str) -> Option<&str> {
         .then_some(thread)
 }
 
+/// The PSP scanner sees OSC titles at their wire position. VTE can deliver
+/// those same title callbacks later when synchronized updates end, so remember
+/// which clears were already applied and avoid retiring a newer PSP report.
+#[derive(Default)]
+pub(crate) struct ProgramStatusTitleStream {
+    current_thread: Option<String>,
+    pending_titles: VecDeque<(String, bool)>,
+    pending_bindings: usize,
+}
+
+impl ProgramStatusTitleStream {
+    fn update_binding(&mut self, title: &str, status: &mut ProgramStatusSnapshot) -> bool {
+        if let Some(next) = session_thread_field(title)
+            && self.current_thread.as_deref() != Some(next)
+        {
+            self.current_thread = Some(next.to_owned());
+            status.clear_binding();
+            return true;
+        }
+        false
+    }
+
+    pub fn scanned(&mut self, title: String, status: &mut ProgramStatusSnapshot) {
+        let changed = self.update_binding(&title, status);
+        self.pending_bindings += usize::from(changed);
+        self.pending_titles.push_back((title, changed));
+    }
+
+    pub fn binding_pending(&self) -> bool {
+        self.pending_bindings > 0
+    }
+
+    fn emitted(&mut self, title: &str, status: &mut ProgramStatusSnapshot) {
+        if self
+            .pending_titles
+            .front()
+            .is_some_and(|(next, _)| next == title)
+        {
+            if let Some((_, changed)) = self.pending_titles.pop_front() {
+                self.pending_bindings -= usize::from(changed);
+            }
+        } else {
+            self.update_binding(title, status);
+        }
+    }
+}
+
 impl EventListener for MuxelListener {
     fn send_event(&self, event: Event) {
         match event {
@@ -390,9 +458,11 @@ impl EventListener for MuxelListener {
                         if evidence.begin_binding(seq).bell {
                             self.bell.store(false, Ordering::Relaxed);
                         }
-                        self.program_status.lock().clear_binding();
                     }
                 }
+                self.program_status_titles
+                    .lock()
+                    .emitted(&title, &mut self.program_status.lock());
                 *self.title.lock() = Some(title);
                 *self.title_changed_at.lock() = Some(Instant::now());
                 self.title_generation.fetch_add(1, Ordering::Relaxed);
@@ -450,6 +520,7 @@ mod tests {
             title: Arc::new(Mutex::new(None)),
             evidence: Arc::new(Mutex::new(LifecycleEvidence::default())),
             program_status: Arc::new(Mutex::new(ProgramStatusSnapshot::default())),
+            program_status_titles: Default::default(),
             title_generation: Arc::new(AtomicU64::new(0)),
             title_changed_at: Arc::new(Mutex::new(None)),
             session_id_hint: hint.clone(),

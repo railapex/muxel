@@ -49,6 +49,7 @@ pub(crate) enum Event {
     Report(Report),
     Reset,
     ShellPrompt,
+    Title(String),
 }
 
 fn valid_token(value: &str) -> bool {
@@ -222,6 +223,19 @@ impl Scanner {
             Some(Event::Query)
         } else if self.raw == b"133;A" || self.raw.starts_with(b"133;A;") {
             Some(Event::ShellPrompt)
+        } else if self.raw.starts_with(b"0;") || self.raw.starts_with(b"2;") {
+            // Match VTE's OSC 0/2 title decoding (16 params including the
+            // selector). Binding titles must be observed in wire order even
+            // when VTE buffers synchronized UI.
+            let title = self.raw[2..]
+                .split(|byte| *byte == b';')
+                .take(15)
+                .filter_map(|part| std::str::from_utf8(part).ok())
+                .collect::<Vec<_>>()
+                .join(";")
+                .trim()
+                .to_owned();
+            Some(Event::Title(title))
         } else {
             self.raw
                 .strip_prefix(b"7501;")

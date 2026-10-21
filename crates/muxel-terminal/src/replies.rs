@@ -164,7 +164,8 @@ impl ImmediateReplies {
                 }
                 ProgramStatusEvent::Report(_)
                 | ProgramStatusEvent::Reset
-                | ProgramStatusEvent::ShellPrompt => {}
+                | ProgramStatusEvent::ShellPrompt
+                | ProgramStatusEvent::Title(_) => {}
             }
         }
         if start < bytes.len() {
@@ -323,6 +324,7 @@ mod tests {
                 title: Default::default(),
                 title_generation: Default::default(),
                 program_status: Default::default(),
+                program_status_titles: Default::default(),
                 title_changed_at: Default::default(),
                 session_id_hint: Default::default(),
                 bell: Default::default(),

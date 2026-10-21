@@ -7,7 +7,9 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::TerminalPalette;
-use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
+use crate::listener::{
+    EvidenceRead, LifecycleEvidence, MuxelListener, ProgramStatusTitleStream, SharedWriter,
+};
 use crate::profile;
 use crate::program_status::{Event as ProgramStatusEvent, ProgramStatusSnapshot, Scanner};
 use crate::replies::{ImmediateReplies, Replies};
@@ -898,6 +900,7 @@ pub struct TerminalSession {
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     program_status_scanner: Mutex<Scanner>,
+    program_status_titles: Arc<Mutex<ProgramStatusTitleStream>>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1322,6 +1325,7 @@ impl TerminalSession {
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
         let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        let program_status_titles = Arc::new(Mutex::new(ProgramStatusTitleStream::default()));
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1393,6 +1397,7 @@ impl TerminalSession {
             title: title.clone(),
             evidence: evidence.clone(),
             program_status: program_status.clone(),
+            program_status_titles: program_status_titles.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
@@ -1413,6 +1418,7 @@ impl TerminalSession {
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             program_status_scanner: Mutex::new(Scanner::default()),
+            program_status_titles,
             writer,
             master,
             output_queue,
@@ -1511,9 +1517,19 @@ impl TerminalSession {
                 if matches!(event, ProgramStatusEvent::Query) {
                     continue;
                 }
+                if let ProgramStatusEvent::Title(title) = event {
+                    // VTE may defer the matching title callback until ESU.
+                    // Bind PSP here, before a later report on the wire, and
+                    // let the listener consume that deferred callback once.
+                    self.program_status_titles
+                        .lock()
+                        .scanned(title, &mut self.program_status.lock());
+                    processor.advance(&mut *term, &bytes[start..=index]);
+                    start = index + 1;
+                    continue;
+                }
                 // Apply the VTE span before the PSP event at its final byte.
-                // A title before this report opens its binding first; a title
-                // after it will clear the record when that span is parsed.
+                // Non-title callbacks and output remain in their own order.
                 processor.advance(&mut *term, &bytes[start..=index]);
                 start = index + 1;
                 match event {
@@ -1529,7 +1545,7 @@ impl TerminalSession {
                     }
                     ProgramStatusEvent::Reset => self.program_status.lock().clear(),
                     ProgramStatusEvent::ShellPrompt => self.program_status.lock().shell_prompt(),
-                    ProgramStatusEvent::Query => unreachable!(),
+                    ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => unreachable!(),
                 }
             }
             if start < bytes.len() {
@@ -1712,7 +1728,12 @@ impl TerminalSession {
         writer.write_all(data)?;
         writer.flush()?;
         if !data.is_empty() {
-            self.evidence.lock().record_submission(submitted_at);
+            let has_prompt = self.input_snapshot().1 || data.len() > 1;
+            if has_prompt {
+                self.evidence.lock().record_prompt_submission(submitted_at);
+            } else {
+                self.evidence.lock().record_submission(submitted_at);
+            }
             self.turn_submitted.store(true, Ordering::Relaxed);
             self.advance_input(Some(true));
             self.mark_interactive();
@@ -1791,7 +1812,12 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
-        self.evidence.lock().record_submission(SystemTime::now());
+        let submitted_at = SystemTime::now();
+        if self.input_snapshot().1 {
+            self.evidence.lock().record_prompt_submission(submitted_at);
+        } else {
+            self.evidence.lock().record_submission(submitted_at);
+        }
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
     }
@@ -1806,6 +1832,10 @@ impl TerminalSession {
     /// identity or submission never establishes or transfers that ownership.
     pub fn first_submission_binding(&self) -> Option<u64> {
         self.evidence.lock().first_submission_binding()
+    }
+
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.evidence.lock().initial_unbound_submission()
     }
 
     /// The input revision and draft bit. Ordinary non-empty input writes (keys,
@@ -2394,6 +2424,12 @@ impl TerminalSession {
     }
 
     pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        // A synchronized update may have supplied a new UUID title while VTE
+        // still holds its callback. Do not publish that conversation's PSP
+        // facts under the previous binding revision before ESU flushes it.
+        if self.program_status_titles.lock().binding_pending() {
+            return ProgramStatusSnapshot::default();
+        }
         *self.program_status.lock()
     }
 
