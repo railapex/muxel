@@ -9,6 +9,7 @@
 use crate::colors::TerminalPalette;
 use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
 use crate::profile;
+use crate::program_status::ProgramStatusSnapshot;
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -915,6 +916,9 @@ pub struct TerminalSession {
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
+    /// Current root OSC 7501 report from this PTY launch. Child-id records do
+    /// not drive pane status; a provider binding switch clears the root.
+    program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     title_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
@@ -1316,8 +1320,13 @@ impl TerminalSession {
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
-        let immediate_replies =
-            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
+        let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        let immediate_replies = ImmediateReplies::new(
+            replies.clone(),
+            palette.clone(),
+            &term_config,
+            program_status.clone(),
+        );
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1414,6 +1423,7 @@ impl TerminalSession {
             child_pid,
             title,
             evidence,
+            program_status,
             title_generation,
             title_changed_at,
             session_id_hint,
@@ -2327,6 +2337,7 @@ impl TerminalSession {
     ) {
         let evidence = &mut *self.evidence.lock();
         let switch = evidence.switch_binding(from, to, learned_at);
+        self.program_status.lock().clear();
         if switch.bell {
             self.bell.store(false, Ordering::Relaxed);
         }
@@ -2349,6 +2360,22 @@ impl TerminalSession {
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
+    }
+
+    pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        *self.program_status.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_program_status(&self, wire: &[u8]) {
+        use crate::program_status::{Event, Scanner};
+        let mut scanner = Scanner::default();
+        for &byte in wire {
+            if let Some(Event::Report(report)) = scanner.advance(byte) {
+                self.program_status.lock().apply(report);
+            }
+        }
+        self.trigger_runtime();
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -5278,6 +5305,40 @@ mod tests {
         let reply = std::fs::read(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
         assert_eq!(String::from_utf8_lossy(&reply), "\x1b[>0;2501;1c");
+    }
+
+    #[test]
+    fn program_status_answer_reaches_a_unix_child_before_da() {
+        let out = std::env::temp_dir().join(format!("muxel-psp-{}", Uuid::new_v4()));
+        let expected = format!("{}\x1b[?6c", crate::program_status::CAPABILITY_REPLY);
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; head -c {} > '{}'",
+            expected.len(),
+            out.display()
+        );
+        let (session, rx) = TerminalSession::spawn(
+            CommandSpec::program("/bin/sh", vec!["-c".into(), script]),
+            80,
+            24,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Ok(PtyChunk::Output(_)) | Err(async_channel::TryRecvError::Empty) => {}
+            }
+            if Instant::now() > deadline {
+                session.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reply = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(reply, expected.as_bytes());
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output

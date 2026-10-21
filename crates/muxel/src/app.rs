@@ -1104,6 +1104,15 @@ fn apply_status_sample(
     effect
 }
 
+fn should_refresh_accomplishments_after_status(
+    previous: Option<AgentStatus>,
+    effect: SampleEffect,
+    coverage: muxel_terminal::TerminalStatusCoverage,
+) -> bool {
+    (effect.changed && previous == Some(AgentStatus::Working))
+        || (effect.completed && coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus)
+}
+
 fn apply_popout_status_sample(
     record: &mut Option<SeenStatus>,
     mut activity: Option<&mut AgentActivity>,
@@ -1134,12 +1143,38 @@ fn apply_popout_status_sample(
 mod status_attention_tests {
     use super::{
         AgentActivity, AgentStatus, NotifKind, SampleEffect, SeenStatus, StatusAttention,
-        StatusBinding, StatusSample, apply_status_sample, status_attention,
+        StatusBinding, StatusSample, apply_status_sample,
+        should_refresh_accomplishments_after_status, status_attention,
     };
+    use muxel_terminal::TerminalStatusCoverage;
     use uuid::Uuid;
 
     fn seen(status: AgentStatus, binding: StatusBinding) -> Option<SeenStatus> {
         Some(SeenStatus { status, binding })
+    }
+
+    #[test]
+    fn a_coalesced_program_status_completion_refreshes_accomplishments_once() {
+        let completed = SampleEffect {
+            changed: true,
+            completed: true,
+            ..SampleEffect::default()
+        };
+        assert!(should_refresh_accomplishments_after_status(
+            Some(AgentStatus::Idle),
+            completed,
+            TerminalStatusCoverage::ProgramStatus,
+        ));
+        assert!(!should_refresh_accomplishments_after_status(
+            Some(AgentStatus::Done),
+            SampleEffect::default(),
+            TerminalStatusCoverage::ProgramStatus,
+        ));
+        assert!(!should_refresh_accomplishments_after_status(
+            Some(AgentStatus::Idle),
+            completed,
+            TerminalStatusCoverage::ProviderVisible,
+        ));
     }
 
     #[test]
@@ -11627,8 +11662,7 @@ impl MuxelApp {
             }
             activity_changed |= effect.activity_changed;
             let changed = effect.changed;
-            if changed
-                && previous == Some(AgentStatus::Working)
+            if should_refresh_accomplishments_after_status(previous, effect, runtime.coverage)
                 && let Some(instance) = self.workspace.instance(iid)
             {
                 turns_finished.push(instance.project_id);

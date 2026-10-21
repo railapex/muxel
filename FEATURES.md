@@ -321,6 +321,14 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — local panes accept OSC 7501 reports from agents
+  that send them and answer a capability query before a following DA query.
+  Working, blocked (including permission, question, or auth kind), and finished
+  states come from the agent while its root report is current. A finished Codex
+  turn also reaches **done** when its submitted Working turn reports Idle; protocol
+  `error` uses the existing **done** badge with its error source retained. Clear,
+  provider switch, process exit, or relaunch returns the pane to its existing
+  fallback detection; remote tmux panes continue using that fallback.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes

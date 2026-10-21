@@ -6,6 +6,7 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
+use crate::program_status::{ProgramState, ProgramStatusKind, RootStatus};
 use crate::session::{
     CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, TerminalSession,
 };
@@ -175,6 +176,10 @@ pub enum AgentStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalStatusReason {
     ProcessExit,
+    /// Current root OSC 7501 report. The optional kind belongs to Blocked.
+    ProgramStatus(Option<ProgramStatusKind>),
+    /// OSC 7501 `error` maps to the existing Done badge and control state.
+    ProgramStatusError,
     BlockedMarker,
     WorkingMarker,
     ProviderTitle,
@@ -187,6 +192,8 @@ pub enum TerminalStatusReason {
 /// Scope of the no-hook evidence used by the runtime reducer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalStatusCoverage {
+    /// A current root OSC 7501 report supplies provider-owned lifecycle state.
+    ProgramStatus,
     /// Only PTY activity/bell/exit is available; quiet does not prove no work.
     ActivityOnly,
     /// Configured markers add visible-grid semantics, but not hidden-work proof.
@@ -226,6 +233,9 @@ struct RuntimeStatusState {
     /// See [`screen_hold_after`].
     screen_held: bool,
     coverage: TerminalStatusCoverage,
+    fallback_coverage: TerminalStatusCoverage,
+    program_status_revision: u64,
+    program_status_active: bool,
     snapshot_seq: u64,
     binding_rev: u64,
     /// Last title edge read from the session; `None` replays the current
@@ -256,6 +266,9 @@ impl RuntimeStatusState {
             attributable: true,
             screen_held: false,
             coverage,
+            fallback_coverage: coverage,
+            program_status_revision: 0,
+            program_status_active: false,
             snapshot_seq: 0,
             binding_rev: 0,
             title_cursor: None,
@@ -306,6 +319,13 @@ impl RuntimeStatusState {
     ) -> (bool, Option<Instant>) {
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
+        let program_status = session.program_status_snapshot();
+        let program_root = (!exited).then_some(program_status.root).flatten();
+        let program_status_changed_source = program_root.is_some() != self.program_status_active
+            || program_status.clear_revision > self.program_status_revision;
+        let previous_program_status_revision = self.program_status_revision;
+        self.program_status_revision = program_status.revision;
+        self.program_status_active = program_root.is_some();
         if binding_changed {
             // A new provider conversation cannot inherit lifecycle evidence or
             // visible facts from the retired binding. The current generation is
@@ -329,6 +349,12 @@ impl RuntimeStatusState {
             // advanced (listener title bump or `provider_switched`), in order
             // with any bell the new binding has rung since; one read inside a
             // switch window never rang.
+        }
+        if program_status_changed_source {
+            // A fallback title/screen Working edge cannot complete a new PSP
+            // Idle report, and a cleared PSP edge cannot complete fallback Idle.
+            self.prev_raw = None;
+            self.done_latch = false;
         }
 
         let evidence = session.runtime_evidence(self.title_cursor);
@@ -472,19 +498,35 @@ impl RuntimeStatusState {
             title = provider_screen;
         }
 
-        let raw = combine_title_status(exited, base, title, screen_working);
-        let can_latch = can_latch_completion(
-            !working_markers.is_empty(),
-            self.semantic_title_status.is_some(),
-        );
-        let raw_reason = status_reason(
-            raw,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
+        let fallback_raw = combine_title_status(exited, base, title, screen_working);
+        let raw = program_root.map_or(fallback_raw, program_status_state);
+        let can_latch = program_root.is_some()
+            || can_latch_completion(
+                !working_markers.is_empty(),
+                self.semantic_title_status.is_some(),
+            );
+        if program_root.is_some_and(|root| root.state == ProgramState::Idle)
+            && program_status.working_to_idle_revision > previous_program_status_revision
+            && program_status.working_to_idle_revision > program_status.clear_revision
+        {
+            // Codex can emit Working then Idle in one coalesced drain. Retain
+            // that edge for the existing submission-armed Done latch.
+            self.prev_raw = Some(AgentStatus::Working);
+            self.done_latch = false;
+        }
+        let raw_reason = program_root.map_or_else(
+            || {
+                status_reason(
+                    raw,
+                    exited,
+                    bell,
+                    title,
+                    provider_screen,
+                    working_marker,
+                    blocked_marker,
+                )
+            },
+            program_status_reason,
         );
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
         let (status, latch, armed) = if raw_attributable {
@@ -505,32 +547,45 @@ impl RuntimeStatusState {
         self.done_latch = latch;
         self.completion_armed = armed;
 
-        if let Some(deadline) = fallback_status_deadline(
-            now,
-            idle,
-            status,
-            title_provider,
-            !working_markers.is_empty(),
-        ) {
+        if program_root.is_none()
+            && let Some(deadline) = fallback_status_deadline(
+                now,
+                idle,
+                status,
+                title_provider,
+                !working_markers.is_empty(),
+            )
+        {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = status_reason(
-            status,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
+        let reason = program_root.map_or_else(
+            || {
+                status_reason(
+                    status,
+                    exited,
+                    bell,
+                    title,
+                    provider_screen,
+                    working_marker,
+                    blocked_marker,
+                )
+            },
+            program_status_reason,
         );
         let attributable = status_is_attributable(settling, self.screen_held, reason);
         if exited {
             next_deadline = None;
         }
-        let completion_ready = self.provider_settled || submitted_turn;
+        let completion_ready = self.provider_settled || submitted_turn || program_root.is_some();
+        let coverage = if program_root.is_some() {
+            TerminalStatusCoverage::ProgramStatus
+        } else {
+            self.fallback_coverage
+        };
         let public_changed = status != self.status
             || reason != self.reason
+            || coverage != self.coverage
             || attributable != self.attributable
             || binding_changed
             || completion_ready != self.completion_ready;
@@ -539,10 +594,40 @@ impl RuntimeStatusState {
         }
         self.status = status;
         self.reason = reason;
+        self.coverage = coverage;
         self.attributable = attributable;
         self.binding_rev = binding_rev;
         self.completion_ready = completion_ready;
+        if public_changed && let Some(root) = program_root {
+            log::debug!(
+                "program status source=osc7501 launch={} state={:?} kind={:?} badge={:?}",
+                session.id,
+                root.state,
+                root.kind,
+                status
+            );
+        }
         (public_changed, next_deadline)
+    }
+}
+
+fn program_status_state(root: RootStatus) -> AgentStatus {
+    match root.state {
+        ProgramState::Idle => AgentStatus::Idle,
+        ProgramState::Working => AgentStatus::Working,
+        ProgramState::Blocked => AgentStatus::Blocked,
+        // The four-badge model has no Error badge. A failed, stopped turn is
+        // finished for ctl wait and attention, with the error source retained.
+        ProgramState::Done | ProgramState::Error => AgentStatus::Done,
+        ProgramState::Clear => AgentStatus::Idle, // clear never creates a root record
+    }
+}
+
+fn program_status_reason(root: RootStatus) -> TerminalStatusReason {
+    if root.state == ProgramState::Error {
+        TerminalStatusReason::ProgramStatusError
+    } else {
+        TerminalStatusReason::ProgramStatus(root.kind)
     }
 }
 
@@ -1339,6 +1424,9 @@ fn status_reason(
 fn status_is_attributable(settling: bool, screen_held: bool, reason: TerminalStatusReason) -> bool {
     match reason {
         TerminalStatusReason::ProcessExit | TerminalStatusReason::Bell => true,
+        // The binding switch clears the old root, so a current root report is
+        // provider-owned evidence even while an older title is settling.
+        TerminalStatusReason::ProgramStatus(_) | TerminalStatusReason::ProgramStatusError => true,
         TerminalStatusReason::ProviderScreen
         | TerminalStatusReason::BlockedMarker
         | TerminalStatusReason::WorkingMarker
@@ -4020,6 +4108,7 @@ mod provider_switch_tests {
         TitleProvider, screen_hold_after, status_is_attributable, title_status_trace,
     };
     use crate::listener::SWITCH_SLACK;
+    use crate::program_status::ProgramStatusKind;
     use crate::session::{CommandSpec, PtyOutput, TerminalSession};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -4033,6 +4122,147 @@ mod provider_switch_tests {
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
         TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+    }
+
+    #[test]
+    fn program_status_root_overrides_visible_fallback_until_clear_or_exit() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        let mut sample = |wire: &[u8], offset_ms| {
+            session.test_program_status(wire);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(offset_ms),
+            );
+            runtime.snapshot(&session)
+        };
+        let working = sample(b"\x1b]7501;state=working\x07", 0);
+        assert_eq!(working.status, AgentStatus::Working);
+        assert!(working.completion_ready);
+        assert_eq!(working.coverage, TerminalStatusCoverage::ProgramStatus);
+        assert_eq!(working.reason, TerminalStatusReason::ProgramStatus(None));
+
+        let child = sample(b"\x1b]7501;state=blocked:kind=question:id=worker\x07", 1);
+        assert_eq!(child.status, AgentStatus::Working);
+        let blocked = sample(b"\x1b]7501;state=blocked:kind=permission\x07", 2);
+        assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert_eq!(
+            blocked.reason,
+            TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Permission))
+        );
+        let idle = sample(b"\x1b]7501;state=idle\x07", 3);
+        assert_eq!(idle.status, AgentStatus::Idle);
+        let done = sample(b"\x1b]7501;state=done\x07", 4);
+        assert_eq!(done.status, AgentStatus::Done);
+        assert_eq!(done.reason, TerminalStatusReason::ProgramStatus(None));
+        let error = sample(b"\x1b]7501;state=error\x07", 5);
+        assert_eq!(error.status, AgentStatus::Done);
+        assert_eq!(error.reason, TerminalStatusReason::ProgramStatusError);
+        let clear = sample(b"\x1b]7501;state=clear\x07", 6);
+        assert_eq!(clear.status, AgentStatus::Idle);
+        assert_eq!(clear.coverage, TerminalStatusCoverage::ProviderVisible);
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            true,
+            now + Duration::from_millis(7),
+        );
+        let exit = runtime.snapshot(&session);
+        assert_eq!(exit.status, AgentStatus::Done);
+        assert_eq!(exit.reason, TerminalStatusReason::ProcessExit);
+        session.kill();
+
+        let (restarted, _receiver) = fixture();
+        let mut fresh = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        fresh.reconcile(
+            &restarted,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(8),
+        );
+        assert_eq!(fresh.snapshot(&restarted).status, AgentStatus::Idle);
+        assert_eq!(fresh.coverage, TerminalStatusCoverage::ProviderVisible);
+        restarted.kill();
+    }
+
+    #[test]
+    fn codex_idle_after_working_finishes_only_an_armed_turn_and_resets_on_resume() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Idle);
+
+        session.mark_turn_submitted();
+        session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+
+        let switched = SystemTime::now() - Duration::from_secs(5);
+        session.provider_switched_at(switched, switched, switched);
+        session.test_program_status(b"\x1b]7501;state=idle\x07");
+        assert!(session.runtime_evidence(None).settling);
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Idle);
+        assert!(runtime.snapshot(&session).attributable);
+
+        session.process_drained(&drained(&[("fresh", SystemTime::now())]));
+        session.mark_turn_submitted();
+        session.test_program_status(b"\x1b]7501;state=working\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(3),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+        session.test_program_status(b"\x1b]7501;state=blocked\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(4),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Blocked);
+        session.test_program_status(b"\x1b]7501;state=idle\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(5),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+        session.kill();
     }
 
     fn drained(reads: &[(&str, SystemTime)]) -> PtyOutput {
@@ -4539,10 +4769,13 @@ mod provider_switch_tests {
     }
 
     #[test]
-    fn while_a_switch_settles_only_an_exit_or_a_fresh_bell_is_attributable() {
+    fn while_a_switch_settles_process_exit_bell_and_program_status_are_attributable() {
         use TerminalStatusReason::*;
         for reason in [
             ProcessExit,
+            ProgramStatus(None),
+            ProgramStatus(Some(ProgramStatusKind::Question)),
+            ProgramStatusError,
             BlockedMarker,
             WorkingMarker,
             ProviderTitle,
@@ -4554,7 +4787,10 @@ mod provider_switch_tests {
             assert!(status_is_attributable(false, false, reason), "{reason:?}");
             assert_eq!(
                 status_is_attributable(true, false, reason),
-                matches!(reason, ProcessExit | Bell),
+                matches!(
+                    reason,
+                    ProcessExit | Bell | ProgramStatus(_) | ProgramStatusError
+                ),
                 "{reason:?}"
             );
             // A held screen marker stays the old conversation's after the
