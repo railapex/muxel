@@ -48,6 +48,7 @@ pub(crate) enum Event {
     Query,
     Report(Report),
     Reset,
+    ShellPrompt,
 }
 
 fn valid_token(value: &str) -> bool {
@@ -113,6 +114,15 @@ fn parse_report(body: &[u8]) -> Option<Report> {
         if value.len() > limit {
             return None;
         }
+        // A present but malformed address must never become a root report.
+        if key == b"id" {
+            let value = std::str::from_utf8(value).ok()?;
+            if !valid_id(value) {
+                return None;
+            }
+            id = Some(value.to_owned());
+            continue;
+        }
         if !value
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.,+/=-".contains(byte))
@@ -132,7 +142,6 @@ fn parse_report(body: &[u8]) -> Option<Report> {
                     _ => None,
                 }
             }
-            b"id" => id = Some(value.to_owned()),
             b"kind" => {
                 kind = match value {
                     "permission" => Some(ProgramStatusKind::Permission),
@@ -149,9 +158,6 @@ fn parse_report(body: &[u8]) -> Option<Report> {
         }
     }
     let state = state?;
-    if id.as_deref().is_some_and(|id| !valid_id(id)) {
-        return None;
-    }
     if state != ProgramState::Blocked {
         kind = None;
     }
@@ -214,6 +220,8 @@ impl Scanner {
         }
         let event = if self.raw == b"7501;?" {
             Some(Event::Query)
+        } else if self.raw == b"133;A" || self.raw.starts_with(b"133;A;") {
+            Some(Event::ShellPrompt)
         } else {
             self.raw
                 .strip_prefix(b"7501;")
@@ -248,6 +256,10 @@ impl Scanner {
             },
             ScanState::OtherEscape => match byte {
                 b'\\' | 0x18 | 0x1a => self.state = ScanState::Ground,
+                b'c' => {
+                    self.state = ScanState::Ground;
+                    return Some(Event::Reset);
+                }
                 0x1b => {}
                 _ => self.state = ScanState::OtherString,
             },
@@ -273,6 +285,9 @@ impl Scanner {
                 self.raw.clear();
                 if byte == b']' {
                     self.start();
+                } else if byte == b'c' {
+                    self.state = ScanState::Ground;
+                    return Some(Event::Reset);
                 } else if matches!(byte, b'P' | b'X' | b'^' | b'_') {
                     self.state = ScanState::OtherString;
                 } else if byte != 0x1b {
@@ -299,6 +314,8 @@ pub(crate) struct ProgramStatusSnapshot {
     pub revision: u64,
     pub clear_revision: u64,
     pub working_to_idle_revision: u64,
+    pub idle_completions: u64,
+    pub explicit_completions: u64,
     working_active: bool,
 }
 
@@ -314,6 +331,15 @@ impl ProgramStatusSnapshot {
         self.revision = self.revision.wrapping_add(1);
         if self.working_active && report.state == ProgramState::Idle {
             self.working_to_idle_revision = self.revision;
+            self.idle_completions = self.idle_completions.wrapping_add(1);
+        }
+        if (self.working_active
+            || self
+                .root
+                .is_some_and(|root| root.state == ProgramState::Blocked))
+            && matches!(report.state, ProgramState::Done | ProgramState::Error)
+        {
+            self.explicit_completions = self.explicit_completions.wrapping_add(1);
         }
         match report.state {
             ProgramState::Working => self.working_active = true,
@@ -332,6 +358,33 @@ impl ProgramStatusSnapshot {
         self.revision = self.revision.wrapping_add(1);
         self.clear_revision = self.revision;
         self.root = None;
+        self.working_active = false;
+    }
+
+    /// A title or out-of-band switch starts a different provider conversation.
+    /// Transition counts and the root belong only to their original binding.
+    pub fn clear_binding(&mut self) {
+        self.clear();
+        self.working_to_idle_revision = 0;
+        self.idle_completions = 0;
+        self.explicit_completions = 0;
+    }
+
+    /// A new shell prompt retires an unfinished reporter. Completed reports
+    /// remain visible; an unsampled Working-to-Idle edge cannot finish there.
+    pub fn shell_prompt(&mut self) {
+        if self
+            .root
+            .is_some_and(|root| matches!(root.state, ProgramState::Working | ProgramState::Blocked))
+        {
+            self.clear();
+        } else if self
+            .root
+            .is_some_and(|root| root.state == ProgramState::Idle)
+        {
+            self.revision = self.revision.wrapping_add(1);
+            self.clear_revision = self.revision;
+        }
         self.working_active = false;
     }
 }
@@ -381,6 +434,9 @@ mod tests {
         for body in [
             "state=unknown",
             "state=working:id=bad//id",
+            "state=blocked:id=worker!",
+            "state=clear:id=worker!",
+            "state=working:id=",
             "state=working:msg=abcde",
             "state=working:msg=SGVsbG8K",
             "state=working:title=/w==",
@@ -399,6 +455,15 @@ mod tests {
         assert!(events(b"\x1b]7501;?\x1bX\x1b]7501;?\x07\x1b\\").is_empty());
         assert!(events(b"\x1bPopaque\x1b]7501;?\x07\x1b\\").is_empty());
         assert_eq!(events(b"\x1bc"), vec![Event::Reset]);
+        for split in 0..b"\x1bPunterminated\x1bc\x1b]7501;state=working\x07".len() {
+            let wire = b"\x1bPunterminated\x1bc\x1b]7501;state=working\x07";
+            let mut scanner = Scanner::default();
+            let mut found = Vec::new();
+            for part in [&wire[..split], &wire[split..]] {
+                found.extend(part.iter().filter_map(|byte| scanner.advance(*byte)));
+            }
+            assert!(matches!(found.as_slice(), [Event::Reset, Event::Report(_)]));
+        }
     }
 
     #[test]
@@ -430,5 +495,45 @@ mod tests {
         }
         assert_eq!(status.root, None);
         assert_eq!(status.clear_revision, status.revision);
+    }
+
+    #[test]
+    fn shell_prompt_retires_busy_records_but_preserves_finished_records() {
+        let mut status = ProgramStatusSnapshot::default();
+        for state in ["working", "blocked"] {
+            let wire = format!("\x1b]7501;state={state}\x07\x1b]133;A\x07");
+            for event in events(wire.as_bytes()) {
+                match event {
+                    Event::Report(report) => status.apply(report),
+                    Event::ShellPrompt => status.shell_prompt(),
+                    _ => {}
+                }
+            }
+            assert_eq!(status.root, None, "{state}");
+            assert_eq!(status.clear_revision, status.revision);
+        }
+        for state in ["done", "error"] {
+            let wire = format!("\x1b]7501;state={state}\x07\x1b]133;A\x1b\\");
+            for event in events(wire.as_bytes()) {
+                match event {
+                    Event::Report(report) => status.apply(report),
+                    Event::ShellPrompt => status.shell_prompt(),
+                    _ => {}
+                }
+            }
+            assert!(matches!(
+                status.root.unwrap().state,
+                ProgramState::Done | ProgramState::Error
+            ));
+        }
+        let wire = b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07\x1b]133;A\x07";
+        for event in events(wire) {
+            match event {
+                Event::Report(report) => status.apply(report),
+                Event::ShellPrompt => status.shell_prompt(),
+                _ => {}
+            }
+        }
+        assert!(status.working_to_idle_revision < status.clear_revision);
     }
 }

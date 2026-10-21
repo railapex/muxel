@@ -216,6 +216,9 @@ pub struct TerminalRuntimeSnapshot {
     pub input_rev: u64,
     pub draft_latched: bool,
     pub completion_ready: bool,
+    /// New provider-owned completions in this launch and binding. Consumers
+    /// compare this value even when two turns end at the same Done badge.
+    pub completion_revision: u64,
 }
 
 impl TerminalRuntimeSnapshot {
@@ -236,6 +239,10 @@ struct RuntimeStatusState {
     fallback_coverage: TerminalStatusCoverage,
     program_status_revision: u64,
     program_status_active: bool,
+    program_explicit_completions: u64,
+    program_idle_completions: u64,
+    completion_revision: u64,
+    codex_idle_done: bool,
     snapshot_seq: u64,
     binding_rev: u64,
     /// Last title edge read from the session; `None` replays the current
@@ -269,6 +276,10 @@ impl RuntimeStatusState {
             fallback_coverage: coverage,
             program_status_revision: 0,
             program_status_active: false,
+            program_explicit_completions: 0,
+            program_idle_completions: 0,
+            completion_revision: 0,
+            codex_idle_done: false,
             snapshot_seq: 0,
             binding_rev: 0,
             title_cursor: None,
@@ -304,6 +315,11 @@ impl RuntimeStatusState {
             input_rev,
             draft_latched,
             completion_ready: self.completion_ready && current_binding,
+            completion_revision: if current_binding {
+                self.completion_revision
+            } else {
+                0
+            },
         }
     }
 
@@ -323,7 +339,6 @@ impl RuntimeStatusState {
         let program_root = (!exited).then_some(program_status.root).flatten();
         let program_status_changed_source = program_root.is_some() != self.program_status_active
             || program_status.clear_revision > self.program_status_revision;
-        let previous_program_status_revision = self.program_status_revision;
         self.program_status_revision = program_status.revision;
         self.program_status_active = program_root.is_some();
         if binding_changed {
@@ -341,6 +356,10 @@ impl RuntimeStatusState {
             self.working_marker = false;
             self.blocked_marker = false;
             self.provider_screen = None;
+            self.program_explicit_completions = 0;
+            self.program_idle_completions = 0;
+            self.completion_revision = 0;
+            self.codex_idle_done = false;
             // Read the new binding's title edges from its start: from the
             // title that began it, or after everything recorded before a
             // switch reported out of band (all of it ambiguous).
@@ -499,21 +518,36 @@ impl RuntimeStatusState {
         }
 
         let fallback_raw = combine_title_status(exited, base, title, screen_working);
-        let raw = program_root.map_or(fallback_raw, program_status_state);
-        let can_latch = program_root.is_some()
-            || can_latch_completion(
-                !working_markers.is_empty(),
-                self.semantic_title_status.is_some(),
-            );
-        if program_root.is_some_and(|root| root.state == ProgramState::Idle)
-            && program_status.working_to_idle_revision > previous_program_status_revision
+        let new_explicit = program_status
+            .explicit_completions
+            .saturating_sub(self.program_explicit_completions);
+        let new_idle = program_status
+            .idle_completions
+            .saturating_sub(self.program_idle_completions);
+        self.program_explicit_completions = program_status.explicit_completions;
+        self.program_idle_completions = program_status.idle_completions;
+        let codex_idle_completion = title_provider == TitleProvider::Codex
+            && submitted_turn
+            && program_root.is_some_and(|root| root.state == ProgramState::Idle)
             && program_status.working_to_idle_revision > program_status.clear_revision
+            && new_idle > 0;
+        if codex_idle_completion {
+            self.codex_idle_done = true;
+        } else if !program_root.is_some_and(|root| root.state == ProgramState::Idle)
+            || title_provider != TitleProvider::Codex
         {
-            // Codex can emit Working then Idle in one coalesced drain. Retain
-            // that edge for the existing submission-armed Done latch.
-            self.prev_raw = Some(AgentStatus::Working);
-            self.done_latch = false;
+            self.codex_idle_done = false;
         }
+        let new_completions = new_explicit + if codex_idle_completion { new_idle } else { 0 };
+        let previous_completion_revision = self.completion_revision;
+        self.completion_revision = self.completion_revision.wrapping_add(new_completions);
+        let raw = program_root.map_or(fallback_raw, |root| {
+            if root.state == ProgramState::Idle && self.codex_idle_done {
+                AgentStatus::Done
+            } else {
+                program_status_state(root)
+            }
+        });
         let raw_reason = program_root.map_or_else(
             || {
                 status_reason(
@@ -529,12 +563,19 @@ impl RuntimeStatusState {
             program_status_reason,
         );
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
-        let (status, latch, armed) = if raw_attributable {
+        let (status, latch, armed) = if program_root.is_some() {
+            // Authoritative protocol states bypass the visible-source latch.
+            // Only the Codex transition above derives Done from PSP Idle.
+            (raw, false, submitted_turn)
+        } else if raw_attributable {
             latch_done_after_readiness(
                 self.prev_raw,
                 raw,
                 self.done_latch,
-                can_latch,
+                can_latch_completion(
+                    !working_markers.is_empty(),
+                    self.semantic_title_status.is_some(),
+                ),
                 self.completion_armed,
                 submitted_turn,
             )
@@ -543,7 +584,7 @@ impl RuntimeStatusState {
             // it disappears. Keep the new binding's explicit submission only.
             (raw, false, submitted_turn)
         };
-        self.prev_raw = raw_attributable.then_some(raw);
+        self.prev_raw = (program_root.is_none() && raw_attributable).then_some(raw);
         self.done_latch = latch;
         self.completion_armed = armed;
 
@@ -588,7 +629,8 @@ impl RuntimeStatusState {
             || coverage != self.coverage
             || attributable != self.attributable
             || binding_changed
-            || completion_ready != self.completion_ready;
+            || completion_ready != self.completion_ready
+            || self.completion_revision != previous_completion_revision;
         if public_changed {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
         }
@@ -4125,6 +4167,51 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn title_binding_orders_program_reports_within_one_read() {
+        let title = b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0001 | Ready\x07";
+        let working = b"\x1b]7501;state=working\x07";
+
+        let (before, _receiver) = fixture();
+        let mut wire = working.to_vec();
+        wire.extend_from_slice(title);
+        before.process_output(&wire);
+        assert_eq!(before.binding_revision(), 1);
+        assert_eq!(before.program_status_snapshot().root, None);
+        before.kill();
+
+        let (after, _receiver) = fixture();
+        let mut wire = title.to_vec();
+        wire.extend_from_slice(working);
+        after.process_output(&wire);
+        assert_eq!(after.binding_revision(), 1);
+        assert_eq!(
+            after.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        after.process_output(
+            b"\x1b]7501;state=idle\x07\x1b]0;019f95d7-db31-7db0-904d-9e08330e0002 | Ready\x07",
+        );
+        let switched = after.program_status_snapshot();
+        assert_eq!(after.binding_revision(), 2);
+        assert_eq!(switched.root, None);
+        assert_eq!(switched.idle_completions, 0);
+        after.kill();
+    }
+
+    #[test]
+    fn shell_prompt_retires_busy_program_status_in_the_terminal_drain() {
+        let (session, _receiver) = fixture();
+        session.process_output(b"\x1b]7501;state=blocked\x07\x1b]133;A\x07");
+        assert_eq!(session.program_status_snapshot().root, None);
+        session.process_output(b"\x1b]7501;state=done\x07\x1b]133;A\x07");
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Done
+        );
+        session.kill();
+    }
+
+    #[test]
     fn program_status_root_overrides_visible_fallback_until_clear_or_exit() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
@@ -4218,7 +4305,9 @@ mod provider_switch_tests {
         let switched = SystemTime::now() - Duration::from_secs(5);
         session.provider_switched_at(switched, switched, switched);
         session.test_program_status(b"\x1b]7501;state=idle\x07");
-        assert!(session.runtime_evidence(None).settling);
+        // The test helper now uses the production output parser, so the new
+        // report itself is fresh evidence after the out-of-band switch.
+        assert!(!session.runtime_evidence(None).settling);
         runtime.reconcile(
             &session,
             TitleProvider::Codex,
@@ -4262,6 +4351,86 @@ mod provider_switch_tests {
             now + Duration::from_millis(5),
         );
         assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+        session.kill();
+    }
+
+    #[test]
+    fn protocol_idle_is_authoritative_except_for_codex_current_binding_work() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.mark_turn_submitted();
+        session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, now);
+        let cancelled = runtime.snapshot(&session);
+        assert_eq!(cancelled.status, AgentStatus::Idle);
+        assert_eq!(cancelled.completion_revision, 0);
+
+        // A fallback Working title is not PSP Working evidence. Even when it
+        // precedes the Idle report in the same drain, it cannot finish a turn.
+        session.process_output("\x1b]0;◐ Task\x07\x1b]7501;state=idle\x07".as_bytes());
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(1),
+        );
+        let idle = runtime.snapshot(&session);
+        assert_eq!(idle.status, AgentStatus::Idle);
+        assert_eq!(idle.completion_revision, 0);
+        session.kill();
+    }
+
+    #[test]
+    fn consecutive_coalesced_codex_turns_have_distinct_completion_revisions() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.mark_turn_submitted();
+        for expected in [1, 2] {
+            session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(expected),
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, AgentStatus::Done);
+            assert_eq!(snapshot.completion_revision, expected);
+        }
+        session.kill();
+    }
+
+    #[test]
+    fn program_working_blocked_done_has_one_completion_revision() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.mark_turn_submitted();
+        for (wire, status, completion_revision) in [
+            (
+                b"\x1b]7501;state=working\x07".as_slice(),
+                AgentStatus::Working,
+                0,
+            ),
+            (
+                b"\x1b]7501;state=blocked\x07".as_slice(),
+                AgentStatus::Blocked,
+                0,
+            ),
+            (b"\x1b]7501;state=done\x07".as_slice(), AgentStatus::Done, 1),
+        ] {
+            session.test_program_status(wire);
+            runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, now);
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, status);
+            assert_eq!(snapshot.completion_revision, completion_revision);
+        }
         session.kill();
     }
 

@@ -3,6 +3,7 @@
 //! and mode reports) back to the child. Every other query is answered on the
 //! PTY reader thread — see `replies`.
 
+use crate::program_status::ProgramStatusSnapshot;
 use crate::replies::Replies;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
@@ -336,6 +337,8 @@ pub(crate) struct MuxelListener {
     /// publishes a different UUID-shaped thread (or the app reports a switch);
     /// ordinary spinner/title frames for the same conversation do not churn it.
     pub evidence: Arc<Mutex<LifecycleEvidence>>,
+    /// Cleared at a title-driven conversation boundary in VTE output order.
+    pub program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
     /// use it to distinguish a repeated title event from an unchanged snapshot.
     pub title_generation: Arc<AtomicU64>,
@@ -387,6 +390,7 @@ impl EventListener for MuxelListener {
                         if evidence.begin_binding(seq).bell {
                             self.bell.store(false, Ordering::Relaxed);
                         }
+                        self.program_status.lock().clear_binding();
                     }
                 }
                 *self.title.lock() = Some(title);
@@ -445,6 +449,7 @@ mod tests {
             ))))),
             title: Arc::new(Mutex::new(None)),
             evidence: Arc::new(Mutex::new(LifecycleEvidence::default())),
+            program_status: Arc::new(Mutex::new(ProgramStatusSnapshot::default())),
             title_generation: Arc::new(AtomicU64::new(0)),
             title_changed_at: Arc::new(Mutex::new(None)),
             session_id_hint: hint.clone(),

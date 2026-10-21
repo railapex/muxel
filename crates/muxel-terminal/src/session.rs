@@ -9,7 +9,7 @@
 use crate::colors::TerminalPalette;
 use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
 use crate::profile;
-use crate::program_status::ProgramStatusSnapshot;
+use crate::program_status::{Event as ProgramStatusEvent, ProgramStatusSnapshot, Scanner};
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -897,6 +897,7 @@ pub struct TerminalSession {
     pub id: Uuid,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    program_status_scanner: Mutex<Scanner>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1321,12 +1322,8 @@ impl TerminalSession {
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
         let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
-        let immediate_replies = ImmediateReplies::new(
-            replies.clone(),
-            palette.clone(),
-            &term_config,
-            program_status.clone(),
-        );
+        let immediate_replies =
+            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1395,6 +1392,7 @@ impl TerminalSession {
             replies,
             title: title.clone(),
             evidence: evidence.clone(),
+            program_status: program_status.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
@@ -1414,6 +1412,7 @@ impl TerminalSession {
             id: Uuid::new_v4(),
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            program_status_scanner: Mutex::new(Scanner::default()),
             writer,
             master,
             output_queue,
@@ -1497,13 +1496,45 @@ impl TerminalSession {
     fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
+        let mut status_scanner = self.program_status_scanner.lock();
         let mut parsed = false;
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
             }
             self.evidence.lock().begin_read(read_at);
-            processor.advance(&mut *term, bytes);
+            let mut start = 0;
+            for (index, &byte) in bytes.iter().enumerate() {
+                let Some(event) = status_scanner.advance(byte) else {
+                    continue;
+                };
+                if matches!(event, ProgramStatusEvent::Query) {
+                    continue;
+                }
+                // Apply the VTE span before the PSP event at its final byte.
+                // A title before this report opens its binding first; a title
+                // after it will clear the record when that span is parsed.
+                processor.advance(&mut *term, &bytes[start..=index]);
+                start = index + 1;
+                match event {
+                    ProgramStatusEvent::Report(report) => {
+                        if report.id.is_none() {
+                            log::debug!(
+                                "program status source=osc7501 report state={:?} kind={:?}",
+                                report.state,
+                                report.kind
+                            );
+                        }
+                        self.program_status.lock().apply(report);
+                    }
+                    ProgramStatusEvent::Reset => self.program_status.lock().clear(),
+                    ProgramStatusEvent::ShellPrompt => self.program_status.lock().shell_prompt(),
+                    ProgramStatusEvent::Query => unreachable!(),
+                }
+            }
+            if start < bytes.len() {
+                processor.advance(&mut *term, &bytes[start..]);
+            }
             parsed = true;
         }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
@@ -2337,7 +2368,7 @@ impl TerminalSession {
     ) {
         let evidence = &mut *self.evidence.lock();
         let switch = evidence.switch_binding(from, to, learned_at);
-        self.program_status.lock().clear();
+        self.program_status.lock().clear_binding();
         if switch.bell {
             self.bell.store(false, Ordering::Relaxed);
         }
@@ -2368,13 +2399,7 @@ impl TerminalSession {
 
     #[cfg(test)]
     pub(crate) fn test_program_status(&self, wire: &[u8]) {
-        use crate::program_status::{Event, Scanner};
-        let mut scanner = Scanner::default();
-        for &byte in wire {
-            if let Some(Event::Report(report)) = scanner.advance(byte) {
-                self.program_status.lock().apply(report);
-            }
-        }
+        self.process_output(wire);
         self.trigger_runtime();
     }
 

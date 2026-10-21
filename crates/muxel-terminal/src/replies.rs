@@ -13,9 +13,7 @@
 
 use crate::colors::{TerminalPalette, index_to_rgb};
 use crate::listener::SharedWriter;
-use crate::program_status::{
-    CAPABILITY_REPLY, Event as ProgramStatusEvent, ProgramStatusSnapshot, Scanner,
-};
+use crate::program_status::{CAPABILITY_REPLY, Event as ProgramStatusEvent, Scanner};
 use alacritty_terminal::term::{Config as TermConfig, Osc52};
 use alacritty_terminal::vte::ansi::{Handler, Mode, PrivateMode, Processor, Timeout};
 use parking_lot::Mutex;
@@ -125,7 +123,6 @@ pub(crate) struct ImmediateReplies {
     parser: Processor<Unsynchronized>,
     handler: ReplyHandler,
     program_status_scanner: Scanner,
-    program_status: Arc<Mutex<ProgramStatusSnapshot>>,
 }
 
 impl ImmediateReplies {
@@ -135,12 +132,10 @@ impl ImmediateReplies {
         replies: Arc<Replies>,
         palette: Arc<Mutex<TerminalPalette>>,
         config: &TermConfig,
-        program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     ) -> Self {
         Self {
             parser: Processor::new(),
             program_status_scanner: Scanner::default(),
-            program_status,
             handler: ReplyHandler {
                 replies,
                 palette,
@@ -167,17 +162,9 @@ impl ImmediateReplies {
                     log::debug!("program status source=osc7501 query; sending capability answer");
                     self.handler.replies.send(CAPABILITY_REPLY.to_owned());
                 }
-                ProgramStatusEvent::Report(report) => {
-                    if report.id.is_none() {
-                        log::debug!(
-                            "program status source=osc7501 report state={:?} kind={:?}",
-                            report.state,
-                            report.kind
-                        );
-                    }
-                    self.program_status.lock().apply(report);
-                }
-                ProgramStatusEvent::Reset => self.program_status.lock().clear(),
+                ProgramStatusEvent::Report(_)
+                | ProgramStatusEvent::Reset
+                | ProgramStatusEvent::ShellPrompt => {}
             }
         }
         if start < bytes.len() {
@@ -280,7 +267,7 @@ mod tests {
     use super::{ImmediateReplies, Replies, SECONDARY_DA};
     use crate::colors::{TerminalPalette, index_to_rgb};
     use crate::listener::MuxelListener;
-    use crate::program_status::{CAPABILITY_REPLY, ProgramStatusSnapshot};
+    use crate::program_status::CAPABILITY_REPLY;
     use crate::session::term_config;
     use alacritty_terminal::event::{Event, EventListener};
     use alacritty_terminal::term::Term;
@@ -335,17 +322,14 @@ mod tests {
                 evidence: Default::default(),
                 title: Default::default(),
                 title_generation: Default::default(),
+                program_status: Default::default(),
                 title_changed_at: Default::default(),
                 session_id_hint: Default::default(),
                 bell: Default::default(),
                 clipboard_store: Default::default(),
             };
-            let reader = ImmediateReplies::new(
-                replies,
-                Arc::new(Mutex::new(palette())),
-                &term_config(),
-                Arc::new(Mutex::new(ProgramStatusSnapshot::default())),
-            );
+            let reader =
+                ImmediateReplies::new(replies, Arc::new(Mutex::new(palette())), &term_config());
             let term = Term::new(term_config(), &TermSize::new(80, 24), listener);
             Self {
                 reader,
@@ -475,6 +459,13 @@ mod tests {
             pipeline.drain(wire),
             format!("\x1b[1;1R{CAPABILITY_REPLY}\x1b[?6c")
         );
+    }
+
+    #[test]
+    fn interrupted_dcs_then_ris_restores_capability_queries() {
+        let mut pipeline = Pipeline::new();
+        assert_eq!(pipeline.read(b"\x1bPunterminated\x1b"), "");
+        assert_eq!(pipeline.read(b"c\x1b]7501;?\x07"), CAPABILITY_REPLY);
     }
 
     #[test]
