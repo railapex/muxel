@@ -2,12 +2,13 @@
 //! no wall clock, socket, persistence or UI belongs here.
 
 use super::{Error, ErrorCode, Response};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CreationPolicy {
     #[default]
@@ -16,32 +17,70 @@ pub enum CreationPolicy {
     Allow,
 }
 
-impl<'de> Deserialize<'de> for CreationPolicy {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum Named {
-            Off,
-            Ask,
-            Allow,
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Saved {
-            Legacy(bool),
-            Named(Named),
-        }
-        Ok(match Saved::deserialize(de)? {
-            Saved::Legacy(false) | Saved::Named(Named::Off) => Self::Off,
-            Saved::Named(Named::Ask) => Self::Ask,
-            Saved::Legacy(true) | Saved::Named(Named::Allow) => Self::Allow,
-        })
+/// Render metadata literally rather than letting a value insert rows, reorder
+/// surrounding labels with bidi controls, or hide characters in the card.
+pub fn escape_approval_value(value: &str) -> String {
+    escape_card_text(value, false)
+}
+
+/// Keep the complete prompt readable over multiple lines. Other controls and
+/// invisible format characters remain visible as escape sequences.
+pub fn escape_approval_prompt(value: &str) -> String {
+    escape_card_text(value, true)
+}
+
+fn escape_card_text(value: &str, multiline: bool) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        escaped.extend(approval_characters(ch, multiline));
     }
+    escaped
+}
+
+fn approval_characters(ch: char, multiline: bool) -> impl Iterator<Item = char> {
+    let literal = ((ch == '\n' && multiline)
+        || (!matches!(
+            ch.general_category(),
+            GeneralCategory::Control
+                | GeneralCategory::Format
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+        ) && !matches!(ch, '\\' | '"')))
+    .then_some(ch);
+    let escaped = literal.is_none().then(|| ch.escape_default());
+    literal.into_iter().chain(escaped.into_iter().flatten())
+}
+
+/// A short preview and the number of source lines whose text remains hidden.
+/// A line cut by the character cap counts as one more line too.
+pub fn approval_prompt_summary(prompt: &str) -> (String, usize) {
+    let mut lines = prompt.lines().skip_while(|line| line.trim().is_empty());
+    let mut text = String::new();
+    let mut remaining_chars = 600;
+    for index in 0..3 {
+        let Some(line) = lines.next() else {
+            return (text, 0);
+        };
+        if index > 0 {
+            text.push('\n');
+        }
+        let mut chars = line.chars().flat_map(|ch| approval_characters(ch, false));
+        for ch in chars.by_ref().take(remaining_chars) {
+            text.push(ch);
+            remaining_chars -= 1;
+        }
+        if chars.next().is_some() {
+            return (text, 1 + lines.count());
+        }
+    }
+    (text, lines.count())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchClass {
+    /// A terminal preset whose program is a recognized built-in agent.
     Preset,
+    /// Any other configured program, including shells and custom commands.
     Shell,
     Literal,
 }

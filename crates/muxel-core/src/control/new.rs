@@ -5,6 +5,7 @@ use crate::pane::{PaneNode, add_tab, set_active_tab, split};
 use crate::{AgentPreset, Instance, PresetKind, Project, SplitDirection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,25 @@ pub struct NewOptions {
 impl NewOptions {
     /// Also checked by the server: callers may send JSON without using the CLI.
     pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("from", &self.from), ("name", &self.name)] {
+            if let Some(value) = value
+                && (value.trim().is_empty()
+                    || value.chars().take(129).count() > 128
+                    || value.chars().any(|ch| {
+                        matches!(
+                            ch.general_category(),
+                            GeneralCategory::Control
+                                | GeneralCategory::Format
+                                | GeneralCategory::LineSeparator
+                                | GeneralCategory::ParagraphSeparator
+                        )
+                    }))
+            {
+                return Err(format!(
+                    "--{name} needs 1–128 characters without Unicode control, format or line separators"
+                ));
+            }
+        }
         for (name, value) in [("model", &self.model), ("effort", &self.effort)] {
             if let Some(value) = value
                 && (value.is_empty()

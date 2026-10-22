@@ -134,7 +134,7 @@ feature is added or changed, update the matching entry here in the same change**
   (via a CLI flag or by typing it in at startup), and a runner startup delay
   (ms to wait after the agent's first output before a runner types — for slow
   starters like opencode, and for Grok, whose animated welcome screen never goes
-  quiet; 0 = auto-wait until output goes quiet).
+  quiet; 0 = auto-wait until output goes quiet, with a 30-second cap).
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
   automatically once installed. A GUI launch reconstructs the bin dirs the desktop
@@ -443,7 +443,7 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
-- **Provider startup input** — typed startup tasks wait for Claude's editable
+- **Provider startup input** — controller-owned startup tasks wait for Claude's editable
   composer and bracketed-paste mode, Codex's live editor and Ready title, or
   Grok's semantic idle state after its configured startup delay.
   Codex folder-trust menus receive no task input; readiness failure leaves the
@@ -460,6 +460,14 @@ feature is added or changed, update the matching entry here in the same change**
   protocol (including Muse) refuse controller startup tasks without typing.
   Input stops if the pane is replaced, someone types, the writer fails, or
   readiness times out; it never replays a submitted task automatically.
+  On muxel's own tmux servers, the active pane's full title is forwarded to
+  attached clients, so Codex and Grok readiness works through tmux as well.
+  Imported default-server sessions retain that server's title configuration;
+  missing readiness refuses controller tasks there. UI runners, loops and TypeIn
+  presets keep their configured delay or quiet-output wait, typing at the
+  30-second cap even if output never settles. Missing readiness or reaching the
+  cap shows a notice in the terminal; failed or interrupted startup input also
+  shows a notice. These launches do not require the controller readiness protocol.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy.
@@ -603,20 +611,21 @@ feature is added or changed, update the matching entry here in the same change**
   `--name` names the tab, `--split right|down` creates a pane.
   Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
-  the new pane and activates its window. `--background` remains accepted as a
+  the new pane, raising its window only after click approval. `--background` remains accepted as a
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`
   field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
   the separate **Outside terminal creation** policy in Settings → Grok Bot.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
-  opens configured non-shell terminal presets. All literal argv, including agent argv, and shell-classified
+  opens configured terminal presets whose program is a recognized built-in agent provider.
+  All literal argv, including agent argv, and shell or unrecognized-program
   presets/defaults also require "Also allow typing into shell panes". Configured
-  non-literal presets not classified as shells need only the first two grants.
-  Literal argv and shell presets always Ask, even under Allow. All three grants
+  non-literal recognized agent presets need only the first two grants.
+  Literal argv and shell or unrecognized-program presets always Ask, even under Allow. All three grants
   default off; upgrades do not infer creation permission from older
   control/command grants. Users enable the required settings themselves.
-  The existing shell/non-shell classifier is a soft policy for trusted configured
-  presets, not an executable allowlist.
+  Creating panes for ssh, wsl.exe, python, node and custom executables requires
+  the shell grant and a click. Existing-pane writes require the shell grant too.
   Commands run as the host muxel process with its permissions and environment,
   outside the caller's sandbox; coding agents and configurable presets are not a
   security sandbox. Creation is checked at admission and rechecked at mutation
@@ -642,8 +651,11 @@ feature is added or changed, update the matching entry here in the same change**
   Ask answers admission immediately with a pending request UUID; the CLI polls
   once a second and prints the final reply. `--no-wait` returns the pending ID for
   scripts to poll with `ctl new-status ID`. The floating card shows declared
-  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), preset, cwd,
-  pane name and the prompt's first lines, or full literal argv. Long details
+  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), destination
+  project, preset, cwd, pane name and the prompt's first nonblank lines, with an
+  omitted-line count, or full literal argv. The full prompt is available in the
+  scrolling details. Labels and pane names have bounded lengths and reject
+  control, format and line-separator characters; displayed values are escaped. Long details
   scroll, with literal arguments shown one per line, including empty arguments.
   Labels are not authenticated identities. **Allow once** / **Deny** require
   mouse clicks. Both buttons stay disabled for 750 ms after each card appears,
@@ -663,8 +675,7 @@ feature is added or changed, update the matching entry here in the same change**
   Finished replies remain available for ten minutes (latest 256); at most 64
   approvals wait, and approvals do not survive a host restart. Creation requests
   use protocol v2, or v3 when selecting model/effort, so older hosts refuse
-  unsupported fields. Old saved bool
-  creation settings load false as Off and true as Allow.
+  unsupported fields.
   Turning creation off leaves existing panes and typing permissions unchanged
   and does not cancel launches already admitted for spawning. Deferred requests
   still recheck the current grant. Human toolbar creation is unaffected.
@@ -685,8 +696,10 @@ feature is added or changed, update the matching entry here in the same change**
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
-  and panes classified as shells.
-  Configured non-literal agents remain controllable while outside control is on;
+  and programs outside the recognized built-in agent providers.
+  A recognized agent that fails to launch and falls back to a shell also requires
+  the shell-input grant, even though its saved preset still names the agent.
+  Configured non-literal recognized agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
   Revocation does not stop processes

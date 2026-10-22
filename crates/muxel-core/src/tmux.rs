@@ -572,11 +572,30 @@ pub fn session_by_suffix(sessions: &[RemoteSession], instance: Uuid) -> Option<&
 /// in its argv. The desktop restores `exit-empty on` when it quits.
 ///
 /// Ported to Swift as `TmuxCommands.startServer()` — keep both in step.
+/// Owned servers also forward the active pane's complete OSC title to attached
+/// clients. Imported sessions on the default server retain their own settings.
 pub fn start_server_args() -> Vec<String> {
-    ["start-server", ";", "set", "-s", "exit-empty", "off"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "start-server",
+        ";",
+        "set",
+        "-s",
+        "exit-empty",
+        "off",
+        ";",
+        "set",
+        "-g",
+        "set-titles",
+        "on",
+        ";",
+        "set",
+        "-g",
+        "set-titles-string",
+        "#{pane_title}",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Arguments for `tmux …` to hand `exit-empty` back, so the server exits with its
@@ -884,7 +903,24 @@ mod tests {
     fn start_server_args_name_no_project_and_keep_the_server_alive() {
         assert_eq!(
             start_server_args(),
-            vec!["start-server", ";", "set", "-s", "exit-empty", "off"]
+            vec![
+                "start-server",
+                ";",
+                "set",
+                "-s",
+                "exit-empty",
+                "off",
+                ";",
+                "set",
+                "-g",
+                "set-titles",
+                "on",
+                ";",
+                "set",
+                "-g",
+                "set-titles-string",
+                "#{pane_title}"
+            ]
         );
         assert_eq!(
             restore_exit_empty_args(),
@@ -893,7 +929,10 @@ mod tests {
         // The server's command line names its socket, and must not name muxel
         // either: a `pkill -f muxel` would take every agent down with it.
         let server = Socket::Private.argv(start_server_args()).join(" ");
-        assert_eq!(server, "-L mxl start-server ; set -s exit-empty off");
+        assert_eq!(
+            server,
+            "-L mxl start-server ; set -s exit-empty off ; set -g set-titles on ; set -g set-titles-string #{pane_title}"
+        );
         assert!(!server.contains("muxel"), "{server}");
     }
 

@@ -19,8 +19,41 @@ final class AgentLaunchTests: XCTestCase {
         XCTAssertNotNil(json["instruction_injection"])
         let launch = AgentLaunch.resolveLaunch(restored)
         XCTAssertEqual(launch.args, original.args)
-        XCTAssertEqual(launch.startupInput, "/or-spar 20689")
-        XCTAssertTrue(launch.submit)
+        XCTAssertNil(launch.startupInput)
+        XCTAssertFalse(launch.submit)
+    }
+
+    func testRefusedCtlTaskHasNoPhoneStartupInputWithoutOutsideOrigin() {
+        // The task marker is sufficient, even for an older write-back that lost
+        // the outside-origin field or a task whose approval never completed.
+        var blocked = inst(prompt: "unconsumed task", injection: .typeIn)
+        blocked.controlPrompt = true
+        blocked.autoSubmit = true
+        XCTAssertFalse(blocked.controlCreated)
+        let launch = AgentLaunch.resolveLaunch(blocked)
+        XCTAssertNil(launch.startupInput)
+        XCTAssertFalse(launch.submit)
+    }
+
+    func testRestoredCtlTaskCannotBecomeCliFlagOrTypedInput() throws {
+        for started in [false, true] {
+            for injection in [InjectionMode.typeIn, .cliFlag(flag: "--append-system-prompt")] {
+                var saved = inst(args: ["--model", "sonnet"], prompt: "unconsumed task",
+                                 injection: injection, sessionId: "saved-session", started: started)
+                saved.controlPrompt = true
+                saved.controlCreated = true
+                saved.autoSubmit = true
+                let restored = try JSONDecoder().decode(Instance.self, from: JSONEncoder().encode(saved))
+                let launch = AgentLaunch.resolveLaunch(restored)
+                XCTAssertEqual(launch.args, saved.args)
+                XCTAssertNil(launch.startupInput)
+                XCTAssertFalse(launch.submit)
+                let claude = try XCTUnwrap(AgentLaunch.builtinPreset(for: restored))
+                XCTAssertEqual(AgentLaunch.sessionResumeArgs(preset: claude, instance: restored),
+                               [started ? "--resume" : "--session-id", "saved-session"])
+                XCTAssertEqual(restored.systemPrompt, saved.systemPrompt)
+            }
+        }
     }
 
     func testLegacyTaskDefaultsToNoSeparateInstructionTransport() throws {
@@ -37,6 +70,8 @@ final class AgentLaunchTests: XCTestCase {
                             injection: .typeIn, sessionId: "old-session", started: true)
         original.literalArgv = true
         original.launchDir = "/srv/external"
+        original.controlCreated = true
+        original.instructionInjection = .cliFlag(flag: "--append-system-prompt")
         let data = try JSONEncoder().encode(original)
         let restored = try JSONDecoder().decode(Instance.self, from: data)
         XCTAssertEqual(restored, original)

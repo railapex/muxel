@@ -95,6 +95,60 @@ final class LiteralLifecycleTests: XCTestCase {
         XCTAssertEqual(copy.tmuxSocket, TmuxCommands.socketName)
     }
 
+    func testDuplicateCtlTaskStripsUnconsumedTextBeforeClearingOrigin() async throws {
+        for consumed in [false, true] {
+            let state = TestFixtures.makeState()
+            let (_, project) = TestFixtures.seedProject(state)
+            var original = pane(project, literal: false)
+            original.program = "claude"
+            original.controlCreated = true
+            original.controlPrompt = true
+            original.isRunner = true
+            original.systemPrompt = consumed ? nil : "outside task must not replay"
+            original.autoSubmit = !consumed
+            original.injection = .typeIn
+            original.instructionInjection = .cliFlag(flag: "--append-system-prompt")
+            let remote = install([original], state: state, project: project)
+
+            await state.duplicate(original, in: project)
+
+            let copy = try XCTUnwrap(remote.layout.instances.first { $0.id != original.id })
+            XCTAssertFalse(copy.controlCreated)
+            XCTAssertFalse(copy.controlPrompt)
+            XCTAssertNil(copy.systemPrompt)
+            XCTAssertFalse(copy.autoSubmit)
+            XCTAssertNil(copy.instructionInjection)
+            XCTAssertEqual(copy.injection, .cliFlag(flag: "--append-system-prompt"))
+            XCTAssertEqual(copy.launchDir, original.launchDir)
+            let launch = AgentLaunch.resolveLaunch(copy)
+            XCTAssertNil(launch.startupInput)
+            XCTAssertFalse(launch.submit)
+            XCTAssertFalse(launch.args.contains("outside task must not replay"))
+            XCTAssertEqual(remote.layout.instances.first { $0.id == original.id }, original)
+        }
+    }
+
+    func testDuplicateOrdinaryPresetPreservesInstructionPromptAndTransport() async throws {
+        for injection in [InjectionMode.typeIn, .cliFlag(flag: "--append-system-prompt")] {
+            let state = TestFixtures.makeState()
+            let (_, project) = TestFixtures.seedProject(state)
+            var original = pane(project, literal: false)
+            original.program = "claude"
+            original.systemPrompt = "ordinary preset instructions"
+            original.injection = injection
+            original.autoSubmit = true
+            let before = AgentLaunch.resolveLaunch(original)
+            let remote = install([original], state: state, project: project)
+
+            await state.duplicate(original, in: project)
+
+            let copy = try XCTUnwrap(remote.layout.instances.first { $0.id != original.id })
+            XCTAssertEqual(copy.systemPrompt, original.systemPrompt)
+            XCTAssertEqual(copy.injection, original.injection)
+            XCTAssertEqual(AgentLaunch.resolveLaunch(copy), before)
+        }
+    }
+
     func testCloseLiteralRemovesLayoutWithoutProbingOrKillingMatchingSession() async {
         let state = TestFixtures.makeState()
         let (_, project) = TestFixtures.seedProject(state)

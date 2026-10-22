@@ -23,7 +23,8 @@ pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnStat
 mod approval;
 pub use approval::{
     APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
-    LaunchClass, PendingApproval, creation_decision, creation_refusal,
+    LaunchClass, PendingApproval, approval_prompt_summary, creation_decision, creation_refusal,
+    escape_approval_prompt, escape_approval_value,
 };
 
 /// Endpoint and plain-request version. Guards and plain creation require v2.
@@ -1057,7 +1058,7 @@ usage: muxel ctl <command> [args]
   new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
               [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
-                                 open in background; --focus selects and raises;
+                                 open in background; --focus selects, raises only after click approval;
                                  --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
@@ -1077,8 +1078,8 @@ AGENT is an id from `panes`, a name, project/name, or `focused`.
 Everything after `--` is taken literally (for text that starts with --).
 For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
 ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
-Ask requires a click for every request. Allow covers configured non-shell terminal presets.
-Literal argv and shell presets always Ask; the click card never takes keyboard focus.
+Ask requires a click for every request. Allow covers recognized built-in agent programs in terminal presets.
+Literal argv and other programs require the shell grant and always Ask; the click card never takes keyboard focus.
 Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
 Both mouse-down and release must belong to that same armed card.
 `--prompt` submits a user task through the one-shot runner path, once on first launch; only non-shell terminal presets support it.
@@ -1409,18 +1410,16 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   Prompts for literal, shell and browser launches receive
   `prompt_unsupported`. Creation preserves the selected tab, focus, project and
   window by default, without raising the window. `--focus` selects the new pane
-  and activates its window. `--background` is accepted as a compatibility no-op,
+  and raises its window only after click approval. `--background` is accepted as a compatibility no-op,
   including alongside `--focus`. JSON callers use `focus` (default false);
   the legacy `background` field remains accepted and does not control focus.
   Every `new` request requires outside control plus Settings > Grok Bot >
   Outside terminal creation set to Ask or Allow. Ask requires a click for every
-  request; Allow permits configured non-shell terminal presets. All literal argv,
-  even an agent
-  executable, and shell presets/defaults additionally require "Also allow typing
-  into shell panes". Configured non-literal presets not classified as shells need
-  only the first two grants. Literal argv and shell presets always Ask, even
-  under Allow. The existing shell/non-shell classifier is a soft
-  policy for trusted configured presets, not an executable allowlist.
+  request; Allow permits terminal presets running recognized built-in agent
+  programs. All literal argv, even an agent executable, and other programs
+  (including ssh, wsl.exe, python, node and custom commands) additionally require
+  "Also allow typing into shell panes" and always Ask, even under Allow.
+  Existing-pane writes use the same recognized-program rule when that grant is off.
   All three permissions default off; upgrades leave creation off even if both
   older grants are on. Ask the user to enable the required settings themselves.
   Ask returns `{ "pending": true, "request_id": "UUID" }` immediately, without
@@ -1439,6 +1438,9 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   keyboard focus, and shows the waiting count in FIFO order. `--from LABEL` and
   the caller's MUXEL_INSTANCE_ID are displayed as declared information, not
   authenticated identity (the token is the whole authorization).
+  `--from` and `--name` take 1–128 characters without Unicode control, format or
+  line-separator characters. The card escapes values and shows the full prompt
+  in its scrolling details; its summary reports how many more lines remain.
   Final replies remain available for ten minutes, bounded to the latest 256;
   up to 64 approvals may wait. Approvals are runtime-only and do not survive a
   host restart. Plain creation and status requests use protocol v2; creation with

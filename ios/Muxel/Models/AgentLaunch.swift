@@ -32,7 +32,10 @@ enum AgentLaunch {
     /// Resolve an instance into program/args + any TypeIn startup input, applying its
     /// system-prompt injection mode. Port of `resolve_launch`.
     static func resolveLaunch(_ instance: Instance) -> ResolvedLaunch {
-        if instance.literalArgv {
+        // Only the desktop's live ctl startup owner can dispatch this task.
+        // Shared metadata survives refused launches and restarts; attaching on
+        // the phone must never replay it, through TypeIn or a CLI flag.
+        if instance.literalArgv || instance.controlPrompt {
             return ResolvedLaunch(program: instance.program, args: instance.args,
                                   startupInput: nil, submit: false)
         }

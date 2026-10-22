@@ -216,6 +216,13 @@ impl MuxelApp {
         let preview = &request.preview;
         let mut details = vec![
             (
+                t("Project"),
+                self.workspace
+                    .project(request.pid)
+                    .map(|project| project.name.clone())
+                    .unwrap_or_default(),
+            ),
+            (
                 t("Caller (declared)"),
                 request
                     .options
@@ -277,19 +284,28 @@ impl MuxelApp {
                 serde_json::to_string_pretty(argv).unwrap_or_default(),
             ));
         }
-        if let Some(prompt) = &request.options.prompt {
-            details.push((
-                t("Prompt (first lines)"),
-                prompt
-                    .lines()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .chars()
-                    .take(600)
-                    .collect(),
-            ));
-        }
+        let prompt_summary = request.options.prompt.as_deref().map(|prompt| {
+            let (text, remaining) = ctl::approval_prompt_summary(prompt);
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t("Prompt summary")),
+                )
+                .child(div().text_sm().child(text))
+                .when(remaining > 0, |summary| {
+                    let more = if remaining == 1 {
+                        t("1 more line").to_string()
+                    } else {
+                        tf("{count} more lines", &[("count", &remaining.to_string())])
+                    };
+                    summary.child(div().text_xs().child(more))
+                })
+        });
         let waiting = self.control_approvals.len().saturating_sub(1);
         let card = div()
             .id("control-approval")
@@ -327,7 +343,13 @@ impl MuxelApp {
                     .children(details.into_iter().map(|(label, value)| {
                         div().flex().flex_col().flex_none().gap_1()
                             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label))
-                            .child(div().text_sm().child(value))
+                            .child(div().text_sm().child(ctl::escape_approval_value(&value)))
+                    }))
+                    .children(prompt_summary)
+                    .children(request.options.prompt.as_deref().map(|prompt| {
+                        div().flex().flex_col().flex_none().gap_1()
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(t("Full prompt")))
+                            .child(div().text_sm().child(ctl::escape_approval_prompt(prompt)))
                     })),
             )
             .child(div().text_xs().child(tf(
