@@ -4857,6 +4857,41 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn completion_revision_survives_clear_or_exit_to_fallback() {
+        for exited in [false, true] {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            session.test_program_status(b"\x1b]7501;state=working\x07");
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.snapshot(&session).completion_revision, 0);
+            if exited {
+                session.test_program_status(b"\x1b]7501;state=done\x07");
+            } else {
+                session.test_program_status(b"\x1b]7501;state=done\x07\x1b]7501;state=clear\x07");
+            }
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                exited,
+                Instant::now(),
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.coverage, TerminalStatusCoverage::ProviderVisible);
+            assert_eq!(snapshot.completion_revision, 1);
+            session.kill();
+        }
+    }
+
+    #[test]
     fn program_working_blocked_done_has_one_completion_revision() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

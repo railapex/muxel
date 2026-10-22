@@ -1049,6 +1049,9 @@ struct SampleEffect {
     notify: Option<NotifKind>,
     /// A new completion, for auto-read.
     completed: bool,
+    /// Provider-owned completion even if a later clear or exit changed the
+    /// current status coverage before this sample was consumed.
+    program_completion: bool,
 }
 
 /// Apply one status sample to a pane's attention: the status recorded for it,
@@ -1078,12 +1081,11 @@ fn apply_status_sample(
             } => (true, notify, new_binding),
         };
     let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
-    let completion_pulse = coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus
-        && record
-            .filter(|seen| seen.binding == binding)
-            .map_or(completion_revision > 0, |seen| {
-                completion_revision > seen.completion_revision
-            });
+    let completion_pulse = record
+        .filter(|seen| seen.binding == binding)
+        .map_or(completion_revision > 0, |seen| {
+            completion_revision > seen.completion_revision
+        });
     *record = Some(SeenStatus {
         status,
         binding,
@@ -1134,6 +1136,7 @@ fn apply_status_sample(
         || (!completion_pulse
             && !new_binding
             && is_restored_transition(false, status, restored_state));
+    effect.program_completion = completion_pulse && !restored;
     effect.completed = (changed && status == AgentStatus::Done || completion_pulse) && !restored;
     effect.notify = if completion_pulse && status == AgentStatus::Done && !attended && !restored {
         Some(NotifKind::Done)
@@ -1148,7 +1151,9 @@ fn should_refresh_accomplishments_after_status(
     effect: SampleEffect,
     coverage: muxel_terminal::TerminalStatusCoverage,
 ) -> bool {
-    if coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus {
+    if effect.program_completion {
+        true
+    } else if coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus {
         effect.completed
     } else {
         effect.changed
@@ -1331,6 +1336,54 @@ mod status_attention_tests {
         assert!(effect.completed);
         assert_eq!(effect.notify, Some(NotifKind::Blocked));
         assert_eq!(activity.completed_at, Some(400));
+    }
+
+    #[test]
+    fn program_completion_survives_clear_or_exit_to_fallback_coverage() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            let mut record = Some(SeenStatus {
+                status: AgentStatus::Working,
+                binding,
+                coverage: TerminalStatusCoverage::ProgramStatus,
+                completion_revision: 0,
+            });
+            let mut activity = AgentActivity::default();
+            activity.observe(
+                Some(muxel_core::AgentActivityState::Idle),
+                muxel_core::AgentActivityState::Working,
+                100,
+            );
+            let sample = StatusSample {
+                status,
+                binding,
+                coverage: TerminalStatusCoverage::ProviderVisible,
+                completion_revision: 1,
+                attributable: true,
+                attended: false,
+                preserve_restored: false,
+            };
+            let previous = record;
+            let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+            assert!(effect.program_completion, "{status:?}");
+            assert!(effect.completed, "{status:?}");
+            assert!(should_refresh_accomplishments_after_status(
+                previous,
+                effect,
+                sample.coverage
+            ));
+            assert_eq!(activity.completed_at, Some(200));
+            let repeated = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+            assert!(!repeated.program_completion);
+            assert!(!should_refresh_accomplishments_after_status(
+                record,
+                repeated,
+                sample.coverage
+            ));
+        }
     }
 
     #[test]
