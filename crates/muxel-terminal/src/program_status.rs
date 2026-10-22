@@ -329,6 +329,12 @@ pub(crate) struct Observer {
     osc_generation: u64,
     osc_invalid_control: bool,
     discard_osc: bool,
+    pending_st: Option<PendingSt>,
+}
+
+struct PendingSt {
+    event: Event,
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -374,6 +380,9 @@ impl Observer {
     }
 
     pub(crate) fn advance_at(&mut self, byte: u8, fresh: bool, generation: u64) -> Option<Event> {
+        let confirmed_st = self.pending_st.take().and_then(|pending| {
+            (byte == b'\\' && fresh && pending.generation == generation).then_some(pending.event)
+        });
         let was_osc = self.osc_len > 0;
         // vte's std build grows its OSC Vec without a limit. This watchdog
         // follows only OSC entry and termination; it does not decode a second
@@ -390,7 +399,7 @@ impl Observer {
                 self.discard_osc = false;
                 self.parser = Parser::new();
             }
-            return None;
+            return confirmed_st;
         }
         if self.osc_len > 0 {
             self.osc_len += 1;
@@ -406,7 +415,7 @@ impl Observer {
                 if byte == 0x1b {
                     self.parser.advance(&mut ObservedEvent::default(), &[byte]);
                 }
-                return None;
+                return confirmed_st;
             }
             if matches!(byte, 0x1b | 0x07 | 0x18 | 0x1a) {
                 self.osc_len = 0;
@@ -421,8 +430,13 @@ impl Observer {
         let osc_attributable = self.osc_fresh && fresh && self.osc_generation == generation;
         let escape_attributable =
             self.escape_fresh && fresh && self.escape_generation == generation;
-        self.escape = byte == 0x1b;
-        if self.escape {
+        // VTE stays in Escape across C0 (apart from CAN/SUB), DEL, and
+        // unsupported high bytes. Keep that entry provenance so an OSC after
+        // ESC NUL ] still receives the same budget and binding boundary.
+        let escape = byte == 0x1b
+            || (self.escape && matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff));
+        self.escape = escape;
+        if byte == 0x1b {
             self.escape_fresh = fresh;
             self.escape_generation = generation;
         }
@@ -431,15 +445,22 @@ impl Observer {
             ..ObservedEvent::default()
         };
         self.parser.advance(&mut sink, &[byte]);
-        match sink.event {
+        let current = match sink.event {
             Some(Event::Title(title)) if completing_osc && osc_attributable => {
                 Some(Event::Title(title))
             }
             Some(Event::Reset) if escape_attributable => Some(Event::Reset),
             Some(Event::Query | Event::Report(_)) if self.osc_invalid_control => None,
+            Some(event @ (Event::Report(_) | Event::ShellPrompt))
+                if completing_osc && osc_attributable && byte == 0x1b =>
+            {
+                self.pending_st = Some(PendingSt { event, generation });
+                None
+            }
             Some(event) if completing_osc && osc_attributable => Some(event),
             _ => None,
-        }
+        };
+        confirmed_st.or(current)
     }
 }
 
@@ -664,6 +685,53 @@ mod tests {
                 .is_empty()
         );
         assert!(observed(b"\x1b]7501;sta\x01te=working\x07").is_empty());
+    }
+
+    #[test]
+    fn ignored_bytes_in_escape_cannot_bypass_the_osc_budget() {
+        for ignored in [0x00, 0x7f, 0x80] {
+            let mut observer = Observer::default();
+            for byte in [0x1b, ignored, b']', b'0', b';'] {
+                assert_eq!(observer.advance(byte), None);
+            }
+            assert!(observer.osc_len > 0, "ignored={ignored:#x}");
+            for byte in std::iter::repeat_n(b'A', 5000) {
+                assert_eq!(observer.advance(byte), None);
+            }
+            assert!(observer.discard_osc, "ignored={ignored:#x}");
+            assert_eq!(observer.advance(0x07), None);
+            let recovered = b"\x1b]7501;state=idle\x07"
+                .iter()
+                .filter_map(|byte| observer.advance(*byte))
+                .collect::<Vec<_>>();
+            assert!(
+                matches!(recovered.as_slice(), [Event::Report(report)] if report.state == ProgramState::Idle)
+            );
+        }
+    }
+
+    #[test]
+    fn reports_wait_for_the_second_byte_of_st() {
+        let mut observer = Observer::default();
+        for byte in b"\x1b]7501;state=done\x1b" {
+            assert_eq!(observer.advance(*byte), None);
+        }
+        for byte in b"[2J" {
+            assert_eq!(observer.advance(*byte), None);
+        }
+        for byte in b"\x1b]7501;state=blocked\x1b" {
+            assert_eq!(observer.advance(*byte), None);
+        }
+        assert!(
+            matches!(observer.advance(b'\\'), Some(Event::Report(report)) if report.state == ProgramState::Blocked)
+        );
+
+        let mut observer = Observer::default();
+        for byte in b"\x1b]7501;state=done\x1b" {
+            assert_eq!(observer.advance_at(*byte, true, 1), None);
+        }
+        assert_eq!(observer.advance_at(b'\\', true, 2), None);
+        assert_eq!(observed(b"\x1b]7501;state=done\x07").len(), 1);
     }
 
     fn events(bytes: &[u8]) -> Vec<Event> {

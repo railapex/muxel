@@ -4540,6 +4540,29 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn incomplete_st_cannot_replace_the_current_program_status() {
+        let (session, _receiver) = fixture();
+        session.test_program_status(b"\x1b]7501;state=working\x07");
+        session.test_program_status(b"\x1b]7501;state=done\x1b");
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.test_program_status(b"[2J");
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.test_program_status(b"\x1b]7501;state=done\x1b");
+        session.test_program_status(b"\\");
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Done
+        );
+        session.kill();
+    }
+
+    #[test]
     fn codex_idle_after_working_finishes_only_an_armed_turn_and_resets_on_resume() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
