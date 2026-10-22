@@ -2,8 +2,8 @@
 //! files and process enumeration are read by the background task below.
 
 use super::{
-    MuxelApp, PaneView, home_dir, is_claude_program, is_codex_program, is_grok_program,
-    validated_codex_session_id,
+    MuxelApp, NotifKind, PaneView, home_dir, is_claude_program, is_codex_program, is_grok_program,
+    launch_token_current, session_id_bound_elsewhere, validated_codex_session_id,
 };
 #[cfg(windows)]
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
@@ -13,7 +13,7 @@ use muxel_core::session_discovery::{
     CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
 use muxel_core::tmux::Socket;
-use muxel_core::{AgentPreset, CodexHintMiss};
+use muxel_core::{AgentPreset, CodexHintMiss, CodexResumePath, CodexSession};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,6 +46,166 @@ pub(super) fn resume_codex_session(
     muxel_core::codex_resume_path(home, id, path)
 }
 
+#[derive(Clone)]
+pub(super) struct CodexLaunchPreflight {
+    home: PathBuf,
+    cwd: PathBuf,
+    id: Option<String>,
+}
+
+pub(super) enum CodexLaunchResult {
+    Found(CodexSession),
+    Missing,
+    Unknown,
+}
+
+/// Only a started local Codex pane without an exact path needs this one-time
+/// recovery scan. The request copies its identity before the worker starts.
+impl MuxelApp {
+    pub(super) fn codex_launch_preflight_request(&self, iid: Uuid) -> Option<CodexLaunchPreflight> {
+        let instance = self.workspace.instance(iid)?;
+        let project = self.workspace.project(instance.project_id)?;
+        if !(project.remote.is_none()
+            && instance.session_started
+            && instance.session_path.is_none()
+            && is_codex_program(self.resume_program(iid)))
+        {
+            return None;
+        }
+        Some(CodexLaunchPreflight {
+            home: home_dir()?,
+            cwd: instance
+                .worktree_path
+                .clone()
+                .unwrap_or_else(|| project.root_path.clone()),
+            id: instance.session_id.clone(),
+        })
+    }
+
+    pub(super) fn apply_codex_launch_preflight(
+        &mut self,
+        iid: Uuid,
+        token: u64,
+        request: &CodexLaunchPreflight,
+        result: CodexLaunchResult,
+    ) -> bool {
+        if !launch_token_current(&self.terminal_launching, iid, token) {
+            return false;
+        }
+        let Some(instance) = self.workspace.instance(iid) else {
+            return false;
+        };
+        let Some(project) = self.workspace.project(instance.project_id) else {
+            return false;
+        };
+        if !instance.session_started
+            || instance.session_id != request.id
+            || instance.session_path.is_some()
+            || project.remote.is_some()
+            || instance
+                .worktree_path
+                .as_ref()
+                .unwrap_or(&project.root_path)
+                != &request.cwd
+            || !is_codex_program(self.resume_program(iid))
+        {
+            return false;
+        }
+        let idless = request.id.is_none();
+        let missing = matches!(result, CodexLaunchResult::Missing);
+        let found = match result {
+            CodexLaunchResult::Found(session)
+                if request.id.as_deref().is_none_or(|id| id == session.id)
+                    && (!idless
+                        || !session_id_bound_elsewhere(
+                            &self.workspace.instances,
+                            iid,
+                            &session.id,
+                        )) =>
+            {
+                Some(session)
+            }
+            _ => None,
+        };
+        let mut changed = false;
+        if let Some(session) = found {
+            let instance = self.workspace.instance_mut(iid).unwrap();
+            instance.session_id = Some(session.id);
+            instance.session_path = Some(session.path);
+            changed = true;
+        } else if idless || missing {
+            let instance = self.workspace.instance_mut(iid).unwrap();
+            instance.session_id = None;
+            instance.session_path = None;
+            instance.session_started = false;
+            changed = true;
+            if idless {
+                self.add_event(
+                    NotifKind::Success,
+                    crate::i18n::t("Codex started fresh"),
+                    crate::i18n::t("Use Import to find an earlier conversation.").to_string(),
+                );
+            }
+        }
+        if changed {
+            self.bump_session_binding_generation(iid);
+            self.persist();
+        }
+        true
+    }
+}
+
+pub(super) fn codex_launch_preflight(request: &CodexLaunchPreflight) -> CodexLaunchResult {
+    if let Some(id) = request.id.as_deref() {
+        match resume_codex_session(&request.home, id, None) {
+            Ok(CodexResumePath::Found(path)) => {
+                return CodexLaunchResult::Found(CodexSession {
+                    id: id.into(),
+                    path,
+                });
+            }
+            Ok(CodexResumePath::Missing) => return CodexLaunchResult::Missing,
+            Ok(CodexResumePath::Unknown) => {}
+            Err(error) => {
+                log::warn!("could not check Codex rollout before resume: {error}");
+                return CodexLaunchResult::Unknown;
+            }
+        }
+    }
+    #[cfg(all(test, windows))]
+    let injected = CODEX_RESTORE_TEST_SCAN.lock().unwrap().clone();
+    #[cfg(all(test, windows))]
+    let scanned = if let Some(scan) = injected {
+        scan(&request.home, &request.cwd, request.id.as_deref())
+    } else {
+        muxel_core::codex_restore_scan(&request.home, &request.cwd, request.id.as_deref())
+    };
+    #[cfg(not(all(test, windows)))]
+    let scanned =
+        muxel_core::codex_restore_scan(&request.home, &request.cwd, request.id.as_deref());
+    match scanned {
+        Ok(Some(session)) => CodexLaunchResult::Found(session),
+        Ok(None) => CodexLaunchResult::Missing,
+        Err(error) => {
+            log::warn!("could not complete Codex rollout recovery scan: {error}");
+            CodexLaunchResult::Unknown
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+type CodexRestoreTestScan = std::sync::Arc<
+    dyn Fn(&Path, &Path, Option<&str>) -> std::io::Result<Option<CodexSession>> + Send + Sync,
+>;
+#[cfg(all(test, windows))]
+static CODEX_RESTORE_TEST_SCAN: std::sync::Mutex<Option<CodexRestoreTestScan>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, windows))]
+pub(super) fn inject_codex_restore_scan(scan: CodexRestoreTestScan) -> CodexLaunchTestGuard {
+    *CODEX_RESTORE_TEST_SCAN.lock().unwrap() = Some(scan);
+    CodexLaunchTestGuard
+}
+
 #[cfg(all(test, windows))]
 type CodexResumeTestLookup = std::sync::Arc<
     dyn Fn(&Path, &str, Option<&Path>) -> std::io::Result<muxel_core::CodexResumePath>
@@ -74,6 +234,7 @@ impl Drop for CodexLaunchTestGuard {
     fn drop(&mut self) {
         *CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap() = None;
         *CODEX_RESUME_TEST_LOOKUP.lock().unwrap() = None;
+        *CODEX_RESTORE_TEST_SCAN.lock().unwrap() = None;
     }
 }
 #[cfg(all(test, windows))]
@@ -641,13 +802,19 @@ mod w8lm_tests {
                 "app::session_discovery::w8lm_tests::sleeping_title_child",
             ])
             .env("MUXEL_TEST_SLEEPY_TITLE_READY", &ready);
-        let started = Instant::now();
-        assert!(bounded_title_command(command, Duration::from_secs(4)).is_none());
+        let task =
+            std::thread::spawn(move || bounded_title_command(command, Duration::from_secs(10)));
+        let launch_deadline = Instant::now() + Duration::from_secs(8);
+        while !ready.exists() && Instant::now() < launch_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             ready.exists(),
-            "sleeping child did not start before the deadline"
+            "sleeping child did not start before the launch deadline"
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let started = Instant::now();
+        assert!(task.join().unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(11));
         std::fs::remove_file(ready).unwrap();
     }
 

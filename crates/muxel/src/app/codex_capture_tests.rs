@@ -1,8 +1,10 @@
 use super::MuxelApp;
-use super::session_discovery::{inject_codex_launch_lookup, inject_codex_resume_lookup};
+use super::session_discovery::{
+    inject_codex_launch_lookup, inject_codex_restore_scan, inject_codex_resume_lookup,
+};
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
-use muxel_core::{AgentPreset, CodexResumePath, Instance, Project, RemoteRef};
+use muxel_core::{AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef};
 use muxel_terminal::{CommandSpec, TerminalLaunch};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 struct TempRoot(PathBuf);
+static CODEX_CAPTURE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
@@ -20,6 +23,9 @@ impl Drop for TempRoot {
 }
 
 fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+    let _fixture = CODEX_CAPTURE_FIXTURE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!("muxel-codex-capture-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
@@ -61,29 +67,162 @@ fn codex_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
 }
 
 #[test]
-fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
+fn codex_launch_preparation_queues_slow_recovery_without_waiting() {
     with_app(|cx, window| {
         let pane = codex_pane(cx, window);
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
-        let _lookup = inject_codex_launch_lookup(Arc::new(move |_, _| {
-            observed.fetch_add(1, Ordering::Relaxed);
+        let _lookup = inject_codex_restore_scan(Arc::new(move |_, _, id| {
+            assert!(id.is_none());
             std::thread::sleep(Duration::from_millis(350));
-            Some("01a0e807-a64d-7502-b922-cff0e0000000".into())
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
         }));
         window
             .update(cx, |app, window, cx| {
-                let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
-                assert!(!meta.was_resume);
-                assert!(!spec.args.iter().any(|arg| arg == "resume"));
-                assert!(app.workspace.instance(pane).unwrap().session_id.is_none());
+                assert!(app.prepare_terminal_spawn(pane, window, cx).is_none());
+                app.terminal_launching.remove(&pane); // prevent the test from spawning Codex
             })
             .unwrap();
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
-            "restore enumerated session history"
+            "lookup ran during UI preparation"
         );
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while calls.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        cx.run_until_parked();
+    });
+}
+
+#[test]
+fn missing_legacy_codex_rollout_starts_fresh_inside_tmux() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let _dated = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
+        let _scan = inject_codex_restore_scan(Arc::new(|_, _, wanted| {
+            assert_eq!(wanted, Some("01a1543c-9700-7000-8000-000000000001"));
+            Ok(None)
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.session_id = Some(id.into());
+                instance.use_tmux = true;
+                instance.tmux_session = Some("muxel_capture_deadbeef".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let request = app.codex_launch_preflight_request(pane).unwrap();
+                let finding = super::session_discovery::codex_launch_preflight(&request);
+                assert!(app.apply_codex_launch_preflight(pane, token, &request, finding));
+                let (meta, spec, _) = app
+                    .prepare_reserved_terminal_spawn(pane, token, cx)
+                    .unwrap();
+                assert!(!meta.was_resume);
+                assert!(!spec.args.join(" ").contains(&format!("resume {id}")));
+                assert!(app.workspace.instance(pane).unwrap().session_id.is_none());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn incomplete_legacy_codex_scan_keeps_the_saved_id() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let _dated = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
+        let _scan = inject_codex_restore_scan(Arc::new(|_, _, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let request = app.codex_launch_preflight_request(pane).unwrap();
+                let finding = super::session_discovery::codex_launch_preflight(&request);
+                assert!(app.apply_codex_launch_preflight(pane, token, &request, finding));
+                let instance = app.workspace.instance(pane).unwrap();
+                assert_eq!(instance.session_id.as_deref(), Some(id));
+                assert!(instance.session_started);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn unique_legacy_codex_rollout_recovers_idless_pane() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let path = muxel_store::data_dir()
+            .unwrap()
+            .join(format!("rollout-{id}.jsonl"));
+        let found = path.clone();
+        let _scan = inject_codex_restore_scan(Arc::new(move |_, _, wanted| {
+            assert!(wanted.is_none());
+            Ok(Some(CodexSession {
+                id: id.into(),
+                path: found.clone(),
+            }))
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let request = app.codex_launch_preflight_request(pane).unwrap();
+                let finding = super::session_discovery::codex_launch_preflight(&request);
+                assert!(app.apply_codex_launch_preflight(pane, token, &request, finding));
+                let instance = app.workspace.instance(pane).unwrap();
+                assert_eq!(instance.session_id.as_deref(), Some(id));
+                assert_eq!(instance.session_path.as_ref(), Some(&path));
+                assert!(instance.session_started);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn ambiguous_legacy_codex_rollouts_start_fresh_with_one_import_notice() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let _scan = inject_codex_restore_scan(Arc::new(|_, _, wanted| {
+            assert!(wanted.is_none());
+            Ok(None)
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let request = app.codex_launch_preflight_request(pane).unwrap();
+                let finding = super::session_discovery::codex_launch_preflight(&request);
+                let notices_before = app.notifications.len();
+                assert!(app.apply_codex_launch_preflight(pane, token, &request, finding));
+                let instance = app.workspace.instance(pane).unwrap();
+                assert!(!instance.session_started);
+                assert!(instance.session_id.is_none());
+                assert_eq!(app.notifications.len(), notices_before + 1);
+                assert!(
+                    app.notifications
+                        .last()
+                        .unwrap()
+                        .subtitle
+                        .contains("Import")
+                );
+                assert!(!app.apply_codex_launch_preflight(
+                    pane,
+                    token,
+                    &request,
+                    super::session_discovery::CodexLaunchResult::Missing
+                ));
+                assert_eq!(app.notifications.len(), notices_before + 1);
+            })
+            .unwrap();
     });
 }
 
@@ -213,6 +352,11 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
         let document = window
             .update(cx, |app, window, cx| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
+                app.workspace.instance_mut(pane).unwrap().session_path = Some(
+                    muxel_store::data_dir()
+                        .unwrap()
+                        .join(format!("rollout-{id}.jsonl")),
+                );
                 let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
                 assert!(meta.was_resume);
                 assert!(spec.args.iter().any(|arg| arg == "resume"));
@@ -225,8 +369,12 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
                 muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap()
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            cx.run_until_parked();
+            // The unfocused terminal drain coalesces output on GPUI's virtual
+            // clock; an `exit 37` can produce output before its exit event.
+            cx.executor().advance_clock(Duration::from_millis(100));
             cx.run_until_parked();
             let exited = window
                 .update(cx, |app, _, cx| {
@@ -256,6 +404,68 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
                     app.workspace.instance(pane).unwrap().session_id.as_deref(),
                     Some(id)
                 );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn clean_tmux_client_exit_after_codex_resume_keeps_the_pane() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let _lookup = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
+        window
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.session_id = Some(id.into());
+                instance.session_path = Some(
+                    muxel_store::data_dir()
+                        .unwrap()
+                        .join(format!("rollout-{id}.jsonl")),
+                );
+                instance.use_tmux = true;
+                instance.tmux_session = Some("muxel_capture_deadbeef".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                app.settings.close_on_exit = true;
+                let (meta, _, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                assert!(meta.was_resume);
+                #[cfg(windows)]
+                let command = CommandSpec::program("cmd.exe", vec!["/C".into(), "exit 0".into()]);
+                #[cfg(not(windows))]
+                let command = CommandSpec::program("/bin/sh", vec!["-c".into(), "exit 0".into()]);
+                let launch = TerminalLaunch::spawn_for_instance(command, size, pane).unwrap();
+                app.finish_terminal_spawn(meta, Ok(launch), window, cx);
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            if window
+                .update(cx, |app, _, cx| {
+                    app.terminals.get(&pane).unwrap().read(cx).exited()
+                })
+                .unwrap()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "test child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        window
+            .update(cx, |app, window, cx| {
+                app.tick(window, cx);
+                assert!(app.workspace.instance(pane).is_some());
+                assert_eq!(
+                    app.workspace.instance(pane).unwrap().session_id.as_deref(),
+                    Some(id)
+                );
+                app.terminal_launches.get_mut(&pane).unwrap().0 =
+                    Instant::now() - Duration::from_secs(super::RECOVER_WITHIN_SECS + 1);
+                app.tick(window, cx);
+                assert!(app.workspace.instance(pane).is_some());
             })
             .unwrap();
     });

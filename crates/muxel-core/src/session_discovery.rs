@@ -267,7 +267,8 @@ impl SessionDiscovery {
     /// poll: Codex misses back off from one to thirty seconds, independently of
     /// directory stamp changes. Claude and Grok
     /// cap misses at two seconds so new in-process switches stay timely.
-    /// A hit polls in one second; a bound Codex hint stops polling altogether.
+    /// A hit polls in one second, or five when it needs a tmux subprocess to
+    /// read the title. A bound Codex OSC hint stops polling altogether.
     pub fn finish(
         &mut self,
         request: &SessionDiscoveryRequest,
@@ -286,7 +287,15 @@ impl SessionDiscovery {
         self.codex_owner = None;
         let delay = if found {
             self.misses = 0;
-            Duration::from_secs(1)
+            Duration::from_secs(
+                if request.key.provider == SessionProvider::Codex
+                    && request.key.tmux_session.is_some()
+                {
+                    5
+                } else {
+                    1
+                },
+            )
         } else {
             self.misses = self.misses.saturating_add(1);
             let cap = match request.key.provider {
@@ -641,5 +650,21 @@ mod tests {
             }
             assert!(discovery.begin(key, now).is_some());
         }
+    }
+
+    #[test]
+    fn tmux_title_polls_at_most_every_five_seconds_after_a_hit() {
+        let mut key = key();
+        key.tmux_session = Some("muxel_example_12345678".into());
+        let now = Instant::now();
+        let mut discovery = SessionDiscovery::default();
+        let request = discovery.begin(key.clone(), now).unwrap();
+        assert!(discovery.finish(&request, Some(&key), now, true));
+        assert!(
+            discovery
+                .begin(key.clone(), now + Duration::from_secs(4))
+                .is_none()
+        );
+        assert!(discovery.begin(key, now + Duration::from_secs(5)).is_some());
     }
 }

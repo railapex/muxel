@@ -239,6 +239,89 @@ pub fn codex_resume_path(
     Ok(CodexResumePath::Unknown)
 }
 
+/// One background-only recovery walk for layouts saved before rollout paths
+/// were recorded. With an id, find that exact rollout outside its dated folder;
+/// without one, bind only if exactly one distinct top-level thread used `cwd`.
+/// An incomplete walk is an error, never evidence that an id disappeared.
+pub fn codex_restore_scan(
+    home: &Path,
+    cwd: &Path,
+    wanted_id: Option<&str>,
+) -> io::Result<Option<CodexSession>> {
+    let wanted_id = wanted_id
+        .map(|id| {
+            Uuid::parse_str(id).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        })
+        .transpose()?;
+    let root = home.join(".codex/sessions");
+    let mut stack = vec![root];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut entries_seen = 0usize;
+    let mut found: Option<CodexSession> = None;
+    let mut compressed_without_metadata = false;
+    while let Some(dir) = stack.pop() {
+        let entries = match list(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            entries_seen += 1;
+            if entries_seen > 100_000 || Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Codex rollout scan budget",
+                ));
+            }
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Some(file_id) =
+                filename_uuid(&entry.file_name()).and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                continue;
+            };
+            let path = entry.path();
+            if let Some(wanted) = wanted_id {
+                if file_id == wanted {
+                    return Ok(Some(CodexSession {
+                        id: wanted.to_string(),
+                        path,
+                    }));
+                }
+                continue;
+            }
+            let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
+                // This version cannot read compressed metadata. It may belong
+                // to the same cwd, so a plain rollout is not proven unique.
+                compressed_without_metadata |= path.extension().is_some_and(|ext| ext == "zst");
+                continue;
+            };
+            if Uuid::parse_str(&id).ok() != Some(file_id)
+                || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
+            {
+                continue;
+            }
+            let id = file_id.to_string();
+            if found.as_ref().is_some_and(|session| session.id != id) {
+                return Ok(None);
+            }
+            found = Some(CodexSession { id, path });
+        }
+    }
+    Ok(if compressed_without_metadata {
+        None
+    } else {
+        found
+    })
+}
+
 #[derive(Default)]
 pub struct CodexSessionNames {
     path: Option<PathBuf>,
@@ -308,8 +391,70 @@ impl CodexSessionNames {
 
 #[cfg(test)]
 mod tests {
-    use super::dates;
+    use super::{codex_restore_scan, codex_resume_path, dates};
     use chrono::DateTime;
+    use std::path::Path;
+    use uuid::Uuid;
+
+    #[test]
+    fn restore_scan_finds_wrong_day_and_binds_only_unique_cwd() {
+        let home = std::env::temp_dir().join(format!("muxel-codex-restore-{}", Uuid::new_v4()));
+        let day = home.join(".codex/sessions/2020/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let cwd = home.join("project");
+        let first = "01a1543c-9700-7000-8000-000000000001";
+        let second = "01a1543c-9700-7000-8000-000000000002";
+        let write = |id: &str, at: &Path| {
+            let path = day.join(format!("rollout-{id}.jsonl"));
+            let meta = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":at}});
+            std::fs::write(&path, format!("{meta}\n")).unwrap();
+            path
+        };
+        let first_path = write(first, &cwd);
+        assert!(matches!(
+            codex_resume_path(&home, first, None).unwrap(),
+            super::CodexResumePath::Unknown
+        ));
+        assert_eq!(
+            codex_restore_scan(&home, &cwd, Some(first))
+                .unwrap()
+                .unwrap()
+                .path,
+            first_path
+        );
+        assert_eq!(
+            codex_restore_scan(&home, &cwd, None).unwrap().unwrap().id,
+            first
+        );
+        let second_path = write(second, &cwd);
+        assert!(codex_restore_scan(&home, &cwd, None).unwrap().is_none());
+        assert_eq!(
+            codex_restore_scan(&home, &cwd, Some(first))
+                .unwrap()
+                .unwrap()
+                .path,
+            first_path
+        );
+        std::fs::remove_file(second_path).unwrap();
+        let compressed = day.join(format!("rollout-{second}.jsonl.zst"));
+        std::fs::write(&compressed, "compressed rollout").unwrap();
+        assert!(codex_restore_scan(&home, &cwd, None).unwrap().is_none());
+        std::fs::remove_file(first_path).unwrap();
+        assert!(codex_restore_scan(&home, &cwd, None).unwrap().is_none());
+        assert_eq!(
+            codex_restore_scan(&home, &cwd, Some(second))
+                .unwrap()
+                .unwrap()
+                .path,
+            compressed
+        );
+        assert!(
+            codex_restore_scan(&home, &cwd, Some(first))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn day_lookup_has_one_day_normally_and_one_neighbor_at_boundaries() {

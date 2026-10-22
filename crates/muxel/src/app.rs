@@ -186,6 +186,8 @@ mod maximize_follow_tests {
 /// ridden out within the minute; anything longer-lived is left to the next connect —
 /// see `MuxelApp::reap_remote_session`.
 const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
+/// A resume launch has this long to prove its saved session is valid.
+const RECOVER_WITHIN_SECS: u64 = 10;
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_WINDOWS_LAUNCH_CONCURRENCY: usize = 2;
@@ -6269,11 +6271,11 @@ impl MuxelApp {
     /// - **Host-minted** (`session_id_flag` set): first launch
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
-    ///   bound panes resume their saved id. A started pane with no saved id starts
-    ///   fresh: restoration never reconstructs its identity by scanning.
+    ///   bound panes resume their saved id. Legacy started panes without an id
+    ///   get a one-time worker scan before this method chooses fresh or resume.
     ///
-    /// This launch-time lookup still performs synchronous store I/O, including
-    /// when tick recovery reaches it. Recurring discovery uses background workers.
+    /// Exact saved-path checks still do synchronous store I/O. Missing-path
+    /// recovery and recurring discovery run on background workers.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
@@ -6702,6 +6704,22 @@ impl MuxelApp {
         if self.terminal_restarts.contains(instance_id) {
             return;
         }
+        if self.codex_launch_preflight_request(instance_id).is_some() {
+            // A replacement may still have an exited terminal view, so the
+            // ordinary new-pane reservation cannot be used here.
+            self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
+            let token = self.next_terminal_launch_token;
+            self.terminal_launching.insert(
+                instance_id,
+                LaunchTicket {
+                    token,
+                    since: Instant::now(),
+                },
+            );
+            self.reset_terminal_runtime(instance_id);
+            self.launch_reserved_terminal_async(instance_id, token, window, cx);
+            return;
+        }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
         // An explicit/immediate spawn supersedes a deferred launch still creating
         // its PTY. Its token will fail validation and dropping it kills the child.
@@ -6799,6 +6817,10 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
+        if self.codex_launch_preflight_request(instance_id).is_some() {
+            self.launch_reserved_terminal_async(instance_id, token, window, cx);
+            return None;
+        }
         self.prepare_reserved_terminal_spawn(instance_id, token, cx)
     }
 
@@ -7004,14 +7026,38 @@ impl MuxelApp {
         let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
             return;
         };
+        self.launch_reserved_terminal_async(instance_id, token, window, cx);
+    }
+
+    fn launch_reserved_terminal_async(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preflight = self.codex_launch_preflight_request(instance_id);
         cx.spawn(async move |this, cx| {
             // Give GPUI a frame to paint the selected pane's loading state before
             // the worker begins process discovery and ConPTY construction.
             cx.background_executor()
                 .timer(Duration::from_millis(1))
                 .await;
+            let finding = if let Some(request) = preflight.as_ref() {
+                let request = request.clone();
+                Some(
+                    cx.background_executor()
+                        .spawn(async move { session_discovery::codex_launch_preflight(&request) })
+                        .await,
+                )
+            } else {
+                None
+            };
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
+                    if let (Some(request), Some(finding)) = (preflight.as_ref(), finding) {
+                        this.apply_codex_launch_preflight(instance_id, token, request, finding);
+                    }
                     this.prepare_reserved_terminal_spawn(instance_id, token, cx)
                 })
                 .ok()
@@ -10654,9 +10700,6 @@ impl MuxelApp {
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
         let focused = self.active_instance;
-        // A `--resume` launch has this long to prove its saved session is valid;
-        // past that we stop watching it for recovery signals.
-        const RECOVER_WITHIN_SECS: u64 = 10;
         struct Snap {
             iid: Uuid,
             status: AgentStatus,
@@ -10946,11 +10989,30 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
+            // A tmux client may exit 0 when Codex refuses a resume and closes its
+            // session. Keep the pane and its id if the on-screen error detector
+            // missed the reason; a clean client exit is not proof of agent success.
+            let uncertain_codex_resume = tmux_session.is_some()
+                && is_codex_program(self.resume_program(iid))
+                && self
+                    .terminal_launches
+                    .get(&iid)
+                    .is_some_and(|&(at, was_resume)| {
+                        was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
+                    });
+
             if self.should_recover_expired_resume(iid, resume_error, exit_recover) {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
-            } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
+            } else if newly_exited && exit_code == Some(0) && uncertain_codex_resume {
+                self.add_event(
+                    NotifKind::Error,
+                    tf("{title}: Codex resume ended early", &[("title", &title)]),
+                    t("Kept the pane and its session id so you can inspect the exit.").to_string(),
+                );
+                dirty = true;
+            } else if newly_exited && exit_code == Some(0) && self.settings.close_on_exit {
                 // Close-on-exit keys off the actual process exit, not the display
                 // state (Done also means "finished a turn" while still running).
                 // Only a *clean* exit qualifies: a crash (non-zero) or a bare PTY
@@ -11071,9 +11133,9 @@ impl MuxelApp {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
             self.bump_session_binding_generation(iid);
+            let codex = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
-                inst.session_id = (!is_codex_program(inst.program.as_deref()))
-                    .then(|| Uuid::new_v4().to_string());
+                inst.session_id = (!codex).then(|| Uuid::new_v4().to_string());
                 inst.session_path = None;
                 inst.session_started = false;
             }

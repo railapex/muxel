@@ -155,9 +155,12 @@ feature is added or changed, update the matching entry here in the same change**
     Local tmux panes read their own `pane_title` from the recorded tmux socket on a
     background worker because tmux does not forward that title to the terminal view.
     Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
-    A started pane
-    without a saved UUID starts a fresh conversation; restore never scans history
-    to guess which conversation belonged to it. The immutable
+    A legacy started pane without a saved UUID gets one background recovery walk.
+    It rebinds only when exactly one rollout records that pane's directory; otherwise
+    it starts fresh and points to Import in the notification feed. A compressed
+    rollout whose cwd metadata cannot be read also prevents an automatic choice.
+    A saved UUID without a path gets a dated lookup, then one bounded background
+    full walk if the dated lookup misses. A confirmed miss starts fresh. The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
     checked near a date boundary. Only matching filenames are opened to validate the
@@ -180,7 +183,8 @@ feature is added or changed, update the matching entry here in the same change**
   starter binding. Recurring Codex rollout discovery and Claude hook validation run
   in the background, alongside Grok's process lookup. Each pane keeps one pending
   lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
+  grows from one to thirty seconds, even while the day directory changes. Tmux
+  title reads run at most once every five seconds after a hit.
   A sibling-owned tmux title is reread under backoff so a later unowned title
   can bind; its rollout validation is cached only while the same sibling owns
   it. Other sibling-owned hints wait until ownership or binding changes. Launch,
@@ -190,10 +194,11 @@ feature is added or changed, update the matching entry here in the same change**
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved Codex conversation is abandoned when its validated saved rollout
-  path and compression sibling are both absent or non-files, or when Codex itself
-  reports that the exact resumed ID is missing soon after launch. An invalid path,
-  unreadable store, dated lookup miss, or unrelated early exit keeps the id and
-  attempts resume.
+  path and compression sibling are both absent or non-files, when a complete
+  recovery walk finds no matching rollout, or when Codex itself reports that the
+  exact resumed ID is missing soon after launch. An invalid path, unreadable store,
+  incomplete walk, or unrelated early exit keeps the id and attempts resume. A tmux
+  client that exits cleanly just after a Codex resume leaves the pane up for inspection.
   Remote Codex panes never check the local session store. Archived Codex sessions
   require unarchiving in Codex before they can resume.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or

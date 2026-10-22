@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 mod codex_sessions;
 pub use codex_sessions::{
-    CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_resume_path,
-    codex_session_from_hint,
+    CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_restore_scan,
+    codex_resume_path, codex_session_from_hint,
 };
 
 #[cfg(test)]
@@ -877,8 +877,8 @@ fn is_codex_title_state(state: &str) -> bool {
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
-/// Explicit Import uses this history search in the background. Restore and spawn
-/// never reconstruct pane identity with a newest-by-directory heuristic.
+/// Explicit Import uses this newest-by-directory history search in the
+/// background. Restore only accepts a unique cwd match, never this heuristic.
 pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
