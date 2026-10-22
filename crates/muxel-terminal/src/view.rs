@@ -4234,7 +4234,10 @@ mod provider_switch_tests {
                 );
                 #[cfg(unix)]
                 let mut spec = CommandSpec::program("/bin/cat", vec![]);
-                spec.initial_binding = InitialBinding::Known(initial.clone());
+                spec.initial_binding = InitialBinding::Known {
+                    id: initial.clone(),
+                    resumed: false,
+                };
                 let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
                 assert_eq!(session.binding_revision(), 1);
                 let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
@@ -4290,6 +4293,26 @@ mod provider_switch_tests {
         session.process_drained(&drained(&[(
             "\x1b]7501;state=working\x07",
             hook + SWITCH_SLACK + Duration::from_millis(200),
+        )]));
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn fresh_program_report_after_stale_sync_end_in_one_read_is_attributable() {
+        let (session, _receiver) = fixture();
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            "\x1b[?2026h",
+            hook - Duration::from_millis(500),
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        session.process_drained(&drained(&[(
+            "\x1b]7501;state=done\x07\x1b[?2026l\x1b]7501;state=working\x07",
+            hook + SWITCH_SLACK + Duration::from_millis(100),
         )]));
         assert_eq!(
             session.program_status_snapshot().root.unwrap().state,
@@ -5172,6 +5195,155 @@ mod provider_switch_tests {
         session.process_drained(&drained(&[("\x1b]7501;state=done\x07", old_read)]));
         assert_eq!(session.program_status_snapshot().root, None);
         assert!(session.runtime_evidence(None).settling);
+        session.kill();
+    }
+
+    #[test]
+    fn split_osc_title_keeps_the_read_time_of_its_body() {
+        for split in [18, 44] {
+            let (session, _receiver) = fixture();
+            let first = uuid::Uuid::new_v4();
+            let stale = uuid::Uuid::new_v4();
+            session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let hook = SystemTime::now();
+            let title = format!("\x1b]0;{stale} | Working\x07");
+            session.process_drained(&drained(&[(
+                &title[..split],
+                hook - Duration::from_millis(500),
+            )]));
+            session.provider_switched_at(hook, hook, hook);
+            let switched = session.binding_revision();
+            session.process_drained(&drained(&[(
+                &title[split..],
+                hook + SWITCH_SLACK + Duration::from_millis(100),
+            )]));
+            assert_eq!(
+                session.binding_revision(),
+                switched,
+                "split at byte {split}"
+            );
+            assert!(
+                session
+                    .session_id_hint()
+                    .unwrap()
+                    .starts_with(&first.to_string())
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn split_osc_st_terminator_keeps_the_read_time_of_its_body() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{stale} | Working"),
+            hook - Duration::from_millis(500),
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(
+            "\x1b",
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        session.process_drained(&drained(&[(
+            "\\",
+            hook + SWITCH_SLACK + Duration::from_millis(120),
+        )]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn split_osc_opening_escape_keeps_its_first_read_time() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[("\x1b", hook - Duration::from_millis(500))]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(
+            &format!("]0;{stale} | Working\x07"),
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn a_fresh_title_after_a_stale_terminator_in_one_read_can_bind() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{stale} | Working"),
+            hook - Duration::from_millis(500),
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(
+            &format!("\x07\x1b]0;{fresh} | Ready\x07"),
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert_eq!(session.binding_revision(), switched + 1);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&fresh.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn consecutive_sync_frames_use_each_frames_read_time() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{first} | Working\x07"),
+            hook - Duration::from_millis(500),
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026l\x1b[?2026h\x1b]0;{next} | Ready\x07"),
+            fresh,
+        )]));
+        session.process_drained(&drained(&[(
+            "\x1b[?2026l",
+            fresh + Duration::from_millis(20),
+        )]));
+        assert_eq!(session.binding_revision(), switched + 1);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&next.to_string())
+        );
         session.kill();
     }
 

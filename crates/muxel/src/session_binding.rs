@@ -153,26 +153,62 @@ pub(crate) struct ClaudeHookStamp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClaudeBinding {
     pub session_id: String,
+    pub from_resume: bool,
     /// `None` for a record written by an older muxel's hook.
     pub stamp: Option<ClaudeHookStamp>,
 }
 
-/// Whether a pane's binding record reports a switch, given the nonce of the
-/// last record this launch read (`seen`) and the bound conversation. A stamped
-/// record is known by its nonce: one this launch hasn't seen is a switch even
-/// when it names the bound conversation, as after `/resume B` and `/resume A`
-/// between two reads. The launch's first stamped record, and a record from an
-/// older muxel's hook, switch only when they name another conversation: a
-/// resumed launch's own `SessionStart` names the conversation muxel launched.
+/// A stamped nonce identifies a hook invocation. Older hook records have no
+/// nonce, so their exact bytes and preserved file time identify a retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeHookIdentity {
+    Stamped(Uuid),
+    Legacy {
+        modified: Option<SystemTime>,
+        bytes: Vec<u8>,
+    },
+}
+
+pub(crate) fn claude_hook_identity(
+    binding: &ClaudeBinding,
+    modified: Option<SystemTime>,
+    bytes: &[u8],
+) -> ClaudeHookIdentity {
+    binding.stamp.map_or_else(
+        || ClaudeHookIdentity::Legacy {
+            modified,
+            bytes: bytes.to_vec(),
+        },
+        |stamp| ClaudeHookIdentity::Stamped(stamp.nonce),
+    )
+}
+
+/// A new hook invocation is a switch even when its final UUID equals the
+/// bound one: `/resume B` and `/resume A` can happen between discovery reads.
+/// Only a proven startup receipt for this resumed launch confirms its binding.
 pub(crate) fn claude_record_switches(
     binding: &ClaudeBinding,
-    seen: Option<Uuid>,
+    current: &ClaudeHookIdentity,
+    seen: Option<&ClaudeHookIdentity>,
     bound: Option<&str>,
+    confirms_launch: bool,
 ) -> bool {
-    match (binding.stamp, seen) {
-        (Some(stamp), Some(seen)) => stamp.nonce != seen,
-        _ => bound != Some(binding.session_id.as_str()),
-    }
+    seen != Some(current)
+        && (bound != Some(binding.session_id.as_str()) || !(seen.is_none() && confirms_launch))
+}
+
+pub(crate) fn claude_receipt_confirms_launch(
+    binding: &ClaudeBinding,
+    receipt_at: Option<SystemTime>,
+    launched_at: SystemTime,
+    resumed: bool,
+    first_submission_at: Option<SystemTime>,
+) -> bool {
+    resumed
+        && binding.from_resume
+        && receipt_at.is_some_and(|at| {
+            at >= launched_at && first_submission_at.is_none_or(|submitted| at < submitted)
+        })
 }
 
 pub(crate) fn hook_instance_from_args(
@@ -461,6 +497,7 @@ pub(crate) fn claude_binding_from_record(record: &[u8], home: &Path) -> Option<C
     }
     Some(ClaudeBinding {
         session_id: session_id.to_string(),
+        from_resume: source == "resume",
         stamp: claude_hook_stamp(&event),
     })
 }
@@ -941,26 +978,133 @@ mod tests {
         resume(&a);
         let first = read_claude_binding(&data, instance_id, &home).unwrap();
         let stamp = first.stamp.expect("the hook stamps its record");
+        let first_identity = ClaudeHookIdentity::Stamped(stamp.nonce);
         assert!(before <= stamp.recorded_at && stamp.recorded_at <= SystemTime::now());
-        assert!(!claude_record_switches(&first, None, Some(a.as_str())));
+        assert!(!claude_record_switches(
+            &first,
+            &first_identity,
+            None,
+            Some(a.as_str()),
+            true,
+        ));
 
         // `/resume B` and then `/resume A`, both before muxel's next read.
         resume(&b);
         resume(&a);
         let last = read_claude_binding(&data, instance_id, &home).unwrap();
         assert_eq!(last.session_id, a);
+        let last_identity = ClaudeHookIdentity::Stamped(last.stamp.unwrap().nonce);
         assert!(
-            claude_record_switches(&last, Some(stamp.nonce), Some(a.as_str())),
+            claude_record_switches(
+                &last,
+                &last_identity,
+                Some(&first_identity),
+                Some(a.as_str()),
+                true,
+            ),
             "a record muxel hasn't seen is a switch, whatever it names"
         );
         // The same record read again, because removing it failed, is not.
-        let nonce = last.stamp.map(|stamp| stamp.nonce);
-        assert!(!claude_record_switches(&last, nonce, Some(a.as_str())));
+        assert!(!claude_record_switches(
+            &last,
+            &last_identity,
+            Some(&last_identity),
+            Some(a.as_str()),
+            false,
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn an_older_hooks_record_switches_only_to_another_conversation() {
+    fn fresh_launch_a_to_b_to_a_without_startup_receipt_is_a_switch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+
+        // `claude --session-id A` has no SessionStart receipt. Both later
+        // resumes can overwrite the shared hook file before discovery polls.
+        resume_hook(&data, &home, &cwd, instance_id, &b);
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let last = read_claude_binding(&data, instance_id, &home).unwrap();
+        assert_eq!(last.session_id, a);
+        let current = ClaudeHookIdentity::Stamped(last.stamp.unwrap().nonce);
+        assert!(!claude_receipt_confirms_launch(
+            &last,
+            last.stamp.map(|stamp| stamp.recorded_at),
+            SystemTime::now() - Duration::from_secs(1),
+            false,
+            None,
+        ));
+        assert!(claude_record_switches(
+            &last,
+            &current,
+            None,
+            Some(a.as_str()),
+            false,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_pre_submission_resume_receipt_confirms_the_resumed_launch() {
+        let launched_at = SystemTime::now();
+        let receipt_at = launched_at + Duration::from_millis(10);
+        let submitted_at = receipt_at + Duration::from_millis(10);
+        let binding = ClaudeBinding {
+            session_id: Uuid::new_v4().to_string(),
+            from_resume: true,
+            stamp: Some(ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: receipt_at,
+            }),
+        };
+        assert!(claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            true,
+            Some(submitted_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            false,
+            Some(submitted_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            true,
+            Some(launched_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(launched_at - Duration::from_millis(1)),
+            launched_at,
+            true,
+            None,
+        ));
+        let clear = ClaudeBinding {
+            from_resume: false,
+            ..binding
+        };
+        assert!(!claude_receipt_confirms_launch(
+            &clear,
+            Some(receipt_at),
+            launched_at,
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn an_older_hooks_same_id_record_switches_once() {
         let root = temp_dir();
         let data = root.join("data");
         let home = root.join("home");
@@ -988,14 +1132,29 @@ mod tests {
         assert_eq!(record.modified, Some(written));
         let binding = claude_binding_from_record(&record.bytes, &home).unwrap();
         assert_eq!(binding.stamp, None);
-        let seen = Some(Uuid::new_v4());
+        let current = claude_hook_identity(&binding, record.modified, &record.bytes);
+        assert!(claude_record_switches(
+            &binding,
+            &current,
+            None,
+            Some(session_id.as_str()),
+            false,
+        ));
         assert!(!claude_record_switches(
             &binding,
-            seen,
-            Some(session_id.as_str())
+            &current,
+            Some(&current),
+            Some(session_id.as_str()),
+            false,
         ));
         let other = Uuid::new_v4().to_string();
-        assert!(claude_record_switches(&binding, seen, Some(other.as_str())));
+        assert!(claude_record_switches(
+            &binding,
+            &current,
+            None,
+            Some(other.as_str()),
+            false,
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

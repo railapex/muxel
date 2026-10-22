@@ -3148,12 +3148,19 @@ fn is_claude_program(program: Option<&str>) -> bool {
 fn launch_initial_binding(
     program: Option<&str>,
     session_args: Option<&[String]>,
+    resuming: bool,
 ) -> muxel_terminal::InitialBinding {
     if let Some(id) = session_args.and_then(|args| args.get(1)) {
-        return muxel_terminal::InitialBinding::Known(Some(id.clone()));
+        return muxel_terminal::InitialBinding::Known {
+            id: Some(id.clone()),
+            resumed: resuming,
+        };
     }
     if !is_claude_program(program) && !is_codex_program(program) && !is_grok_program(program) {
-        return muxel_terminal::InitialBinding::Known(None);
+        return muxel_terminal::InitialBinding::Known {
+            id: None,
+            resumed: false,
+        };
     }
     muxel_terminal::InitialBinding::Unknown
 }
@@ -3652,6 +3659,7 @@ mod loop_cleanup_tests {
         spec.initial_binding = super::launch_initial_binding(
             Some("claude"),
             Some(&["--session-id".to_string(), first.to_string()]),
+            false,
         );
         let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
         let mut run = run(session.id);
@@ -4381,7 +4389,7 @@ pub struct MuxelApp {
     #[cfg(windows)]
     grok_observations: HashMap<Uuid, session_discovery::GrokObservation>,
     /// Per pane, the PTY launch and nonce of the last Claude hook record read.
-    claude_hook_seen: HashMap<Uuid, (Uuid, Uuid)>,
+    claude_hook_seen: HashMap<Uuid, (Uuid, crate::session_binding::ClaudeHookIdentity)>,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -7746,6 +7754,7 @@ impl MuxelApp {
         spec.initial_binding = launch_initial_binding(
             agent_program.as_deref(),
             session_resume.as_ref().map(|(args, _)| args.as_slice()),
+            resuming,
         );
         if let Some(shell) = remote_paste_shell {
             spec = spec.with_paste_shell(shell);
@@ -11615,17 +11624,24 @@ impl MuxelApp {
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
             return Ok(None);
         }
+        let current =
+            crate::session_binding::claude_hook_identity(&binding, record.modified, &record.bytes);
         let seen = self
             .claude_hook_seen
             .get(&iid)
             .filter(|(seen_launch, _)| Some(*seen_launch) == launch)
-            .map(|(_, nonce)| *nonce);
+            .map(|(_, identity)| identity);
         let bound = self
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
-            self.remember_claude_hook(iid, launch, binding.stamp);
+        // Before a launch there is no live runtime or loop owner to retire.
+        // A same-ID pending record is already represented by saved metadata.
+        if launch.is_none() && bound == Some(binding.session_id.as_str()) {
+            return Ok(None);
+        }
+        if !crate::session_binding::claude_record_switches(&binding, &current, seen, bound, false) {
+            self.remember_claude_hook(iid, launch, current);
             return Ok(None);
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
@@ -11639,7 +11655,7 @@ impl MuxelApp {
         instance.auto_name = None;
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
-            self.remember_claude_hook(iid, launch, binding.stamp);
+            self.remember_claude_hook(iid, launch, current);
             Ok(Some(switched_at))
         } else {
             // The claimed record stays; the next claim retries it before any
@@ -11661,16 +11677,16 @@ impl MuxelApp {
         }
     }
 
-    /// Remember the nonce of a hook record this launch has handled, so the same
-    /// record read again (deleting it failed) isn't another switch.
+    /// Remember the hook record this launch handled, so a failed delete cannot
+    /// turn the same receipt into another switch.
     fn remember_claude_hook(
         &mut self,
         iid: Uuid,
         launch: Option<Uuid>,
-        stamp: Option<crate::session_binding::ClaudeHookStamp>,
+        identity: crate::session_binding::ClaudeHookIdentity,
     ) {
-        if let (Some(launch), Some(stamp)) = (launch, stamp) {
-            self.claude_hook_seen.insert(iid, (launch, stamp.nonce));
+        if let Some(launch) = launch {
+            self.claude_hook_seen.insert(iid, (launch, identity));
         }
     }
 

@@ -57,7 +57,7 @@ mod tests {
         let mut spec = CommandSpec::program("/bin/cat", vec![]);
         let launch_args = vec!["--session-id".to_string(), id.to_string()];
         spec.status_program = Some("claude".into());
-        spec.initial_binding = launch_initial_binding(Some("claude"), Some(&launch_args));
+        spec.initial_binding = launch_initial_binding(Some("claude"), Some(&launch_args), false);
         let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
         session.mark_turn_submitted();
         assert_eq!(session.binding_revision(), 1);

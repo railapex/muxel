@@ -660,7 +660,10 @@ pub struct CommandSpec {
 pub enum InitialBinding {
     #[default]
     Unknown,
-    Known(Option<String>),
+    Known {
+        id: Option<String>,
+        resumed: bool,
+    },
 }
 
 impl CommandSpec {
@@ -909,12 +912,127 @@ pub(crate) struct PointerHit {
     pub rows: u16,
 }
 
+/// Read times for terminal controls whose callback can arrive in a later PTY
+/// read. The small scanner only finds OSC endings and DEC 2026 frame edges;
+/// VTE remains the authority on whether those bytes form a terminal event.
+#[derive(Default)]
+struct OutputReadClock {
+    osc_since: Option<SystemTime>,
+    escape_at: Option<SystemTime>,
+    sync_since: Option<SystemTime>,
+    next_sync_since: Option<SystemTime>,
+    sync_prefix_len: usize,
+    sync_prefix_at: Option<SystemTime>,
+}
+
+enum OutputBoundary {
+    Plain,
+    SyncStart(SystemTime),
+    SyncEnd,
+}
+
+impl OutputReadClock {
+    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
+        [self.osc_since, self.escape_at, self.sync_since]
+            .into_iter()
+            .flatten()
+            .fold(read_at, SystemTime::min)
+    }
+
+    /// Return a boundary after which another event in the same read can use a
+    /// different origin. ESC itself terminates OSC in VTE (including ESC \\ ST).
+    fn scan(&mut self, byte: u8, read_at: SystemTime) -> Option<OutputBoundary> {
+        let mut boundary = None;
+        if self.osc_since.is_some() {
+            match byte {
+                0x07 | 0x18 | 0x1a => {
+                    self.osc_since = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                0x1b => {
+                    self.osc_since = None;
+                    self.escape_at = Some(read_at);
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                _ => {}
+            }
+        } else if let Some(escape_at) = self.escape_at.take() {
+            if byte == b']' {
+                self.osc_since = Some(escape_at);
+            } else if byte == 0x1b {
+                self.escape_at = Some(read_at);
+                boundary = Some(OutputBoundary::Plain);
+            } else {
+                boundary = Some(OutputBoundary::Plain);
+            }
+        } else if byte == 0x1b {
+            self.escape_at = Some(read_at);
+        }
+
+        const PREFIX: &[u8] = b"\x1b[?2026";
+        if self.sync_prefix_len == 0 {
+            if byte == 0x1b {
+                self.sync_prefix_len = 1;
+                self.sync_prefix_at = Some(read_at);
+            }
+        } else if self.sync_prefix_len < PREFIX.len() && byte == PREFIX[self.sync_prefix_len] {
+            self.sync_prefix_len += 1;
+        } else if self.sync_prefix_len == PREFIX.len() && matches!(byte, b'h' | b'l') {
+            let started = self.sync_prefix_at.take().unwrap_or(read_at);
+            self.sync_prefix_len = 0;
+            boundary = Some(if byte == b'h' {
+                OutputBoundary::SyncStart(started)
+            } else {
+                OutputBoundary::SyncEnd
+            });
+        } else {
+            self.sync_prefix_len = usize::from(byte == 0x1b);
+            self.sync_prefix_at = (byte == 0x1b).then_some(read_at);
+        }
+        boundary
+    }
+
+    fn after_segment(
+        &mut self,
+        boundary: Option<OutputBoundary>,
+        active: bool,
+        read_at: SystemTime,
+    ) {
+        match boundary {
+            Some(OutputBoundary::SyncStart(started)) if active => {
+                if self.sync_since.is_some() {
+                    self.next_sync_since.get_or_insert(started);
+                } else {
+                    self.sync_since = Some(started);
+                }
+            }
+            Some(OutputBoundary::SyncEnd) if active => {
+                if let Some(started) = self.next_sync_since.take() {
+                    self.sync_since = Some(started);
+                }
+            }
+            _ => {}
+        }
+        if !active {
+            self.sync_since = None;
+            self.next_sync_since = None;
+        } else if self.sync_since.is_none() {
+            // VTE also ends a frame at its buffer limit. Preserve safety if it
+            // starts another without a complete edge in this read.
+            self.sync_since = Some(read_at);
+        }
+    }
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
+    launched_at: SystemTime,
+    launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     program_status_observer: Mutex<Observer>,
     program_status_generation: AtomicU64,
+    read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1175,6 +1293,11 @@ impl TerminalSession {
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        let launched_at = SystemTime::now();
+        let launch_resumed = matches!(
+            &spec.initial_binding,
+            InitialBinding::Known { resumed: true, .. }
+        );
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -1339,7 +1462,7 @@ impl TerminalSession {
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
         let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
-        if matches!(&spec.initial_binding, InitialBinding::Known(_)) {
+        if matches!(&spec.initial_binding, InitialBinding::Known { .. }) {
             program_status.lock().adopt_binding(1);
         }
         let immediate_replies =
@@ -1404,7 +1527,7 @@ impl TerminalSession {
         let title = Arc::new(Mutex::new(None));
         let evidence = Arc::new(Mutex::new(match &spec.initial_binding {
             InitialBinding::Unknown => LifecycleEvidence::default(),
-            InitialBinding::Known(id) => LifecycleEvidence::known_at_launch(id.clone()),
+            InitialBinding::Known { id, .. } => LifecycleEvidence::known_at_launch(id.clone()),
         }));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
@@ -1432,10 +1555,13 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launched_at,
+            launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             program_status_observer: Mutex::new(Observer::default()),
             program_status_generation: AtomicU64::new(0),
+            read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
             output_queue,
@@ -1500,8 +1626,9 @@ impl TerminalSession {
     }
 
     /// Feed PTY output through the VTE parser into the terminal grid. Evidence
-    /// it raises (a title, a bell) is stamped as read now; the view's drain uses
-    /// [`Self::process_drained`], which stamps it with when it was read.
+    /// it raises uses the current read time, or the opening read of a title or
+    /// synchronized frame that began earlier. The view's drain uses
+    /// [`Self::process_drained`] with the reader's timestamps.
     pub(crate) fn process_output(&self, data: &[u8]) {
         self.parse([(data, SystemTime::now())]);
     }
@@ -1520,26 +1647,25 @@ impl TerminalSession {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
         let mut status_observer = self.program_status_observer.lock();
+        let mut clock = self.read_clock.lock();
         let mut parsed = false;
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
             }
-            let fresh = self.evidence.lock().begin_read(read_at);
             let mut start = 0;
+            let mut effective_at = clock.effective_at(read_at);
+            let mut fresh = self.evidence.lock().begin_read(effective_at);
             for (index, &byte) in bytes.iter().enumerate() {
+                let boundary = clock.scan(byte, read_at);
                 let generation = self.program_status_generation.load(Ordering::Acquire);
-                let Some(event) = status_observer.advance_at(byte, fresh, generation) else {
-                    continue;
-                };
-                if matches!(event, ProgramStatusEvent::Query) {
-                    continue;
-                }
-                if let ProgramStatusEvent::Title(title) = event {
+                let event = status_observer.advance_at(byte, fresh, generation);
+                let event_fresh = fresh;
+                if let Some(ProgramStatusEvent::Title(ref title)) = event {
                     // The observer advances the PSP binding in wire order.
                     // The UI title still belongs to alacritty's listener,
                     // which can defer its callback until ESU.
-                    if let Some(thread) = session_thread_field(&title)
+                    if let Some(thread) = session_thread_field(title)
                         && let Some(key) = ThreadKey::from_field(thread)
                     {
                         let first_title = self.session_id_hint.lock().is_none();
@@ -1559,60 +1685,77 @@ impl TerminalSession {
                             }
                         }
                     }
-                    processor.advance(&mut *term, &bytes[start..=index]);
-                    start = index + 1;
-                    continue;
                 }
-                // Apply the VTE span before the PSP event at its final byte.
-                // Non-title callbacks and output remain in their own order.
-                processor.advance(&mut *term, &bytes[start..=index]);
-                start = index + 1;
-                match event {
-                    ProgramStatusEvent::Report(report) => {
-                        let mut status = self.program_status.lock();
-                        if fresh
-                            && self.program_status_generation.load(Ordering::Acquire) == generation
-                        {
-                            if report.id.is_none() {
-                                log::debug!(
-                                    "program status source=osc7501 report state={:?} kind={:?}",
-                                    report.state,
-                                    report.kind
-                                );
+                // VTE and the PSP observer see each control in wire order.
+                // A boundary ends the current timestamp segment even when it
+                // does not produce a PSP event.
+                if event.is_some() || boundary.is_some() {
+                    processor.advance(&mut *term, &bytes[start..=index]);
+                    clock.after_segment(
+                        boundary,
+                        processor.sync_timeout().sync_timeout().is_some(),
+                        read_at,
+                    );
+                    start = index + 1;
+                    effective_at = clock.effective_at(read_at);
+                    if start < bytes.len() {
+                        fresh = self.evidence.lock().begin_read(effective_at);
+                    }
+                }
+                if let Some(event) = event {
+                    match event {
+                        ProgramStatusEvent::Report(report) => {
+                            let mut status = self.program_status.lock();
+                            if event_fresh
+                                && self.program_status_generation.load(Ordering::Acquire)
+                                    == generation
+                            {
+                                if report.id.is_none() {
+                                    log::debug!(
+                                        "program status source=osc7501 report state={:?} kind={:?}",
+                                        report.state,
+                                        report.kind
+                                    );
+                                }
+                                status.apply(report);
                             }
-                            status.apply(report);
                         }
-                    }
-                    ProgramStatusEvent::Reset => {
-                        let mut status = self.program_status.lock();
-                        if fresh
-                            && self.program_status_generation.load(Ordering::Acquire) == generation
-                        {
-                            status.clear();
+                        ProgramStatusEvent::Reset => {
+                            let mut status = self.program_status.lock();
+                            if event_fresh
+                                && self.program_status_generation.load(Ordering::Acquire)
+                                    == generation
+                            {
+                                status.clear();
+                            }
                         }
-                    }
-                    ProgramStatusEvent::ShellPrompt => {
-                        let mut status = self.program_status.lock();
-                        if fresh
-                            && self.program_status_generation.load(Ordering::Acquire) == generation
-                        {
-                            status.shell_prompt();
+                        ProgramStatusEvent::ShellPrompt => {
+                            let mut status = self.program_status.lock();
+                            if event_fresh
+                                && self.program_status_generation.load(Ordering::Acquire)
+                                    == generation
+                            {
+                                status.shell_prompt();
+                            }
                         }
+                        ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => {}
                     }
-                    ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => unreachable!(),
                 }
             }
             if start < bytes.len() {
                 processor.advance(&mut *term, &bytes[start..]);
+                clock.after_segment(
+                    None,
+                    processor.sync_timeout().sync_timeout().is_some(),
+                    read_at,
+                );
             }
-            self.evidence
-                .lock()
-                .sync_state_after_read(processor.sync_timeout().sync_timeout().is_some(), read_at);
             parsed = true;
         }
         // A synchronized update can time out here or on a runtime deadline
-        // without another read. Both paths must replay its oldest read time.
-        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor);
+        // without another read. Replay its oldest read time from the shared
+        // output clock, including a new frame started in the same PTY read.
+        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
         self.evidence.lock().end_read();
         if parsed {
             let screen = term.screen_lines() as i32;
@@ -1874,6 +2017,18 @@ impl TerminalSession {
     /// Whether any turn was submitted in this launch, in any conversation.
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    pub fn launched_at(&self) -> SystemTime {
+        self.launched_at
+    }
+
+    pub fn launch_resumed(&self) -> bool {
+        self.launch_resumed
+    }
+
+    pub fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
     }
 
     /// Conversation observed before this launch's first submitted turn. None
@@ -2488,6 +2643,7 @@ impl TerminalSession {
         &self,
         term: &mut Term<MuxelListener>,
         processor: &mut Processor,
+        clock: &mut OutputReadClock,
     ) -> bool {
         let Some(deadline) = processor.sync_timeout().sync_timeout() else {
             return false;
@@ -2495,14 +2651,13 @@ impl TerminalSession {
         if Instant::now() < deadline {
             return false;
         }
-        let started = self.evidence.lock().sync_started_at();
-        if let Some(started) = started {
-            self.evidence.lock().begin_read(started);
-        }
+        self.evidence
+            .lock()
+            .begin_read(clock.effective_at(SystemTime::now()));
         processor.stop_sync(term);
-        let mut evidence = self.evidence.lock();
-        evidence.sync_state_after_read(false, SystemTime::now());
-        evidence.end_read();
+        clock.sync_since = None;
+        clock.next_sync_since = None;
+        self.evidence.lock().end_read();
         profile::sync_expired();
         true
     }
@@ -2510,7 +2665,8 @@ impl TerminalSession {
     fn flush_expired_program_status_sync(&self) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
-        if self.flush_expired_sync_locked(&mut term, &mut processor) {
+        let mut clock = self.read_clock.lock();
+        if self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock) {
             self.bump_content();
             self.trigger_runtime();
         }
