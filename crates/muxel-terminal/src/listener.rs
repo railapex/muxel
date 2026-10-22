@@ -163,23 +163,66 @@ pub(crate) struct LifecycleEvidence {
     /// zero means its recipient was unknown and stays unknown for this run.
     first_submission: Option<u64>,
     binding_rev: u64,
+    /// Conversation pinned by launch arguments, if one was supplied.
+    initial_id: Option<String>,
     binding_since: u64,
     /// The window of the switch reported out of band that began the current
     /// binding, if one did.
     window: Option<SwitchWindow>,
     /// When the reader received the output being parsed.
     reading_at: Option<SystemTime>,
+    /// DEC synchronized updates defer title callbacks until ESU or timeout.
+    /// Replay must retain the oldest read time of the buffered frame.
+    sync_started_at: Option<SystemTime>,
     /// Output read after the window has been parsed.
     fresh_output: bool,
 }
 
 impl LifecycleEvidence {
+    pub(crate) fn known_at_launch(initial_id: Option<String>) -> Self {
+        Self {
+            binding_rev: 1,
+            initial_id,
+            ..Self::default()
+        }
+    }
+
+    /// The first provider title confirms the launch's known binding. A title
+    /// naming a different pinned conversation is a real switch.
+    pub(crate) fn first_title_confirms_launch(&self, thread: &str) -> bool {
+        self.binding_rev == 1
+            && self.initial_id.as_deref().is_none_or(|id| {
+                uuid::Uuid::parse_str(id)
+                    .ok()
+                    .is_some_and(|id| Some(id) == uuid::Uuid::parse_str(thread).ok())
+                    || thread.strip_suffix("...").is_some_and(|prefix| {
+                        id.get(..prefix.len())
+                            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                    })
+            })
+    }
+
     /// The parser is about to apply output the reader received at `at`.
     pub(crate) fn begin_read(&mut self, at: SystemTime) -> bool {
-        self.reading_at = Some(at);
-        let fresh = self.output_is_fresh(at);
+        let effective_at = self.sync_started_at.unwrap_or(at);
+        self.reading_at = Some(effective_at);
+        let fresh = self.output_is_fresh(effective_at);
         self.fresh_output |= fresh;
         fresh
+    }
+
+    /// Called after each parser chunk, while the parser lock still identifies
+    /// whether a synchronized update has buffered output for a later replay.
+    pub(crate) fn sync_state_after_read(&mut self, active: bool, at: SystemTime) {
+        self.sync_started_at = if active {
+            Some(self.sync_started_at.map_or(at, |started| started.min(at)))
+        } else {
+            None
+        };
+    }
+
+    pub(crate) fn sync_started_at(&self) -> Option<SystemTime> {
+        self.sync_started_at
     }
 
     pub(crate) fn end_read(&mut self) {
@@ -405,10 +448,16 @@ impl EventListener for MuxelListener {
                 let mut evidence = self.evidence.lock();
                 let at = evidence.output_time();
                 let seq = evidence.record_title(Some(title.clone()), at);
-                if let Some(next) = session_thread_field(&title) {
+                // A queued title read before an out-of-band switch may be
+                // parsed after it. Keep it as visible level state, but it
+                // cannot name or begin the replacement binding.
+                if evidence.output_is_fresh(at)
+                    && let Some(next) = session_thread_field(&title)
+                {
+                    let first_title = hint.is_none();
                     let changed = hint.as_deref().and_then(session_thread_field) != Some(next);
                     *hint = Some(title.clone());
-                    if changed {
+                    if changed && !(first_title && evidence.first_title_confirms_launch(next)) {
                         // This title opens the new provider binding. Frames
                         // before it belong to the retired conversation and
                         // cannot seed the new reducer. So does a bell that
@@ -555,6 +604,22 @@ mod tests {
         let seq = evidence.record_title(Some("replacement".into()), at + Duration::from_secs(2));
         evidence.begin_binding(seq);
         evidence.record_submission(at + Duration::from_secs(3));
+        assert_eq!(evidence.binding_rev(), 2);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+    }
+
+    #[test]
+    fn pinned_launch_first_uuid_confirms_binding_but_different_uuid_switches() {
+        let pinned = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        let mut evidence = LifecycleEvidence::known_at_launch(Some(pinned.clone()));
+        let at = SystemTime::now();
+        evidence.record_submission(at);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        assert!(evidence.first_title_confirms_launch(&pinned));
+        assert!(!evidence.first_title_confirms_launch(&other));
+        let seq = evidence.record_title(Some(other), at);
+        evidence.begin_binding(seq);
         assert_eq!(evidence.binding_rev(), 2);
         assert_eq!(evidence.first_submission_binding(), Some(1));
     }

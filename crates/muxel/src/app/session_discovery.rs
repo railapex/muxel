@@ -336,7 +336,7 @@ impl MuxelApp {
                     if unowned {
                         self.stage_discovered_claude(iid, record, binding, cx)
                     } else {
-                        session_binding::acknowledge_claude_binding(record);
+                        acknowledge_futile_claude_record(record, binding.is_some());
                         None
                     }
                 }
@@ -526,7 +526,7 @@ impl MuxelApp {
         cx: &App,
     ) -> Option<SessionBindingUpdate> {
         let Some(binding) = binding else {
-            session_binding::acknowledge_claude_binding(record);
+            acknowledge_futile_claude_record(record, false);
             return None;
         };
         let launch = self.discovery_terminal(iid)?.read(cx).session().id;
@@ -726,6 +726,17 @@ fn claim_validated_claude_record(
         return None;
     }
     Some(record)
+}
+
+/// A valid record whose transcript or project tree is temporarily unavailable
+/// remains claimed for the next discovery pass. Malformed records cannot heal.
+fn acknowledge_futile_claude_record(
+    record: session_binding::ClaimedClaudeRecord,
+    binding_valid: bool,
+) {
+    if binding_valid || !session_binding::claude_record_structurally_valid(&record.bytes) {
+        session_binding::acknowledge_claude_binding(record);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1305,7 +1316,8 @@ mod grok_regressions {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveryCandidate, SessionOwnership, claim_validated_claude_record, discover_sessions,
+        DiscoveryCandidate, SessionOwnership, acknowledge_futile_claude_record,
+        claim_validated_claude_record, discover_sessions,
     };
     use crate::session_binding;
     use muxel_core::session_discovery::{SessionDiscovery, SessionDiscoveryKey, SessionProvider};
@@ -1338,6 +1350,7 @@ mod tests {
     }
 
     struct ClaudeFixture {
+        root: PathBuf,
         home: PathBuf,
         data: PathBuf,
         pane: Uuid,
@@ -1346,9 +1359,7 @@ mod tests {
 
     impl ClaudeFixture {
         fn new() -> Self {
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.wip/discovery-tests")
-                .join(Uuid::new_v4().to_string());
+            let root = std::env::temp_dir().join(format!("muxel-discovery-{}", Uuid::new_v4()));
             let home = root.join("home");
             let data = root.join("data");
             std::fs::create_dir_all(home.join(".claude/projects/fixture")).unwrap();
@@ -1369,6 +1380,7 @@ mod tests {
                 )
                 .unwrap();
             Self {
+                root,
                 home,
                 data,
                 pane,
@@ -1381,11 +1393,15 @@ mod tests {
         }
 
         fn hook(&self, identity: Uuid, nonce: Uuid) -> Vec<u8> {
+            self.hook_source(identity, nonce, "resume")
+        }
+
+        fn hook_source(&self, identity: Uuid, nonce: Uuid, source: &str) -> Vec<u8> {
             let project = self.home.join(".claude/projects/fixture");
             let transcript = project.join(format!("{identity}.jsonl"));
             std::fs::write(&transcript, "{}\n").unwrap();
             let bytes = json!({
-                "hook_event_name":"SessionStart", "source":"resume", "session_id":identity,
+                "hook_event_name":"SessionStart", "source":source, "session_id":identity,
                 "cwd":project, "transcript_path":transcript,
                 "muxel_hook":{"nonce":nonce, "recorded_at_us":123456000_u64}
             })
@@ -1425,6 +1441,22 @@ mod tests {
         ) -> Option<session_binding::ClaimedClaudeRecord> {
             claim_validated_claude_record(&self.data, self.pane, snapshot)
         }
+    }
+
+    impl Drop for ClaudeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn claude_fixture_removes_its_temp_tree() {
+        let root = {
+            let fixture = ClaudeFixture::new();
+            assert!(fixture.root.starts_with(std::env::temp_dir()));
+            fixture.root.clone()
+        };
+        assert!(!root.exists());
     }
 
     #[test]
@@ -1497,6 +1529,55 @@ mod tests {
         let (latest, binding) = fixture.candidate();
         assert_eq!(binding.session_id, second.to_string());
         session_binding::acknowledge_claude_binding(fixture.claim(&latest).unwrap());
+        assert!(
+            session_binding::read_pending_claude_binding(&fixture.data, fixture.pane).is_none()
+        );
+    }
+
+    #[test]
+    fn clear_record_retries_when_claude_project_tree_appears_later() {
+        let fixture = ClaudeFixture::new();
+        let identity = Uuid::new_v4();
+        let original = fixture.hook_source(identity, Uuid::new_v4(), "clear");
+        std::fs::remove_dir_all(fixture.home.join(".claude/projects")).unwrap();
+        let mut batch = discover_sessions(
+            vec![fixture.request.clone()],
+            &fixture.home,
+            Some(&fixture.data),
+            Default::default(),
+        );
+        let snapshot = match batch.results.pop().unwrap().1 {
+            DiscoveryCandidate::Claude {
+                snapshot,
+                binding: None,
+            } => snapshot,
+            _ => panic!("missing project tree must defer validation"),
+        };
+        let claim = fixture.claim(&snapshot).unwrap();
+        acknowledge_futile_claude_record(claim, false);
+        assert_eq!(
+            session_binding::read_pending_claude_binding(&fixture.data, fixture.pane)
+                .unwrap()
+                .bytes,
+            original
+        );
+        let project = fixture.home.join(".claude/projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{identity}.jsonl")), "{}\n").unwrap();
+        let (retry, binding) = fixture.candidate();
+        assert_eq!(binding.session_id, identity.to_string());
+        session_binding::acknowledge_claude_binding(fixture.claim(&retry).unwrap());
+    }
+
+    #[test]
+    fn malformed_claude_record_is_acknowledged() {
+        let fixture = ClaudeFixture::new();
+        let shared = fixture.shared();
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        std::fs::write(&shared, b"not json").unwrap();
+        let snapshot =
+            session_binding::read_pending_claude_binding(&fixture.data, fixture.pane).unwrap();
+        acknowledge_futile_claude_record(fixture.claim(&snapshot).unwrap(), false);
         assert!(
             session_binding::read_pending_claude_binding(&fixture.data, fixture.pane).is_none()
         );

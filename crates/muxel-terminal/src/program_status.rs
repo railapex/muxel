@@ -490,6 +490,10 @@ pub(crate) struct ProgramStatusSnapshot {
 }
 
 impl ProgramStatusSnapshot {
+    pub fn confirm_initial_title(&mut self, thread: ThreadKey) {
+        self.thread = Some(thread);
+    }
+
     pub fn observe_title(&mut self, thread: ThreadKey, carry_initial_working: bool) {
         if self.thread != Some(thread) {
             let working =

@@ -628,6 +628,9 @@ pub struct CommandSpec {
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
+    /// The launch already names its conversation, or has no provider binding
+    /// source. An unpinned provider with a title/registry source stays unknown.
+    pub initial_binding: InitialBinding,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
@@ -653,6 +656,13 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub enum InitialBinding {
+    #[default]
+    Unknown,
+    Known(Option<String>),
+}
+
 impl CommandSpec {
     /// Run the user's default shell. On Windows that's PowerShell (`cmd.exe` is
     /// available as a separate preset); elsewhere it's `$SHELL`.
@@ -665,6 +675,7 @@ impl CommandSpec {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
             status_program: None,
+            initial_binding: InitialBinding::Unknown,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -684,6 +695,7 @@ impl CommandSpec {
         Self {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
+            initial_binding: InitialBinding::Unknown,
             program,
             args,
             cwd: None,
@@ -1327,6 +1339,9 @@ impl TerminalSession {
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
         let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        if matches!(&spec.initial_binding, InitialBinding::Known(_)) {
+            program_status.lock().adopt_binding(1);
+        }
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1387,7 +1402,10 @@ impl TerminalSession {
         drop(writer_handle);
 
         let title = Arc::new(Mutex::new(None));
-        let evidence = Arc::new(Mutex::new(LifecycleEvidence::default()));
+        let evidence = Arc::new(Mutex::new(match &spec.initial_binding {
+            InitialBinding::Unknown => LifecycleEvidence::default(),
+            InitialBinding::Known(id) => LifecycleEvidence::known_at_launch(id.clone()),
+        }));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
@@ -1524,12 +1542,21 @@ impl TerminalSession {
                     if let Some(thread) = session_thread_field(&title)
                         && let Some(key) = ThreadKey::from_field(thread)
                     {
-                        let carry = self.evidence.lock().can_carry_initial_working();
+                        let first_title = self.session_id_hint.lock().is_none();
+                        let evidence = self.evidence.lock();
+                        let carry = evidence.can_carry_initial_working();
+                        let confirms_launch =
+                            first_title && evidence.first_title_confirms_launch(thread);
+                        drop(evidence);
                         let mut status = self.program_status.lock();
                         if fresh
                             && self.program_status_generation.load(Ordering::Acquire) == generation
                         {
-                            status.observe_title(key, carry);
+                            if confirms_launch {
+                                status.confirm_initial_title(key);
+                            } else {
+                                status.observe_title(key, carry);
+                            }
                         }
                     }
                     processor.advance(&mut *term, &bytes[start..=index]);
@@ -1578,6 +1605,9 @@ impl TerminalSession {
             if start < bytes.len() {
                 processor.advance(&mut *term, &bytes[start..]);
             }
+            self.evidence
+                .lock()
+                .sync_state_after_read(processor.sync_timeout().sync_timeout().is_some(), read_at);
             parsed = true;
         }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
@@ -1592,7 +1622,16 @@ impl TerminalSession {
             .sync_timeout()
             .is_some_and(|d| Instant::now() >= d)
         {
+            let buffered_at = (!parsed)
+                .then(|| self.evidence.lock().sync_started_at())
+                .flatten();
+            if let Some(started) = buffered_at {
+                self.evidence.lock().begin_read(started);
+            }
             processor.stop_sync(&mut *term);
+            self.evidence
+                .lock()
+                .sync_state_after_read(false, SystemTime::now());
             profile::sync_expired();
         }
         self.evidence.lock().end_read();
@@ -2474,7 +2513,14 @@ impl TerminalSession {
             .sync_timeout()
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
+            let started = self.evidence.lock().sync_started_at();
+            if let Some(started) = started {
+                self.evidence.lock().begin_read(started);
+            }
             processor.stop_sync(&mut *term);
+            let mut evidence = self.evidence.lock();
+            evidence.sync_state_after_read(false, SystemTime::now());
+            evidence.end_read();
             self.bump_content();
             self.trigger_runtime();
         }
@@ -2510,6 +2556,11 @@ impl TerminalSession {
     pub(crate) fn test_program_status(&self, wire: &[u8]) {
         self.process_output(wire);
         self.trigger_runtime();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&self, idle: Duration) {
+        *self.last_output.lock() = Instant::now() - idle;
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
