@@ -4237,10 +4237,28 @@ mod provider_switch_tests {
                 spec.initial_binding = InitialBinding::Known(initial.clone());
                 let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
                 assert_eq!(session.binding_revision(), 1);
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Codex,
+                    &[],
+                    &[],
+                    false,
+                    Instant::now(),
+                );
                 session.test_program_status(b"\x1b]7501;state=working\x07");
                 assert!(session.program_status_snapshot().root.is_some());
                 session.test_program_status(format!("\x1b]0;{title_id} | Working\x07").as_bytes());
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Codex,
+                    &[],
+                    &[],
+                    false,
+                    Instant::now(),
+                );
                 assert_eq!(session.binding_revision(), 1);
+                assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
                 assert_eq!(
                     session.program_status_snapshot().root.unwrap().state,
                     crate::program_status::ProgramState::Working
@@ -5056,6 +5074,46 @@ mod provider_switch_tests {
                 .unwrap()
                 .starts_with(&first.to_string())
         );
+        session.kill();
+    }
+
+    #[test]
+    fn runtime_deadline_flush_keeps_a_stale_title_in_the_old_binding() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        let old_read = hook - Duration::from_millis(500);
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{stale} | Working\x07"),
+            old_read,
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        let deadline = session.program_status_sync_deadline().unwrap();
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+        );
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.process_drained(&drained(&[("\x1b]7501;state=done\x07", old_read)]));
+        assert_eq!(session.program_status_snapshot().root, None);
+        assert!(session.runtime_evidence(None).settling);
         session.kill();
     }
 

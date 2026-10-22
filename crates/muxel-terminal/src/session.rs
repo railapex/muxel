@@ -1610,30 +1610,9 @@ impl TerminalSession {
                 .sync_state_after_read(processor.sync_timeout().sync_timeout().is_some(), read_at);
             parsed = true;
         }
-        // Synchronized updates (DECSET 2026): vte BUFFERS everything between
-        // BSU/ESU instead of applying it, and expiring a stuck window is the
-        // embedder's job (alacritty services this in its event loop; vte's
-        // deadline is 150ms). Without this check, an app that opens a window
-        // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap. What it
-        // applies was read by the last chunk at the latest, and is stamped so.
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|d| Instant::now() >= d)
-        {
-            let buffered_at = (!parsed)
-                .then(|| self.evidence.lock().sync_started_at())
-                .flatten();
-            if let Some(started) = buffered_at {
-                self.evidence.lock().begin_read(started);
-            }
-            processor.stop_sync(&mut *term);
-            self.evidence
-                .lock()
-                .sync_state_after_read(false, SystemTime::now());
-            profile::sync_expired();
-        }
+        // A synchronized update can time out here or on a runtime deadline
+        // without another read. Both paths must replay its oldest read time.
+        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor);
         self.evidence.lock().end_read();
         if parsed {
             let screen = term.screen_lines() as i32;
@@ -2505,22 +2484,33 @@ impl TerminalSession {
         self.processor.lock().sync_timeout().sync_timeout()
     }
 
+    fn flush_expired_sync_locked(
+        &self,
+        term: &mut Term<MuxelListener>,
+        processor: &mut Processor,
+    ) -> bool {
+        let Some(deadline) = processor.sync_timeout().sync_timeout() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        let started = self.evidence.lock().sync_started_at();
+        if let Some(started) = started {
+            self.evidence.lock().begin_read(started);
+        }
+        processor.stop_sync(term);
+        let mut evidence = self.evidence.lock();
+        evidence.sync_state_after_read(false, SystemTime::now());
+        evidence.end_read();
+        profile::sync_expired();
+        true
+    }
+
     fn flush_expired_program_status_sync(&self) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            let started = self.evidence.lock().sync_started_at();
-            if let Some(started) = started {
-                self.evidence.lock().begin_read(started);
-            }
-            processor.stop_sync(&mut *term);
-            let mut evidence = self.evidence.lock();
-            evidence.sync_state_after_read(false, SystemTime::now());
-            evidence.end_read();
+        if self.flush_expired_sync_locked(&mut term, &mut processor) {
             self.bump_content();
             self.trigger_runtime();
         }
