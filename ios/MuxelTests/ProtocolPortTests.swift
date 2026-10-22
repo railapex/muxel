@@ -64,7 +64,9 @@ final class ProtocolPortTests: XCTestCase {
     func testStartServerNamesNoProject() {
         XCTAssertEqual(
             TmuxCommands.startServer(),
-            ["start-server", ";", "set", "-s", "exit-empty", "off"])
+            ["start-server", ";", "set", "-s", "exit-empty", "off",
+             ";", "set", "-g", "set-titles", "on",
+             ";", "set", "-g", "set-titles-string", "#{pane_title}"])
         // The `;` has to reach tmux as a literal argument (tmux's command separator);
         // if the remote shell ate it, `set -s exit-empty off` would run as a shell
         // command and the server would exit the moment it had no sessions.
@@ -72,7 +74,8 @@ final class ProtocolPortTests: XCTestCase {
         // server's command line still names no project, no session, and not muxel.
         XCTAssertEqual(
             TmuxCommands.commandLine(TmuxCommands.startServer()),
-            "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
+            "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'"
+                + " ';' 'set' '-g' 'set-titles' 'on' ';' 'set' '-g' 'set-titles-string' '#{pane_title}'")
         XCTAssertFalse(TmuxCommands.commandLine(TmuxCommands.startServer()).contains("muxel"))
     }
 

@@ -1486,7 +1486,7 @@ mod tests {
                 "{}; if ! tmux -L mxl has-session -t '=muxel-abc123' 2>/dev/null \
                  && tmux has-session -t '=muxel-abc123' 2>/dev/null; \
                  then set --; else set -- -L mxl; fi; \
-                 if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; \
+                 if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off ';' set -g set-titles on ';' set -g set-titles-string '#{{pane_title}}'; fi; \
                  exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
@@ -1826,8 +1826,7 @@ mod tests {
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
         // Only this project-less tmux process may start the owned server.
-        let server =
-            "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; ";
+        let server = "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off ';' set -g set-titles on ';' set -g set-titles-string '#{pane_title}'; fi; ";
         let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
             !before.contains("webapp"),
