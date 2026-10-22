@@ -85,7 +85,9 @@ feature is added or changed, update the matching entry here in the same change**
   palette's *Restart agent*) stops the pane's process *and* its tmux session,
   local or remote, then relaunches in place in a fresh session. A resume-capable
   agent comes back on its saved conversation, so an updated harness binary takes
-  effect without losing it; a shell or other program starts over.
+  effect without losing it; a shell or other program starts over. On Windows,
+  a Grok restart first saves any newly discovered conversation. If that save
+  fails, the pane keeps running and reports the error.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -174,9 +176,14 @@ feature is added or changed, update the matching entry here in the same change**
   lookup across pop-out and docking, and unresolved results retry with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
+  On Windows, an accepted Grok conversation stays reserved to its pane even
+  while its metadata save is pending.
   A saved conversation is abandoned only once muxel has confirmed it
   is really gone — a session store it couldn't read leaves the pane's resume id alone —
-  and the pane then quietly starts fresh.
+  and the pane then quietly starts fresh. Before a local Claude relaunch, pending hook
+  records are handled through the newest binding before resume arguments are chosen.
+  If recovery cannot be saved or acknowledged, launch stops and the pending record
+  remains available for retry.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -314,6 +321,15 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — direct PTY panes accept OSC 7501 reports from
+  agents that send them and answer a capability query before a following DA query.
+  Working, blocked (including permission, question, or auth kind), and finished
+  states come from the agent while its root report is current. A finished Codex
+  turn also reaches **done** when its submitted Working turn reports Idle; protocol
+  `error` uses the existing **done** badge with its error source retained. Clear,
+  provider switch, shell prompt, process exit, or relaunch returns an unfinished
+  pane to its existing fallback detection. Both local and remote tmux panes
+  continue using that fallback because tmux does not forward OSC 7501 reports.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes
@@ -343,6 +359,23 @@ feature is added or changed, update the matching entry here in the same change**
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
   pane) can't fake a finished turn.
+- **Event-driven status snapshots** — terminal output, semantic titles, bells,
+  process exit, resize invalidation, and exact quiet/debounce deadlines update one
+  per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
+  or mutate lifecycle state. When an agent switches conversations in place (a
+  `/resume`), evidence from around the switch can't complete a turn or notify:
+  the pane shows the agent's current state until the new conversation's own
+  evidence arrives, and the Enter that picked the conversation doesn't count as
+  a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
+  sends are refused and `wait` keeps waiting; `send --force` retains its override.
+  A silent in-place switch retires the old visible state after a five-second
+  quiet deadline and returns to Idle without reporting a completed turn.
+  A Grok conversation switch releases old loop ownership even if saving fails.
+  Each pane uses its own discovery history, so another pane's refresh cannot
+  discard its valid current title.
+  The snapshot carries a launch id and
+  provider-binding, input and sequence revisions; without provider hooks its coverage remains
+  explicitly limited to visible terminal evidence.
 - **Auto-continue** — an agent that lays out a multi-phase plan sometimes finishes
   the first phase and just stops, waiting, with the todo list still half-unchecked.
   Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
@@ -443,7 +476,16 @@ feature is added or changed, update the matching entry here in the same change**
   active project — a loop firing on a timer can't interrupt what you're typing.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy.
+  copy. Cleanup requires current attributable evidence from the launch and
+  conversation known before the first submitted turn. A pinned launch (including
+  Claude's `--session-id`) owns its first prompt from spawn; an unpinned agent's
+  later first identity cannot establish which conversation received that prompt.
+  Switching conversations or reopening its pane stops tracking the old run
+  without closing the new one. At the
+  runtime cap, uncertain or unidentified runs stop tracking without closing the
+  pane, so later scheduled runs can fire. If an unpinned submission preceded
+  identity discovery, even an Exit-policy loop leaves its pane open for a human
+  to close.
 - **Managed from the main window** — a toolbar "Loops" dropdown lists your loops:
   click one to run it now, the pencil to edit it in Settings → Loops, or "New
   loop…" to create one. Schedules survive restarts (a daily-at whose time passed
@@ -573,8 +615,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
-  Scheduled loops stay tracked across popout and redock. On Windows, Grok
-  conversation discovery follows the live terminal in either window.
+  Activity and attendance follow the same conversation attribution as docked
+  terminals; redocking uncertain state preserves existing attention cards.
+  On Windows, Grok conversation discovery follows the live terminal in either
+  window.
+  Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
