@@ -134,7 +134,7 @@ feature is added or changed, update the matching entry here in the same change**
   (via a CLI flag or by typing it in at startup), and a runner startup delay
   (ms to wait after the agent's first output before a runner types — for slow
   starters like opencode, and for Grok, whose animated welcome screen never goes
-  quiet; 0 = auto-wait until output goes quiet).
+  quiet; 0 = auto-wait until output goes quiet, with a 30-second cap).
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
   automatically once installed. A GUI launch reconstructs the bin dirs the desktop
@@ -146,6 +146,8 @@ feature is added or changed, update the matching entry here in the same change**
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
   Restart retries) and the error lands in the NOTIFICATIONS feed.
+  Outside-created panes show the requested program's launch failure directly;
+  their approved command is never replaced with a shell.
 - **Session resume** — resume-capable agents reopen their prior conversation after
   a muxel restart. Two shapes, both configurable per preset:
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
@@ -441,6 +443,31 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
+- **Provider startup input** — controller-owned startup tasks wait for Claude's editable
+  composer and bracketed-paste mode, Codex's live editor and Ready title, or
+  Grok's semantic idle state after its configured startup delay.
+  Codex folder-trust menus receive no task input; readiness failure leaves the
+  provider running and reports `startup_error` through `ctl status` and `show`.
+  Permission text inside Claude's pasted task does not block its submission.
+  `ctl wait` keeps a newly created task pending through startup and paste, then
+  confirms submission only from a fresh provider turn or rendered user row.
+  Enter admission alone stays pending. Codex can receive one extra Enter after
+  five seconds only if the exact task is visible on one ASCII editor row with
+  its cursor at the end and no new user row; ambiguous reflow gets no retry. Task text
+  is never pasted twice. Grok and Claude do not inherit that retry. After ten
+  seconds without acceptance, `ctl wait` reports `submission_failed`, with an
+  explanation in `startup_error`. Providers without a verified input/acceptance
+  protocol (including Muse) refuse controller startup tasks without typing.
+  Input stops if the pane is replaced, someone types, the writer fails, or
+  readiness times out; it never replays a submitted task automatically.
+  On muxel's own tmux servers, the active pane's full title is forwarded to
+  attached clients, so Codex and Grok readiness works through tmux as well.
+  Imported default-server sessions retain that server's title configuration;
+  missing readiness refuses controller tasks there. UI runners, loops and TypeIn
+  presets keep their configured delay or quiet-output wait, typing at the
+  30-second cap even if output never settles. Missing readiness or reaching the
+  cap shows a notice in the terminal; failed or interrupted startup input also
+  shows a notice. These launches do not require the controller readiness protocol.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy.
@@ -554,6 +581,104 @@ feature is added or changed, update the matching entry here in the same change**
   status (working / blocked / done / idle / exited), read its last prompt and last
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
+- **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
+  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
+  plain and prompt launches, retained on restart. The preset needs Model flag /
+  Effort flag configured and absent from Extra args; literal argv cannot use
+  these options (`parameter_unsupported`). Values are 1–64 characters from
+  `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
+  directory details; preset overrides remain Allow-eligible. Flag templates
+  containing `{}` substitute
+  the value into one argument. New Claude presets use `--effort`; new Codex
+  presets use `--config=model_reasoning_effort={}`. Existing presets are unchanged.
+  Parameterized creation uses control protocol v3 so older hosts refuse it;
+  plain creation and status polling remain v2. Hosts require the exact command version.
+  Choose `--preset NAME` (or its id), or pass
+  `-- PROGRAM ARGS...` to launch literal argv, including spaces, quotes and empty
+  arguments. `--prompt TEXT` (or `--prompt -` for stdin) submits a user task
+  through the existing one-shot runner path for a configured non-shell terminal
+  preset. This replaces the preset's configured system prompt with the task;
+  preset arguments are kept. The typed first turn is exactly the task. Automatic
+  file-link and memory instructions use the preset's separate flag/config
+  transport when available, and are omitted for TypeIn-only presets.
+  The task text is discarded after first launch.
+  Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
+  conversation. Literal, shell and browser launches refuse prompts with
+  `prompt_unsupported`. `--cwd`
+  accepts an existing absolute directory, including a linked worktree outside
+  the project root; it defaults to the root. Automatic memory and accomplishments
+  instructions still address the project's files when the launch directory differs.
+  `--name` names the tab, `--split right|down` creates a pane.
+  Creation preserves the selected tab, focus,
+  project and window by default, without raising the window. `--focus` selects
+  the new pane, raising its window only after click approval. `--background` remains accepted as a
+  compatibility no-op. JSON uses `focus` (default false); the legacy `background`
+  field is accepted and ignored. The JSON reply identifies the pane and launch.
+  ALL outside creation requires both "Allow outside tools to control muxel" and
+  the separate **Outside terminal creation** policy in Settings → Grok Bot.
+  It defaults to **Off**. **Ask** requires a click for each request; **Allow**
+  opens configured terminal presets whose program is a recognized built-in agent provider.
+  All literal argv, including agent argv, and shell or unrecognized-program
+  presets/defaults also require "Also allow typing into shell panes". Configured
+  non-literal recognized agent presets need only the first two grants.
+  Literal argv and shell or unrecognized-program presets always Ask, even under Allow. All three grants
+  default off; upgrades do not infer creation permission from older
+  control/command grants. Users enable the required settings themselves.
+  Creating panes for ssh, wsl.exe, python, node and custom executables requires
+  the shell grant and a click. Existing-pane writes require the shell grant too.
+  Commands run as the host muxel process with its permissions and environment,
+  outside the caller's sandbox; coding agents and configurable presets are not a
+  security sandbox. Creation is checked at admission and rechecked at mutation
+  time before executable discovery, placement, persistence or spawning.
+  Quitting, deletion and remote projects refuse
+  creation. Literal launches on Windows require a native executable (installed
+  Codex resolves to its packaged executable); batch wrappers cannot preserve
+  arbitrary argv. Literal launches bypass preset rewriting and tmux wrapping.
+  Built-in output markers still track work and permission prompts without
+  modifying the command or injecting startup input.
+  They restore stopped; project selection, Restart and wake never replay their
+  opening brief. The pane's explicit **Run again** action reruns the saved argv.
+  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
+  exited terminals keep their **done** badge and completion age.
+  Literal panes never claim or clean up tmux sessions, including stale peer
+  metadata. Phone duplicates keep them stopped without assigning a tmux session;
+  closing them still removes their layout entry and owned worktree normally.
+  Launch directories are stored separately from owned worktrees, so closing a
+  pane never deletes its cwd and migration never registers it as owned.
+  Without `--prompt`, preset and default launches keep toolbar injection, resume and hooks.
+  `new` opens terminal panes; browser presets (including a browser default) are
+  not supported yet and receive a refusal.
+  Ask answers admission immediately with a pending request UUID; the CLI polls
+  once a second and prints the final reply. `--no-wait` returns the pending ID for
+  scripts to poll with `ctl new-status ID`. The floating card shows declared
+  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), destination
+  project, preset, cwd, pane name and the prompt's first nonblank lines, with an
+  omitted-line count, or full literal argv. The full prompt is available in the
+  scrolling details. Labels and pane names have bounded lengths and reject
+  control, format and line-separator characters; displayed values are escaped. Long details
+  scroll, with literal arguments shown one per line, including empty arguments.
+  Labels are not authenticated identities. **Allow once** / **Deny** require
+  mouse clicks. Both buttons stay disabled for 750 ms after each card appears,
+  and double-clicks are ignored. Mouse-down and release must belong to the same
+  armed card, so a held press cannot transfer across expiry. Scrolling stays in
+  the card; keyboard input remains in the terminal. Cards appear in FIFO order
+  with a waiting count and an OS
+  notification, and native browser views yield to them.
+  Approvals expire 120 seconds after admission (`approval_timeout`), including
+  time behind another card; denial returns `approval_denied`. Turning creation
+  or outside control off refuses every pending request and removes its card.
+  Outside control off also stops the server, so polling callers receive
+  `host_unavailable` after connection retries. Connection and host-availability
+  failures retry up to three times against the same UUID; the CLI never reissues creation.
+  Exhausted retries and uncoded status errors name the UUID to query with
+  `new-status` and advise against repeating `new` while the original may still wait.
+  Finished replies remain available for ten minutes (latest 256); at most 64
+  approvals wait, and approvals do not survive a host restart. Creation requests
+  use protocol v2, or v3 when selecting model/effort, so older hosts refuse
+  unsupported fields.
+  Turning creation off leaves existing panes and typing permissions unchanged
+  and does not cancel launches already admitted for spawning. Deferred requests
+  still recheck the current grant. Human toolbar creation is unaffected.
 - **Reads what the agent actually said** — `show` returns the last prompt and the
   model's last reply the way read-aloud finds them (a local Claude pane's session
   transcript, otherwise the pane's scrollback), and for a blocked
@@ -565,7 +690,20 @@ feature is added or changed, update the matching entry here in the same change**
   working or waiting on a question (unless forced), `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
-  shell panes" is on too, since typing into a shell is running commands.
+  shell panes" is on too, since typing into a shell is running commands. That
+  setting also grants `new` shell preset/default and all literal argv launches
+  when the separate outside terminal-creation grant is enabled. Existing shell
+  writes require global control and this command grant even when creation is off.
+  Turning "Also allow typing into shell panes" off refuses subsequent control
+  writes to every literal argv pane, even agent-looking or interpreter programs,
+  and programs outside the recognized built-in agent providers.
+  A recognized agent that fails to launch and falls back to a shell also requires
+  the shell-input grant, even though its saved preset still names the agent.
+  Configured non-literal recognized agents remain controllable while outside control is on;
+  disabling all outside control is a separate setting. Delayed Enter and keys
+  recheck the shell-input grant and terminal/session availability before writing.
+  Revocation does not stop processes
+  or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
   the pane closes or restarts. A withheld send fails and attempts to release only
   its own tmux claim; timeout, command failure or older tmux can leave the claim
@@ -592,7 +730,7 @@ feature is added or changed, update the matching entry here in the same change**
   computer, including shells, receive `MUXEL_INSTANCE_ID` set to the pane's id,
   which `muxel ctl` takes as AGENT. An agent or script inside a pane
   can check its own status or read its own screen without guessing at its name.
-  If a requested command cannot start, its local fallback shell receives the same
+  If a local UI command cannot start, its fallback shell receives the same
   pane id without copying the failed command's transport variables.
   A pane kept in tmux gets it when muxel creates its session, from tmux 3.2 on
   (which can hand a new session's program a variable). On older tmux it goes
