@@ -77,6 +77,9 @@ impl TryFrom<String> for Socket {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return Err("tmux socket name must be nonempty and contain no path separators".into());
+        }
         match name.as_str() {
             SOCKET_NAME => Ok(Self::Private),
             "default" => Ok(Self::Default),
@@ -1477,7 +1480,6 @@ mod tests {
     #[test]
     fn named_owner_roundtrips_without_becoming_legacy() {
         for name in [
-            "",
             "   ",
             "mxl-profile",
             "default ",
@@ -1513,6 +1515,14 @@ mod tests {
                 serde_json::from_value::<Socket>(serde_json::json!(name)).unwrap(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn invalid_named_socket_is_rejected_on_decode() {
+        for name in ["", "a/b", "a\\b", "/", "\\"] {
+            assert!(Socket::try_from(name.to_string()).is_err(), "{name:?}");
+            assert!(serde_json::from_value::<Socket>(serde_json::json!(name)).is_err());
         }
     }
 

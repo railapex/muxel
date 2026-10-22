@@ -122,7 +122,7 @@ enum TmuxCommands {
             case .incomplete:
                 return "Couldn't confirm both tmux servers. Reconnect and try again."
             case .ownershipRefreshRequired:
-                return "That session name is in use on another tmux server. Refresh the project layout before reconnecting."
+                return "That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives."
             }
         }
     }
@@ -131,7 +131,7 @@ enum TmuxCommands {
     /// discovery cannot distinguish an empty server from a permission failure.
     static func confirmedTargetsCommand() -> String {
         "export LC_ALL=C; " + [socketName, "default"].map { server in
-            commandLine(["list-sessions", "-F", "\(server)\t#{session_name}"], session: "", socket: server)
+            commandLine(["list-sessions", "-F", "#{session_name}"], session: "", socket: server)
                 + " 2>&1; echo \":muxel-listed:$?\""
         }.joined(separator: "; ")
     }
@@ -142,19 +142,22 @@ enum TmuxCommands {
         var listing: [String] = []
         var targets: [SessionTarget] = []
         for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(raw)
+            // Match Rust's `lines()`: a CR from CRLF is a line ending, not
+            // part of a session name or marker status.
+            var line = String(raw)
+            if line.hasSuffix("\r") { line.removeLast() }
             guard line.hasPrefix(":muxel-listed:") else {
                 listing.append(line); continue
             }
-            guard answered < servers.count,
-                  let status = UInt8(line.dropFirst(":muxel-listed:".count)) else { throw ProbeError.incomplete }
+            guard answered < servers.count else { throw ProbeError.incomplete }
+            let status = String(line.dropFirst(":muxel-listed:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let text = listing.joined(separator: "\n")
-            if status == 0 {
-                let rows = parseTargets(text)
-                guard rows.count == listing.filter({ !$0.isEmpty }).count,
-                      rows.allSatisfy({ $0.socket == servers[answered] }) else { throw ProbeError.incomplete }
-                targets += rows
-            } else if !confirmedNoServer(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if status == "0" {
+                guard listing.allSatisfy({ !$0.isEmpty }) else { throw ProbeError.incomplete }
+                targets += listing.map { SessionTarget(name: $0, socket: servers[answered]) }
+            } else if UInt8(status).map({ $0 != 0 }) != true
+                        || !confirmedNoServer(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
                 throw ProbeError.incomplete
             }
             answered += 1
@@ -214,6 +217,14 @@ enum TmuxCommands {
 
     static func resolveTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
         resolveTarget(instance, in: targets, name: { $0.name }, socket: { $0.socket })
+    }
+
+    /// A recorded Default owner must match by its exact saved name. Suffix
+    /// recovery could otherwise attach a different session before migration is
+    /// checked, or after the checked inventory found the recorded name absent.
+    static func recordedDefaultTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
+        guard instance.tmuxSocket == "default", let recordedName = instance.tmuxSession else { return nil }
+        return targets.first { $0.socket == "default" && $0.name == recordedName }
     }
 
     static func resolveTarget<Row>(_ instance: Instance, in rows: [Row],

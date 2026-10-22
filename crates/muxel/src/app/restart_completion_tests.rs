@@ -227,24 +227,29 @@ fn stale_remote_restart_completion_leaves_new_generation_pending() {
 #[test]
 fn local_restart_failed_owner_save_never_kills_or_respawns() {
     with_app(|cx, main| {
+        let iid = main
+            .update(cx, |app, window, cx| {
+                let root = muxel_store::data_dir().unwrap().join("project");
+                std::fs::create_dir_all(&root).unwrap();
+                let project = app.workspace.add_project(Project::new("local", &root));
+                let mut instance = Instance::shell(project);
+                instance.tmux_session = Some("must-not-be-killed".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(project).unwrap().layout = Some(PaneNode::leaf(iid));
+                app.workspace.active_project = Some(project);
+                app.current_workspace = Some(Uuid::new_v4());
+                // A directory at the destination makes the actual atomic save fail.
+                let path = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                std::fs::create_dir_all(&path).unwrap();
+
+                app.restart_agent(iid, window, cx);
+                iid
+            })
+            .unwrap();
+        cx.run_until_parked();
         main.update(cx, |app, window, cx| {
-            let root = muxel_store::data_dir().unwrap().join("project");
-            std::fs::create_dir_all(&root).unwrap();
-            let project = app.workspace.add_project(Project::new("local", &root));
-            let mut instance = Instance::shell(project);
-            instance.tmux_session = Some("must-not-be-killed".into());
-            instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
-            let iid = instance.id;
-            app.workspace.add_instance(instance);
-            app.workspace.project_mut(project).unwrap().layout = Some(PaneNode::leaf(iid));
-            app.workspace.active_project = Some(project);
-            app.current_workspace = Some(Uuid::new_v4());
-            // A directory at the destination makes the actual atomic save fail.
-            let path = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
-            std::fs::create_dir_all(&path).unwrap();
-
-            app.restart_agent(iid, window, cx);
-
             assert!(!app.terminal_restarts.contains(iid));
             assert!(app.terminals.is_empty());
             assert!(app.terminal_launching.is_empty());
@@ -314,7 +319,7 @@ fn peer_migration_collision_stops_restart_without_changing_owner() {
             let instance = app.workspace.instance(iid).unwrap();
             assert_eq!(instance.tmux_socket, Some(Socket::Default));
             assert_eq!(instance.tmux_session.as_deref(), Some("owned"));
-            assert!(app.failed_launches[&iid].contains("Refresh"));
+            assert!(app.failed_launches[&iid].contains("Open this project"));
         });
     });
 }

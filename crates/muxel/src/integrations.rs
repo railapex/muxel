@@ -1862,7 +1862,7 @@ pub(crate) fn confirmed_tmux_respawn_target(
     probe: impl FnMut(&Socket) -> Result<bool>,
 ) -> Result<SessionTarget> {
     session.for_respawn(probe)?.with_context(|| {
-        t("That session name is in use on another tmux server. Refresh the project layout before retrying this pane.")
+        t("That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives.")
     })
 }
 
@@ -1874,12 +1874,16 @@ fn local_tmux_has_session_confirmed(
     let mut cmd = tmux_on(socket.clone());
     cmd.args(muxel_core::tmux::has_session_args(session));
     let out = run_tmux_output_until(cmd, deadline)?;
+    confirmed_tmux_has_session_output(&out, session)
+}
+
+fn confirmed_tmux_has_session_output(out: &std::process::Output, session: &str) -> Result<bool> {
     if out.status.success() {
         return Ok(true);
     }
     let error = String::from_utf8_lossy(&out.stderr);
     if out.status.code() == Some(1)
-        && (error.trim_start().starts_with("can't find session:")
+        && (error.trim() == format!("can't find session: {session}")
             || muxel_core::tmux::confirmed_no_server(&error))
     {
         return Ok(false);
@@ -1947,8 +1951,9 @@ fn run_tmux_output_with(
     })
 }
 
-/// Complete, checked inventory for a Default-owner launch. Partial output or an
-/// inaccessible server cannot authorize migration to another socket.
+/// A live Default owner reattaches after one exact-name probe. Migration from an
+/// absent Default owner needs complete answers from both servers; partial output
+/// or an inaccessible server cannot authorize moving to another socket.
 pub fn remote_tmux_launch_target(
     loc: &RepoLoc,
     session: &SessionTarget,
@@ -1960,6 +1965,19 @@ pub fn remote_tmux_launch_target(
         bail!("not a remote project")
     };
     let (session, sockets) = tmux_launch_inventory(session, local_tmux_root().as_deref());
+    if session.socket == Some(Socket::Default) {
+        let exact = format!(
+            "export LC_ALL=C; {}",
+            ssh::session_tmux_command(&session, &muxel_core::tmux::has_session_args(&session.name),)
+        );
+        let out = run_tmux_output_until(remote_ssh_command(conn, exact), deadline)?;
+        if confirmed_tmux_has_session_output(&out, &session.name)? {
+            if require_absent {
+                bail!("tmux session “{session}” is still running");
+            }
+            return Ok(session);
+        }
+    }
     let cmd = remote_ssh_command(
         conn,
         format!(
@@ -2274,9 +2292,27 @@ pub fn kill_tmux_session_confirmed(
         .socket
         .as_ref()
         .context("resolve the tmux owner before restart")?;
+    if *socket == Socket::Default {
+        match local_tmux_has_session_confirmed(&Socket::Private, &session.name, deadline) {
+            Ok(true) => bail!(
+                "{}",
+                t(
+                    "That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives."
+                )
+            ),
+            Ok(false) => {}
+            Err(error) if tmux_command_spawn_failed(&error) => return Ok(session),
+            Err(error) => return Err(error),
+        }
+    }
     let mut cmd = tmux_on(socket.clone());
     cmd.args(muxel_core::tmux::kill_session_args(&session.name));
-    run_tmux_until(cmd, deadline, &GitEnv::production())?.context("tmux restart timed out")?;
+    match run_tmux_until(cmd, deadline, &GitEnv::production()) {
+        Ok(Some(_)) => {}
+        Ok(None) => bail!("tmux restart timed out"),
+        Err(error) if tmux_command_spawn_failed(&error) => return Ok(session),
+        Err(error) => return Err(error),
+    }
     if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
         bail!("tmux session “{session}” is still running");
     }
@@ -2287,6 +2323,10 @@ pub fn kill_tmux_session_confirmed(
             local_tmux_has_session_confirmed(other, &session.name, deadline)
         }
     })
+}
+
+fn tmux_command_spawn_failed(error: &anyhow::Error) -> bool {
+    error.root_cause().is::<std::io::Error>() && error.to_string().starts_with("starting tmux ")
 }
 
 pub fn restart_remote_tmux(
@@ -3411,6 +3451,59 @@ mod tests {
                 (saved, Socket::BOTH.to_vec())
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_local_tmux_probes_and_kill_use_exact_names() {
+        use std::io::ErrorKind;
+
+        match command("tmux").arg("-V").output() {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                eprintln!("skipping real tmux test: tmux is not installed");
+                return;
+            }
+            Err(error) => panic!("couldn't check tmux: {error}"),
+            Ok(output) => assert!(output.status.success(), "tmux -V: {output:?}"),
+        }
+
+        struct TestServer(Socket);
+        impl Drop for TestServer {
+            fn drop(&mut self) {
+                let _ = tmux_on(&self.0).arg("kill-server").output();
+            }
+        }
+
+        let server = TestServer(Socket::Named(format!("mxl-test-{}", uuid::Uuid::new_v4())));
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target", deadline()).unwrap());
+
+        let created = tmux_on(&server.0)
+            .args(["new-session", "-d", "-s", "target2"])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "new-session: {created:?}");
+        assert!(local_tmux_has_session_confirmed(&server.0, "target2", deadline()).unwrap());
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target", deadline()).unwrap());
+
+        let missing = tmux_on(&server.0)
+            .args(muxel_core::tmux::has_session_args("target"))
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&missing.stderr).trim(),
+            "can't find session: target"
+        );
+        assert!(!confirmed_tmux_has_session_output(&missing, "target").unwrap());
+        assert!(confirmed_tmux_has_session_output(&missing, "other").is_err());
+
+        let target = SessionTarget::new("target2", Some(server.0.clone()));
+        assert_eq!(
+            kill_tmux_session_confirmed(&target, deadline()).unwrap(),
+            target
+        );
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target2", deadline()).unwrap());
     }
 
     fn hanging_tmux_command() -> Command {

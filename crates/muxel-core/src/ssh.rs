@@ -1765,6 +1765,42 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_status_parser_matches_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Target {
+            socket: String,
+            name: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            output: String,
+            accepted: bool,
+            targets: Vec<Target>,
+        }
+
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/tmux-confirmed-status.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let parsed = parse_session_listings_for_migration(&case.output);
+            assert_eq!(parsed.is_some(), case.accepted, "{:?}", case.output);
+            if let Some(parsed) = parsed {
+                let actual: Vec<_> = parsed
+                    .iter()
+                    .map(|row| (row.socket.name().into_owned(), row.name.clone()))
+                    .collect();
+                let expected: Vec<_> = case
+                    .targets
+                    .iter()
+                    .map(|target| (target.socket.clone(), target.name.clone()))
+                    .collect();
+                assert_eq!(actual, expected, "{:?}", case.output);
+            }
+        }
+    }
+
+    #[test]
     fn strict_confirmation_keeps_a_named_owner_and_rejects_failed_replies() {
         let sockets = [Socket::Named("mxl-profile".into())];
         let rows = parse_session_listings_for_migration_on(

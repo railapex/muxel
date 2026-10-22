@@ -1206,8 +1206,10 @@ feature is added or changed, update the matching entry here in the same change**
   earlier muxel reattaches to it there (closing the pane still stops it). Its next
   session starts on muxel's own server after both servers confirm the old session
   is gone and `mxl` has no session of that exact name. A namesake on `mxl` is left
-  alone and the pane keeps its default-server binding until its owner is refreshed;
-  retry cannot recreate a second agent on Default. An imported session stays on
+  alone and the pane keeps its default-server binding. Open the project on the
+  device that moved the session so it saves the new owner to the sync layout; the
+  waiting pane then attaches automatically. Retry cannot recreate a second agent
+  on Default. An imported session stays on
   its recorded owner while running. Desktop and phone save an allowed migration
   before launching; a failed probe or save cannot authorize it. Reconnecting also
   retries pending closes on their recorded named servers; absence from the

@@ -6684,10 +6684,20 @@ impl MuxelApp {
         if self.resolve_remote_tmux_owner(instance_id, window, cx) {
             return;
         }
-        if !self.prepare_local_tmux_owner(instance_id) {
-            cx.notify();
+        if self.begin_local_tmux_owner_preparation(instance_id, None, cx) {
             return;
         }
+        self.spawn_terminal_with_owner(instance_id, window, cx);
+    }
+
+    /// The owner has either never needed a probe or was checked on a worker for
+    /// this launch. Do not recheck a live Default owner on the UI thread.
+    fn spawn_terminal_with_owner(
+        &mut self,
+        instance_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Whether this launch will `--resume` a saved session (true on every
         // launch after the first, for resume-capable agents).
         let was_resume = self
@@ -6766,7 +6776,7 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
-        self.prepare_reserved_terminal_spawn(instance_id, token, cx)
+        self.prepare_reserved_terminal_spawn(instance_id, token, None, cx)
     }
 
     /// Claim one generation without doing command discovery or PTY work. This
@@ -6816,10 +6826,15 @@ impl MuxelApp {
         self.add_event(NotifKind::Error, t("Launch failed"), message);
     }
 
-    /// Resolve legacy local ownership and move an extinct Default session only
-    /// after exact probes confirm the destination has no namesake.
-    fn prepare_local_tmux_owner(&mut self, iid: Uuid) -> bool {
-        let Some((target, original_name, original_socket)) =
+    /// Resolve legacy local ownership on a worker. The same launch ticket
+    /// survives the probe so a live Default owner is not probed twice.
+    fn begin_local_tmux_owner_preparation(
+        &mut self,
+        iid: Uuid,
+        deferred_token: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((pid, target, original_name, original_socket)) =
             self.workspace.instance(iid).and_then(|instance| {
                 let project = self.workspace.project(instance.project_id)?;
                 (project.remote.is_none()
@@ -6831,6 +6846,7 @@ impl MuxelApp {
                             != instance.tmux_socket))
                     .then(|| {
                         (
+                            instance.project_id,
                             instance.tmux_target(&project.name),
                             instance.tmux_session.clone(),
                             instance.tmux_socket.clone(),
@@ -6838,40 +6854,91 @@ impl MuxelApp {
                     })
             })
         else {
-            return true;
+            return false;
         };
-        let result = integrations::local_tmux_launch_target(
-            &target,
-            Instant::now() + Duration::from_secs(2),
-        );
-        let result = result.and_then(|prepared| {
-            let instance = self
-                .workspace
-                .instance_mut(iid)
-                .expect("local pane still present");
-            instance.tmux_session = Some(prepared.name);
-            instance.tmux_socket = prepared.socket;
-            if self.try_persist() {
-                Ok(())
-            } else {
-                let instance = self
-                    .workspace
-                    .instance_mut(iid)
-                    .expect("local pane still present");
-                instance.tmux_session = original_name;
-                instance.tmux_socket = original_socket;
-                Err(anyhow::anyhow!(
-                    "couldn't save the tmux session owner before launch"
-                ))
-            }
+        let token = deferred_token.unwrap_or_else(|| {
+            self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
+            let token = self.next_terminal_launch_token;
+            self.terminal_launching.insert(
+                iid,
+                LaunchTicket {
+                    token,
+                    since: Instant::now(),
+                },
+            );
+            token
         });
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                self.fail_tmux_launch(iid, format!("{error:#}"));
-                false
+        let workspace = self.current_workspace;
+        cx.spawn(async move |this, cx| {
+            let pending = target.clone();
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    integrations::local_tmux_launch_target(
+                        &pending,
+                        Instant::now() + Duration::from_secs(2),
+                    )
+                })
+                .await;
+            let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
+                if this.current_workspace != workspace
+                    || !launch_token_current(&this.terminal_launching, iid, token)
+                {
+                    return;
+                }
+                let current = this.workspace.instance(iid).and_then(|instance| {
+                    let project = this.workspace.project(instance.project_id)?;
+                    Some((instance.project_id, instance.tmux_target(&project.name)))
+                });
+                if current != Some((pid, target)) {
+                    this.terminal_launching.remove(&iid);
+                    this.spawn_terminal_deferred(iid, window, cx);
+                    return;
+                }
+                let prepared = match prepared {
+                    Ok(target) => target,
+                    Err(error) => {
+                        this.fail_tmux_launch(iid, format!("{error:#}"));
+                        cx.notify();
+                        return;
+                    }
+                };
+                let prepared_for_launch = prepared.clone();
+                if let Some(instance) = this.workspace.instance_mut(iid) {
+                    instance.tmux_session = Some(prepared.name);
+                    instance.tmux_socket = prepared.socket;
+                }
+                if !this.try_persist() {
+                    if let Some(instance) = this.workspace.instance_mut(iid) {
+                        instance.tmux_session = original_name;
+                        instance.tmux_socket = original_socket;
+                    }
+                    this.fail_tmux_launch(
+                        iid,
+                        t("Couldn't save the tmux session owner before launch.").to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if deferred_token.is_some() {
+                    this.spawn_reserved_terminal_deferred(
+                        iid,
+                        token,
+                        Some(prepared_for_launch),
+                        window,
+                        cx,
+                    );
+                } else {
+                    this.terminal_launching.remove(&iid);
+                    this.spawn_terminal_with_owner(iid, window, cx);
+                }
+            });
+            if landed.is_none() {
+                Self::release_unlanded_launch(&this, iid, token, cx);
             }
-        }
+        })
+        .detach();
+        true
     }
 
     /// Older layouts have only a session name. Resolve and persist its owner
@@ -6942,12 +7009,8 @@ impl MuxelApp {
                     return;
                 };
                 if instance.project_id != pid || instance.tmux_target(&host.name) != expected {
-                    this.fail_tmux_launch(
-                        iid,
-                        t("The pane's tmux owner changed while preparing attachment. Try again.")
-                            .to_string(),
-                    );
-                    cx.notify();
+                    this.terminal_launching.remove(&iid);
+                    this.spawn_terminal_deferred(iid, window, cx);
                     return;
                 }
                 let prepared = match prepared {
@@ -6975,7 +7038,7 @@ impl MuxelApp {
                     return;
                 }
                 this.reset_terminal_runtime(iid);
-                this.spawn_reserved_terminal_deferred(iid, token, window, cx);
+                this.spawn_reserved_terminal_deferred(iid, token, None, window, cx);
             });
             if landed.is_none() {
                 Self::release_unlanded_launch(&this, iid, token, cx);
@@ -6991,6 +7054,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
+        prepared_local_owner: Option<SessionTarget>,
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
@@ -7000,7 +7064,17 @@ impl MuxelApp {
         {
             return None;
         }
-        if !self.prepare_local_tmux_owner(instance_id) {
+        let still_prepared = prepared_local_owner.is_some_and(|expected| {
+            self.workspace
+                .instance(instance_id)
+                .is_some_and(|instance| {
+                    self.workspace
+                        .project(instance.project_id)
+                        .is_some_and(|project| instance.tmux_target(&project.name) == expected)
+                })
+        });
+        if !still_prepared && self.begin_local_tmux_owner_preparation(instance_id, Some(token), cx)
+        {
             return None;
         }
         let was_resume = self
@@ -7071,7 +7145,7 @@ impl MuxelApp {
         let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
             return;
         };
-        self.spawn_reserved_terminal_deferred(instance_id, token, window, cx);
+        self.spawn_reserved_terminal_deferred(instance_id, token, None, window, cx);
     }
 
     /// Continue the admitted generation after owner discovery. Re-reserving here
@@ -7080,6 +7154,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
+        prepared_local_owner: Option<SessionTarget>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7091,7 +7166,12 @@ impl MuxelApp {
                 .await;
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
-                    this.prepare_reserved_terminal_spawn(instance_id, token, cx)
+                    this.prepare_reserved_terminal_spawn(
+                        instance_id,
+                        token,
+                        prepared_local_owner,
+                        cx,
+                    )
                 })
                 .ok()
                 .flatten()
@@ -10379,6 +10459,22 @@ impl MuxelApp {
         } = remote;
         let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
         self.bind_peer_sessions(pid, &mut instances);
+        let old_bindings: HashMap<_, _> = local
+            .iter()
+            .map(|instance| (instance.id, (&instance.tmux_session, &instance.tmux_socket)))
+            .collect();
+        let rebound_failures: Vec<_> = instances
+            .iter()
+            .filter(|instance| self.failed_launches.contains_key(&instance.id))
+            .filter(|instance| {
+                old_bindings
+                    .get(&instance.id)
+                    .is_some_and(|(name, socket)| {
+                        *name != &instance.tmux_session || *socket != &instance.tmux_socket
+                    })
+            })
+            .map(|instance| instance.id)
+            .collect();
         let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
         let closed: Vec<Uuid> = before
             .iter()
@@ -10402,6 +10498,11 @@ impl MuxelApp {
             self.last_status.remove(&iid);
             self.failed_launches.remove(&iid);
             self.workspace.remove_instance_meta(iid);
+        }
+        // A refused namesake or stale owner must be retried against the peer's
+        // newly saved binding. Restart would kill the session we want to attach.
+        for iid in rebound_failures {
+            self.failed_launches.remove(&iid);
         }
         for instance in instances {
             // A peer can replace the binding while this pane keeps its PTY.
@@ -14684,7 +14785,7 @@ impl MuxelApp {
     /// snapping back to where it was created.
     fn push_remote_layout_now(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         enum Pushed {
-            Written,
+            Written(RemoteLayout),
             /// The file holds a peer's newer layout (its JSON), left in place.
             PeerAhead(String),
         }
@@ -14714,34 +14815,75 @@ impl MuxelApp {
             return;
         }
         let root = doc.remote_root.clone();
-        let json = doc.to_json();
         let local_key = key.clone();
+        let workspace = self.current_workspace;
         self.remote_push_inflight.insert(pid);
         *self.layout_push_epoch.entry(pid).or_default() += 1;
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
+                    let mut doc = doc;
                     if let Some(current) = integrations::fetch_remote_layout(&loc)
                         && let Some(file) = RemoteLayout::parse(&current, &root)
-                        && muxel_core::push_overwrites_peer(
+                    {
+                        if muxel_core::push_overwrites_peer(
                             &file,
                             synced.as_deref(),
                             &local_key,
                             local_rev,
-                        )
-                    {
-                        return Ok(Pushed::PeerAhead(current));
+                        ) {
+                            return Ok(Pushed::PeerAhead(current));
+                        }
+                        let peer_by_id: HashMap<_, _> = file
+                            .instances
+                            .iter()
+                            .map(|instance| (instance.id, instance))
+                            .collect();
+                        for instance in &mut doc.instances {
+                            if let Some(peer) = peer_by_id.get(&instance.id) {
+                                muxel_core::preserve_private_tmux_binding(instance, peer);
+                            }
+                        }
                     }
-                    integrations::push_remote_layout(&loc, &json).map(|()| Pushed::Written)
+                    integrations::push_remote_layout(&loc, &doc.to_json())
+                        .map(|()| Pushed::Written(doc))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
+                if this.current_workspace != workspace {
+                    return;
+                }
                 match res {
-                    Ok(Pushed::Written) => {
-                        this.layout_synced_keys.insert(pid, key);
+                    Ok(Pushed::Written(written)) => {
+                        let written_key = written.content_key();
+                        let mut rebound = Vec::new();
+                        for instance in &written.instances {
+                            if let Some(local) = this.workspace.instance_mut(instance.id)
+                                && muxel_core::preserve_private_tmux_binding(local, instance)
+                            {
+                                rebound.push(instance.id);
+                            }
+                        }
+                        for iid in &rebound {
+                            this.bump_session_binding_generation(*iid);
+                            this.failed_launches.remove(iid);
+                        }
+                        if !rebound.is_empty() {
+                            this.persist();
+                            this.spawn_project_terminals_now(pid, window, cx);
+                        }
+                        this.layout_synced_keys.insert(pid, written_key.clone());
                         this.layout_push_failing.remove(&pid);
+                        if this.workspace.project(pid).is_some_and(|project| {
+                            RemoteLayout::capture(project, &this.workspace, now_epoch).content_key()
+                                != written_key
+                        }) {
+                            this.remote_push_due
+                                .entry(pid)
+                                .or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                        }
                     }
                     Ok(Pushed::PeerAhead(current)) => {
                         this.poll_peer_layout(pid, &current, window, cx);
@@ -17356,36 +17498,103 @@ impl MuxelApp {
             .remote_host_for_instance(iid)
             .filter(|host| !host.os.is_windows());
         let Some(host) = remote_host else {
-            let restarted = (|| -> anyhow::Result<()> {
-                if let Some(session) = recorded_session {
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    let session = integrations::resolve_local_tmux_owner(&session, deadline)?;
-                    let closed = muxel_core::tmux::ClosedSession {
-                        name: session.name.clone(),
-                        socket: session.socket.clone(),
-                        instance: iid,
-                    };
-                    if !self.terminal_restarts.record_owner(
-                        &mut self.workspace,
-                        iid,
-                        restart,
-                        &closed,
-                    ) || !self.try_persist()
-                    {
-                        anyhow::bail!("couldn't save the tmux session owner before restart");
-                    }
-                    let next = integrations::kill_tmux_session_confirmed(&session, deadline)?;
-                    self.save_restart_migration(iid, restart, &session, &next)?;
-                }
-                Ok(())
-            })();
-            self.terminal_restarts.finish(iid, restart);
-            if let Err(error) = restarted {
-                self.fail_restart(iid, t("Couldn't restart"), &format!("{error:#}"));
+            if recorded_session.is_none() {
+                self.terminal_restarts.finish(iid, restart);
+                self.spawn_terminal(iid, window, cx);
+                self.focus_instance(iid, window, cx);
                 cx.notify();
                 return;
             }
-            self.spawn_terminal(iid, window, cx);
+            let session = recorded_session.expect("checked local tmux session");
+            let workspace = self.current_workspace;
+            cx.spawn(async move |this, cx| {
+                let resolved = cx
+                    .background_executor()
+                    .spawn(async move {
+                        integrations::resolve_local_tmux_owner(
+                            &session,
+                            Instant::now() + Duration::from_secs(2),
+                        )
+                    })
+                    .await;
+                let restarted = match resolved {
+                    Ok(session) => {
+                        let closed = muxel_core::tmux::ClosedSession {
+                            name: session.name.clone(),
+                            socket: session.socket.clone(),
+                            instance: iid,
+                        };
+                        let saved = this
+                            .update(cx, |this, _| {
+                                this.current_workspace == workspace
+                                    && this.terminal_restarts.record_owner(
+                                        &mut this.workspace,
+                                        iid,
+                                        restart,
+                                        &closed,
+                                    )
+                                    && this.try_persist()
+                            })
+                            .unwrap_or(false);
+                        if saved {
+                            let pending = session.clone();
+                            let killed = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    integrations::kill_tmux_session_confirmed(
+                                        &pending,
+                                        Instant::now() + Duration::from_secs(2),
+                                    )
+                                })
+                                .await;
+                            match killed {
+                                Ok(next) => this
+                                    .update(cx, |this, _| {
+                                        if this.current_workspace != workspace {
+                                            anyhow::bail!("workspace changed during restart");
+                                        }
+                                        this.save_restart_migration(iid, restart, &session, &next)
+                                    })
+                                    .unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!("restart owner is no longer available"))
+                                    }),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "couldn't save the tmux session owner before restart"
+                            ))
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let completed =
+                    Self::in_project_or_main(&this, Some(project), cx, |this, window, cx| {
+                        if this.current_workspace != workspace
+                            || !this.terminal_restarts.finish(iid, restart)
+                            || this.workspace.instance(iid).is_none()
+                        {
+                            return;
+                        }
+                        if let Err(error) = restarted {
+                            this.fail_restart(iid, t("Couldn't restart"), &format!("{error:#}"));
+                        } else {
+                            this.spawn_terminal(iid, window, cx);
+                            if this.active_instance == Some(iid) {
+                                this.focus_instance(iid, window, cx);
+                            }
+                        }
+                        cx.notify();
+                    });
+                if completed.is_none() {
+                    let _ = this.update(cx, |this, _| {
+                        if this.current_workspace == workspace {
+                            this.terminal_restarts.finish(iid, restart);
+                        }
+                    });
+                }
+            })
+            .detach();
             self.focus_instance(iid, window, cx);
             cx.notify();
             return;
