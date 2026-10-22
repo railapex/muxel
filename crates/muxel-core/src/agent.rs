@@ -936,19 +936,32 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
     false
 }
 
-/// First top-level `session_meta` line → `(thread id, cwd)`.
-fn codex_session_meta(path: &Path) -> Option<(String, String)> {
-    use std::io::{BufRead, BufReader};
+enum CodexSessionMeta {
+    TopLevel { id: String, cwd: String },
+    Subagent,
+}
+
+/// Keep a confirmed subagent separate from a rollout whose metadata could not
+/// be read. Restore may ignore the former but cannot prove cwd uniqueness while
+/// the latter could belong to this pane.
+fn codex_session_meta_detail(path: &Path) -> std::io::Result<CodexSessionMeta> {
+    use std::io::{self, BufRead, BufReader};
     #[cfg(test)]
     codex_lookup_tests::record_open(path);
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path)?;
     for line in BufReader::new(file).lines().take(8) {
-        let line = line.ok()?;
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if v.get("type")?.as_str()? != "session_meta" {
+        let line = line?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if v.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
             continue;
         }
-        let payload = v.get("payload")?;
+        let payload = v.get("payload").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex session metadata has no payload",
+            )
+        })?;
         // A subagent shares its parent's session_id but owns a different thread.
         // Neither its thread nor its parent's id describes this terminal pane.
         if payload
@@ -958,17 +971,43 @@ fn codex_session_meta(path: &Path) -> Option<(String, String)> {
                 source.as_str() == Some("subagent") || source.get("subagent").is_some()
             })
         {
-            return None;
+            return Ok(CodexSessionMeta::Subagent);
         }
         let id = payload
             .get("id")
-            .or_else(|| payload.get("session_id"))?
-            .as_str()?
+            .or_else(|| payload.get("session_id"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Codex session metadata has no id",
+                )
+            })?
             .to_string();
-        let cwd = payload.get("cwd")?.as_str()?.to_string();
-        return Some((id, cwd));
+        let cwd = payload
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Codex session metadata has no cwd",
+                )
+            })?
+            .to_string();
+        return Ok(CodexSessionMeta::TopLevel { id, cwd });
     }
-    None
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Codex rollout has no session metadata",
+    ))
+}
+
+/// First top-level `session_meta` line → `(thread id, cwd)`.
+fn codex_session_meta(path: &Path) -> Option<(String, String)> {
+    match codex_session_meta_detail(path).ok()? {
+        CodexSessionMeta::TopLevel { id, cwd } => Some((id, cwd)),
+        CodexSessionMeta::Subagent => None,
+    }
 }
 
 pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {

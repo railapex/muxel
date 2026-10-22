@@ -1,6 +1,9 @@
 //! Bounded lookups in Codex's dated rollout store.
 
-use super::{codex_session_meta, is_codex_thread_id_hint, paths_loosely_equal};
+use super::{
+    CodexSessionMeta, codex_session_meta, codex_session_meta_detail, is_codex_thread_id_hint,
+    paths_loosely_equal,
+};
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, Timelike, Utc};
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -258,7 +261,7 @@ pub fn codex_restore_scan(
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut entries_seen = 0usize;
     let mut found: Option<CodexSession> = None;
-    let mut compressed_without_metadata = false;
+    let mut unresolved_metadata = false;
     while let Some(dir) = stack.pop() {
         let entries = match list(&dir) {
             Ok(entries) => entries,
@@ -297,15 +300,23 @@ pub fn codex_restore_scan(
                 }
                 continue;
             }
-            let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
-                // This version cannot read compressed metadata. It may belong
-                // to the same cwd, so a plain rollout is not proven unique.
-                compressed_without_metadata |= path.extension().is_some_and(|ext| ext == "zst");
-                continue;
+            let (id, recorded_cwd) = match codex_session_meta_detail(&path) {
+                Ok(CodexSessionMeta::TopLevel { id, cwd }) => (id, cwd),
+                Ok(CodexSessionMeta::Subagent) => continue,
+                Err(_) => {
+                    // A malformed, unreadable or compressed rollout may belong
+                    // to this cwd. A readable match is not proven unique.
+                    unresolved_metadata = true;
+                    continue;
+                }
             };
-            if Uuid::parse_str(&id).ok() != Some(file_id)
-                || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-            {
+            if !paths_loosely_equal(Path::new(&recorded_cwd), cwd) {
+                continue;
+            }
+            if Uuid::parse_str(&id).ok() != Some(file_id) {
+                // The recorded cwd matches, but the thread identity does not
+                // agree with the filename. It cannot establish uniqueness.
+                unresolved_metadata = true;
                 continue;
             }
             let id = file_id.to_string();
@@ -315,11 +326,7 @@ pub fn codex_restore_scan(
             found = Some(CodexSession { id, path });
         }
     }
-    Ok(if compressed_without_metadata {
-        None
-    } else {
-        found
-    })
+    Ok(if unresolved_metadata { None } else { found })
 }
 
 #[derive(Default)]
@@ -395,6 +402,43 @@ mod tests {
     use chrono::DateTime;
     use std::path::Path;
     use uuid::Uuid;
+
+    #[test]
+    fn unreadable_rollout_prevents_cwd_binding_but_confirmed_subagent_does_not() {
+        let home = std::env::temp_dir().join(format!("muxel-codex-restore-{}", Uuid::new_v4()));
+        let day = home.join(".codex/sessions/2020/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let cwd = home.join("project");
+        let first = "01a1543c-9700-7000-8000-000000000001";
+        let second = "01a1543c-9700-7000-8000-000000000002";
+        let first_meta =
+            serde_json::json!({"type":"session_meta","payload":{"id":first,"cwd":cwd}});
+        std::fs::write(
+            day.join(format!("rollout-{first}.jsonl")),
+            format!("{first_meta}\n"),
+        )
+        .unwrap();
+        let second_path = day.join(format!("rollout-{second}.jsonl"));
+        std::fs::write(&second_path, "{\"type\":\"session_meta\",\"payload\":").unwrap();
+        assert!(codex_restore_scan(&home, &cwd, None).unwrap().is_none());
+
+        let subagent = serde_json::json!({
+            "type":"session_meta",
+            "payload":{"id":second,"cwd":cwd,"parent_thread_id":first}
+        });
+        std::fs::write(&second_path, format!("{subagent}\n")).unwrap();
+        assert_eq!(
+            codex_restore_scan(&home, &cwd, None).unwrap().unwrap().id,
+            first
+        );
+        let mismatched = serde_json::json!({
+            "type":"session_meta",
+            "payload":{"id":first,"cwd":cwd}
+        });
+        std::fs::write(&second_path, format!("{mismatched}\n")).unwrap();
+        assert!(codex_restore_scan(&home, &cwd, None).unwrap().is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn restore_scan_finds_wrong_day_and_binds_only_unique_cwd() {

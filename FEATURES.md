@@ -157,8 +157,11 @@ feature is added or changed, update the matching entry here in the same change**
     Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
     A legacy started pane without a saved UUID gets one background recovery walk.
     It rebinds only when exactly one rollout records that pane's directory; otherwise
-    it starts fresh and points to Import in the notification feed. A compressed
-    rollout whose cwd metadata cannot be read also prevents an automatic choice.
+    it starts fresh and points to Import in the notification feed. Any rollout
+    whose cwd metadata cannot be read, compressed or plain, prevents an automatic
+    choice; a confirmed subagent does not count as a candidate. Restore keeps
+    the lookup inside its launch wave, and reconnect ticks do not restart a
+    pending lookup.
     A saved UUID without a path gets a dated lookup, then one bounded background
     full walk if the dated lookup misses. A confirmed miss starts fresh. The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened

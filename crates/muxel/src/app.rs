@@ -3189,6 +3189,23 @@ struct TerminalSpawnMeta {
     started: Instant,
 }
 
+/// Restore owns these preparations until the wave settles. A Codex scan must
+/// remain inside that ownership, or it escapes the wave's admission and cancel
+/// checks while the rollout store is being read.
+enum RestoredTerminalPreparation {
+    Ready(TerminalSpawnMeta, Box<CommandSpec>, (u16, u16)),
+    CodexPreflight(u64, session_discovery::CodexLaunchPreflight),
+}
+
+impl RestoredTerminalPreparation {
+    fn token(&self) -> u64 {
+        match self {
+            Self::Ready(meta, _, _) => meta.token,
+            Self::CodexPreflight(token, _) => *token,
+        }
+    }
+}
+
 pub struct MuxelApp {
     workspace: Workspace,
     /// Live terminals, keyed by instance id.
@@ -6807,21 +6824,23 @@ impl MuxelApp {
         }
     }
 
-    /// Prepare the stateful/UI half of a deferred terminal launch. The returned
-    /// spec can be spawned on a worker; completion must come back through
-    /// `finish_deferred_terminal_spawn`.
-    fn prepare_terminal_spawn(
+    /// Reserve a restore pane without detaching its Codex history preflight.
+    /// The restore wave awaits that scan and keeps the pane within its launch
+    /// limit and project-visibility cancellation path.
+    fn prepare_restored_terminal_spawn(
         &mut self,
         instance_id: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+    ) -> Option<RestoredTerminalPreparation> {
         let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
-        if self.codex_launch_preflight_request(instance_id).is_some() {
-            self.launch_reserved_terminal_async(instance_id, token, window, cx);
-            return None;
+        if let Some(request) = self.codex_launch_preflight_request(instance_id) {
+            return Some(RestoredTerminalPreparation::CodexPreflight(token, request));
         }
         self.prepare_reserved_terminal_spawn(instance_id, token, cx)
+            .map(|(meta, spec, size)| {
+                RestoredTerminalPreparation::Ready(meta, Box::new(spec), size)
+            })
     }
 
     /// Claim one generation without doing command discovery or PTY work. This
@@ -8264,7 +8283,7 @@ impl MuxelApp {
                         if this.workspace.instance(iid).map(|i| i.kind)
                             == Some(InstanceKind::Terminal)
                         {
-                            Ok(this.prepare_terminal_spawn(iid, window, cx))
+                            Ok(this.prepare_restored_terminal_spawn(iid, window, cx))
                         } else {
                             this.spawn_project_pane(iid, window, cx);
                             Ok(None)
@@ -8275,12 +8294,47 @@ impl MuxelApp {
                         cancelled = true;
                         break;
                     };
-                    if let Some((meta, spec, size)) = prepared {
-                        owned_tokens.push((iid, meta.token));
-                        let task = cx.background_executor().spawn(async move {
-                            TerminalLaunch::spawn_for_instance(spec, size, iid)
+                    if let Some(prepared) = prepared {
+                        let token = prepared.token();
+                        let started = Instant::now();
+                        owned_tokens.push((iid, token));
+                        let this_for_launch = this.clone();
+                        let task = cx.spawn(async move |cx| {
+                            let (meta, spec, size) = match prepared {
+                                RestoredTerminalPreparation::Ready(meta, spec, size) => {
+                                    (meta, *spec, size)
+                                }
+                                RestoredTerminalPreparation::CodexPreflight(token, request) => {
+                                    let scan_request = request.clone();
+                                    let finding = cx
+                                        .background_executor()
+                                        .spawn(async move {
+                                            session_discovery::codex_launch_preflight(&scan_request)
+                                        })
+                                        .await;
+                                    Self::restore_step(&this_for_launch, pid, cx, |this, _, cx| {
+                                        if this.deferred_activation_generation.get(&pid)
+                                            != Some(&generation)
+                                            || !this.apply_codex_launch_preflight(
+                                                iid, token, &request, finding,
+                                            )
+                                        {
+                                            return None;
+                                        }
+                                        this.prepare_reserved_terminal_spawn(iid, token, cx)
+                                    })
+                                    .flatten()?
+                                }
+                            };
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    TerminalLaunch::spawn_for_instance(spec, size, iid)
+                                })
+                                .await;
+                            Some((meta, result))
                         });
-                        launches.push((index, iid, meta, task));
+                        launches.push((index, iid, token, started, task));
                     }
                 }
                 // The wave's workers are already running. Await every one, even
@@ -8288,8 +8342,8 @@ impl MuxelApp {
                 // stop ConPTY creation, it only frees the pane to be started a
                 // second time beside it. Awaiting in pane order controls
                 // admission/focus order, not concurrency.
-                for (index, iid, meta, task) in launches {
-                    let remaining = TERMINAL_LAUNCH_DEADLINE.saturating_sub(meta.started.elapsed());
+                for (index, iid, token, started, task) in launches {
+                    let remaining = TERMINAL_LAUNCH_DEADLINE.saturating_sub(started.elapsed());
                     // Boxed so the handle can move to a task of its own if the
                     // deadline passes first.
                     let mut task = Box::pin(task);
@@ -8301,13 +8355,28 @@ impl MuxelApp {
                         // Past its deadline the launch stops holding admission,
                         // so the restore goes on without it. It keeps running: a
                         // task of its own lands it when the worker returns.
-                        owned_tokens.retain(|&owned| owned != (iid, meta.token));
+                        owned_tokens.retain(|&owned| owned != (iid, token));
                         let this = this.clone();
                         cx.spawn(async move |cx| {
-                            let result = task.await;
-                            Self::land_restored_launch(&this, pid, index == 0, meta, result, cx);
+                            if let Some((meta, result)) = task.await {
+                                Self::land_restored_launch(
+                                    &this,
+                                    pid,
+                                    index == 0,
+                                    meta,
+                                    result,
+                                    cx,
+                                );
+                            } else {
+                                Self::release_unlanded_launch(&this, iid, token, cx);
+                            }
                         })
                         .detach();
+                        continue;
+                    };
+                    let Some((meta, result)) = result else {
+                        owned_tokens.retain(|&owned| owned != (iid, token));
+                        Self::release_unlanded_launch(&this, iid, token, cx);
                         continue;
                     };
                     let current =
@@ -10985,6 +11054,10 @@ impl MuxelApp {
             let tmux_lost = exited
                 && tmux_session.is_some()
                 && (exit_signal.is_some() || exit_code != Some(0))
+                // A background preflight or replacement already owns this pane.
+                // Retrying on the next tick would replace its token before it
+                // can land and repeat the rollout walk indefinitely.
+                && !self.terminal_launching.contains_key(&iid)
                 && self.terminal_launches.get(&iid).is_none_or(|&(at, _)| {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });

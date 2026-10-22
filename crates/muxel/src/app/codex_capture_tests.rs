@@ -16,6 +16,67 @@ use uuid::Uuid;
 struct TempRoot(PathBuf);
 static CODEX_CAPTURE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn pending_codex_reconnect_keeps_one_launch_token() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        window
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+                instance.use_tmux = true;
+                instance.tmux_session = Some("muxel_review_deadbeef".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                let command = CommandSpec::program("cmd.exe", vec!["/C".into(), "exit 37".into()]);
+                let launch = TerminalLaunch::spawn_for_instance(command, (80, 24), pane).unwrap();
+                app.install_terminal_spawn(
+                    super::TerminalSpawnMeta {
+                        instance_id: pane,
+                        token: 0,
+                        program: "cmd.exe".into(),
+                        cwd: String::new(),
+                        was_resume: true,
+                        started: Instant::now(),
+                    },
+                    Ok(launch),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            if window
+                .update(cx, |app, _, cx| {
+                    app.terminals.get(&pane).unwrap().read(cx).exited()
+                })
+                .unwrap()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "test child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        window
+            .update(cx, |app, window, cx| {
+                app.terminal_launches.get_mut(&pane).unwrap().0 =
+                    Instant::now() - Duration::from_secs(60);
+                // Skip the first-outage tmux probe; this test has no tmux server.
+                app.reconnecting.insert(pane, 1);
+                app.tick(window, cx);
+                let first = app.terminal_launching.get(&pane).unwrap().token;
+                // The worker cannot finish while this UI update is running.
+                app.tick(window, cx);
+                let second = app.terminal_launching.remove(&pane).unwrap().token;
+                assert_eq!(first, second);
+            })
+            .unwrap();
+    });
+}
+
 impl Drop for TempRoot {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();
@@ -80,7 +141,8 @@ fn codex_launch_preparation_queues_slow_recovery_without_waiting() {
         }));
         window
             .update(cx, |app, window, cx| {
-                assert!(app.prepare_terminal_spawn(pane, window, cx).is_none());
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                app.launch_reserved_terminal_async(pane, token, window, cx);
                 app.terminal_launching.remove(&pane); // prevent the test from spawning Codex
             })
             .unwrap();
@@ -97,6 +159,35 @@ fn codex_launch_preparation_queues_slow_recovery_without_waiting() {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        cx.run_until_parked();
+    });
+}
+
+#[test]
+fn restored_codex_preflight_remains_owned_by_its_wave() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let _lookup = inject_codex_restore_scan(Arc::new(|_, _, _| {
+            panic!("restore preparation detached the Codex scan")
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                let prepared = app
+                    .prepare_restored_terminal_spawn(pane, window, cx)
+                    .unwrap();
+                let super::RestoredTerminalPreparation::CodexPreflight(token, _) = prepared else {
+                    panic!("started Codex pane did not enter restore preflight")
+                };
+                assert!(super::launch_token_current(
+                    &app.terminal_launching,
+                    pane,
+                    token
+                ));
+                app.terminal_launching.remove(&pane);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(1));
         cx.run_until_parked();
     });
 }
@@ -357,7 +448,10 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
                         .unwrap()
                         .join(format!("rollout-{id}.jsonl")),
                 );
-                let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, size) = app
+                    .prepare_reserved_terminal_spawn(pane, token, cx)
+                    .unwrap();
                 assert!(meta.was_resume);
                 assert!(spec.args.iter().any(|arg| arg == "resume"));
                 #[cfg(windows)]
@@ -428,7 +522,10 @@ fn clean_tmux_client_exit_after_codex_resume_keeps_the_pane() {
                 instance.tmux_session = Some("muxel_capture_deadbeef".into());
                 instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
                 app.settings.close_on_exit = true;
-                let (meta, _, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let token = app.reserve_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, _, size) = app
+                    .prepare_reserved_terminal_spawn(pane, token, cx)
+                    .unwrap();
                 assert!(meta.was_resume);
                 #[cfg(windows)]
                 let command = CommandSpec::program("cmd.exe", vec!["/C".into(), "exit 0".into()]);
