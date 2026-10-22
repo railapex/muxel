@@ -1668,21 +1668,15 @@ impl TerminalSession {
                     if let Some(thread) = session_thread_field(title)
                         && let Some(key) = ThreadKey::from_field(thread)
                     {
-                        let first_title = self.session_id_hint.lock().is_none();
                         let evidence = self.evidence.lock();
                         let carry = evidence.can_carry_initial_working();
-                        let confirms_launch =
-                            first_title && evidence.first_title_confirms_launch(thread);
+                        let confirms_launch = evidence.first_title_confirms_launch(thread);
                         drop(evidence);
                         let mut status = self.program_status.lock();
                         if fresh
                             && self.program_status_generation.load(Ordering::Acquire) == generation
                         {
-                            if confirms_launch {
-                                status.confirm_initial_title(key);
-                            } else {
-                                status.observe_title(key, carry);
-                            }
+                            status.observe_title(key, carry, confirms_launch);
                         }
                     }
                 }

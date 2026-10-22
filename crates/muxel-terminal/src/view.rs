@@ -4277,6 +4277,51 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn synchronized_second_title_consumes_known_launch_confirmation_once() {
+        let id = "019f95d7-db31-7db0-904d-9e08330e0001";
+        #[cfg(windows)]
+        let mut spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let mut spec = CommandSpec::program("/bin/cat", vec![]);
+        spec.initial_binding = InitialBinding::Known {
+            id: Some(id.to_string()),
+            resumed: false,
+        };
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
+        let abbreviated = format!("{}...", &id[..29]);
+        session.test_program_status(
+            format!(
+                "\x1b[?2026h\x1b]0;{id} | Working\x07\x1b]0;{abbreviated} | Working\x07\x1b]7501;state=blocked:kind=permission\x07\x1b[?2026l"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(session.binding_revision(), 2);
+        let program_status = session.program_status_snapshot();
+        assert_eq!(program_status.binding_revision, 2);
+        assert_eq!(
+            program_status.root,
+            Some(crate::program_status::RootStatus {
+                state: crate::program_status::ProgramState::Blocked,
+                kind: Some(crate::program_status::ProgramStatusKind::Permission),
+            })
+        );
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Blocked);
+        session.kill();
+    }
+
+    #[test]
     fn synchronized_stale_report_cannot_cross_an_out_of_band_switch() {
         let (session, _receiver) = fixture();
         let hook = SystemTime::now();

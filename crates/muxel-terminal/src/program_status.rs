@@ -511,11 +511,19 @@ pub(crate) struct ProgramStatusSnapshot {
 }
 
 impl ProgramStatusSnapshot {
-    pub fn confirm_initial_title(&mut self, thread: ThreadKey) {
-        self.thread = Some(thread);
-    }
-
-    pub fn observe_title(&mut self, thread: ThreadKey, carry_initial_working: bool) {
+    pub fn observe_title(
+        &mut self,
+        thread: ThreadKey,
+        carry_initial_working: bool,
+        confirms_launch: bool,
+    ) {
+        // The listener can defer title callbacks until a synchronized frame
+        // ends. Consume this exception here, at the first title the observer
+        // accepts, so another title in that frame opens its own binding.
+        if self.thread.is_none() && confirms_launch {
+            self.thread = Some(thread);
+            return;
+        }
         if self.thread != Some(thread) {
             let working =
                 self.binding_revision == 0 && carry_initial_working && self.working_active;
