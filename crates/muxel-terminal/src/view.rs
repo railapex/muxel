@@ -4370,6 +4370,34 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn a_fresh_bell_inside_an_old_escape_keeps_its_own_read_time() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[("\x1b", hook - Duration::from_millis(500))]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(
+            &format!("\x00\x07]0;{stale} | Ready\x07"),
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert!(
+            session.has_bell(),
+            "the executed BEL was read after the switch"
+        );
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
     fn a_fresh_title_after_a_stale_terminator_in_one_read_can_bind() {
         let (session, _receiver) = fixture();
         let first = uuid::Uuid::new_v4();
