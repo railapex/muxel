@@ -9,6 +9,7 @@ use crate::profile;
 use crate::session::{CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -890,6 +891,7 @@ pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
     startup_turn: Option<muxel_core::control::StartupTurn>,
+    startup_notice: Option<SharedString>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
     font_family: SharedString,
@@ -958,6 +960,16 @@ pub struct TerminalView {
 /// platform/window knowledge out of this crate without creating a dependency
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
+
+fn startup_fallback_notice(at_cap: bool, ready: bool) -> Option<&'static str> {
+    if at_cap {
+        Some("Startup output did not settle within 30 seconds. Continuing with startup input.")
+    } else if !ready {
+        Some("Input readiness could not be confirmed. Continuing after the startup output wait.")
+    } else {
+        None
+    }
+}
 
 fn with_startup_view<R>(
     view: &WeakEntity<TerminalView>,
@@ -1516,8 +1528,8 @@ impl TerminalView {
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,
         // press Enter to confirm it, then type the prompt and press Enter.
         //
-        // Silence is not an editable composer. Known providers must pass their
-        // input protocol, and controller tasks need independent turn acceptance.
+        // Controller tasks require a live composer and independent acceptance.
+        // UI runners, loops and TypeIn presets retain quiet-then-paste fallback.
         if let Some(input) = startup_input.as_ref() {
             profile::startup_event(
                 instance_id,
@@ -1541,15 +1553,15 @@ impl TerminalView {
             let session = session.clone();
             let automation_program = startup_program.clone();
             let known_provider = title_provider != TitleProvider::Other;
-            let framed_readiness =
-                matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
-            let control_task = startup_owner.is_some();
             let armed_at = Instant::now();
-            let mut guard = crate::startup::Guard::new(
+            let mut guard = crate::startup::Guard::for_startup(
                 session.input_rev(),
-                Some(Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64)),
-            )
-            .with_control_turn(startup_owner.clone());
+                startup_owner,
+                Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64),
+            );
+            let control_task = guard.requires_readiness();
+            let framed_readiness = control_task
+                && matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
             cx.spawn(async move |view: WeakEntity<Self>, cx| {
                 let result: Result<(), crate::startup::Stop> = async {
                     if control_task && !known_provider {
@@ -1596,9 +1608,27 @@ impl TerminalView {
                             waited += POLL_MS;
                         }
                     }
-                    if known_provider {
+                    if control_task {
                         wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
                             .await?;
+                    } else {
+                        let ready = with_startup_view(&view, &session, cx, |view| {
+                            startup_ready(
+                                title_provider,
+                                &session.startup_screen(),
+                                session.title_snapshot().1.as_deref(),
+                                &view.blocked_markers,
+                                true,
+                            )
+                        })?;
+                        if let Some(notice) = startup_fallback_notice(waited >= MAX_WAIT_MS, ready) {
+                            let _ = view.update(cx, |view, cx| {
+                                if !view.exited && Arc::ptr_eq(&view.session, &session) {
+                                    view.startup_notice = Some(notice.into());
+                                    cx.notify();
+                                }
+                            });
+                        }
                     }
                     profile::startup_event(
                         instance_id,
@@ -1640,7 +1670,7 @@ impl TerminalView {
                         cx.background_executor()
                             .timer(Duration::from_millis(PRE_TYPE_MS))
                             .await;
-                        if known_provider {
+                        if control_task {
                             guard.reset_ready();
                             wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
                                 .await?;
@@ -1666,7 +1696,7 @@ impl TerminalView {
                             cx.background_executor()
                                 .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                                 .await;
-                            if known_provider {
+                            if control_task {
                                 guard.reset_ready();
                                 wait_startup_composer(
                                     &view, &session, cx, &mut guard, armed_at, false,
@@ -1700,7 +1730,7 @@ impl TerminalView {
                                 startup_started.elapsed(),
                                 1,
                             );
-                            if known_provider {
+                            if control_task {
                                 confirm_startup_submission(
                                     &view, &session, cx, &mut guard, armed_at, &attempt,
                                 )
@@ -1736,6 +1766,18 @@ impl TerminalView {
                         0,
                     );
                     log::warn!("terminal startup automation stopped: {reason:?}");
+                    if !control_task {
+                        let _ = view.update(cx, |view, cx| {
+                            if view.exited || !Arc::ptr_eq(&view.session, &session) {
+                                return;
+                            }
+                            view.startup_notice = Some(match reason {
+                                crate::startup::Stop::Interrupted => "Startup input cancelled after user input or a pane change.",
+                                _ => "Startup input could not be sent. Enter the task in the terminal to continue.",
+                            }.into());
+                            cx.notify();
+                        });
+                    }
                 }
             })
             .detach();
@@ -1878,6 +1920,7 @@ impl TerminalView {
             instance_id,
             session,
             startup_turn,
+            startup_notice: None,
             focus_handle,
             palette: TerminalPalette::default(),
             font_family: SharedString::default(),
@@ -2160,6 +2203,9 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_notice.take().is_some() {
+            cx.notify();
+        }
         let t0 = Instant::now();
         let held = event.is_held;
         let m = &event.keystroke.modifiers;
@@ -2374,6 +2420,7 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .size_full()
+            .relative()
             // Fill the inset margin with the terminal background and inset the
             // element so the grid (sized from the inner area) never butts against
             // the pane edge — a too-wide TUI truncates inside the margin.
@@ -2389,6 +2436,21 @@ impl Render for TerminalView {
                 px(self.font_size),
                 self.mouse_mode,
             ))
+            .when_some(self.startup_notice.clone(), |pane, notice| {
+                pane.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .bg(rgb(0x42351d))
+                        .text_color(rgb(0xffe2a4))
+                        .child(notice),
+                )
+            })
     }
 }
 
@@ -2399,6 +2461,23 @@ mod launch_identity_tests {
     use muxel_core::control::INSTANCE_ID_ENV;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    #[test]
+    fn timing_fallback_always_explains_missing_readiness_or_the_cap() {
+        assert!(super::startup_fallback_notice(false, true).is_none());
+        assert!(
+            super::startup_fallback_notice(false, false)
+                .unwrap()
+                .contains("readiness")
+        );
+        for ready in [false, true] {
+            assert!(
+                super::startup_fallback_notice(true, ready)
+                    .unwrap()
+                    .contains("30 seconds")
+            );
+        }
+    }
 
     #[test]
     fn outside_startup_launch_failure_refuses_a_real_fallback_and_cancels_its_task() {

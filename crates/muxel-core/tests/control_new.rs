@@ -11,6 +11,105 @@ fn words(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn creation_recognizes_only_builtin_agent_programs_and_installed_launchers() {
+    for preset in AgentPreset::defaults()
+        .into_iter()
+        .filter(|preset| preset.kind == muxel_core::PresetKind::Terminal)
+    {
+        // Auto-reading still distinguishes agent presets from built-in shells;
+        // every built-in agent must also be listed by the stricter ctl rule.
+        if muxel_core::readaloud::is_agent_program(preset.program.as_deref()) {
+            assert!(
+                AgentPreset::is_recognized_agent_program(preset.program.as_deref()),
+                "{}",
+                preset.name
+            );
+        }
+    }
+    for name in [
+        "claude", "opencode", "amp", "grok", "codex", "muse", "hermes", "ollama", "pi",
+    ] {
+        for program in [
+            name.to_string(),
+            format!("/opt/tools/{name}"),
+            format!(r"C:\tools\{}.EXE", name.to_ascii_uppercase()),
+            format!("{name}.cmd"),
+        ] {
+            assert!(
+                AgentPreset::is_recognized_agent_program(Some(&program)),
+                "{program}"
+            );
+        }
+    }
+    for program in [
+        None,
+        Some("ssh"),
+        Some("wsl.exe"),
+        Some("python"),
+        Some("node"),
+        Some("custom"),
+        Some("custom.exe"),
+        Some("pwsh"),
+        Some("codex-proxy"),
+        Some("claude "),
+        Some(""),
+    ] {
+        assert!(
+            !AgentPreset::is_recognized_agent_program(program),
+            "{program:?}"
+        );
+    }
+}
+
+#[test]
+fn creation_card_labels_are_bounded_and_reject_unicode_controls_and_formats() {
+    for name_field in [false, true] {
+        let options = |value: String| NewOptions {
+            name: name_field.then(|| value.clone()),
+            from: (!name_field).then_some(value),
+            ..Default::default()
+        };
+        assert!(options("é".repeat(128)).validate().is_ok());
+        assert!(options("é".repeat(129)).validate().is_err());
+        assert!(options("François • 東京🙂".into()).validate().is_ok());
+        for value in [
+            "",
+            "  ",
+            "fake\nProject: other",
+            "a\rb",
+            "a\tb",
+            "a\0b",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{600}b",
+            "a\u{61c}b",
+            "a\u{200b}b",
+            "a\u{200c}b",
+            "a\u{200d}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{feff}b",
+            "a\u{fff9}b",
+            "a\u{110bd}b",
+            "a\u{13430}b",
+            "a\u{1bca0}b",
+            "a\u{1d173}b",
+            "a\u{e0001}b",
+            "a\u{e0020}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            let value = options(value.into());
+            assert!(
+                value.validate().is_err(),
+                "name_field={name_field}, {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn outside_creation_origin_survives_restore_and_local_duplicates_get_ui_policy() {
     let project = Project::new("repo", std::env::current_dir().unwrap());
     let preset = AgentPreset::codex();

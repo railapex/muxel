@@ -2397,12 +2397,6 @@ fn push_mouse_report(
     }
 }
 
-/// Resolve `program` to a path CreateProcess can launch on Windows.
-///
-/// portable-pty's PATH search prefers an extension-less file over PATHEXT
-/// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
-/// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
-/// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
 /// Resolve a literal launch without permitting a batch interpreter to reparse
 /// argv. Windows npm Codex wrappers resolve to their packaged native executable.
 pub fn literal_program_for_spawn(program: &str) -> anyhow::Result<String> {
@@ -2450,6 +2444,12 @@ fn validate_literal_program(program: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `program` to a path CreateProcess can launch on Windows.
+///
+/// portable-pty's PATH search prefers an extension-less file over PATHEXT
+/// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
+/// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
+/// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
 fn resolve_program_for_spawn(program: &str) -> String {
     #[cfg(not(windows))]
     {

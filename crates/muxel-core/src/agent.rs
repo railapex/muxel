@@ -493,6 +493,24 @@ impl AgentPreset {
         }
     }
 
+    /// Programs of the built-in agent presets, including installed native/npm
+    /// launchers. This is an outside-control allowlist, not shell detection.
+    pub fn is_recognized_agent_program(program: Option<&str>) -> bool {
+        let Some(program) = program else {
+            return false;
+        };
+        let name = program.rsplit(['/', '\\']).next().unwrap_or_default();
+        let name = name.to_ascii_lowercase();
+        let name = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".cmd"))
+            .unwrap_or(&name);
+        matches!(
+            name,
+            "claude" | "opencode" | "amp" | "grok" | "codex" | "muse" | "hermes" | "ollama" | "pi"
+        )
+    }
+
     pub fn defaults() -> Vec<AgentPreset> {
         let mut presets = vec![Self::shell()];
         // On Windows, offer cmd.exe and Git Bash alongside the PowerShell default.

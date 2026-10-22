@@ -58,6 +58,20 @@ pub(crate) struct Guard {
 }
 
 impl Guard {
+    /// Only controller-owned turns require positive readiness before writing.
+    /// Ordinary runners retain the quiet-output wait and its type-at-cap fallback.
+    pub(crate) fn for_startup(
+        revision: u64,
+        owner: Option<muxel_core::control::StartupTurnOwner>,
+        timeout: Duration,
+    ) -> Self {
+        Self::new(revision, owner.as_ref().map(|_| timeout)).with_control_turn(owner)
+    }
+
+    pub(crate) fn requires_readiness(&self) -> bool {
+        self.control_turn.is_some()
+    }
+
     pub(crate) fn new(revision: u64, deadline: Option<Duration>) -> Self {
         Self {
             expected_revision: revision,
@@ -245,13 +259,7 @@ impl Screen {
             return None;
         }
         let cursor = usize::try_from(self.cursor_row).ok()?;
-        let bottom = rows.iter().rposition(|row| {
-            row.trim_start()
-                .as_bytes()
-                .get(..4)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"gpt-"))
-                && row.contains(" · ")
-        })?;
+        let bottom = rows.iter().rposition(|row| codex_footer(row))?;
         // Use the final prompt in the whole snapshot: a later menu cannot
         // borrow an earlier editor's footer or cursor position.
         let top = rows.iter().rposition(|row| {
@@ -374,6 +382,30 @@ impl Screen {
     }
 }
 
+/// Codex can show either shortcut/context hints or a passive model/cwd row.
+/// Model identifiers are user-configurable, so none are enumerated here. The
+/// surrounding live cursor, paste mode and final prompt checks establish the
+/// editor; a menu's Enter/Esc actions must not masquerade as its status footer.
+fn codex_footer(row: &str) -> bool {
+    let text = row.trim();
+    if text.starts_with("? for shortcuts") {
+        return true;
+    }
+    if !row.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let Some((model, status)) = text.split_once(" · ") else {
+        return false;
+    };
+    !model.is_empty()
+        && model.chars().next().is_some_and(char::is_alphanumeric)
+        && !status.trim().is_empty()
+        && !model.eq_ignore_ascii_case("enter continue")
+        && !model.eq_ignore_ascii_case("enter to confirm")
+        && !status.to_ascii_lowercase().contains("esc quit")
+        && !status.to_ascii_lowercase().contains("esc to cancel")
+}
+
 pub(crate) fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -462,6 +494,70 @@ mod tests {
             Err(Stop::Interrupted)
         );
     }
+    #[test]
+    fn startup_is_strict_only_when_a_controller_owns_the_turn() {
+        use crate::session::CommandSpec;
+        use muxel_core::control::StartupTurn;
+        for owned in [false, true] {
+            let turn = StartupTurn::default();
+            let mut spec = CommandSpec::program("codex", vec![]);
+            spec.startup_input = Some("task".into());
+            spec.startup_turn = owned.then(|| turn.claim().unwrap());
+            let mut guard = Guard::for_startup(0, spec.startup_turn, ms(30_000));
+            assert_eq!(guard.requires_readiness(), owned);
+            let writes = Cell::new(0);
+            let result = guard.write(ms(30_300), 0, || {
+                writes.set(writes.get() + 1);
+                Ok(())
+            });
+            assert_eq!(result, if owned { Err(Stop::NotReady) } else { Ok(()) });
+            assert_eq!(writes.get(), usize::from(!owned));
+            if !owned {
+                // The delayed submit is admitted too; an external edit still
+                // interrupts it, even when readiness uses a timing fallback.
+                guard.write(ms(30_700), 1, || Ok(())).unwrap();
+                assert_eq!(guard.check(ms(30_800), 3), Err(Stop::Interrupted));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_footer_supports_shortcuts_and_arbitrary_models() {
+        for footer in [
+            "  ? for shortcuts                                   98% context left",
+            "  ? for shortcuts",
+            "  o3 high · scratch",
+            "  o4-mini · /work",
+            "  custom-provider/coder · /work · Context 0% used",
+            "  coder · scratch",
+        ] {
+            let mut sample = screen(
+                &format!("OpenAI Codex\n› Ask Codex to do anything\n\n{footer}"),
+                1,
+                2,
+            );
+            assert!(sample.codex_composer_context(true).is_some(), "{footer}");
+            sample.text = format!("OpenAI Codex\n› task\n\n{footer}");
+            sample.cursor_column = 6;
+            assert!(sample.codex_exact_retry_draft("task"), "{footer}");
+            sample.bracketed_paste = false;
+            assert!(sample.codex_composer_context(false).is_none(), "{footer}");
+        }
+        for footer in [
+            "enter continue · esc quit",
+            "  enter to confirm · Esc to cancel",
+            "  · scratch",
+            "  coder · ",
+        ] {
+            assert!(
+                screen(&format!("› 1. Trust and continue\n{footer}"), 0, 2)
+                    .codex_composer_context(true)
+                    .is_none(),
+                "{footer}"
+            );
+        }
+    }
+
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {
         let mut guard = Guard::new(0, Some(ms(30_000)));

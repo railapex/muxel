@@ -236,6 +236,14 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionId = nil
         sessionStarted = false
         autoName = nil
+        if controlPrompt {
+            // Copy the preset's instruction transport, never the outside task.
+            systemPrompt = nil
+            autoSubmit = false
+            injection = instructionInjection ?? InjectionMode.none
+            instructionInjection = nil
+            controlPrompt = false
+        }
         controlCreated = false
     }
 }

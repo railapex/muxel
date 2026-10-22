@@ -6,6 +6,41 @@ use muxel_core::{AgentPreset, InjectionMode, Project, Settings, resolve_launch_f
 use serde_json::json;
 
 #[test]
+fn approval_summary_skips_blank_lines_and_counts_line_and_character_cuts() {
+    let (text, more) =
+        muxel_core::control::approval_prompt_summary("\n  \nfirst\nsecond\nthird\nfourth\nfifth");
+    assert_eq!(text, "first\nsecond\nthird");
+    assert_eq!(more, 2);
+    let (text, more) =
+        muxel_core::control::approval_prompt_summary(&format!("{}\nlast", "é".repeat(650)));
+    assert_eq!(text, "é".repeat(600));
+    assert_eq!(more, 2, "the partly hidden line counts too");
+    assert_eq!(
+        muxel_core::control::approval_prompt_summary("\n \nvisible"),
+        ("visible".into(), 0)
+    );
+}
+
+#[test]
+fn approval_details_keep_the_complete_prompt_and_escape_invisible_card_values() {
+    let prompt = format!("\n\n{}\nlast task\u{202e}\u{200b}", "long task".repeat(200));
+    let displayed = muxel_core::control::escape_approval_prompt(&prompt);
+    assert!(displayed.starts_with("\n\n"));
+    assert!(displayed.contains(&"long task".repeat(200)));
+    assert!(displayed.ends_with("last task\\u{202e}\\u{200b}"));
+    assert_eq!(
+        muxel_core::control::escape_approval_value(
+            "Caller\nProject:\tspoof\u{202e}\u{200b}\u{2028}"
+        ),
+        "Caller\\nProject:\\tspoof\\u{202e}\\u{200b}\\u{2028}"
+    );
+    assert_eq!(
+        muxel_core::control::escape_approval_value("東京 • café"),
+        "東京 • café"
+    );
+}
+
+#[test]
 fn creation_policy_matrix_keeps_literal_and_shell_launches_click_only() {
     for policy in [
         CreationPolicy::Off,
@@ -41,11 +76,9 @@ fn creation_policy_matrix_keeps_literal_and_shell_launches_click_only() {
 }
 
 #[test]
-fn creation_policy_accepts_old_bools_and_persists_named_choices() {
+fn creation_policy_accepts_only_named_choices_and_rejects_bools() {
     assert_eq!(Settings::default().control_allow_new, CreationPolicy::Off);
     for (value, expected) in [
-        (json!(false), CreationPolicy::Off),
-        (json!(true), CreationPolicy::Allow),
         (json!("off"), CreationPolicy::Off),
         (json!("ask"), CreationPolicy::Ask),
         (json!("allow"), CreationPolicy::Allow),
@@ -63,6 +96,9 @@ fn creation_policy_accepts_old_bools_and_persists_named_choices() {
         );
     }
     assert!(serde_json::from_value::<Settings>(json!({"control_allow_new":"always"})).is_err());
+    for value in [false, true] {
+        assert!(serde_json::from_value::<Settings>(json!({"control_allow_new":value})).is_err());
+    }
 }
 
 #[test]

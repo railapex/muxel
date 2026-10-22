@@ -7,7 +7,7 @@ impl MuxelApp {
     pub(super) fn creation_decision(&self, instance: &Instance) -> ctl::CreationDecision {
         let class = if instance.literal_argv {
             ctl::LaunchClass::Literal
-        } else if readaloud::is_agent_program(instance.program.as_deref()) {
+        } else if AgentPreset::is_recognized_agent_program(instance.program.as_deref()) {
             ctl::LaunchClass::Preset
         } else {
             ctl::LaunchClass::Shell
@@ -178,7 +178,9 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            window.activate_window();
+            if approved {
+                window.activate_window();
+            }
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);

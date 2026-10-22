@@ -5,7 +5,6 @@
 use super::super::{ConfirmAction, PlacementMode, WorktreeChoice};
 use super::{ControlTurn, CtlResult, control_launch_spec, control_program_writable};
 use muxel_core::control::{self as ctl, CreationPolicy, ErrorCode};
-use muxel_core::readaloud;
 use muxel_core::{AgentPreset, Instance, PaneNode, Project, Settings, SplitDirection, Workspace};
 use muxel_terminal::CommandSpec;
 use serde_json::{Value, json};
@@ -383,6 +382,179 @@ fn control_new_focus_selects_the_new_pane_project_and_activates_its_window() {
 }
 
 #[test]
+fn control_new_allow_focus_selects_without_raising_until_click_approved() {
+    for approved in [false, true] {
+        let mut app = MuxelApp::fixture();
+        let (pid, _) = target_project(&mut app, false);
+        let mut window = Window::default();
+        let result = app
+            .control_new(
+                pid,
+                ctl::NewOptions {
+                    preset: Some("Codex".into()),
+                    focus: true,
+                    ..Default::default()
+                },
+                approved,
+                &mut window,
+                &mut Context(PhantomData),
+            )
+            .unwrap();
+        let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+        assert_eq!(app.active_instance, Some(iid));
+        assert_eq!(app.workspace.active_project, Some(pid));
+        assert_eq!(window.activations, usize::from(approved));
+    }
+}
+
+#[test]
+fn control_new_custom_programs_require_shell_grant_click_and_write_permission() {
+    for program in [
+        "ssh",
+        "wsl.exe",
+        "python",
+        "node",
+        "custom-program",
+        "/usr/local/bin/custom",
+        r"C:\tools\custom.exe",
+    ] {
+        let mut app = MuxelApp::fixture();
+        app.presets[0].program = Some(program.into());
+        app.refuses_without_mutation(ctl::NewOptions::default(), COMMAND_SETTING);
+        app.settings.control_allow_shells = true;
+        let pid = app.workspace.projects[0].id;
+        let preview = app
+            .prepare_control_new(pid, &ctl::NewOptions::default())
+            .unwrap();
+        assert_eq!(
+            app.creation_decision(&preview),
+            ctl::CreationDecision::Ask,
+            "{program}"
+        );
+        assert!(
+            control_program_writable(&preview, false).is_err(),
+            "{program}"
+        );
+        assert!(
+            control_program_writable(&preview, true).is_ok(),
+            "{program}"
+        );
+        let mut window = Window::default();
+        let before = app.snapshot(&window);
+        assert!(
+            app.control_new(
+                pid,
+                ctl::NewOptions::default(),
+                false,
+                &mut window,
+                &mut Context(PhantomData)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            app.snapshot(&window),
+            before,
+            "click-free {program} mutated state"
+        );
+        app.control_new(
+            pid,
+            ctl::NewOptions::default(),
+            true,
+            &mut window,
+            &mut Context(PhantomData),
+        )
+        .unwrap();
+        assert_eq!(app.launches, 1);
+    }
+}
+
+#[test]
+fn control_new_builtin_agents_share_creation_and_write_recognition() {
+    for program in [
+        "claude", "opencode", "amp", "grok", "codex", "muse", "hermes", "ollama", "pi",
+    ] {
+        let mut app = MuxelApp::fixture();
+        app.presets[0].program = Some(program.into());
+        let pid = app.workspace.projects[0].id;
+        let preview = app
+            .prepare_control_new(pid, &ctl::NewOptions::default())
+            .unwrap();
+        assert_eq!(
+            app.creation_decision(&preview),
+            ctl::CreationDecision::Allow,
+            "{program}"
+        );
+        assert!(
+            control_program_writable(&preview, false).is_ok(),
+            "{program}"
+        );
+        app.control_new(
+            pid,
+            ctl::NewOptions::default(),
+            false,
+            &mut Window::default(),
+            &mut Context(PhantomData),
+        )
+        .unwrap();
+        assert_eq!(app.launches, 1);
+    }
+}
+
+#[test]
+fn control_new_custom_program_tasks_still_need_shell_grant_and_click() {
+    for program in ["ssh", "wsl.exe", "python", "node", "custom-program"] {
+        let mut app = MuxelApp::fixture();
+        app.presets[0].program = Some(program.into());
+        let options = ctl::NewOptions {
+            prompt: Some("explicitly approved task\nsecond line".into()),
+            ..Default::default()
+        };
+        app.refuses_without_mutation(options.clone(), COMMAND_SETTING);
+        app.settings.control_allow_shells = true;
+        let pid = app.workspace.projects[0].id;
+        let preview = app.prepare_control_new(pid, &options).unwrap();
+        assert_eq!(app.creation_decision(&preview), ctl::CreationDecision::Ask);
+        let mut window = Window::default();
+        let before = app.snapshot(&window);
+        assert!(
+            app.control_new(
+                pid,
+                options.clone(),
+                false,
+                &mut window,
+                &mut Context(PhantomData)
+            )
+            .is_err()
+        );
+        assert_eq!(app.snapshot(&window), before);
+        app.open(options, &mut window).unwrap();
+        assert_eq!(app.launches, 1);
+    }
+}
+
+#[test]
+fn control_new_invalid_card_labels_refuse_before_mutation() {
+    for value in [
+        "fake\nProject: another".into(),
+        "caller\u{202e}".into(),
+        "pane\u{200b}".into(),
+        "x".repeat(129),
+    ] {
+        for name in [false, true] {
+            let mut app = MuxelApp::fixture();
+            app.refuses_without_mutation(
+                ctl::NewOptions {
+                    name: name.then(|| value.clone()),
+                    from: (!name).then(|| value.clone()),
+                    ..Default::default()
+                },
+                if name { "--name" } else { "--from" },
+            );
+        }
+    }
+}
+
+#[test]
 fn control_new_startup_wait_is_pending_before_placement_until_actual_submission() {
     let mut app = MuxelApp::fixture();
     let result = app
@@ -511,6 +683,82 @@ fn control_new_startup_lost_owner_suppresses_input_and_controller_drop_cancels_l
     let next_owner = next.startup.as_ref().unwrap().claim().unwrap();
     drop(next);
     assert!(!next_owner.is_pending());
+}
+
+#[test]
+fn control_new_tmux_startup_keeps_provider_and_owner_after_isolated_transport_wrapping() {
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let root = std::env::temp_dir().join(format!("ctl-tmux-policy-{}", Uuid::new_v4()));
+    let socket = muxel_core::tmux::Socket::isolated(&root);
+    for preset in [AgentPreset::codex(), AgentPreset::grok()] {
+        let task = "one exact task\nsecond line";
+        let mut instance = ctl::NewOptions {
+            prompt: Some(task.into()),
+            ..Default::default()
+        }
+        .instance(&project, std::slice::from_ref(&preset), 0)
+        .unwrap();
+        instance.use_tmux = true;
+        instance.tmux_socket = Some(socket);
+        instance.tmux_session = Some(format!("mxl-test-{}", instance.id));
+        assert!(instance.use_tmux);
+        let resolved = muxel_core::resolve_launch_for_session(&instance, false);
+        let provider = resolved.program.as_deref().unwrap();
+        let transport = crate::session_binding::tmux_pane_args(
+            instance.tmux_socket.unwrap(),
+            instance.tmux_session.as_deref().unwrap(),
+            resolved.program.as_deref(),
+            &resolved.args,
+            instance.id,
+            true,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(transport.args.starts_with(&socket.args()));
+        assert!(
+            transport
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--" && pair[1] == provider)
+        );
+        assert!(
+            transport
+                .env
+                .iter()
+                .any(|(key, value)| key == muxel_store::USER_DATA_DIR_ENV
+                    && value == root.to_str().unwrap())
+        );
+        let mut wrapped = CommandSpec::program("tmux", transport.args)
+            .with_status_program(resolved.program.clone())
+            .with_startup_input(resolved.startup_input.unwrap())
+            .with_submit(resolved.submit)
+            .with_auto_mode(2);
+        wrapped.env = transport.env;
+        let turn = ControlTurn::startup(task.into());
+        let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+        let admitted =
+            control_launch_spec(Some(&instance), Some(&turn), Some(owner), wrapped.clone());
+        assert_eq!(admitted.program, "tmux");
+        assert_eq!(admitted.status_program.as_deref(), Some(provider));
+        assert_eq!(admitted.startup_input.as_deref(), Some(task));
+        assert!(admitted.submit);
+        assert!(admitted.startup_turn.as_ref().unwrap().is_pending());
+        assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &Default::default(), 90_000));
+        assert!(!admitted.allow_shell_fallback);
+
+        // Saved tmux transport and task metadata cannot recreate runtime ownership.
+        let restored = control_launch_spec(Some(&instance), None, None, wrapped.clone());
+        assert_eq!(restored.status_program.as_deref(), Some(provider));
+        assert!(restored.startup_input.is_none());
+        assert!(!restored.submit);
+        assert_eq!(restored.auto_mode_presses, 0);
+        assert!(restored.startup_turn.is_none());
+        assert!(!restored.allow_shell_fallback);
+        let cancelled = control_launch_spec(Some(&instance), Some(&turn), None, wrapped);
+        assert!(cancelled.startup_input.is_none());
+        assert!(!cancelled.allow_shell_fallback);
+        assert!(!admitted.startup_turn.as_ref().unwrap().is_pending());
+    }
 }
 
 const CREATION_SETTING: &str = "Outside terminal creation";
