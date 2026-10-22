@@ -56,6 +56,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod accomplishments_ui;
+#[cfg(all(test, windows))]
+mod codex_capture_tests;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
@@ -184,6 +186,8 @@ mod maximize_follow_tests {
 /// ridden out within the minute; anything longer-lived is left to the next connect —
 /// see `MuxelApp::reap_remote_session`.
 const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
+/// A resume launch has this long to prove its saved session is valid.
+const RECOVER_WITHIN_SECS: u64 = 10;
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_WINDOWS_LAUNCH_CONCURRENCY: usize = 2;
@@ -1449,7 +1453,7 @@ fn scan_importable(
             Some("claude") => integrations::claude_conversations(home, cwd)
                 .first()
                 .map(|(id, _)| id.clone()),
-            Some("codex") => muxel_core::codex_latest_session_id(home, cwd),
+            Some("codex") => session_discovery::capture_codex_session_id(home, cwd),
             _ => None,
         }
     };
@@ -2413,21 +2417,34 @@ fn effective_local_cwd(
         .map(|path| path.display().to_string())
 }
 
-/// Claude's transcript probe decides whether its UUID is missing before launch.
-/// Once launched, neither generic failure nor "No conversation found" proves the
-/// UUID is invalid: a cwd mismatch produces the same message. Other providers
-/// retain the established early-exit recovery.
+/// A generic early exit does not prove a saved Codex or Claude conversation is
+/// gone. Only a provider-specific missing-session message can recover Codex;
+/// Claude's transcript probe decides before launch because a cwd mismatch can
+/// produce the same message as a missing conversation.
 fn should_recover_expired_session(
-    is_claude: bool,
+    program: Option<&str>,
     explicit_missing: bool,
     early_nonzero_exit: bool,
 ) -> bool {
-    !is_claude && (explicit_missing || early_nonzero_exit)
+    if is_claude_program(program) {
+        return false;
+    }
+    if is_codex_program(program) {
+        return explicit_missing;
+    }
+    explicit_missing || early_nonzero_exit
+}
+
+fn resume_missing_message(program: Option<&str>, id: Option<&str>, text: &str) -> bool {
+    if is_codex_program(program) {
+        return id.is_some_and(|id| text.contains(&format!("No saved session found with ID {id}")));
+    }
+    text.contains("No conversation found")
 }
 
 #[cfg(test)]
 mod claude_resume_tests {
-    use super::{effective_local_cwd, should_recover_expired_session};
+    use super::{effective_local_cwd, resume_missing_message, should_recover_expired_session};
     use std::path::Path;
 
     #[test]
@@ -2445,38 +2462,35 @@ mod claude_resume_tests {
 
     #[test]
     fn unrelated_claude_resume_failure_preserves_the_saved_uuid() {
-        assert!(!should_recover_expired_session(true, false, true));
-        assert!(!should_recover_expired_session(true, true, false));
-        assert!(should_recover_expired_session(false, false, true));
+        assert!(!should_recover_expired_session(Some("claude"), false, true));
+        assert!(!should_recover_expired_session(Some("claude"), true, false));
+        assert!(!should_recover_expired_session(Some("codex"), false, true));
+        assert!(should_recover_expired_session(Some("codex"), true, false));
+        assert!(should_recover_expired_session(Some("grok"), false, true));
+    }
+
+    #[test]
+    fn codex_resume_failure_requires_its_own_exact_missing_message() {
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        assert!(!resume_missing_message(
+            Some("codex"),
+            Some(id),
+            "network failed"
+        ));
+        assert!(!resume_missing_message(
+            Some("codex"),
+            Some(id),
+            "No saved session found with ID another-id"
+        ));
+        assert!(resume_missing_message(
+            Some("codex"),
+            Some(id),
+            &format!("No saved session found with ID {id}")
+        ));
     }
 }
 
-/// Whether an agent-minted session id is no longer on disk (Codex today).
-fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
-    let program = preset.program.as_deref().unwrap_or_default();
-    if !is_codex_program(Some(program)) {
-        return false;
-    }
-    let Some(home) = home_dir() else {
-        return false;
-    };
-    !muxel_core::codex_session_exists(&home, session_id)
-}
-
-/// Recover a legacy agent-minted session id by cwd when no exact binding was saved.
-fn capture_agent_session_id(
-    preset: &muxel_core::AgentPreset,
-    cwd: Option<&std::path::Path>,
-) -> Option<String> {
-    let program = preset.program.as_deref().unwrap_or_default();
-    if !is_codex_program(Some(program)) {
-        return None;
-    }
-    let home = home_dir()?;
-    let cwd = cwd?;
-    muxel_core::codex_latest_session_id(&home, cwd)
-}
-
+#[cfg(test)]
 fn unowned_captured_session_id(
     captured: Option<String>,
     sibling_session_ids: &HashSet<String>,
@@ -2492,7 +2506,7 @@ fn validated_codex_session_id(
     home: &std::path::Path,
     cwd: &std::path::Path,
     profile_pane: Option<Uuid>,
-) -> Option<String> {
+) -> Option<muxel_core::CodexSession> {
     let hint = muxel_core::codex_session_hint_from_title(preset, title_hint?)?;
     let prefix = hint.strip_suffix("...").unwrap_or(&hint);
     if current.is_some_and(|id| id.starts_with(prefix)) {
@@ -2503,7 +2517,7 @@ fn validated_codex_session_id(
         "codex-session-validate",
         profile_pane,
     );
-    muxel_core::codex_session_id_from_hint(home, &hint, cwd)
+    muxel_core::codex_session_from_hint(home, &hint, cwd)
 }
 
 fn session_id_bound_elsewhere(instances: &[Instance], owner: Uuid, session_id: &str) -> bool {
@@ -3203,6 +3217,7 @@ pub struct MuxelApp {
     /// Parent-owned Codex thread names, keyed by the session UUID captured from
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
+    codex_name_index: muxel_core::CodexSessionNames,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -5592,6 +5607,7 @@ impl MuxelApp {
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
             codex_session_names: HashMap::new(),
+            codex_name_index: Default::default(),
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -6255,11 +6271,11 @@ impl MuxelApp {
     /// - **Host-minted** (`session_id_flag` set): first launch
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
-    ///   bound panes resume their saved id. A legacy started pane with no saved id
-    ///   recovers the newest cwd-matching rollout before `resume <id>`.
+    ///   bound panes resume their saved id. Legacy started panes without an id
+    ///   get a one-time worker scan before this method chooses fresh or resume.
     ///
-    /// This launch-time lookup still performs synchronous store I/O, including
-    /// when tick recovery reaches it. Recurring discovery uses background workers.
+    /// Exact saved-path checks still do synchronous store I/O. Missing-path
+    /// recovery and recurring discovery run on background workers.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
@@ -6335,19 +6351,14 @@ impl MuxelApp {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
             self.adopt_claude_session_binding(iid);
         }
-        let sibling_session_ids: HashSet<String> = self
-            .workspace
-            .instances
-            .iter()
-            .filter(|instance| instance.id != iid)
-            .filter_map(|instance| instance.session_id.clone())
-            .collect();
         let inst = self.workspace.instance_mut(iid)?;
+        let previous_session_path = inst.session_path.clone();
         let host_minted = preset.session_id_flag.is_some();
         let mut resume_cwd = None;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_path = None;
             }
             // Proactive resume: if we'd `--resume` an already-started session but its
             // transcript is gone from disk (deleted/expired), start a *fresh* session
@@ -6367,36 +6378,47 @@ impl MuxelApp {
                     ClaudeSessionState::Found { cwd } => resume_cwd = cwd,
                     ClaudeSessionState::Missing => {
                         inst.session_id = Some(Uuid::new_v4().to_string());
+                        inst.session_path = None;
                         inst.session_started = false;
                     }
                     ClaudeSessionState::NotClaude | ClaudeSessionState::Unknown => {}
                 }
             }
         } else if inst.session_started {
-            // Agent-minted (Codex): legacy panes created before exact title
-            // capture have no id, so recover their newest cwd-matching rollout.
-            // A known id that disappeared must start fresh; adopting "latest"
-            // there can steal a sibling pane's conversation.
             if inst.session_id.is_none() {
-                let captured = {
-                    let _phase = ui_profile::phase("activation", "codex-session-latest", Some(iid));
-                    capture_agent_session_id(&preset, cwd.as_deref())
-                };
-                if let Some(id) = unowned_captured_session_id(captured, &sibling_session_ids) {
-                    inst.session_id = Some(id);
-                } else {
-                    inst.session_started = false;
-                }
-            } else if inst.session_id.as_deref().is_some_and(|sid| {
-                let _phase = ui_profile::phase("activation", "codex-session-exists", Some(iid));
-                agent_minted_session_gone(&preset, sid)
-            }) {
-                inst.session_id = None;
+                inst.session_path = None;
                 inst.session_started = false;
+            } else if local
+                && is_codex_program(preset.program.as_deref())
+                && let (Some(home), Some(id)) = (home_dir(), inst.session_id.as_deref())
+            {
+                let _phase = ui_profile::phase("activation", "codex-session-exists", Some(iid));
+                match session_discovery::resume_codex_session(
+                    &home,
+                    id,
+                    inst.session_path.as_deref(),
+                ) {
+                    Ok(muxel_core::CodexResumePath::Found(path)) => inst.session_path = Some(path),
+                    Ok(muxel_core::CodexResumePath::Missing) => {
+                        inst.session_id = None;
+                        inst.session_path = None;
+                        inst.session_started = false;
+                    }
+                    Ok(muxel_core::CodexResumePath::Unknown) => {}
+                    // An unreadable store does not prove an exact identity expired.
+                    Err(error) => {
+                        log::warn!("could not check Codex rollout before resume: {error}")
+                    }
+                }
             }
         }
         let snapshot = inst.clone();
-        muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd))
+        let result =
+            muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd));
+        if snapshot.session_path != previous_session_path {
+            self.persist();
+        }
+        result
     }
 
     fn command_for(&mut self, instance_id: Uuid) -> Result<CommandSpec, String> {
@@ -6682,6 +6704,22 @@ impl MuxelApp {
         if self.terminal_restarts.contains(instance_id) {
             return;
         }
+        if self.codex_launch_preflight_request(instance_id).is_some() {
+            // A replacement may still have an exited terminal view, so the
+            // ordinary new-pane reservation cannot be used here.
+            self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
+            let token = self.next_terminal_launch_token;
+            self.terminal_launching.insert(
+                instance_id,
+                LaunchTicket {
+                    token,
+                    since: Instant::now(),
+                },
+            );
+            self.reset_terminal_runtime(instance_id);
+            self.launch_reserved_terminal_async(instance_id, token, window, cx);
+            return;
+        }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
         // An explicit/immediate spawn supersedes a deferred launch still creating
         // its PTY. Its token will fail validation and dropping it kills the child.
@@ -6703,10 +6741,6 @@ impl MuxelApp {
         }
         // Whether this launch will `--resume` a saved session (true on every
         // launch after the first, for resume-capable agents).
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
         let spec = match self.command_for(instance_id) {
             Ok(spec) => spec,
             Err(error) => {
@@ -6714,6 +6748,10 @@ impl MuxelApp {
                 return;
             }
         };
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
         // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
@@ -6779,6 +6817,10 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
+        if self.codex_launch_preflight_request(instance_id).is_some() {
+            self.launch_reserved_terminal_async(instance_id, token, window, cx);
+            return None;
+        }
         self.prepare_reserved_terminal_spawn(instance_id, token, cx)
     }
 
@@ -6916,10 +6958,6 @@ impl MuxelApp {
         {
             return None;
         }
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
         let spec = match self.command_for(instance_id) {
             Ok(spec) => spec,
             Err(error) => {
@@ -6927,6 +6965,10 @@ impl MuxelApp {
                 return None;
             }
         };
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
         let meta = TerminalSpawnMeta {
             instance_id,
             token,
@@ -6984,14 +7026,38 @@ impl MuxelApp {
         let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
             return;
         };
+        self.launch_reserved_terminal_async(instance_id, token, window, cx);
+    }
+
+    fn launch_reserved_terminal_async(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preflight = self.codex_launch_preflight_request(instance_id);
         cx.spawn(async move |this, cx| {
             // Give GPUI a frame to paint the selected pane's loading state before
             // the worker begins process discovery and ConPTY construction.
             cx.background_executor()
                 .timer(Duration::from_millis(1))
                 .await;
+            let finding = if let Some(request) = preflight.as_ref() {
+                let request = request.clone();
+                Some(
+                    cx.background_executor()
+                        .spawn(async move { session_discovery::codex_launch_preflight(&request) })
+                        .await,
+                )
+            } else {
+                None
+            };
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
+                    if let (Some(request), Some(finding)) = (preflight.as_ref(), finding) {
+                        this.apply_codex_launch_preflight(instance_id, token, request, finding);
+                    }
                     this.prepare_reserved_terminal_spawn(instance_id, token, cx)
                 })
                 .ok()
@@ -10017,35 +10083,50 @@ impl MuxelApp {
             })
             .then(home_dir)
             .flatten();
+        let mut codex_name_index = std::mem::take(&mut self.codex_name_index);
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, tmux, branches, changes, codex_names) = cx
-                .background_executor()
-                .spawn(async move {
-                    let available = installed_programs(&presets);
-                    let gh = program_on_path("gh");
-                    let sshpass = program_on_path("sshpass");
-                    let tmux = cfg!(unix) && program_on_path("tmux");
-                    let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
-                        .into_iter()
-                        .map(|(id, root)| {
-                            let loc = integrations::RepoLoc::Local(root);
-                            (
-                                id,
-                                integrations::repo_current_branch(&loc),
-                                integrations::list_branches(&loc),
-                            )
-                        })
-                        .collect();
-                    let changes: Vec<(Uuid, usize)> = worktrees
-                        .into_iter()
-                        .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
-                        .collect();
-                    let codex_names = codex_home.map(|home| muxel_core::codex_session_names(&home));
-                    (available, gh, sshpass, tmux, branches, changes, codex_names)
-                })
-                .await;
+            let (available, gh, sshpass, tmux, branches, changes, codex_names, codex_name_index) =
+                cx.background_executor()
+                    .spawn(async move {
+                        let available = installed_programs(&presets);
+                        let gh = program_on_path("gh");
+                        let sshpass = program_on_path("sshpass");
+                        let tmux = cfg!(unix) && program_on_path("tmux");
+                        let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
+                            .into_iter()
+                            .map(|(id, root)| {
+                                let loc = integrations::RepoLoc::Local(root);
+                                (
+                                    id,
+                                    integrations::repo_current_branch(&loc),
+                                    integrations::list_branches(&loc),
+                                )
+                            })
+                            .collect();
+                        let changes: Vec<(Uuid, usize)> = worktrees
+                            .into_iter()
+                            .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
+                            .collect();
+                        let codex_names = codex_home.map(|home| {
+                            codex_name_index
+                                .refresh(&home)
+                                .map(|changed| changed.then(|| codex_name_index.names().clone()))
+                        });
+                        (
+                            available,
+                            gh,
+                            sshpass,
+                            tmux,
+                            branches,
+                            changes,
+                            codex_names,
+                            codex_name_index,
+                        )
+                    })
+                    .await;
             let _ = this.update(cx, |this, cx| {
                 this.status_refresh_in_flight = false;
+                this.codex_name_index = codex_name_index;
                 this.available_programs = available;
                 this.gh_available = gh;
                 this.sshpass_available = sshpass;
@@ -10061,12 +10142,16 @@ impl MuxelApp {
                 }
                 this.worktree_changes = changes.into_iter().collect();
                 match codex_names {
-                    Some(Ok(names)) => this.codex_session_names = names,
+                    Some(Ok(Some(names))) => this.codex_session_names = names,
+                    Some(Ok(None)) => {}
                     Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                         this.codex_session_names.clear();
                     }
                     Some(Err(_)) => {}
-                    None => this.codex_session_names.clear(),
+                    None => {
+                        this.codex_session_names.clear();
+                        this.codex_name_index = Default::default();
+                    }
                 }
                 let updates: Vec<(Uuid, String)> = this
                     .workspace
@@ -10459,6 +10544,34 @@ impl MuxelApp {
         }
     }
 
+    fn resume_program(&self, iid: Uuid) -> Option<&str> {
+        self.workspace.instance(iid).and_then(|instance| {
+            instance
+                .preset_id
+                .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                .or_else(|| {
+                    self.presets
+                        .iter()
+                        .find(|preset| preset.name == instance.preset)
+                })
+                .and_then(|preset| preset.program.as_deref())
+                .or(instance.program.as_deref())
+        })
+    }
+
+    fn should_recover_expired_resume(
+        &self,
+        iid: Uuid,
+        explicit_missing: bool,
+        early_nonzero_exit: bool,
+    ) -> bool {
+        should_recover_expired_session(
+            self.resume_program(iid),
+            explicit_missing,
+            early_nonzero_exit,
+        )
+    }
+
     /// Status-refresh tick: re-render and fire desktop notifications for
     /// unfocused agents when they finish or ring the terminal bell. The bell is
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
@@ -10587,9 +10700,6 @@ impl MuxelApp {
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
         let focused = self.active_instance;
-        // A `--resume` launch has this long to prove its saved session is valid;
-        // past that we stop watching it for recovery signals.
-        const RECOVER_WITHIN_SECS: u64 = 10;
         struct Snap {
             iid: Uuid,
             status: AgentStatus,
@@ -10621,18 +10731,21 @@ impl MuxelApp {
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
-                // Some providers hang on "No conversation found" instead of
-                // exiting. Search recent reflowed text while the resume is fresh;
-                // Claude still preserves its UUID because cwd mismatch produces
-                // the same message.
+                let inst = self.workspace.instance(*iid);
+                // Some providers hang after reporting a missing conversation.
+                // The Codex message names the exact saved ID; a generic failure
+                // or unrelated screen text cannot erase its binding.
                 let resume_error =
                     self.terminal_launches
                         .get(iid)
                         .is_some_and(|&(at, was_resume)| {
                             was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                         })
-                        && v.recent_text(40).contains("No conversation found");
-                let inst = self.workspace.instance(*iid);
+                        && resume_missing_message(
+                            self.resume_program(*iid),
+                            inst.and_then(|instance| instance.session_id.as_deref()),
+                            &v.recent_text(40),
+                        );
                 let title = inst
                     .map(|i| i.display_name().to_string())
                     .unwrap_or_default();
@@ -10829,29 +10942,17 @@ impl MuxelApp {
                     .as_ref()
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket))
             });
-            let is_claude = self.workspace.instance(iid).is_some_and(|instance| {
-                instance
-                    .preset_id
-                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
-                    .or_else(|| {
-                        self.presets
-                            .iter()
-                            .find(|preset| preset.name == instance.preset)
-                    })
-                    .is_some_and(|preset| is_claude_program(preset.program.as_deref()))
-            });
-            // A `--resume` launch whose saved session is invalid (deleted/expired)
-            // recovers by re-spawning the same agent with a fresh session, rather
-            // than closing it. Claude never qualifies here: its proactive transcript
-            // probe already handles a confirmed miss, while both this message and a
-            // generic non-zero exit can be caused by a cwd mismatch. Replacing the
-            // UUID in that case would hide a valid conversation. Other providers
-            // retain the earlier generic early-exit recovery.
+            // A `--resume` launch with a proven missing session recovers by
+            // re-spawning fresh. Claude's proactive transcript probe handles its
+            // confirmed misses before launch. Codex requires its exact missing-ID
+            // message here; an unrelated early failure retains the valid binding.
+            // Other providers retain the earlier generic early-exit recovery.
             // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
             //
-            // Never for a tmux pane: what exits there is the tmux *client*, and its
-            // status says nothing about the agent's resume (an agent that failed to
-            // resume would end its session and leave the client at 0). Treating a
+            // Never infer an expired resume from a tmux client's exit: what exits
+            // there is the *client*, and its status says nothing about the agent's
+            // resume (an agent that failed to resume would end its session and
+            // leave the client at 0). Treating a
             // killed tmux server as a bad resume threw the conversation away — it
             // reset `session_id` — every time the server died twice inside
             // `RECOVER_WITHIN_SECS`. Those panes belong to `tmux_lost` below.
@@ -10888,11 +10989,30 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
-            if should_recover_expired_session(is_claude, resume_error, exit_recover) {
+            // A tmux client may exit 0 when Codex refuses a resume and closes its
+            // session. Keep the pane and its id if the on-screen error detector
+            // missed the reason; a clean client exit is not proof of agent success.
+            let uncertain_codex_resume = tmux_session.is_some()
+                && is_codex_program(self.resume_program(iid))
+                && self
+                    .terminal_launches
+                    .get(&iid)
+                    .is_some_and(|&(at, was_resume)| {
+                        was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
+                    });
+
+            if self.should_recover_expired_resume(iid, resume_error, exit_recover) {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
-            } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
+            } else if newly_exited && exit_code == Some(0) && uncertain_codex_resume {
+                self.add_event(
+                    NotifKind::Error,
+                    tf("{title}: Codex resume ended early", &[("title", &title)]),
+                    t("Kept the pane and its session id so you can inspect the exit.").to_string(),
+                );
+                dirty = true;
+            } else if newly_exited && exit_code == Some(0) && self.settings.close_on_exit {
                 // Close-on-exit keys off the actual process exit, not the display
                 // state (Done also means "finished a turn" while still running).
                 // Only a *clean* exit qualifies: a crash (non-zero) or a bare PTY
@@ -11013,8 +11133,10 @@ impl MuxelApp {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
             self.bump_session_binding_generation(iid);
+            let codex = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
-                inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_id = (!codex).then(|| Uuid::new_v4().to_string());
+                inst.session_path = None;
                 inst.session_started = false;
             }
             self.persist();
@@ -30801,7 +30923,7 @@ mod grok_session_tests {
 #[cfg(test)]
 mod shell_title_tests {
     use super::{
-        agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
+        authoritative_terminal_auto_title, codex_session_auto_title, is_codex_program,
         session_id_bound_elsewhere, shell_dir_title, terminal_auto_title,
         unowned_captured_session_id, validated_codex_session_id,
     };
@@ -30933,14 +31055,14 @@ mod shell_title_tests {
 
     #[test]
     fn codex_session_binding_resolves_provider_hint_and_rejects_owned_rollout() {
-        let first = Uuid::new_v4().to_string();
-        let later = Uuid::new_v4().to_string();
+        let first = "01a1543c-9700-7000-8000-000000000001".to_string();
+        let later = "01a1543c-9701-7000-8000-000000000002".to_string();
         let preset = AgentPreset::codex();
         let initial_frame = format!("{}... | Ready", &first[..29]);
         let later_frame = format!("{}... | Ready", &later[..29]);
         let home = std::env::temp_dir().join(format!("muxel-codex-binding-{}", Uuid::new_v4()));
         let cwd = home.join("project");
-        let sessions = home.join(".codex/sessions/2026/08/23");
+        let sessions = home.join(".codex/sessions/2026/10/19");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         for id in [&first, &later] {
@@ -30957,7 +31079,8 @@ mod shell_title_tests {
 
         assert_eq!(
             validated_codex_session_id(&preset, None, Some(&initial_frame), &home, &cwd, None,)
-                .as_deref(),
+                .as_ref()
+                .map(|session| session.id.as_str()),
             Some(first.as_str())
         );
         assert_eq!(
@@ -30980,7 +31103,8 @@ mod shell_title_tests {
                 &cwd,
                 None,
             )
-            .as_deref(),
+            .as_ref()
+            .map(|session| session.id.as_str()),
             Some(later.as_str())
         );
         assert_eq!(
@@ -30999,7 +31123,7 @@ mod shell_title_tests {
             program: Some("codex-title-proxy.exe".to_string()),
             ..preset
         };
-        assert!(!agent_minted_session_gone(&proxy, &first));
+        assert!(!is_codex_program(proxy.program.as_deref()));
 
         let owner = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
         let mut sibling = Instance::from_preset(owner.project_id, &AgentPreset::claude());
