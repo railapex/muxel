@@ -1,0 +1,13 @@
+[
+  {"output": ":muxel-listed:0\n:muxel-listed:0\n", "accepted": true, "targets": []},
+  {"output": "private\n:muxel-listed:0\ndefault\n:muxel-listed:0\n", "accepted": true, "targets": [{"socket": "mxl", "name": "private"}, {"socket": "default", "name": "default"}]},
+  {"output": " owned|with|pipes \nname with spaces\ntab\tname\n:muxel-listed:0\n:muxel-listed:0\n", "accepted": true, "targets": [{"socket": "mxl", "name": " owned|with|pipes "}, {"socket": "mxl", "name": "name with spaces"}, {"socket": "mxl", "name": "tab\tname"}]},
+  {"output": "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n:muxel-listed:1\nwork\n:muxel-listed:0\n", "accepted": true, "targets": [{"socket": "default", "name": "work"}]},
+  {"output": "no server running on /tmp/tmux-1000/mxl\n:muxel-listed:1\nerror connecting to /tmp/tmux-1000/default (Connection refused)\n:muxel-listed:1\n", "accepted": true, "targets": []},
+  {"output": "\n:muxel-listed:0\n:muxel-listed:0\n", "accepted": false, "targets": []},
+  {"output": "work\n\n:muxel-listed:0\n:muxel-listed:0\n", "accepted": false, "targets": []},
+  {"output": "work\n:muxel-listed:unknown\n:muxel-listed:0\n", "accepted": false, "targets": []},
+  {"output": "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n:muxel-listed:0\n", "accepted": false, "targets": []},
+  {"output": "work\n:muxel-listed:0\n", "accepted": false, "targets": []},
+  {"output": ":muxel-listed:0\n:muxel-listed:0\ntrailing", "accepted": false, "targets": []}
+]

@@ -108,6 +108,94 @@ enum TmuxCommands {
         var socket: String
     }
 
+    struct DefaultMigration: Equatable {
+        let recordedSession: String?
+        let sessionName: String
+    }
+
+    enum ProbeError: LocalizedError, Equatable {
+        case incomplete
+        case ownershipRefreshRequired
+
+        var errorDescription: String? {
+            switch self {
+            case .incomplete:
+                return "Couldn't confirm both tmux servers. Reconnect and try again."
+            case .ownershipRefreshRequired:
+                return "That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives."
+            }
+        }
+    }
+
+    /// Default migration needs both complete replies. Ordinary best-effort
+    /// discovery cannot distinguish an empty server from a permission failure.
+    static func confirmedTargetsCommand() -> String {
+        "export LC_ALL=C; " + [socketName, "default"].map { server in
+            commandLine(["list-sessions", "-F", "#{session_name}"], session: "", socket: server)
+                + " 2>&1; echo \":muxel-listed:$?\""
+        }.joined(separator: "; ")
+    }
+
+    static func parseConfirmedTargets(_ output: String) throws -> [SessionTarget] {
+        let servers = [socketName, "default"]
+        var answered = 0
+        var listing: [String] = []
+        var targets: [SessionTarget] = []
+        for raw in output.utf8.split(separator: 0x0A, omittingEmptySubsequences: false) {
+            // Swift groups CRLF into one Character, so split UTF-8 bytes on LF
+            // before dropping Rust `lines()`'s optional terminal CR.
+            let line = String(decoding: raw.dropLast(raw.last == 0x0D ? 1 : 0), as: UTF8.self)
+            guard line.hasPrefix(":muxel-listed:") else {
+                listing.append(line); continue
+            }
+            guard answered < servers.count else { throw ProbeError.incomplete }
+            let status = String(line.dropFirst(":muxel-listed:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = listing.joined(separator: "\n")
+            if status == "0" {
+                guard listing.allSatisfy({ !$0.isEmpty }) else { throw ProbeError.incomplete }
+                targets += listing.map { SessionTarget(name: $0, socket: servers[answered]) }
+            } else if UInt8(status).map({ $0 != 0 }) != true
+                        || !confirmedNoServer(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                throw ProbeError.incomplete
+            }
+            answered += 1
+            listing = []
+        }
+        guard answered == servers.count,
+              listing.allSatisfy({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            throw ProbeError.incomplete
+        }
+        return targets
+    }
+
+    private static func confirmedNoServer(_ message: String) -> Bool {
+        guard !message.contains("\n") else { return false }
+        let absent = "no server running on "
+        if message.hasPrefix(absent) { return message.count > absent.count }
+        let connecting = "error connecting to "
+        guard message.hasPrefix(connecting) else { return false }
+        return [" (No such file or directory)", " (Connection refused)"].contains { suffix in
+            message.hasSuffix(suffix) && message.count > connecting.count + suffix.count
+        }
+    }
+
+    /// Called only after checked inventory. A Private namesake stops the plan
+    /// until saved ownership is refreshed; inventory alone cannot identify it.
+    static func targetForNewSession(_ instance: Instance, name: String, confirmedTargets: [SessionTarget])
+        throws -> (target: SessionTarget, migration: DefaultMigration?) {
+        let owner = instance.tmuxSocket ?? socketName
+        if owner == "default",
+           !confirmedTargets.contains(where: { $0.name == name && $0.socket == "default" }) {
+            guard !confirmedTargets.contains(where: { $0.name == name && $0.socket == socketName }) else {
+                throw ProbeError.ownershipRefreshRequired
+            }
+            return (.init(name: name, socket: socketName),
+                    DefaultMigration(recordedSession: instance.tmuxSession, sessionName: name))
+        }
+        return (.init(name: name, socket: owner), nil)
+    }
+
     /// Keep server identity beside every name, including duplicate names.
     static func listTargetsCommand(socket: String? = nil) -> String {
         let servers = socket.map { [$0] } ?? [socketName, "default"]
@@ -128,6 +216,14 @@ enum TmuxCommands {
 
     static func resolveTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
         resolveTarget(instance, in: targets, name: { $0.name }, socket: { $0.socket })
+    }
+
+    /// A recorded Default owner must match by its exact saved name. Suffix
+    /// recovery could otherwise attach a different session before migration is
+    /// checked, or after the checked inventory found the recorded name absent.
+    static func recordedDefaultTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
+        guard instance.tmuxSocket == "default", let recordedName = instance.tmuxSession else { return nil }
+        return targets.first { $0.socket == "default" && $0.name == recordedName }
     }
 
     static func resolveTarget<Row>(_ instance: Instance, in rows: [Row],

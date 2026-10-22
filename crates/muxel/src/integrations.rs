@@ -254,7 +254,7 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
 pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
     let mut panes = Vec::new();
     for socket in local_tmux_sockets() {
-        let out = tmux_on(socket)
+        let out = tmux_on(&socket)
             .args(muxel_core::tmux::list_sessions_args())
             .stdin(std::process::Stdio::null())
             .output()
@@ -1427,20 +1427,20 @@ pub fn git_diff(dir: &Path) -> String {
 /// ran `tmux new-session`), muxel gives the server the environment it would have
 /// started it with before opening a pane there. See
 /// `muxel_core::tmux::SERVER_MARK_ENV`.
-pub fn ensure_tmux_server(socket: Socket) {
+pub fn ensure_tmux_server(socket: &Socket) {
     let root = local_tmux_root();
-    let socket = SessionTarget::new("", Some(socket))
+    let socket = SessionTarget::new("", Some(socket.clone()))
         .for_profile(root.as_deref())
         .socket
         .unwrap();
     if socket == Socket::Default {
         return;
     }
-    ensure_tmux_server_on(socket, root.as_deref());
+    ensure_tmux_server_on(&socket, root.as_deref());
 }
 
 /// [`ensure_tmux_server`] on `socket`, for the profile rooted at `root`.
-fn ensure_tmux_server_on(socket: Socket, root: Option<&Path>) {
+fn ensure_tmux_server_on(socket: &Socket, root: Option<&Path>) {
     let mut tmux = tmux_server_command(socket, root);
     default_utf8_locale(&mut tmux);
     let started = tmux
@@ -1457,7 +1457,7 @@ fn ensure_tmux_server_on(socket: Socket, root: Option<&Path>) {
 /// Who started the local server on `socket`, read from the marker that
 /// [`tmux_server_command`] gives a server it starts. Reading it also flags the
 /// marker removed, so no pane inherits it. `None` if tmux couldn't be run.
-fn tmux_server_origin(socket: Socket) -> Option<ServerOrigin> {
+fn tmux_server_origin(socket: &Socket) -> Option<ServerOrigin> {
     let out = tmux_on(socket)
         .args(muxel_core::tmux::server_origin_args())
         .stdin(std::process::Stdio::null())
@@ -1485,7 +1485,7 @@ fn command_environment(cmd: &Command) -> Vec<(OsString, OsString)> {
 /// muxel would have started it with (`wanted`), and mark it as muxel's either way,
 /// so this happens once per server. Blocking, best-effort, and logged. See
 /// `muxel_core::tmux::reseed_environment_script`.
-fn reseed_tmux_server(socket: Socket, wanted: &[(OsString, OsString)]) {
+fn reseed_tmux_server(socket: &Socket, wanted: &[(OsString, OsString)]) {
     let Ok(out) = tmux_on(socket)
         .args(["show-environment", "-g"])
         .stdin(std::process::Stdio::null())
@@ -1503,7 +1503,7 @@ fn reseed_tmux_server(socket: Socket, wanted: &[(OsString, OsString)]) {
         .map(|(name, value)| (name.as_encoded_bytes(), value.as_encoded_bytes()))
         .collect();
     let script = muxel_core::tmux::reseed_environment_script(&current, &wanted);
-    let server = String::from(socket);
+    let server = socket.name();
     if tmux_source_stdin(socket, &script) {
         let removed: Vec<_> = muxel_core::tmux::environment_extras(&current, &wanted)
             .into_iter()
@@ -1534,7 +1534,7 @@ fn reseed_tmux_server(socket: Socket, wanted: &[(OsString, OsString)]) {
 
 /// Run `script` on the local server on `socket` through `tmux source-file -`, so
 /// nothing in it lands in a command line. Whether tmux ran it.
-fn tmux_source_stdin(socket: Socket, script: &str) -> bool {
+fn tmux_source_stdin(socket: &Socket, script: &str) -> bool {
     use std::io::Write as _;
     let Ok(mut child) = tmux_on(socket)
         .args(["source-file", "-"])
@@ -1554,8 +1554,8 @@ fn tmux_source_stdin(socket: Socket, script: &str) -> bool {
     child.wait().is_ok_and(|status| status.success()) && written
 }
 
-fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
-    let socket = SessionTarget::new("", Some(socket))
+fn tmux_server_command(socket: &Socket, root: Option<&Path>) -> Command {
+    let socket = SessionTarget::new("", Some(socket.clone()))
         .for_profile(root)
         .socket
         .unwrap();
@@ -1582,7 +1582,7 @@ mod tmux_server_environment_tests {
     fn isolated_startup_uses_its_socket_without_seeding_profile_environment() {
         for isolated in [false, true] {
             let root = isolated.then_some(std::path::Path::new("/isolated"));
-            let command = tmux_server_command(muxel_core::tmux::Socket::Private, root);
+            let command = tmux_server_command(&muxel_core::tmux::Socket::Private, root);
             let args: Vec<_> = command.get_args().collect();
             let prefix = muxel_core::tmux::Socket::local(root)[0].args();
             assert_eq!(args[..2], prefix.iter().map(OsStr::new).collect::<Vec<_>>());
@@ -1618,7 +1618,7 @@ mod tmux_server_origin_tests {
         }
 
         fn global(&self, name: &str) -> String {
-            let out = tmux_on(self.0)
+            let out = tmux_on(&self.0)
                 .args(["show-environment", "-g", name])
                 .output()
                 .unwrap();
@@ -1630,7 +1630,7 @@ mod tmux_server_origin_tests {
             let file = std::env::temp_dir().join(format!("muxel-tmux-{}", uuid::Uuid::new_v4()));
             let done = file.with_extension("done");
             let script = r#"eval "test \${$1+set}" && eval "printf %s \"\$$1\"" > "$2"; : > "$3""#;
-            let status = tmux_on(self.0)
+            let status = tmux_on(&self.0)
                 .args(["new-session", "-d", "--", "sh", "-c", script, "sh", name])
                 .arg(&file)
                 .arg(&done)
@@ -1651,7 +1651,7 @@ mod tmux_server_origin_tests {
 
     impl Drop for Server {
         fn drop(&mut self) {
-            let _ = tmux_on(self.0).arg("kill-server").output();
+            let _ = tmux_on(&self.0).arg("kill-server").output();
         }
     }
 
@@ -1659,7 +1659,7 @@ mod tmux_server_origin_tests {
     #[ignore = "requires tmux 3.1 or newer"]
     fn a_server_muxel_starts_is_marked_without_panes_seeing_the_marker() {
         let server = Server::new();
-        ensure_tmux_server_on(server.0, None);
+        ensure_tmux_server_on(&server.0, None);
         assert_eq!(
             server.global(SERVER_MARK_ENV),
             format!("-{SERVER_MARK_ENV}")
@@ -1675,7 +1675,7 @@ mod tmux_server_origin_tests {
         let server = Server::new();
         let home = std::env::var("HOME").unwrap();
         // What a pane that kills the server and runs `tmux new-session` leaves.
-        let started = tmux_on(server.0)
+        let started = tmux_on(&server.0)
             .args(muxel_core::tmux::start_server_args())
             .env("HOME", "/nonexistent")
             .env("MUXEL_TEST_LEFTOVER", "1")
@@ -1684,7 +1684,7 @@ mod tmux_server_origin_tests {
         assert!(started.success());
         assert_eq!(server.pane_sees("HOME").as_deref(), Some("/nonexistent"));
 
-        ensure_tmux_server_on(server.0, None);
+        ensure_tmux_server_on(&server.0, None);
         assert_eq!(server.pane_sees("HOME"), Some(home));
         assert_eq!(server.pane_sees("MUXEL_TEST_LEFTOVER"), None);
         assert_eq!(
@@ -1702,7 +1702,7 @@ mod tmux_server_origin_tests {
     #[ignore = "requires tmux 3.1 or newer"]
     fn values_reach_panes_byte_for_byte() {
         let server = Server::new();
-        ensure_tmux_server_on(server.0, None);
+        ensure_tmux_server_on(&server.0, None);
         let value = " $HOME ${HOME} ~ \"q\" 'q' \\ ; \\; #{pid} %if {} -x\nline\ttab é ";
         let script = muxel_core::tmux::reseed_environment_script(
             &[],
@@ -1711,7 +1711,7 @@ mod tmux_server_origin_tests {
                 (b"MUXEL_TEST_EMPTY", b""),
             ],
         );
-        assert!(tmux_source_stdin(server.0, &script));
+        assert!(tmux_source_stdin(&server.0, &script));
         assert_eq!(server.pane_sees("MUXEL_TEST_VALUE").as_deref(), Some(value));
         assert_eq!(server.pane_sees("MUXEL_TEST_EMPTY").as_deref(), Some(""));
     }
@@ -1769,7 +1769,7 @@ fn cached_tmux_session_env_support(
 ///
 /// Only this profile's own server: the default one is the user's.
 pub fn restore_tmux_exit_empty() {
-    let _ = tmux_on(local_tmux_sockets()[0])
+    let _ = tmux_on(&local_tmux_sockets()[0])
         .args(muxel_core::tmux::restore_exit_empty_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1779,9 +1779,9 @@ pub fn restore_tmux_exit_empty() {
 
 /// `tmux` on `socket` — muxel's own server, or the default one (see
 /// `muxel_core::tmux::Socket`).
-fn tmux_on(socket: Socket) -> Command {
+fn tmux_on(socket: impl std::borrow::Borrow<Socket>) -> Command {
     let mut cmd = command("tmux");
-    cmd.args(socket.args());
+    cmd.args(socket.borrow().args());
     cmd
 }
 
@@ -1791,7 +1791,7 @@ fn local_tmux_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn local_tmux_sockets() -> Vec<Socket> {
+pub(crate) fn local_tmux_sockets() -> Vec<Socket> {
     Socket::local(local_tmux_root().as_deref())
 }
 
@@ -1826,7 +1826,213 @@ pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
     let session = profile_tmux_target(session);
     session
         .socket
+        .clone()
         .unwrap_or_else(|| Socket::locate(|socket| local_tmux_has_session(socket, &session.name)))
+}
+
+/// Resolve legacy metadata without treating a failed probe as an empty server.
+pub fn resolve_local_tmux_owner(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    let socket = match &session.socket {
+        Some(socket) => socket.clone(),
+        None => Socket::try_locate(|socket| {
+            local_tmux_has_session_confirmed(&socket, &session.name, deadline)
+        })?,
+    };
+    Ok(SessionTarget::new(session.name.clone(), Some(socket)))
+}
+
+/// The launch target may move off Default only after both exact-name probes
+/// answer. A Private namesake belongs to somebody else and is never adopted.
+pub fn local_tmux_launch_target(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let resolved = resolve_local_tmux_owner(session, deadline)?;
+    confirmed_tmux_respawn_target(&resolved, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
+}
+
+pub(crate) fn confirmed_tmux_respawn_target(
+    session: &SessionTarget,
+    probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    session.for_respawn(probe)?.with_context(|| {
+        t("That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives.")
+    })
+}
+
+fn local_tmux_has_session_confirmed(
+    socket: &Socket,
+    session: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let mut cmd = tmux_on(socket.clone());
+    cmd.args(muxel_core::tmux::has_session_args(session));
+    let out = run_tmux_output_until(cmd, deadline)?;
+    confirmed_tmux_has_session_output(&out, session)
+}
+
+fn confirmed_tmux_has_session_output(out: &std::process::Output, session: &str) -> Result<bool> {
+    if out.status.success() {
+        return Ok(true);
+    }
+    let error = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(1)
+        && (confirmed_tmux_missing_session_error(&error, session)
+            || muxel_core::tmux::confirmed_no_server(&error))
+    {
+        return Ok(false);
+    }
+    bail!("couldn't query tmux session “{session}”: {}", error.trim())
+}
+
+fn confirmed_tmux_missing_session_error(error: &str, session: &str) -> bool {
+    let line = error
+        .strip_suffix("\r\n")
+        .or_else(|| error.strip_suffix('\n'))
+        .unwrap_or(error);
+    line == format!("can't find session: {session}")
+}
+
+/// Collect a bounded command reply within one deadline, killing and reaping an
+/// overdue child. Both pipes drain concurrently; oversized replies fail closed.
+fn run_tmux_output_until(cmd: Command, deadline: Instant) -> Result<std::process::Output> {
+    run_tmux_output_with(cmd, deadline, &GitEnv::production())
+}
+
+fn run_tmux_output_with(
+    mut cmd: Command,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    fn capture(
+        pipe: impl Read + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            const MAX_REPLY: u64 = 1024 * 1024;
+            let mut bytes = Vec::new();
+            let reply = pipe
+                .take(MAX_REPLY + 1)
+                .read_to_end(&mut bytes)
+                .and_then(|_| {
+                    if bytes.len() as u64 > MAX_REPLY {
+                        Err(std::io::Error::other("tmux probe reply is too large"))
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = tx.send(reply);
+        });
+        rx
+    }
+    if Instant::now() >= deadline {
+        bail!("tmux probe timed out");
+    }
+    cmd.env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = lifecycle.spawn(&mut cmd).context("starting tmux probe")?;
+    let stdout = capture(child.child.stdout.take().context("tmux probe stdout")?);
+    let stderr = capture(child.child.stderr.take().context("tmux probe stderr")?);
+    let (child, status) = lifecycle.wait_until(child, deadline);
+    lifecycle.reap(child);
+    let status = status.context("tmux probe timed out")?;
+    let stdout = stdout.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+    let stderr = stderr.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// A live Default owner reattaches after one exact-name probe. Migration from an
+/// absent Default owner needs complete answers from both servers; partial output
+/// or an inaccessible server cannot authorize moving to another socket.
+pub fn remote_tmux_launch_target(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    instance: uuid::Uuid,
+    require_absent: bool,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let RepoLoc::Remote(conn) = loc else {
+        bail!("not a remote project")
+    };
+    let (session, sockets) = tmux_launch_inventory(session, local_tmux_root().as_deref());
+    if session.socket == Some(Socket::Default) {
+        let exact = format!(
+            "export LC_ALL=C; {}",
+            ssh::session_tmux_command(&session, &muxel_core::tmux::has_session_args(&session.name),)
+        );
+        let out = run_tmux_output_until(remote_ssh_command(conn, exact), deadline)?;
+        if confirmed_tmux_has_session_output(&out, &session.name)? {
+            if require_absent {
+                bail!("tmux session “{session}” is still running");
+            }
+            return Ok(session);
+        }
+    }
+    let cmd = remote_ssh_command(
+        conn,
+        format!(
+            "export LC_ALL=C; {}",
+            ssh::list_session_names_command_on(&sockets)
+        ),
+    );
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out));
+    }
+    let sessions = ssh::parse_session_listings_for_migration_on(
+        &String::from_utf8_lossy(&out.stdout),
+        &sockets,
+    )
+    .context("couldn't confirm the tmux servers queried")?;
+    let resolved = muxel_core::tmux::ClosedSession {
+        name: session.name.clone(),
+        socket: session.socket.clone(),
+        instance,
+    }
+    .resolve_owner(&sessions, profile_tmux_socket())
+    .target();
+    if require_absent
+        && sessions
+            .iter()
+            .any(|row| Some(&row.socket) == session.socket.as_ref() && row.name == resolved.name)
+    {
+        bail!("tmux session “{session}” is still running");
+    }
+    confirmed_tmux_respawn_target(&resolved, |socket| {
+        Ok(sessions
+            .iter()
+            .any(|row| &row.socket == socket && row.name == resolved.name))
+    })
+}
+
+fn tmux_launch_inventory(
+    session: &SessionTarget,
+    root: Option<&Path>,
+) -> (SessionTarget, Vec<Socket>) {
+    let session = session.for_profile(root);
+    let sockets = match &session.socket {
+        Some(Socket::Named(_) | Socket::Isolated(_)) => session.socket.as_slice().to_vec(),
+        _ => Socket::local(root),
+    };
+    (session, sockets)
 }
 
 /// Whether a tmux session is still alive, on this profile's servers (exact-match target,
@@ -1834,8 +2040,8 @@ pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
 /// a pane that just died.
 pub fn tmux_session_exists(session: &SessionTarget) -> bool {
     let session = profile_tmux_target(session);
-    match session.socket {
-        Some(socket) => local_tmux_has_session(socket, &session.name),
+    match &session.socket {
+        Some(socket) => local_tmux_has_session(socket.clone(), &session.name),
         None => Socket::BOTH
             .into_iter()
             .any(|socket| local_tmux_has_session(socket, &session.name)),
@@ -2036,8 +2242,8 @@ fn bounded_tmux_socket(
     lifecycle: &GitEnv,
     mut probe: impl FnMut(Socket) -> Command,
 ) -> Result<Socket> {
-    if let Some(socket) = session.socket {
-        return Ok(socket);
+    if let Some(socket) = &session.socket {
+        return Ok(socket.clone());
     }
     Socket::try_locate(|socket| {
         let status = run_tmux_until(probe(socket), deadline, lifecycle)?
@@ -2083,6 +2289,104 @@ pub fn kill_tmux_session(session: &SessionTarget) {
         .output();
 }
 
+/// Restart requires a confirmed teardown; a failed kill must never turn into a
+/// silent create-or-attach of the old process.
+pub fn kill_tmux_session_confirmed(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    kill_tmux_session_confirmed_on(&session, deadline)
+}
+
+/// Restart an already-profiled target. Keeping this separate lets tests use a
+/// throwaway Named socket even when the test process inherited a profile root.
+fn kill_tmux_session_confirmed_on(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let socket = session
+        .socket
+        .as_ref()
+        .context("resolve the tmux owner before restart")?;
+    if *socket == Socket::Default {
+        match local_tmux_has_session_confirmed(&Socket::Private, &session.name, deadline) {
+            Ok(true) => bail!(
+                "{}",
+                t(
+                    "That session name is in use on another tmux server. Open this project on the device that moved its session to the sync layout; this pane will attach when the new owner arrives."
+                )
+            ),
+            Ok(false) => {}
+            Err(error) if tmux_command_spawn_failed(&error) => return Ok(session.clone()),
+            Err(error) => return Err(error),
+        }
+    }
+    let mut cmd = tmux_on(socket.clone());
+    cmd.args(muxel_core::tmux::kill_session_args(&session.name));
+    match run_tmux_until(cmd, deadline, &GitEnv::production()) {
+        Ok(Some(_)) => {}
+        Ok(None) => bail!("tmux restart timed out"),
+        Err(error) if tmux_command_spawn_failed(&error) => return Ok(session.clone()),
+        Err(error) => return Err(error),
+    }
+    if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+        bail!("tmux session “{session}” is still running");
+    }
+    confirmed_tmux_respawn_target(session, |other| {
+        if other == socket {
+            Ok(false) // The owned session was just confirmed gone.
+        } else {
+            local_tmux_has_session_confirmed(other, &session.name, deadline)
+        }
+    })
+}
+
+pub(crate) fn tmux_command_spawn_failed(error: &anyhow::Error) -> bool {
+    error.root_cause().is::<std::io::Error>() && error.to_string().starts_with("starting tmux ")
+}
+
+pub fn restart_remote_tmux(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    instance: uuid::Uuid,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let RepoLoc::Remote(conn) = loc else {
+        bail!("not a remote project")
+    };
+    let session = profile_tmux_target(session);
+    if session.socket.is_none() {
+        bail!("resolve and save the tmux owner before restart")
+    }
+    let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out))
+    }
+    if session.socket == Some(Socket::Default) {
+        remote_tmux_launch_target(loc, &session, instance, true, deadline)
+    } else {
+        let command = format!(
+            "export LC_ALL=C; {}",
+            ssh::list_session_names_command_on(session.socket.as_slice())
+        );
+        let out = run_tmux_output_until(remote_ssh_command(conn, command), deadline)?;
+        if !out.status.success() {
+            bail!("{}", ssh_error_message(&out))
+        }
+        let rows = ssh::parse_session_listings_for_migration_on(
+            &String::from_utf8_lossy(&out.stdout),
+            session.socket.as_slice(),
+        )
+        .context("couldn't confirm the tmux session's owner")?;
+        if rows.iter().any(|row| row.name == session.name) {
+            bail!("tmux session “{session}” is still running");
+        }
+        Ok(session.clone())
+    }
+}
+
 /// Resolve a legacy close without mutating either server. The caller must save
 /// this owner before its first kill and retain it across failures and retries.
 pub fn resolve_remote_tmux_close(
@@ -2097,14 +2401,19 @@ pub fn resolve_remote_tmux_close(
         return Ok(closed);
     }
     let sockets = local_tmux_sockets();
-    let out = ssh_run(
-        host,
-        control_path,
-        password,
-        &ssh::list_sessions_command_on(&sockets),
-    )?;
-    let sessions = ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
-        .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
+    let command = format!(
+        "export LC_ALL=C; {}",
+        ssh::list_session_names_command_on(&sockets)
+    );
+    let out = ssh_run(host, control_path, password, &command)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out))
+    }
+    let sessions = ssh::parse_session_listings_for_migration_on(
+        &String::from_utf8_lossy(&out.stdout),
+        &sockets,
+    )
+    .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
     Ok(closed.resolve_owner(&sessions, profile_tmux_socket()))
 }
 
@@ -2206,7 +2515,7 @@ pub fn kill_remote_tmux_detached(
 /// Fire-and-forget kill of a local tmux session on its owner (quit-time cleanup).
 pub fn kill_local_tmux_detached(session: &SessionTarget) {
     let session = profile_tmux_target(session);
-    let mut cmd = match session.socket {
+    let mut cmd = match &session.socket {
         Some(socket) => {
             let mut cmd = tmux_on(socket);
             cmd.args(muxel_core::tmux::kill_session_args(&session.name));
@@ -3122,6 +3431,126 @@ fn clear_read_only(path: &Path) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_tmux_session_error_preserves_name_whitespace() {
+        assert!(confirmed_tmux_missing_session_error(
+            "can't find session: target \n",
+            "target "
+        ));
+        assert!(confirmed_tmux_missing_session_error(
+            "can't find session: target \r\n",
+            "target "
+        ));
+        assert!(!confirmed_tmux_missing_session_error(
+            "can't find session: target\n",
+            "target "
+        ));
+        assert!(!confirmed_tmux_missing_session_error(
+            "can't find session: target \n\n",
+            "target "
+        ));
+    }
+
+    #[test]
+    fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {
+        let root = Path::new("/isolated-migration");
+        let isolated = Socket::isolated(root);
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+            Some(Socket::Named("peer '名".into())),
+        ] {
+            let saved = SessionTarget::new("exact name ", prior);
+            let (target, sockets) = tmux_launch_inventory(&saved, Some(root));
+            assert_eq!(target.name, saved.name);
+            assert_eq!(target.socket, Some(isolated.clone()));
+            assert_eq!(sockets, std::slice::from_ref(&isolated));
+            assert_eq!(
+                confirmed_tmux_respawn_target(&target, |_| panic!("global migration probe"))
+                    .unwrap(),
+                target
+            );
+            let reply = "exact name \n:muxel-listed:0\n";
+            let rows = ssh::parse_session_listings_for_migration_on(reply, &sockets).unwrap();
+            assert_eq!(rows[0].target(), target);
+            assert!(ssh::parse_session_listings_for_migration_on(reply, &Socket::BOTH).is_none());
+        }
+        let named = SessionTarget::new("work", Some(Socket::Named("peer '名".into())));
+        let (target, sockets) = tmux_launch_inventory(&named, None);
+        assert_eq!(target, named);
+        assert_eq!(sockets, named.socket.as_slice());
+        for owner in [None, Some(Socket::Private), Some(Socket::Default)] {
+            let saved = SessionTarget::new("work", owner);
+            assert_eq!(
+                tmux_launch_inventory(&saved, None),
+                (saved, Socket::BOTH.to_vec())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_local_tmux_probes_and_kill_use_exact_names() {
+        use std::io::ErrorKind;
+
+        match command("tmux").arg("-V").output() {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                eprintln!("skipping real tmux test: tmux is not installed");
+                return;
+            }
+            Err(error) => panic!("couldn't check tmux: {error}"),
+            Ok(output) => assert!(output.status.success(), "tmux -V: {output:?}"),
+        }
+
+        struct TestServer(Socket);
+        impl Drop for TestServer {
+            fn drop(&mut self) {
+                let _ = tmux_on(&self.0).arg("kill-server").output();
+            }
+        }
+
+        let server = TestServer(Socket::Named(format!("mxl-test-{}", uuid::Uuid::new_v4())));
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target", deadline()).unwrap());
+
+        let created = tmux_on(&server.0)
+            .args(["new-session", "-d", "-s", "target2"])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "new-session: {created:?}");
+        assert!(local_tmux_has_session_confirmed(&server.0, "target2", deadline()).unwrap());
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target", deadline()).unwrap());
+
+        let missing = tmux_on(&server.0)
+            .args(muxel_core::tmux::has_session_args("target"))
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&missing.stderr).trim(),
+            "can't find session: target"
+        );
+        assert!(!confirmed_tmux_has_session_output(&missing, "target").unwrap());
+        assert!(confirmed_tmux_has_session_output(&missing, "other").is_err());
+
+        let missing_spaced = tmux_on(&server.0)
+            .args(muxel_core::tmux::has_session_args("target "))
+            .output()
+            .unwrap();
+        assert_eq!(missing_spaced.status.code(), Some(1), "{missing_spaced:?}");
+        assert_eq!(missing_spaced.stderr, b"can't find session: target \n");
+        assert!(!confirmed_tmux_has_session_output(&missing_spaced, "target ").unwrap());
+
+        let target = SessionTarget::new("target2", Some(server.0.clone()));
+        assert_eq!(
+            kill_tmux_session_confirmed_on(&target, deadline()).unwrap(),
+            target
+        );
+        assert!(!local_tmux_has_session_confirmed(&server.0, "target2", deadline()).unwrap());
+    }
+
     fn hanging_tmux_command() -> Command {
         if cfg!(windows) {
             let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
@@ -3161,6 +3590,28 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    #[test]
+    fn migration_probe_timeout_reaps_the_child_and_does_not_authorize_absence() {
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let error = run_tmux_output_with(
+            hanging_tmux_command(),
+            started + Duration::from_millis(50),
+            &lifecycle,
+        )
+        .expect_err("a hung query cannot confirm an empty server");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    #[test]
+    fn migration_probe_expired_deadline_does_not_spawn() {
+        let lifecycle = GitEnv::for_tests();
+        assert!(run_tmux_output_with(hanging_tmux_command(), Instant::now(), &lifecycle).is_err());
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 0);
     }
 
     #[test]

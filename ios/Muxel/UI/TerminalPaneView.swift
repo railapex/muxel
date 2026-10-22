@@ -151,7 +151,8 @@ struct TerminalPaneView: View {
 
     /// Reuse the instance's already-live terminal if the store still holds one
     /// (navigation keeps it connected); otherwise decide the PTY command — attach to a
-    /// live tmux session (matched by uuid8 suffix), or create-and-attach one running
+    /// live tmux session (exact recorded name on Default, otherwise uuid8 suffix),
+    /// or create-and-attach one running
     /// the instance's program — and start a session in the store. Returns whether a
     /// live session is now in hand. `announce` surfaces the error (banner / host-key
     /// prompt) on the first/manual attempt but stays quiet during silent backoff.
@@ -167,9 +168,24 @@ struct TerminalPaneView: View {
         do {
             let conn = state.connection(for: host)
             try await conn.connect()
-            guard let plan = try await state.prepareTmuxAttachment(instanceId: instance.id, in: project, prepare: { current in
-                let targets = TmuxCommands.parseTargets(try await conn.run(
-                    TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+            guard let plan = try await state.prepareTmuxAttachmentPlan(instanceId: instance.id, in: project, prepare: { current in
+                let targets: [TmuxCommands.SessionTarget]
+                if current.tmuxSocket == "default" {
+                    // A recorded Default session can still be attached without a
+                    // complete reply from the other server. Only a missing session
+                    // needs the strict inventory before migrating its owner.
+                    let defaultTargets = TmuxCommands.parseTargets(try await conn.run(
+                        TmuxCommands.listTargetsCommand(socket: "default")))
+                    if TmuxCommands.recordedDefaultTarget(current, in: defaultTargets) != nil {
+                        targets = defaultTargets
+                    } else {
+                        targets = try TmuxCommands.parseConfirmedTargets(try await conn.run(
+                            TmuxCommands.confirmedTargetsCommand()))
+                    }
+                } else {
+                    targets = TmuxCommands.parseTargets(try await conn.run(
+                        TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+                }
                 let command: String
                 let sessionName: String
                 let socket: String
@@ -178,7 +194,11 @@ struct TerminalPaneView: View {
                 var startupDelayMs = 0
                 var startupSubmit = false
                 var resumeSessionId: String?
-                if let live = TmuxCommands.resolveTarget(current, in: targets) {
+                var migration: TmuxCommands.DefaultMigration?
+                let live = current.tmuxSocket == "default"
+                    ? TmuxCommands.recordedDefaultTarget(current, in: targets)
+                    : TmuxCommands.resolveTarget(current, in: targets)
+                if let live {
                     // A live session for this instance already exists (created by desktop or
                     // a prior attach) — attach to its real name, whatever slug it carries.
                     sessionName = live.name
@@ -189,11 +209,13 @@ struct TerminalPaneView: View {
                     // layout (`tmux_session`) so we converge with the name desktop uses for
                     // this instance; fall back to deriving one from the host name.
                     creating = true
-                    socket = current.tmuxSocket ?? TmuxCommands.socketName
                     let name = (current.tmuxSession?.isEmpty == false)
                         ? current.tmuxSession!
                         : TmuxSession.name(hostName: host.name, instanceId: current.id)
                     sessionName = name
+                    let prepared = try TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
+                    socket = prepared.target.socket
+                    migration = prepared.migration
 
                     // Resolve program/args like desktop: model/effort/extra are already in
                     // `args`; apply the system-prompt injection + prepend session-resume args.
@@ -213,11 +235,12 @@ struct TerminalPaneView: View {
                     startupSubmit = resolved.submit
                     if resumeCapable { resumeSessionId = inst.sessionId }
                 }
-                return (target: .init(name: sessionName, socket: socket),
+                return TmuxAttachmentPlan(target: .init(name: sessionName, socket: socket),
                         attachment: AttachmentPlan(command: command, sessionName: sessionName, socket: socket,
                                                    creating: creating, startupInput: startupInput,
                                                    startupDelayMs: startupDelayMs, startupSubmit: startupSubmit,
-                                                   resumeSessionId: resumeSessionId))
+                                                   resumeSessionId: resumeSessionId),
+                                          defaultMigration: migration)
             }) else { return false }
             guard !Task.isCancelled, state.selectedProject?.id == project.id,
                   let accepted = state.layout?.instances.first(where: { $0.id == instance.id }),

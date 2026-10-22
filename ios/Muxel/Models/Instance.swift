@@ -153,6 +153,10 @@ struct Instance: Codable, Equatable, Identifiable {
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
         tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket)
+        if let tmuxSocket, tmuxSocket.isEmpty || tmuxSocket.contains("/") || tmuxSocket.contains("\\") {
+            throw DecodingError.dataCorruptedError(forKey: .tmuxSocket, in: c,
+                                                   debugDescription: "Invalid tmux socket name")
+        }
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0
