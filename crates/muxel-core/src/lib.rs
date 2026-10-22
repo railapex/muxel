@@ -34,11 +34,12 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
-    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
+    ACCOMPLISHMENTS_FILE, AgentPreset, CodexHintMiss, CodexResumePath, CodexSession,
+    CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
+    accomplishments_header, accomplishments_instruction, append_agent_instruction,
     claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
-    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
+    codex_latest_session_id, codex_restore_scan, codex_resume_path, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
     codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
     memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
@@ -579,6 +580,9 @@ pub struct Instance {
     /// on restart. `None` until first launch / for agents without resume support.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Validated provider transcript/rollout path for the saved session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<PathBuf>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
@@ -616,6 +620,7 @@ impl Instance {
     /// A duplicated pane copies launch settings, not the source conversation.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
+        self.session_path = None;
         self.session_started = false;
         self.auto_name = None;
     }
@@ -667,6 +672,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -729,6 +735,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -1412,6 +1419,7 @@ impl RemoteLayout {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
                     instance.session_id = None;
+                    instance.session_path = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
                 }
@@ -1497,8 +1505,8 @@ pub fn push_overwrites_peer(
 /// A peer layout's instances as this machine should hold them: every one the peer
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
-/// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content.
+/// program-supplied title, terminal grid, agent activity and rollout path),
+/// which is per-machine and never part of the shared content.
 pub fn merge_peer_instances(
     local: &[Instance],
     peer: Vec<Instance>,
@@ -1507,10 +1515,17 @@ pub fn merge_peer_instances(
     peer.into_iter()
         .map(|mut instance| {
             instance.project_id = project_id;
+            // A peer's filesystem path is never evidence for this machine.
+            instance.session_path = None;
             if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
                 instance.auto_name = mine.auto_name.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                // A rollout path belongs to this machine, even when a peer
+                // supplied another path for the same conversation.
+                if instance.session_id.is_some() && instance.session_id == mine.session_id {
+                    instance.session_path = mine.session_path.clone();
+                }
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()
@@ -3488,6 +3503,8 @@ mod remote_layout_tests {
         kept.grid = Some((100, 30));
         kept.auto_name = Some("Fixing tests".into());
         kept.activity.last_state = Some(AgentActivityState::Working);
+        kept.session_id = Some(Uuid::new_v4().to_string());
+        kept.session_path = Some(PathBuf::from("/local/rollout.jsonl"));
         let closed = Instance::shell(local_pid);
 
         let peer_pid = Uuid::new_v4();
@@ -3496,9 +3513,11 @@ mod remote_layout_tests {
         peer_kept.grid = Some((40, 20));
         peer_kept.auto_name = None;
         peer_kept.activity = AgentActivity::default();
+        peer_kept.session_path = Some(PathBuf::from("/peer/rollout.jsonl"));
         peer_kept.custom_name = Some("Reviewer".into());
         let mut added = Instance::shell(peer_pid);
         added.tmux_session = Some("muxel_proj_12345678".into());
+        added.session_path = Some(PathBuf::from("/peer/other-rollout.jsonl"));
 
         let merged = merge_peer_instances(
             &[kept.clone(), closed.clone()],
@@ -3515,9 +3534,20 @@ mod remote_layout_tests {
         assert_eq!(k.grid, Some((100, 30))); // per-machine: ours
         assert_eq!(k.auto_name.as_deref(), Some("Fixing tests"));
         assert_eq!(k.activity.last_state, Some(AgentActivityState::Working));
+        assert_eq!(k.session_path, kept.session_path);
+
+        let mut changed_id = kept.clone();
+        changed_id.session_path = None;
+        changed_id.session_id = Some(Uuid::new_v4().to_string());
+        assert!(
+            merge_peer_instances(&[kept.clone()], vec![changed_id], local_pid)[0]
+                .session_path
+                .is_none()
+        );
 
         let a = merged.iter().find(|i| i.id == added.id).unwrap();
         assert_eq!(a.tmux_session, added.tmux_session);
+        assert!(a.session_path.is_none());
     }
 
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only

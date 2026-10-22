@@ -70,6 +70,7 @@ final class InteropTests: XCTestCase {
     func testDuplicateResetClearsConversationStateAndAutoName() {
         var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
         instance.sessionId = "session"
+        instance.sessionPath = "/local/rollout.jsonl"
         instance.sessionStarted = true
         instance.autoName = "Generated title"
         instance.customName = "Manual title"
@@ -77,6 +78,7 @@ final class InteropTests: XCTestCase {
         instance.resetConversationForDuplicate()
 
         XCTAssertNil(instance.sessionId)
+        XCTAssertNil(instance.sessionPath)
         XCTAssertFalse(instance.sessionStarted)
         XCTAssertNil(instance.autoName)
         XCTAssertEqual(instance.customName, "Manual title")
@@ -165,6 +167,20 @@ final class InteropTests: XCTestCase {
         let bback = try MuxelJSON.decoder.decode(Instance.self, from: bdata)
         XCTAssertEqual(bback.kind, .browser)
         XCTAssertEqual(bback.browserUrl, "https://example.com")
+    }
+
+    func testCodexSessionPathSurvivesLayoutWriteBack() throws {
+        let json = """
+        { "id": "aaaaaaaa-0000-0000-0000-000000000000", "project_id": "p",
+          "title": "Codex", "session_id": "bbbbbbbb-0000-0000-0000-000000000000",
+          "session_path": "/home/me/.codex/sessions/2026/10/22/rollout-bbbb.jsonl",
+          "session_started": true }
+        """
+        let instance = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        let encoded = try MuxelJSON.encoder.encode(instance)
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: encoded)
+        XCTAssertEqual(decoded.sessionPath, instance.sessionPath)
+        XCTAssertEqual(decoded.sessionId, instance.sessionId)
     }
 
     func testOrderedPaneInstancesIncludesEditorAndDiff() throws {
