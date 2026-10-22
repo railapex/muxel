@@ -87,6 +87,8 @@ targets:
     platform: iOS
     sources:
       - path: MuxelTests
+      - path: ../tests/fixtures/tmux-confirmed-status.json
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios.tests
