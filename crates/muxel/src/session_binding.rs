@@ -7,12 +7,15 @@ use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const CLAUDE_BINDING_DIR: &str = "provider-session-bindings/claude";
 const CLAUDE_SETTINGS_DIR: &str = "provider-session-bindings/claude/settings";
 const CLAUDE_HOOK_FLAG: &str = "--claude-session-hook";
 const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024;
+/// The field the hook adds to Claude's event: see [`ClaudeHookStamp`].
+const HOOK_STAMP_FIELD: &str = "muxel_hook";
 pub(crate) const MUXEL_INSTANCE_ID_ENV: &str = muxel_core::control::INSTANCE_ID_ENV;
 
 /// The process muxel starts for a pane, for [`pane_env`].
@@ -135,6 +138,77 @@ pub(crate) fn tmux_pane_args(
     // The same profile values on the client cover user-defined
     // update-environment options during attach. pane_env strips the pane id.
     Ok(LocalTmuxLaunch { args, env })
+}
+
+/// What the hook adds to the record it writes: a nonce naming this write, and
+/// when it ran. A record with a nonce muxel hasn't seen means a SessionStart ran
+/// since the last one, even when it names the conversation already bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeHookStamp {
+    pub nonce: Uuid,
+    pub recorded_at: SystemTime,
+}
+
+/// A pane's binding record, validated, from one read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeBinding {
+    pub session_id: String,
+    pub from_resume: bool,
+    /// `None` for a record written by an older muxel's hook.
+    pub stamp: Option<ClaudeHookStamp>,
+}
+
+/// A stamped nonce identifies a hook invocation. Older hook records have no
+/// nonce, so their exact bytes and preserved file time identify a retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeHookIdentity {
+    Stamped(Uuid),
+    Legacy {
+        modified: Option<SystemTime>,
+        bytes: Vec<u8>,
+    },
+}
+
+pub(crate) fn claude_hook_identity(
+    binding: &ClaudeBinding,
+    modified: Option<SystemTime>,
+    bytes: &[u8],
+) -> ClaudeHookIdentity {
+    binding.stamp.map_or_else(
+        || ClaudeHookIdentity::Legacy {
+            modified,
+            bytes: bytes.to_vec(),
+        },
+        |stamp| ClaudeHookIdentity::Stamped(stamp.nonce),
+    )
+}
+
+/// A new hook invocation is a switch even when its final UUID equals the
+/// bound one: `/resume B` and `/resume A` can happen between discovery reads.
+/// Only a proven startup receipt for this resumed launch confirms its binding.
+pub(crate) fn claude_record_switches(
+    binding: &ClaudeBinding,
+    current: &ClaudeHookIdentity,
+    seen: Option<&ClaudeHookIdentity>,
+    bound: Option<&str>,
+    confirms_launch: bool,
+) -> bool {
+    seen != Some(current)
+        && (bound != Some(binding.session_id.as_str()) || !(seen.is_none() && confirms_launch))
+}
+
+pub(crate) fn claude_receipt_confirms_launch(
+    binding: &ClaudeBinding,
+    receipt_at: Option<SystemTime>,
+    launched_at: SystemTime,
+    resumed: bool,
+    first_submission_at: Option<SystemTime>,
+) -> bool {
+    resumed
+        && binding.from_resume
+        && receipt_at.is_some_and(|at| {
+            at >= launched_at && first_submission_at.is_none_or(|submitted| at < submitted)
+        })
 }
 
 pub(crate) fn hook_instance_from_args(
@@ -293,19 +367,25 @@ fn write_claude_binding_from_reader(
     if input.len() as u64 > MAX_HOOK_INPUT_BYTES {
         bail!("Claude SessionStart input exceeds {MAX_HOOK_INPUT_BYTES} bytes");
     }
-    let event: Value = serde_json::from_str(&input).context("parsing Claude SessionStart input")?;
+    let mut event: Value =
+        serde_json::from_str(&input).context("parsing Claude SessionStart input")?;
     validate_claude_event(&event)?;
+    stamp_claude_event(&mut event, Uuid::new_v4(), SystemTime::now());
 
     let path = claude_binding_path(data_dir, instance_id);
     let parent = path.parent().context("Claude binding path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating Claude binding directory {}", parent.display()))?;
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temp, input.as_bytes())
+    std::fs::write(&temp, event.to_string())
         .with_context(|| format!("writing Claude binding {}", temp.display()))?;
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("replacing Claude binding {}", path.display()))?;
+    // muxel may claim the previous record (rename it away) at any moment.
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error)
+                .with_context(|| format!("replacing Claude binding {}", path.display()));
+        }
+        _ => {}
     }
     std::fs::rename(&temp, &path)
         .with_context(|| format!("installing Claude binding {}", path.display()))?;
@@ -350,14 +430,47 @@ fn validate_claude_event(event: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn claude_session_id_from_binding(
-    data_dir: &Path,
-    instance_id: Uuid,
-    home: &Path,
-) -> Option<String> {
-    let event: Value =
-        serde_json::from_slice(&std::fs::read(claude_binding_path(data_dir, instance_id)).ok()?)
-            .ok()?;
+/// A malformed hook record cannot become valid on retry. Filesystem checks in
+/// `claude_binding_from_record` may fail temporarily, so they stay separate.
+pub(crate) fn claude_record_structurally_valid(record: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(record).is_ok_and(|event| validate_claude_event(&event).is_ok())
+}
+
+fn stamp_claude_event(event: &mut Value, nonce: Uuid, recorded_at: SystemTime) {
+    let micros = recorded_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64);
+    if let Some(event) = event.as_object_mut() {
+        event.insert(
+            HOOK_STAMP_FIELD.to_string(),
+            json!({ "nonce": nonce.to_string(), "recorded_at_us": micros }),
+        );
+    }
+}
+
+fn claude_hook_stamp(event: &Value) -> Option<ClaudeHookStamp> {
+    let stamp = event.get(HOOK_STAMP_FIELD)?;
+    let nonce = Uuid::parse_str(stamp.get("nonce")?.as_str()?).ok()?;
+    let micros = stamp.get("recorded_at_us")?.as_u64()?;
+    Some(ClaudeHookStamp {
+        nonce,
+        recorded_at: SystemTime::UNIX_EPOCH + Duration::from_micros(micros),
+    })
+}
+
+/// The pane's binding record, if one is present and valid.
+#[cfg(test)]
+fn read_claude_binding(data_dir: &Path, instance_id: Uuid, home: &Path) -> Option<ClaudeBinding> {
+    claude_binding_from_record(
+        &std::fs::read(claude_binding_path(data_dir, instance_id)).ok()?,
+        home,
+    )
+}
+
+/// Parse and validate one read of a binding record. The session id, its
+/// transcript and the hook's stamp all come from the same bytes.
+pub(crate) fn claude_binding_from_record(record: &[u8], home: &Path) -> Option<ClaudeBinding> {
+    let event: Value = serde_json::from_slice(record).ok()?;
     validate_claude_event(&event).ok()?;
     let session_id = event.get("session_id")?.as_str()?;
     let source = event.get("source")?.as_str()?;
@@ -382,11 +495,127 @@ pub(crate) fn claude_session_id_from_binding(
                 && matches!(source, "clear" | "fork") => {}
         _ => return None,
     }
-    Some(session_id.to_string())
+    Some(ClaudeBinding {
+        session_id: session_id.to_string(),
+        from_resume: source == "resume",
+        stamp: claude_hook_stamp(&event),
+    })
 }
 
-pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
-    let _ = std::fs::remove_file(claude_binding_path(data_dir, instance_id));
+/// A binding record muxel has claimed: its bytes, read once, and its write
+/// time (an older muxel's hook didn't stamp its record).
+/// Immutable worker input. Reading it does not claim or acknowledge the hook.
+pub(crate) struct ClaudeBindingSnapshot {
+    pub bytes: Vec<u8>,
+    pub modified: Option<SystemTime>,
+}
+
+/// Validate a pending claim before a newer shared hook, without changing either.
+/// Read bytes and modification time from the same open file.
+pub(crate) fn read_pending_claude_binding(
+    data_dir: &Path,
+    instance_id: Uuid,
+) -> Option<ClaudeBindingSnapshot> {
+    let mut file = match std::fs::File::open(claude_claimed_binding_path(data_dir, instance_id)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::File::open(claude_binding_path(data_dir, instance_id)).ok()?
+        }
+        Err(_) => return None,
+    };
+    let modified = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(ClaudeBindingSnapshot { bytes, modified })
+}
+
+pub(crate) struct ClaimedClaudeRecord {
+    path: PathBuf,
+    pub bytes: Vec<u8>,
+    pub modified: Option<SystemTime>,
+}
+
+/// Where a pane's binding record moves while muxel handles it. The hook never
+/// writes this name, so a record it writes meanwhile lands at the shared path.
+fn claude_claimed_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf {
+    data_dir
+        .join(CLAUDE_BINDING_DIR)
+        .join(format!("{instance_id}.claimed.json"))
+}
+
+/// Claim the pane's next binding record: one claimed before whose handling
+/// failed, else the shared record, moved to the claimed name by an atomic
+/// rename. Renaming keeps its write time.
+pub(crate) fn claim_claude_binding(
+    data_dir: &Path,
+    instance_id: Uuid,
+) -> Option<ClaimedClaudeRecord> {
+    try_claim_claude_binding(data_dir, instance_id)
+        .ok()
+        .flatten()
+}
+
+fn try_claim_claude_binding(
+    data_dir: &Path,
+    instance_id: Uuid,
+) -> Result<Option<ClaimedClaudeRecord>> {
+    let path = claude_claimed_binding_path(data_dir, instance_id);
+    if !path.try_exists()? {
+        match std::fs::rename(claude_binding_path(data_dir, instance_id), &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("claim Claude conversation binding"),
+        }
+    }
+    let bytes = std::fs::read(&path).context("read claimed Claude conversation binding")?;
+    let modified = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    Ok(Some(ClaimedClaudeRecord {
+        path,
+        bytes,
+        modified,
+    }))
+}
+
+/// Drain pending records before choosing launch arguments. A failed handler leaves
+/// its claim intact. Once a record has been handled, failed acknowledgement
+/// cannot undo a saved binding; launch may continue if no newer record waits.
+pub(crate) fn recover_claude_bindings_before_resume(
+    data_dir: &Path,
+    instance_id: Uuid,
+    mut adopt: impl FnMut(&ClaimedClaudeRecord) -> Result<()>,
+) -> Result<()> {
+    while let Some(record) = try_claim_claude_binding(data_dir, instance_id)? {
+        adopt(&record)?;
+        if let Err(error) = std::fs::remove_file(&record.path) {
+            log::warn!(
+                "handled Claude conversation hook record could not be acknowledged: {error}"
+            );
+            // The old claim occupies the claim path. A newer hook at the
+            // shared path cannot be consumed until that path is free, so never
+            // choose resume arguments over it.
+            if claude_binding_path(data_dir, instance_id)
+                .try_exists()
+                .context("check for a newer Claude conversation after acknowledgement failure")?
+            {
+                bail!("a newer Claude conversation is pending behind an unacknowledged record");
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Delete a claimed record once it has been handled. Only the claimed file
+/// goes; a record the hook has written since waits for the next claim.
+pub(crate) fn acknowledge_claude_binding(record: ClaimedClaudeRecord) {
+    if let Err(error) = std::fs::remove_file(&record.path) {
+        log::warn!("could not acknowledge Claude conversation hook record: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +627,210 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-claude-binding-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Run the hook as Claude does on `/resume <session_id>` in `cwd`.
+    fn resume_hook(data: &Path, home: &Path, cwd: &Path, instance_id: Uuid, session_id: &str) {
+        let transcript = muxel_core::claude_session_path(home, cwd, session_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let event = json!({
+            "session_id": session_id,
+            "transcript_path": transcript,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+            "source": "resume"
+        });
+        write_claude_binding_from_reader(
+            data,
+            instance_id,
+            std::io::Cursor::new(event.to_string()),
+        )
+        .unwrap();
+    }
+
+    fn claimed_session(record: &ClaimedClaudeRecord, home: &Path) -> String {
+        claude_binding_from_record(&record.bytes, home)
+            .unwrap()
+            .session_id
+    }
+
+    struct PendingResume {
+        root: PathBuf,
+        data: PathBuf,
+        home: PathBuf,
+        workspace_path: PathBuf,
+        instance_id: Uuid,
+        old_id: String,
+        new_id: String,
+    }
+
+    impl PendingResume {
+        fn new() -> Self {
+            let root = temp_dir();
+            let data = root.join("data");
+            let home = root.join("home");
+            let cwd = root.join("project");
+            let mut instance = muxel_core::Instance::from_preset(
+                Uuid::new_v4(),
+                &muxel_core::AgentPreset::claude(),
+            );
+            let instance_id = instance.id;
+            let old_id = Uuid::new_v4().to_string();
+            let new_id = Uuid::new_v4().to_string();
+            instance.session_id = Some(old_id.clone());
+            instance.session_started = true;
+            let mut workspace = muxel_core::Workspace::default();
+            workspace.instances.push(instance);
+            let workspace_path = root.join("workspace.json");
+            muxel_store::save_workspace_to(&workspace_path, &workspace).unwrap();
+            resume_hook(&data, &home, &cwd, instance_id, &old_id);
+            drop(claim_claude_binding(&data, instance_id).unwrap());
+            resume_hook(&data, &home, &cwd, instance_id, &new_id);
+            Self {
+                root,
+                data,
+                home,
+                workspace_path,
+                instance_id,
+                old_id,
+                new_id,
+            }
+        }
+
+        fn workspace(&self) -> muxel_core::Workspace {
+            muxel_store::load_workspace_from(&self.workspace_path).unwrap()
+        }
+
+        fn persist_record(
+            &self,
+            workspace: &mut muxel_core::Workspace,
+            record: &ClaimedClaudeRecord,
+        ) -> Result<()> {
+            let binding = claude_binding_from_record(&record.bytes, &self.home).unwrap();
+            let instance = workspace.instance_mut(self.instance_id).unwrap();
+            instance.session_id = Some(binding.session_id);
+            instance.session_started = true;
+            muxel_store::save_workspace_to(&self.workspace_path, workspace)
+        }
+
+        fn resume_args(&self, workspace: &muxel_core::Workspace) -> Vec<String> {
+            muxel_core::session_resume_args(
+                &muxel_core::AgentPreset::claude(),
+                workspace.instance(self.instance_id).unwrap(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for PendingResume {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn prelaunch_recovery_selects_newer_binding_after_a_claimed_record() {
+        let pending = PendingResume::new();
+        let mut workspace = pending.workspace();
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            pending.persist_record(&mut workspace, record)
+        })
+        .unwrap();
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.new_id.clone()]
+        );
+        assert_eq!(
+            pending.resume_args(&pending.workspace()),
+            pending.resume_args(&workspace)
+        );
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_none());
+    }
+
+    #[test]
+    fn prelaunch_recovery_stops_on_a_partial_persistence_failure() {
+        let pending = PendingResume::new();
+        let mut workspace = pending.workspace();
+        let mut handled = Vec::new();
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                let session = claimed_session(record, &pending.home);
+                handled.push(session.clone());
+                if session == pending.new_id {
+                    bail!("simulated workspace save failure");
+                }
+                pending.persist_record(&mut workspace, record)
+            });
+        assert!(
+            result.is_err(),
+            "failed recovery must prevent launch argument selection"
+        );
+        assert_eq!(
+            handled,
+            vec![pending.old_id.clone(), pending.new_id.clone()]
+        );
+        assert_eq!(
+            pending
+                .workspace()
+                .instance(pending.instance_id)
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(pending.old_id.as_str())
+        );
+        let retry = claim_claude_binding(&pending.data, pending.instance_id).unwrap();
+        assert_eq!(claimed_session(&retry, &pending.home), pending.new_id);
+        drop(retry);
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            pending.persist_record(&mut workspace, record)
+        })
+        .unwrap();
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.new_id.clone()]
+        );
+    }
+
+    #[test]
+    fn prelaunch_recovery_allows_saved_binding_after_acknowledgement_fails_without_newer_record() {
+        let pending = PendingResume::new();
+        // Remove the shared newer hook: only the already-saved claim remains.
+        std::fs::remove_file(claude_binding_path(&pending.data, pending.instance_id)).unwrap();
+        let mut workspace = pending.workspace();
+        let mut handled = 0;
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                handled += 1;
+                pending.persist_record(&mut workspace, record)?;
+                std::fs::remove_file(&record.path)?;
+                std::fs::create_dir(&record.path)?;
+                Ok(())
+            });
+        assert!(result.is_ok());
+        assert_eq!(handled, 1);
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.old_id.clone()]
+        );
+    }
+
+    #[test]
+    fn prelaunch_recovery_refuses_newer_binding_behind_failed_acknowledgement() {
+        let pending = PendingResume::new();
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                std::fs::remove_file(&record.path)?;
+                std::fs::create_dir(&record.path)?;
+                Ok(())
+            });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("newer Claude conversation")
+        );
+        assert!(claude_binding_path(&pending.data, pending.instance_id).exists());
     }
 
     #[test]
@@ -462,7 +895,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home).as_deref(),
+            read_claude_binding(&data, instance_id, &home)
+                .map(|binding| binding.session_id)
+                .as_deref(),
             Some(session_id.as_str())
         );
 
@@ -482,7 +917,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home),
+            read_claude_binding(&data, instance_id, &home).map(|binding| binding.session_id),
             None
         );
 
@@ -494,7 +929,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(&transcript).unwrap();
         assert_eq!(
-            claude_session_id_from_binding(&data, instance_id, &home),
+            read_claude_binding(&data, instance_id, &home).map(|binding| binding.session_id),
             None
         );
 
@@ -513,13 +948,264 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                claude_session_id_from_binding(&data, instance_id, &home).as_deref(),
+                read_claude_binding(&data, instance_id, &home)
+                    .map(|binding| binding.session_id)
+                    .as_deref(),
                 Some(session_id.as_str()),
                 "{source} should bind before Claude writes the first transcript record"
             );
         }
-        clear_claude_binding(&data, instance_id);
+        let record = claim_claude_binding(&data, instance_id).unwrap();
+        acknowledge_claude_binding(record);
         assert!(!claude_binding_path(&data, instance_id).exists());
+        assert!(claim_claude_binding(&data, instance_id).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_to_b_to_a_between_polls_reads_as_a_switch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        let resume = |session_id: &str| resume_hook(&data, &home, &cwd, instance_id, session_id);
+
+        // `claude --resume A` runs the hook as it launches, naming A.
+        let before = SystemTime::now();
+        resume(&a);
+        let first = read_claude_binding(&data, instance_id, &home).unwrap();
+        let stamp = first.stamp.expect("the hook stamps its record");
+        let first_identity = ClaudeHookIdentity::Stamped(stamp.nonce);
+        assert!(before <= stamp.recorded_at && stamp.recorded_at <= SystemTime::now());
+        assert!(!claude_record_switches(
+            &first,
+            &first_identity,
+            None,
+            Some(a.as_str()),
+            true,
+        ));
+
+        // `/resume B` and then `/resume A`, both before muxel's next read.
+        resume(&b);
+        resume(&a);
+        let last = read_claude_binding(&data, instance_id, &home).unwrap();
+        assert_eq!(last.session_id, a);
+        let last_identity = ClaudeHookIdentity::Stamped(last.stamp.unwrap().nonce);
+        assert!(
+            claude_record_switches(
+                &last,
+                &last_identity,
+                Some(&first_identity),
+                Some(a.as_str()),
+                true,
+            ),
+            "a record muxel hasn't seen is a switch, whatever it names"
+        );
+        // The same record read again, because removing it failed, is not.
+        assert!(!claude_record_switches(
+            &last,
+            &last_identity,
+            Some(&last_identity),
+            Some(a.as_str()),
+            false,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_launch_a_to_b_to_a_without_startup_receipt_is_a_switch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+
+        // `claude --session-id A` has no SessionStart receipt. Both later
+        // resumes can overwrite the shared hook file before discovery polls.
+        resume_hook(&data, &home, &cwd, instance_id, &b);
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let last = read_claude_binding(&data, instance_id, &home).unwrap();
+        assert_eq!(last.session_id, a);
+        let current = ClaudeHookIdentity::Stamped(last.stamp.unwrap().nonce);
+        assert!(!claude_receipt_confirms_launch(
+            &last,
+            last.stamp.map(|stamp| stamp.recorded_at),
+            SystemTime::now() - Duration::from_secs(1),
+            false,
+            None,
+        ));
+        assert!(claude_record_switches(
+            &last,
+            &current,
+            None,
+            Some(a.as_str()),
+            false,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_pre_submission_resume_receipt_confirms_the_resumed_launch() {
+        let launched_at = SystemTime::now();
+        let receipt_at = launched_at + Duration::from_millis(10);
+        let submitted_at = receipt_at + Duration::from_millis(10);
+        let binding = ClaudeBinding {
+            session_id: Uuid::new_v4().to_string(),
+            from_resume: true,
+            stamp: Some(ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: receipt_at,
+            }),
+        };
+        assert!(claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            true,
+            Some(submitted_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            false,
+            Some(submitted_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(receipt_at),
+            launched_at,
+            true,
+            Some(launched_at),
+        ));
+        assert!(!claude_receipt_confirms_launch(
+            &binding,
+            Some(launched_at - Duration::from_millis(1)),
+            launched_at,
+            true,
+            None,
+        ));
+        let clear = ClaudeBinding {
+            from_resume: false,
+            ..binding
+        };
+        assert!(!claude_receipt_confirms_launch(
+            &clear,
+            Some(receipt_at),
+            launched_at,
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn an_older_hooks_same_id_record_switches_once() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4().to_string();
+        let transcript = muxel_core::claude_session_path(&home, &cwd, &session_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        // An older muxel's hook wrote Claude's event as it came.
+        let path = claude_binding_path(&data, instance_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let event = json!({
+            "session_id": session_id,
+            "transcript_path": transcript,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+            "source": "resume"
+        });
+        std::fs::write(&path, event.to_string()).unwrap();
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let record = claim_claude_binding(&data, instance_id).unwrap();
+        // Its write time stands in for the stamp; claiming it keeps that.
+        assert_eq!(record.modified, Some(written));
+        let binding = claude_binding_from_record(&record.bytes, &home).unwrap();
+        assert_eq!(binding.stamp, None);
+        let current = claude_hook_identity(&binding, record.modified, &record.bytes);
+        assert!(claude_record_switches(
+            &binding,
+            &current,
+            None,
+            Some(session_id.as_str()),
+            false,
+        ));
+        assert!(!claude_record_switches(
+            &binding,
+            &current,
+            Some(&current),
+            Some(session_id.as_str()),
+            false,
+        ));
+        let other = Uuid::new_v4().to_string();
+        assert!(claude_record_switches(
+            &binding,
+            &current,
+            None,
+            Some(other.as_str()),
+            false,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_record_written_while_muxel_handles_the_last_survives_its_acknowledgement() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let claimed = claim_claude_binding(&data, instance_id).unwrap();
+        assert_eq!(claimed_session(&claimed, &home), a);
+        // The hook runs again between muxel's read and its acknowledgement.
+        resume_hook(&data, &home, &cwd, instance_id, &b);
+        acknowledge_claude_binding(claimed);
+
+        let next = claim_claude_binding(&data, instance_id).expect("B wasn't deleted unread");
+        assert_eq!(claimed_session(&next, &home), b);
+        acknowledge_claude_binding(next);
+        assert!(claim_claude_binding(&data, instance_id).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_record_whose_handling_failed_is_claimed_again_before_a_newer_one() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let claimed = claim_claude_binding(&data, instance_id).unwrap();
+        // Saving the binding failed, so the record isn't acknowledged; the
+        // hook runs again before the next tick.
+        drop(claimed);
+        resume_hook(&data, &home, &cwd, instance_id, &b);
+
+        let retry = claim_claude_binding(&data, instance_id).unwrap();
+        assert_eq!(claimed_session(&retry, &home), a);
+        acknowledge_claude_binding(retry);
+        let next = claim_claude_binding(&data, instance_id).unwrap();
+        assert_eq!(claimed_session(&next, &home), b);
+        acknowledge_claude_binding(next);
+        assert!(claim_claude_binding(&data, instance_id).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -593,7 +1279,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                claude_session_id_from_binding(&data, instance_id, &home),
+                read_claude_binding(&data, instance_id, &home).map(|binding| binding.session_id),
                 None
             );
         }
@@ -619,7 +1305,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                claude_session_id_from_binding(&data, instance_id, &home),
+                read_claude_binding(&data, instance_id, &home).map(|binding| binding.session_id),
                 None
             );
         }
