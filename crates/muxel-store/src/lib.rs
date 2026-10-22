@@ -699,6 +699,26 @@ mod tests {
     }
 
     #[test]
+    fn outside_creation_policy_round_trips_named_toml_and_rejects_bools() {
+        use muxel_core::control::CreationPolicy;
+        for (text, expected) in [
+            ("control_allow_new = 'off'", CreationPolicy::Off),
+            ("control_allow_new = 'ask'", CreationPolicy::Ask),
+            ("control_allow_new = 'allow'", CreationPolicy::Allow),
+        ] {
+            let settings = parse_settings(text).unwrap();
+            assert_eq!(settings.control_allow_new, expected);
+            let saved = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(parse_settings(&saved).unwrap().control_allow_new, expected);
+            assert!(!saved.contains("control_allow_new = true"));
+            assert!(!saved.contains("control_allow_new = false"));
+        }
+        for value in ["true", "false"] {
+            assert!(parse_settings(&format!("control_allow_new = {value}")).is_err());
+        }
+    }
+
+    #[test]
     fn workspaces_index_round_trips() {
         let dir = std::env::temp_dir().join("muxel-store-test-workspaces-rt");
         let _ = std::fs::create_dir_all(&dir);

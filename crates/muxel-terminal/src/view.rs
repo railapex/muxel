@@ -9,6 +9,7 @@ use crate::profile;
 use crate::session::{CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -889,6 +890,8 @@ fn coalesce_pending(
 pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    startup_turn: Option<muxel_core::control::StartupTurn>,
+    startup_notice: Option<SharedString>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
     font_family: SharedString,
@@ -958,6 +961,299 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
+fn startup_fallback_notice(at_cap: bool, ready: bool) -> Option<&'static str> {
+    if at_cap {
+        Some("Startup output did not settle within 30 seconds. Continuing with startup input.")
+    } else if !ready {
+        Some("Input readiness could not be confirmed. Continuing after the startup output wait.")
+    } else {
+        None
+    }
+}
+
+fn with_startup_view<R>(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    action: impl FnOnce(&TerminalView) -> R,
+) -> Result<R, crate::startup::Stop> {
+    view.update(cx, |view, _| {
+        (!view.exited && Arc::ptr_eq(&view.session, session)).then(|| action(view))
+    })
+    .ok()
+    .flatten()
+    .ok_or(crate::startup::Stop::Interrupted)
+}
+
+fn claude_startup_ready(
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    empty: bool,
+) -> bool {
+    let Some(context) = screen.claude_composer_context(empty) else {
+        return false;
+    };
+    parse_agent_title(TitleProvider::Claude, title).and_then(|frame| frame.status)
+        != Some(AgentStatus::Working)
+        && provider_screen_status(TitleProvider::Claude, &context).is_none()
+        && !blocked_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+fn startup_ready(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    empty: bool,
+) -> bool {
+    if provider == TitleProvider::Claude {
+        return claude_startup_ready(screen, title, blocked_markers, empty);
+    }
+    let context = match provider {
+        TitleProvider::Codex => screen.codex_composer_context(empty),
+        // Grok supports configurable/hidden prompt prefixes and multiline
+        // editors. Its semantic idle title, after its configured startup settle,
+        // is the supported admission signal; do not guess a universal glyph.
+        TitleProvider::Grok => Some(screen.text.clone()),
+        _ => return false,
+    };
+    let Some(context) = context else {
+        return false;
+    };
+    parse_agent_title(provider, title).and_then(|frame| frame.status) == Some(AgentStatus::Idle)
+        && provider_screen_status(provider, &context).is_none()
+        && (provider != TitleProvider::Codex
+            || ![
+                "Trust this folder?",
+                "Folder access",
+                "enter continue · esc quit",
+            ]
+            .iter()
+            .any(|chrome| context.contains(chrome)))
+        && !blocked_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+/// Starting/Waiting are useful display states but do not establish that a new
+/// user task was accepted. Do not use the sticky display status or our CR marker.
+fn startup_title_working(provider: TitleProvider, title: Option<&str>) -> bool {
+    if parse_agent_title(provider, title).and_then(|frame| frame.status)
+        != Some(AgentStatus::Working)
+    {
+        return false;
+    }
+    if provider == TitleProvider::Codex {
+        let Some((_, state)) = title.and_then(|title| title.rsplit_once(" | ")) else {
+            return false;
+        };
+        return matches!(
+            state
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("working" | "thinking")
+        );
+    }
+    true
+}
+
+fn startup_draft_matches(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    input: &str,
+) -> bool {
+    match provider {
+        TitleProvider::Claude => screen.claude_draft_matches(input),
+        TitleProvider::Codex => screen.codex_draft_matches(input),
+        _ => false,
+    }
+}
+
+fn startup_empty_composer(provider: TitleProvider, screen: &crate::startup::Screen) -> bool {
+    match provider {
+        TitleProvider::Claude => screen.claude_composer_context(true).is_some(),
+        TitleProvider::Codex => screen.codex_composer_context(true).is_some(),
+        _ => false,
+    }
+}
+
+struct StartupAttempt<'a> {
+    provider: TitleProvider,
+    input: &'a str,
+    expected_input: String,
+    before_title: u64,
+    before_prompt: Option<String>,
+    instance_id: Uuid,
+}
+
+fn startup_has_fresh_user_row(attempt: &StartupAttempt<'_>, prompt: Option<&str>) -> bool {
+    prompt.is_some_and(|prompt| {
+        crate::startup::normalized(prompt) == attempt.expected_input
+            && attempt.before_prompt.as_deref() != Some(attempt.expected_input.as_str())
+    })
+}
+
+fn startup_retry_allowed(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    prompt: Option<&str>,
+) -> bool {
+    attempt.provider == TitleProvider::Codex
+        && !startup_has_fresh_user_row(attempt, prompt)
+        && screen.codex_exact_retry_draft(attempt.input)
+        && startup_ready(attempt.provider, screen, title, blocked_markers, false)
+}
+
+fn startup_provider_accepted(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    title_generation: u64,
+    prompt: Option<&str>,
+) -> bool {
+    if startup_draft_matches(attempt.provider, screen, attempt.input) {
+        return false;
+    }
+    let fresh_user_row = startup_has_fresh_user_row(attempt, prompt)
+        && startup_empty_composer(attempt.provider, screen);
+    fresh_user_row
+        || (title_generation != attempt.before_title
+            && startup_title_working(attempt.provider, title))
+}
+
+async fn confirm_startup_submission(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    attempt: &StartupAttempt<'_>,
+) -> Result<(), crate::startup::Stop> {
+    use crate::startup::{Acceptance, AcceptanceAction};
+    let mut acceptance = Acceptance::default();
+    let started = Instant::now();
+    loop {
+        let (accepted, retryable) = with_startup_view(view, session, cx, |view| {
+            guard.check(armed_at.elapsed(), session.input_rev())?;
+            let (generation, title) = session.title_snapshot();
+            let screen = session.startup_screen();
+            let history = session.recent_text(500);
+            let prompt = muxel_core::readaloud::prompt_from_screen(&history);
+            let accepted = startup_provider_accepted(
+                attempt,
+                &screen,
+                title.as_deref(),
+                generation,
+                prompt.as_deref(),
+            );
+            // Grok can restore a previously stashed draft after accepting a
+            // task. Its retained text is not a safe Enter-retry predicate.
+            let retryable = startup_retry_allowed(
+                attempt,
+                &screen,
+                title.as_deref(),
+                &view.blocked_markers,
+                prompt.as_deref(),
+            );
+            Ok::<_, crate::startup::Stop>((accepted, retryable))
+        })??;
+        match acceptance.observe(started.elapsed(), accepted, retryable) {
+            AcceptanceAction::Accepted => {
+                guard.submitted(startup_now_ms());
+                return Ok(());
+            }
+            AcceptanceAction::RetryEnter => {
+                // Recheck session, ownership and input revision on admission;
+                // never re-paste the task or retry an ambiguous provider.
+                write_startup_input(view, session, cx, guard, armed_at, true, |session| {
+                    session.try_submit_input(b"\r")
+                })?;
+                profile::startup_event(
+                    attempt.instance_id,
+                    "codex",
+                    "automation-enter-retry",
+                    armed_at.elapsed(),
+                    1,
+                );
+            }
+            AcceptanceAction::Failed => {
+                guard.fail(crate::startup::Stop::NotAccepted);
+                return Err(crate::startup::Stop::NotAccepted);
+            }
+            AcceptanceAction::Observe => {}
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+fn startup_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+async fn wait_startup_composer(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    empty: bool,
+) -> Result<(), crate::startup::Stop> {
+    loop {
+        let ready = with_startup_view(view, session, cx, |view| {
+            let screen = session.startup_screen();
+            let title = session.title();
+            guard.ready(
+                armed_at.elapsed(),
+                session.input_rev(),
+                startup_ready(
+                    view.title_provider,
+                    &screen,
+                    title.as_deref(),
+                    &view.blocked_markers,
+                    empty,
+                ),
+            )
+        })??;
+        if ready {
+            return Ok(());
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+fn write_startup_input(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    submit: bool,
+    write: impl FnOnce(&TerminalSession) -> std::io::Result<()>,
+) -> Result<(), crate::startup::Stop> {
+    with_startup_view(view, session, cx, |_| {
+        let admitted_at = startup_now_ms();
+        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))?;
+        if submit {
+            guard.enter_admitted(admitted_at);
+        }
+        Ok(())
+    })?
+}
+
 /// Why the drain loop most recently notified GPUI to request a redraw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalNotifyCause {
@@ -979,6 +1275,9 @@ pub struct TerminalFocusProfile {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
+        if let Some(startup) = &self.startup_turn {
+            startup.cancel();
+        }
         profile::pane_closed(self.instance_id);
     }
 }
@@ -1006,9 +1305,10 @@ struct DrainTransport {
 
 impl TerminalLaunch {
     /// Spawn `spec` at `size` (`(cols, rows)`); if it can't be launched (e.g. the
-    /// agent isn't installed), fall back to a shell that prints the error. `Err` only
-    /// when even the fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`,
-    /// fd exhaustion, …).
+    /// agent isn't installed), fall back to a shell that prints the error. Literal
+    /// commands and outside-created panes surface their error without replacing
+    /// the program. Other launches return `Err` only when even the fallback shell
+    /// can't spawn.
     ///
     /// `size` should be the grid the pane will actually render at — see
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
@@ -1042,6 +1342,7 @@ impl TerminalLaunch {
                 rx,
                 launch_error: None,
             }),
+            Err(e) if spec.literal_argv || !spec.allow_shell_fallback => Err(e),
             Err(e) => {
                 // Capture the full error (incl. the OS code) for the dev console.
                 let launch_error = format!("{e:#}");
@@ -1179,6 +1480,10 @@ impl TerminalView {
             launch_error,
         } = launch;
         let startup_input = spec.startup_input.clone();
+        let startup_owner = spec.startup_turn.clone();
+        let startup_turn = startup_owner
+            .as_ref()
+            .map(muxel_core::control::StartupTurnOwner::signal);
         let auto_mode_presses = spec.auto_mode_presses;
         let startup_delay_ms = spec.startup_delay_ms;
         let submit = spec.submit;
@@ -1223,13 +1528,8 @@ impl TerminalView {
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,
         // press Enter to confirm it, then type the prompt and press Enter.
         //
-        // "Ready" = the child has produced output AND has then been quiet for
-        // SETTLE_MS. This adapts to slow starters (e.g. opencode, whose first
-        // output — clearing the screen — comes early but whose input box only
-        // appears seconds later, once it stops emitting): we wait for the load
-        // output to actually stop, not a guessed delay. SETTLE_MS is generous so
-        // a brief pause mid-load isn't mistaken for ready. Capped by MAX_WAIT in
-        // case a UI never goes quiet.
+        // Controller tasks require a live composer and independent acceptance.
+        // UI runners, loops and TypeIn presets retain quiet-then-paste fallback.
         if let Some(input) = startup_input.as_ref() {
             profile::startup_event(
                 instance_id,
@@ -1252,70 +1552,231 @@ impl TerminalView {
             const SHIFT_TAB: &[u8] = b"\x1b[Z";
             let session = session.clone();
             let automation_program = startup_program.clone();
-            cx.spawn(async move |_view: WeakEntity<Self>, cx| {
-                let timer = |ms| cx.background_executor().timer(Duration::from_millis(ms));
-                // Wait for the agent's first output (it has started up).
-                let mut waited = 0u64;
-                while !session.has_output() && waited < MAX_WAIT_MS {
-                    timer(POLL_MS).await;
-                    waited += POLL_MS;
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-first-output",
-                    startup_started.elapsed(),
-                    0,
-                );
-                if startup_delay_ms > 0 {
-                    // Preset-configured fixed delay after first output — for agents
-                    // that keep loading well past their first draw (e.g. opencode).
-                    timer(startup_delay_ms as u64).await;
-                } else {
-                    // Auto: wait until output goes quiet (UI finished drawing).
-                    while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
-                        timer(POLL_MS).await;
+            let known_provider = title_provider != TitleProvider::Other;
+            let armed_at = Instant::now();
+            let mut guard = crate::startup::Guard::for_startup(
+                session.input_rev(),
+                startup_owner,
+                Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64),
+            );
+            let control_task = guard.requires_readiness();
+            let framed_readiness = control_task
+                && matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
+            cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                let result: Result<(), crate::startup::Stop> = async {
+                    if control_task && !known_provider {
+                        guard.fail(crate::startup::Stop::UnsupportedProvider);
+                        return Err(crate::startup::Stop::UnsupportedProvider);
+                    }
+                    // Wait for the agent's first output (it has started up).
+                    let mut waited = 0u64;
+                    loop {
+                        let has_output = with_startup_view(&view, &session, cx, |_| {
+                            guard.check(armed_at.elapsed(), session.input_rev())?;
+                            Ok::<_, crate::startup::Stop>(session.has_output())
+                        })??;
+                        if has_output || waited >= MAX_WAIT_MS {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(POLL_MS))
+                            .await;
                         waited += POLL_MS;
                     }
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-settled",
-                    startup_started.elapsed(),
-                    0,
-                );
-                for _ in 0..auto_mode_presses {
-                    session.write_input(SHIFT_TAB);
-                    timer(KEY_GAP_MS).await;
-                }
-                // Confirm the mode switch with a single Enter.
-                if auto_mode_presses > 0 {
-                    session.write_input(b"\r");
-                    timer(KEY_GAP_MS).await;
-                }
-                if let Some(input) = startup_input {
-                    timer(PRE_TYPE_MS).await;
-                    session.paste(&input);
                     profile::startup_event(
                         instance_id,
                         &automation_program,
-                        "automation-pasted",
+                        "automation-first-output",
                         startup_started.elapsed(),
-                        input.len(),
+                        0,
                     );
-                    // On restore, leave the prompt typed but unsubmitted.
-                    if submit {
-                        timer(SUBMIT_DELAY_MS).await;
-                        session.mark_turn_submitted();
-                        session.write_input(b"\r");
+                    if startup_delay_ms > 0 {
+                        // Preset-configured fixed delay after first output — for agents
+                        // that keep loading well past their first draw (e.g. opencode).
+                        cx.background_executor()
+                            .timer(Duration::from_millis(startup_delay_ms as u64))
+                            .await;
+                    } else if !framed_readiness {
+                        // Auto: wait until output goes quiet (UI finished drawing).
+                        while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
+                            with_startup_view(&view, &session, cx, |_| {
+                                guard.check(armed_at.elapsed(), session.input_rev())
+                            })??;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(POLL_MS))
+                                .await;
+                            waited += POLL_MS;
+                        }
+                    }
+                    if control_task {
+                        wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
+                            .await?;
+                    } else {
+                        let ready = with_startup_view(&view, &session, cx, |view| {
+                            startup_ready(
+                                title_provider,
+                                &session.startup_screen(),
+                                session.title_snapshot().1.as_deref(),
+                                &view.blocked_markers,
+                                true,
+                            )
+                        })?;
+                        if let Some(notice) = startup_fallback_notice(waited >= MAX_WAIT_MS, ready) {
+                            let _ = view.update(cx, |view, cx| {
+                                if !view.exited && Arc::ptr_eq(&view.session, &session) {
+                                    view.startup_notice = Some(notice.into());
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        "automation-settled",
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    for _ in 0..auto_mode_presses {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_write_input(SHIFT_TAB),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .await;
+                    }
+                    // Confirm the mode switch with a single Enter.
+                    if auto_mode_presses > 0 {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_write_input(b"\r"),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .await;
+                    }
+                    if let Some(input) = startup_input {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(PRE_TYPE_MS))
+                            .await;
+                        if control_task {
+                            guard.reset_ready();
+                            wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
+                                .await?;
+                        }
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_paste(&input),
+                        )?;
                         profile::startup_event(
                             instance_id,
                             &automation_program,
-                            "automation-submitted",
+                            "automation-pasted",
                             startup_started.elapsed(),
-                            1,
+                            input.len(),
                         );
+                        // On restore, leave the prompt typed but unsubmitted.
+                        if submit {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(SUBMIT_DELAY_MS))
+                                .await;
+                            if control_task {
+                                guard.reset_ready();
+                                wait_startup_composer(
+                                    &view, &session, cx, &mut guard, armed_at, false,
+                                )
+                                .await?;
+                            }
+                            let attempt = StartupAttempt {
+                                provider: title_provider,
+                                input: &input,
+                                expected_input: crate::startup::normalized(&input),
+                                before_title: session.title_snapshot().0,
+                                before_prompt: muxel_core::readaloud::prompt_from_screen(
+                                    &session.recent_text(500),
+                                )
+                                .map(|prompt| crate::startup::normalized(&prompt)),
+                                instance_id,
+                            };
+                            write_startup_input(
+                                &view,
+                                &session,
+                                cx,
+                                &mut guard,
+                                armed_at,
+                                true,
+                                |session| session.try_submit_input(b"\r"),
+                            )?;
+                            profile::startup_event(
+                                instance_id,
+                                &automation_program,
+                                "automation-enter-admitted",
+                                startup_started.elapsed(),
+                                1,
+                            );
+                            if control_task {
+                                confirm_startup_submission(
+                                    &view, &session, cx, &mut guard, armed_at, &attempt,
+                                )
+                                .await?;
+                                profile::startup_event(
+                                    instance_id,
+                                    &automation_program,
+                                    "automation-submitted",
+                                    startup_started.elapsed(),
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(reason) = result {
+                    let phase = match reason {
+                        crate::startup::Stop::Interrupted => "automation-interrupted",
+                        crate::startup::Stop::NotReady => "automation-not-ready",
+                        crate::startup::Stop::NotAccepted => "automation-not-accepted",
+                        crate::startup::Stop::UnsupportedProvider => {
+                            "automation-unsupported-provider"
+                        }
+                        crate::startup::Stop::WriteFailed => "automation-write-failed",
+                    };
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        phase,
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    log::warn!("terminal startup automation stopped: {reason:?}");
+                    if !control_task {
+                        let _ = view.update(cx, |view, cx| {
+                            if view.exited || !Arc::ptr_eq(&view.session, &session) {
+                                return;
+                            }
+                            view.startup_notice = Some(match reason {
+                                crate::startup::Stop::Interrupted => "Startup input cancelled after user input or a pane change.",
+                                _ => "Startup input could not be sent. Enter the task in the terminal to continue.",
+                            }.into());
+                            cx.notify();
+                        });
                     }
                 }
             })
@@ -1458,6 +1919,8 @@ impl TerminalView {
         Self {
             instance_id,
             session,
+            startup_turn,
+            startup_notice: None,
             focus_handle,
             palette: TerminalPalette::default(),
             font_family: SharedString::default(),
@@ -1740,6 +2203,9 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_notice.take().is_some() {
+            cx.notify();
+        }
         let t0 = Instant::now();
         let held = event.is_held;
         let m = &event.keystroke.modifiers;
@@ -1954,6 +2420,7 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .size_full()
+            .relative()
             // Fill the inset margin with the terminal background and inset the
             // element so the grid (sized from the inner area) never butts against
             // the pane edge — a too-wide TUI truncates inside the margin.
@@ -1969,6 +2436,21 @@ impl Render for TerminalView {
                 px(self.font_size),
                 self.mouse_mode,
             ))
+            .when_some(self.startup_notice.clone(), |pane, notice| {
+                pane.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .bg(rgb(0x42351d))
+                        .text_color(rgb(0xffe2a4))
+                        .child(notice),
+                )
+            })
     }
 }
 
@@ -1979,6 +2461,120 @@ mod launch_identity_tests {
     use muxel_core::control::INSTANCE_ID_ENV;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    #[test]
+    fn timing_fallback_always_explains_missing_readiness_or_the_cap() {
+        assert!(super::startup_fallback_notice(false, true).is_none());
+        assert!(
+            super::startup_fallback_notice(false, false)
+                .unwrap()
+                .contains("readiness")
+        );
+        for ready in [false, true] {
+            assert!(
+                super::startup_fallback_notice(true, ready)
+                    .unwrap()
+                    .contains("30 seconds")
+            );
+        }
+    }
+
+    #[test]
+    fn outside_startup_launch_failure_refuses_a_real_fallback_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        for allow_fallback in [true, false] {
+            let marker = std::env::temp_dir().join(format!("muxel-fallback-{}", Uuid::new_v4()));
+            #[cfg(windows)]
+            let fallback = CommandSpec::program(
+                "powershell.exe",
+                vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "[System.IO.File]::WriteAllText('{}', 'fallback')",
+                        marker.display().to_string().replace('\'', "''")
+                    ),
+                ],
+            );
+            #[cfg(not(windows))]
+            let fallback = CommandSpec::program(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "printf fallback > \"$1\"".into(),
+                    "muxel-test".into(),
+                    marker.display().to_string(),
+                ],
+            );
+            let signal = StartupTurn::default();
+            let mut requested = CommandSpec::program(
+                std::env::temp_dir()
+                    .join(format!("muxel-missing-{}.exe", Uuid::new_v4()))
+                    .display()
+                    .to_string(),
+                vec![],
+            );
+            requested.allow_shell_fallback = allow_fallback;
+            if !allow_fallback {
+                requested.startup_turn = signal.claim();
+            }
+            let result = TerminalLaunch::spawn_with_fallback(requested, fallback, (80, 24), None);
+            if allow_fallback {
+                let launch = result.expect("ordinary UI preset retains its fallback");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let marker_complete = loop {
+                    if std::fs::read_to_string(&marker).ok().as_deref() == Some("fallback") {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                // File creation precedes the completed write, and kill does not
+                // wait for the writer to release its Windows file handle.
+                launch.session.kill();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let exited = loop {
+                    match launch.rx.try_recv() {
+                        Ok(ProfiledPtyChunk::Exit { .. }) => break true,
+                        Err(async_channel::TryRecvError::Closed) => break false,
+                        Ok(ProfiledPtyChunk::Output { .. }) => {}
+                        Err(async_channel::TryRecvError::Empty) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let cleanup = loop {
+                    match std::fs::remove_file(&marker) {
+                        Ok(()) => break Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break Ok(()),
+                        Err(error) if Instant::now() >= deadline => break Err(error),
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                };
+                assert!(
+                    marker_complete,
+                    "the injected fallback must finish its write"
+                );
+                assert!(exited, "the fallback child must exit before cleanup");
+                cleanup.expect("remove fallback marker after bounded retries");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "outside-approved program failure must surface"
+                );
+                assert!(!marker.exists(), "no replacement shell may execute");
+                assert_eq!(signal.state(), StartupTurnState::Cancelled);
+            }
+        }
+    }
 
     #[test]
     fn failed_launch_fallback_has_own_identity() {
@@ -2091,6 +2687,28 @@ mod launch_identity_tests {
     }
 }
 
+#[cfg(test)]
+mod literal_launch_tests {
+    use super::TerminalLaunch;
+    use crate::session::CommandSpec;
+
+    #[test]
+    fn literal_failure_never_substitutes_a_fallback_program() {
+        let missing =
+            std::env::temp_dir().join(format!("muxel-missing-{}.exe", uuid::Uuid::new_v4()));
+        let fallback = CommandSpec::program(missing.display().to_string(), vec![]);
+        let literal =
+            CommandSpec::literal(missing.display().to_string(), vec!["opening brief".into()]);
+        let error = TerminalLaunch::spawn_with_fallback(literal, fallback, (80, 24), None)
+            .err()
+            .expect("literal launch must fail");
+        assert!(
+            !format!("{error:#}").contains("fallback shell"),
+            "{error:#}"
+        );
+    }
+}
+
 // Existing launch smoke tests use Unix programs.
 #[cfg(all(test, unix))]
 mod launch_tests {
@@ -2126,6 +2744,295 @@ mod launch_tests {
             .expect("spawn cat");
         assert!(launch.launch_error().is_none());
         launch.session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::{
+        StartupAttempt, TitleProvider, claude_startup_ready, startup_provider_accepted,
+        startup_ready, startup_retry_allowed,
+    };
+    use crate::startup::Screen;
+
+    fn codex_screen(draft: &str) -> Screen {
+        Screen {
+            // Codex 0.163's passive status line replaces the shortcut hint,
+            // including in the empty editor; drafts hide that hint as well.
+            text: format!(
+                "OpenAI Codex\n› {draft}\n\n  gpt-5.4 high fast · scratch · Context 0% used\n  ⚠ 1 · f2"
+            ),
+            cursor_row: 1,
+            cursor_column: if draft == "Ask Codex to do anything" {
+                2
+            } else {
+                draft.chars().count() + 2
+            },
+            cursor_visible: true,
+            bracketed_paste: true,
+        }
+    }
+
+    #[test]
+    fn codex_readiness_rejects_starting_titles_and_folder_trust() {
+        let mut screen = codex_screen("Ask Codex to do anything");
+        assert!(startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            Some("scratch | Ready"),
+            &[],
+            true
+        ));
+        for title in [
+            None,
+            Some("scratch | Starting"),
+            Some("scratch | Waiting"),
+            Some("scratch | Working"),
+        ] {
+            assert!(!startup_ready(
+                TitleProvider::Codex,
+                &screen,
+                title,
+                &[],
+                true
+            ));
+        }
+        screen
+            .text
+            .insert_str(0, "Folder access\nTrust this folder?\n");
+        screen.cursor_row += 2;
+        assert!(!startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            Some("scratch | Ready"),
+            &[],
+            true
+        ));
+    }
+
+    #[test]
+    fn startup_acceptance_rejects_own_echo_stale_work_and_boot_activity() {
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        let empty = codex_screen("Ask Codex to do anything");
+        for (generation, title) in [
+            (8, "scratch | Working"),
+            (9, "scratch | Starting"),
+            (9, "scratch | Waiting"),
+        ] {
+            assert!(!startup_provider_accepted(
+                &attempt,
+                &empty,
+                Some(title),
+                generation,
+                None
+            ));
+        }
+        assert!(!startup_provider_accepted(
+            &attempt,
+            &codex_screen("task"),
+            Some("scratch | Working"),
+            9,
+            Some("task")
+        ));
+        assert!(startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Working"),
+            9,
+            None
+        ));
+        // A fast real turn can finish before a poll; its rendered user row and
+        // cleared live editor still prove acceptance without a caught spinner.
+        assert!(startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("task")
+        ));
+        assert!(!startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("other task")
+        ));
+        let old_row = StartupAttempt {
+            before_prompt: Some("task".into()),
+            ..attempt
+        };
+        assert!(!startup_provider_accepted(
+            &old_row,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("task")
+        ));
+    }
+
+    #[test]
+    fn codex_retry_refuses_any_receipt_changed_whitespace_and_unproven_editor_geometry() {
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "a  b",
+            expected_input: "a b".into(),
+            before_title: 2,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert!(startup_retry_allowed(
+            &attempt,
+            &codex_screen("a  b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &codex_screen("a b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        // A fresh matching user row independently forbids a second CR, even
+        // when the provider has retained or restored identical draft text.
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &codex_screen("a  b"),
+            Some("scratch | Ready"),
+            &[],
+            Some("a  b")
+        ));
+        let mut suffix = codex_screen("a  b changed");
+        suffix.cursor_column = 6;
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &suffix,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        let mut continuation = codex_screen("a  b");
+        continuation.text = continuation
+            .text
+            .replace("a  b\n\n", "a  b\n  more content\n\n");
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &continuation,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        continuation.text = codex_screen("a  b")
+            .text
+            .replace("a  b\n\n", "a  b\n\n  hidden continuation\n\n");
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &continuation,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        let multiline = StartupAttempt {
+            input: "a\nb",
+            ..attempt
+        };
+        assert!(!startup_retry_allowed(
+            &multiline,
+            &codex_screen("a b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+    }
+
+    #[test]
+    fn grok_task_quoting_codex_trust_text_does_not_block_its_own_first_enter() {
+        let screen = Screen { text: "Grok\n› Explain Trust this folder? and Folder access and enter continue · esc quit\n".into(),
+            cursor_row: 1, cursor_column: 80, cursor_visible: true, bracketed_paste: true };
+        assert!(startup_ready(
+            TitleProvider::Grok,
+            &screen,
+            Some("scratch - grok"),
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn quoted_permission_text_in_the_draft_does_not_block_its_own_submit() {
+        for (draft, cursor_row) in [
+            ("❯ Explain the wording Do you want to proceed", 2),
+            (
+                "❯ Explain the wording\n  Do you want to proceed\n  and this second line",
+                4,
+            ),
+        ] {
+            let mut screen = Screen {
+                text: format!("Claude Code\n────────────────\n{draft}\n────────────────\nmode"),
+                cursor_column: 22,
+                cursor_row,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            let markers = vec!["Do you want to proceed".into()];
+            assert!(claude_startup_ready(&screen, None, &markers, false));
+            assert!(!claude_startup_ready(&screen, None, &markers, true));
+            // A real permission question outside the composer still vetoes CR.
+            screen.text.insert_str(0, "Do you want to proceed\n");
+            screen.cursor_row += 1;
+            assert!(!claude_startup_ready(&screen, None, &markers, false));
+        }
+    }
+
+    #[test]
+    fn native_slash_completion_is_ready_for_submit_but_not_an_empty_startup() {
+        // The controlled native reproduction's completion menu has no permission
+        // footer. Its occupied composer must admit the first CR, never a retry.
+        let screen = Screen {
+            text: "Claude Code v2.1.304\n  ❯ /b12-ready  Reply exactly B12_READY. Do not use tools,\n                 read or write files, or call other agents…\n────────────────────────────────────────\n❯\u{a0}/b12-ready\n────────────────────────────────────────\n  Friday 0%\n  ⏵⏵ auto mode on (shift+tab to cycle)".into(),
+            cursor_column: 12, cursor_row: 4, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(&screen, None, &[], true));
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("◐ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(
+            &screen,
+            None,
+            &["manual approval".into(), "auto mode on".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn permission_chrome_vetoes_an_old_composer_even_with_idle_title() {
+        let screen = Screen {
+            text: "────────────────\n❯ task\n────────────────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel".into(),
+            cursor_column: 6, cursor_row: 1, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
     }
 }
 

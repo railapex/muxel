@@ -253,6 +253,11 @@ saved changes.
 Attachment waits for that queue and verifies the instance exists in the saved
 layout, even when its tmux owner already matches. A failed launch save therefore
 cannot start an agent from an optimistic pane alone.
+Tasks created by desktop `ctl new --prompt` are preserved in shared metadata but
+never typed or submitted by the phone, including after a refused launch or restore.
+Only the desktop's live startup owner may dispatch that task. Duplicating such a
+pane strips its task before clearing outside origin and restores the preset's
+separate instruction transport; ordinary preset prompts keep their usual behavior.
 
 Future: APNs push via a remote watcher daemon (instant background alerts + live
 status-bar updates); tmux **control mode** (`-C`); interactive split resize + tab
