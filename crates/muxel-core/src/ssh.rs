@@ -1826,8 +1826,7 @@ mod tests {
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
         // Only this project-less tmux process may start the owned server.
-        let server =
-            "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off ';' set -g set-titles on ';' set -g set-titles-string '#{pane_title}'; fi; ";
+        let server = "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off ';' set -g set-titles on ';' set -g set-titles-string '#{pane_title}'; fi; ";
         let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
             !before.contains("webapp"),
