@@ -4165,6 +4165,92 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn stale_uuid_title_cannot_advance_an_out_of_band_binding() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        assert_eq!(session.binding_revision(), 1);
+        let hook = SystemTime::now();
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        assert_eq!(switched, 2);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{stale} | Working\x07"),
+            hook - Duration::from_millis(500),
+        )]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(session.runtime_evidence(None).settling);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{new} | Ready\x07"),
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert_eq!(session.binding_revision(), switched + 1);
+        session.kill();
+    }
+
+    #[test]
+    fn synchronized_stale_uuid_title_keeps_its_original_read_time() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{stale} | Working\x07"),
+            hook - Duration::from_millis(500),
+        )]));
+        assert_eq!(session.binding_revision(), 1);
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(
+            "\x1b[?2026l",
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn expired_synchronized_title_cannot_rebind_after_a_switch() {
+        let (session, _receiver) = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let hook = SystemTime::now();
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{stale} | Working\x07"),
+            hook - Duration::from_millis(500),
+        )]));
+        session.provider_switched_at(hook, hook, hook);
+        let switched = session.binding_revision();
+        std::thread::sleep(Duration::from_millis(250));
+        session.process_drained(&PtyOutput::default());
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
     fn replacement_before_first_uuid_cannot_complete_the_unidentified_submission() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

@@ -168,6 +168,9 @@ pub(crate) struct LifecycleEvidence {
     window: Option<SwitchWindow>,
     /// When the reader received the output being parsed.
     reading_at: Option<SystemTime>,
+    /// DEC synchronized updates defer title callbacks until ESU or timeout.
+    /// Replay must retain the oldest read time of the buffered frame.
+    sync_started_at: Option<SystemTime>,
     /// Output read after the window has been parsed.
     fresh_output: bool,
 }
@@ -198,8 +201,23 @@ impl LifecycleEvidence {
 
     /// The parser is about to apply output the reader received at `at`.
     pub(crate) fn begin_read(&mut self, at: SystemTime) {
-        self.reading_at = Some(at);
-        self.fresh_output |= self.output_is_fresh(at);
+        let effective_at = self.sync_started_at.unwrap_or(at);
+        self.reading_at = Some(effective_at);
+        self.fresh_output |= self.output_is_fresh(effective_at);
+    }
+
+    /// Called after each parser chunk, while the parser lock still identifies
+    /// whether a synchronized update has buffered output for a later replay.
+    pub(crate) fn sync_state_after_read(&mut self, active: bool, at: SystemTime) {
+        self.sync_started_at = if active {
+            Some(self.sync_started_at.map_or(at, |started| started.min(at)))
+        } else {
+            None
+        };
+    }
+
+    pub(crate) fn sync_started_at(&self) -> Option<SystemTime> {
+        self.sync_started_at
     }
 
     pub(crate) fn end_read(&mut self) {
@@ -400,7 +418,12 @@ impl EventListener for MuxelListener {
                 let mut evidence = self.evidence.lock();
                 let at = evidence.output_time();
                 let seq = evidence.record_title(Some(title.clone()), at);
-                if let Some(next) = session_thread_field(&title) {
+                // A queued title read before an out-of-band switch may be
+                // parsed after it. Keep it as visible level state, but it
+                // cannot name or begin the replacement binding.
+                if evidence.output_is_fresh(at)
+                    && let Some(next) = session_thread_field(&title)
+                {
                     let first_title = hint.is_none();
                     let changed = hint.as_deref().and_then(session_thread_field) != Some(next);
                     *hint = Some(title.clone());

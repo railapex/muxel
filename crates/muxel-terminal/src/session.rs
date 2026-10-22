@@ -1509,6 +1509,9 @@ impl TerminalSession {
             }
             self.evidence.lock().begin_read(read_at);
             processor.advance(&mut *term, bytes);
+            self.evidence
+                .lock()
+                .sync_state_after_read(processor.sync_timeout().sync_timeout().is_some(), read_at);
             parsed = true;
         }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
@@ -1523,7 +1526,16 @@ impl TerminalSession {
             .sync_timeout()
             .is_some_and(|d| Instant::now() >= d)
         {
+            let buffered_at = (!parsed)
+                .then(|| self.evidence.lock().sync_started_at())
+                .flatten();
+            if let Some(started) = buffered_at {
+                self.evidence.lock().begin_read(started);
+            }
             processor.stop_sync(&mut *term);
+            self.evidence
+                .lock()
+                .sync_state_after_read(false, SystemTime::now());
             profile::sync_expired();
         }
         self.evidence.lock().end_read();

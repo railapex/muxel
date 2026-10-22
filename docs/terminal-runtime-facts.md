@@ -74,9 +74,14 @@ current title without a completion edge.
     retired.
   - Output read inside the window is ambiguous. The current title stays as
     level state (Working, Idle or Blocked), but nothing in the window forms a
-    completion edge, latches Done, or rings the bell.
+    completion edge, latches Done, rings the bell, changes the session hint, or
+    starts another UUID binding.
   - Output read after the window, and input written after the interval's end,
     are attributed to the new conversation.
+
+  DEC synchronized updates can defer title callbacks until ESU or a timeout.
+  Replayed titles retain the oldest read time of that buffered update, so a
+  fresh ESU read cannot turn an old UUID into a new binding.
 
   Until fresh evidence arrives (a title read after the window or, with no
   title, any output read after it), the reducer shows level state only. An
