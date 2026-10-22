@@ -951,14 +951,24 @@ impl OutputReadClock {
                 }
                 _ => {}
             }
-        } else if let Some(escape_at) = self.escape_at.take() {
-            if byte == b']' {
-                self.osc_since = Some(escape_at);
-            } else if byte == 0x1b {
-                self.escape_at = Some(read_at);
-                boundary = Some(OutputBoundary::Plain);
-            } else {
-                boundary = Some(OutputBoundary::Plain);
+        } else if let Some(escape_at) = self.escape_at {
+            // Match vte 0.15's Escape state: C0 executes without leaving it,
+            // ESC/DEL/high bytes are ignored, and CAN/SUB abort it. An OSC
+            // opened after any of those retained bytes began at the first ESC.
+            match byte {
+                b']' => {
+                    self.escape_at = None;
+                    self.osc_since = Some(escape_at);
+                }
+                0x18 | 0x1a => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
+                _ => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
             }
         } else if byte == 0x1b {
             self.escape_at = Some(read_at);
