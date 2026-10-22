@@ -15,6 +15,7 @@ mod links;
 mod listener;
 mod present_flag;
 mod profile;
+mod program_status;
 mod replies;
 mod search;
 mod session;
@@ -24,13 +25,14 @@ pub use colors::TerminalPalette;
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
+pub use program_status::ProgramStatusKind;
 pub use session::{
-    CommandSpec, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk,
-    PtyOutputQueueStats, PtyReceiver, TerminalSession,
+    CommandSpec, InitialBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+    PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession,
 };
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     PathPasteErrorHandler, TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch,
-    TerminalMouseMode, TerminalNotifyCause, TerminalView, clean_agent_title,
-    paste_clipboard_into_session,
+    TerminalMouseMode, TerminalNotifyCause, TerminalRuntimeSnapshot, TerminalStatusCoverage,
+    TerminalStatusReason, TerminalView, clean_agent_title, paste_clipboard_into_session,
 };
