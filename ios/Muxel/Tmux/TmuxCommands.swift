@@ -156,10 +156,17 @@ enum TmuxCommands {
     /// so `start-server` alone would evaporate before the first `new-session` and the
     /// server would be re-forked with the project name back in its argv.
     ///
+    /// Forward the active pane's title to attached clients so agent title/status
+    /// consumers receive it through tmux. These global settings are applied when
+    /// prewarming muxel's own server; attaching an existing session on the user's
+    /// default server does not run this command or change that server's settings.
+    ///
     /// `Shell.quote(";")` renders as `';'`, so the remote shell hands tmux a literal `;`
     /// argument (its command separator) rather than splitting the line itself.
     static func startServer() -> [String] {
-        ["start-server", ";", "set", "-s", "exit-empty", "off"]
+        ["start-server", ";", "set", "-s", "exit-empty", "off",
+         ";", "set", "-g", "set-titles", "on",
+         ";", "set", "-g", "set-titles-string", "#{pane_title}"]
     }
 
     /// Create a session running `program`+`args` in `cwd`.
