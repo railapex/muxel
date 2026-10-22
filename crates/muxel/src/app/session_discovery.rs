@@ -79,7 +79,7 @@ impl GrokObservation {
 struct ClaudeCommit {
     record: session_binding::ClaimedClaudeRecord,
     launch: Uuid,
-    stamp: Option<session_binding::ClaudeHookStamp>,
+    identity: session_binding::ClaudeHookIdentity,
 }
 
 struct SessionBindingUpdate {
@@ -529,23 +529,45 @@ impl MuxelApp {
             acknowledge_futile_claude_record(record, false);
             return None;
         };
-        let launch = self.discovery_terminal(iid)?.read(cx).session().id;
+        let receipt_at = binding
+            .stamp
+            .map(|stamp| stamp.recorded_at)
+            .or(record.modified);
+        let (launch, confirms_launch) = {
+            let view = self.discovery_terminal(iid)?;
+            let view = view.read(cx);
+            let terminal = view.session();
+            (
+                terminal.id,
+                session_binding::claude_receipt_confirms_launch(
+                    &binding,
+                    receipt_at,
+                    terminal.launched_at(),
+                    terminal.launch_resumed(),
+                    terminal.first_submission_at(),
+                ),
+            )
+        };
+        let current =
+            session_binding::claude_hook_identity(&binding, record.modified, &record.bytes);
         let seen = self
             .claude_hook_seen
             .get(&iid)
             .filter(|(seen_launch, _)| *seen_launch == launch)
-            .map(|(_, nonce)| *nonce);
+            .map(|(_, identity)| identity);
         let bound = self.workspace.instance(iid)?.session_id.as_deref();
-        if !session_binding::claude_record_switches(&binding, seen, bound) {
-            self.remember_claude_hook(iid, Some(launch), binding.stamp);
+        if !session_binding::claude_record_switches(
+            &binding,
+            &current,
+            seen,
+            bound,
+            confirms_launch,
+        ) {
+            self.remember_claude_hook(iid, Some(launch), current);
             session_binding::acknowledge_claude_binding(record);
             return None;
         }
-        let switched_at = binding
-            .stamp
-            .map(|stamp| stamp.recorded_at)
-            .or(record.modified)
-            .unwrap_or_else(SystemTime::now);
+        let switched_at = receipt_at.unwrap_or_else(SystemTime::now);
         // A new nonce can report A -> B -> A between reads even when the final
         // UUID equals the saved one. It still needs a runtime boundary.
         let mut update = self.stage_discovered_session(iid, binding.session_id, true)?;
@@ -553,7 +575,7 @@ impl MuxelApp {
         update.claude = Some(ClaudeCommit {
             record,
             launch,
-            stamp: binding.stamp,
+            identity: current,
         });
         Some(update)
     }
@@ -594,7 +616,7 @@ impl MuxelApp {
         if self.try_persist() {
             for update in updates {
                 if let Some(claude) = update.claude {
-                    self.remember_claude_hook(update.pane, Some(claude.launch), claude.stamp);
+                    self.remember_claude_hook(update.pane, Some(claude.launch), claude.identity);
                     session_binding::acknowledge_claude_binding(claude.record);
                 }
                 if let Some((from, to)) = update.switched

@@ -79,9 +79,11 @@ current title without a completion edge.
   - Output read after the window, and input written after the interval's end,
     are attributed to the new conversation.
 
-  DEC synchronized updates can defer title callbacks until ESU or a timeout.
-  Replayed titles retain the oldest read time of that buffered update, so a
-  fresh ESU read cannot turn an old UUID into a new binding.
+  An OSC title split across reads keeps the read time of its opening escape
+  through BEL or ST. DEC synchronized updates can defer title callbacks until
+  ESU or a timeout; replay keeps the oldest read time of that frame. Each new
+  frame gets its own origin, even when the previous frame closes in the same
+  read. A late terminator or ESU cannot turn an old UUID into a new binding.
 
   Until fresh evidence arrives (a title read after the window or, with no
   title, any output read after it), the reducer shows level state only. An
@@ -158,12 +160,13 @@ current title without a completion edge.
   still compare as unchanged, so after a relaunch into a different
   conversation, an event in the state last recorded for the pane can be
   missed.
-- Claude's hook stamps each record with a nonce. A record whose nonce this
-  launch hasn't seen is a switch even when it names the conversation already
-  bound, so `/resume B` then `/resume A` between two reads is a switch. The
-  launch's first record, and a record from an older muxel's hook, switch only
-  when they name another conversation: a resumed launch's own `SessionStart`
-  names the conversation muxel launched. Recurring discovery validates an
+- Claude's hook stamps each record with a nonce; older records are identified
+  by their exact bytes and write time. A new record is a switch even when it
+  names the bound conversation, so `/resume B` then `/resume A` between two
+  reads retires the old runtime. Only a `resume` receipt from a launch that
+  actually used `--resume`, recorded after spawn and before its first submitted
+  turn, confirms that launch without opening another binding. A fresh
+  `--session-id` launch has no startup receipt. Recurring discovery validates an
   immutable snapshot on a worker. The UI claims the current record by
   renaming it, then requires its bytes and write time to match that snapshot
   before applying or acknowledging it. Prelaunch recovery uses the same UI

@@ -159,6 +159,7 @@ pub(crate) struct LifecycleEvidence {
     /// never transfer that ownership to a replacement conversation. Revision
     /// zero means its recipient was unknown and stays unknown for this run.
     first_submission: Option<u64>,
+    first_submission_at: Option<SystemTime>,
     binding_rev: u64,
     /// Conversation pinned by launch arguments, if one was supplied.
     initial_id: Option<String>,
@@ -168,9 +169,6 @@ pub(crate) struct LifecycleEvidence {
     window: Option<SwitchWindow>,
     /// When the reader received the output being parsed.
     reading_at: Option<SystemTime>,
-    /// DEC synchronized updates defer title callbacks until ESU or timeout.
-    /// Replay must retain the oldest read time of the buffered frame.
-    sync_started_at: Option<SystemTime>,
     /// Output read after the window has been parsed.
     fresh_output: bool,
 }
@@ -201,23 +199,8 @@ impl LifecycleEvidence {
 
     /// The parser is about to apply output the reader received at `at`.
     pub(crate) fn begin_read(&mut self, at: SystemTime) {
-        let effective_at = self.sync_started_at.unwrap_or(at);
-        self.reading_at = Some(effective_at);
-        self.fresh_output |= self.output_is_fresh(effective_at);
-    }
-
-    /// Called after each parser chunk, while the parser lock still identifies
-    /// whether a synchronized update has buffered output for a later replay.
-    pub(crate) fn sync_state_after_read(&mut self, active: bool, at: SystemTime) {
-        self.sync_started_at = if active {
-            Some(self.sync_started_at.map_or(at, |started| started.min(at)))
-        } else {
-            None
-        };
-    }
-
-    pub(crate) fn sync_started_at(&self) -> Option<SystemTime> {
-        self.sync_started_at
+        self.reading_at = Some(at);
+        self.fresh_output |= self.output_is_fresh(at);
     }
 
     pub(crate) fn end_read(&mut self) {
@@ -258,10 +241,15 @@ impl LifecycleEvidence {
         let mark = self.mark(at);
         self.submitted = Some(mark);
         self.first_submission.get_or_insert(self.binding_rev);
+        self.first_submission_at.get_or_insert(at);
     }
 
     pub(crate) fn first_submission_binding(&self) -> Option<u64> {
         self.first_submission.filter(|rev| *rev != 0)
+    }
+
+    pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
+        self.first_submission_at
     }
 
     pub(crate) fn binding_rev(&self) -> u64 {
