@@ -333,12 +333,15 @@ impl RuntimeStatusState {
         exited: bool,
         now: Instant,
     ) -> (bool, Option<Instant>) {
+        let program_status = session.program_status_snapshot();
+        // Reading PSP may flush an expired synchronized update and deliver
+        // its deferred UUID title through the #91 listener.
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
-        let program_status = session.program_status_snapshot();
         let program_root = (!exited).then_some(program_status.root).flatten();
-        let program_status_changed_source = program_root.is_some() != self.program_status_active
-            || program_status.clear_revision > self.program_status_revision;
+        let program_status_cleared = program_status.clear_revision > self.program_status_revision;
+        let program_status_changed_source =
+            program_root.is_some() != self.program_status_active || program_status_cleared;
         self.program_status_revision = program_status.revision;
         self.program_status_active = program_root.is_some();
         if binding_changed {
@@ -374,6 +377,9 @@ impl RuntimeStatusState {
             // Idle report, and a cleared PSP edge cannot complete fallback Idle.
             self.prev_raw = None;
             self.done_latch = false;
+            if program_status_cleared {
+                self.codex_idle_done = false;
+            }
         }
 
         let evidence = session.runtime_evidence(self.title_cursor);
@@ -432,7 +438,7 @@ impl RuntimeStatusState {
         let has_visible_sources = !working_markers.is_empty()
             || !blocked_markers.is_empty()
             || needs_provider_screen_scan;
-        let mut next_deadline = None;
+        let mut next_deadline = session.program_status_sync_deadline();
         match status_screen_capture_plan(
             self.content_generation,
             content_generation,
@@ -530,11 +536,15 @@ impl RuntimeStatusState {
         // title arrives. A PSP Working edge in that first binding confirms the
         // work; later binding switches still require a new submission.
         let codex_submitted_turn = submitted_turn || session.initial_unbound_submission();
-        let codex_idle_completion = title_provider == TitleProvider::Codex
-            && codex_submitted_turn
+        let codex_idle_completions =
+            if title_provider == TitleProvider::Codex && codex_submitted_turn {
+                new_idle
+            } else {
+                0
+            };
+        let codex_idle_completion = codex_idle_completions > 0
             && program_root.is_some_and(|root| root.state == ProgramState::Idle)
-            && program_status.working_to_idle_revision > program_status.clear_revision
-            && new_idle > 0;
+            && program_status.working_to_idle_revision > program_status.clear_revision;
         if codex_idle_completion {
             self.codex_idle_done = true;
         } else if !program_root.is_some_and(|root| root.state == ProgramState::Idle)
@@ -542,7 +552,7 @@ impl RuntimeStatusState {
         {
             self.codex_idle_done = false;
         }
-        let new_completions = new_explicit + if codex_idle_completion { new_idle } else { 0 };
+        let new_completions = new_explicit + codex_idle_completions;
         let previous_completion_revision = self.completion_revision;
         self.completion_revision = self.completion_revision.wrapping_add(new_completions);
         let raw = program_root.map_or(fallback_raw, |root| {
@@ -2056,7 +2066,7 @@ impl TerminalView {
                     // On restore, leave the prompt typed but unsubmitted.
                     if submit {
                         timer(SUBMIT_DELAY_MS).await;
-                        session.mark_turn_submitted();
+                        session.mark_prompt_submitted();
                         session.write_input(b"\r");
                         profile::startup_event(
                             instance_id,
@@ -2331,7 +2341,7 @@ impl TerminalView {
     /// facts are current for readers on return; the caller decides when to paint.
     /// Returns whether the public snapshot changed.
     fn update_runtime(&mut self, cx: &mut Context<Self>) -> bool {
-        let binding_changed = self.runtime.binding_rev != self.session.binding_revision();
+        let previous_binding = self.runtime.binding_rev;
         let (changed, deadline) = self.runtime.reconcile(
             &self.session,
             self.title_provider,
@@ -2340,7 +2350,7 @@ impl TerminalView {
             self.exited,
             Instant::now(),
         );
-        self.schedule_runtime_deadline(deadline, binding_changed, cx);
+        self.schedule_runtime_deadline(deadline, previous_binding != self.runtime.binding_rev, cx);
         changed
     }
 
@@ -4243,6 +4253,89 @@ mod provider_switch_tests {
             crate::program_status::ProgramState::Blocked
         );
         twice.kill();
+
+        let (st, _receiver) = fixture();
+        st.process_output(
+            b"\x1b[?2026h\x1b]0;019f95d7-db31-7db0-904d-9e08330e0008 | Re\x01ady\x1b",
+        );
+        st.process_output(b"\\\x1b]7501;state=working\x07");
+        assert_eq!(st.program_status_snapshot().root, None);
+        st.process_output(b"\x1b[?2026l");
+        assert_eq!(st.binding_revision(), 1);
+        assert_eq!(
+            st.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        st.process_output(
+            b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0009 | Ready\x1b\\\x1b]7501;state=blocked\x07",
+        );
+        assert_eq!(st.binding_revision(), 2);
+        assert_eq!(
+            st.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Blocked
+        );
+        st.kill();
+
+        let (oversized, _receiver) = fixture();
+        let title = format!(
+            "\x1b]0;019f95d7-db31-7db0-904d-9e08330e0010 | {}\x07\x1b]7501;state=working\x07",
+            "x".repeat(5000)
+        );
+        oversized.process_output(title.as_bytes());
+        assert_eq!(oversized.binding_revision(), 1);
+        assert_eq!(oversized.program_status_snapshot().root, None);
+        oversized.process_output(b"\x1b]7501;state=blocked\x07");
+        assert_eq!(
+            oversized.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Blocked
+        );
+        oversized.process_output(
+            b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0010 | Ready\x07\x1b]7501;state=idle\x07",
+        );
+        assert_eq!(oversized.binding_revision(), 1);
+        assert_eq!(
+            oversized.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Idle
+        );
+        oversized.kill();
+    }
+
+    #[test]
+    fn unterminated_synchronized_title_flushes_on_runtime_deadline() {
+        let (session, _receiver) = fixture();
+        session.process_output(
+            b"\x1b[?2026h\x1b]0;019f95d7-db31-7db0-904d-9e08330e0016 | Ready\x07\x1b]7501;state=working\x07",
+        );
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let (_, deadline) = runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        if session.binding_revision() == 0 {
+            let sync_deadline = session
+                .program_status_sync_deadline()
+                .expect("BSU has a timeout");
+            assert!(deadline.is_some_and(|deadline| deadline <= sync_deadline));
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Idle);
+            std::thread::sleep(
+                sync_deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+            );
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+        }
+        assert_eq!(session.binding_revision(), 1);
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+        session.kill();
     }
 
     #[test]
@@ -4407,7 +4500,7 @@ mod provider_switch_tests {
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
         session.paste("A real prompt");
-        session.mark_turn_submitted();
+        session.mark_prompt_submitted();
         session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0011 | Ready\x07");
         assert_eq!(session.binding_revision(), 1);
         assert!(!session.runtime_evidence(None).submitted);
@@ -4444,6 +4537,71 @@ mod provider_switch_tests {
         runtime.reconcile(&selector, TitleProvider::Codex, &[], &[], false, now);
         assert_eq!(runtime.snapshot(&selector).status, AgentStatus::Idle);
         selector.kill();
+
+        let (navigation, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        navigation.write_input(b"\x1b[B"); // Down in the resume picker.
+        assert!(navigation.input_snapshot().1);
+        navigation.mark_turn_submitted();
+        navigation.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0014 | Ready\x07");
+        navigation.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+        runtime.reconcile(&navigation, TitleProvider::Codex, &[], &[], false, now);
+        assert_eq!(runtime.snapshot(&navigation).status, AgentStatus::Idle);
+        navigation.kill();
+    }
+
+    #[test]
+    fn known_initial_prompt_keeps_working_across_first_uuid_title() {
+        for title in [
+            "019f95d7-db31-7db0-904d-9e08330e0015",
+            "01a163d0-b2d5-7232-8ffe-fb1e6...",
+        ] {
+            for sync in [false, true] {
+                for title_first in [false, true] {
+                    let (session, _receiver) = fixture();
+                    let mut runtime =
+                        RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                    session.paste("A real prompt");
+                    session.mark_prompt_submitted();
+                    let working = "\x1b]7501;state=working\x07";
+                    let title_frame = format!("\x1b]0;{title} | Ready\x07");
+                    let idle = "\x1b]7501;state=idle\x07";
+                    let wire = format!(
+                        "{}{}{}{}{}",
+                        if sync { "\x1b[?2026h" } else { "" },
+                        if title_first { &title_frame } else { working },
+                        if title_first { working } else { &title_frame },
+                        idle,
+                        if sync { "\x1b[?2026l" } else { "" },
+                    );
+                    session.test_program_status(wire.as_bytes());
+                    runtime.reconcile(
+                        &session,
+                        TitleProvider::Codex,
+                        &[],
+                        &[],
+                        false,
+                        Instant::now(),
+                    );
+                    let snapshot = runtime.snapshot(&session);
+                    assert_eq!(
+                        session.binding_revision(),
+                        1,
+                        "{title} sync={sync} first={title_first}"
+                    );
+                    assert_eq!(
+                        snapshot.status,
+                        AgentStatus::Done,
+                        "{title} sync={sync} first={title_first}"
+                    );
+                    assert_eq!(
+                        snapshot.completion_revision, 1,
+                        "{title} sync={sync} first={title_first}"
+                    );
+                    session.kill();
+                }
+            }
+        }
     }
 
     #[test]
@@ -4496,6 +4654,65 @@ mod provider_switch_tests {
             assert_eq!(snapshot.completion_revision, expected);
         }
         session.kill();
+    }
+
+    #[test]
+    fn clear_or_ris_then_idle_retires_previous_codex_completion() {
+        for reset in [b"\x1b]7501;state=clear\x07".as_slice(), b"\x1bc".as_slice()] {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            session.mark_turn_submitted();
+            session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            let mut wire = reset.to_vec();
+            wire.extend_from_slice(b"\x1b]7501;state=idle\x07");
+            session.test_program_status(&wire);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, AgentStatus::Idle, "reset={reset:?}");
+            assert_eq!(snapshot.completion_revision, 1);
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn coalesced_completion_pulses_when_newer_work_is_current() {
+        for completion in ["idle", "done"] {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            session.mark_turn_submitted();
+            let wire = format!(
+                "\x1b]7501;state=working\x07\x1b]7501;state={completion}\x07\x1b]7501;state=working\x07"
+            );
+            session.test_program_status(wire.as_bytes());
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, AgentStatus::Working, "{completion}");
+            assert_eq!(snapshot.completion_revision, 1, "{completion}");
+            session.kill();
+        }
     }
 
     #[test]

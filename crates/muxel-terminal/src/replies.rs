@@ -323,8 +323,6 @@ mod tests {
                 evidence: Default::default(),
                 title: Default::default(),
                 title_generation: Default::default(),
-                program_status: Default::default(),
-                program_status_titles: Default::default(),
                 title_changed_at: Default::default(),
                 session_id_hint: Default::default(),
                 bell: Default::default(),

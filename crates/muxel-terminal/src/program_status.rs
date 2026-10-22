@@ -4,6 +4,7 @@
 //! Only the root record drives a pane badge; child ids are valid protocol input
 //! but describe work inside the pane, not the pane's own lifecycle.
 
+use alacritty_terminal::vte::{Parser, Perform};
 use base64::Engine as _;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
@@ -187,8 +188,9 @@ enum ScanState {
     OtherEscape,
 }
 
-/// Bounded scanner for OSCs beside the VTE parser. DCS and other strings stay
-/// opaque, so a passthrough wrapper cannot forge a local status report.
+/// Reader-thread framing for immediate capability replies. PSP state and
+/// binding attribution use `Observer` on the UI drain. DCS and other strings
+/// stay opaque here, so a passthrough wrapper cannot forge a local query.
 #[derive(Default)]
 pub(crate) struct Scanner {
     state: ScanState,
@@ -313,10 +315,162 @@ impl Scanner {
     }
 }
 
+/// Passive VTE observer for the PTY output stream. Alacritty keeps its own
+/// processor for the grid and UI title; this parser observes protocol facts
+/// before synchronized updates can defer the grid's callbacks.
+#[derive(Default)]
+pub(crate) struct Observer {
+    parser: Parser,
+    escape: bool,
+    escape_fresh: bool,
+    escape_generation: u64,
+    osc_len: usize,
+    osc_fresh: bool,
+    osc_generation: u64,
+    osc_invalid_control: bool,
+    discard_osc: bool,
+}
+
+#[derive(Default)]
+struct ObservedEvent {
+    event: Option<Event>,
+    cancelled: bool,
+}
+
+impl Perform for ObservedEvent {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if self.cancelled || params.is_empty() {
+            return;
+        }
+        self.event = match params[0] {
+            b"0" | b"2" if params.len() >= 2 => {
+                let title = params[1..]
+                    .iter()
+                    .filter_map(|part| std::str::from_utf8(part).ok())
+                    .collect::<Vec<_>>()
+                    .join(";")
+                    .trim()
+                    .to_owned();
+                Some(Event::Title(title))
+            }
+            b"7501" if params.len() == 2 && params[1] == b"?" => Some(Event::Query),
+            b"7501" if params.len() == 2 => parse_report(params[1]).map(Event::Report),
+            b"133" if params.get(1) == Some(&b"A".as_slice()) => Some(Event::ShellPrompt),
+            _ => None,
+        };
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if !ignore && intermediates.is_empty() && byte == b'c' {
+            self.event = Some(Event::Reset);
+        }
+    }
+}
+
+impl Observer {
+    #[cfg(test)]
+    fn advance(&mut self, byte: u8) -> Option<Event> {
+        self.advance_at(byte, true, 0)
+    }
+
+    pub(crate) fn advance_at(&mut self, byte: u8, fresh: bool, generation: u64) -> Option<Event> {
+        let was_osc = self.osc_len > 0;
+        // vte's std build grows its OSC Vec without a limit. This watchdog
+        // follows only OSC entry and termination; it does not decode a second
+        // grammar. On overflow, reset the parser and discard until termination.
+        if self.discard_osc {
+            if byte == 0x1b {
+                self.discard_osc = false;
+                self.escape = true;
+                self.escape_fresh = fresh;
+                self.escape_generation = generation;
+                self.parser = Parser::new();
+                self.parser.advance(&mut ObservedEvent::default(), &[byte]);
+            } else if matches!(byte, 0x07 | 0x18 | 0x1a) {
+                self.discard_osc = false;
+                self.parser = Parser::new();
+            }
+            return None;
+        }
+        if self.osc_len > 0 {
+            self.osc_len += 1;
+            self.osc_invalid_control |=
+                matches!(byte, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f);
+            if self.osc_len > MAX_SEQUENCE {
+                self.osc_len = 0;
+                self.parser = Parser::new();
+                self.discard_osc = byte != 0x1b;
+                self.escape = byte == 0x1b;
+                self.escape_fresh = fresh;
+                self.escape_generation = generation;
+                if byte == 0x1b {
+                    self.parser.advance(&mut ObservedEvent::default(), &[byte]);
+                }
+                return None;
+            }
+            if matches!(byte, 0x1b | 0x07 | 0x18 | 0x1a) {
+                self.osc_len = 0;
+            }
+        } else if self.escape && byte == b']' {
+            self.osc_len = 2;
+            self.osc_fresh = self.escape_fresh && fresh;
+            self.osc_generation = self.escape_generation;
+            self.osc_invalid_control = false;
+        }
+        let completing_osc = was_osc && matches!(byte, 0x1b | 0x07 | 0x18 | 0x1a);
+        let osc_attributable = self.osc_fresh && fresh && self.osc_generation == generation;
+        let escape_attributable =
+            self.escape_fresh && fresh && self.escape_generation == generation;
+        self.escape = byte == 0x1b;
+        if self.escape {
+            self.escape_fresh = fresh;
+            self.escape_generation = generation;
+        }
+        let mut sink = ObservedEvent {
+            cancelled: matches!(byte, 0x18 | 0x1a),
+            ..ObservedEvent::default()
+        };
+        self.parser.advance(&mut sink, &[byte]);
+        match sink.event {
+            Some(Event::Title(title)) if completing_osc && osc_attributable => {
+                Some(Event::Title(title))
+            }
+            Some(Event::Reset) if escape_attributable => Some(Event::Reset),
+            Some(Event::Query | Event::Report(_)) if self.osc_invalid_control => None,
+            Some(event) if completing_osc && osc_attributable => Some(event),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootStatus {
     pub state: ProgramState,
     pub kind: Option<ProgramStatusKind>,
+}
+
+/// The exact UUID-shaped title field accepted by #91. Codex also publishes
+/// abbreviated fields ending in `...`; a full UUID parser would miss those
+/// boundaries. Fixed storage keeps the snapshot Copy without hashing titles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadKey {
+    bytes: [u8; 36],
+    len: u8,
+}
+
+impl ThreadKey {
+    pub(crate) fn from_field(field: &str) -> Option<Self> {
+        let bytes = field.as_bytes();
+        if bytes.len() > 36 {
+            return None;
+        }
+        let mut key = Self {
+            bytes: [0; 36],
+            len: bytes.len() as u8,
+        };
+        key.bytes[..bytes.len()].copy_from_slice(bytes);
+        Some(key)
+    }
 }
 
 /// One pane's root record and ordered transition facts. `revision` also lets a
@@ -325,15 +479,38 @@ pub(crate) struct RootStatus {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramStatusSnapshot {
     pub root: Option<RootStatus>,
+    pub binding_revision: u64,
     pub revision: u64,
     pub clear_revision: u64,
     pub working_to_idle_revision: u64,
     pub idle_completions: u64,
     pub explicit_completions: u64,
     working_active: bool,
+    thread: Option<ThreadKey>,
 }
 
 impl ProgramStatusSnapshot {
+    pub fn observe_title(&mut self, thread: ThreadKey, carry_initial_working: bool) {
+        if self.thread != Some(thread) {
+            let working =
+                self.binding_revision == 0 && carry_initial_working && self.working_active;
+            self.thread = Some(thread);
+            self.binding_revision = self.binding_revision.wrapping_add(1);
+            self.clear_binding();
+            self.working_active = working;
+        }
+    }
+
+    pub fn adopt_binding(&mut self, revision: u64) {
+        self.binding_revision = revision;
+        self.clear_binding();
+    }
+
+    pub fn recover_binding(&mut self, revision: u64, thread: Option<ThreadKey>) {
+        self.thread = thread;
+        self.adopt_binding(revision);
+    }
+
     pub fn apply(&mut self, report: Report) {
         if report.id.is_some() {
             return;
@@ -405,7 +582,85 @@ impl ProgramStatusSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, ProgramState, ProgramStatusKind, ProgramStatusSnapshot, Scanner};
+    use super::{Event, Observer, ProgramState, ProgramStatusKind, ProgramStatusSnapshot, Scanner};
+
+    fn observed(bytes: &[u8]) -> Vec<Event> {
+        let mut observer = Observer::default();
+        bytes
+            .iter()
+            .filter_map(|byte| observer.advance(*byte))
+            .collect()
+    }
+
+    #[test]
+    fn observer_uses_vte_title_framing_and_normalization() {
+        let wire = b"\x1b]0;Topic\x01; Ready\x1b\\\x1b]7501;state=working\x07";
+        let expected = observed(wire);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0], Event::Title("Topic; Ready".to_string()));
+        assert!(
+            matches!(&expected[1], Event::Report(report) if report.state == ProgramState::Working)
+        );
+        for split in 0..=wire.len() {
+            let mut observer = Observer::default();
+            let mut actual = Vec::new();
+            for part in [&wire[..split], &wire[split..]] {
+                actual.extend(part.iter().filter_map(|byte| observer.advance(*byte)));
+            }
+            assert_eq!(actual, expected, "split at {split}");
+        }
+        // VTE completes OSC at ESC, before the slash half of ST arrives.
+        let mut observer = Observer::default();
+        let first = b"\x1b]0;Topic\x1b";
+        let events = first
+            .iter()
+            .filter_map(|byte| observer.advance(*byte))
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec![Event::Title("Topic".to_string())]);
+        assert_eq!(observer.advance(b'\\'), None);
+    }
+
+    #[test]
+    fn observer_rejects_stale_and_cross_boundary_titles() {
+        let title = b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0015 | Old\x07";
+        let mut observer = Observer::default();
+        assert!(
+            title
+                .iter()
+                .all(|byte| observer.advance_at(*byte, false, 1).is_none())
+        );
+
+        let mut observer = Observer::default();
+        let start = b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0015 | Old";
+        assert!(
+            start
+                .iter()
+                .all(|byte| observer.advance_at(*byte, true, 1).is_none())
+        );
+        assert_eq!(observer.advance_at(0x07, true, 2), None);
+    }
+
+    #[test]
+    fn observer_bounds_osc_and_recovers_from_opaque_strings() {
+        let mut wire = b"\x1b]7501;state=working:msg=".to_vec();
+        wire.extend(vec![b'A'; 5000]);
+        wire.extend_from_slice(b"\x07\x1b]7501;state=idle\x07");
+        assert_eq!(observed(&wire).len(), 1);
+        assert!(
+            matches!(&observed(&wire)[0], Event::Report(report) if report.state == ProgramState::Idle)
+        );
+        assert_eq!(
+            observed(b"\x1bPopaque\x1bc\x1b]133;A\x07"),
+            vec![Event::Reset, Event::ShellPrompt]
+        );
+        // vte exposes at most 16 OSC parameters. Reject extra semicolons so
+        // a malformed address hidden past that limit cannot become root.
+        assert!(
+            observed(b"\x1b]7501;state=working;x;x;x;x;x;x;x;x;x;x;x;x;x;x;id=worker!\x07")
+                .is_empty()
+        );
+        assert!(observed(b"\x1b]7501;sta\x01te=working\x07").is_empty());
+    }
 
     fn events(bytes: &[u8]) -> Vec<Event> {
         let mut scanner = Scanner::default();

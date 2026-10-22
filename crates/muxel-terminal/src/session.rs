@@ -8,10 +8,12 @@
 
 use crate::colors::TerminalPalette;
 use crate::listener::{
-    EvidenceRead, LifecycleEvidence, MuxelListener, ProgramStatusTitleStream, SharedWriter,
+    EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter, session_thread_field,
 };
 use crate::profile;
-use crate::program_status::{Event as ProgramStatusEvent, ProgramStatusSnapshot, Scanner};
+use crate::program_status::{
+    Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
+};
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -899,8 +901,8 @@ pub struct TerminalSession {
     pub id: Uuid,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
-    program_status_scanner: Mutex<Scanner>,
-    program_status_titles: Arc<Mutex<ProgramStatusTitleStream>>,
+    program_status_observer: Mutex<Observer>,
+    program_status_generation: AtomicU64,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1325,7 +1327,6 @@ impl TerminalSession {
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
         let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
-        let program_status_titles = Arc::new(Mutex::new(ProgramStatusTitleStream::default()));
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1396,8 +1397,6 @@ impl TerminalSession {
             replies,
             title: title.clone(),
             evidence: evidence.clone(),
-            program_status: program_status.clone(),
-            program_status_titles: program_status_titles.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
@@ -1417,8 +1416,8 @@ impl TerminalSession {
             id: Uuid::new_v4(),
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
-            program_status_scanner: Mutex::new(Scanner::default()),
-            program_status_titles,
+            program_status_observer: Mutex::new(Observer::default()),
+            program_status_generation: AtomicU64::new(0),
             writer,
             master,
             output_queue,
@@ -1502,28 +1501,37 @@ impl TerminalSession {
     fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
-        let mut status_scanner = self.program_status_scanner.lock();
+        let mut status_observer = self.program_status_observer.lock();
         let mut parsed = false;
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
             }
-            self.evidence.lock().begin_read(read_at);
+            let fresh = self.evidence.lock().begin_read(read_at);
             let mut start = 0;
             for (index, &byte) in bytes.iter().enumerate() {
-                let Some(event) = status_scanner.advance(byte) else {
+                let generation = self.program_status_generation.load(Ordering::Acquire);
+                let Some(event) = status_observer.advance_at(byte, fresh, generation) else {
                     continue;
                 };
                 if matches!(event, ProgramStatusEvent::Query) {
                     continue;
                 }
                 if let ProgramStatusEvent::Title(title) = event {
-                    // VTE may defer the matching title callback until ESU.
-                    // Bind PSP here, before a later report on the wire, and
-                    // let the listener consume that deferred callback once.
-                    self.program_status_titles
-                        .lock()
-                        .scanned(title, &mut self.program_status.lock());
+                    // The observer advances the PSP binding in wire order.
+                    // The UI title still belongs to alacritty's listener,
+                    // which can defer its callback until ESU.
+                    if let Some(thread) = session_thread_field(&title)
+                        && let Some(key) = ThreadKey::from_field(thread)
+                    {
+                        let carry = self.evidence.lock().can_carry_initial_working();
+                        let mut status = self.program_status.lock();
+                        if fresh
+                            && self.program_status_generation.load(Ordering::Acquire) == generation
+                        {
+                            status.observe_title(key, carry);
+                        }
+                    }
                     processor.advance(&mut *term, &bytes[start..=index]);
                     start = index + 1;
                     continue;
@@ -1534,17 +1542,36 @@ impl TerminalSession {
                 start = index + 1;
                 match event {
                     ProgramStatusEvent::Report(report) => {
-                        if report.id.is_none() {
-                            log::debug!(
-                                "program status source=osc7501 report state={:?} kind={:?}",
-                                report.state,
-                                report.kind
-                            );
+                        let mut status = self.program_status.lock();
+                        if fresh
+                            && self.program_status_generation.load(Ordering::Acquire) == generation
+                        {
+                            if report.id.is_none() {
+                                log::debug!(
+                                    "program status source=osc7501 report state={:?} kind={:?}",
+                                    report.state,
+                                    report.kind
+                                );
+                            }
+                            status.apply(report);
                         }
-                        self.program_status.lock().apply(report);
                     }
-                    ProgramStatusEvent::Reset => self.program_status.lock().clear(),
-                    ProgramStatusEvent::ShellPrompt => self.program_status.lock().shell_prompt(),
+                    ProgramStatusEvent::Reset => {
+                        let mut status = self.program_status.lock();
+                        if fresh
+                            && self.program_status_generation.load(Ordering::Acquire) == generation
+                        {
+                            status.clear();
+                        }
+                    }
+                    ProgramStatusEvent::ShellPrompt => {
+                        let mut status = self.program_status.lock();
+                        if fresh
+                            && self.program_status_generation.load(Ordering::Acquire) == generation
+                        {
+                            status.shell_prompt();
+                        }
+                    }
                     ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => unreachable!(),
                 }
             }
@@ -1728,12 +1755,10 @@ impl TerminalSession {
         writer.write_all(data)?;
         writer.flush()?;
         if !data.is_empty() {
-            let has_prompt = self.input_snapshot().1 || data.len() > 1;
-            if has_prompt {
-                self.evidence.lock().record_prompt_submission(submitted_at);
-            } else {
-                self.evidence.lock().record_submission(submitted_at);
-            }
+            // This API admits a known prompt after `paste_prompt` has checked
+            // the pane and input revision. Generic keyboard Enter uses
+            // `mark_turn_submitted` and cannot prove prompt intent.
+            self.evidence.lock().record_prompt_submission(submitted_at);
             self.turn_submitted.store(true, Ordering::Relaxed);
             self.advance_input(Some(true));
             self.mark_interactive();
@@ -1813,11 +1838,17 @@ impl TerminalSession {
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
         let submitted_at = SystemTime::now();
-        if self.input_snapshot().1 {
-            self.evidence.lock().record_prompt_submission(submitted_at);
-        } else {
-            self.evidence.lock().record_submission(submitted_at);
-        }
+        self.evidence.lock().record_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Explicit prompt submission from a path that supplied the prompt text.
+    /// Keyboard Enter alone can select a resume item, even after arrow input.
+    pub fn mark_prompt_submitted(&self) {
+        let submitted_at = SystemTime::now();
+        let mut evidence = self.evidence.lock();
+        evidence.record_prompt_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
     }
@@ -2396,9 +2427,15 @@ impl TerminalSession {
         to: SystemTime,
         learned_at: SystemTime,
     ) {
+        // A sequence begun before this boundary cannot become a new binding's
+        // report just because its terminator arrives in a later PTY read.
+        self.program_status_generation
+            .fetch_add(1, Ordering::AcqRel);
         let evidence = &mut *self.evidence.lock();
         let switch = evidence.switch_binding(from, to, learned_at);
-        self.program_status.lock().clear_binding();
+        self.program_status
+            .lock()
+            .adopt_binding(evidence.binding_rev());
         if switch.bell {
             self.bell.store(false, Ordering::Relaxed);
         }
@@ -2423,14 +2460,50 @@ impl TerminalSession {
         self.evidence.lock().binding_rev()
     }
 
+    /// The embedder owns vte's synchronized-update timeout. The view uses this
+    /// deadline to revisit a title/report held by a BSU without more PTY bytes.
+    pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
+        self.processor.lock().sync_timeout().sync_timeout()
+    }
+
+    fn flush_expired_program_status_sync(&self) {
+        let mut term = self.term.lock();
+        let mut processor = self.processor.lock();
+        if processor
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            processor.stop_sync(&mut *term);
+            self.bump_content();
+            self.trigger_runtime();
+        }
+    }
+
     pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        self.flush_expired_program_status_sync();
         // A synchronized update may have supplied a new UUID title while VTE
-        // still holds its callback. Do not publish that conversation's PSP
-        // facts under the previous binding revision before ESU flushes it.
-        if self.program_status_titles.lock().binding_pending() {
+        // still holds its callback. The observer is then ahead of #91.
+        // The listener takes hint before evidence for a title callback. Keep
+        // that order here when recovering from an over-budget title.
+        let hint_thread = self
+            .session_id_hint
+            .lock()
+            .as_deref()
+            .and_then(session_thread_field)
+            .and_then(ThreadKey::from_field);
+        let binding_rev = self.evidence.lock().binding_rev();
+        let mut status = self.program_status.lock();
+        if status.binding_revision > binding_rev {
             return ProgramStatusSnapshot::default();
         }
-        *self.program_status.lock()
+        if status.binding_revision < binding_rev {
+            // An overlong title can be rejected by the observer's OSC budget
+            // while alacritty still emits it. The listener proves a newer
+            // binding; retire old PSP facts and accept later fresh reports.
+            status.recover_binding(binding_rev, hint_thread);
+        }
+        *status
     }
 
     #[cfg(test)]
@@ -5151,6 +5224,57 @@ mod runtime_fact_tests {
         std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
         assert!(!session.resize(81, 24));
         assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    #[test]
+    fn queued_and_cross_boundary_reports_cannot_restore_a_retired_binding() {
+        let session = fixture();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10);
+        let mut first = PtyOutput::default();
+        first.push(b"\x1b]7501;state=working\x07", old);
+        session.process_drained(&first);
+        assert!(session.program_status_snapshot().root.is_some());
+
+        session.provider_switched_at(now, now, now);
+        let mut queued = PtyOutput::default();
+        queued.push(b"\x1b]7501;state=done\x07", old);
+        session.process_drained(&queued);
+        let snapshot = session.program_status_snapshot();
+        assert_eq!(snapshot.root, None);
+        assert_eq!(snapshot.explicit_completions, 0);
+
+        let mut ambiguous_start = PtyOutput::default();
+        ambiguous_start.push(b"\x1b]7501;state=done", now + Duration::from_secs(1));
+        session.process_drained(&ambiguous_start);
+        let mut fresh_end = PtyOutput::default();
+        fresh_end.push(b"\x07", now + Duration::from_secs(10));
+        session.process_drained(&fresh_end);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        // The first half of this frame is parsed before another switch; its
+        // terminator arrives in a fresh read after the boundary.
+        let before = now + Duration::from_secs(20);
+        let mut partial = PtyOutput::default();
+        partial.push(b"\x1b]7501;state=done", before);
+        session.process_drained(&partial);
+        session.provider_switched_at(before, before, before);
+        let mut ending = PtyOutput::default();
+        ending.push(b"\x07", before + Duration::from_secs(10));
+        session.process_drained(&ending);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        let mut new = PtyOutput::default();
+        new.push(
+            b"\x1b]7501;state=working\x07",
+            before + Duration::from_secs(11),
+        );
+        session.process_drained(&new);
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
         session.kill();
     }
 

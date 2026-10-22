@@ -1078,8 +1078,7 @@ fn apply_status_sample(
             } => (true, notify, new_binding),
         };
     let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
-    let completion_pulse = status == AgentStatus::Done
-        && coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus
+    let completion_pulse = coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus
         && record
             .filter(|seen| seen.binding == binding)
             .map_or(completion_revision > 0, |seen| {
@@ -1114,7 +1113,17 @@ fn apply_status_sample(
                 .current_state()
                 .or_else(|| previous.map(activity_state))
         };
-        effect.activity_changed |= activity.observe(previous_activity, activity_state(status), now);
+        if completion_pulse && status != AgentStatus::Done {
+            // Two protocol turns can fit in one PTY drain. Keep the current
+            // badge Working/Blocked while recording the intervening finish.
+            effect.activity_changed |=
+                activity.observe(previous_activity, AgentActivityState::Done, now);
+            effect.activity_changed |=
+                activity.observe(Some(AgentActivityState::Done), activity_state(status), now);
+        } else {
+            effect.activity_changed |=
+                activity.observe(previous_activity, activity_state(status), now);
+        }
         if attended && status == AgentStatus::Done {
             effect.activity_changed |= activity.attend(now);
         }
@@ -1126,7 +1135,7 @@ fn apply_status_sample(
             && !new_binding
             && is_restored_transition(false, status, restored_state));
     effect.completed = (changed && status == AgentStatus::Done || completion_pulse) && !restored;
-    effect.notify = if completion_pulse && !attended && !restored {
+    effect.notify = if completion_pulse && status == AgentStatus::Done && !attended && !restored {
         Some(NotifKind::Done)
     } else {
         notify.filter(|_| !attended && !restored)
@@ -1265,6 +1274,63 @@ mod status_attention_tests {
             repeated,
             sample.coverage
         ));
+    }
+
+    #[test]
+    fn program_status_completion_pulse_survives_newer_working_level() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = Some(SeenStatus {
+            status: AgentStatus::Working,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 0,
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(
+            Some(muxel_core::AgentActivityState::Idle),
+            muxel_core::AgentActivityState::Working,
+            100,
+        );
+        let sample = StatusSample {
+            status: AgentStatus::Working,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 1,
+            attributable: true,
+            attended: false,
+            preserve_restored: false,
+        };
+        let previous = record;
+        let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+        assert!(effect.completed);
+        assert!(!effect.changed);
+        assert_eq!(effect.notify, None);
+        assert_eq!(activity.completed_at, Some(200));
+        assert_eq!(
+            activity.current_state(),
+            Some(muxel_core::AgentActivityState::Working)
+        );
+        assert!(should_refresh_accomplishments_after_status(
+            previous,
+            effect,
+            sample.coverage
+        ));
+        let repeated = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+        assert!(!repeated.completed);
+        assert_eq!(activity.completed_at, Some(200));
+
+        let blocked = StatusSample {
+            status: AgentStatus::Blocked,
+            completion_revision: 2,
+            ..sample
+        };
+        let effect = apply_status_sample(&mut record, Some(&mut activity), blocked, 400);
+        assert!(effect.completed);
+        assert_eq!(effect.notify, Some(NotifKind::Blocked));
+        assert_eq!(activity.completed_at, Some(400));
     }
 
     #[test]
@@ -12198,7 +12264,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(self.continue_message_for(iid).as_bytes());
-            session.mark_turn_submitted();
+            session.mark_prompt_submitted();
             session.write_input(b"\r");
         }
     }
@@ -18864,7 +18930,7 @@ impl MuxelApp {
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
                 let session = view.read(cx).session();
-                session.mark_turn_submitted();
+                session.mark_prompt_submitted();
                 session.write_input(payload.as_bytes());
             }
         }
@@ -18907,12 +18973,20 @@ impl MuxelApp {
         else {
             return;
         };
+        let mut supplied_prompt = false;
         for step in steps {
             match step {
-                SnippetStep::Paste(text) => session.paste(text),
+                SnippetStep::Paste(text) => {
+                    supplied_prompt |= !text.is_empty();
+                    session.paste(text);
+                }
                 SnippetStep::Write(bytes) => {
                     if bytes.ends_with(b"\r") {
-                        session.mark_turn_submitted();
+                        if supplied_prompt || bytes.len() > 1 {
+                            session.mark_prompt_submitted();
+                        } else {
+                            session.mark_turn_submitted();
+                        }
                     }
                     session.write_input(bytes);
                 }
@@ -19636,7 +19710,7 @@ impl MuxelApp {
         };
         session.paste(text);
         if submit {
-            session.mark_turn_submitted();
+            session.mark_prompt_submitted();
             session.write_input(b"\r");
         }
         self.focus_instance(iid, window, cx);
