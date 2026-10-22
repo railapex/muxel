@@ -139,9 +139,8 @@ final class InteropTests: XCTestCase {
             let accepted: Bool
             let targets: [Target]
         }
-        let fixtureURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("tests/fixtures/tmux-confirmed-status.json")
+        let fixtureURL = try XCTUnwrap(Bundle(for: InteropTests.self)
+            .url(forResource: "tmux-confirmed-status", withExtension: "json"))
         let cases = try JSONDecoder().decode([Fixture].self, from: Data(contentsOf: fixtureURL))
         XCTAssertFalse(cases.isEmpty)
         for (index, sample) in cases.enumerated() {

@@ -334,6 +334,21 @@ struct LaunchTicket {
     since: Instant,
 }
 
+/// The local owner probe belongs to one binding. A missing tmux executable
+/// permits the terminal's shell fallback, but does not prove the session absent.
+enum LocalOwnerPreparation {
+    Confirmed(SessionTarget),
+    TmuxUnavailable(SessionTarget),
+}
+
+impl LocalOwnerPreparation {
+    fn target(&self) -> &SessionTarget {
+        match self {
+            Self::Confirmed(target) | Self::TmuxUnavailable(target) => target,
+        }
+    }
+}
+
 /// Whether a running launch still holds restore admission at `now`.
 fn launch_holds_admission(launch: LaunchTicket, now: Instant) -> bool {
     now.saturating_duration_since(launch.since) < TERMINAL_LAUNCH_DEADLINE
@@ -6399,7 +6414,11 @@ impl MuxelApp {
         muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd))
     }
 
-    fn command_for(&mut self, instance_id: Uuid) -> Result<CommandSpec, String> {
+    fn command_for(
+        &mut self,
+        instance_id: Uuid,
+        tmux_unavailable: bool,
+    ) -> Result<CommandSpec, String> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -6516,14 +6535,23 @@ impl MuxelApp {
             }) {
                 Some(session) => {
                     let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
-                    let socket = integrations::local_tmux_socket(&session);
+                    // A failed process spawn gives no version or owner answer.
+                    // Build the normal tmux command without another probe so
+                    // TerminalLaunch can show its existing fallback shell.
+                    let socket = if tmux_unavailable {
+                        integrations::profile_tmux_target(&session)
+                            .socket
+                            .unwrap_or(Socket::Private)
+                    } else {
+                        integrations::local_tmux_socket(&session)
+                    };
                     let launch = crate::session_binding::tmux_pane_args(
                         socket.clone(),
                         &session.name,
                         resolved.program.as_deref(),
                         &resolved.args,
                         instance_id,
-                        integrations::tmux_session_env_supported(),
+                        tmux_unavailable || integrations::tmux_session_env_supported(),
                         root.as_deref(),
                     )
                     .map_err(|error| match error {
@@ -6536,7 +6564,9 @@ impl MuxelApp {
                     // *before* this client creates its session — otherwise the shared
                     // server inherits this argv and a stray `pkill -f <project>` kills
                     // every agent in every session. See `ensure_tmux_server`.
-                    integrations::ensure_tmux_server(&socket);
+                    if !tmux_unavailable {
+                        integrations::ensure_tmux_server(&socket);
+                    }
                     (CommandSpec::program("tmux", launch.args), launch.env)
                 }
                 None => (
@@ -6687,7 +6717,7 @@ impl MuxelApp {
         if self.begin_local_tmux_owner_preparation(instance_id, None, cx) {
             return;
         }
-        self.spawn_terminal_with_owner(instance_id, window, cx);
+        self.spawn_terminal_with_owner(instance_id, false, window, cx);
     }
 
     /// The owner has either never needed a probe or was checked on a worker for
@@ -6695,6 +6725,7 @@ impl MuxelApp {
     fn spawn_terminal_with_owner(
         &mut self,
         instance_id: Uuid,
+        tmux_unavailable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6704,7 +6735,7 @@ impl MuxelApp {
             .workspace
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
-        let spec = match self.command_for(instance_id) {
+        let spec = match self.command_for(instance_id, tmux_unavailable) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error, cx);
@@ -6890,20 +6921,37 @@ impl MuxelApp {
                     let project = this.workspace.project(instance.project_id)?;
                     Some((instance.project_id, instance.tmux_target(&project.name)))
                 });
-                if current != Some((pid, target)) {
+                if current != Some((pid, target.clone())) {
                     this.terminal_launching.remove(&iid);
                     this.spawn_terminal_deferred(iid, window, cx);
                     return;
                 }
                 let prepared = match prepared {
                     Ok(target) => target,
+                    Err(error) if integrations::tmux_command_spawn_failed(&error) => {
+                        // The probe never answered. Keep the recorded owner and
+                        // let TerminalLaunch handle the tmux spawn failure.
+                        if deferred_token.is_some() {
+                            this.spawn_reserved_terminal_deferred(
+                                iid,
+                                token,
+                                Some(LocalOwnerPreparation::TmuxUnavailable(target)),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            this.terminal_launching.remove(&iid);
+                            this.spawn_terminal_with_owner(iid, true, window, cx);
+                        }
+                        return;
+                    }
                     Err(error) => {
                         this.fail_tmux_launch(iid, format!("{error:#}"));
                         cx.notify();
                         return;
                     }
                 };
-                let prepared_for_launch = prepared.clone();
+                let prepared_for_launch = LocalOwnerPreparation::Confirmed(prepared.clone());
                 if let Some(instance) = this.workspace.instance_mut(iid) {
                     instance.tmux_session = Some(prepared.name);
                     instance.tmux_socket = prepared.socket;
@@ -6930,7 +6978,7 @@ impl MuxelApp {
                     );
                 } else {
                     this.terminal_launching.remove(&iid);
-                    this.spawn_terminal_with_owner(iid, window, cx);
+                    this.spawn_terminal_with_owner(iid, false, window, cx);
                 }
             });
             if landed.is_none() {
@@ -7054,7 +7102,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
-        prepared_local_owner: Option<SessionTarget>,
+        prepared_local_owner: Option<LocalOwnerPreparation>,
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
@@ -7064,13 +7112,15 @@ impl MuxelApp {
         {
             return None;
         }
-        let still_prepared = prepared_local_owner.is_some_and(|expected| {
+        let still_prepared = prepared_local_owner.as_ref().is_some_and(|prepared| {
             self.workspace
                 .instance(instance_id)
                 .is_some_and(|instance| {
                     self.workspace
                         .project(instance.project_id)
-                        .is_some_and(|project| instance.tmux_target(&project.name) == expected)
+                        .is_some_and(|project| {
+                            instance.tmux_target(&project.name) == *prepared.target()
+                        })
                 })
         });
         if !still_prepared && self.begin_local_tmux_owner_preparation(instance_id, Some(token), cx)
@@ -7081,7 +7131,12 @@ impl MuxelApp {
             .workspace
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
-        let spec = match self.command_for(instance_id) {
+        let tmux_unavailable = still_prepared
+            && matches!(
+                prepared_local_owner,
+                Some(LocalOwnerPreparation::TmuxUnavailable(_))
+            );
+        let spec = match self.command_for(instance_id, tmux_unavailable) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error, cx);
@@ -7154,7 +7209,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
-        prepared_local_owner: Option<SessionTarget>,
+        prepared_local_owner: Option<LocalOwnerPreparation>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -10463,9 +10518,8 @@ impl MuxelApp {
             .iter()
             .map(|instance| (instance.id, (&instance.tmux_session, &instance.tmux_socket)))
             .collect();
-        let rebound_failures: Vec<_> = instances
+        let rebound_bindings: Vec<_> = instances
             .iter()
-            .filter(|instance| self.failed_launches.contains_key(&instance.id))
             .filter(|instance| {
                 old_bindings
                     .get(&instance.id)
@@ -10499,10 +10553,14 @@ impl MuxelApp {
             self.failed_launches.remove(&iid);
             self.workspace.remove_instance_meta(iid);
         }
-        // A refused namesake or stale owner must be retried against the peer's
-        // newly saved binding. Restart would kill the session we want to attach.
-        for iid in rebound_failures {
+        // A refused launch or an in-flight restart belongs to the old owner.
+        // Release both admissions before spawning the peer's newly saved owner.
+        // In particular, a delayed restart must never fail against this binding
+        // and offer a retry that would kill the peer's session.
+        for iid in rebound_bindings {
             self.failed_launches.remove(&iid);
+            self.terminal_restarts.cancel(iid);
+            self.terminal_launching.remove(&iid);
         }
         for instance in instances {
             // A peer can replace the binding while this pane keeps its PTY.

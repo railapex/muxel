@@ -141,11 +141,10 @@ enum TmuxCommands {
         var answered = 0
         var listing: [String] = []
         var targets: [SessionTarget] = []
-        for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            // Match Rust's `lines()`: a CR from CRLF is a line ending, not
-            // part of a session name or marker status.
-            var line = String(raw)
-            if line.hasSuffix("\r") { line.removeLast() }
+        for raw in output.utf8.split(separator: 0x0A, omittingEmptySubsequences: false) {
+            // Swift groups CRLF into one Character, so split UTF-8 bytes on LF
+            // before dropping Rust `lines()`'s optional terminal CR.
+            let line = String(decoding: raw.dropLast(raw.last == 0x0D ? 1 : 0), as: UTF8.self)
             guard line.hasPrefix(":muxel-listed:") else {
                 listing.append(line); continue
             }

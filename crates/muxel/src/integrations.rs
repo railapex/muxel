@@ -1883,12 +1883,20 @@ fn confirmed_tmux_has_session_output(out: &std::process::Output, session: &str) 
     }
     let error = String::from_utf8_lossy(&out.stderr);
     if out.status.code() == Some(1)
-        && (error.trim() == format!("can't find session: {session}")
+        && (confirmed_tmux_missing_session_error(&error, session)
             || muxel_core::tmux::confirmed_no_server(&error))
     {
         return Ok(false);
     }
     bail!("couldn't query tmux session “{session}”: {}", error.trim())
+}
+
+fn confirmed_tmux_missing_session_error(error: &str, session: &str) -> bool {
+    let line = error
+        .strip_suffix("\r\n")
+        .or_else(|| error.strip_suffix('\n'))
+        .unwrap_or(error);
+    line == format!("can't find session: {session}")
 }
 
 /// Collect a bounded command reply within one deadline, killing and reaping an
@@ -2288,6 +2296,15 @@ pub fn kill_tmux_session_confirmed(
     deadline: Instant,
 ) -> Result<SessionTarget> {
     let session = profile_tmux_target(session);
+    kill_tmux_session_confirmed_on(&session, deadline)
+}
+
+/// Restart an already-profiled target. Keeping this separate lets tests use a
+/// throwaway Named socket even when the test process inherited a profile root.
+fn kill_tmux_session_confirmed_on(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
     let socket = session
         .socket
         .as_ref()
@@ -2301,7 +2318,7 @@ pub fn kill_tmux_session_confirmed(
                 )
             ),
             Ok(false) => {}
-            Err(error) if tmux_command_spawn_failed(&error) => return Ok(session),
+            Err(error) if tmux_command_spawn_failed(&error) => return Ok(session.clone()),
             Err(error) => return Err(error),
         }
     }
@@ -2310,13 +2327,13 @@ pub fn kill_tmux_session_confirmed(
     match run_tmux_until(cmd, deadline, &GitEnv::production()) {
         Ok(Some(_)) => {}
         Ok(None) => bail!("tmux restart timed out"),
-        Err(error) if tmux_command_spawn_failed(&error) => return Ok(session),
+        Err(error) if tmux_command_spawn_failed(&error) => return Ok(session.clone()),
         Err(error) => return Err(error),
     }
     if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
         bail!("tmux session “{session}” is still running");
     }
-    confirmed_tmux_respawn_target(&session, |other| {
+    confirmed_tmux_respawn_target(session, |other| {
         if other == socket {
             Ok(false) // The owned session was just confirmed gone.
         } else {
@@ -2325,7 +2342,7 @@ pub fn kill_tmux_session_confirmed(
     })
 }
 
-fn tmux_command_spawn_failed(error: &anyhow::Error) -> bool {
+pub(crate) fn tmux_command_spawn_failed(error: &anyhow::Error) -> bool {
     error.root_cause().is::<std::io::Error>() && error.to_string().starts_with("starting tmux ")
 }
 
@@ -3415,6 +3432,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_tmux_session_error_preserves_name_whitespace() {
+        assert!(confirmed_tmux_missing_session_error(
+            "can't find session: target \n",
+            "target "
+        ));
+        assert!(confirmed_tmux_missing_session_error(
+            "can't find session: target \r\n",
+            "target "
+        ));
+        assert!(!confirmed_tmux_missing_session_error(
+            "can't find session: target\n",
+            "target "
+        ));
+        assert!(!confirmed_tmux_missing_session_error(
+            "can't find session: target \n\n",
+            "target "
+        ));
+    }
+
+    #[test]
     fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {
         let root = Path::new("/isolated-migration");
         let isolated = Socket::isolated(root);
@@ -3498,9 +3535,17 @@ mod tests {
         assert!(!confirmed_tmux_has_session_output(&missing, "target").unwrap());
         assert!(confirmed_tmux_has_session_output(&missing, "other").is_err());
 
+        let missing_spaced = tmux_on(&server.0)
+            .args(muxel_core::tmux::has_session_args("target "))
+            .output()
+            .unwrap();
+        assert_eq!(missing_spaced.status.code(), Some(1), "{missing_spaced:?}");
+        assert_eq!(missing_spaced.stderr, b"can't find session: target \n");
+        assert!(!confirmed_tmux_has_session_output(&missing_spaced, "target ").unwrap());
+
         let target = SessionTarget::new("target2", Some(server.0.clone()));
         assert_eq!(
-            kill_tmux_session_confirmed(&target, deadline()).unwrap(),
+            kill_tmux_session_confirmed_on(&target, deadline()).unwrap(),
             target
         );
         assert!(!local_tmux_has_session_confirmed(&server.0, "target2", deadline()).unwrap());
