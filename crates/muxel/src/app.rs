@@ -10558,9 +10558,7 @@ impl MuxelApp {
         // In particular, a delayed restart must never fail against this binding
         // and offer a retry that would kill the peer's session.
         for iid in rebound_bindings {
-            self.failed_launches.remove(&iid);
-            self.terminal_restarts.cancel(iid);
-            self.terminal_launching.remove(&iid);
+            self.release_rebound_terminal_owner(iid);
         }
         for instance in instances {
             // A peer can replace the binding while this pane keeps its PTY.
@@ -10598,6 +10596,14 @@ impl MuxelApp {
         // The peer's new panes attach to their sessions (`tmux new-session -A`).
         self.spawn_project_terminals_now(pid, window, cx);
         cx.notify();
+    }
+
+    /// Both layout adoption and push reconciliation can accept a peer's owner.
+    /// Any work admitted for the prior owner must stop before the new one attaches.
+    fn release_rebound_terminal_owner(&mut self, iid: Uuid) {
+        self.failed_launches.remove(&iid);
+        self.terminal_restarts.cancel(iid);
+        self.terminal_launching.remove(&iid);
     }
 
     /// After adopting a peer's layout: re-seed change detection so the adoption
@@ -14926,7 +14932,7 @@ impl MuxelApp {
                         }
                         for iid in &rebound {
                             this.bump_session_binding_generation(*iid);
-                            this.failed_launches.remove(iid);
+                            this.release_rebound_terminal_owner(*iid);
                         }
                         if !rebound.is_empty() {
                             this.persist();
@@ -17565,6 +17571,10 @@ impl MuxelApp {
             }
             let session = recorded_session.expect("checked local tmux session");
             let workspace = self.current_workspace;
+            enum LocalRestartResult {
+                Relaunch,
+                TmuxUnavailable,
+            }
             cx.spawn(async move |this, cx| {
                 let resolved = cx
                     .background_executor()
@@ -17575,7 +17585,7 @@ impl MuxelApp {
                         )
                     })
                     .await;
-                let restarted = match resolved {
+                let restarted: anyhow::Result<LocalRestartResult> = match resolved {
                     Ok(session) => {
                         let closed = muxel_core::tmux::ClosedSession {
                             name: session.name.clone(),
@@ -17615,7 +17625,8 @@ impl MuxelApp {
                                     })
                                     .unwrap_or_else(|_| {
                                         Err(anyhow::anyhow!("restart owner is no longer available"))
-                                    }),
+                                    })
+                                    .map(|()| LocalRestartResult::Relaunch),
                                 Err(error) => Err(error),
                             }
                         } else {
@@ -17623,6 +17634,12 @@ impl MuxelApp {
                                 "couldn't save the tmux session owner before restart"
                             ))
                         }
+                    }
+                    // Legacy metadata has no owner to persist or kill when tmux
+                    // cannot even start. Keep it unresolved and show the same
+                    // shell fallback as an ordinary failed local launch.
+                    Err(error) if integrations::tmux_command_spawn_failed(&error) => {
+                        Ok(LocalRestartResult::TmuxUnavailable)
                     }
                     Err(error) => Err(error),
                 };
@@ -17634,12 +17651,27 @@ impl MuxelApp {
                         {
                             return;
                         }
-                        if let Err(error) = restarted {
-                            this.fail_restart(iid, t("Couldn't restart"), &format!("{error:#}"));
-                        } else {
-                            this.spawn_terminal(iid, window, cx);
-                            if this.active_instance == Some(iid) {
-                                this.focus_instance(iid, window, cx);
+                        match restarted {
+                            Err(error) => {
+                                this.fail_restart(
+                                    iid,
+                                    t("Couldn't restart"),
+                                    &format!("{error:#}"),
+                                );
+                            }
+                            Ok(outcome) => {
+                                match outcome {
+                                    LocalRestartResult::Relaunch => {
+                                        this.spawn_terminal(iid, window, cx);
+                                    }
+                                    LocalRestartResult::TmuxUnavailable => {
+                                        this.reset_terminal_runtime(iid);
+                                        this.spawn_terminal_with_owner(iid, true, window, cx);
+                                    }
+                                }
+                                if this.active_instance == Some(iid) {
+                                    this.focus_instance(iid, window, cx);
+                                }
                             }
                         }
                         cx.notify();
