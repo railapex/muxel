@@ -80,7 +80,9 @@ current title without a completion edge.
     are attributed to the new conversation.
 
   An OSC title split across reads keeps the read time of its opening escape
-  through BEL or ST. DEC synchronized updates can defer title callbacks until
+  through BEL or ST. A control such as BEL executed between that escape and
+  the OSC selector uses its own read time without changing the title's origin.
+  DEC synchronized updates can defer title callbacks until
   ESU or a timeout; replay keeps the oldest read time of that frame. Each new
   frame gets its own origin, even when the previous frame closes in the same
   read. A late terminator or ESU cannot turn an old UUID into a new binding.

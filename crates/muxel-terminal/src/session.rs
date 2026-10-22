@@ -927,6 +927,7 @@ struct OutputReadClock {
 
 enum OutputBoundary {
     Plain,
+    ExecutedControl,
     SyncStart(SystemTime),
     SyncEnd,
 }
@@ -937,6 +938,13 @@ impl OutputReadClock {
             .into_iter()
             .flatten()
             .fold(read_at, SystemTime::min)
+    }
+
+    /// VTE executes C0 controls in Escape state. Their events belong to this
+    /// read even when the pending ESC survives for a later OSC. Synchronized
+    /// replay remains framed by its own starting read.
+    fn executed_control_at(&self, read_at: SystemTime) -> SystemTime {
+        self.sync_since.map_or(read_at, |at| at.min(read_at))
     }
 
     /// Return a boundary after which another event in the same read can use a
@@ -967,9 +975,12 @@ impl OutputReadClock {
                 }
                 0x18 | 0x1a => {
                     self.escape_at = None;
-                    boundary = Some(OutputBoundary::Plain);
+                    boundary = Some(OutputBoundary::ExecutedControl);
                 }
-                0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => {}
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x1b | 0x7f..=0xff => {}
                 _ => {
                     self.escape_at = None;
                     boundary = Some(OutputBoundary::Plain);
@@ -1694,7 +1705,24 @@ impl TerminalSession {
                 // A boundary ends the current timestamp segment even when it
                 // does not produce a PSP event.
                 if event.is_some() || boundary.is_some() {
-                    processor.advance(&mut *term, &bytes[start..=index]);
+                    if matches!(boundary, Some(OutputBoundary::ExecutedControl)) {
+                        if start < index {
+                            self.evidence.lock().begin_read(effective_at);
+                            processor.advance(&mut *term, &bytes[start..index]);
+                            clock.after_segment(
+                                None,
+                                processor.sync_timeout().sync_timeout().is_some(),
+                                read_at,
+                            );
+                        }
+                        self.evidence
+                            .lock()
+                            .begin_read(clock.executed_control_at(read_at));
+                        processor.advance(&mut *term, &bytes[index..=index]);
+                    } else {
+                        self.evidence.lock().begin_read(effective_at);
+                        processor.advance(&mut *term, &bytes[start..=index]);
+                    }
                     clock.after_segment(
                         boundary,
                         processor.sync_timeout().sync_timeout().is_some(),
