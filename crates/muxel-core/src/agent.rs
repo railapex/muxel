@@ -208,7 +208,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::CliFlag {
@@ -428,7 +428,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--config=model_reasoning_effort={}".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::TypeIn,
@@ -493,6 +493,24 @@ impl AgentPreset {
         }
     }
 
+    /// Programs of the built-in agent presets, including installed native/npm
+    /// launchers. This is an outside-control allowlist, not shell detection.
+    pub fn is_recognized_agent_program(program: Option<&str>) -> bool {
+        let Some(program) = program else {
+            return false;
+        };
+        let name = program.rsplit(['/', '\\']).next().unwrap_or_default();
+        let name = name.to_ascii_lowercase();
+        let name = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".cmd"))
+            .unwrap_or(&name);
+        matches!(
+            name,
+            "claude" | "opencode" | "amp" | "grok" | "codex" | "muse" | "hermes" | "ollama" | "pi"
+        )
+    }
+
     pub fn defaults() -> Vec<AgentPreset> {
         let mut presets = vec![Self::shell()];
         // On Windows, offer cmd.exe and Git Bash alongside the PowerShell default.
@@ -517,24 +535,25 @@ impl AgentPreset {
         presets
     }
 
-    /// Compose the full argument list: `model_flag model`, then
-    /// `effort_flag effort`, then the extra args. Pairs are skipped unless both
-    /// the flag and the value are set (and non-empty).
+    /// Compose model, effort, then extra args. A flag containing `{}` emits one
+    /// argument with the value substituted; otherwise it emits flag then value.
     pub fn compose_args(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if let (Some(flag), Some(model)) = (
-            &self.model_flag,
-            self.model.as_ref().filter(|m| !m.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(model.clone());
-        }
-        if let (Some(flag), Some(effort)) = (
-            &self.effort_flag,
-            self.effort.as_ref().filter(|e| !e.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(effort.clone());
+        for (flag, value) in [
+            (&self.model_flag, &self.model),
+            (&self.effort_flag, &self.effort),
+        ] {
+            if let (Some(flag), Some(value)) = (
+                flag.as_ref().filter(|flag| !flag.trim().is_empty()),
+                value.as_ref().filter(|value| !value.is_empty()),
+            ) {
+                if flag.contains("{}") {
+                    out.push(flag.replace("{}", value));
+                } else {
+                    out.push(flag.clone());
+                    out.push(value.clone());
+                }
+            }
         }
         out.extend(self.args.iter().cloned());
         out
@@ -569,22 +588,44 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 /// submitting it again on process restart mutates the resumed transcript. CLI
 /// flags remain launch configuration and may need to be applied on every process.
 pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> ResolvedLaunch {
+    if instance.literal_argv {
+        return ResolvedLaunch {
+            program: instance.program.clone(),
+            args: instance.args.clone(),
+            startup_input: None,
+            auto_mode_presses: 0,
+            submit: false,
+            env: instance
+                .env
+                .iter()
+                .map(|e| (e.key.clone(), e.value.clone()))
+                .collect(),
+        };
+    }
     let mut args = instance.args.clone();
     let mut startup_input = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
-        match &instance.injection {
-            InjectionMode::CliFlag { flag } => {
-                args.push(flag.clone());
-                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        if instance.control_prompt {
+            if !resuming && instance.auto_submit {
+                startup_input = Some(prompt.clone());
             }
-            InjectionMode::TypeIn if !resuming => {
-                // A raw newline is Enter in TUIs without bracketed-paste mode.
-                // Keep the instruction bundle to one startup turn everywhere.
-                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        } else {
+            match &instance.injection {
+                InjectionMode::CliFlag { flag } => {
+                    args.push(flag.clone());
+                    args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn if !resuming => {
+                    // A raw newline is Enter in TUIs without bracketed-paste mode.
+                    // Keep the instruction bundle to one startup turn everywhere.
+                    // Consumed ctl tasks leave no text, including automatically
+                    // assembled instructions, in a later conversation's input.
+                    startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn => {}
+                InjectionMode::None => {}
             }
-            InjectionMode::TypeIn => {}
-            InjectionMode::None => {}
         }
     }
 
@@ -593,12 +634,13 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         args.push(codex_terminal_title_override().to_string());
     }
 
+    let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
     ResolvedLaunch {
         program: instance.program.clone(),
         args,
         startup_input,
         auto_mode_presses: instance.auto_mode_presses,
-        submit: instance.auto_submit,
+        submit,
         env: instance
             .env
             .iter()
@@ -621,6 +663,9 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
 /// avoids a flush race for host-minted agents. When a session was genuinely
 /// deleted, the caller probes the disk and restarts cleanly.
 pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
+    if instance.literal_argv {
+        return None;
+    }
     let resume_flag = preset.resume_flag.as_deref()?;
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
@@ -2059,7 +2104,7 @@ mod tests {
 
     #[test]
     fn compose_args_skips_unset_model_and_effort() {
-        // Claude has a model_flag but no model set, and no effort_flag.
+        // Configured flags without values add no arguments.
         assert!(AgentPreset::claude().compose_args().is_empty());
     }
 

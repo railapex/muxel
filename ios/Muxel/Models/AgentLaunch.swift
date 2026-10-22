@@ -32,6 +32,13 @@ enum AgentLaunch {
     /// Resolve an instance into program/args + any TypeIn startup input, applying its
     /// system-prompt injection mode. Port of `resolve_launch`.
     static func resolveLaunch(_ instance: Instance) -> ResolvedLaunch {
+        // Only the desktop's live ctl startup owner can dispatch this task.
+        // Shared metadata survives refused launches and restarts; attaching on
+        // the phone must never replay it, through TypeIn or a CLI flag.
+        if instance.literalArgv || instance.controlPrompt {
+            return ResolvedLaunch(program: instance.program, args: instance.args,
+                                  startupInput: nil, submit: false)
+        }
         var args = instance.args
         var startupInput: String?
         if let prompt = instance.systemPrompt, !prompt.isEmpty {
@@ -54,7 +61,8 @@ enum AgentLaunch {
     /// the first launch (creating the session with the chosen id), `[resumeFlag, id]`
     /// once started. Port of `session_resume_args`.
     static func sessionResumeArgs(preset: Preset, instance: Instance) -> [String]? {
-        guard let idFlag = preset.sessionIdFlag,
+        guard !instance.literalArgv,
+              let idFlag = preset.sessionIdFlag,
               let resumeFlag = preset.resumeFlag,
               let id = instance.sessionId else { return nil }
         return [instance.sessionStarted ? resumeFlag : idFlag, id]
@@ -64,6 +72,7 @@ enum AgentLaunch {
     /// name, then by program basename — so a re-attach knows its resume/model flags.
     /// (iOS builtin ids are per-process random, so we match on name/program, not id.)
     static func builtinPreset(for instance: Instance) -> Preset? {
+        guard !instance.literalArgv else { return nil }
         if !instance.preset.isEmpty,
            let byName = Preset.builtins.first(where: { $0.name == instance.preset }) {
             return byName
