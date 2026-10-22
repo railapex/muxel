@@ -49,6 +49,10 @@ resets its latches and reads the new binding's title edges from its start. If
 more title edges arrived than the 64-edge buffer keeps, it rebuilds from the
 current title without a completion edge.
 
+- A pinned `--session-id` or `--resume` launch begins at binding revision one,
+  as does a provider with no binding source. Its first matching UUID title
+  confirms that binding; a different UUID begins a replacement binding.
+  An unpinned provider with a binding source waits for its first report.
 - A Codex title with a different UUID thread begins the binding at that title,
   in exact order. Earlier frames, and a bell that rang before it, are retired;
   a bell after it, even in the same drained batch, survives.
@@ -79,6 +83,11 @@ current title without a completion edge.
   Idle there may be the old conversation's, so it neither starts a completion
   edge nor arms one; a submission made after the switch still arms. A turn
   that starts and finishes inside the window shows no Done.
+
+  If the new conversation prints nothing further, a five-second quiet deadline
+  retires the old visible status to attributable Idle. It does not manufacture
+  a Working-to-Done edge. New output before or after that deadline resumes the
+  normal evidence rules.
 
   The status shown meanwhile is marked non-attributable
   (`status_attributable()`): a Blocked from an old title or a prompt still on
@@ -123,8 +132,9 @@ current title without a completion edge.
 
   Scheduled-loop cleanup also reads the current snapshot, never retained
   attention history. It owns the launch and the conversation that received
-  the first submitted turn, only when its identity was observed before that
-  submission. Without a prior identity, ownership stays unknown for the whole
+  the first submitted turn, only when its identity was known at launch or
+  observed before that submission. Without a prior identity, ownership stays
+  unknown for the whole
   run: a later UUID or hook cannot prove which conversation received the prompt.
   Later identities or submissions do not establish or transfer ownership.
   Replacement
@@ -154,7 +164,10 @@ current title without a completion edge.
   before applying or acknowledging it. Prelaunch recovery uses the same UI
   claim owner. A record the hook writes meanwhile waits at the shared path;
   a newer mismatching claim or one whose binding failed to save is retained
-  and validated before the next shared record.
+  and validated before the next shared record. A structurally valid record whose
+  project tree is temporarily unavailable is retained for retry. After a
+  recovered binding saves, an acknowledgement failure is logged; launch can
+  continue when no newer shared record is pending.
 - An accepted Grok identity is retained separately from durable workspace
   metadata. A real identity change invalidates the live terminal before saving,
   so a failed save cannot leave an old Exit-policy loop owning the replacement.

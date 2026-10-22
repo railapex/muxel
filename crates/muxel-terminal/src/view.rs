@@ -56,6 +56,7 @@ const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
 /// Visible lifecycle parsing is independent from paint cadence, but it still
 /// must not allocate a full grid string for every PTY read under stream load.
 const STATUS_SCREEN_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+const SILENT_SWITCH_SETTLE: Duration = Duration::from_secs(5);
 
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
@@ -245,6 +246,8 @@ struct RuntimeStatusState {
     grok_blocked_at: Option<Instant>,
     grok_screen_working_at: Option<Instant>,
     deadline: Option<Instant>,
+    /// A silent out-of-band switch cannot wait forever for fresh PTY output.
+    switch_settle_until: Option<Instant>,
     timer_generation: u64,
 }
 
@@ -273,6 +276,7 @@ impl RuntimeStatusState {
             grok_blocked_at: None,
             grok_screen_working_at: None,
             deadline: None,
+            switch_settle_until: None,
             timer_generation: 0,
         }
     }
@@ -325,6 +329,7 @@ impl RuntimeStatusState {
             // title that began it, or after everything recorded before a
             // switch reported out of band (all of it ambiguous).
             self.title_cursor = None;
+            self.switch_settle_until = None;
             // The retired conversation's bell was cleared where the binding
             // advanced (listener title bump or `provider_switched`), in order
             // with any bell the new binding has rung since; one read inside a
@@ -345,6 +350,12 @@ impl RuntimeStatusState {
             // A switch reported out of band starts the screen hold; the
             // capture below, and later ones, decide when it ends.
             self.screen_held = evidence.windowed;
+            if evidence.windowed {
+                self.switch_settle_until = Some(now + SILENT_SWITCH_SETTLE);
+            }
+        }
+        if !settling {
+            self.switch_settle_until = None;
         }
         if title_overflowed {
             // Missing an ordered title edge invalidates this source. Rebuild from
@@ -416,6 +427,19 @@ impl RuntimeStatusState {
         }
         let bell = session.has_bell();
         let idle = session.idle_for();
+        // The old title or screen may remain visible after an idle /clear or
+        // /resume. If the new binding stays silent, retire that stale level
+        // state after a quiet period; never turn it into a completion edge.
+        let silent_switch_settled = settling
+            && self.switch_settle_until.is_some_and(|until| now >= until)
+            && idle >= SILENT_SWITCH_SETTLE;
+        if settling
+            && !silent_switch_settled
+            && let Some(until) = self.switch_settle_until
+        {
+            let deadline = until.max(now + SILENT_SWITCH_SETTLE.saturating_sub(idle));
+            next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+        }
         let base = classify_facts(
             exited,
             self.working_marker,
@@ -472,7 +496,11 @@ impl RuntimeStatusState {
             title = provider_screen;
         }
 
-        let raw = combine_title_status(exited, base, title, screen_working);
+        let raw = if silent_switch_settled && !exited && !bell {
+            AgentStatus::Idle
+        } else {
+            combine_title_status(exited, base, title, screen_working)
+        };
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
             self.semantic_title_status.is_some(),
@@ -486,7 +514,16 @@ impl RuntimeStatusState {
             working_marker,
             blocked_marker,
         );
-        let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
+        let raw_reason = if silent_switch_settled && !exited && !bell {
+            TerminalStatusReason::Quiet
+        } else {
+            raw_reason
+        };
+        let raw_attributable = status_is_attributable(
+            settling && !silent_switch_settled,
+            self.screen_held,
+            raw_reason,
+        );
         let (status, latch, armed) = if raw_attributable {
             latch_done_after_readiness(
                 self.prev_raw,
@@ -524,7 +561,13 @@ impl RuntimeStatusState {
             working_marker,
             blocked_marker,
         );
-        let attributable = status_is_attributable(settling, self.screen_held, reason);
+        let reason = if silent_switch_settled && !exited && !bell {
+            TerminalStatusReason::Quiet
+        } else {
+            reason
+        };
+        let attributable =
+            status_is_attributable(settling && !silent_switch_settled, self.screen_held, reason);
         if exited {
             next_deadline = None;
         }
@@ -4063,10 +4106,8 @@ mod provider_switch_tests {
                 learned - Duration::from_millis(10),
             ),
         ]));
-        // No more output arrives. Passage of time cannot attribute a final
-        // title that was read inside the switch window. Loop cleanup must
-        // therefore release tracking at its cap without closing this pane.
-        for elapsed in [Duration::ZERO, Duration::from_secs(30 * 60)] {
+        // A title read inside the switch window cannot complete the old turn.
+        for elapsed in [Duration::ZERO, Duration::from_secs(1)] {
             runtime.reconcile(
                 &session,
                 TitleProvider::Claude,
@@ -4084,6 +4125,42 @@ mod provider_switch_tests {
             assert_ne!(snapshot.status, AgentStatus::Done);
             assert!(session.runtime_evidence(None).settling);
         }
+        session.kill();
+    }
+
+    #[test]
+    fn silent_claude_switch_retires_old_working_level_at_deadline() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let clock = Instant::now();
+        session.process_probe_output("\x1b]0;\u{25d0} Old task\x07".as_bytes());
+        runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, clock);
+        let hook = SystemTime::now();
+        session.provider_switched_at(hook, hook, hook);
+        let (_, deadline) = runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            clock + Duration::from_millis(1),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+        assert!(!runtime.snapshot(&session).attributable);
+        assert!(deadline.is_some(), "silent switch schedules a settle check");
+        session.set_idle_for_test(Duration::from_secs(6));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            clock + Duration::from_secs(6),
+        );
+        let settled = runtime.snapshot(&session);
+        assert_eq!(settled.status, AgentStatus::Idle);
+        assert!(settled.attributable);
+        assert!(!settled.completion_ready);
         session.kill();
     }
 

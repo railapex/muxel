@@ -394,6 +394,12 @@ fn validate_claude_event(event: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A malformed hook record cannot become valid on retry. Filesystem checks in
+/// `claude_binding_from_record` may fail temporarily, so they stay separate.
+pub(crate) fn claude_record_structurally_valid(record: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(record).is_ok_and(|event| validate_claude_event(&event).is_ok())
+}
+
 fn stamp_claude_event(event: &mut Value, nonce: Uuid, recorded_at: SystemTime) {
     let micros = recorded_at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -539,8 +545,8 @@ fn try_claim_claude_binding(
 }
 
 /// Drain pending records before choosing launch arguments. A failed handler leaves
-/// its claim intact; failed acknowledgement stops recovery rather than retrying
-/// the same claim forever or launching over a pending newer binding.
+/// its claim intact. Once a record has been handled, failed acknowledgement
+/// cannot undo a saved binding; launch may continue if no newer record waits.
 pub(crate) fn recover_claude_bindings_before_resume(
     data_dir: &Path,
     instance_id: Uuid,
@@ -548,7 +554,21 @@ pub(crate) fn recover_claude_bindings_before_resume(
 ) -> Result<()> {
     while let Some(record) = try_claim_claude_binding(data_dir, instance_id)? {
         adopt(&record)?;
-        std::fs::remove_file(record.path).context("acknowledge recovered Claude conversation")?;
+        if let Err(error) = std::fs::remove_file(&record.path) {
+            log::warn!(
+                "handled Claude conversation hook record could not be acknowledged: {error}"
+            );
+            // The old claim occupies the claim path. A newer hook at the
+            // shared path cannot be consumed until that path is free, so never
+            // choose resume arguments over it.
+            if claude_binding_path(data_dir, instance_id)
+                .try_exists()
+                .context("check for a newer Claude conversation after acknowledgement failure")?
+            {
+                bail!("a newer Claude conversation is pending behind an unacknowledged record");
+            }
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -556,7 +576,9 @@ pub(crate) fn recover_claude_bindings_before_resume(
 /// Delete a claimed record once it has been handled. Only the claimed file
 /// goes; a record the hook has written since waits for the next claim.
 pub(crate) fn acknowledge_claude_binding(record: ClaimedClaudeRecord) {
-    let _ = std::fs::remove_file(record.path);
+    if let Err(error) = std::fs::remove_file(&record.path) {
+        log::warn!("could not acknowledge Claude conversation hook record: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -734,18 +756,43 @@ mod tests {
     }
 
     #[test]
-    fn prelaunch_recovery_stops_if_acknowledgement_fails() {
+    fn prelaunch_recovery_allows_saved_binding_after_acknowledgement_fails_without_newer_record() {
         let pending = PendingResume::new();
+        // Remove the shared newer hook: only the already-saved claim remains.
+        std::fs::remove_file(claude_binding_path(&pending.data, pending.instance_id)).unwrap();
+        let mut workspace = pending.workspace();
         let mut handled = 0;
         let result =
             recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
                 handled += 1;
+                pending.persist_record(&mut workspace, record)?;
                 std::fs::remove_file(&record.path)?;
                 std::fs::create_dir(&record.path)?;
                 Ok(())
             });
-        assert!(result.unwrap_err().to_string().contains("acknowledge"));
+        assert!(result.is_ok());
         assert_eq!(handled, 1);
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.old_id.clone()]
+        );
+    }
+
+    #[test]
+    fn prelaunch_recovery_refuses_newer_binding_behind_failed_acknowledgement() {
+        let pending = PendingResume::new();
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                std::fs::remove_file(&record.path)?;
+                std::fs::create_dir(&record.path)?;
+                Ok(())
+            });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("newer Claude conversation")
+        );
         assert!(claude_binding_path(&pending.data, pending.instance_id).exists());
     }
 

@@ -2856,6 +2856,19 @@ fn is_claude_program(program: Option<&str>) -> bool {
     )
 }
 
+fn launch_initial_binding(
+    program: Option<&str>,
+    session_args: Option<&[String]>,
+) -> muxel_terminal::InitialBinding {
+    if let Some(id) = session_args.and_then(|args| args.get(1)) {
+        return muxel_terminal::InitialBinding::Known(Some(id.clone()));
+    }
+    if !is_claude_program(program) && !is_codex_program(program) && !is_grok_program(program) {
+        return muxel_terminal::InitialBinding::Known(None);
+    }
+    muxel_terminal::InitialBinding::Unknown
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ClaudeSessionState {
     NotClaude,
@@ -3335,53 +3348,58 @@ mod loop_cleanup_tests {
     }
 
     #[test]
-    fn loop_cleanup_never_owns_a_replacement_before_the_first_uuid() {
-        let (session, _receiver) = session();
+    fn loop_cleanup_first_uuid_confirms_pinned_launch_without_transferring_replacement() {
+        let first = Uuid::new_v4();
+        #[cfg(windows)]
+        let mut spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let mut spec = CommandSpec::program("/bin/cat", vec![]);
+        spec.initial_binding = super::launch_initial_binding(
+            Some("claude"),
+            Some(&["--session-id".to_string(), first.to_string()]),
+        );
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).unwrap();
         let mut run = run(session.id);
         session.mark_turn_submitted();
-        assert_eq!(session.first_submission_binding(), None);
-        let first = Uuid::new_v4();
+        assert_eq!(session.first_submission_binding(), Some(1));
         session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
         let rev = session.binding_revision();
         assert_eq!(rev, 1);
-        assert_eq!(session.first_submission_binding(), None);
-        session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
-        // That UUID may belong to B, replacing the unidentified recipient A.
-        // Even an attributable B Done cannot authorize this run's completion.
-        for status in [AgentStatus::Working, AgentStatus::Done] {
-            for elapsed in [
+        assert_eq!(session.first_submission_binding(), Some(1));
+        assert_eq!(
+            run.cleanup(
+                snapshot(session.id, rev, AgentStatus::Working),
+                rev,
+                session.first_submission_binding(),
                 Duration::ZERO,
-                MAX_LOOP_RUNTIME - Duration::from_secs(1),
-                MAX_LOOP_RUNTIME,
-            ] {
-                assert_eq!(
-                    run.cleanup(
-                        snapshot(session.id, rev, status),
-                        rev,
-                        session.first_submission_binding(),
-                        elapsed
-                    ),
-                    if elapsed >= MAX_LOOP_RUNTIME {
-                        LoopCleanup::Abandon
-                    } else {
-                        LoopCleanup::Continue
-                    }
-                );
-            }
-        }
-        assert!(!run.seen_working);
-        // Later identities and submissions cannot repair unknown ownership.
+            ),
+            LoopCleanup::Continue
+        );
+        session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
+        assert_eq!(
+            run.cleanup(
+                snapshot(session.id, rev, AgentStatus::Done),
+                rev,
+                session.first_submission_binding(),
+                Duration::ZERO,
+            ),
+            LoopCleanup::Finish
+        );
+        // A later UUID is a replacement and cannot be closed by this run.
         let replacement = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{replacement} | Ready\x07").as_bytes());
-        session.mark_turn_submitted();
         let replaced = session.binding_revision();
-        assert_eq!(session.first_submission_binding(), None);
+        assert_eq!(replaced, 2);
+        assert_eq!(session.first_submission_binding(), Some(1));
         assert_eq!(
             run.cleanup(
                 snapshot(session.id, replaced, AgentStatus::Done),
                 replaced,
                 session.first_submission_binding(),
-                MAX_LOOP_RUNTIME
+                Duration::ZERO
             ),
             LoopCleanup::Abandon
         );
@@ -7429,6 +7447,14 @@ impl MuxelApp {
             };
             (spec, cwd, extra_env)
         };
+        // A pinned launch has a conversation before any provider output or hook.
+        // Providers without a binding source keep their launch as one binding.
+        // Codex titles, Grok registry rows, and unpinned Claude hooks must first
+        // establish an identity before a loop can own its submission.
+        spec.initial_binding = launch_initial_binding(
+            agent_program.as_deref(),
+            session_resume.as_ref().map(|(args, _)| args.as_slice()),
+        );
         if let Some(shell) = remote_paste_shell {
             spec = spec.with_paste_shell(shell);
         } else if agent_program.is_some() {
@@ -11282,6 +11308,9 @@ impl MuxelApp {
     ) -> anyhow::Result<Option<SystemTime>> {
         let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
+            if crate::session_binding::claude_record_structurally_valid(&record.bytes) {
+                anyhow::bail!("pending Claude conversation could not yet be validated");
+            }
             return Ok(None);
         };
         // The hook stamps when it ran. An older muxel's hook didn't; its

@@ -623,6 +623,9 @@ pub struct CommandSpec {
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
+    /// The launch already names its conversation, or has no provider binding
+    /// source. An unpinned provider with a title/registry source stays unknown.
+    pub initial_binding: InitialBinding,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
@@ -648,6 +651,13 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub enum InitialBinding {
+    #[default]
+    Unknown,
+    Known(Option<String>),
+}
+
 impl CommandSpec {
     /// Run the user's default shell. On Windows that's PowerShell (`cmd.exe` is
     /// available as a separate preset); elsewhere it's `$SHELL`.
@@ -660,6 +670,7 @@ impl CommandSpec {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
             status_program: None,
+            initial_binding: InitialBinding::Unknown,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -679,6 +690,7 @@ impl CommandSpec {
         Self {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
+            initial_binding: InitialBinding::Unknown,
             program,
             args,
             cwd: None,
@@ -1376,7 +1388,10 @@ impl TerminalSession {
         drop(writer_handle);
 
         let title = Arc::new(Mutex::new(None));
-        let evidence = Arc::new(Mutex::new(LifecycleEvidence::default()));
+        let evidence = Arc::new(Mutex::new(match &spec.initial_binding {
+            InitialBinding::Unknown => LifecycleEvidence::default(),
+            InitialBinding::Known(id) => LifecycleEvidence::known_at_launch(id.clone()),
+        }));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
@@ -2349,6 +2364,11 @@ impl TerminalSession {
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&self, idle: Duration) {
+        *self.last_output.lock() = Instant::now() - idle;
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
