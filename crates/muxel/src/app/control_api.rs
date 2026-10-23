@@ -1694,14 +1694,11 @@ mod tmux_control_policy_tests {
             return;
         }
         let id = Uuid::new_v4().simple().to_string();
-        let dir = std::env::temp_dir().join(format!("muxel-ctl-bindings-{id}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("socket");
-        let socket_arg = socket.to_string_lossy().to_string();
+        let socket = format!("mxlctl-{}", &id[..12]);
         let name = format!("muxel_test_{}", &id[..8]);
         let args = vec![
-            "-S".into(),
-            socket_arg.clone(),
+            "-L".into(),
+            socket.clone(),
             "-f".into(),
             "/dev/null".into(),
             "new-session".into(),
@@ -1717,7 +1714,7 @@ mod tmux_control_policy_tests {
             .expect("spawn tmux client");
         let tmux = |args: &[&str]| {
             Command::new("tmux")
-                .args(["-S", &socket_arg, "-f", "/dev/null"])
+                .args(["-L", &socket, "-f", "/dev/null"])
                 .args(args)
                 .env_remove("TMUX")
                 .output()
@@ -1756,9 +1753,13 @@ mod tmux_control_policy_tests {
             "#{window_id}",
         ]);
         let count = String::from_utf8_lossy(&windows.stdout).lines().count();
+        let socket_path = tmux(&["display-message", "-p", "#{socket_path}"]);
+        let socket_path = String::from_utf8_lossy(&socket_path.stdout).trim().to_string();
         session.kill();
         let _ = tmux(&["kill-server"]);
-        let _ = std::fs::remove_dir_all(dir);
+        if socket_path.ends_with(&socket) {
+            let _ = std::fs::remove_file(socket_path);
+        }
         assert_eq!(count, 1, "ctl opened a new tmux shell window");
     }
 }
