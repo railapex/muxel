@@ -1681,7 +1681,7 @@ fn show_value(
 #[cfg(all(test, unix))]
 mod tmux_control_policy_tests {
     use super::control_program_writable;
-    use muxel_core::{AgentPreset, Instance};
+    use muxel_core::{AgentPreset, Instance, control as ctl};
     use muxel_terminal::{CommandSpec, PtyChunk, TerminalSession};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1720,6 +1720,17 @@ mod tmux_control_policy_tests {
                 .output()
                 .expect("run tmux")
         };
+        let window_count = || {
+            let windows = tmux(&[
+                "list-windows",
+                "-t",
+                &format!("={name}"),
+                "-F",
+                "#{window_id}",
+            ]);
+            assert!(windows.status.success(), "tmux session disappeared");
+            String::from_utf8_lossy(&windows.stdout).lines().count()
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut rendered = false;
         loop {
@@ -1751,21 +1762,31 @@ mod tmux_control_policy_tests {
 
         let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
         agent.tmux_session = Some(name.clone());
+        let press_prefix_c = || {
+            for key in ["ctrl-b", "c"] {
+                session
+                    .try_write_input(&ctl::key_bytes(key, false).expect("ctl key"))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        };
         if control_program_writable(&agent, false).is_ok() {
-            // This is exactly the ctl key byte stream while the shell grant is off.
-            session.try_write_input(b"\x02c").unwrap();
+            press_prefix_c();
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        let count = loop {
-            let windows = tmux(&[
-                "list-windows",
-                "-t",
-                &format!("={name}"),
-                "-F",
-                "#{window_id}",
-            ]);
-            let count = String::from_utf8_lossy(&windows.stdout).lines().count();
+        let denied_count = loop {
+            let count = window_count();
             if count > 1 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(control_program_writable(&agent, true).is_ok());
+        press_prefix_c();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let allowed_count = loop {
+            let count = window_count();
+            if count >= 2 || Instant::now() >= deadline {
                 break count;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1779,7 +1800,11 @@ mod tmux_control_policy_tests {
         if socket_path.ends_with(&socket) {
             let _ = std::fs::remove_file(socket_path);
         }
-        assert_eq!(count, 1, "ctl opened a new tmux shell window");
+        assert_eq!(denied_count, 1, "ctl opened a new tmux shell window");
+        assert_eq!(
+            allowed_count, 2,
+            "positive control did not invoke tmux's prefix binding"
+        );
     }
 }
 
