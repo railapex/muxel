@@ -2765,6 +2765,11 @@ impl TerminalSession {
         self.trigger_runtime();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&self, idle: Duration) {
+        *self.last_output.lock() = Instant::now() - idle;
+    }
+
     /// Time since output was last processed (for idle detection).
     pub fn idle_for(&self) -> Duration {
         self.last_output.lock().elapsed()
