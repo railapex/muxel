@@ -1682,7 +1682,7 @@ fn show_value(
 mod tmux_control_policy_tests {
     use super::control_program_writable;
     use muxel_core::{AgentPreset, Instance};
-    use muxel_terminal::{CommandSpec, TerminalSession};
+    use muxel_terminal::{CommandSpec, PtyChunk, TerminalSession};
     use std::process::Command;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -1708,9 +1708,9 @@ mod tmux_control_policy_tests {
             "--".into(),
             "sh".into(),
             "-c".into(),
-            "sleep 30".into(),
+            "sleep 120".into(),
         ];
-        let (session, _rx) = TerminalSession::spawn(CommandSpec::program("tmux", args), 80, 24)
+        let (session, rx) = TerminalSession::spawn(CommandSpec::program("tmux", args), 80, 24)
             .expect("spawn tmux client");
         let tmux = |args: &[&str]| {
             Command::new("tmux")
@@ -1721,22 +1721,33 @@ mod tmux_control_policy_tests {
                 .expect("run tmux")
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while String::from_utf8_lossy(
-            &tmux(&[
-                "display-message",
-                "-p",
-                "-t",
-                &format!("={name}:"),
-                "#{session_attached}",
-            ])
-            .stdout,
-        )
-        .trim()
-            != "1"
-        {
+        let mut rendered = false;
+        loop {
+            while let Ok(chunk) = rx.try_recv() {
+                if let PtyChunk::Output(bytes) = chunk {
+                    rendered |= !bytes.is_empty();
+                    session.process_output(&bytes);
+                }
+            }
+            let attached = String::from_utf8_lossy(
+                &tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("={name}:"),
+                    "#{session_attached}",
+                ])
+                .stdout,
+            )
+            .trim()
+                == "1";
+            if attached && rendered {
+                break;
+            }
             assert!(Instant::now() < deadline, "tmux client never attached");
             std::thread::sleep(Duration::from_millis(50));
         }
+        std::thread::sleep(Duration::from_millis(100));
 
         let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
         agent.tmux_session = Some(name.clone());
@@ -1744,17 +1755,25 @@ mod tmux_control_policy_tests {
             // This is exactly the ctl key byte stream while the shell grant is off.
             session.try_write_input(b"\x02c").unwrap();
         }
-        std::thread::sleep(Duration::from_millis(250));
-        let windows = tmux(&[
-            "list-windows",
-            "-t",
-            &format!("={name}"),
-            "-F",
-            "#{window_id}",
-        ]);
-        let count = String::from_utf8_lossy(&windows.stdout).lines().count();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let count = loop {
+            let windows = tmux(&[
+                "list-windows",
+                "-t",
+                &format!("={name}"),
+                "-F",
+                "#{window_id}",
+            ]);
+            let count = String::from_utf8_lossy(&windows.stdout).lines().count();
+            if count > 1 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         let socket_path = tmux(&["display-message", "-p", "#{socket_path}"]);
-        let socket_path = String::from_utf8_lossy(&socket_path.stdout).trim().to_string();
+        let socket_path = String::from_utf8_lossy(&socket_path.stdout)
+            .trim()
+            .to_string();
         session.kill();
         let _ = tmux(&["kill-server"]);
         if socket_path.ends_with(&socket) {
