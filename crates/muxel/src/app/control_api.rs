@@ -1678,6 +1678,91 @@ fn show_value(
     })
 }
 
+#[cfg(all(test, unix))]
+mod tmux_control_policy_tests {
+    use super::control_program_writable;
+    use muxel_core::{AgentPreset, Instance};
+    use muxel_terminal::{CommandSpec, TerminalSession};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn tmux_prefix_c_without_shell_grant_does_not_open_a_shell_window() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-bindings-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("socket");
+        let socket_arg = socket.to_string_lossy().to_string();
+        let name = format!("muxel_test_{}", &id[..8]);
+        let args = vec![
+            "-S".into(),
+            socket_arg.clone(),
+            "-f".into(),
+            "/dev/null".into(),
+            "new-session".into(),
+            "-A".into(),
+            "-s".into(),
+            name.clone(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "sleep 30".into(),
+        ];
+        let (session, _rx) = TerminalSession::spawn(CommandSpec::program("tmux", args), 80, 24)
+            .expect("spawn tmux client");
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .args(["-S", &socket_arg, "-f", "/dev/null"])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .expect("run tmux")
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while String::from_utf8_lossy(
+            &tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={name}:"),
+                "#{session_attached}",
+            ])
+            .stdout,
+        )
+        .trim()
+            != "1"
+        {
+            assert!(Instant::now() < deadline, "tmux client never attached");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        agent.tmux_session = Some(name.clone());
+        if control_program_writable(&agent, false).is_ok() {
+            // This is exactly the ctl key byte stream while the shell grant is off.
+            session.try_write_input(b"\x02c").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let windows = tmux(&[
+            "list-windows",
+            "-t",
+            &format!("={name}"),
+            "-F",
+            "#{window_id}",
+        ]);
+        let count = String::from_utf8_lossy(&windows.stdout).lines().count();
+        session.kill();
+        let _ = tmux(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(count, 1, "ctl opened a new tmux shell window");
+    }
+}
+
 #[cfg(test)]
 mod prompt_submission_tests {
     use super::{enter_verdict, paste_prompt, press_prompt_enter};
