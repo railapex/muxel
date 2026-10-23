@@ -1737,7 +1737,6 @@ mod tmux_control_policy_tests {
             while let Ok(chunk) = rx.try_recv() {
                 if let PtyChunk::Output(bytes) = chunk {
                     rendered |= !bytes.is_empty();
-                    session.process_output(&bytes);
                 }
             }
             let attached = String::from_utf8_lossy(
