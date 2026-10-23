@@ -1572,6 +1572,7 @@ fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
         // the global default for unrelated sessions. Local panes get these
         // values through new-session -e instead.
         tmux.env_remove(muxel_store::USER_DATA_DIR_ENV)
+            .env_remove(crate::uat_root::UAT_ROOT_ENV)
             .env_remove(crate::control::CONTROL_ENV);
     }
     tmux
@@ -1596,7 +1597,11 @@ mod tmux_server_environment_tests {
                 .map(|(key, _)| key)
                 .collect();
             assert!(removed.contains(&OsStr::new(crate::session_binding::MUXEL_INSTANCE_ID_ENV)));
-            for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
+            for key in [
+                muxel_store::USER_DATA_DIR_ENV,
+                crate::uat_root::UAT_ROOT_ENV,
+                crate::control::CONTROL_ENV,
+            ] {
                 assert_eq!(removed.contains(&OsStr::new(key)), isolated);
             }
             assert!(command.get_envs().any(|(key, value)| {

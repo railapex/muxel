@@ -1603,6 +1603,10 @@ feature is added or changed, update the matching entry here in the same change**
   Credentials are not migrated from the default profile; if a root cannot be
   resolved when first used, its fallback keychain name may differ from a later
   resolved name.
+- **Private UAT root alias** — dogfood builds also accept `--uat-root DIR` for an
+  absolute isolated profile and enter its seeded current workspace after terms
+  are accepted. Combining it with `--user-data-dir` is refused; arguments after
+  `ctl` remain command payload.
 
 ## Settings & theming
 
@@ -1733,6 +1737,9 @@ feature is added or changed, update the matching entry here in the same change**
   and exit, without opening a window, so asking the binary for its version never
   starts a second muxel that would take over the running one's `muxel ctl`
   endpoint and window position.
+- **Exact dogfood build identity** — `muxel --build-info-json` reports the embedded
+  commit, branch, profile and source cleanliness before opening a window. Debug
+  window titles and the update dialog also identify the build.
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
   AppImage that crashes or is SIGKILLed can't unmount its squashfuse mount, and a
   dead leftover mount makes any filesystem scan (a desktop monitor's periodic

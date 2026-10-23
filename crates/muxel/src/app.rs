@@ -8167,6 +8167,15 @@ impl MuxelApp {
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
+        // A UAT run enters its seeded current workspace after first-run terms.
+        if !this.show_terms
+            && crate::uat_root::active()
+            && let Some(id) = this.workspaces.current
+        {
+            cx.defer_in(window, move |this, window, cx| {
+                this.enter_workspace(id, window, cx);
+            });
+        }
         this
     }
 
@@ -27382,6 +27391,12 @@ impl MuxelApp {
                             ),
                     ))
                     .child(div().font_semibold().child(t("muxel")))
+                    .children(crate::build_info::title_identity().map(|identity| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(identity)
+                    }))
                     .child(
                         div()
                             .text_xs()
@@ -31356,7 +31371,7 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// The in-app updater modal: shows the current version + update state, and
+    /// The in-app updater modal: shows the current build + update state, and
     /// (depending on install type) a Download/Install + Restart flow, or the
     /// package-manager command for installs that can't self-update.
     fn render_update_modal(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -31365,8 +31380,8 @@ impl MuxelApp {
 
         let mut body = v_flex().gap_3().w_full().flex_1().min_h_0().child(
             div().text_sm().text_color(muted).child(tf(
-                "Current version: {version}",
-                &[("version", crate::update::APP_VERSION)],
+                "Current build: {version}",
+                &[("version", &crate::build_info::compact_label())],
             )),
         );
 
