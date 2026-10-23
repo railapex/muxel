@@ -3,7 +3,10 @@
 //! window identity and the final methods that would focus, persist and spawn.
 
 use super::super::{ConfirmAction, PlacementMode, WorktreeChoice};
-use super::{ControlTurn, CtlResult, control_launch_spec, control_program_writable};
+use super::{
+    ControlTurn, CtlResult, control_launch_spec, control_program_writable,
+    control_uses_tmux_client, tmux_input_refusal,
+};
 use muxel_core::control::{self as ctl, CreationPolicy, ErrorCode};
 use muxel_core::readaloud;
 use muxel_core::{AgentPreset, Instance, PaneNode, Project, Settings, SplitDirection, Workspace};
@@ -70,6 +73,8 @@ struct MuxelApp {
     launches: usize,
     control_turns: std::collections::HashMap<Uuid, ControlTurn>,
     reject_placement: bool,
+    use_tmux: bool,
+    tmux_available: bool,
 }
 
 impl MuxelApp {
@@ -107,6 +112,8 @@ impl MuxelApp {
             launches: 0,
             control_turns: Default::default(),
             reject_placement: false,
+            use_tmux: false,
+            tmux_available: false,
         }
     }
 
@@ -818,6 +825,30 @@ fn control_new_policy_allows_defined_agent_presets_with_creation_permission() {
             Some(app.presets[1].id)
         );
     }
+}
+
+#[test]
+fn control_new_prompt_checks_tmux_text_without_blocking_plain_prompts() {
+    let mut app = MuxelApp::fixture();
+    app.current_preset = 1;
+    app.use_tmux = true;
+    app.tmux_available = true;
+    app.refuses_without_mutation(
+        ctl::NewOptions {
+            prompt: Some("hello\u{2}world".into()),
+            ..Default::default()
+        },
+        COMMAND_SETTING,
+    );
+    app.open(
+        ctl::NewOptions {
+            prompt: Some("one\ntwo".into()),
+            ..Default::default()
+        },
+        &mut Window::default(),
+    )
+    .unwrap();
+    assert_eq!(app.launches, 1);
 }
 
 #[test]

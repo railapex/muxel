@@ -807,6 +807,10 @@ feature is added or changed, update the matching entry here in the same change**
   Configured non-literal agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
+  Without the shell grant, ctl refuses raw control keys other than named safe
+  keys and `ctrl-c`, and control characters in `send` or `new --prompt` text sent
+  through a tmux client. Custom tmux bindings on printable prefixes or `bind -n`
+  keys can still be reached without the grant.
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or

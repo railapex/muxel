@@ -607,6 +607,48 @@ pub fn describe_layout(node: &PaneNode) -> (Value, HashMap<Uuid, usize>) {
 
 // --- Keys --------------------------------------------------------------------------
 
+/// Inputs that cannot directly select tmux's usual prefix key table. The
+/// spelling matters: a named `esc` is allowed, while a literal ESC is not.
+pub fn tmux_key_without_shell_grant(key: &str) -> bool {
+    let mut chars = key.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return !c.is_control();
+    }
+    matches!(
+        key.trim().to_ascii_lowercase().replace('_', "-").as_str(),
+        "enter"
+            | "return"
+            | "esc"
+            | "escape"
+            | "tab"
+            | "shift-tab"
+            | "backtab"
+            | "up"
+            | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "backspace"
+            | "delete"
+            | "del"
+            | "pageup"
+            | "page-up"
+            | "pagedown"
+            | "page-down"
+            | "space"
+            | "ctrl-c"
+    )
+}
+
+/// Text accepted for a tmux client without the shell grant. Layout controls
+/// are needed for multi-line prompts; other control codes could hit bindings.
+pub fn tmux_text_without_shell_grant(text: &str) -> bool {
+    text.chars().all(|c| {
+        matches!(c, '\t' | '\n' | '\r') || !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
+    })
+}
+
 /// The bytes a key name sends: `enter`, `esc`, `tab`, `shift-tab`, the arrows,
 /// `backspace`, `delete`, `space`, `home`, `end`, `pageup`, `pagedown`,
 /// `ctrl-<letter>`, or any single character. Arrows (and home/end) follow the
@@ -1607,7 +1649,7 @@ mod tests {
         AgentEntry, AgentInfo, AgentState, CliCommand, Command, Error, ErrorCode, PaneNode,
         Request, Response, WaitOutcome, awaiting_reply, describe_layout, flag_value, key_bytes,
         parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent, resolve_project,
-        short_id, skill, wait_outcome,
+        short_id, skill, tmux_key_without_shell_grant, tmux_text_without_shell_grant, wait_outcome,
     };
     use crate::{AgentActivity, SplitDirection};
     use uuid::Uuid;
@@ -2007,6 +2049,24 @@ mod tests {
         assert_eq!(key_bytes("é", false), Some("é".as_bytes().to_vec()));
         assert_eq!(key_bytes("ctrl-shift", false), None);
         assert_eq!(key_bytes("hello", false), None);
+    }
+
+    #[test]
+    fn tmux_key_rule_distinguishes_named_keys_from_raw_controls() {
+        for key in ["ctrl-a", "\u{2}", "\u{1b}", "\u{80}"] {
+            assert!(!tmux_key_without_shell_grant(key), "{key:?}");
+        }
+        for key in ["ctrl-c", "esc", "up", "1", "é", "enter", "shift-tab"] {
+            assert!(tmux_key_without_shell_grant(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn tmux_text_rule_rejects_control_bytes_except_layout() {
+        for value in ["a\u{2}b", "a\u{1b}b", "a\u{7f}b", "a\u{80}b"] {
+            assert!(!tmux_text_without_shell_grant(value), "{value:?}");
+        }
+        assert!(tmux_text_without_shell_grant("one\ntwo\r\tthree é"));
     }
 
     #[test]

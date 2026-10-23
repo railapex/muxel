@@ -83,6 +83,16 @@ impl MuxelApp {
         if let ctl::CreationDecision::Refuse(code) = self.creation_decision(&instance) {
             return Err(ctl::creation_refusal(code));
         }
+        if !self.settings.control_allow_shells
+            && (control_uses_tmux_client(&instance, None)
+                || (!instance.literal_argv && self.use_tmux && self.tmux_available))
+            && options
+                .prompt
+                .as_deref()
+                .is_some_and(|text| !ctl::tmux_text_without_shell_grant(text))
+        {
+            return Err(tmux_input_refusal());
+        }
         let cwd = instance.launch_dir.as_ref().expect("new always sets cwd");
         if !cwd.is_absolute() || !cwd.is_dir() {
             return Err("--cwd must be an existing absolute directory".into());

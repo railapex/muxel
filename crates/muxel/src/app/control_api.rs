@@ -25,6 +25,263 @@ pub(super) use approval::PreparedCreation;
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
 
+fn control_uses_tmux_client(inst: &Instance, remote: Option<&RemoteHost>) -> bool {
+    if inst.tmux_session.is_some() {
+        return true;
+    }
+    match remote {
+        Some(host) => host.use_tmux(inst.use_tmux),
+        None => inst.use_tmux,
+    }
+}
+
+#[cfg(test)]
+mod tmux_input_policy_tests {
+    use super::{Input, KeyPress, control_uses_tmux_client, tmux_input_allowed};
+    use muxel_core::{AgentPreset, Instance, RemoteHost, RemoteOs, control as ctl};
+    use uuid::Uuid;
+
+    #[test]
+    fn effective_local_and_ssh_tmux_transport_selects_the_input_rule() {
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        assert!(!control_uses_tmux_client(&agent, None));
+        assert!(tmux_input_allowed(&agent, None, false, false).is_ok());
+        agent.tmux_session = Some("muxel_agent".into());
+        assert!(control_uses_tmux_client(&agent, None));
+        assert!(tmux_input_allowed(&agent, None, false, false).is_err());
+        assert!(tmux_input_allowed(&agent, None, false, true).is_ok());
+        assert!(tmux_input_allowed(&agent, None, true, false).is_ok());
+
+        agent.tmux_session = None;
+        agent.use_tmux = true;
+        assert!(control_uses_tmux_client(&agent, None));
+        agent.use_tmux = false;
+        let host = RemoteHost::new("host", "host.example");
+        assert!(control_uses_tmux_client(&agent, Some(&host)));
+        assert!(tmux_input_allowed(&agent, Some(&host), false, false).is_err());
+        let mut direct_host = host.clone();
+        direct_host.default_use_tmux = false;
+        assert!(!control_uses_tmux_client(&agent, Some(&direct_host)));
+        agent.use_tmux = true;
+        assert!(control_uses_tmux_client(&agent, Some(&direct_host)));
+        direct_host.os = RemoteOs::Windows;
+        assert!(!control_uses_tmux_client(&agent, Some(&direct_host)));
+        agent.tmux_session = Some("still-attached".into());
+        assert!(control_uses_tmux_client(&agent, Some(&direct_host)));
+        assert!(tmux_input_allowed(&agent, Some(&direct_host), false, false).is_err());
+        assert!(!ctl::tmux_key_without_shell_grant("ctrl-b"));
+    }
+
+    #[test]
+    fn revoking_grant_stops_the_safe_tail_of_a_prefix_batch() {
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        agent.tmux_session = Some("muxel_agent".into());
+        let input = Input::Keys(
+            ["ctrl-b", "c"]
+                .into_iter()
+                .map(|key| KeyPress {
+                    bytes: ctl::key_bytes(key, false).unwrap(),
+                    submits: false,
+                    safe_without_shell_grant: ctl::tmux_key_without_shell_grant(key),
+                })
+                .collect(),
+        );
+        let safe = input.safe_without_shell_grant();
+        assert!(!safe);
+        assert!(tmux_input_allowed(&agent, None, true, safe).is_ok());
+        assert!(tmux_input_allowed(&agent, None, false, safe).is_err());
+    }
+}
+
+fn tmux_input_refusal() -> ctl::Error {
+    "this input to a tmux pane requires command execution permission in Settings > Grok Bot > \
+     \"Also allow typing into shell panes\""
+        .into()
+}
+
+#[cfg(all(test, unix))]
+mod real_tmux_input_tests {
+    use super::{control_program_writable, tmux_input_allowed};
+    use muxel_core::{AgentPreset, Instance, control as ctl};
+    use muxel_terminal::{CommandSpec, PtyChunk, TerminalSession};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn prefix_is_refused_without_grant_but_plain_send_reaches_pane() {
+        // CI installs tmux; a local Unix machine may not have it.
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        let socket = format!("mxlctl-{}", &id[..12]);
+        let name = format!("muxel_test_{}", &id[..8]);
+        let args = vec![
+            "-L".into(),
+            socket.clone(),
+            "-f".into(),
+            "/dev/null".into(),
+            "new-session".into(),
+            "-A".into(),
+            "-s".into(),
+            name.clone(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "read line; printf 'RECEIVED:%s\\n' \"$line\"; sleep 120".into(),
+        ];
+        let (session, rx) = TerminalSession::spawn(CommandSpec::program("tmux", args), 80, 24)
+            .expect("spawn tmux client");
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .args(["-L", &socket, "-f", "/dev/null"])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .expect("run tmux")
+        };
+        let window_count = || {
+            let output = tmux(&[
+                "list-windows",
+                "-t",
+                &format!("={name}"),
+                "-F",
+                "#{window_id}",
+            ]);
+            assert!(output.status.success(), "tmux session disappeared");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rendered = false;
+        loop {
+            while let Ok(chunk) = rx.try_recv() {
+                if let PtyChunk::Output(bytes) = chunk {
+                    rendered |= !bytes.is_empty();
+                }
+            }
+            let output = tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={name}:"),
+                "#{session_attached}",
+            ]);
+            let attached = String::from_utf8_lossy(&output.stdout).trim() == "1";
+            if attached && rendered {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tmux client never attached");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        agent.tmux_session = Some(name.clone());
+        assert!(control_program_writable(&agent, false).is_ok());
+        let write_key = |key: &str, grant: bool| {
+            if tmux_input_allowed(&agent, None, grant, ctl::tmux_key_without_shell_grant(key))
+                .is_ok()
+            {
+                session
+                    .try_write_input(&ctl::key_bytes(key, false).expect("ctl key"))
+                    .unwrap();
+            }
+        };
+        let prefix_pair = |grant| {
+            let keys = ["ctrl-b", "c"];
+            if tmux_input_allowed(
+                &agent,
+                None,
+                grant,
+                keys.iter()
+                    .all(|key| ctl::tmux_key_without_shell_grant(key)),
+            )
+            .is_ok()
+            {
+                write_key(keys[0], grant);
+                std::thread::sleep(Duration::from_millis(80));
+                write_key(keys[1], grant);
+            }
+        };
+        prefix_pair(false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let denied_count = loop {
+            let count = window_count();
+            if count > 1 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let text = "plain task";
+        assert!(
+            tmux_input_allowed(
+                &agent,
+                None,
+                false,
+                ctl::tmux_text_without_shell_grant(text)
+            )
+            .is_ok()
+        );
+        session.try_paste(text).unwrap();
+        write_key("enter", false);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let delivered = loop {
+            let output = tmux(&["capture-pane", "-p", "-t", &format!("={name}:0.0")]);
+            let screen = String::from_utf8_lossy(&output.stdout);
+            if screen.contains("RECEIVED:plain task") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // The same bytes invoke tmux's prefix binding when explicitly granted.
+        prefix_pair(true);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let allowed_count = loop {
+            let count = window_count();
+            if count >= 2 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let socket_path = tmux(&["display-message", "-p", "#{socket_path}"]);
+        let socket_path = String::from_utf8_lossy(&socket_path.stdout)
+            .trim()
+            .to_string();
+        session.kill();
+        let _ = tmux(&["kill-server"]);
+        if socket_path.ends_with(&socket) {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        assert_eq!(
+            denied_count, 1,
+            "ctl opened a tmux shell window without grant"
+        );
+        assert!(delivered, "plain text and Enter did not reach the pane");
+        assert_eq!(
+            allowed_count, 2,
+            "positive control did not invoke tmux prefix"
+        );
+    }
+}
+
+fn tmux_input_allowed(
+    inst: &Instance,
+    remote: Option<&RemoteHost>,
+    allow_shells: bool,
+    safe_without_shell_grant: bool,
+) -> CtlResult<()> {
+    if !safe_without_shell_grant && !allow_shells && control_uses_tmux_client(inst, remote) {
+        return Err(tmux_input_refusal());
+    }
+    Ok(())
+}
+
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
 fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
@@ -166,8 +423,23 @@ enum Answer {
 enum Input {
     /// Pasted, then submitted with Enter `SUBMIT_DELAY_MS` later.
     Prompt(String),
-    /// Raw keys, `KEY_GAP_MS` apart; `true` marks one that submits.
-    Keys(Vec<(Vec<u8>, bool)>),
+    /// Raw keys, `KEY_GAP_MS` apart.
+    Keys(Vec<KeyPress>),
+}
+
+struct KeyPress {
+    bytes: Vec<u8>,
+    submits: bool,
+    safe_without_shell_grant: bool,
+}
+
+impl Input {
+    fn safe_without_shell_grant(&self) -> bool {
+        match self {
+            Self::Prompt(text) => ctl::tmux_text_without_shell_grant(text),
+            Self::Keys(keys) => keys.iter().all(|key| key.safe_without_shell_grant),
+        }
+    }
 }
 
 /// The turn a piece of typing starts, for `wait` here and for other muxels.
@@ -487,7 +759,7 @@ impl MuxelApp {
                                 this.persist_settings();
                                 cx.notify();
                             })),
-                        t("Also allow typing into shell panes. This permits writes to shell and raw-command panes. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Configured non-literal agent presets do not need this command grant; presets are trusted configuration, not a sandbox."),
+                        t("Also allow typing into shell panes. This permits writes to shell and raw-command panes. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Configured non-literal agent presets do not need this command grant; presets are trusted configuration, not a sandbox. Without this grant, ctl refuses unlisted control keys and control characters in text sent through a tmux client, but custom printable-prefix and bind -n bindings can still be reached."),
                     ))
                     .child(
                         div()
@@ -1194,6 +1466,20 @@ impl MuxelApp {
             })
     }
 
+    /// Recheck the effective transport and grant at the actual write boundary.
+    fn control_input_allowed(&self, iid: Uuid, safe_without_shell_grant: bool) -> CtlResult<()> {
+        let inst = self
+            .workspace
+            .instance(iid)
+            .ok_or("that agent has just closed")?;
+        tmux_input_allowed(
+            inst,
+            self.remote_host_for_instance(iid).as_ref(),
+            self.settings.control_allow_shells,
+            safe_without_shell_grant,
+        )
+    }
+
     /// Where `inst`'s claim lives: its tmux session, on this machine or its host.
     /// `None` without tmux — a plain PTY is this muxel's alone.
     fn control_claim_site(&self, inst: &Instance) -> Option<ClaimSite> {
@@ -1252,6 +1538,7 @@ impl MuxelApp {
         if text.trim().is_empty() {
             return Err("nothing to send".into());
         }
+        self.control_input_allowed(iid, ctl::tmux_text_without_shell_grant(&text))?;
         let state = self
             .workspace
             .instance(iid)
@@ -1321,7 +1608,11 @@ impl MuxelApp {
             grace_ms: ctl::ANSWER_GRACE_MS,
             lead_ms: 0,
         };
-        let input = Input::Keys(vec![(key.as_bytes().to_vec(), false)]);
+        let input = Input::Keys(vec![KeyPress {
+            bytes: key.as_bytes().to_vec(),
+            submits: false,
+            safe_without_shell_grant: ctl::tmux_text_without_shell_grant(key),
+        }]);
         self.control_typing(iid, input, Some(turn), false, reply, cx)
     }
 
@@ -1333,20 +1624,25 @@ impl MuxelApp {
     ) -> CtlResult<Typing> {
         let session = self.control_writable(iid, cx)?;
         let app_cursor = session.is_app_cursor_mode();
-        let presses: Vec<(Vec<u8>, bool)> = keys
+        let presses: Vec<KeyPress> = keys
             .iter()
             .map(|key| {
                 ctl::key_bytes(key, app_cursor)
-                    .map(|bytes| (bytes, ctl::key_submits(key)))
+                    .map(|bytes| KeyPress {
+                        bytes,
+                        submits: ctl::key_submits(key),
+                        safe_without_shell_grant: ctl::tmux_key_without_shell_grant(key),
+                    })
                     .ok_or_else(|| format!("unknown key '{key}'"))
             })
             .collect::<Result<_, _>>()?;
+        self.control_input_allowed(iid, presses.iter().all(|key| key.safe_without_shell_grant))?;
         let was_blocked = self
             .workspace
             .instance(iid)
             .and_then(|inst| self.control_state(inst, cx))
             == Some(AgentState::Blocked);
-        let submits = presses.iter().any(|(_, submit)| *submit);
+        let submits = presses.iter().any(|key| key.submits);
         let lead_ms = KEY_GAP_MS as i64 * presses.len().saturating_sub(1) as i64;
         // Answering a prompt, or submitting one, starts a turn `wait` should wait
         // for; other keys (esc, arrows) start none.
@@ -1380,6 +1676,10 @@ impl MuxelApp {
             Ok(session) => session,
             Err(error) => return Task::ready(Err(error)),
         };
+        let input_safe_without_shell_grant = typing.input.safe_without_shell_grant();
+        if let Err(error) = self.control_input_allowed(typing.iid, input_safe_without_shell_grant) {
+            return Task::ready(Err(error));
+        }
         let Typing {
             iid,
             turn,
@@ -1401,6 +1701,7 @@ impl MuxelApp {
                     this.update(cx, |app, cx| {
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
+                        app.control_input_allowed(iid, input_safe_without_shell_grant)?;
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
                         // at the actual Enter admission, never at the prediction.
@@ -1412,7 +1713,7 @@ impl MuxelApp {
             }
             Input::Keys(presses) => {
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
-                    for (i, (bytes, submit)) in presses.into_iter().enumerate() {
+                    for (i, press) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(KEY_GAP_MS))
@@ -1428,10 +1729,16 @@ impl MuxelApp {
                                 if !Arc::ptr_eq(&session, &current_session) {
                                     return false;
                                 }
-                                if submit {
+                                if app
+                                    .control_input_allowed(iid, input_safe_without_shell_grant)
+                                    .is_err()
+                                {
+                                    return false;
+                                }
+                                if press.submits {
                                     session.mark_turn_submitted();
                                 }
-                                session.write_input(&bytes);
+                                session.write_input(&press.bytes);
                                 true
                             })
                             .unwrap_or(false);
