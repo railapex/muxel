@@ -7,8 +7,13 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::TerminalPalette;
-use crate::listener::{MuxelListener, SharedWriter};
+use crate::listener::{
+    EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter, session_thread_field,
+};
 use crate::profile;
+use crate::program_status::{
+    Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
+};
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -27,7 +32,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
@@ -142,6 +147,8 @@ struct OutputQueueState {
     /// share this state for teardown.
     #[cfg(unix)]
     child_hangup: ChildHangup,
+    #[cfg(all(test, unix))]
+    force_child_exit: AtomicBool,
 }
 
 /// Muxel's one SIGHUP to a Unix child. [`TerminalSession::kill`], the
@@ -251,6 +258,12 @@ impl OutputQueueState {
         #[cfg(unix)]
         wake_reader(&mut counters);
         self.space_available.notify_all();
+    }
+
+    #[cfg(all(test, unix))]
+    fn force_child_exit_for_test(&self) {
+        self.force_child_exit.store(true, Ordering::Release);
+        self.close_session();
     }
 
     /// Hand the queue the reader's poller, to notify when the stream closes. A
@@ -417,6 +430,8 @@ fn output_queue<T>(
         chunk_capacity,
         #[cfg(unix)]
         child_hangup: ChildHangup::default(),
+        #[cfg(all(test, unix))]
+        force_child_exit: AtomicBool::new(false),
     });
     (
         OutputQueueSender {
@@ -501,17 +516,53 @@ impl PtyReceiver {
 }
 
 /// Internal reader envelope. It preserves the exact public [`PtyChunk`] shape
-/// while carrying opt-in timing from the PTY reader to the GPUI drain path.
+/// while carrying when each read arrived, and opt-in profiling timing, from the
+/// PTY reader to the GPUI drain path.
 pub(crate) enum ProfiledPtyChunk {
     Output {
         bytes: Vec<u8>,
         timing: Option<PtyReadTiming>,
+        /// When the reader received these bytes. Lifecycle evidence they carry
+        /// is stamped with this, not with when the drain parses them.
+        read_at: SystemTime,
     },
     Exit {
         code: Option<i32>,
         signal: Option<String>,
         read_error: Option<String>,
     },
+}
+
+/// PTY output drained for one parse, with when the reader received each chunk.
+#[derive(Default)]
+pub(crate) struct PtyOutput {
+    bytes: Vec<u8>,
+    /// For each chunk in order: where it ends in `bytes`, and when it was read.
+    reads: Vec<(usize, SystemTime)>,
+}
+
+impl PtyOutput {
+    pub(crate) fn push(&mut self, bytes: &[u8], read_at: SystemTime) {
+        self.bytes.extend_from_slice(bytes);
+        self.reads.push((self.bytes.len(), read_at));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = (&[u8], SystemTime)> {
+        let mut start = 0;
+        self.reads.iter().map(move |&(end, read_at)| {
+            let chunk = &self.bytes[start..end];
+            start = end;
+            (chunk, read_at)
+        })
+    }
 }
 
 impl OutputQueueItem for ProfiledPtyChunk {
@@ -542,10 +593,19 @@ impl PtyChunkSender {
         matches!(self, Self::Profiled(_))
     }
 
-    fn send_output(&self, bytes: Vec<u8>, timing: Option<PtyReadTiming>) -> bool {
+    fn send_output(
+        &self,
+        bytes: Vec<u8>,
+        timing: Option<PtyReadTiming>,
+        read_at: SystemTime,
+    ) -> bool {
         match self {
             Self::Public(tx) => tx.send_blocking(PtyChunk::Output(bytes)),
-            Self::Profiled(tx) => tx.send_blocking(ProfiledPtyChunk::Output { bytes, timing }),
+            Self::Profiled(tx) => tx.send_blocking(ProfiledPtyChunk::Output {
+                bytes,
+                timing,
+                read_at,
+            }),
         }
     }
 
@@ -569,12 +629,60 @@ impl PtyChunkSender {
     }
 }
 
+/// What muxel knows at spawn about the provider conversation a launch opens.
+/// A scheduled loop owns the conversation its first submitted turn went to
+/// only when that conversation was known before the turn (see
+/// [`TerminalSession::first_submission_binding`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LaunchBinding {
+    /// The provider names its conversation once it runs, as a fresh Codex
+    /// launch mints its own thread and publishes it in its title. The first
+    /// UUID title begins the launch's first binding.
+    #[default]
+    Unknown,
+    /// The launch opens a known conversation: one muxel pinned with a session
+    /// flag (`--session-id`, `--resume`; its id here), or the one a program
+    /// that reports no id of its own is in. The launch begins in that binding,
+    /// and its first UUID title names it unless it names another pinned id.
+    Known(Option<String>),
+}
+
+/// Reads a pane's title from outside its PTY. A tmux client forwards none of
+/// the titles its pane's program sets unless `set-titles` is on, which muxel
+/// leaves to the user, so a tmux-wrapped pane's title is read through tmux.
+#[derive(Clone)]
+pub struct TitleSource(Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl TitleSource {
+    /// `read` blocks (it may run a process); it is only ever called from a
+    /// background thread, and must bound its own time.
+    pub fn new(read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub fn read(&self) -> Option<String> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for TitleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TitleSource(..)")
+    }
+}
+
 /// What to run in a terminal.
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
     /// Syntax for file arguments at launch, retained across transport wrappers.
     pub paste_shell: PasteShell,
+    /// Already resolved literal target. Never repeat PATH/PATHEXT lookup or use
+    /// a batch interpreter at the final spawn boundary.
+    pub literal_argv: bool,
+    /// False for outside-created panes: a failed approved program must surface
+    /// its launch error instead of installing a writable default shell.
+    pub allow_shell_fallback: bool,
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
@@ -587,6 +695,11 @@ pub struct CommandSpec {
     /// Text to type into the terminal shortly after start (system-prompt
     /// "type-in" injection). Handled by the view, not the session.
     pub startup_input: Option<String>,
+    /// Runtime lease for the first task created through outside control.
+    pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
+    /// Where that task's startup reads the provider's title when the PTY can't
+    /// see it (a tmux-wrapped pane). Unused by any other automation.
+    pub title_source: Option<TitleSource>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -601,6 +714,10 @@ pub struct CommandSpec {
     /// Fixed delay (ms) after the agent's first output before startup automation
     /// types into it. 0 = auto (wait for output to go quiet instead).
     pub startup_delay_ms: u32,
+    /// The provider conversation this launch opens, if muxel knows it.
+    pub binding: LaunchBinding,
+    /// Whether the command actually resumes an existing provider conversation.
+    pub launch_resumed: bool,
 }
 
 impl CommandSpec {
@@ -614,17 +731,23 @@ impl CommandSpec {
         Self {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
+            literal_argv: false,
             status_program: None,
+            allow_shell_fallback: true,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -635,16 +758,40 @@ impl CommandSpec {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
             program,
+            literal_argv: false,
             args,
+            allow_shell_fallback: true,
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            binding: LaunchBinding::Unknown,
+            launch_resumed: false,
+        }
+    }
+
+    pub fn literal(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            literal_argv: true,
+            submit: false,
+            allow_shell_fallback: false,
+            ..Self::program(program, args)
+        }
+    }
+
+    fn program_for_spawn(&self) -> Result<String> {
+        if self.literal_argv {
+            validate_literal_program(&self.program)?;
+            Ok(self.program.clone())
+        } else {
+            Ok(resolve_program_for_spawn(&self.program))
         }
     }
 
@@ -687,6 +834,21 @@ impl CommandSpec {
 
     pub fn with_startup_delay(mut self, ms: u32) -> Self {
         self.startup_delay_ms = ms;
+        self
+    }
+
+    pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
+        self.binding = binding;
+        self
+    }
+
+    pub fn with_launch_resumed(mut self, resumed: bool) -> Self {
+        self.launch_resumed = resumed;
+        self
+    }
+
+    pub fn with_title_source(mut self, source: TitleSource) -> Self {
+        self.title_source = Some(source);
         self
     }
 }
@@ -799,6 +961,27 @@ struct ResizeState {
     since: Instant,
 }
 
+fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
+    if !has_bytes {
+        previous
+    } else {
+        !submission_pending
+    }
+}
+
+/// The input word (see `TerminalSession::input_state`) after one non-empty
+/// write. The revision always advances. Typed input latches the draft, or
+/// clears it when it carries a submission (`Some(true)`); a mouse or wheel
+/// report (`None`) is input but not text, so the draft stays as it was.
+fn next_input_state(state: u64, submitted: Option<bool>) -> u64 {
+    let revision = (state >> 1).wrapping_add(1) & (u64::MAX >> 1);
+    let previous_draft = state & 1 != 0;
+    let draft = submitted.map_or(previous_draft, |submitted| {
+        draft_after_input(previous_draft, submitted, true)
+    });
+    (revision << 1) | u64::from(draft)
+}
+
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
 /// buffer line (negative = history, so the underline scrolls with the content)
 /// plus the URI a click would open.
@@ -826,10 +1009,147 @@ pub(crate) struct PointerHit {
     pub rows: u16,
 }
 
+/// Read times for controls whose VTE callback can arrive in a later PTY read.
+/// This only finds boundaries; VTE still decides whether bytes form an event.
+#[derive(Default)]
+struct OutputReadClock {
+    osc_since: Option<SystemTime>,
+    escape_at: Option<SystemTime>,
+    sync_since: Option<SystemTime>,
+    next_sync_since: Option<SystemTime>,
+    sync_prefix_len: usize,
+    sync_prefix_at: Option<SystemTime>,
+}
+
+enum OutputBoundary {
+    Plain,
+    ExecutedControl,
+    SyncStart(SystemTime),
+    SyncEnd,
+}
+
+impl OutputReadClock {
+    fn unbuffered_at(&self, read_at: SystemTime) -> SystemTime {
+        [self.osc_since, self.escape_at]
+            .into_iter()
+            .flatten()
+            .fold(read_at, SystemTime::min)
+    }
+
+    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
+        let unbuffered = self.unbuffered_at(read_at);
+        self.sync_since.map_or(unbuffered, |at| at.min(unbuffered))
+    }
+
+    fn executed_control_at(&self, read_at: SystemTime) -> SystemTime {
+        self.sync_since.map_or(read_at, |at| at.min(read_at))
+    }
+
+    /// Split after an OSC ends, an Escape-state C0 executes, or DEC 2026
+    /// changes frames so the next event in the same read gets its own origin.
+    fn scan(&mut self, byte: u8, read_at: SystemTime) -> Option<OutputBoundary> {
+        let mut boundary = None;
+        if self.osc_since.is_some() {
+            match byte {
+                0x07 | 0x18 | 0x1a => {
+                    self.osc_since = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                0x1b => {
+                    self.osc_since = None;
+                    self.escape_at = Some(read_at);
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                _ => {}
+            }
+        } else if let Some(escape_at) = self.escape_at {
+            // vte 0.15's Escape state: these C0 bytes execute without leaving
+            // it; ESC, DEL, and high bytes are ignored; CAN/SUB abort it.
+            match byte {
+                b']' => {
+                    self.escape_at = None;
+                    self.osc_since = Some(escape_at);
+                }
+                0x18 | 0x1a => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x1b | 0x7f..=0xff => {}
+                _ => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+            }
+        } else if byte == 0x1b {
+            self.escape_at = Some(read_at);
+        }
+
+        const PREFIX: &[u8] = b"\x1b[?2026";
+        if self.sync_prefix_len == 0 {
+            if byte == 0x1b {
+                self.sync_prefix_len = 1;
+                self.sync_prefix_at = Some(read_at);
+            }
+        } else if self.sync_prefix_len < PREFIX.len() && byte == PREFIX[self.sync_prefix_len] {
+            self.sync_prefix_len += 1;
+        } else if self.sync_prefix_len == PREFIX.len() && matches!(byte, b'h' | b'l') {
+            let started = self.sync_prefix_at.take().unwrap_or(read_at);
+            self.sync_prefix_len = 0;
+            boundary = Some(if byte == b'h' {
+                OutputBoundary::SyncStart(started)
+            } else {
+                OutputBoundary::SyncEnd
+            });
+        } else {
+            self.sync_prefix_len = usize::from(byte == 0x1b);
+            self.sync_prefix_at = (byte == 0x1b).then_some(read_at);
+        }
+        boundary
+    }
+
+    fn after_segment(
+        &mut self,
+        boundary: Option<OutputBoundary>,
+        active: bool,
+        read_at: SystemTime,
+    ) {
+        match boundary {
+            Some(OutputBoundary::SyncStart(started)) if active => {
+                if self.sync_since.is_some() {
+                    self.next_sync_since.get_or_insert(started);
+                } else {
+                    self.sync_since = Some(started);
+                }
+            }
+            Some(OutputBoundary::SyncEnd) if active => {
+                if let Some(started) = self.next_sync_since.take() {
+                    self.sync_since = Some(started);
+                }
+            }
+            _ => {}
+        }
+        if !active {
+            self.sync_since = None;
+            self.next_sync_since = None;
+        } else if self.sync_since.is_none() {
+            // VTE can also end a frame at its buffer limit.
+            self.sync_since = Some(read_at);
+        }
+    }
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
+    launched_at: SystemTime,
+    launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    program_status_observer: Mutex<Observer>,
+    program_status_generation: AtomicU64,
+    read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -848,6 +1168,10 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    evidence: Arc<Mutex<LifecycleEvidence>>,
+    /// Current root OSC 7501 report from this PTY launch. Child-id records do
+    /// not drive pane status; a provider binding switch clears the root.
+    program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     title_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
@@ -893,19 +1217,24 @@ pub struct TerminalSession {
     output_seen: AtomicBool,
     /// Whether this terminal currently has keyboard focus (UI thread + drain).
     focused: AtomicBool,
-    /// Set once Muxel deliberately submits a turn with Enter. Startup title
-    /// activity alone is not evidence that a turn completed.
+    /// Set once Muxel deliberately submits a turn with Enter, for this whole
+    /// launch. Startup title activity alone is not evidence that a turn
+    /// completed. The runtime reducer uses the submission recorded in
+    /// `evidence` instead, which counts only within its provider binding.
     turn_submitted: AtomicBool,
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
-    /// Counts what this terminal sends to the program as input: keys, pastes,
-    /// and mouse and wheel reports (a wheel turn can arrive as arrow keys). Not
-    /// focus reports, and not the terminal's own replies to the program. Input
-    /// that reaches the program another way (another client attached to the
-    /// same tmux session) isn't counted. Code that pasted a prompt can tell from
-    /// it whether this terminal sent anything else before its Enter.
-    input_rev: AtomicU64,
+    submission_pending: AtomicBool,
+    /// The input revision and a conservative draft bit in one atomic word, so
+    /// a reader never sees one write's revision paired with another write's
+    /// draft bit. The low bit is the draft flag; the remaining bits are the
+    /// revision, advanced for each input write (see [`Self::input_snapshot`]).
+    input_state: AtomicU64,
+    /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
+    /// burst of keys/resizes one reconciliation request instead of an event log.
+    runtime_trigger: async_channel::Sender<()>,
+    runtime_events: async_channel::Receiver<()>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -1027,6 +1356,18 @@ pub(crate) struct PaintDrawList {
 }
 
 impl TerminalSession {
+    pub fn launch_resumed(&self) -> bool {
+        self.launch_resumed
+    }
+
+    pub fn launched_at(&self) -> SystemTime {
+        self.launched_at
+    }
+
+    pub fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1081,6 +1422,7 @@ impl TerminalSession {
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        let launched_at = SystemTime::now();
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -1115,7 +1457,7 @@ impl TerminalSession {
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
-        let program = resolve_program_for_spawn(&spec.program);
+        let program = spec.program_for_spawn()?;
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1244,6 +1586,10 @@ impl TerminalSession {
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
+        let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        if matches!(&spec.binding, LaunchBinding::Known(_)) {
+            program_status.lock().adopt_binding(1);
+        }
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1304,6 +1650,7 @@ impl TerminalSession {
         drop(writer_handle);
 
         let title = Arc::new(Mutex::new(None));
+        let evidence = Arc::new(Mutex::new(LifecycleEvidence::for_launch(&spec.binding)));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
@@ -1312,6 +1659,7 @@ impl TerminalSession {
         let listener = MuxelListener {
             replies,
             title: title.clone(),
+            evidence: evidence.clone(),
             title_generation: title_generation.clone(),
             title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
@@ -1325,10 +1673,17 @@ impl TerminalSession {
             listener,
         );
 
+        let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launched_at,
+            launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            program_status_observer: Mutex::new(Observer::default()),
+            program_status_generation: AtomicU64::new(0),
+            read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
             output_queue,
@@ -1337,6 +1692,8 @@ impl TerminalSession {
             input_stop: write_tx,
             child_pid,
             title,
+            evidence,
+            program_status,
             title_generation,
             title_changed_at,
             session_id_hint,
@@ -1364,7 +1721,10 @@ impl TerminalSession {
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
             last_user_input: Mutex::new(None),
-            input_rev: AtomicU64::new(0),
+            submission_pending: AtomicBool::new(false),
+            input_state: AtomicU64::new(0),
+            runtime_trigger,
+            runtime_events,
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -1387,29 +1747,190 @@ impl TerminalSession {
         Ok(session)
     }
 
-    /// Feed PTY output through the VTE parser into the terminal grid.
-    ///
+    /// Feed PTY output through the VTE parser into the terminal grid. Evidence
+    /// uses this read time, or the opening read of a title or synchronized frame
+    /// that began earlier. The view's drain uses the reader's timestamps.
+    pub(crate) fn process_output(&self, data: &[u8]) {
+        self.parse([(data, SystemTime::now())]);
+    }
+
+    /// Feed a drained batch through the parser chunk by chunk, so the evidence
+    /// each chunk raises is stamped with when the reader received it. A batch
+    /// can wait in the queue and the drain's coalescing delay, so its parse
+    /// time can fall after a provider switch its bytes preceded.
+    pub(crate) fn process_drained(&self, output: &PtyOutput) {
+        self.parse(output.chunks());
+    }
+
+    fn advance_timed_segment(
+        &self,
+        processor: &mut Processor,
+        term: &mut Term<MuxelListener>,
+        clock: &mut OutputReadClock,
+        bytes: &[u8],
+        effective_at: SystemTime,
+        incoming_at: SystemTime,
+    ) {
+        // VTE 0.15 replays its synchronized buffer on capacity overflow, then
+        // parses the incoming bytes in the same advance call. Give the replay
+        // its old time and the new bytes their own time.
+        const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
+        let fresh = if processor.sync_timeout().sync_timeout().is_some()
+            && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
+        {
+            self.evidence
+                .lock()
+                .begin_read(clock.sync_since.unwrap_or(effective_at));
+            processor.stop_sync(term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
+            self.evidence.lock().begin_read(incoming_at)
+        } else {
+            self.evidence.lock().begin_read(effective_at)
+        };
+        self.observe_program_status(bytes, fresh);
+        processor.advance(term, bytes);
+    }
+
+    /// Observe each timed segment before VTE can defer its title callbacks.
+    /// Capacity replay has already separated the old frame from these bytes,
+    /// so the observer and the listener receive the same attribution time.
+    fn observe_program_status(&self, bytes: &[u8], fresh: bool) {
+        let mut observer = self.program_status_observer.lock();
+        for &byte in bytes {
+            let generation = self.program_status_generation.load(Ordering::Acquire);
+            let Some(event) = observer.advance_at(byte, fresh, generation) else {
+                continue;
+            };
+            if let ProgramStatusEvent::Title(ref title) = event
+                && let Some(thread) = session_thread_field(title)
+                && let Some(key) = ThreadKey::from_field(thread)
+            {
+                let evidence = self.evidence.lock();
+                let carry = evidence.can_carry_initial_working();
+                let confirms_launch = !evidence.first_thread_switches(thread);
+                drop(evidence);
+                let mut status = self.program_status.lock();
+                if fresh && self.program_status_generation.load(Ordering::Acquire) == generation {
+                    status.observe_title(key, carry, confirms_launch);
+                }
+            }
+            match event {
+                ProgramStatusEvent::Report(report) => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        if report.id.is_none() {
+                            log::debug!(
+                                "program status source=osc7501 report state={:?} kind={:?}",
+                                report.state,
+                                report.kind
+                            );
+                        }
+                        status.apply(report);
+                    }
+                }
+                ProgramStatusEvent::Reset => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.clear();
+                    }
+                }
+                ProgramStatusEvent::ShellPrompt => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.shell_prompt();
+                    }
+                }
+                ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => {}
+            }
+        }
+    }
+
     /// Collects alacritty damage for the next paint (partial row rebuild) and
     /// for paint-priority scheduling (recent interaction vs stream).
-    pub(crate) fn process_output(&self, data: &[u8]) {
+    fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
-        processor.advance(&mut *term, data);
-        // Synchronized updates (DECSET 2026): vte BUFFERS everything between
-        // BSU/ESU instead of applying it, and expiring a stuck window is the
-        // embedder's job (alacritty services this in its event loop; vte's
-        // deadline is 150ms). Without this check, an app that opens a window
-        // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap.
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|d| Instant::now() >= d)
-        {
-            processor.stop_sync(&mut *term);
-            profile::sync_expired();
+        let mut clock = self.read_clock.lock();
+        let mut parsed = false;
+        for (bytes, read_at) in chunks {
+            if bytes.is_empty() {
+                continue;
+            }
+            let mut start = 0;
+            let mut effective_at = clock.effective_at(read_at);
+            let mut unbuffered_at = clock.unbuffered_at(read_at);
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                if let Some(boundary) = clock.scan(byte, read_at) {
+                    if matches!(boundary, OutputBoundary::ExecutedControl) {
+                        if start < index {
+                            self.advance_timed_segment(
+                                &mut processor,
+                                &mut term,
+                                &mut clock,
+                                &bytes[start..index],
+                                effective_at,
+                                unbuffered_at,
+                            );
+                            clock.after_segment(
+                                None,
+                                processor.sync_timeout().sync_timeout().is_some(),
+                                read_at,
+                            );
+                        }
+                        let control_at = clock.executed_control_at(read_at);
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[index..=index],
+                            control_at,
+                            read_at,
+                        );
+                    } else {
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[start..=index],
+                            effective_at,
+                            unbuffered_at,
+                        );
+                    }
+                    clock.after_segment(
+                        Some(boundary),
+                        processor.sync_timeout().sync_timeout().is_some(),
+                        read_at,
+                    );
+                    start = index + 1;
+                    effective_at = clock.effective_at(read_at);
+                    unbuffered_at = clock.unbuffered_at(read_at);
+                }
+            }
+            if start < bytes.len() {
+                self.advance_timed_segment(
+                    &mut processor,
+                    &mut term,
+                    &mut clock,
+                    &bytes[start..],
+                    effective_at,
+                    unbuffered_at,
+                );
+                clock.after_segment(
+                    None,
+                    processor.sync_timeout().sync_timeout().is_some(),
+                    read_at,
+                );
+            }
+            parsed = true;
         }
-        if !data.is_empty() {
+        // Expiry without another read uses the same original frame time.
+        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
+        self.evidence.lock().end_read();
+        if parsed {
             let screen = term.screen_lines() as i32;
             let dmg = match term.damage() {
                 TermDamage::Full => ContentDamage::Full,
@@ -1539,6 +2060,48 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.scroll_input_to_bottom();
+        if !data.is_empty() {
+            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
+            self.advance_input(Some(submitted_enter));
+            if submitted_enter {
+                self.trigger_runtime();
+            }
+            // A TUI reaction will follow; prioritize output during this short
+            // interaction window even if stream output is already queued.
+            self.mark_interactive();
+        }
+        self.try_write_raw(data)
+    }
+
+    /// Admit a complete submission (Enter, or text ending in Enter) and commit
+    /// its lifecycle facts together. Failed admission leaves the draft and
+    /// submission evidence unchanged, with no marker for a later key to consume.
+    /// Success means queued bytes, not confirmation that the child consumed them.
+    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.scroll_input_to_bottom();
+        let mut writer = self.writer.lock();
+        // The child can react as soon as write_all publishes bytes. Keep the
+        // input time before any resume hook it causes, but commit no facts
+        // until writer admission succeeds.
+        let submitted_at = SystemTime::now();
+        self.submission_pending.store(false, Ordering::Release);
+        writer.write_all(data)?;
+        writer.flush()?;
+        if !data.is_empty() {
+            // This API admits a known prompt after `paste_prompt` has checked
+            // the pane and input revision. Generic keyboard Enter uses
+            // `mark_turn_submitted` and cannot prove prompt intent.
+            self.evidence.lock().record_prompt_submission(submitted_at);
+            self.turn_submitted.store(true, Ordering::Relaxed);
+            self.advance_input(Some(true));
+            self.mark_interactive();
+            self.trigger_runtime();
+        }
+        Ok(())
+    }
+
+    fn scroll_input_to_bottom(&self) {
         // Skip scroll work when already pinned to the live row — every key
         // otherwise takes the term mutex for a no-op scroll under load.
         {
@@ -1549,19 +2112,12 @@ impl TerminalSession {
                 self.bump_content();
             }
         }
-        if !data.is_empty() {
-            // A TUI reaction will follow; prioritize output during this short
-            // interaction window even if stream output is already queued.
-            self.mark_interactive();
-            self.input_rev.fetch_add(1, Ordering::AcqRel);
-        }
-        self.try_write_raw(data)
     }
 
-    /// How many times input has been sent so far (see the field). Read it after
-    /// pasting a prompt; a different value later means something else was sent.
+    /// Input revision for keys, pastes, and pointer reports sent by this terminal.
+    /// Input from another client of the same tmux session is not counted.
     pub fn input_rev(&self) -> u64 {
-        self.input_rev.load(Ordering::Acquire)
+        self.input_snapshot().0
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -1604,12 +2160,80 @@ impl TerminalSession {
         *self.last_user_input.lock()
     }
 
-    pub fn mark_turn_submitted(&self) {
-        self.turn_submitted.store(true, Ordering::Relaxed);
+    fn advance_input(&self, submitted: Option<bool>) {
+        let _ = self
+            .input_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                Some(next_input_state(state, submitted))
+            });
     }
 
+    /// Announce that the next input write submits a turn. Call it just before
+    /// writing the Enter (or the text ending in one).
+    pub fn mark_turn_submitted(&self) {
+        let submitted_at = SystemTime::now();
+        self.evidence.lock().record_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Explicit prompt submission from a path that supplied the prompt text.
+    /// Keyboard Enter alone can select a resume item, even after arrow input.
+    pub fn mark_prompt_submitted(&self) {
+        let submitted_at = SystemTime::now();
+        let mut evidence = self.evidence.lock();
+        evidence.record_prompt_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Whether any turn was submitted in this launch, in any conversation.
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Conversation observed before this launch's first submitted turn. None
+    /// means no turn was submitted or its recipient was unknown. A later
+    /// identity or submission never establishes or transfers that ownership.
+    pub fn first_submission_binding(&self) -> Option<u64> {
+        self.evidence.lock().first_submission_binding()
+    }
+
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.evidence.lock().initial_unbound_submission()
+    }
+
+    /// The input revision and draft bit. Ordinary non-empty input writes (keys,
+    /// pastes, mouse and wheel reports) advance the revision before writer
+    /// admission; fallible submissions commit it after successful admission.
+    /// Focus reports and the terminal's own replies to the program don't count.
+    /// The draft bit is set
+    /// by typed input and cleared by a submission.
+    pub fn input_snapshot(&self) -> (u64, bool) {
+        let state = self.input_state.load(Ordering::Relaxed);
+        (state >> 1, state & 1 != 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_evidence(&self, cursor: Option<u64>) -> EvidenceRead {
+        self.runtime_evidence_at(cursor, SystemTime::now())
+    }
+
+    /// Lifecycle evidence for the runtime reducer at wall-clock time `now`:
+    /// title edges after `cursor` (`None`: from the current binding's start)
+    /// and whether a turn was submitted in the current binding.
+    pub(crate) fn runtime_evidence_at(&self, cursor: Option<u64>, now: SystemTime) -> EvidenceRead {
+        self.evidence.lock().read_at(cursor, now)
+    }
+
+    /// Coalesced lifecycle invalidations for the runtime reducer. Receivers
+    /// share this queue; a consumer must reconcile the latest session facts.
+    pub fn runtime_events(&self) -> async_channel::Receiver<()> {
+        self.runtime_events.clone()
+    }
+
+    fn trigger_runtime(&self) {
+        let _ = self.runtime_trigger.try_send(());
     }
 
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
@@ -1651,11 +2275,12 @@ impl TerminalSession {
         Ok(())
     }
 
-    /// Send a mouse or wheel report: input from the user, so it counts, but it
-    /// leaves the scroll position alone.
+    /// Send a mouse or wheel report. It reaches the program as input, so it
+    /// advances the input revision, but it isn't text: the draft bit and the
+    /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
         if !data.is_empty() {
-            self.input_rev.fetch_add(1, Ordering::AcqRel);
+            self.advance_input(None);
         }
         self.write_raw(data);
     }
@@ -1806,6 +2431,7 @@ impl TerminalSession {
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
         self.bump_content();
+        self.trigger_runtime();
         false
     }
 
@@ -1966,6 +2592,11 @@ impl TerminalSession {
     /// The visible screen as text (one row per line, newline-separated). Used for
     /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
     pub(crate) fn visible_text(&self) -> String {
+        self.startup_screen().text
+    }
+
+    /// Capture input geometry and modes with the same grid generation.
+    pub(crate) fn startup_screen(&self) -> crate::startup::Screen {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
         self.with_term(|term| {
             let grid = term.grid();
@@ -1984,7 +2615,14 @@ impl TerminalSession {
                 }
                 s.push('\n');
             }
-            s
+            let cursor = grid.cursor.point;
+            crate::startup::Screen {
+                text: s,
+                cursor_column: cursor.column.0,
+                cursor_row: cursor.line.0,
+                cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
+                bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+            }
         })
     }
 
@@ -2121,19 +2759,127 @@ impl TerminalSession {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
     }
 
-    /// Drop a provider title that belongs to a conversation the running TUI has
-    /// switched away from. The next OSC title repopulates it.
-    pub fn clear_title(&self) {
-        *self.title.lock() = None;
-        self.title_generation.fetch_add(1, Ordering::Relaxed);
-        *self.title_changed_at.lock() = Some(Instant::now());
+    /// The running TUI switched provider conversations at some instant in
+    /// `[from, to]` (one instant when the report carries its own time), as
+    /// reported out of band: a session hook's record or a registry row, read on
+    /// a later tick. Its clock can't be ordered exactly against PTY output, so
+    /// a new binding begins with an ambiguity window around the switch. The
+    /// current title stays as level state unless it was read before the switch
+    /// could have happened (the next OSC title repopulates it), and the bell is
+    /// cleared. Output read inside the window forms no completion edge and
+    /// rings no bell; the reducer waits for evidence read after it.
+    pub fn provider_switched(&self, from: SystemTime, to: SystemTime) {
+        self.provider_switched_at(from, to, SystemTime::now());
+    }
+
+    pub(crate) fn provider_switched_at(
+        &self,
+        from: SystemTime,
+        to: SystemTime,
+        learned_at: SystemTime,
+    ) {
+        // A sequence begun before this boundary cannot become a new binding's
+        // report just because its terminator arrives in a later PTY read.
+        self.program_status_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let evidence = &mut *self.evidence.lock();
+        let switch = evidence.switch_binding(from, to, learned_at);
+        self.program_status
+            .lock()
+            .adopt_binding(evidence.binding_rev());
+        if switch.bell {
+            self.bell.store(false, Ordering::Relaxed);
+        }
+        if switch.title && self.title.lock().take().is_some() {
+            self.title_generation.fetch_add(1, Ordering::Relaxed);
+            *self.title_changed_at.lock() = Some(Instant::now());
+        }
+        // The reducer's screen facts reset with the binding; a new content
+        // generation makes it recapture them.
         self.bump_content();
+        self.trigger_runtime();
     }
 
     /// Latest provider-owned OSC session hint retained across ordinary title
     /// changes. Muxel resolves and validates it before adopting the identity.
     pub fn session_id_hint(&self) -> Option<String> {
         self.session_id_hint.lock().clone()
+    }
+
+    /// Revision of the provider conversation bound to this live PTY launch.
+    pub fn binding_revision(&self) -> u64 {
+        self.evidence.lock().binding_rev()
+    }
+
+    /// The embedder owns vte's synchronized-update timeout. The view uses this
+    /// deadline to revisit a title/report held by a BSU without more PTY bytes.
+    pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
+        self.processor.lock().sync_timeout().sync_timeout()
+    }
+
+    fn flush_expired_sync_locked(
+        &self,
+        term: &mut Term<MuxelListener>,
+        processor: &mut Processor,
+        clock: &mut OutputReadClock,
+    ) -> bool {
+        let Some(deadline) = processor.sync_timeout().sync_timeout() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.evidence
+            .lock()
+            .begin_read(clock.effective_at(SystemTime::now()));
+        processor.stop_sync(term);
+        clock.sync_since = None;
+        clock.next_sync_since = None;
+        self.evidence.lock().end_read();
+        profile::sync_expired();
+        true
+    }
+
+    fn flush_expired_program_status_sync(&self) {
+        let mut term = self.term.lock();
+        let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
+        if self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock) {
+            self.bump_content();
+            self.trigger_runtime();
+        }
+    }
+
+    pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        self.flush_expired_program_status_sync();
+        // A synchronized update may have supplied a new UUID title while VTE
+        // still holds its callback. The observer is then ahead of #91.
+        // The listener takes hint before evidence for a title callback. Keep
+        // that order here when recovering from an over-budget title.
+        let hint_thread = self
+            .session_id_hint
+            .lock()
+            .as_deref()
+            .and_then(session_thread_field)
+            .and_then(ThreadKey::from_field);
+        let binding_rev = self.evidence.lock().binding_rev();
+        let mut status = self.program_status.lock();
+        if status.binding_revision > binding_rev {
+            return ProgramStatusSnapshot::default();
+        }
+        if status.binding_revision < binding_rev {
+            // An overlong title can be rejected by the observer's OSC budget
+            // while alacritty still emits it. The listener proves a newer
+            // binding; retire old PSP facts and accept later fresh reports.
+            status.recover_binding(binding_rev, hint_thread);
+        }
+        *status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_program_status(&self, wire: &[u8]) {
+        self.process_output(wire);
+        self.trigger_runtime();
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -2169,6 +2915,12 @@ impl TerminalSession {
     /// Clear the bell (e.g. once the user focuses the pane).
     pub fn clear_bell(&self) {
         self.bell.store(false, Ordering::Relaxed);
+        self.trigger_runtime();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&self, idle: Duration) {
+        *self.last_output.lock() = Instant::now() - idle;
     }
 
     /// Time since output was last processed (for idle detection).
@@ -2341,6 +3093,53 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+/// Resolve a literal launch without permitting a batch interpreter to reparse
+/// argv. Windows npm Codex wrappers resolve to their packaged native executable.
+pub fn literal_program_for_spawn(program: &str) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let path = std::path::Path::new(program);
+    #[cfg(windows)]
+    let resolved = if path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com"))
+    {
+        program.to_string()
+    } else {
+        resolve_program_for_spawn(program)
+    };
+    #[cfg(not(windows))]
+    let resolved = resolve_program_for_spawn(program);
+    #[cfg(windows)]
+    let resolved = {
+        // Resolution can return a relative PATH entry. Persist an absolute target
+        // so neither the PTY cwd nor a later PATH change can choose another file.
+        let path = std::path::absolute(&resolved)?;
+        path.to_string_lossy().into_owned()
+    };
+    validate_literal_program(&resolved)?;
+    Ok(resolved)
+}
+
+fn validate_literal_program(program: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            !is_windows_batch_program(program),
+            "literal argv cannot run Windows batch script '{program}'; choose its native executable or use --preset"
+        );
+        let path = std::path::Path::new(program);
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file(),
+            "literal executable '{program}' must be an existing absolute native executable"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    Ok(())
 }
 
 /// Resolve `program` to a path CreateProcess can launch on Windows.
@@ -2918,6 +3717,11 @@ impl HangupChild {
     /// caller still reaps it. Without a `hang_up` (the reader ended on EOF or
     /// a read error) it arms nothing.
     fn finish_hangup(&mut self) {
+        #[cfg(test)]
+        if self.queue.force_child_exit.load(Ordering::Acquire) {
+            self.signal(libc::SIGKILL);
+            return;
+        }
         if !self.hung_up {
             return;
         }
@@ -2926,6 +3730,11 @@ impl HangupChild {
         };
         let deadline = sent_at + CHILD_HANGUP_GRACE;
         while Instant::now() < deadline {
+            #[cfg(test)]
+            if self.queue.force_child_exit.load(Ordering::Acquire) {
+                self.signal(libc::SIGKILL);
+                return;
+            }
             match self.child.try_wait() {
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 _ => return,
@@ -2997,6 +3806,7 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                let read_at = SystemTime::now();
                 if ui_gone {
                     // Keep the PTY output pipe moving while owned teardown kills
                     // the child and closes ConPTY. ClosePseudoConsole may wait
@@ -3011,7 +3821,7 @@ fn read_loop(
                 // Before the bytes reach the UI: replies that wait on the UI's
                 // drain can miss the asker's window and be read as typing.
                 immediate_replies.advance(&buf[..n]);
-                if !tx.send_output(buf[..n].to_vec(), timing) {
+                if !tx.send_output(buf[..n].to_vec(), timing, read_at) {
                     // The stream has ended: the receiver dropped, or the
                     // session dropped while the receiver was behind. Stop the
                     // child, then keep draining on Windows until EOF so ConPTY
@@ -3093,6 +3903,10 @@ fn read_loop(
     // the thread costs nothing while sleeping and dies with the process.
     if code.is_none() {
         while let Ok(None) = child.try_wait() {
+            #[cfg(all(test, unix))]
+            if child.queue.force_child_exit.load(Ordering::Acquire) {
+                child.signal(libc::SIGKILL);
+            }
             std::thread::sleep(Duration::from_secs(1));
         }
     }
@@ -3570,15 +4384,18 @@ mod profiler_transport_tests {
             sequence: 7,
             read_at_us: 11,
         };
-        assert!(sender.send_output(vec![4, 5], Some(timing)));
+        let read_at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        assert!(sender.send_output(vec![4, 5], Some(timing), read_at));
         match rx.try_recv().expect("profiled output") {
             ProfiledPtyChunk::Output {
                 bytes,
                 timing: Some(received),
+                read_at: received_at,
             } => {
                 assert_eq!(bytes, [4, 5]);
                 assert_eq!(received.sequence, timing.sequence);
                 assert_eq!(received.read_at_us, timing.read_at_us);
+                assert_eq!(received_at, read_at);
             }
             _ => panic!("expected timed output"),
         }
@@ -4564,12 +5381,150 @@ mod bounded_output_pty_tests {
 // Windows PATH resolution for npm shims (CreateProcess cannot run #!/bin/sh).
 #[cfg(all(test, windows))]
 mod windows_spawn_resolve {
-    use super::{CommandSpec, PtyChunk, TerminalSession, resolve_program_for_spawn_windows};
+    use super::{
+        CommandSpec, PtyChunk, TerminalSession, literal_program_for_spawn,
+        resolve_program_for_spawn_windows,
+    };
     use std::io::Write;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn literal_launch_refuses_batch_scripts_before_spawning() {
+        for extension in ["cmd", "bat"] {
+            let path = std::env::temp_dir().join(format!(
+                "muxel-literal-{}.{}",
+                uuid::Uuid::new_v4(),
+                extension
+            ));
+            std::fs::write(&path, "@echo off\r\n").unwrap();
+            let error = literal_program_for_spawn(path.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert!(
+                error.contains("native executable") && error.contains("--preset"),
+                "{error}"
+            );
+            let spec = CommandSpec::literal(path.display().to_string(), vec![]);
+            assert!(
+                spec.program_for_spawn().is_err(),
+                "final boundary allowed batch target"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn literal_executable_is_resolved_once_even_with_a_batch_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("muxel-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tool.exe");
+        std::fs::write(&exe, b"native fixture").unwrap();
+        std::fs::write(dir.join("tool.exe.cmd"), b"@echo off\r\n").unwrap();
+        let resolved = literal_program_for_spawn(exe.to_str().unwrap()).unwrap();
+        assert_eq!(std::path::Path::new(&resolved), exe);
+        let spec = CommandSpec::literal(&resolved, vec!["brief".into()]);
+        // Exercise the same final-boundary method used by TerminalSession::spawn.
+        // The ordinary resolver would prefer tool.exe.cmd on its second lookup.
+        assert_eq!(spec.program_for_spawn().unwrap(), resolved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Invoked as a child of the real ConPTY launch test below. The libtest `--`
+    // separator accepts arbitrary filter tokens, letting this executable itself
+    // capture the original argv without a shell or another tool dependency.
+    #[test]
+    fn literal_argv_fixture() {
+        let Ok(path) = std::env::var("MUXEL_TEST_ARGV_CAPTURE") else {
+            return;
+        };
+        let args: Vec<_> = std::env::args()
+            .skip_while(|arg| arg != "--")
+            .skip(1)
+            .collect();
+        std::fs::write(path, serde_json::to_vec(&args).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn native_pty_preserves_literal_argv() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let capture =
+            std::env::temp_dir().join(format!("muxel-argv-{}.json", uuid::Uuid::new_v4()));
+        let payload: Vec<String> = [
+            "a brief with spaces",
+            "say \"hello\"",
+            "",
+            "--",
+            "--background",
+            "ampersand & pipe | percent % caret ^",
+            "unicode 🦀",
+            "trailing\\",
+            "white space\\\\",
+            "backslashes\\\\\"quote",
+            "line one\nline two",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut args: Vec<String> = [
+            "--exact",
+            "session::windows_spawn_resolve::literal_argv_fixture",
+            "--nocapture",
+            "--",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        args.extend(payload.clone());
+        let program =
+            literal_program_for_spawn(std::env::current_exe().unwrap().to_str().unwrap()).unwrap();
+        let mut spec = CommandSpec::literal(program, args);
+        spec.env.push((
+            "MUXEL_TEST_ARGV_CAPTURE".into(),
+            capture.display().to_string(),
+        ));
+        let (session, rx) =
+            TerminalSession::spawn(spec, 80, 24).expect("spawn native argv fixture");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut received: Option<Vec<String>> = None;
+        while Instant::now() < deadline {
+            // ConPTY can keep its output pipe open after the child writes its
+            // result. The contract here is argv delivery, not pipe teardown.
+            if let Ok(bytes) = std::fs::read(&capture)
+                && let Ok(args) = serde_json::from_slice(&bytes)
+            {
+                received = Some(args);
+                break;
+            }
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => {
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.kill();
+        drop(_guard);
+        let received = received
+            .or_else(|| {
+                std::fs::read(&capture)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            })
+            .expect("native child captured argv");
+        std::fs::remove_file(capture).unwrap();
+        assert_eq!(received, payload);
+    }
 
     #[test]
     fn prefers_cmd_over_shebang_shim() {
@@ -4653,6 +5608,8 @@ mod windows_spawn_resolve {
             std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         }
         let resolved = resolve_program_for_spawn_windows("codex");
+        let literal = literal_program_for_spawn("codex")
+            .expect("packaged native Codex supports literal argv");
         unsafe {
             match prev {
                 Some(value) => std::env::set_var("PATH", value),
@@ -4665,6 +5622,7 @@ mod windows_spawn_resolve {
         }
 
         assert_eq!(std::path::PathBuf::from(resolved), native);
+        assert_eq!(std::path::PathBuf::from(literal), native);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4758,6 +5716,473 @@ mod windows_spawn_resolve {
     }
 }
 
+#[cfg(test)]
+mod runtime_fact_tests {
+    use super::{
+        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+    };
+    use crate::listener::SWITCH_SLACK;
+    use async_channel::TryRecvError;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn draft_state_changes_only_for_admitted_input_or_submission() {
+        assert!(!draft_after_input(false, false, false));
+        assert!(draft_after_input(false, false, true));
+        assert!(!draft_after_input(true, true, true));
+        assert!(draft_after_input(true, false, true));
+    }
+
+    #[test]
+    fn every_input_write_advances_the_revision_and_only_text_moves_the_draft() {
+        let state = |rev: u64, draft: bool| (rev << 1) | u64::from(draft);
+        assert_eq!(
+            next_input_state(state(4, false), Some(false)),
+            state(5, true)
+        );
+        assert_eq!(
+            next_input_state(state(4, true), Some(true)),
+            state(5, false)
+        );
+        // A mouse or wheel report leaves the draft as it was.
+        assert_eq!(next_input_state(state(4, true), None), state(5, true));
+        assert_eq!(next_input_state(state(4, false), None), state(5, false));
+    }
+
+    #[test]
+    fn runtime_invalidations_are_bounded_and_input_facts_are_atomic() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let events = session.runtime_events();
+
+        session.write_input(b"x");
+        assert_eq!(session.input_snapshot(), (1, true));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // A soft newline is ordinary draft input; the view deliberately does
+        // not mark it as a turn submission.
+        session.write_input(b"\x1b\r");
+        assert_eq!(session.input_snapshot(), (2, true));
+
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert_eq!(session.input_snapshot(), (3, false));
+        assert_eq!(events.try_recv(), Ok(()));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // Read long before the provider switched; then the switch is reported.
+        let now = SystemTime::now();
+        let mut stale = PtyOutput::default();
+        stale.push(b"\x1b]0;stale title\x07\x07", now - Duration::from_secs(10));
+        session.process_drained(&stale);
+        assert!(session.has_bell());
+        session.provider_switched(now, now);
+        // The retired conversation's bell goes with its title.
+        assert!(!session.has_bell());
+        assert_eq!(session.title(), None);
+        let read = session.runtime_evidence(None);
+        assert!(read.titles.is_empty());
+        assert!(!read.overflowed);
+        assert!(!read.submitted);
+        assert_eq!(events.try_recv(), Ok(()));
+        session.clear_bell();
+        assert_eq!(events.try_recv(), Ok(()));
+
+        assert!(session.resize(81, 24));
+        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        assert!(!session.resize(81, 24));
+        assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    #[test]
+    fn capacity_replay_keeps_new_title_and_bell_on_their_fresh_read() {
+        const FILL: usize = 0x20_0000 - 2;
+        for title_event in [true, false] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            let next = uuid::Uuid::new_v4();
+            session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            if title_event {
+                output.push(format!("\x1b]0;{next} | Ready\x07").as_bytes(), fresh);
+            } else {
+                output.push(b"\x07", fresh);
+            }
+            session.process_drained(&output);
+            if title_event {
+                assert!(
+                    session.binding_revision() > switched,
+                    "a fresh UUID title must bind after capacity replay"
+                );
+                assert!(
+                    session
+                        .session_id_hint()
+                        .unwrap()
+                        .starts_with(&next.to_string())
+                );
+            } else {
+                assert!(
+                    session.has_bell(),
+                    "a fresh bell must survive capacity replay"
+                );
+            }
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_preserves_an_osc_that_started_in_the_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        let session = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+        let old = SystemTime::now() - Duration::from_secs(10);
+        let prefix = format!("\x1b]0;{stale} | Ready");
+        let mut frame = b"\x1b[?2026h".to_vec();
+        frame.resize(frame.len() + FILL - prefix.len(), 0);
+        frame.extend_from_slice(prefix.as_bytes());
+        let mut output = PtyOutput::default();
+        output.push(&frame, old);
+        session.process_drained(&output);
+        assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+        let hook = SystemTime::now();
+        session.provider_switched(hook, hook);
+        let switched = session.binding_revision();
+        let fresh_at = hook + SWITCH_SLACK + Duration::from_secs(1);
+        let mut output = PtyOutput::default();
+        output.push(b"\x07", fresh_at);
+        session.process_drained(&output);
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+
+        let mut output = PtyOutput::default();
+        output.push(format!("\x1b]0;{fresh} | Ready\x07").as_bytes(), fresh_at);
+        session.process_drained(&output);
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&fresh.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn fresh_program_reports_survive_capacity_replay_of_an_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\", b"\x1b"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut report = b"\x1b]7501;state=working".to_vec();
+            report.extend_from_slice(ending);
+            let mut output = PtyOutput::default();
+            output.push(&report, fresh);
+            session.process_drained(&output);
+            if ending == b"\x1b" {
+                assert_eq!(session.program_status_snapshot().root, None);
+                let mut output = PtyOutput::default();
+                output.push(b"\\", fresh);
+                session.process_drained(&output);
+            }
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_cannot_refresh_an_old_partial_program_report() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let prefix = b"\x1b]7501;state=done";
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL - prefix.len(), 0);
+            frame.extend_from_slice(prefix);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            output.push(ending, fresh);
+            session.process_drained(&output);
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(session.program_status_snapshot().root, None);
+            let mut output = PtyOutput::default();
+            output.push(b"\x1b]7501;state=working\x07", fresh);
+            session.process_drained(&output);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn queued_and_cross_boundary_reports_cannot_restore_a_retired_binding() {
+        let session = fixture();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10);
+        let mut first = PtyOutput::default();
+        first.push(b"\x1b]7501;state=working\x07", old);
+        session.process_drained(&first);
+        assert!(session.program_status_snapshot().root.is_some());
+
+        session.provider_switched_at(now, now, now);
+        let mut queued = PtyOutput::default();
+        queued.push(b"\x1b]7501;state=done\x07", old);
+        session.process_drained(&queued);
+        let snapshot = session.program_status_snapshot();
+        assert_eq!(snapshot.root, None);
+        assert_eq!(snapshot.explicit_completions, 0);
+
+        let mut ambiguous_start = PtyOutput::default();
+        ambiguous_start.push(b"\x1b]7501;state=done", now + Duration::from_secs(1));
+        session.process_drained(&ambiguous_start);
+        let mut fresh_end = PtyOutput::default();
+        fresh_end.push(b"\x07", now + Duration::from_secs(10));
+        session.process_drained(&fresh_end);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        // The first half of this frame is parsed before another switch; its
+        // terminator arrives in a fresh read after the boundary.
+        let before = now + Duration::from_secs(20);
+        let mut partial = PtyOutput::default();
+        partial.push(b"\x1b]7501;state=done", before);
+        session.process_drained(&partial);
+        session.provider_switched_at(before, before, before);
+        let mut ending = PtyOutput::default();
+        ending.push(b"\x07", before + Duration::from_secs(10));
+        session.process_drained(&ending);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        let mut new = PtyOutput::default();
+        new.push(
+            b"\x1b]7501;state=working\x07",
+            before + Duration::from_secs(11),
+        );
+        session.process_drained(&new);
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
+        struct RefuseSubmission {
+            on_flush: bool,
+        }
+        impl std::io::Write for RefuseSubmission {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        for on_flush in [false, true] {
+            let session = fixture();
+            session.paste("prompt");
+            let pasted = session.input_snapshot();
+            let events = session.runtime_events();
+            *session.writer.lock() = Box::new(RefuseSubmission { on_flush });
+            assert!(session.try_submit_input(b"\r").is_err());
+            assert_eq!(session.input_snapshot(), pasted);
+            assert!(!session.has_submitted_turn());
+            assert_eq!(session.first_submission_at(), None);
+            assert!(!session.runtime_evidence(None).submitted);
+            assert!(!session.submission_pending.load(Ordering::Acquire));
+            assert!(events.is_empty());
+
+            // A recovered writer must treat the next key as ordinary draft
+            // input, and only the following successful Enter as a submission.
+            *session.writer.lock() = Box::new(std::io::sink());
+            session.try_write_input(b"x").unwrap();
+            assert_eq!(session.input_snapshot(), (pasted.0 + 1, true));
+            assert!(events.is_empty());
+            session.try_submit_input(b"\r").unwrap();
+            assert_eq!(session.input_snapshot(), (pasted.0 + 2, false));
+            assert!(session.has_submitted_turn());
+            assert!(session.first_submission_at().is_some());
+            assert!(session.runtime_evidence(None).submitted);
+            assert_eq!(events.try_recv(), Ok(()));
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn resume_selector_submission_keeps_its_pre_admission_timestamp() {
+        struct HookDuringAdmission {
+            hook_at: Arc<Mutex<Option<SystemTime>>>,
+        }
+        impl std::io::Write for HookDuringAdmission {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(bytes, b"\r");
+                // The writer has admitted Enter; the provider can publish its
+                // resume hook before write_all/flush return to the caller.
+                *self.hook_at.lock() = Some(SystemTime::now());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                let hook_at = self.hook_at.lock().expect("Enter admitted");
+                // Establish a strict order even on a coarse wall clock. There
+                // is no scheduling race or fixed sleep in the assertion.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while SystemTime::now() <= hook_at {
+                    assert!(Instant::now() < deadline, "wall clock did not advance");
+                    std::thread::yield_now();
+                }
+                Ok(())
+            }
+        }
+
+        let session = fixture();
+        session.paste("/resume replacement");
+        let pasted = session.input_snapshot();
+        let hook_at = Arc::new(Mutex::new(None));
+        *session.writer.lock() = Box::new(HookDuringAdmission {
+            hook_at: hook_at.clone(),
+        });
+        session.try_submit_input(b"\r").unwrap();
+        let submitted = session.input_snapshot();
+        let hook_at = hook_at.lock().expect("hook published during admission");
+        let first_submission_at = session.first_submission_at().expect("Enter submitted");
+        assert!(first_submission_at >= session.launched_at());
+        assert!(first_submission_at <= hook_at);
+        // Muxel learns of the hook after the writer returns. Its timestamp,
+        // not the time the report was read, decides who received the Enter.
+        session.provider_switched_at(hook_at, hook_at, SystemTime::now());
+        let replacement_submitted = session.runtime_evidence(None).submitted;
+        let launch_submitted = session.has_submitted_turn();
+
+        // A later submission really does belong to the replacement.
+        *session.writer.lock() = Box::new(std::io::sink());
+        session.try_submit_input(b"\r").unwrap();
+        assert_eq!(session.first_submission_at(), Some(first_submission_at));
+        let later_submitted = session.runtime_evidence(None).submitted;
+        session.kill();
+
+        assert_eq!(submitted, (pasted.0 + 1, false));
+        assert!(launch_submitted);
+        assert!(
+            !replacement_submitted,
+            "the resume selector Enter must not arm the replacement conversation"
+        );
+        assert!(later_submitted, "a later Enter must still arm a turn");
+    }
+
+    fn fixture() -> std::sync::Arc<TerminalSession> {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        TerminalSession::spawn(spec, 80, 24)
+            .expect("spawn fixture")
+            .0
+    }
+
+    #[test]
+    fn pointer_reports_advance_the_input_revision_but_not_the_draft() {
+        let session = fixture();
+        session.write_input(b"x");
+        let (typed, draft) = session.input_snapshot();
+        assert!(draft);
+        session.report_mouse_button(0, 0, 0, true, false, false, false);
+        session.report_mouse_button(0, 0, 0, false, false, false, false);
+        assert_eq!(session.input_snapshot(), (typed + 2, true));
+        // A wheel turn that only scrolls muxel's own scrollback never reaches
+        // the program.
+        session.scroll_wheel(-40.0, 20.0, 0, 0);
+        assert_eq!(session.input_snapshot(), (typed + 2, true));
+        session.kill();
+    }
+}
+
 // These tests spawn `/bin/sh` and `/bin/cat`, so they are Unix-only.
 #[cfg(all(test, unix))]
 mod tests {
@@ -4837,6 +6262,40 @@ mod tests {
         let reply = std::fs::read(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
         assert_eq!(String::from_utf8_lossy(&reply), "\x1b[>0;2501;1c");
+    }
+
+    #[test]
+    fn program_status_answer_reaches_a_unix_child_before_da() {
+        let out = std::env::temp_dir().join(format!("muxel-psp-{}", Uuid::new_v4()));
+        let expected = format!("{}\x1b[?6c", crate::program_status::CAPABILITY_REPLY);
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; head -c {} > '{}'",
+            expected.len(),
+            out.display()
+        );
+        let (session, rx) = TerminalSession::spawn(
+            CommandSpec::program("/bin/sh", vec!["-c".into(), script]),
+            80,
+            24,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Ok(PtyChunk::Output(_)) | Err(async_channel::TryRecvError::Empty) => {}
+            }
+            if Instant::now() > deadline {
+                session.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reply = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(reply, expected.as_bytes());
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
@@ -5355,9 +6814,101 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropped_session_leaves_the_child_its_hangup_cleanup() {
-        let (session, rx, marker) = spawn_with_slow_hangup_cleanup("session");
+        // Own both paths before spawning, including a panic while waiting for
+        // ready. The release file must outlive the child, even on failure.
+        struct Fixture {
+            marker: std::path::PathBuf,
+            release: std::path::PathBuf,
+            child_pid: Option<u32>,
+            queue: Option<Arc<OutputQueueState>>,
+            drop_signal: Option<std::sync::mpsc::Sender<()>>,
+            drop_worker: Option<JoinHandle<()>>,
+            reaped: bool,
+        }
 
-        drop(session);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = std::fs::write(&self.release, "");
+                    // Keep the reader as the sole owner of signalling and
+                    // reaping. Closing the queue wakes it if the PTY is silent.
+                    if let Some(queue) = &self.queue {
+                        queue.force_child_exit_for_test();
+                    }
+                }
+                if let Some(signal) = self.drop_signal.take() {
+                    let _ = signal.send(());
+                }
+                if let Some(worker) = self.drop_worker.take() {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !worker.is_finished() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if worker.is_finished() {
+                        let _ = worker.join();
+                    }
+                }
+                if let Some(pid) = self.child_pid
+                    && !self.reaped
+                {
+                    let deadline = Instant::now() + Duration::from_secs(4);
+                    while !process_reaped(pid) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    self.reaped = process_reaped(pid);
+                }
+                if self.reaped || self.child_pid.is_none() {
+                    let _ = std::fs::remove_file(&self.marker);
+                    let _ = std::fs::remove_file(&self.release);
+                }
+            }
+        }
+
+        let marker =
+            std::env::temp_dir().join(format!("muxel-hup-cleanup-{}-session", std::process::id()));
+        let mut release = marker.clone().into_os_string();
+        release.push(".release");
+        let release = std::path::PathBuf::from(release);
+        for path in [&marker, &release] {
+            let _ = std::fs::remove_file(path);
+            assert!(!path.exists(), "stale cleanup fixture: {path:?}");
+        }
+        let mut fixture = Fixture {
+            marker,
+            release,
+            child_pid: None,
+            queue: None,
+            drop_signal: None,
+            drop_worker: None,
+            reaped: false,
+        };
+
+        // Hold cleanup until this observer has checked stream closure. A timed
+        // save can finish while synchronous PTY destruction is still returning.
+        let script = "trap 'trap \"\" HUP; sleep 2; \
+                      while [ ! -f \"${MUXEL_HUP_MARKER}.release\" ]; do sleep 0.02; done; \
+                      echo saved > \"$MUXEL_HUP_MARKER\"; exit 0' HUP; \
+                      echo ready; while :; do sleep 0.1; done";
+        let mut spec = CommandSpec::program("/bin/sh", vec!["-c".into(), script.into()]);
+        spec.env.push((
+            "MUXEL_HUP_MARKER".into(),
+            fixture.marker.to_string_lossy().into_owned(),
+        ));
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        let pid = session.child_pid.expect("fixture child pid");
+        fixture.child_pid = Some(pid);
+        fixture.queue = Some(session.output_queue.clone());
+        let (drop_signal, drop_request) = std::sync::mpsc::channel();
+        fixture.drop_signal = Some(drop_signal);
+        // The worker owns the session before readiness can fail. The observer
+        // never runs its destructor during a panic or a timeout.
+        fixture.drop_worker = Some(std::thread::spawn(move || {
+            let _ = drop_request.recv();
+            drop(session);
+        }));
+        read_until(&rx, "ready");
+
+        fixture.drop_signal.take().unwrap().send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let closed = loop {
             match rx.try_recv() {
@@ -5369,18 +6920,44 @@ mod tests {
                 Err(async_channel::TryRecvError::Empty) => break false,
             }
         };
-        let saved_before_close = marker.exists();
-        let saved = marker_saved(&marker, Duration::from_secs(4));
-        let _ = std::fs::remove_file(&marker);
+        let saved_before_release = fixture.marker.exists();
+        // Release even after a timeout. Keep the pre-release closure result:
+        // cleanup completing afterward must not turn a failure into a pass.
+        let released = std::fs::write(&fixture.release, "").is_ok();
+        let saved = released && marker_saved(&fixture.marker, Duration::from_secs(4));
+        let worker_deadline = Instant::now() + Duration::from_secs(3);
+        while !fixture.drop_worker.as_ref().unwrap().is_finished()
+            && Instant::now() < worker_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let drop_result = if fixture.drop_worker.as_ref().unwrap().is_finished() {
+            Some(fixture.drop_worker.take().unwrap().join())
+        } else {
+            None
+        };
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while !process_reaped(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fixture.reaped = process_reaped(pid);
+        let reaped = fixture.reaped;
+        drop(fixture);
+        assert!(released, "could not release the child's cleanup");
+        assert!(
+            matches!(drop_result, Some(Ok(()))),
+            "session destructor did not finish or panicked"
+        );
         assert!(closed, "the stream stayed open after its session dropped");
         assert!(
-            !saved_before_close,
-            "the stream waited for the child's cleanup before closing"
+            !saved_before_release,
+            "the child's cleanup ran before the observer released it"
         );
         assert!(
             saved,
             "the child was killed before its SIGHUP handler finished"
         );
+        assert!(reaped, "the child was not reaped after its cleanup");
     }
 
     /// Dropping the receiver first stops the reader and hangs up the child;
@@ -5533,6 +7110,77 @@ mod tests {
             session.is_idle_foreground(),
             "the direct child should be the foreground process group"
         );
+        session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::startup::Guard;
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    fn spawn() -> std::sync::Arc<TerminalSession> {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        TerminalSession::spawn(spec, 40, 12).expect("spawn").0
+    }
+
+    #[test]
+    fn quiet_control_output_waits_for_the_actual_claude_composer() {
+        let session = spawn();
+        session.process_probe_output(b"\x1b[2J\x1b[H");
+        let mut guard = Guard::new(0, Some(Duration::from_secs(30)));
+        assert!(session.has_output());
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(2500),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        let frame = format!(
+            "\x1b[2J\x1b[HClaude Code\r\n{}\r\n❯ Try a task\r\n{}\r\nmode\x1b[3;3H\x1b[?25h\x1b[?2004h",
+            "─".repeat(30),
+            "─".repeat(30)
+        );
+        session.process_probe_output(frame.as_bytes());
+        assert!(session.startup_screen().claude_composer(true));
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(7000),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        assert!(
+            guard
+                .ready(
+                    Duration::from_millis(7100),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        session.process_probe_output(b"\x1b[3;3H/b12-ready\x1b[K");
+        assert!(!session.startup_screen().claude_composer(true));
+        assert!(session.startup_screen().claude_composer(false));
+        session.kill();
+    }
+
+    #[test]
+    fn failed_submit_admission_does_not_mark_a_turn_submitted() {
+        let session = spawn();
+        session.input_closed.store(true, Ordering::Release);
+        assert!(session.try_submit_input(b"\r").is_err());
+        assert!(!session.has_submitted_turn());
         session.kill();
     }
 }
