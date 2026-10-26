@@ -16,11 +16,25 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Endpoint and plain-request version. Guarded sends require an explicit v2.
+mod new;
+pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
+mod startup;
+pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
+mod card;
+pub use card::{CardPrompt, card_lines, card_prompt, card_value, is_hidden_char};
+mod approval;
+pub use approval::{
+    APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
+    LaunchClass, PendingApproval, creation_decision, creation_refusal,
+};
+
+/// Endpoint and plain-request version. Guards and plain creation require v2.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// An older v1 host ignores unknown fields but rejects this request version
 /// before forwarding a guarded send to the app.
 pub const GUARDED_SEND_VERSION: u32 = 2;
+/// Model/effort fields must never be silently ignored by older creation hosts.
+pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
 
 /// The file, in muxel's data directory, where the running app says how to reach
 /// it. Owner-only: the token in it is the whole of the authorization.
@@ -62,6 +76,10 @@ pub struct Endpoint {
 pub struct Request {
     pub version: u32,
     pub token: String,
+    /// The calling pane, if this client runs inside one. A declared label,
+    /// not an authenticated identity; older hosts ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_instance_id: Option<Uuid>,
     pub command: Command,
 }
 
@@ -76,6 +94,14 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
+    /// Open a terminal in a project's active tab group.
+    New {
+        project: String,
+        #[serde(flatten)]
+        options: NewOptions,
+    },
+    /// Poll a creation approval without keeping a connection open.
+    NewStatus { request_id: Uuid },
     /// One agent's state, or every agent's.
     Status {
         #[serde(default)]
@@ -106,19 +132,40 @@ pub enum Command {
         launch_id: Option<Uuid>,
     },
     /// Pick a numbered option of the question the agent is blocked on.
-    Answer { agent: String, option: String },
+    Answer {
+        agent: String,
+        option: String,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
     /// Press keys (see [`key_bytes`]).
-    Keys { agent: String, keys: Vec<String> },
+    Keys {
+        agent: String,
+        keys: Vec<String>,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
 }
 
-/// Require v2 for launch guards so older hosts refuse instead of ignoring them.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(command, Command::New { options, .. } if options.model.is_some() || options.effort.is_some())
+    {
+        return PARAMETERIZED_NEW_VERSION;
+    }
     if matches!(
         command,
         Command::Send {
             launch_id: Some(_),
             ..
-        }
+        } | Command::New { .. }
+            | Command::NewStatus { .. }
     ) {
         GUARDED_SEND_VERSION
     } else {
@@ -139,6 +186,12 @@ pub struct Response {
         deserialize_with = "known_code"
     )]
     pub code: Option<ErrorCode>,
+    /// A stable detail of a refusal, when its code alone is too broad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Present and true after a paste attempt. A writer error may leave partial input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pasted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -149,6 +202,8 @@ impl Response {
             ok: true,
             result: Some(result),
             code: None,
+            reason: None,
+            pasted: None,
             error: None,
         }
     }
@@ -159,6 +214,8 @@ impl Response {
             ok: false,
             result: None,
             code: error.code,
+            reason: error.reason,
+            pasted: error.pasted,
             error: Some(error.message),
         }
     }
@@ -170,6 +227,8 @@ impl Response {
         }
         Err(Error {
             code: self.code,
+            reason: self.reason,
+            pasted: self.pasted,
             message: self
                 .error
                 .unwrap_or_else(|| "muxel refused the request".into()),
@@ -193,6 +252,20 @@ fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCod
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    /// Outside control was revoked before the mutation.
+    ControlDisabled,
+    /// Outside terminal creation is Off.
+    CreationDisabled,
+    /// Literal argv or a shell launch needs the shell/command grant.
+    CommandPermissionRequired,
+    /// The user denied this creation request.
+    ApprovalDenied,
+    /// No approval arrived within 120 seconds of admission.
+    ApprovalTimeout,
+    /// Only configured non-shell terminal presets accept user tasks.
+    PromptUnsupported,
+    /// A preset cannot safely express the requested model or effort override.
+    ParameterUnsupported,
     /// The agent is working: `wait` for it (or `send --force`).
     Working,
     /// The agent is waiting on a question: `answer` it, or press `keys`.
@@ -209,8 +282,11 @@ pub enum ErrorCode {
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
+    /// The caller selected its own pane without explicitly forcing the action.
+    SelfTarget,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
-    /// off, or its `control.json` can't be read or reached.
+    /// off, its `control.json` can't be read or reached, or a read-only creation
+    /// status cannot be answered.
     HostUnavailable,
     /// The endpoint's owner process did not pass the liveness check.
     StaleEndpoint,
@@ -220,6 +296,8 @@ pub enum ErrorCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub code: Option<ErrorCode>,
+    pub reason: Option<String>,
+    pub pasted: Option<bool>,
     pub message: String,
 }
 
@@ -227,8 +305,20 @@ impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code: Some(code),
+            reason: None,
+            pasted: None,
             message: message.into(),
         }
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn after_paste(mut self) -> Self {
+        self.pasted = Some(true);
+        self
     }
 }
 
@@ -236,6 +326,8 @@ impl From<String> for Error {
     fn from(message: String) -> Self {
         Self {
             code: None,
+            reason: None,
+            pasted: None,
             message,
         }
     }
@@ -264,6 +356,18 @@ pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<
             format!(
                 "the agent's terminal was replaced since you saw launch_id {expected}: check `status` before sending again"
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// A pane cannot direct input at itself by accident. This uses the caller's
+/// declared environment value for convenience, not as an authorization check.
+pub fn check_self_target(caller: Option<Uuid>, target: Uuid, force: bool) -> Result<(), Error> {
+    if caller == Some(target) && !force {
+        return Err(Error::new(
+            ErrorCode::SelfTarget,
+            "this command targets your own pane; pass --force if you mean to type into it",
         ));
     }
     Ok(())
@@ -332,6 +436,10 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// A startup task that failed before provider acceptance. The terminal itself
+    /// may still be running, for example at a folder-trust menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
@@ -854,6 +962,8 @@ pub fn awaiting_reply(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
+    /// The startup task never obtained provider-owned acceptance.
+    SubmissionFailed,
     /// The turn ended; the reply is ready.
     Finished,
     /// The agent is asking something (see `question`).
@@ -940,6 +1050,25 @@ impl Claim {
         format!("v1|{}|*|*|*|{nonce}", claim_field(owner))
     }
 
+    /// A safe tmux format pattern for comparing the claim before replacing it.
+    /// A nonce identifies modern sends even when a hostname needs quoting;
+    /// legacy claims need every encoded byte to be literal and format-safe.
+    pub fn compare_pattern(&self) -> Option<String> {
+        if let Some(nonce) = self.nonce {
+            let owner = claim_field(&self.owner);
+            owner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                .then(|| Self::pattern(&self.owner, nonce))
+        } else {
+            let value = self.encode();
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "|-_.".contains(c))
+                .then_some(value)
+        }
+    }
+
     /// `None` for an unset option, or a value this version doesn't understand.
     pub fn decode(value: &str) -> Option<Self> {
         let mut parts = value.trim().split('|');
@@ -981,6 +1110,10 @@ pub fn claim_holds(
 
 /// What `muxel ctl …` asked for.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "only one command is parsed per CLI invocation; boxing adds an allocation without reducing a collection"
+)]
 pub enum CliCommand {
     /// A request the app answers directly.
     Request(Command),
@@ -992,7 +1125,7 @@ pub enum CliCommand {
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
-    Help,
+    Help(Option<String>),
 }
 
 /// `wait`'s default patience.
@@ -1004,6 +1137,12 @@ usage: muxel ctl <command> [args]
 
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
+  new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
+                                 open in background; --focus selects and raises;
+                                 --background is a compatibility no-op; --prompt - reads stdin
+  new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
@@ -1012,13 +1151,42 @@ usage: muxel ctl <command> [args]
                                  --launch-id refuses a replaced terminal
   wait AGENT [--timeout SECS] [--full]
                                  wait for the turn to end, then show it
-  answer AGENT OPTION            pick a numbered option of a pending question
-  keys AGENT KEY...              press keys: enter esc tab shift-tab up down
+  answer AGENT OPTION [--force]  pick a numbered option of a pending question
+  keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
   skill                          instructions for an orchestrating agent
+  help [COMMAND]                 show general or command-specific help
 
 AGENT is an id from `panes`, a name, project/name, or `focused`.
-Everything after `--` is taken literally (for text that starts with --).
+send, answer and keys refuse the caller's own pane unless --force is explicit.
+Everything after `--` is taken literally (for text that starts with -).
+For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
+ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
+Ask requires a click for every request. Allow covers configured non-shell terminal presets.
+Literal argv and shell presets always Ask; the click card never takes keyboard focus.
+Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
+Both mouse-down and release must belong to that same armed card.
+`--prompt` submits a user task through the one-shot runner path, once on first launch; only non-shell terminal presets support it.
+It replaces the preset's configured system prompt with the task; preset arguments are kept.
+The typed task stays exact; automatic instructions use a separate flag/config channel when available.
+In Git Bash, set MSYS_NO_PATHCONV=1 for leading-slash prompts, or use --prompt - with stdin.
+Its task text is discarded after the first launch and is not re-typed on a later launch.
+Ask returns a pending request id immediately; the CLI polls once per second until the final reply.
+Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
+Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
+`--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+`--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
+All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
+All three grants default off; upgrades do not infer creation permission from the older grants.
+Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
+Outside control off stops the server; pollers report host_unavailable after their retries.
+Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
+Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
+Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
+Raw argv panes restore stopped; only Run again replays their saved command.
+`new` launch directories are never owned, registered or deleted by muxel.
+On Windows, raw argv requires a native executable; use --preset for batch wrappers.
+`new` opens terminal panes; browser presets (including a browser default) are not supported yet.
 muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
@@ -1027,11 +1195,133 @@ Replies are JSON. A failure is {\"ok\": false, \"error\": ...}, with a \"code\" 
 script can act on it (see `muxel ctl skill`). Exit status: 0 success,
 1 request failure (including no running muxel), 2 invalid command line or stdin.";
 
+pub fn command_help(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "projects" => "usage: muxel ctl projects\nList every project and its agent counts.",
+        "panes" => {
+            "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
+        }
+        "new" => {
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+        }
+        "new-status" => {
+            "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
+        }
+        "status" => {
+            "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
+        }
+        "show" => {
+            "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
+        }
+        "screen" => {
+            "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
+        }
+        "send" => {
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
+        }
+        "wait" => {
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
+        }
+        "answer" => {
+            "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
+        }
+        "keys" => {
+            "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
+        }
+        "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
+        "help" => {
+            "usage: muxel ctl help [COMMAND]\nShow general or command-specific help. Use `--` before literal prompt text that starts with -."
+        }
+        _ => return None,
+    })
+}
+
+fn unknown_command_error(command: &str) -> String {
+    let suggestion = if command == "list" {
+        Some("panes")
+    } else {
+        const VERBS: &[&str] = &[
+            "projects",
+            "panes",
+            "new",
+            "new-status",
+            "status",
+            "show",
+            "screen",
+            "send",
+            "wait",
+            "answer",
+            "keys",
+            "skill",
+            "help",
+        ];
+        VERBS
+            .iter()
+            .map(|verb| (*verb, edit_distance(command, verb)))
+            .min_by_key(|(_, distance)| *distance)
+            .filter(|(_, distance)| *distance <= 3)
+            .map(|(verb, _)| verb)
+    };
+    let hint = suggestion.map_or(String::new(), |verb| format!("\ndid you mean `{verb}`?"));
+    format!("unknown command '{command}'{hint}\n\n{USAGE}")
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, ch) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (col, other) in right.iter().enumerate() {
+            current[col + 1] = (previous[col + 1] + 1)
+                .min(current[col] + 1)
+                .min(previous[col] + usize::from(ch != *other));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 /// Parse the arguments after `muxel ctl`.
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let Some((cmd, rest)) = args.split_first() else {
-        return Ok(CliCommand::Help);
+        return Ok(CliCommand::Help(None));
     };
+    if matches!(cmd.as_str(), "help" | "-h" | "--help") {
+        return match rest {
+            [] => Ok(CliCommand::Help(None)),
+            [target] if command_help(target).is_some() => {
+                Ok(CliCommand::Help(Some(target.clone())))
+            }
+            [target] => Err(unknown_command_error(target)),
+            _ => Err("usage: muxel ctl help [COMMAND]".into()),
+        };
+    }
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        return if command_help(cmd).is_some() {
+            Err(format!(
+                "{cmd} was not run: use `muxel ctl help {cmd}` for help, or `--` before literal -h/--help text"
+            ))
+        } else {
+            Err(unknown_command_error(cmd))
+        };
+    }
+    if cmd == "new" {
+        return new::parse(rest);
+    }
+    if cmd == "new-status" {
+        return match rest {
+            [id] => Ok(CliCommand::Request(Command::NewStatus {
+                request_id: id
+                    .parse()
+                    .map_err(|_| "new-status needs a full request UUID")?,
+            })),
+            _ => Err("usage: muxel ctl new-status REQUEST_ID".into()),
+        };
+    }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
     let mut force = false;
@@ -1126,7 +1416,11 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 .get(1)
                 .cloned()
                 .ok_or("`answer` needs the OPTION number to pick")?;
-            Command::Answer { agent, option }
+            Command::Answer {
+                agent,
+                option,
+                force,
+            }
         }
         "keys" => {
             let agent = agent(&words)?;
@@ -1137,7 +1431,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             if let Some(bad) = keys.iter().find(|k| key_bytes(k, false).is_none()) {
                 return Err(format!("unknown key '{bad}'"));
             }
-            Command::Keys { agent, keys }
+            Command::Keys { agent, keys, force }
         }
         "wait" => {
             at_most(1)?;
@@ -1148,8 +1442,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             });
         }
         "skill" => return Ok(CliCommand::Skill),
-        "help" | "-h" | "--help" => return Ok(CliCommand::Help),
-        other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        other => return Err(unknown_command_error(other)),
     };
     Ok(CliCommand::Request(command))
 }
@@ -1284,6 +1577,98 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
+  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  DIR must be an existing absolute directory; it defaults to the project root
+  and may be a linked worktree or another directory. A preset matches its name
+  or id; omitting both launch choices uses the toolbar's preset for that project.
+  `--model` and `--effort` override the preset's values for this pane, including
+  prompt launches; restarts retain the chosen arguments. Values must contain
+  1–64 characters from `[A-Za-z0-9._:/@+-]` with no leading `-`. Each override
+  requires its Model flag / Effort flag in Settings > Agents, and that flag must
+  be absent from Extra args. A flag containing `{}` emits one argument with the
+  value substituted; other flags emit flag then value. Existing presets are not
+  migrated; fill in their flag fields. Literal `-- PROGRAM` cannot use overrides.
+  New Codex presets use `--config=model_reasoning_effort={}`; existing `-c` or
+  `--config` arguments setting that key also conflict with an effort override.
+  Unsupported combinations receive `parameter_unsupported`. Parameterized
+  presets remain eligible for Allow; Ask shows the requested model and effort.
+  Everything after `--` is literal argv, including spaces, quotes and empty
+  arguments. `--prompt TEXT` sends a user task through the existing runner path;
+  `--prompt -` reads stdin. In Git Bash, set `MSYS_NO_PATHCONV=1` for leading-slash
+  prompts, or use stdin. This replaces the preset's configured system prompt
+  with the task; preset arguments are kept. The typed task stays exact.
+  Automatic instructions use the preset's separate flag/config transport when
+  available; they are omitted for TypeIn-only presets. The task is submitted
+  once and its text is discarded after first launch. Restart, restore and resume neither
+  re-type nor resubmit it, including launches without a resumable conversation.
+  Prompts for literal, shell and browser launches receive
+  `prompt_unsupported`. Creation preserves the selected tab, focus, project and
+  window by default, without raising the window. `--focus` selects the new pane
+  and activates its window. `--background` is accepted as a compatibility no-op,
+  including alongside `--focus`. JSON callers use `focus` (default false);
+  the legacy `background` field remains accepted and does not control focus.
+  Every `new` request requires outside control plus Settings > Grok Bot >
+  Outside terminal creation set to Ask or Allow. Ask requires a click for every
+  request; Allow permits configured non-shell terminal presets. All literal argv,
+  even an agent
+  executable, and shell presets/defaults additionally require "Also allow typing
+  into shell panes". Configured non-literal presets not classified as shells need
+  only the first two grants. Literal argv and shell presets always Ask, even
+  under Allow. The existing shell/non-shell classifier is a soft
+  policy for trusted configured presets, not an executable allowlist.
+  All three permissions default off; upgrades leave creation off even if both
+  older grants are on. Ask the user to enable the required settings themselves.
+  Ask returns `{ "pending": true, "request_id": "UUID" }` immediately, without
+  holding a connection. The CLI polls every second and prints the final reply.
+  Temporary connection and host-availability failures retry up to three times
+  against that same UUID; a successful pending reply resets the retry count.
+  The CLI never reissues `new`. If retries fail, its error names the UUID to
+  query with `new-status`. Uncoded status errors, including an older host's
+  uncoded timeout, also give that advice. Do not repeat `new` while the original
+  may still wait.
+  `--no-wait` prints the pending reply for scripts; use `ctl new-status UUID` to
+  poll it. Requests expire 120 seconds after admission, including time behind
+  another card. Each visible card disables both buttons for 750 ms and ignores
+  double-clicks. Mouse-down and release must belong to the same armed card.
+  The card offers click-only Allow once / Deny, keeps terminal
+  keyboard focus, and shows the waiting count in FIFO order. `--from LABEL` and
+  the caller's MUXEL_INSTANCE_ID are displayed as declared information, not
+  authenticated identity (the token is the whole authorization).
+  Final replies remain available for ten minutes, bounded to the latest 256;
+  up to 64 approvals may wait. Approvals are runtime-only and do not survive a
+  host restart. Plain creation and status requests use protocol v2; creation with
+  model or effort uses v3 so older hosts cannot silently discard the choices.
+  The host requires the exact command version, including for JSON callers.
+  Turning creation or outside control off refuses all pending requests. Outside
+  control off also stops the server, so pollers receive `host_unavailable`
+  after their connection retries rather than the recorded `control_disabled`.
+  Revocation leaves
+  existing panes, already admitted launches and
+  typing permissions unchanged. Deferred requests recheck current permission;
+  human toolbar creation is unaffected.
+  Commands run as the host muxel process with its permissions and environment,
+  outside the caller's sandbox. Coding agents and configurable presets are not
+  a security sandbox. Ask the user to grant authority; do not change settings.
+  Turning "Also allow typing into shell panes" off also refuses later control
+  writes to every raw argv pane, even agent-looking or interpreter programs, and
+  shell-classified panes. Configured non-literal agents remain controllable while
+  outside control is enabled. Disabling all outside control is a separate setting. Revocation
+  does not stop the process or undo input already delivered; queued Enter/keys
+  recheck the shell-input grant and terminal/session availability before each write.
+  The JSON reply contains `id` (short), `uuid` (full), `project`, `project_id`,
+  `cwd`, `program` and `args`. Without `--prompt`, presets and defaults keep toolbar
+  system-prompt injection (including TypeIn), resume and hooks; raw argv bypasses those and tmux.
+  Raw argv panes restore stopped. Project selection, Restart and wake never replay
+  their opening brief; the pane's explicit Run again action reruns the saved argv.
+  DIR is a launch directory, never an owned worktree; closing the pane does not
+  remove it and worktree migration does not register it.
+  On Windows raw argv requires a native executable; use `--preset` for batch
+  wrappers. Installed Codex resolves to its packaged native executable.
+  Remote projects are currently refused.
+  `new` opens terminal panes; browser presets, including a browser default, are
+  not supported yet and receive a refusal.
 - `muxel ctl status [AGENT]` - one agent's status, or every agent's.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
@@ -1293,9 +1678,11 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
   Use it when `show` doesn't explain what's on screen.
 - `muxel ctl send AGENT TEXT` - type TEXT into the agent and press Enter. Refused
-  while the agent is working or blocked, or while muxel on another computer is
-  mid-turn with it. For long or multi-line text, pass `-` and pipe the text on
-  stdin.
+  while the agent is working, blocked, or still in the grace after a submitted
+  control turn, or while muxel on another computer is mid-turn with it. For long
+  or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
+  literal prompt text that starts with `-`; `-h` and `--help` before `--` refuse
+  with exit 2 and are never typed. Use `muxel ctl help COMMAND` for help.
   The reply waits for Enter. If keys, pastes, mouse or wheel reports reach the
   pane after the paste, Enter is withheld and `send` fails with the prompt left
   in its input. A closed or restarted terminal also withholds Enter. Check
@@ -1306,10 +1693,40 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   asynchronous claim work, and `--force` never bypasses it. A successful reply
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
   writer, not confirmation of agent delivery. A lost reply does not make a
-  retry safe; inspect the agent before typing again.
+  retry safe; inspect the agent before typing again. A failure with `pasted: true`
+  means a paste was attempted and the input may be partial. Check `screen` before
+  retrying. A `working` error with `reason: just_submitted` means the prior
+  control turn is still in its grace on a pane with provider status or configured
+  screen markers; `wait` for its reply. Activity-only panes allow a later send.
+  Codex, Claude and Grok sends also observe provider acceptance for about ten
+  seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
+  false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
+  `input_changed` (other input arrived; no further Enter is sent) or
+  `interrupted` (the pane closed, restarted, switched conversation or lost
+  permission). Once Enter is in, the reply is this receipt, never an error.
+  It is null, without waiting, when the pane can't show a receipt: an
+  unsupported provider, or no readable idle status title (tmux hides titles)
+  with a Grok, multi-paragraph or repeated prompt.
+  `enter_retries` reports zero or one additional Enter. Windows Codex alone may
+  receive that retry after five seconds while its exact, fully visible ASCII
+  prose remains in the idle composer and no local input intervened. Clipped,
+  multiline, Unicode or completion drafts get no retry. Text is never pasted
+  twice. Retry also requires a compact composer frame from before the paste
+  and an added blank cursor line proving that the first Enter was consumed;
+  a pending Enter never authorizes another.
+  An unconfirmed receipt requires inspecting `screen` before more input.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints plus
-  `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
+  ends (or it blocks on a question, or exits), then print what `show` prints.
+  Startup tasks stay pending until fresh provider-owned acceptance, not merely
+  our Enter. Codex may receive one extra Enter only while its exact task remains
+  on one exact ASCII row in its live idle editor, with no new user row. Wrapped
+  or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
+  within ten seconds, failed readiness or unsupported provider sets
+  `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
+  before sending another task; do not repeat creation. Muse and other providers
+  without a verified startup protocol receive no task input.
+  The `wait.outcome` values are finished, blocked, exited, not_running,
+  submission_failed or timed_out. Default
   timeout 600 seconds.
 - `muxel ctl answer AGENT OPTION` - pick numbered option OPTION of the question
   the agent is blocked on.
@@ -1323,8 +1740,9 @@ a project usually show its agents under the same ids, but each command only
 reaches the muxel on the computer it runs on.
 
 If you are running in a muxel pane yourself, the environment variable
-`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT: never
-`send` to it, since that types into your own input.
+`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT. `send`,
+`answer`, and `keys` refuse that pane unless you pass `--force`. Older muxel
+hosts ignore this caller ID, so check the target when driving one.
 
 ## Statuses
 
@@ -1346,8 +1764,8 @@ and is left out while the agent is starting and once it has exited.
 
 ## Errors
 
-When `send`, `answer` or `keys` didn't type anything, or muxel couldn't be
-reached, the failure has a `code`:
+Creation permission/approval refusals, typing refusals from `send`, `answer` or
+`keys`, and host connection failures have a `code`:
 
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
   again in a moment.
@@ -1356,7 +1774,16 @@ reached, the failure has a `code`:
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
+- `self_target` - this command would type into its caller's own pane; select a
+  different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+- `control_disabled` - outside control was turned off before the mutation.
+- `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
+- `command_permission_required` - literal argv or a shell launch needs the shell/command grant.
+- `approval_denied` - the user clicked Deny; nothing was created.
+- `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
+- `prompt_unsupported` - prompts require a configured non-shell terminal preset.
+- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing
@@ -1391,7 +1818,8 @@ also withhold Enter and return an error without a code; inspect the input first.
   on both, or one the other attached to). If `send` or `answer` says muxel on
   another computer is using the agent, don't `--force` it: `wait` on the agent
   and try again, or tell the user. Several of you may be driving the same agents.
-- This interface can't create, close or rearrange panes; the layout is the user's.
+- Create panes only when asked, using `new` within the user's granted authority.
+  This interface can't close or rearrange existing panes; the layout is the user's.
 "#;
 
 #[cfg(test)]
@@ -1466,6 +1894,7 @@ mod tests {
         let req = Request {
             version: 1,
             token: "t".into(),
+            caller_instance_id: None,
             command: Command::Show {
                 agent: "claude".into(),
                 full: true,
@@ -1478,6 +1907,7 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"token":"t","command":{"cmd":"projects"}}"#)
                 .unwrap();
         assert_eq!(unit.command, Command::Projects);
+        assert_eq!(unit.caller_instance_id, None);
         let defaults: Request = serde_json::from_str(
             r#"{"version":1,"token":"t","command":{"cmd":"send","agent":"a","text":"hi"}}"#,
         )
@@ -1494,6 +1924,19 @@ mod tests {
         // No launch guard: older requests retain their original shape.
         let line = serde_json::to_string(&defaults).unwrap();
         assert!(!line.contains("launch_id"), "{line}");
+        assert!(!line.contains("caller_instance_id"), "{line}");
+        let caller = Request {
+            caller_instance_id: Some(id(7)),
+            command: Command::Keys {
+                agent: "self".into(),
+                keys: vec!["esc".into()],
+                force: true,
+            },
+            ..req
+        };
+        let line = serde_json::to_string(&caller).unwrap();
+        assert!(line.contains("caller_instance_id"), "{line}");
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), caller);
     }
 
     #[test]
@@ -1523,6 +1966,14 @@ mod tests {
             serde_json::from_str(r#"{"ok":false,"code":"from_later","error":"x"}"#).unwrap();
         assert_eq!(newer.code, None);
         assert_eq!(newer.error.as_deref(), Some("x"));
+        let uncertain = Response::err(
+            Error::new(ErrorCode::Working, "check screen")
+                .with_reason("just_submitted")
+                .after_paste(),
+        );
+        let back: Response = serde_json::from_str(&line(&uncertain)).unwrap();
+        assert_eq!(back.reason.as_deref(), Some("just_submitted"));
+        assert_eq!(back.pasted, Some(true));
         for (code, word) in [
             (ErrorCode::Working, "working"),
             (ErrorCode::Blocked, "blocked"),
@@ -1532,6 +1983,7 @@ mod tests {
             (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
+            (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
         ] {
@@ -1636,6 +2088,7 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            startup_error: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,
@@ -2039,7 +2492,7 @@ Steps:
 
     #[test]
     fn cli_parses_commands_flags_and_literal_text() {
-        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help));
+        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
@@ -2091,6 +2544,46 @@ Steps:
         assert!(parse_cli(&words(&["show", "a", "--nope"])).is_err());
         assert!(parse_cli(&words(&["frobnicate"])).is_err());
         assert!(parse_cli(&words(&["status", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn dash_h_after_command_refuses_without_typing() {
+        for args in [
+            words(&["send", "agent", "-h"]),
+            words(&["send", "--help"]),
+            words(&["keys", "agent", "enter", "--help"]),
+            words(&["new", "project", "-h"]),
+        ] {
+            let error = parse_cli(&args).unwrap_err();
+            assert!(error.contains("was not run"), "{args:?}: {error}");
+            assert!(error.contains("muxel ctl help"), "{args:?}: {error}");
+            assert!(error.contains("`--`"), "{args:?}: {error}");
+        }
+        assert_eq!(
+            parse_cli(&words(&["help", "send"])),
+            Ok(CliCommand::Help(Some("send".into())))
+        );
+        assert!(super::command_help("send").unwrap().contains("--force"));
+        assert!(matches!(
+            parse_cli(&words(&["send", "agent", "--", "-h"])),
+            Ok(CliCommand::Request(Command::Send { text, .. })) if text == "-h"
+        ));
+    }
+
+    #[test]
+    fn unknown_command_suggests_nearest_verb() {
+        let error = parse_cli(&words(&["list"])).unwrap_err();
+        assert!(error.contains("did you mean `panes`?"), "{error}");
+    }
+
+    #[test]
+    fn send_to_own_pane_is_refused() {
+        let me = id(7);
+        let error = super::check_self_target(Some(me), me, false).unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::SelfTarget));
+        assert_eq!(super::check_self_target(Some(me), me, true), Ok(()));
+        assert_eq!(super::check_self_target(Some(me), id(8), false), Ok(()));
+        assert_eq!(super::check_self_target(None, me, false), Ok(()));
     }
 
     #[test]
@@ -2199,5 +2692,34 @@ Steps:
             &before,
             at + super::REPLY_GRACE_MS
         ));
+    }
+
+    #[test]
+    fn claim_compare_patterns_keep_modern_nonce_and_refuse_unsafe_legacy_values() {
+        let claim = super::Claim {
+            owner: "owner".into(),
+            host: "desk'name".into(),
+            at: 42,
+            grace_ms: super::REPLY_GRACE_MS,
+            nonce: Some(uuid::Uuid::from_u128(7)),
+        };
+        assert_eq!(
+            claim.compare_pattern(),
+            Some(super::Claim::pattern("owner", uuid::Uuid::from_u128(7)))
+        );
+        let legacy = super::Claim {
+            nonce: None,
+            host: "desk".into(),
+            ..claim
+        };
+        assert_eq!(legacy.compare_pattern(), Some(legacy.encode()));
+        assert!(
+            super::Claim {
+                host: "desk'name".into(),
+                ..legacy
+            }
+            .compare_pattern()
+            .is_none()
+        );
     }
 }
