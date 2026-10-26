@@ -2873,7 +2873,7 @@ impl TerminalSession {
             // binding; retire old PSP facts and accept later fresh reports.
             status.recover_binding(binding_rev, hint_thread);
         }
-        *status
+        status.clone()
     }
 
     #[cfg(test)]
