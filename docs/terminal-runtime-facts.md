@@ -1,7 +1,8 @@
 # Terminal runtime facts
 
 `TerminalView` keeps one runtime snapshot for each live PTY launch. Its readers
-(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`)
+(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`,
+`runtime_activity()`)
 return the stored snapshot; they never parse terminal rows or advance status.
 Attribution also checks the session's current binding revision, so a switch
 invalidates cached facts before its queued reconciliation runs.
@@ -36,7 +37,7 @@ transition by polling more often.
   unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
   attributable (see below), the binding, completion readiness, coverage, or
-  completion revision changes;
+  completion revision, or cached activity changes;
 - `input_rev`: advances before ordinary non-empty input writes reach
   the PTY writer; fallible control submissions commit it after successful writer
   admission. Keys, pastes, sends, and mouse and wheel reports count. Focus
@@ -48,6 +49,49 @@ transition by polling more often.
   are both Done, or new Working/Blocked reports follow a completion in one drain;
 - the status, whether it is attributable, its strongest reason,
   completion readiness, and evidence coverage.
+
+## Status provenance and activity
+
+Terminal entries in `ctl status`, `panes`, and `show.agent` share one projection.
+Their `status` uses the sidebar's lifecycle rule: Done survives later Idle and
+attendance, and can remain visible while a restored terminal starts. Optional
+`live_status` records the different live state when that happens. Client `wait`,
+send admission, launch identity, reply ownership, and question/controller logic
+use live facts. Older hosts without `live_status` remain supported.
+
+`source` names the current status evidence:
+
+| Runtime reason | Source |
+| --- | --- |
+| Process exit or app process lifecycle | `process` |
+| Root program report, including error | `program` |
+| Existing provider lifecycle hook (Muse) | `hook` |
+| Provider title | `title` |
+| Provider screen or configured marker | `screen` |
+| Bell | `bell` |
+| Recent output | `output` |
+| Output quiet | `quiet` |
+| Not attributable to the current binding | `settling` |
+
+Settling remains Working even if a previous binding left a Done badge. A current
+Blocked root may also supply `blocked_on`: `permission`, `question`, or `auth`.
+Other sources omit the kind. Nonterminal panes omit these provenance fields.
+
+Activity is cached outside the Copy runtime snapshot. The current root retains
+shared `msg` text and integer `progress`; its message and percentage remain
+available while that report is current. Otherwise Working/Blocked may use
+validated Codex/Grok title activity or Claude's current live foreground row.
+The screen consumer uses the same captured provider context as status parsing;
+composer filtering applies when that adapter is present. An unchanged old title
+does not restore activity after a binding switch. Exit and binding retirement
+clear it. Root reports remain authoritative for lifecycle; fallback activity
+does not add a status override.
+
+Every activity value is one line with control characters removed and at most
+200 Unicode characters, including any percentage suffix. Empty activity is
+absent. Reads do not parse output or flush synchronized frames. Metadata-only
+changes advance `snapshot_seq` and refresh sidebar tooltip data through the
+existing status pass; they never create a completion revision or notification.
 
 ## Program status reports
 
