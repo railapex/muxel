@@ -105,8 +105,9 @@ does not add a status override.
 Every activity value is one line with control characters removed and at most
 200 Unicode characters, including any percentage suffix. Empty activity is
 absent. Reads do not parse output or flush synchronized frames. Metadata-only
-changes advance `snapshot_seq` and refresh sidebar tooltip data through the
-existing status pass; they never create a completion revision or notification.
+changes advance `snapshot_seq`; they never create a completion revision or
+notification. Sidebar redraws follow lifecycle and visible-label changes, not
+activity counters. Its tooltip reads current cached activity when opened.
 
 ## Program status reports
 

@@ -73,6 +73,8 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+#[cfg(all(test, windows))]
+mod status_tooltip_tests;
 mod tmux_install_modal;
 mod upkeep;
 
@@ -5479,9 +5481,8 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
-    /// Last rendered lifecycle label and runtime revision. The latter refreshes
-    /// activity tooltips even when the lifecycle badge itself stays unchanged.
-    last_activity_labels: HashMap<Uuid, (String, u64)>,
+    /// Last rendered lifecycle label. Activity is read when its tooltip opens.
+    last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
@@ -13476,9 +13477,8 @@ impl MuxelApp {
             if let Some(instance) = self.workspace.instance(iid) {
                 let label =
                     agent_activity_label(activity_state(status), &instance.activity, now_epoch);
-                let presentation = (label, runtime.snapshot_seq);
-                let previous_label = self.last_activity_labels.insert(iid, presentation.clone());
-                dirty |= previous_label.as_ref() != Some(&presentation);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                dirty |= previous_label.as_ref() != Some(&label);
             }
             dirty |= changed;
             if changed {
@@ -21188,9 +21188,8 @@ impl MuxelApp {
             if let Some(instance) = self.workspace.instance(iid) {
                 let label =
                     agent_activity_label(activity_state(sample.status), &instance.activity, now);
-                let presentation = (label, sample.runtime.snapshot_seq);
-                let previous_label = self.last_activity_labels.insert(iid, presentation.clone());
-                updates.redraw |= previous_label.as_ref() != Some(&presentation);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                updates.redraw |= previous_label.as_ref() != Some(&label);
             }
             updates.redraw |= effect.changed;
         }
@@ -26091,16 +26090,16 @@ impl MuxelApp {
                     if !is_sel {
                         base = base.hover(move |s| s.bg(hover_col));
                     }
-                    if !renaming
-                        && let Some(activity) = self
-                            .terminals
-                            .get(&iid)
-                            .and_then(|view| view.read(cx).runtime_activity().map(str::to_owned))
-                    {
-                        let activity: SharedString = activity.into();
+                    if !renaming && let Some(terminal) = self.terminals.get(&iid).cloned() {
                         base = base.tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(activity.clone())
-                                .build(window, cx)
+                            // Activity can change without a sidebar redraw. Read
+                            // it on hover, including when none existed at render.
+                            let activity = terminal.read(cx).runtime_activity().map(str::to_owned);
+                            match activity {
+                                Some(activity) => gpui_component::tooltip::Tooltip::new(activity)
+                                    .build(window, cx),
+                                None => cx.new(|_| Empty).into(),
+                            }
                         });
                     }
                     let row = if renaming {
