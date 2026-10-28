@@ -964,6 +964,43 @@ fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) 
     }
 }
 
+/// Control and navigation sequences may contain printable ASCII bytes in their
+/// encoding (`ESC [ A`, for example). Only bytes that reach the child as text
+/// can claim a human draft.
+fn has_printable_input(data: &[u8]) -> bool {
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Ss3,
+        String,
+        StringEscape,
+    }
+    let mut state = State::Ground;
+    for &byte in data {
+        state = match state {
+            State::Ground if byte == 0x1b => State::Escape,
+            State::Ground if byte >= 0x20 && byte != 0x7f => return true,
+            State::Ground => State::Ground,
+            State::Escape => match byte {
+                b'[' => State::Csi,
+                b'O' => State::Ss3,
+                b']' | b'P' | b'_' | b'^' | b'X' => State::String,
+                _ => State::Ground,
+            },
+            State::Csi if (0x40..=0x7e).contains(&byte) => State::Ground,
+            State::Csi => State::Csi,
+            State::Ss3 => State::Ground,
+            State::String if byte == 0x07 => State::Ground,
+            State::String if byte == 0x1b => State::StringEscape,
+            State::String => State::String,
+            State::StringEscape if byte == b'\\' => State::Ground,
+            State::StringEscape => State::String,
+        };
+    }
+    false
+}
+
 /// The input word (see `TerminalSession::input_state`) after one non-empty
 /// write. The revision always advances. Typed input latches the draft, or
 /// clears it when it carries a submission (`Some(true)`); a mouse or wheel
@@ -1998,7 +2035,14 @@ impl TerminalSession {
         self.scroll_input_to_bottom();
         if !data.is_empty() {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
+            let draft_input = if submitted_enter {
+                Some(true)
+            } else if has_printable_input(data) {
+                Some(false)
+            } else {
+                None
+            };
+            self.advance_input(draft_input);
             if submitted_enter {
                 self.trigger_runtime();
             }
@@ -5697,7 +5741,8 @@ mod windows_spawn_resolve {
 #[cfg(test)]
 mod runtime_fact_tests {
     use super::{
-        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input,
+        has_printable_input, next_input_state,
     };
     use crate::listener::SWITCH_SLACK;
     use async_channel::TryRecvError;
@@ -5712,6 +5757,21 @@ mod runtime_fact_tests {
         assert!(draft_after_input(false, false, true));
         assert!(!draft_after_input(true, true, true));
         assert!(draft_after_input(true, false, true));
+    }
+
+    #[test]
+    fn escape_key_does_not_latch_a_draft() {
+        for input in [
+            b"\x1b".as_slice(),
+            b"\x1b[A",
+            b"\x1b[200~",
+            b"\x1bOP",
+            b"\x1b]0;title\x07",
+        ] {
+            assert!(!has_printable_input(input), "{input:?}");
+        }
+        assert!(has_printable_input(b"hello"));
+        assert!(has_printable_input(b"\x1b[200~hello\x1b[201~"));
     }
 
     #[test]

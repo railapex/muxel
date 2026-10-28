@@ -561,6 +561,36 @@ impl Screen {
         Some(top..bottom)
     }
 
+    pub(crate) fn codex_composer_draft(&self) -> Option<bool> {
+        let rows: Vec<_> = self.text.lines().collect();
+        let region = self
+            .codex_composer_rows(&rows, false)
+            .or_else(|| self.codex_composer_rows(&rows, true))?;
+        let prompt = rows[region.start].trim_start().strip_prefix('›')?.trim();
+        // Codex's placeholder occupies the same cell as typed text. Leave it
+        // to the input latch rather than claiming it is an empty draft.
+        if prompt == "Ask Codex to do anything" {
+            return None;
+        }
+        let content_end = rows[region.start + 1..=region.end]
+            .iter()
+            .position(|row| codex_footer(row))?
+            + region.start
+            + 1;
+        let has_text = !prompt.is_empty()
+            || rows[region.start + 1..content_end]
+                .iter()
+                .any(|row| !row.trim().is_empty());
+        let cursor_at_start = self.cursor_row == region.start as i32
+            && self.cursor_column
+                == rows[region.start]
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .count()
+                    + 2;
+        Some(has_text || !cursor_at_start)
+    }
+
     pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
         if input.len() > self.text.len() {
             return false;
@@ -660,6 +690,26 @@ impl Screen {
         }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
         (cursor_at_start == empty).then_some(top + 1..bottom)
+    }
+
+    pub(crate) fn claude_composer_draft(&self) -> Option<bool> {
+        let region = self
+            .composer_rows(false)
+            .or_else(|| self.composer_rows(true))?;
+        let rows: Vec<_> = self.text.lines().collect();
+        let prompt = rows[region.start].trim_start().strip_prefix('❯')?.trim();
+        let has_text = !prompt.is_empty()
+            || rows[region.start + 1..region.end]
+                .iter()
+                .any(|row| !row.trim().is_empty());
+        let cursor_at_start = self.cursor_row == region.start as i32
+            && self.cursor_column
+                == rows[region.start]
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .count()
+                    + 2;
+        Some(has_text || !cursor_at_start)
     }
 }
 
@@ -896,6 +946,31 @@ mod tests {
                 2 + draft.last().unwrap().chars().count()
             },
         )
+    }
+
+    #[test]
+    fn codex_composer_parser_overrides_latch() {
+        assert_eq!(ctl_screen(&[""], false).codex_composer_draft(), Some(false));
+        assert_eq!(
+            ctl_screen(&["human draft"], false).codex_composer_draft(),
+            Some(true)
+        );
+        let mut at_start = ctl_screen(&["human draft"], false);
+        at_start.cursor_column = 2;
+        assert_eq!(at_start.codex_composer_draft(), Some(true));
+        let mut hidden = ctl_screen(&["human draft"], false);
+        hidden.cursor_visible = false;
+        assert_eq!(hidden.codex_composer_draft(), None);
+    }
+
+    #[test]
+    fn claude_composer_parser_reports_empty_and_typed() {
+        let empty = screen("header\n────────────\n❯ \n────────────", 2, 2);
+        assert_eq!(empty.claude_composer_draft(), Some(false));
+        let typed = screen("header\n────────────\n❯ human draft\n────────────", 2, 10);
+        assert_eq!(typed.claude_composer_draft(), Some(true));
+        let at_start = screen("header\n────────────\n❯ human draft\n────────────", 2, 2);
+        assert_eq!(at_start.claude_composer_draft(), Some(true));
     }
 
     fn ctl_origin(text: &str) -> Screen {

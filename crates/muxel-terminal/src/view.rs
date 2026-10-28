@@ -3262,6 +3262,17 @@ impl TerminalView {
         self.runtime.snapshot(&self.session)
     }
 
+    /// A provider's live composer decides draft presence when its geometry is
+    /// recognizable. `None` lets callers use the conservative input latch.
+    pub fn control_composer_draft(&self) -> Option<bool> {
+        let screen = self.session.startup_screen();
+        match self.title_provider {
+            TitleProvider::Claude => screen.claude_composer_draft(),
+            TitleProvider::Codex => screen.codex_composer_draft(),
+            _ => None,
+        }
+    }
+
     /// Pure immutable projection used by render/sidebar callers.
     pub fn status(&self) -> AgentStatus {
         self.runtime.status

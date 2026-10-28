@@ -889,6 +889,17 @@ feature is added or changed, update the matching entry here in the same change**
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
+  A visible human draft now refuses `send` with `draft_present` unless `--force`
+  is explicit. Escape and navigation keys do not latch a draft; Claude and
+  Codex use their live composer when its frame is recognizable. Automation can
+  use `send --when-idle --once KEY --launch-id ID` to wait for attributable
+  Idle or Done, no open control turn, and at most one attached tmux client.
+  One send may queue per pane, with a 600-second default or `--timeout SECS`;
+  disconnecting the caller cancels it. The reply includes `waited_ms`. The
+  last 64 once keys per pane live in memory. A repeat after submission returns
+  `duplicate: true`; a repeat after refusal returns the original error under
+  `original`. A process restart clears these keys, so durable delivery remains
+  the caller's responsibility.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

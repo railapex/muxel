@@ -48,6 +48,20 @@ pub struct Incoming {
     pub command: Command,
     pub caller_instance_id: Option<Uuid>,
     pub reply: std::sync::mpsc::Sender<Response>,
+    /// The connection is gone or its bounded wait ended. Queued work checks this
+    /// again in the UI update that can write to the PTY.
+    pub cancelled: Arc<AtomicBool>,
+}
+
+fn reply_timeout(command: &Command) -> Duration {
+    match command {
+        Command::Send {
+            when_idle: true,
+            timeout_secs,
+            ..
+        } => Duration::from_secs(timeout_secs.unwrap_or(control::WHEN_IDLE_TIMEOUT_SECS) + 15),
+        _ => REPLY_TIMEOUT,
+    }
 }
 
 /// The listening side, alive while outside control is on. Dropping it stops
@@ -145,7 +159,7 @@ fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let response = match read_request(&stream) {
-        Ok(request) => dispatch(request, token, tx),
+        Ok(request) => dispatch_connection(request, token, tx, Some(&stream)),
         Err(error) => Response::err(error),
     };
     let mut line = serde_json::to_string(&response)
@@ -162,7 +176,17 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     serde_json::from_str(&line).map_err(|e| format!("not a muxel ctl request: {e}"))
 }
 
+#[cfg(test)]
 fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>) -> Response {
+    dispatch_connection(request, token, tx, None)
+}
+
+fn dispatch_connection(
+    request: Request,
+    token: &str,
+    tx: &async_channel::Sender<Incoming>,
+    connection: Option<&TcpStream>,
+) -> Response {
     if !same_secret(request.token.as_bytes(), token.as_bytes()) {
         return Response::err("wrong token: run `muxel ctl` as the user running muxel");
     }
@@ -174,6 +198,28 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
             request.version
         ));
     }
+    if let Command::Send {
+        once,
+        when_idle,
+        timeout_secs,
+        ..
+    } = &request.command
+    {
+        if once
+            .as_deref()
+            .is_some_and(|key| !control::valid_once_key(key))
+        {
+            return Response::err("--once KEY must be 1–128 bytes without control characters");
+        }
+        if timeout_secs.is_some() && !when_idle {
+            return Response::err("send --timeout requires --when-idle");
+        }
+        if timeout_secs
+            .is_some_and(|seconds| seconds == 0 || seconds > control::WHEN_IDLE_TIMEOUT_MAX_SECS)
+        {
+            return Response::err("send --timeout must be 1–3600 seconds");
+        }
+    }
     let status_poll = matches!(&request.command, Command::NewStatus { .. });
     let unavailable = |message: &str| {
         if status_poll {
@@ -183,17 +229,65 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
         }
     };
     let (reply, answer) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let queued_timeout = matches!(
+        &request.command,
+        Command::Send {
+            when_idle: true,
+            ..
+        }
+    )
+    .then(|| reply_timeout(&request.command));
     let incoming = Incoming {
         command: request.command,
         caller_instance_id: request.caller_instance_id,
         reply,
+        cancelled: cancelled.clone(),
     };
     if tx.send_blocking(incoming).is_err() {
         return unavailable("muxel is shutting down");
     }
-    answer
-        .recv_timeout(REPLY_TIMEOUT)
-        .unwrap_or_else(|_| unavailable("muxel didn't answer in time"))
+    let Some(timeout) = queued_timeout else {
+        return answer
+            .recv_timeout(REPLY_TIMEOUT)
+            .unwrap_or_else(|_| unavailable("muxel didn't answer in time"));
+    };
+    let deadline = Instant::now() + timeout;
+    if let Some(stream) = connection {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+    }
+    loop {
+        match answer.recv_timeout(Duration::from_millis(50)) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                cancelled.store(true, Ordering::Release);
+                return unavailable("muxel stopped waiting for the queued send");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(stream) = connection {
+            match stream.peek(&mut [0_u8; 1]) {
+                Ok(0) => {
+                    cancelled.store(true, Ordering::Release);
+                    return unavailable("the queued send caller disconnected");
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => {
+                    cancelled.store(true, Ordering::Release);
+                    return unavailable("the queued send connection ended");
+                }
+                Ok(_) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            cancelled.store(true, Ordering::Release);
+            return unavailable("muxel didn't answer the queued send in time");
+        }
+    }
 }
 
 /// Compare secrets without leaking, through timing, how much of a guess was right.
@@ -255,6 +349,9 @@ pub fn run_cli(args: &[String]) -> i32 {
             text,
             force,
             launch_id,
+            once,
+            when_idle,
+            timeout_secs,
         }) if text == "-" => {
             let mut text = String::new();
             match std::io::stdin().read_to_string(&mut text) {
@@ -263,6 +360,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                     text: text.trim_end_matches(['\r', '\n']).to_string(),
                     force,
                     launch_id,
+                    once,
+                    when_idle,
+                    timeout_secs,
                 }),
                 Ok(_) => return fail("`send AGENT -` read no text from stdin".into(), 2),
                 Err(e) => return fail(format!("reading stdin: {e}").into(), 2),
@@ -563,7 +663,7 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| unavailable(NOT_RUNNING))?;
-    let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(reply_timeout(&command) + IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut line = serde_json::to_string(&Request {
         version: control::request_version(&command),
@@ -633,8 +733,8 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
-        wait_creation_with, write_endpoint,
+        Server, dispatch, failure_body, process_alive, read_endpoint, reply_timeout, request_at,
+        same_secret, wait_creation_with, write_endpoint,
     };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
     use std::io::{BufRead as _, BufReader, Write as _};
@@ -896,6 +996,9 @@ mod tests {
             text: "hi".into(),
             force: false,
             launch_id: Some(uuid::Uuid::from_u128(42)),
+            once: None,
+            when_idle: false,
+            timeout_secs: None,
         };
         let refused = request_at(&path, send()).unwrap_err();
         assert_eq!(refused.code, Some(ErrorCode::Working));
@@ -912,6 +1015,74 @@ mod tests {
         let gone = request_at(&path, Command::Projects).unwrap_err();
         assert_eq!(gone.code, Some(ErrorCode::HostUnavailable));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn when_idle_cancelled_by_caller_disconnect() {
+        use std::io::Write;
+        use std::net::{Shutdown, SocketAddr, TcpStream};
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let dir = scratch("queued-disconnect");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        let mut stream =
+            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, server.port))).unwrap();
+        let request = control::Request {
+            version: control::SAFE_SEND_VERSION,
+            token: server.token.clone(),
+            command: Command::Send {
+                agent: "agent".into(),
+                text: "message".into(),
+                force: false,
+                launch_id: None,
+                once: None,
+                when_idle: true,
+                timeout_secs: Some(5),
+            },
+            caller_instance_id: None,
+        };
+        writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        let start = Instant::now();
+        let incoming = loop {
+            if let Ok(incoming) = rx.try_recv() {
+                break incoming;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "server did not receive queued send"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!incoming.cancelled.load(Ordering::Acquire));
+        stream.shutdown(Shutdown::Both).unwrap();
+        drop(stream);
+        let start = Instant::now();
+        while !incoming.cancelled.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "disconnect did not cancel queued send"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn when_idle_timeout_extends_client_reply_window() {
+        let command = Command::Send {
+            agent: "agent".into(),
+            text: "message".into(),
+            force: false,
+            launch_id: None,
+            once: None,
+            when_idle: true,
+            timeout_secs: Some(45),
+        };
+        assert_eq!(reply_timeout(&command).as_secs(), 60);
+        assert_eq!(reply_timeout(&Command::Projects).as_secs(), 30);
     }
 
     #[test]
@@ -1033,6 +1204,9 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: Some(uuid::Uuid::from_u128(42)),
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             },
             Command::New {
                 project: "repo".into(),
