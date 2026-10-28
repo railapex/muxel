@@ -13,7 +13,9 @@ use super::*;
 use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
+use muxel_terminal::TerminalStatusCoverage;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a request comes to: its reply, or why there is none.
 type CtlResult<T> = Result<T, ctl::Error>;
@@ -88,6 +90,14 @@ impl ControlTurn {
             None => ctl::awaiting_reply(Some(self.sent_at), self.grace_ms, status, activity, now),
         }
     }
+}
+
+fn turn_has_reply_evidence(turn: &ControlTurn, coverage: Option<TerminalStatusCoverage>) -> bool {
+    turn.startup.is_some()
+        || matches!(
+            coverage,
+            Some(TerminalStatusCoverage::VisibleMarkers | TerminalStatusCoverage::ProviderVisible)
+        )
 }
 
 impl Drop for ControlTurn {
@@ -165,6 +175,7 @@ enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    Queue(QueueRequest),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -195,6 +206,22 @@ struct ClaimSite {
     session: muxel_core::tmux::SessionTarget,
 }
 
+/// A forced send, or a prompt replacing an existing claim, has inspected the
+/// shared option but has not changed it. It publishes its claim only after
+/// paste; a pre-paste refusal leaves the earlier claim exactly as found.
+#[derive(Debug)]
+struct DeferredClaim {
+    expected_pattern: Option<String>,
+    claim: ctl::Claim,
+    published: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ClaimStart {
+    claim: ctl::Claim,
+    deferred: Option<DeferredClaim>,
+}
+
 /// Typing into an agent, already checked against the agent's own state.
 struct Typing {
     iid: Uuid,
@@ -208,7 +235,173 @@ struct Typing {
     force: bool,
     /// `send --launch-id`: checked again immediately before the paste.
     launch_id: Option<Uuid>,
+    once: Option<String>,
+    waited_ms: Option<u64>,
+    cancelled: Option<Arc<AtomicBool>>,
     reply: Value,
+}
+
+struct QueueRequest {
+    iid: Uuid,
+    text: String,
+    force: bool,
+    launch_id: Option<Uuid>,
+    once: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct SendAdmission {
+    state: Option<AgentState>,
+    just_submitted: bool,
+    draft_present: bool,
+    force: bool,
+}
+
+#[derive(Clone)]
+enum OnceOutcome {
+    Pending,
+    Submitted(Value),
+    Failed(ctl::Error),
+}
+
+struct OnceEntry {
+    key: String,
+    outcome: OnceOutcome,
+}
+
+/// Bounded, process-local delivery memory. A pending key cannot be evicted;
+/// it owns an in-flight request that may still reach the paste boundary.
+#[derive(Default)]
+pub(super) struct OnceRegistry {
+    by_pane: HashMap<Uuid, std::collections::VecDeque<OnceEntry>>,
+}
+
+impl OnceRegistry {
+    fn reserve(&mut self, pane: Uuid, key: &str) -> CtlResult<Option<Value>> {
+        let entries = self.by_pane.entry(pane).or_default();
+        if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
+            return match &entry.outcome {
+                OnceOutcome::Pending => Err(ctl::Error::new(
+                    ErrorCode::Busy,
+                    "this once key is still pending",
+                )),
+                OnceOutcome::Submitted(original) => {
+                    let mut duplicate = original.clone();
+                    duplicate["sent"] = json!(true);
+                    duplicate["duplicate"] = json!(true);
+                    Ok(Some(duplicate))
+                }
+                OnceOutcome::Failed(original) => Err(ctl::Error::new(
+                    ErrorCode::Duplicate,
+                    "this once key already failed; the original refusal is attached",
+                )
+                .with_original(json!(ctl::Response::err(original.clone())))),
+            };
+        }
+        if entries.len() >= 64 {
+            let Some(position) = entries
+                .iter()
+                .position(|entry| !matches!(entry.outcome, OnceOutcome::Pending))
+            else {
+                return Err(ctl::Error::new(
+                    ErrorCode::Busy,
+                    "this pane has 64 pending once keys",
+                ));
+            };
+            entries.remove(position);
+        }
+        entries.push_back(OnceEntry {
+            key: key.to_owned(),
+            outcome: OnceOutcome::Pending,
+        });
+        Ok(None)
+    }
+
+    fn complete(&mut self, pane: Uuid, key: &str, result: &CtlResult<Value>) {
+        if let Some(entry) = self
+            .by_pane
+            .get_mut(&pane)
+            .and_then(|entries| entries.iter_mut().find(|entry| entry.key == key))
+        {
+            match (&entry.outcome, result) {
+                (OnceOutcome::Pending | OnceOutcome::Submitted(_), Ok(value)) => {
+                    entry.outcome = OnceOutcome::Submitted(value.clone());
+                }
+                (OnceOutcome::Pending, Err(error)) => {
+                    entry.outcome = OnceOutcome::Failed(error.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn mark_submitted(&mut self, pane: Uuid, key: &str, receipt: &Value) {
+        if let Some(entry) = self
+            .by_pane
+            .get_mut(&pane)
+            .and_then(|entries| entries.iter_mut().find(|entry| entry.key == key))
+            && matches!(entry.outcome, OnceOutcome::Pending)
+        {
+            entry.outcome = OnceOutcome::Submitted(receipt.clone());
+        }
+    }
+
+    fn retain_panes(&mut self, live: &HashSet<Uuid>) {
+        self.by_pane.retain(|pane, _| live.contains(pane));
+    }
+}
+
+/// A reusable quiet-target arm. PR 5 can use the same launch and binding
+/// boundary for queued closes without inheriting send's payload or once log.
+#[derive(Clone, Copy)]
+pub(super) struct IdleArm {
+    launch_id: Uuid,
+    binding_rev: u64,
+    queued_at: std::time::Instant,
+    deadline: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmState {
+    Waiting,
+    Ready,
+    Cancelled,
+    Expired,
+    Replaced,
+}
+
+impl IdleArm {
+    fn state(
+        &self,
+        launch_id: Option<Uuid>,
+        binding_rev: Option<u64>,
+        quiet: bool,
+        cancelled: bool,
+        now: std::time::Instant,
+    ) -> ArmState {
+        if cancelled {
+            ArmState::Cancelled
+        } else if now >= self.deadline {
+            ArmState::Expired
+        } else if launch_id != Some(self.launch_id) || binding_rev != Some(self.binding_rev) {
+            ArmState::Replaced
+        } else if quiet {
+            ArmState::Ready
+        } else {
+            ArmState::Waiting
+        }
+    }
+}
+
+pub(super) struct QueuedSend {
+    arm: IdleArm,
+    text: String,
+    force: bool,
+    once: Option<String>,
+    reply: std::sync::mpsc::Sender<ctl::Response>,
+    cancelled: Arc<AtomicBool>,
+    checking_peers: bool,
 }
 
 /// This muxel process, as its claims name it. Random, not secret.
@@ -219,6 +412,9 @@ fn owner_id() -> &'static str {
 
 /// Shortest wait between writing a claim and reading it back.
 const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
+/// A same-process claim can be replaced after the predicted Enter plus this
+/// scheduling margin. Peers still honor the claim's full reply grace.
+const LOCAL_CLAIM_PENDING_MS: i64 = 2_000;
 
 /// Give the child a head start before its first Enter. This pause does not
 /// establish consumption; provider acceptance is checked separately below.
@@ -269,9 +465,22 @@ fn runtime_control_state(
     }
 }
 
-fn check_send_state(state: Option<AgentState>, force: bool) -> CtlResult<()> {
-    if !force {
-        match state {
+fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
+    if !admission.force {
+        if admission.draft_present {
+            return Err(ctl::Error::new(
+                ErrorCode::DraftPresent,
+                "the agent has a draft in its composer: clear it or pass --force",
+            ));
+        }
+        if admission.just_submitted {
+            return Err(ctl::Error::new(
+                ErrorCode::Working,
+                "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)",
+            )
+            .with_reason("just_submitted"));
+        }
+        match admission.state {
             Some(AgentState::Working) => {
                 return Err(ctl::Error::new(
                     ErrorCode::Working,
@@ -697,12 +906,29 @@ impl MuxelApp {
     }
 
     fn answer_control(&mut self, incoming: crate::control::Incoming, cx: &mut Context<Self>) {
-        let crate::control::Incoming { command, reply } = incoming;
+        let crate::control::Incoming {
+            command,
+            caller_instance_id,
+            reply,
+            cancelled,
+        } = incoming;
+        let answer = self.control_command(command, caller_instance_id, cx);
+        self.deliver_control_answer(answer, reply, cancelled, cx);
+    }
+
+    fn deliver_control_answer(
+        &mut self,
+        answer: Answer,
+        reply: std::sync::mpsc::Sender<ctl::Response>,
+        cancelled: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
         let respond = |result: CtlResult<Value>| match result {
             Ok(value) => ctl::Response::ok(value),
             Err(error) => ctl::Response::err(error),
         };
-        match self.control_command(command, cx) {
+        match answer {
+            Answer::Queue(request) => self.arm_control_send(request, reply, cancelled, cx),
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -717,11 +943,25 @@ impl MuxelApp {
                     .detach();
             }
             Answer::Type(mut typing) => {
+                let (once, iid) = (typing.once.clone(), typing.iid);
+                let prompt = matches!(&typing.input, Input::Prompt(_));
+                if prompt {
+                    self.control_sending.insert(iid);
+                }
                 let Some((site, turn)) = typing.site.take().zip(typing.turn.as_ref()) else {
                     // No tmux session (so nothing to share), or keys that start no turn.
-                    let pressed = self.control_press(*typing, None, cx);
-                    cx.spawn(async move |_this: WeakEntity<Self>, _cx| {
-                        let _ = reply.send(respond(pressed.await));
+                    let pressed = self.control_press(*typing, None, None, cx);
+                    cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                        let result = pressed.await;
+                        let _ = this.update(cx, |app, _| {
+                            if prompt {
+                                app.control_sending.remove(&iid);
+                            }
+                            if let Some(key) = once.as_deref() {
+                                app.control_once.complete(iid, key, &result);
+                            }
+                        });
+                        let _ = reply.send(respond(result));
                     })
                     .detach();
                     return;
@@ -736,27 +976,44 @@ impl MuxelApp {
                     let claimed = cx
                         .background_executor()
                         .spawn(async move {
-                            claim_agent(
-                                &claim_site,
-                                grace_ms,
-                                lead_ms,
-                                force,
-                                can_force,
-                                state,
-                                &activity,
-                            )
+                            if force {
+                                let observed = integrations::tmux_option(
+                                    &claim_site.loc,
+                                    &claim_site.session,
+                                    ctl::CLAIM_OPTION,
+                                );
+                                deferred_claim(observed.as_deref(), grace_ms, lead_ms)
+                                    .map(|deferred| (deferred.claim.clone(), Some(deferred)))
+                            } else {
+                                claim_agent(
+                                    &claim_site,
+                                    grace_ms,
+                                    lead_ms,
+                                    can_force,
+                                    state,
+                                    &activity,
+                                )
+                                .map(|start| (start.claim, start.deferred))
+                            }
                         })
                         .await;
                     let result = match claimed {
-                        Ok(claim) => {
+                        Ok((claim, deferred)) => {
+                            let published =
+                                deferred.as_ref().map(|deferred| deferred.published.clone());
+                            let deferred = deferred.map(|deferred| (site.clone(), deferred));
                             let pressed = this.update(cx, |app, cx| {
-                                app.control_press(*typing, Some(claim.at), cx)
+                                app.control_press(*typing, Some(claim.at), deferred, cx)
                             });
                             let sent = match pressed {
                                 Ok(pressed) => pressed.await,
                                 Err(_) => Err("muxel is shutting down".into()),
                             };
-                            if sent.is_err() {
+                            if release_claim_after_result(&sent)
+                                && published
+                                    .as_ref()
+                                    .is_none_or(|published| published.load(Ordering::Acquire))
+                            {
                                 cx.background_executor()
                                     .spawn(async move { release_claim(&site, &claim) })
                                     .await;
@@ -765,6 +1022,14 @@ impl MuxelApp {
                         }
                         Err(error) => Err(error),
                     };
+                    let _ = this.update(cx, |app, _| {
+                        if prompt {
+                            app.control_sending.remove(&iid);
+                        }
+                        if let Some(key) = once.as_deref() {
+                            app.control_once.complete(iid, key, &result);
+                        }
+                    });
                     let _ = reply.send(respond(result));
                 })
                 .detach();
@@ -772,7 +1037,12 @@ impl MuxelApp {
         }
     }
 
-    fn control_command(&mut self, command: Command, cx: &mut Context<Self>) -> Answer {
+    fn control_command(
+        &mut self,
+        command: Command,
+        caller_instance_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Answer {
         self.sync_control_approvals(cx);
         if let Command::NewStatus { request_id } = &command {
             return Answer::Now(self.control_approvals.status(*request_id));
@@ -799,6 +1069,7 @@ impl MuxelApp {
         }
         let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
         self.control_turns.retain(|id, _| live.contains(id));
+        self.control_once.retain_panes(&live);
         let now = now_ms();
         match command {
             Command::New { project, options } => Answer::Open { project, options },
@@ -833,16 +1104,52 @@ impl MuxelApp {
                 text,
                 force,
                 launch_id,
-            } => match self.control_resolve(&agent) {
-                Ok(iid) => typed(self.control_send(iid, text, force, launch_id, cx)),
+                once,
+                when_idle,
+                timeout_secs,
+            } => match self.control_resolve_for_typing(&agent, caller_instance_id, force) {
+                Ok(iid) if when_idle => Answer::Queue(QueueRequest {
+                    iid,
+                    text,
+                    force,
+                    launch_id,
+                    once,
+                    timeout_secs,
+                }),
+                Ok(iid) => {
+                    if let Some(key) = once.as_deref() {
+                        match self.control_once.reserve(iid, key) {
+                            Ok(Some(duplicate)) => return Answer::Now(Ok(duplicate)),
+                            Ok(None) => {}
+                            Err(error) => return Answer::Now(Err(error)),
+                        }
+                    }
+                    let result = self.control_send(iid, text, force, launch_id, cx);
+                    match result {
+                        Ok(mut typing) => {
+                            typing.once = once;
+                            Answer::Type(Box::new(typing))
+                        }
+                        Err(error) => {
+                            if let Some(key) = once.as_deref() {
+                                self.control_once.complete(iid, key, &Err(error.clone()));
+                            }
+                            Answer::Now(Err(error))
+                        }
+                    }
+                }
                 Err(error) => Answer::Now(Err(error)),
             },
-            Command::Answer { agent, option } => typed(
-                self.control_resolve(&agent)
+            Command::Answer {
+                agent,
+                option,
+                force,
+            } => typed(
+                self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_answer(iid, &option, cx)),
             ),
-            Command::Keys { agent, keys } => typed(
-                self.control_resolve(&agent)
+            Command::Keys { agent, keys, force } => typed(
+                self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
         }
@@ -896,6 +1203,17 @@ impl MuxelApp {
             })
             .collect();
         ctl::resolve_agent(query, &entries, self.active_instance).map_err(Into::into)
+    }
+
+    fn control_resolve_for_typing(
+        &self,
+        query: &str,
+        caller_instance_id: Option<Uuid>,
+        force: bool,
+    ) -> CtlResult<Uuid> {
+        let iid = self.control_resolve(query)?;
+        ctl::check_self_target(caller_instance_id, iid, force)?;
+        Ok(iid)
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
@@ -1261,8 +1579,36 @@ impl MuxelApp {
             activity: inst.activity.clone(),
             force,
             launch_id: None,
+            once: None,
+            waited_ms: None,
+            cancelled: None,
             reply,
         })
+    }
+
+    fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
+        let inst = self.workspace.instance(iid);
+        let state = inst.and_then(|inst| self.control_state(inst, cx));
+        let (coverage, draft_present) = self.terminal_view(iid).map_or((None, false), |view| {
+            let view = view.read(cx);
+            (
+                Some(view.runtime_snapshot().coverage),
+                view.control_composer_draft()
+                    .unwrap_or_else(|| view.session().input_snapshot().1),
+            )
+        });
+        let just_submitted = inst.is_some_and(|inst| {
+            self.control_turns.get(&iid).is_some_and(|turn| {
+                turn_has_reply_evidence(turn, coverage)
+                    && turn.awaiting_reply(state, &inst.activity, now_ms())
+            })
+        });
+        SendAdmission {
+            state,
+            just_submitted,
+            draft_present,
+            force,
+        }
     }
 
     fn control_send(
@@ -1278,11 +1624,7 @@ impl MuxelApp {
         if text.trim().is_empty() {
             return Err("nothing to send".into());
         }
-        let state = self
-            .workspace
-            .instance(iid)
-            .and_then(|inst| self.control_state(inst, cx));
-        check_send_state(state, force)?;
+        check_send_state(self.control_send_admission(iid, force, cx))?;
         let turn = Turn {
             prompt: Some(text.clone()),
             grace_ms: ctl::REPLY_GRACE_MS,
@@ -1297,6 +1639,289 @@ impl MuxelApp {
             launch_id,
             ..typing
         })
+    }
+
+    fn arm_control_send(
+        &mut self,
+        request: QueueRequest,
+        reply: std::sync::mpsc::Sender<ctl::Response>,
+        cancelled: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
+        let QueueRequest {
+            iid,
+            text,
+            force,
+            launch_id,
+            once,
+            timeout_secs,
+        } = request;
+        let fail = |error: ctl::Error, app: &mut Self| {
+            if let Some(key) = once.as_deref() {
+                app.control_once.complete(iid, key, &Err(error.clone()));
+            }
+            let _ = reply.send(ctl::Response::err(error));
+        };
+        if let Some(key) = once.as_deref() {
+            match self.control_once.reserve(iid, key) {
+                Ok(Some(duplicate)) => {
+                    let _ = reply.send(ctl::Response::ok(duplicate));
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = reply.send(ctl::Response::err(error));
+                    return;
+                }
+            }
+        }
+        if timeout_secs
+            .is_some_and(|seconds| seconds == 0 || seconds > ctl::WHEN_IDLE_TIMEOUT_MAX_SECS)
+        {
+            fail(
+                ctl::Error::from("send --timeout must be 1–3600 seconds"),
+                self,
+            );
+            return;
+        }
+        if text.trim().is_empty() {
+            fail(ctl::Error::from("nothing to send"), self);
+            return;
+        }
+        if self.control_pending_sends.contains_key(&iid) {
+            fail(
+                ctl::Error::new(ErrorCode::Busy, "this pane already has a queued send"),
+                self,
+            );
+            return;
+        }
+        let session = match self.control_writable(iid, cx) {
+            Ok(session) => session,
+            Err(error) => {
+                fail(error, self);
+                return;
+            }
+        };
+        if let Err(error) = ctl::check_launch_id(launch_id, Some(session.id)) {
+            fail(error, self);
+            return;
+        }
+        let queued_at = std::time::Instant::now();
+        let arm = IdleArm {
+            launch_id: session.id,
+            binding_rev: session.binding_revision(),
+            queued_at,
+            deadline: queued_at
+                + Duration::from_secs(timeout_secs.unwrap_or(ctl::WHEN_IDLE_TIMEOUT_SECS)),
+        };
+        self.control_pending_sends.insert(
+            iid,
+            QueuedSend {
+                arm,
+                text,
+                force,
+                once,
+                reply,
+                cancelled,
+                checking_peers: false,
+            },
+        );
+        self.pump_control_sends(cx);
+    }
+
+    fn control_send_quiet(&self, iid: Uuid, cx: &App) -> bool {
+        if self.control_sending.contains(&iid) {
+            return false;
+        }
+        let Some(instance) = self.workspace.instance(iid) else {
+            return false;
+        };
+        let state = self.control_state(instance, cx);
+        if !matches!(state, Some(AgentState::Idle | AgentState::Done)) {
+            return false;
+        }
+        !self
+            .control_turns
+            .get(&iid)
+            .is_some_and(|turn| turn.awaiting_reply(state, &instance.activity, now_ms()))
+    }
+
+    fn control_send_arm_state(&self, iid: Uuid, queued: &QueuedSend, cx: &App) -> ArmState {
+        let identity = self
+            .terminal_view(iid)
+            .map(|view| {
+                let view = view.read(cx);
+                (
+                    Some(view.session().id),
+                    Some(view.session().binding_revision()),
+                )
+            })
+            .unwrap_or((None, None));
+        queued.arm.state(
+            identity.0,
+            identity.1,
+            self.control_send_quiet(iid, cx),
+            queued.cancelled.load(Ordering::Acquire),
+            std::time::Instant::now(),
+        )
+    }
+
+    fn finish_queued_send(&mut self, iid: Uuid, queued: QueuedSend, result: CtlResult<Value>) {
+        if let Some(key) = queued.once.as_deref() {
+            self.control_once.complete(iid, key, &result);
+        }
+        let response = match result {
+            Ok(value) => ctl::Response::ok(value),
+            Err(error) => ctl::Response::err(error),
+        };
+        let _ = queued.reply.send(response);
+    }
+
+    /// Called by the one-second status tick and immediately after an arm. A
+    /// ready local pane can fire in this UI update; tmux peers are checked off
+    /// thread, then the same launch, binding and quiet facts are checked again.
+    pub(super) fn pump_control_sends(&mut self, cx: &mut Context<Self>) {
+        let panes: Vec<_> = self.control_pending_sends.keys().copied().collect();
+        for iid in panes {
+            let Some(queued) = self.control_pending_sends.get(&iid) else {
+                continue;
+            };
+            let state = if self.settings.control_enabled {
+                self.control_send_arm_state(iid, queued, cx)
+            } else {
+                ArmState::Cancelled
+            };
+            let refusal = match state {
+                ArmState::Cancelled => Some(ctl::Error::new(
+                    ErrorCode::HostUnavailable,
+                    "the queued send was cancelled or outside control was turned off",
+                )),
+                ArmState::Expired => Some(ctl::Error::new(
+                    ErrorCode::TimedOut,
+                    "the pane did not become safely idle before the queued send timed out",
+                )),
+                ArmState::Replaced => Some(ctl::Error::new(
+                    ErrorCode::LaunchMismatch,
+                    "the pane launch or conversation changed while the send was queued",
+                )),
+                ArmState::Ready | ArmState::Waiting => None,
+            };
+            if let Some(error) = refusal {
+                if let Some(queued) = self.control_pending_sends.remove(&iid) {
+                    self.finish_queued_send(iid, queued, Err(error));
+                }
+                continue;
+            }
+            if state != ArmState::Ready || queued.checking_peers {
+                continue;
+            }
+            let site = self
+                .workspace
+                .instance(iid)
+                .and_then(|inst| self.control_claim_site(inst));
+            if let Some(site) = site {
+                if let Some(queued) = self.control_pending_sends.get_mut(&iid) {
+                    queued.checking_peers = true;
+                }
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    let count = cx
+                        .background_executor()
+                        .spawn(async move {
+                            integrations::tmux_attached_clients(&site.loc, &site.session)
+                        })
+                        .await;
+                    let _ =
+                        this.update(cx, |app, cx| app.fire_queued_send_if_peers(iid, count, cx));
+                })
+                .detach();
+            } else {
+                self.fire_queued_send(iid, cx);
+            }
+        }
+    }
+
+    fn fire_queued_send_if_peers(&mut self, iid: Uuid, count: Option<u32>, cx: &mut Context<Self>) {
+        let Some(queued) = self.control_pending_sends.get_mut(&iid) else {
+            return;
+        };
+        queued.checking_peers = false;
+        if count.is_some_and(|count| count <= 1) {
+            self.fire_queued_send(iid, cx);
+        }
+    }
+
+    fn fire_queued_send(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let Some(queued) = self.control_pending_sends.remove(&iid) else {
+            return;
+        };
+        match self.control_send_arm_state(iid, &queued, cx) {
+            ArmState::Waiting => {
+                self.control_pending_sends.insert(iid, queued);
+                return;
+            }
+            ArmState::Cancelled => {
+                self.finish_queued_send(
+                    iid,
+                    queued,
+                    Err(ctl::Error::new(
+                        ErrorCode::HostUnavailable,
+                        "the queued send caller disconnected",
+                    )),
+                );
+                return;
+            }
+            ArmState::Expired => {
+                self.finish_queued_send(
+                    iid,
+                    queued,
+                    Err(ctl::Error::new(
+                        ErrorCode::TimedOut,
+                        "the queued send timed out",
+                    )),
+                );
+                return;
+            }
+            ArmState::Replaced => {
+                self.finish_queued_send(
+                    iid,
+                    queued,
+                    Err(ctl::Error::new(
+                        ErrorCode::LaunchMismatch,
+                        "the pane launch or conversation changed while queued",
+                    )),
+                );
+                return;
+            }
+            ArmState::Ready => {}
+        }
+        let result = self.control_send(
+            iid,
+            queued.text.clone(),
+            queued.force,
+            Some(queued.arm.launch_id),
+            cx,
+        );
+        match result {
+            Ok(mut typing) => {
+                typing.once = queued.once;
+                typing.waited_ms = Some(
+                    queued
+                        .arm
+                        .queued_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+                typing.cancelled = Some(queued.cancelled.clone());
+                self.deliver_control_answer(
+                    Answer::Type(Box::new(typing)),
+                    queued.reply,
+                    queued.cancelled,
+                    cx,
+                );
+            }
+            Err(error) => self.finish_queued_send(iid, queued, Err(error)),
+        }
     }
 
     fn control_answer(
@@ -1399,6 +2024,7 @@ impl MuxelApp {
         &mut self,
         typing: Typing,
         at: Option<i64>,
+        deferred: Option<(Arc<ClaimSite>, DeferredClaim)>,
         cx: &mut Context<Self>,
     ) -> Task<CtlResult<Value>> {
         // The pane may have closed while another muxel's claim was checked.
@@ -1411,23 +2037,50 @@ impl MuxelApp {
             turn,
             reply,
             launch_id,
+            force,
+            waited_ms,
+            cancelled,
+            once,
             ..
         } = typing;
         match typing.input {
             Input::Prompt(text) => {
+                // This is the same UI update as local keyboard input and PTY
+                // draining. Re-read after the asynchronous tmux claim settle.
+                let admission = self.control_send_admission(iid, force, cx);
                 let attempt = self
                     .terminal_view(iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
-                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
+                let mut reply = match paste_prompt(
+                    &session,
+                    iid,
+                    &text,
+                    launch_id,
+                    admission,
+                    cancelled.as_deref(),
+                ) {
                     Ok(reply) => reply,
                     Err(error) => return Task::ready(Err(error)),
                 };
+                if let Some(waited_ms) = waited_ms {
+                    reply["waited_ms"] = json!(waited_ms);
+                }
                 let pasted = session.input_rev();
+                let first_receipt = reply.clone();
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    if let Some((site, deferred)) = deferred {
+                        cx.background_executor()
+                            .spawn(async move { publish_deferred_claim(&site, deferred) })
+                            .await?;
+                    }
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
                     let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
+                        if cancelled.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) {
+                            return Err(ctl::Error::new(ErrorCode::HostUnavailable,
+                                "the queued send caller disconnected after paste; Enter was withheld").after_paste());
+                        }
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
                         if attempt.as_ref().is_some_and(|attempt| {
@@ -1436,15 +2089,18 @@ impl MuxelApp {
                                     == muxel_terminal::PromptSubmissionState::Interrupted
                             })
                         }) {
-                            return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
+                            return Err(ctl::Error::from("the provider conversation changed after the paste, so Enter was withheld: check its `screen`").after_paste());
                         }
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
                         // at the actual Enter admission, never at the prediction.
                         app.note_control_turn(iid, turn, now_ms());
+                        if let Some(key) = once.as_deref() {
+                            app.control_once.mark_submitted(iid, key, &first_receipt);
+                        }
                         Ok(session.input_rev())
                     })
-                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    .unwrap_or_else(|_| Err(ctl::Error::from("muxel is shutting down").after_paste()))?;
                     // Enter is in. Whatever happens next, the reply is this
                     // receipt: an error would read as "Enter withheld".
                     let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
@@ -1457,6 +2113,9 @@ impl MuxelApp {
                     loop {
                         let action = this
                             .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                if cancelled.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) {
+                                    return Err(Unconfirmed::Interrupted);
+                                }
                                 confirmation_verdict(
                                     app.control_writable(iid, cx),
                                     &session,
@@ -1497,6 +2156,7 @@ impl MuxelApp {
                 })
             }
             Input::Keys(presses) => {
+                debug_assert!(deferred.is_none(), "only prompts can defer a claim");
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     for (i, (bytes, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
@@ -1678,14 +2338,15 @@ fn enter_verdict<T>(
 ) -> CtlResult<()> {
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
-        Ok(_) => return Err("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`".into()),
-        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`").into()),
+        Ok(_) => return Err(ctl::Error::from("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`").after_paste()),
+        Err(why) => return Err(ctl::Error::from(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")).after_paste()),
     }
     if now != pasted {
         return Err(ctl::Error::new(
             ErrorCode::InputChanged,
             "local input changed after the prompt was pasted, so Enter wasn't pressed: check its `screen` before sending again",
-        ));
+        )
+        .after_paste());
     }
     Ok(())
 }
@@ -1695,20 +2356,40 @@ fn paste_prompt(
     pane: Uuid,
     text: &str,
     expected_launch: Option<Uuid>,
+    admission: SendAdmission,
+    cancelled: Option<&AtomicBool>,
 ) -> CtlResult<Value> {
+    check_send_state(admission)?;
     ctl::check_launch_id(expected_launch, Some(session.id))?;
-    session
-        .try_paste(text)
-        .map_err(|error| format!("couldn't admit the prompt to the PTY writer: {error}"))?;
+    if cancelled.is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Err(ctl::Error::new(
+            ErrorCode::HostUnavailable,
+            "the queued send caller disconnected before paste",
+        ));
+    }
+    session.try_paste(text).map_err(|error| {
+        ctl::Error::from(format!(
+            "couldn't finish pasting the prompt ({error}); input may be partial: check its `screen`"
+        ))
+        .after_paste()
+    })?;
     Ok(ctl::pasted_prompt_receipt(pane, session.id))
+}
+
+fn release_claim_after_result(result: &CtlResult<Value>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.pasted != Some(true))
 }
 
 fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<()> {
     enter_verdict(Ok(session.clone()), session, pasted, session.input_rev())?;
     session.try_submit_input(b"\r").map_err(|error| {
-        format!(
+        ctl::Error::from(format!(
             "the prompt was pasted but Enter couldn't be admitted ({error}): check its `screen`"
-        )
+        ))
+        .after_paste()
     })?;
     Ok(())
 }
@@ -1728,13 +2409,81 @@ fn read_claim(site: &ClaimSite) -> Option<ctl::Claim> {
         .and_then(|value| ctl::Claim::decode(&value))
 }
 
+fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlResult<DeferredClaim> {
+    let expected_pattern = observed
+        .map(|value| {
+            ctl::Claim::decode(value)
+                .and_then(|claim| claim.compare_pattern())
+                .ok_or_else(|| {
+                    ctl::Error::new(
+                        ErrorCode::ClaimedElsewhere,
+                        "the existing tmux claim cannot be compared safely; no input was sent",
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(DeferredClaim {
+        expected_pattern,
+        claim: ctl::Claim {
+            owner: owner_id().to_string(),
+            host: crate::control::local_hostname().to_string(),
+            at: now_ms() + lead_ms,
+            grace_ms,
+            nonce: Some(Uuid::new_v4()),
+        },
+        published: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+fn publish_deferred_claim(site: &ClaimSite, deferred: DeferredClaim) -> CtlResult<()> {
+    publish_deferred_claim_with(
+        deferred,
+        |expected, claim| {
+            integrations::set_tmux_option_if(
+                &site.loc,
+                &site.session,
+                ctl::CLAIM_OPTION,
+                expected,
+                &claim.encode(),
+            )
+            .map_err(|error| {
+                ctl::Error::from(format!(
+                    "the prompt was pasted but its tmux claim could not be published ({error:#}); Enter was withheld: check `screen`"
+                ))
+                .after_paste()
+            })
+        },
+        || read_claim(site),
+    )
+}
+
+fn publish_deferred_claim_with(
+    deferred: DeferredClaim,
+    write_if: impl FnOnce(Option<&str>, &ctl::Claim) -> CtlResult<()>,
+    read: impl FnOnce() -> Option<ctl::Claim>,
+) -> CtlResult<()> {
+    let mut claim = deferred.claim;
+    claim.at = now_ms() + SUBMIT_DELAY_MS as i64;
+    write_if(deferred.expected_pattern.as_deref(), &claim)?;
+    if !read().is_some_and(|current| current.same_turn(&claim)) {
+        return Err(ctl::Error::new(
+            ErrorCode::ClaimedElsewhere,
+            "another muxel changed the tmux claim after the paste; Enter was withheld: check `screen`",
+        )
+        .after_paste());
+    }
+    deferred.published.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Before typing into an agent whose tmux session other muxels may share: refuse
-/// if another muxel's turn with it is still open, then claim it for this one and
-/// read the claim back after a pause, so that when two muxels reach an idle agent
-/// at the same moment only the later write types. The pause is twice the read's
-/// round trip (so a slower host gets a longer one), but at least
-/// [`CLAIM_SETTLE_MIN`]. Returns the claim's unique identity and shared timing
-/// estimate. A prompt's local turn uses its actual Enter admission time.
+/// if any earlier turn with it is still open, then claim it for this one. A
+/// conditional tmux write and readback keep a peer from claiming the same idle
+/// pane between our read and write. A prompt replacing an existing claim defers
+/// its conditional write until after paste, so pre-paste refusal preserves the
+/// earlier claim. The immediate claim settles for twice the read's round trip
+/// (at least [`CLAIM_SETTLE_MIN`]). A prompt's local turn uses its actual Enter
+/// admission time.
 ///
 /// Best effort: a host whose tmux can't be reached leaves the agent unclaimed
 /// rather than untypeable — the pane itself works, or `control_writable` would
@@ -1743,11 +2492,59 @@ fn claim_agent(
     site: &ClaimSite,
     grace_ms: i64,
     lead_ms: i64,
-    force: bool,
     can_force: bool,
     state: Option<AgentState>,
     activity: &AgentActivity,
-) -> CtlResult<ctl::Claim> {
+) -> CtlResult<ClaimStart> {
+    claim_agent_with(
+        ClaimAttempt {
+            grace_ms,
+            lead_ms,
+            can_force,
+            state,
+            activity,
+        },
+        || read_claim(site),
+        |expected, claim| {
+            integrations::set_tmux_option_if(
+                &site.loc,
+                &site.session,
+                ctl::CLAIM_OPTION,
+                expected,
+                &claim.encode(),
+            )
+            .map_err(|error| {
+                log::warn!("muxel ctl: couldn't claim {}: {error:#}", site.session);
+            })
+            .is_ok()
+        },
+        std::thread::sleep,
+    )
+}
+
+/// The shared claim sequence with I/O supplied by the tmux site. Tests can
+/// replay a live same-owner claim without a tmux daemon or scheduler race.
+struct ClaimAttempt<'a> {
+    grace_ms: i64,
+    lead_ms: i64,
+    can_force: bool,
+    state: Option<AgentState>,
+    activity: &'a AgentActivity,
+}
+
+fn claim_agent_with(
+    attempt: ClaimAttempt<'_>,
+    read: impl Fn() -> Option<ctl::Claim>,
+    write: impl Fn(Option<&str>, &ctl::Claim) -> bool,
+    settle_wait: impl Fn(Duration),
+) -> CtlResult<ClaimStart> {
+    let ClaimAttempt {
+        grace_ms,
+        lead_ms,
+        can_force,
+        state,
+        activity,
+    } = attempt;
     let busy = |claim: &ctl::Claim, how: &str| {
         let hint = if can_force {
             "`wait` on the agent and try again (or pass --force to send anyway)"
@@ -1760,11 +2557,14 @@ fn claim_agent(
         )
     };
     let asked = Instant::now();
-    let theirs = read_claim(site);
+    let theirs = read();
     let settle = (asked.elapsed() * 2).max(CLAIM_SETTLE_MIN);
-    if !force
-        && let Some(claim) = &theirs
-        && ctl::claim_holds(claim, owner_id(), state, activity, now_ms())
+    if let Some(claim) = &theirs
+        // Another muxel holds the full grace. Our own claim only blocks while
+        // its paste/Enter may still be in flight, and only prompts can defer
+        // replacement until after their final pre-paste admission check.
+        && (!can_force || claim.owner != owner_id() || now_ms() < claim.at + LOCAL_CLAIM_PENDING_MS)
+        && ctl::awaiting_reply(Some(claim.at), claim.grace_ms, state, activity, now_ms())
     {
         let ago = (now_ms() - claim.at).max(0) / 1000;
         return Err(busy(
@@ -1780,22 +2580,51 @@ fn claim_agent(
         grace_ms,
         nonce: Some(Uuid::new_v4()),
     };
-    if let Err(error) =
-        integrations::set_tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION, &mine.encode())
-    {
-        log::warn!("muxel ctl: couldn't claim {}: {error:#}", site.session);
-        return Ok(ctl::Claim {
-            at: now_ms() + lead_ms,
-            ..mine
+    let expected_pattern = theirs
+        .as_ref()
+        .map(|claim| {
+            claim.compare_pattern().ok_or_else(|| {
+                ctl::Error::new(
+                    ErrorCode::ClaimedElsewhere,
+                    "the existing tmux claim cannot be compared safely; no input was sent",
+                )
+            })
+        })
+        .transpose()?;
+    if can_force && expected_pattern.is_some() {
+        let deferred = DeferredClaim {
+            expected_pattern,
+            claim: mine.clone(),
+            published: Arc::new(AtomicBool::new(false)),
+        };
+        return Ok(ClaimStart {
+            claim: mine,
+            deferred: Some(deferred),
         });
     }
-    std::thread::sleep(settle);
-    match read_claim(site) {
-        Some(claim) if !claim.same_turn(&mine) && !force => Err(busy(
+    if !write(expected_pattern.as_deref(), &mine) {
+        return Ok(ClaimStart {
+            claim: ctl::Claim {
+                at: now_ms() + lead_ms,
+                ..mine
+            },
+            deferred: None,
+        });
+    }
+    settle_wait(settle);
+    match read() {
+        Some(claim) if !claim.same_turn(&mine) => Err(busy(
             &claim,
             "started typing into this agent at the same moment",
         )),
-        _ => Ok(mine),
+        None => Err(ctl::Error::new(
+            ErrorCode::ClaimedElsewhere,
+            "the tmux claim could not be confirmed; no input was sent",
+        )),
+        Some(_) => Ok(ClaimStart {
+            claim: mine,
+            deferred: None,
+        }),
     }
 }
 
@@ -1856,15 +2685,191 @@ fn show_value(
 }
 
 #[cfg(test)]
+mod queued_send_tests {
+    use super::{ArmState, IdleArm, OnceRegistry};
+    use muxel_core::control::{self as ctl, ErrorCode};
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn once_key_repeat_after_submit_is_duplicate_success() {
+        let pane = Uuid::new_v4();
+        let mut registry = OnceRegistry::default();
+        assert_eq!(registry.reserve(pane, "delivery").unwrap(), None);
+        assert_eq!(
+            registry.reserve(pane, "delivery").unwrap_err().code,
+            Some(ErrorCode::Busy)
+        );
+        registry.mark_submitted(pane, "delivery", &json!({"sent":true,"pasted":true}));
+        assert_eq!(
+            registry.reserve(pane, "delivery").unwrap(),
+            Some(json!({"sent":true,"pasted":true,"duplicate":true}))
+        );
+        registry.complete(
+            pane,
+            "delivery",
+            &Ok(json!({"sent":true,"pasted":true,"submission_confirmed":true})),
+        );
+        assert_eq!(
+            registry.reserve(pane, "delivery").unwrap().unwrap()["submission_confirmed"],
+            true
+        );
+    }
+
+    #[test]
+    fn once_key_repeat_after_failure_returns_original() {
+        let pane = Uuid::new_v4();
+        let mut registry = OnceRegistry::default();
+        registry.reserve(pane, "delivery").unwrap();
+        let original = ctl::Error::new(ErrorCode::DraftPresent, "draft is present");
+        registry.complete(pane, "delivery", &Err(original));
+        let duplicate = registry.reserve(pane, "delivery").unwrap_err();
+        assert_eq!(duplicate.code, Some(ErrorCode::Duplicate));
+        let prior = duplicate.original.unwrap();
+        assert_eq!(prior["code"], "draft_present");
+        assert_eq!(prior["error"], "draft is present");
+    }
+
+    #[test]
+    fn when_idle_waits_for_quiet_then_sends() {
+        let launch = Uuid::new_v4();
+        let now = Instant::now();
+        let arm = IdleArm {
+            launch_id: launch,
+            binding_rev: 3,
+            queued_at: now,
+            deadline: now + Duration::from_secs(10),
+        };
+        assert_eq!(
+            arm.state(Some(launch), Some(3), false, false, now),
+            ArmState::Waiting
+        );
+        assert_eq!(
+            arm.state(Some(launch), Some(3), true, false, now),
+            ArmState::Ready
+        );
+    }
+
+    #[test]
+    fn when_idle_cancelled_by_caller_disconnect() {
+        let launch = Uuid::new_v4();
+        let now = Instant::now();
+        let arm = IdleArm {
+            launch_id: launch,
+            binding_rev: 3,
+            queued_at: now,
+            deadline: now + Duration::from_secs(10),
+        };
+        assert_eq!(
+            arm.state(Some(launch), Some(3), true, true, now),
+            ArmState::Cancelled
+        );
+    }
+
+    #[test]
+    fn when_idle_cleared_by_launch_change() {
+        let launch = Uuid::new_v4();
+        let now = Instant::now();
+        let arm = IdleArm {
+            launch_id: launch,
+            binding_rev: 3,
+            queued_at: now,
+            deadline: now + Duration::from_secs(10),
+        };
+        assert_eq!(
+            arm.state(Some(Uuid::new_v4()), Some(3), true, false, now),
+            ArmState::Replaced
+        );
+        assert_eq!(
+            arm.state(Some(launch), Some(4), true, false, now),
+            ArmState::Replaced
+        );
+        assert_eq!(
+            arm.state(
+                Some(launch),
+                Some(3),
+                false,
+                false,
+                now + Duration::from_secs(10)
+            ),
+            ArmState::Expired
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn when_idle_second_queue_is_busy() {
+        use super::QueueRequest;
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("queued-send");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("queued", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some("cmd.exe".into());
+                    instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                    let pane = instance.id;
+                    let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+                    app.workspace.add_instance(instance);
+                    app.settings.control_enabled = true;
+                    app.settings.control_allow_shells = true;
+                    let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    let before = session.input_rev();
+                    app.terminals.insert(pane, view);
+                    // Hold the quiet condition closed while both requests arrive.
+                    app.control_sending.insert(pane);
+                    let request = || QueueRequest {
+                        iid: pane,
+                        text: "message".into(),
+                        force: false,
+                        launch_id: Some(session.id),
+                        once: None,
+                        timeout_secs: Some(10),
+                    };
+                    let (first_tx, _first_rx) = mpsc::channel();
+                    app.arm_control_send(request(), first_tx, Arc::new(AtomicBool::new(false)), cx);
+                    assert!(app.control_pending_sends.contains_key(&pane));
+                    let (second_tx, second_rx) = mpsc::channel();
+                    app.arm_control_send(
+                        request(),
+                        second_tx,
+                        Arc::new(AtomicBool::new(false)),
+                        cx,
+                    );
+                    let refusal = second_rx.try_recv().unwrap();
+                    assert_eq!(refusal.code, Some(ErrorCode::Busy));
+                    assert_eq!(session.input_rev(), before);
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[cfg(test)]
 mod prompt_submission_tests {
     use super::{
-        PromptConfirmation, PromptConfirmationAction, Unconfirmed, confirmation_verdict,
-        enter_verdict, paste_prompt, press_prompt_enter, submission_receipt,
+        ClaimAttempt, PromptConfirmation, PromptConfirmationAction, SendAdmission, Unconfirmed,
+        claim_agent_with, confirmation_verdict, deferred_claim, enter_verdict, now_ms, owner_id,
+        paste_prompt, press_prompt_enter, publish_deferred_claim_with, submission_receipt,
     };
-    use muxel_core::control::ErrorCode;
+    use muxel_core::{AgentActivity, control::ErrorCode};
     use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
     use serde_json::json;
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        sync::Arc,
+        time::Duration,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -1877,19 +2882,210 @@ mod prompt_submission_tests {
         let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
         let pane = Uuid::new_v4();
         let before = session.input_rev();
-        let refusal = paste_prompt(&session, pane, "prompt", Some(Uuid::new_v4())).unwrap_err();
+        let admission = SendAdmission {
+            state: Some(super::AgentState::Idle),
+            just_submitted: false,
+            draft_present: false,
+            force: false,
+        };
+        let refusal = paste_prompt(
+            &session,
+            pane,
+            "prompt",
+            Some(Uuid::new_v4()),
+            admission,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(refusal.code, Some(ErrorCode::LaunchMismatch));
         assert_eq!(
             session.input_rev(),
             before,
             "a refused launch must type nothing"
         );
-        let receipt = paste_prompt(&session, pane, "prompt", Some(session.id)).unwrap();
+        let receipt =
+            paste_prompt(&session, pane, "prompt", Some(session.id), admission, None).unwrap();
         let revision = session.input_rev();
         session.kill();
         assert_ne!(revision, before);
         assert_eq!(receipt["pasted"], true);
         assert_eq!(receipt["launch_id"], session.id.to_string());
+    }
+
+    #[test]
+    fn paste_rechecks_working_after_claim_settle() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let before = session.input_rev();
+        let refused = paste_prompt(
+            &session,
+            Uuid::new_v4(),
+            "late prompt",
+            None,
+            SendAdmission {
+                state: Some(super::AgentState::Working),
+                just_submitted: false,
+                draft_present: false,
+                force: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::Working));
+        assert_eq!(
+            session.input_rev(),
+            before,
+            "late working state typed bytes"
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn draft_appearing_between_admission_and_paste_refuses() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let before = session.input_rev();
+        let refusal = paste_prompt(
+            &session,
+            Uuid::new_v4(),
+            "automation prompt",
+            Some(session.id),
+            SendAdmission {
+                state: Some(super::AgentState::Idle),
+                just_submitted: false,
+                draft_present: true,
+                force: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, Some(ErrorCode::DraftPresent));
+        assert_eq!(session.input_rev(), before);
+        session.kill();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_press_rechecks_before_paste_and_leaves_forced_claim_unpublished() {
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::time::{Instant, SystemTime};
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let (session, before, result, rx_forced, published) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("control-paste");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some("cmd.exe".into());
+                    instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                    instance.tmux_session = Some("isolated-test-claim".into());
+                    let pane = instance.id;
+                    let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+                    app.workspace.add_instance(instance);
+                    app.settings.control_enabled = true;
+                    app.settings.control_allow_shells = true;
+                    let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    app.control_turns.insert(
+                        pane,
+                        super::ControlTurn {
+                            prompt: Some("earlier".into()),
+                            sent_at: super::now_ms(),
+                            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                            startup: None,
+                        },
+                    );
+                    assert!(
+                        !app.control_send_admission(pane, false, cx).just_submitted,
+                        "activity-only panes cannot leave later sends in a blind grace"
+                    );
+                    let typing = app
+                        .control_typing(
+                            pane,
+                            super::Input::Prompt("late prompt".into()),
+                            Some(super::Turn {
+                                prompt: Some("late prompt".into()),
+                                grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                                lead_ms: 0,
+                            }),
+                            false,
+                            serde_json::Value::Null,
+                            cx,
+                        )
+                        .unwrap();
+                    let before = session.input_rev();
+                    let now = SystemTime::now();
+                    session.provider_switched(now, now);
+                    let pressed = app.control_press(typing, None, None, cx);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cx.spawn(async move |_, _| {
+                        tx.send(pressed.await).unwrap();
+                    })
+                    .detach();
+                    let old = muxel_core::control::Claim {
+                        owner: "peer".into(),
+                        host: "peer".into(),
+                        at: super::now_ms(),
+                        grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                        nonce: Some(Uuid::new_v4()),
+                    };
+                    let deferred = super::deferred_claim(
+                        Some(&old.encode()),
+                        muxel_core::control::REPLY_GRACE_MS,
+                        super::SUBMIT_DELAY_MS as i64,
+                    )
+                    .unwrap();
+                    let published = deferred.published.clone();
+                    let site = app
+                        .control_claim_site(app.workspace.instance(pane).unwrap())
+                        .unwrap();
+                    let mut forced = app
+                        .control_typing(
+                            pane,
+                            super::Input::Prompt("forced prompt".into()),
+                            None,
+                            true,
+                            serde_json::Value::Null,
+                            cx,
+                        )
+                        .unwrap();
+                    forced.launch_id = Some(Uuid::new_v4());
+                    let refused =
+                        app.control_press(forced, None, Some((Arc::new(site), deferred)), cx);
+                    let (tx_forced, rx_forced) = std::sync::mpsc::channel();
+                    cx.spawn(async move |_, _| {
+                        tx_forced.send(refused.await).unwrap();
+                    })
+                    .detach();
+                    (session, before, rx, rx_forced, published)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let refused = result.try_recv().unwrap();
+            assert_eq!(refused.as_ref().unwrap_err().code, Some(ErrorCode::Working));
+            assert!(super::release_claim_after_result(&refused));
+            let forced = rx_forced.try_recv().unwrap();
+            assert_eq!(
+                forced.as_ref().unwrap_err().code,
+                Some(ErrorCode::LaunchMismatch)
+            );
+            assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(session.input_rev(), before, "late state wrote input");
+        });
     }
 
     #[test]
@@ -1958,6 +3154,237 @@ mod prompt_submission_tests {
         assert_eq!(replaced.code, None);
         let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
         assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn post_paste_failures_carry_pasted_field() {
+        let session = Arc::new(1_u8);
+        let error = enter_verdict(Ok(Arc::new(1)), &session, 7, 7).unwrap_err();
+        let response = muxel_core::control::Response::err(error);
+        assert_eq!(serde_json::to_value(response).unwrap()["pasted"], true);
+
+        // The final #106 contract reports failures after Enter in a successful
+        // receipt. A withheld Enter is still an error with pasted input.
+        let error = enter_verdict(Ok(session.clone()), &session, 7, 8).unwrap_err();
+        let response = muxel_core::control::Response::err(error);
+        assert_eq!(serde_json::to_value(response).unwrap()["pasted"], true);
+    }
+
+    #[test]
+    fn claim_survives_failure_after_enter_admitted() {
+        // A failure after paste and before Enter keeps the shared claim. Once
+        // Enter lands, #106 returns a successful receipt instead of an error.
+        let failure = muxel_core::control::Error::new(ErrorCode::InputChanged, "Enter withheld")
+            .after_paste();
+        assert!(!super::release_claim_after_result(&Err(failure)));
+        let before_paste = muxel_core::control::Error::new(ErrorCode::Working, "busy");
+        assert!(super::release_claim_after_result(&Err(before_paste)));
+        assert!(!super::release_claim_after_result(&Ok(
+            json!({"pasted": true})
+        )));
+    }
+
+    #[test]
+    fn concurrent_local_send_does_not_replace_an_open_claim() {
+        let live = muxel_core::control::Claim {
+            owner: owner_id().to_string(),
+            host: "local".into(),
+            at: now_ms() + 100,
+            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+            nonce: Some(Uuid::new_v4()),
+        };
+        let stored = RefCell::new(Some(live.clone()));
+        let writes = Cell::new(0);
+        let error = claim_agent_with(
+            ClaimAttempt {
+                grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                lead_ms: 400,
+                can_force: true,
+                state: Some(super::AgentState::Idle),
+                activity: &AgentActivity::default(),
+            },
+            || stored.borrow().clone(),
+            |_, claim| {
+                writes.set(writes.get() + 1);
+                *stored.borrow_mut() = Some(claim.clone());
+                true
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::ClaimedElsewhere));
+        assert_eq!(
+            writes.get(),
+            0,
+            "the second send wrote over the first claim"
+        );
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&live));
+
+        // A later local send can follow the predicted Enter after its margin,
+        // while a peer still sees the full shared reply grace.
+        let expired = muxel_core::control::Claim {
+            at: now_ms() - super::LOCAL_CLAIM_PENDING_MS - 1_000,
+            ..live
+        };
+        let peer = muxel_core::control::Claim {
+            owner: "peer".into(),
+            ..expired.clone()
+        };
+        *stored.borrow_mut() = Some(peer.clone());
+        assert!(
+            claim_agent_with(
+                ClaimAttempt {
+                    grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                    lead_ms: 400,
+                    can_force: true,
+                    state: Some(super::AgentState::Idle),
+                    activity: &AgentActivity::default(),
+                },
+                || stored.borrow().clone(),
+                |_, claim| {
+                    writes.set(writes.get() + 1);
+                    *stored.borrow_mut() = Some(claim.clone());
+                    true
+                },
+                |_| {},
+            )
+            .is_err()
+        );
+        assert_eq!(writes.get(), 0);
+        assert_eq!(stored.borrow().as_ref().unwrap().owner, "peer");
+
+        *stored.borrow_mut() = Some(expired.clone());
+        let next = claim_agent_with(
+            ClaimAttempt {
+                grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                lead_ms: 400,
+                can_force: true,
+                state: Some(super::AgentState::Idle),
+                activity: &AgentActivity::default(),
+            },
+            || stored.borrow().clone(),
+            |_, claim| {
+                writes.set(writes.get() + 1);
+                *stored.borrow_mut() = Some(claim.clone());
+                true
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(writes.get(), 0, "the replacement is deferred until paste");
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&expired));
+        assert!(!next.claim.same_turn(&expired));
+        let deferred = next.deferred.unwrap();
+        let published = deferred.published.clone();
+        // A delayed pre-paste refusal leaves the prior nonce in place; the
+        // answer_control cleanup path skips an unpublished deferred claim.
+        let refused = Err(muxel_core::control::Error::new(
+            ErrorCode::Working,
+            "now working",
+        ));
+        assert!(super::release_claim_after_result(&refused));
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&expired));
+
+        assert!(
+            claim_agent_with(
+                ClaimAttempt {
+                    grace_ms: muxel_core::control::ANSWER_GRACE_MS,
+                    lead_ms: 0,
+                    can_force: false,
+                    state: Some(super::AgentState::Idle),
+                    activity: &AgentActivity::default(),
+                },
+                || stored.borrow().clone(),
+                |_, _| panic!("answer keys must not replace a live local claim"),
+                |_| {},
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_claim_inserted_after_an_empty_read_is_not_overwritten() {
+        let peer = muxel_core::control::Claim {
+            owner: "peer".into(),
+            host: "peer-host".into(),
+            at: now_ms(),
+            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+            nonce: Some(Uuid::new_v4()),
+        };
+        let stored = RefCell::new(None);
+        let result = claim_agent_with(
+            ClaimAttempt {
+                grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                lead_ms: 400,
+                can_force: true,
+                state: Some(super::AgentState::Idle),
+                activity: &AgentActivity::default(),
+            },
+            || stored.borrow().clone(),
+            |expected, claim| {
+                assert!(expected.is_none());
+                *stored.borrow_mut() = Some(peer.clone());
+                // The conditional tmux set sees the peer's intervening claim
+                // and takes its false branch.
+                if stored.borrow().is_none() {
+                    *stored.borrow_mut() = Some(claim.clone());
+                }
+                true
+            },
+            |_| {},
+        );
+        assert_eq!(result.unwrap_err().code, Some(ErrorCode::ClaimedElsewhere));
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&peer));
+    }
+
+    #[test]
+    fn forced_claim_waits_for_paste_and_preserves_an_intervening_peer() {
+        let old = muxel_core::control::Claim {
+            owner: "old".into(),
+            host: "old-host".into(),
+            at: now_ms(),
+            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+            nonce: Some(Uuid::new_v4()),
+        };
+        let stored = RefCell::new(Some(old.clone()));
+        let deferred = deferred_claim(Some(&old.encode()), old.grace_ms, 400).unwrap();
+        let published = deferred.published.clone();
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&old));
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+        let peer = muxel_core::control::Claim {
+            owner: "new-peer".into(),
+            nonce: Some(Uuid::new_v4()),
+            ..old.clone()
+        };
+        *stored.borrow_mut() = Some(peer.clone());
+        let write_if = |expected: Option<&str>, claim: &muxel_core::control::Claim| {
+            let current = stored.borrow();
+            let matches = current
+                .as_ref()
+                .and_then(muxel_core::control::Claim::compare_pattern)
+                .as_deref()
+                == expected;
+            drop(current);
+            if matches {
+                *stored.borrow_mut() = Some(claim.clone());
+            }
+            Ok(())
+        };
+        let error = publish_deferred_claim_with(deferred, write_if, || stored.borrow().clone())
+            .unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::ClaimedElsewhere));
+        assert_eq!(error.pasted, Some(true));
+        assert!(stored.borrow().as_ref().unwrap().same_turn(&peer));
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+
+        *stored.borrow_mut() = Some(old.clone());
+        let deferred = deferred_claim(Some(&old.encode()), old.grace_ms, 400).unwrap();
+        let published = deferred.published.clone();
+        publish_deferred_claim_with(deferred, write_if, || stored.borrow().clone()).unwrap();
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!stored.borrow().as_ref().unwrap().same_turn(&old));
+        assert!(deferred_claim(Some("unreadable"), old.grace_ms, 400).is_err());
     }
 
     #[test]
@@ -2068,7 +3495,10 @@ mod prompt_submission_tests {
 
 #[cfg(test)]
 mod runtime_control_tests {
-    use super::{AgentState, AgentStatus, check_send_state, ctl, runtime_control_state};
+    use super::{
+        AgentState, AgentStatus, SendAdmission, check_send_state, ctl, runtime_control_state,
+        turn_has_reply_evidence,
+    };
     use muxel_core::AgentActivity;
     use muxel_terminal::{
         CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
@@ -2077,7 +3507,36 @@ mod runtime_control_tests {
     use std::time::SystemTime;
 
     #[test]
+    fn draft_typed_by_human_refuses_send() {
+        let admission = SendAdmission {
+            state: Some(AgentState::Idle),
+            just_submitted: false,
+            draft_present: true,
+            force: false,
+        };
+        assert_eq!(
+            check_send_state(admission).unwrap_err().code,
+            Some(ctl::ErrorCode::DraftPresent)
+        );
+        assert!(
+            check_send_state(SendAdmission {
+                force: true,
+                ..admission
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
+        let send = |state, force| {
+            check_send_state(SendAdmission {
+                state: Some(state),
+                just_submitted: false,
+                draft_present: false,
+                force,
+            })
+        };
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -2108,7 +3567,7 @@ mod runtime_control_tests {
                 ..cached
             };
             let before = runtime_control_state(runtime, revision);
-            assert!(check_send_state(Some(before), false).is_ok());
+            assert!(send(before, false).is_ok());
             assert_eq!(
                 ctl::wait_outcome(Some(before), false),
                 Some(ctl::WaitOutcome::Finished)
@@ -2118,8 +3577,8 @@ mod runtime_control_tests {
             // even before the runtime event has been processed.
             let state = runtime_control_state(runtime, session.binding_revision());
             assert_eq!(state, AgentState::Working);
-            assert!(check_send_state(Some(state), false).is_err());
-            assert!(check_send_state(Some(state), true).is_ok());
+            assert!(send(state, false).is_err());
+            assert!(send(state, true).is_ok());
             let awaiting = ctl::awaiting_reply(
                 Some(100),
                 ctl::REPLY_GRACE_MS,
@@ -2144,7 +3603,7 @@ mod runtime_control_tests {
                 ..cached
             };
             let state = runtime_control_state(runtime, session.binding_revision());
-            assert!(check_send_state(Some(state), false).is_err());
+            assert!(send(state, false).is_err());
             assert_eq!(ctl::wait_outcome(Some(state), false), None);
         }
         let fresh = TerminalRuntimeSnapshot {
@@ -2153,10 +3612,74 @@ mod runtime_control_tests {
         };
         let state = runtime_control_state(fresh, session.binding_revision());
         assert_eq!(state, AgentState::Done);
-        assert!(check_send_state(Some(state), false).is_ok());
+        assert!(send(state, false).is_ok());
         assert_eq!(
             ctl::wait_outcome(Some(state), false),
             Some(ctl::WaitOutcome::Finished)
         );
+    }
+
+    #[test]
+    fn send_refuses_just_submitted_turn_with_reason() {
+        let turn = super::ControlTurn {
+            prompt: Some("first turn".into()),
+            sent_at: 100,
+            grace_ms: ctl::REPLY_GRACE_MS,
+            startup: None,
+        };
+        let activity = AgentActivity::default();
+        assert!(turn.awaiting_reply(Some(AgentState::Idle), &activity, 101));
+        let error = check_send_state(SendAdmission {
+            state: Some(AgentState::Idle),
+            just_submitted: true,
+            draft_present: false,
+            force: false,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, Some(ctl::ErrorCode::Working));
+        assert_eq!(
+            serde_json::to_value(ctl::Response::err(error)).unwrap()["reason"],
+            "just_submitted"
+        );
+        let working = SendAdmission {
+            state: Some(AgentState::Working),
+            just_submitted: true,
+            draft_present: false,
+            force: false,
+        };
+        assert_eq!(
+            check_send_state(working).unwrap_err().reason.as_deref(),
+            Some("just_submitted")
+        );
+        assert!(
+            check_send_state(SendAdmission {
+                force: true,
+                ..working
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn activity_only_panes_do_not_keep_a_later_send_in_the_grace() {
+        let turn = super::ControlTurn {
+            prompt: Some("first turn".into()),
+            sent_at: 100,
+            grace_ms: ctl::REPLY_GRACE_MS,
+            startup: None,
+        };
+        let activity = AgentActivity::default();
+        let state = Some(AgentState::Idle);
+        assert!(turn.awaiting_reply(state, &activity, 101));
+        assert!(!turn_has_reply_evidence(
+            &turn,
+            Some(TerminalStatusCoverage::ActivityOnly)
+        ));
+        for coverage in [
+            TerminalStatusCoverage::VisibleMarkers,
+            TerminalStatusCoverage::ProviderVisible,
+        ] {
+            assert!(turn_has_reply_evidence(&turn, Some(coverage)));
+        }
     }
 }

@@ -2548,20 +2548,45 @@ pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Opti
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
-/// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(
+/// Number of clients attached to this exact session. A queued automation send
+/// needs this before firing because another client's typing is invisible to
+/// this muxel process. A failed query never counts as quiet.
+pub fn tmux_attached_clients(loc: &RepoLoc, session: &SessionTarget) -> Option<u32> {
+    let out = tmux_at(
+        loc,
+        session,
+        &[
+            "display-message".into(),
+            "-p".into(),
+            "-t".into(),
+            session.name.clone(),
+            "#{session_attached}".into(),
+        ],
+    )?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+        .flatten()
+}
+
+/// Publish a claim through one tmux server command only while its option still
+/// matches the pre-paste observation. A false `if-shell` branch exits cleanly;
+/// the caller reads the option back to learn whether its nonce won.
+pub fn set_tmux_option_if(
     loc: &RepoLoc,
     session: &SessionTarget,
     option: &str,
+    expected_pattern: Option<&str>,
     value: &str,
 ) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(&session.name, option, value);
+    let args = muxel_core::tmux::set_option_if_args(&session.name, option, expected_pattern, value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote conditional tmux claim safely"))?;
     let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
     if !out.status.success() {
         bail!(
-            "tmux set-option failed: {}",
+            "tmux conditional set-option failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
