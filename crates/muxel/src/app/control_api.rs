@@ -269,6 +269,80 @@ fn runtime_control_state(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ControlStatusFields {
+    status: Option<AgentState>,
+    live_status: Option<AgentState>,
+    source: Option<ctl::AgentStatusSource>,
+    blocked_on: Option<ctl::AgentBlockedOn>,
+}
+
+fn control_status_fields(
+    live: Option<AgentState>,
+    runtime: Option<(muxel_terminal::TerminalRuntimeSnapshot, u64)>,
+    instance: Option<&Instance>,
+    restoring: bool,
+) -> ControlStatusFields {
+    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+    let mut fields = ControlStatusFields {
+        status: live,
+        live_status: None,
+        source: None,
+        blocked_on: None,
+    };
+    let Some(live) = live else {
+        return fields;
+    };
+    if matches!(
+        live,
+        AgentState::Starting | AgentState::Exited | AgentState::NotRunning | AgentState::Failed
+    ) {
+        fields.source = Some(ctl::AgentStatusSource::Process);
+        return fields;
+    }
+    let Some((runtime, binding)) = runtime else {
+        fields.source = Some(ctl::AgentStatusSource::Process);
+        return fields;
+    };
+    if !runtime.is_attributable_to(binding) {
+        fields.status = Some(AgentState::Working);
+        fields.source = Some(ctl::AgentStatusSource::Settling);
+        return fields;
+    }
+    let display = match persisted_status(runtime.status, instance, restoring) {
+        AgentStatus::Working => AgentState::Working,
+        AgentStatus::Idle => AgentState::Idle,
+        AgentStatus::Blocked => AgentState::Blocked,
+        AgentStatus::Done => AgentState::Done,
+    };
+    fields.status = Some(display);
+    fields.live_status = (display != live).then_some(live);
+    fields.source = Some(match runtime.reason {
+        TerminalStatusReason::ProcessExit => ctl::AgentStatusSource::Process,
+        TerminalStatusReason::ProgramStatus(_) | TerminalStatusReason::ProgramStatusError => {
+            ctl::AgentStatusSource::Program
+        }
+        TerminalStatusReason::ProviderHook => ctl::AgentStatusSource::Hook,
+        TerminalStatusReason::ProviderTitle => ctl::AgentStatusSource::Title,
+        TerminalStatusReason::ProviderScreen
+        | TerminalStatusReason::BlockedMarker
+        | TerminalStatusReason::WorkingMarker => ctl::AgentStatusSource::Screen,
+        TerminalStatusReason::Bell => ctl::AgentStatusSource::Bell,
+        TerminalStatusReason::RecentOutput => ctl::AgentStatusSource::Output,
+        TerminalStatusReason::Quiet => ctl::AgentStatusSource::Quiet,
+    });
+    if display == AgentState::Blocked
+        && let TerminalStatusReason::ProgramStatus(Some(kind)) = runtime.reason
+    {
+        fields.blocked_on = Some(match kind {
+            ProgramStatusKind::Permission => ctl::AgentBlockedOn::Permission,
+            ProgramStatusKind::Question => ctl::AgentBlockedOn::Question,
+            ProgramStatusKind::Auth => ctl::AgentBlockedOn::Auth,
+        });
+    }
+    fields
+}
+
 fn check_send_state(state: Option<AgentState>, force: bool) -> CtlResult<()> {
     if !force {
         match state {
@@ -954,7 +1028,32 @@ impl MuxelApp {
         cx: &App,
     ) -> AgentInfo {
         let project = self.workspace.project(inst.project_id);
-        let status = self.control_state(inst, cx);
+        let live = self.control_state(inst, cx);
+        let runtime = self.terminals.get(&inst.id).map(|view| {
+            let view = view.read(cx);
+            (
+                view.runtime_snapshot(),
+                view.session().binding_revision(),
+                view.runtime_activity().map(str::to_owned),
+            )
+        });
+        let fields = control_status_fields(
+            live,
+            runtime
+                .as_ref()
+                .map(|(snapshot, binding, _)| (*snapshot, *binding)),
+            Some(inst),
+            self.restoring_activity.contains(&inst.id),
+        );
+        let activity = if matches!(
+            live,
+            Some(AgentState::Working | AgentState::Blocked | AgentState::Idle | AgentState::Done)
+        ) && fields.source != Some(ctl::AgentStatusSource::Settling)
+        {
+            runtime.and_then(|(_, _, activity)| activity)
+        } else {
+            None
+        };
         let preset = inst
             .preset_id
             .and_then(|id| self.presets.iter().find(|p| p.id == id))
@@ -982,10 +1081,14 @@ impl MuxelApp {
             model: ctl::flag_value(&inst.args, &model_flag),
             is_agent: inst.kind == InstanceKind::Terminal
                 && readaloud::is_agent_program(inst.program.as_deref()),
-            status,
+            status: fields.status,
+            live_status: fields.live_status,
+            source: fields.source,
+            activity,
+            blocked_on: fields.blocked_on,
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
-                status,
+                live,
                 self.terminals
                     .get(&inst.id)
                     .map(|view| view.read(cx).session().id),
@@ -993,7 +1096,7 @@ impl MuxelApp {
             awaiting_reply: self
                 .control_turns
                 .get(&inst.id)
-                .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+                .is_some_and(|turn| turn.awaiting_reply(live, &inst.activity, now)),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
@@ -1802,7 +1905,7 @@ fn claim_agent(
 /// `show`'s `controller`: which muxel last typed into the agent through `muxel
 /// ctl`, and whether that turn is still open as far as this muxel can see.
 fn controller_value(claim: &ctl::Claim, shown: &Value, activity: &AgentActivity) -> Value {
-    let state: Option<AgentState> = serde_json::from_value(shown["agent"]["status"].clone()).ok();
+    let state = ctl::reported_live_state(&shown["agent"]);
     json!({
         "host": claim.host,
         "at": claim.at,
@@ -1844,7 +1947,7 @@ fn show_value(
         .map(|text| (text, "transcript"))
         .or_else(|| readaloud::prompt_from_screen(&screen).map(|text| (text, "screen")))
         .or_else(|| sent.map(|text| (text, "muxel")));
-    let question = (info.status == Some(AgentState::Blocked))
+    let question = (info.live_state() == Some(AgentState::Blocked))
         .then(|| ctl::pending_question(visible))
         .flatten();
     json!({
@@ -2063,6 +2166,218 @@ mod prompt_submission_tests {
             assert_eq!(stopped["submission_confirmed"], json!(false));
             assert_eq!(stopped["unconfirmed_reason"], json!(code));
         }
+    }
+}
+
+#[cfg(test)]
+mod status_provenance_tests {
+    use super::{
+        AgentState, AgentStatus, check_send_state, control_status_fields, ctl,
+        runtime_control_state,
+    };
+    use muxel_core::{AgentActivityState, AgentPreset, Instance};
+    use muxel_terminal::{
+        ProgramStatusKind, TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+    };
+    use uuid::Uuid;
+
+    fn sample(status: AgentStatus, reason: TerminalStatusReason) -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            status,
+            attributable: true,
+            reason,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            launch_id: Uuid::new_v4(),
+            binding_rev: 1,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+            completion_revision: 0,
+        }
+    }
+
+    fn completed_instance() -> Instance {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance
+            .activity
+            .observe(None, AgentActivityState::Working, 100);
+        instance.activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200,
+        );
+        instance
+    }
+
+    #[test]
+    fn ctl_status_reports_program_source_under_psp() {
+        let runtime = sample(
+            AgentStatus::Working,
+            TerminalStatusReason::ProgramStatus(None),
+        );
+        let fields =
+            control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false);
+        assert_eq!(fields.status, Some(AgentState::Working));
+        assert_eq!(fields.source, Some(ctl::AgentStatusSource::Program));
+    }
+
+    #[test]
+    fn unattributable_status_reports_settling_and_stays_working() {
+        let instance = completed_instance();
+        for (attributable, current_binding) in [(false, 1), (true, 2)] {
+            let runtime = TerminalRuntimeSnapshot {
+                attributable,
+                ..sample(AgentStatus::Done, TerminalStatusReason::ProviderTitle)
+            };
+            let live = runtime_control_state(runtime, current_binding);
+            let fields = control_status_fields(
+                Some(live),
+                Some((runtime, current_binding)),
+                Some(&instance),
+                true,
+            );
+            assert_eq!(fields.status, Some(AgentState::Working));
+            assert_eq!(fields.source, Some(ctl::AgentStatusSource::Settling));
+            assert_eq!(fields.blocked_on, None);
+            assert!(check_send_state(Some(live), false).is_err());
+            assert_eq!(ctl::wait_outcome(Some(live), false), None);
+        }
+    }
+
+    #[test]
+    fn blocked_on_comes_from_psp_kind() {
+        for (kind, blocked_on) in [
+            (
+                ProgramStatusKind::Permission,
+                ctl::AgentBlockedOn::Permission,
+            ),
+            (ProgramStatusKind::Question, ctl::AgentBlockedOn::Question),
+            (ProgramStatusKind::Auth, ctl::AgentBlockedOn::Auth),
+        ] {
+            let runtime = sample(
+                AgentStatus::Blocked,
+                TerminalStatusReason::ProgramStatus(Some(kind)),
+            );
+            let fields =
+                control_status_fields(Some(AgentState::Blocked), Some((runtime, 1)), None, false);
+            assert_eq!(fields.blocked_on, Some(blocked_on));
+        }
+    }
+
+    #[test]
+    fn ctl_status_holds_done_over_idle_until_attended() {
+        let mut instance = completed_instance();
+        let runtime = sample(AgentStatus::Idle, TerminalStatusReason::Quiet);
+        let fields = control_status_fields(
+            Some(AgentState::Idle),
+            Some((runtime, 1)),
+            Some(&instance),
+            false,
+        );
+        assert_eq!(fields.status, Some(AgentState::Done));
+        assert_eq!(fields.live_status, Some(AgentState::Idle));
+        instance.activity.attend(300);
+        // Upstream preserves lifecycle Done after attendance too; unread is separate.
+        let attended = control_status_fields(
+            Some(AgentState::Idle),
+            Some((runtime, 1)),
+            Some(&instance),
+            false,
+        );
+        assert_eq!(attended.status, Some(AgentState::Done));
+    }
+
+    #[test]
+    fn send_to_held_done_pane_still_goes_through() {
+        let instance = completed_instance();
+        assert_eq!(
+            super::persisted_status(AgentStatus::Idle, Some(&instance), false),
+            AgentStatus::Done
+        );
+        let runtime = sample(AgentStatus::Idle, TerminalStatusReason::Quiet);
+        let live = runtime_control_state(runtime, 1);
+        assert_eq!(live, AgentState::Idle);
+        assert!(check_send_state(Some(live), false).is_ok());
+        assert_eq!(
+            ctl::wait_outcome(Some(live), false),
+            Some(ctl::WaitOutcome::Finished)
+        );
+    }
+
+    #[test]
+    fn a_restored_done_badge_cannot_finish_wait_while_live_facts_are_working() {
+        let instance = completed_instance();
+        let runtime = sample(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
+        let fields = control_status_fields(
+            Some(AgentState::Working),
+            Some((runtime, 1)),
+            Some(&instance),
+            true,
+        );
+        assert_eq!(fields.status, Some(AgentState::Done));
+        assert_eq!(fields.live_status, Some(AgentState::Working));
+        let response =
+            serde_json::json!({"status": fields.status, "live_status": fields.live_status});
+        let live = ctl::reported_live_state(&response);
+        assert_eq!(ctl::wait_outcome(live, false), None);
+        assert!(check_send_state(live, false).is_err());
+    }
+
+    #[test]
+    fn sources_and_kinds_keep_their_wire_contract() {
+        for (reason, source) in [
+            (TerminalStatusReason::ProcessExit, "process"),
+            (TerminalStatusReason::ProgramStatus(None), "program"),
+            (TerminalStatusReason::ProgramStatusError, "program"),
+            (TerminalStatusReason::ProviderHook, "hook"),
+            (TerminalStatusReason::ProviderTitle, "title"),
+            (TerminalStatusReason::ProviderScreen, "screen"),
+            (TerminalStatusReason::BlockedMarker, "screen"),
+            (TerminalStatusReason::WorkingMarker, "screen"),
+            (TerminalStatusReason::Bell, "bell"),
+            (TerminalStatusReason::RecentOutput, "output"),
+            (TerminalStatusReason::Quiet, "quiet"),
+        ] {
+            let runtime = sample(AgentStatus::Working, reason);
+            let fields =
+                control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false);
+            assert_eq!(
+                serde_json::to_value(fields.source).unwrap(),
+                serde_json::json!(source)
+            );
+        }
+        let runtime = sample(
+            AgentStatus::Working,
+            TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Permission)),
+        );
+        assert_eq!(
+            control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false)
+                .blocked_on,
+            None
+        );
+        assert_eq!(control_status_fields(None, None, None, false).source, None);
+    }
+
+    #[test]
+    fn wait_state_is_backward_compatible_and_rejects_a_malformed_live_value() {
+        for response in [
+            serde_json::json!({"status": "done"}),
+            serde_json::json!({"status": "done", "live_status": null}),
+            serde_json::json!({"status": "done", "live_status": "idle"}),
+        ] {
+            assert_eq!(
+                ctl::wait_outcome(ctl::reported_live_state(&response), false),
+                Some(ctl::WaitOutcome::Finished)
+            );
+        }
+        let working = serde_json::json!({"status": "done", "live_status": "working"});
+        assert_eq!(
+            ctl::wait_outcome(ctl::reported_live_state(&working), false),
+            None
+        );
+        let malformed = serde_json::json!({"status": "done", "live_status": "unknown"});
+        assert_eq!(ctl::reported_live_state(&malformed), None);
     }
 }
 

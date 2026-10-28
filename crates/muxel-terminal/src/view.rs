@@ -258,6 +258,10 @@ struct RuntimeStatusState {
     blocked_marker: bool,
     provider_screen: Option<AgentStatus>,
     composer_present: bool,
+    activity: Option<Arc<str>>,
+    program_activity: Option<Arc<str>>,
+    title_activity: Option<Arc<str>>,
+    screen_activity: Option<Arc<str>>,
     prev_raw: Option<AgentStatus>,
     done_latch: bool,
     completion_armed: bool,
@@ -301,6 +305,10 @@ impl RuntimeStatusState {
             blocked_marker: false,
             provider_screen: None,
             composer_present: false,
+            activity: None,
+            program_activity: None,
+            title_activity: None,
+            screen_activity: None,
             prev_raw: None,
             done_latch: false,
             completion_armed: false,
@@ -339,6 +347,14 @@ impl RuntimeStatusState {
         }
     }
 
+    fn activity(&self, session: &TerminalSession) -> Option<&str> {
+        if self.binding_rev == session.binding_revision() && self.attributable {
+            self.activity.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Reconcile parser evidence and visible state; the view schedules the returned deadline.
     fn reconcile(
         &mut self,
@@ -355,6 +371,9 @@ impl RuntimeStatusState {
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
         let program_root = (!exited).then_some(program_status.root.as_ref()).flatten();
+        let previous_activity = self.activity.clone();
+        let program_metadata_changed =
+            binding_changed || program_status.revision != self.program_status_revision;
         let program_status_cleared = program_status.clear_revision > self.program_status_revision;
         let program_status_changed_source =
             program_root.is_some() != self.program_status_active || program_status_cleared;
@@ -376,6 +395,10 @@ impl RuntimeStatusState {
             self.working_marker = false;
             self.blocked_marker = false;
             self.provider_screen = None;
+            self.activity = None;
+            self.program_activity = None;
+            self.title_activity = None;
+            self.screen_activity = None;
             self.program_explicit_completions = 0;
             self.program_idle_completions = 0;
             self.completion_revision = 0;
@@ -389,6 +412,9 @@ impl RuntimeStatusState {
             // advanced (listener title bump or `provider_switched`), in order
             // with any bell the new binding has rung since; one read inside a
             // switch window never rang.
+        }
+        if program_metadata_changed || exited {
+            self.program_activity = program_root.and_then(program_activity);
         }
         if program_status_changed_source {
             // A fallback title/screen Working edge cannot complete a new PSP
@@ -456,6 +482,15 @@ impl RuntimeStatusState {
             }
         }
         let fresh_title = observed_title.filter(|_| !settling);
+        if title_overflowed {
+            self.title_activity = None;
+        }
+        if evidence.title_fresh && !settling {
+            self.title_activity = parse_agent_title(title_provider, title_text.as_deref())
+                .and_then(|frame| frame.activity)
+                .and_then(clean_activity)
+                .map(Arc::from);
+        }
         self.provider_settled =
             provider_settled_after_title(self.provider_settled, fresh_title, submitted_turn);
         if let Some(status) = fresh_title {
@@ -497,6 +532,11 @@ impl RuntimeStatusState {
                 self.blocked_marker =
                     status_marker_matches(title_provider, blocked_markers, &screen);
                 self.provider_screen = provider_screen_status(title_provider, &screen);
+                self.screen_activity = (title_provider == TitleProvider::Claude)
+                    .then(|| claude_live_activity(&screen))
+                    .flatten()
+                    .and_then(clean_activity)
+                    .map(Arc::from);
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
             StatusScreenCapture::None if !has_visible_sources => {
@@ -507,6 +547,7 @@ impl RuntimeStatusState {
                 self.blocked_marker = false;
                 self.provider_screen = None;
                 self.composer_present = false;
+                self.screen_activity = None;
             }
             StatusScreenCapture::None => {}
         }
@@ -767,7 +808,28 @@ impl RuntimeStatusState {
         } else {
             self.fallback_coverage
         };
+        if exited {
+            self.title_activity = None;
+            self.screen_activity = None;
+        }
+        self.activity = if !attributable || exited {
+            None
+        } else {
+            self.program_activity.clone().or_else(|| {
+                matches!(status, AgentStatus::Working | AgentStatus::Blocked)
+                    .then(|| {
+                        self.title_activity.clone().or_else(|| {
+                            (!self.screen_held)
+                                .then(|| self.screen_activity.clone())
+                                .flatten()
+                        })
+                    })
+                    .flatten()
+            })
+        };
+        let activity_changed = self.activity != previous_activity;
         let public_changed = status != self.status
+            || activity_changed
             || reason != self.reason
             || coverage != self.coverage
             || attributable != self.attributable
@@ -793,6 +855,37 @@ impl RuntimeStatusState {
             );
         }
         (public_changed, next_deadline)
+    }
+}
+
+fn clean_activity(text: &str) -> Option<String> {
+    let mut cleaned: String = text
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'))
+        .take(200)
+        .collect();
+    cleaned.truncate(cleaned.trim_end().len());
+    let leading = cleaned.len() - cleaned.trim_start().len();
+    cleaned.drain(..leading);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn program_activity(root: &RootStatus) -> Option<Arc<str>> {
+    let message = root.msg.as_deref().and_then(clean_activity);
+    match (message, root.progress) {
+        (None, None) => None,
+        (Some(message), None) => Some(Arc::from(message)),
+        (None, Some(progress)) => Some(Arc::from(format!("{progress}%"))),
+        (Some(mut message), Some(progress)) => {
+            let suffix = format!(" · {progress}%");
+            let limit = 200 - suffix.chars().count();
+            if let Some((boundary, _)) = message.char_indices().nth(limit) {
+                message.truncate(boundary);
+            }
+            message.truncate(message.trim_end().len());
+            message.push_str(&suffix);
+            Some(Arc::from(message))
+        }
     }
 }
 
@@ -826,9 +919,10 @@ enum TitleProvider {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentTitleFrame {
+struct AgentTitleFrame<'a> {
     status: Option<AgentStatus>,
     name: Option<String>,
+    activity: Option<&'a str>,
 }
 
 impl TitleProvider {
@@ -863,7 +957,7 @@ impl TitleProvider {
 /// Parse one provider-owned title frame into independent lifecycle and naming
 /// observations. Unknown titles produce neither: every process sharing the PTY
 /// can emit OSC titles, and those events carry no process identity.
-fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<AgentTitleFrame> {
+fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<AgentTitleFrame<'_>> {
     let title = title?.trim();
     match provider {
         TitleProvider::Claude => {
@@ -886,6 +980,7 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             Some(AgentTitleFrame {
                 status: Some(status),
                 name: (!name.is_empty()).then_some(name),
+                activity: None,
             })
         }
         TitleProvider::Codex => {
@@ -903,6 +998,7 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
                     return Some(AgentTitleFrame {
                         status: Some(AgentStatus::Blocked),
                         name,
+                        activity: None,
                     });
                 }
             }
@@ -917,6 +1013,10 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             Some(AgentTitleFrame {
                 status: Some(codex_title_state(state)?),
                 name: Some(name.to_string()),
+                activity: state
+                    .split_once('·')
+                    .map(|(_, activity)| activity.trim())
+                    .filter(|activity| !activity.is_empty()),
             })
         }
         TitleProvider::Grok => {
@@ -955,6 +1055,12 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             Some(AgentTitleFrame {
                 status,
                 name: (!name.is_empty()).then_some(name),
+                activity: match name_start {
+                    3 => payload.get(2).copied(),
+                    2 => payload.get(1).copied(),
+                    _ => None,
+                }
+                .filter(|activity| !activity.is_empty()),
             })
         }
         TitleProvider::Muse => {
@@ -966,6 +1072,7 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             (!name.is_empty() && !name.contains(['/', '\\', ':'])).then(|| AgentTitleFrame {
                 status: None,
                 name: Some(name.to_string()),
+                activity: None,
             })
         }
         TitleProvider::Other => None,
@@ -1250,6 +1357,18 @@ fn is_grok_question(screen: &str) -> bool {
             })
             .count()
             >= 2
+}
+
+fn claude_live_activity(screen: &str) -> Option<&str> {
+    for line in screen.lines().rev() {
+        if is_claude_live_foreground_row(line) {
+            return Some(line.trim());
+        }
+        if is_claude_completed_foreground_row(line) {
+            return None;
+        }
+    }
+    None
 }
 
 fn claude_screen_has_current_work(screen: &str) -> bool {
@@ -3660,6 +3779,11 @@ impl TerminalView {
 
     pub fn runtime_snapshot(&self) -> TerminalRuntimeSnapshot {
         self.runtime.snapshot(&self.session)
+    }
+
+    /// Cached, bounded activity for the current binding; reading never parses output.
+    pub fn runtime_activity(&self) -> Option<&str> {
+        self.runtime.activity(&self.session)
     }
 
     /// Pure immutable projection used by render/sidebar callers.
@@ -6633,6 +6757,278 @@ mod provider_switch_tests {
         TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
     }
 
+    mod status_provenance_tests {
+        use super::{
+            AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider, fixture,
+        };
+        use crate::view::{clean_activity, program_activity};
+        use base64::Engine as _;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn psp_msg_and_progress_surface_as_activity() {
+            let (session, _receiver) = fixture();
+            session.test_program_status(
+                b"\x1b]7501;state=working:msg=UmVhZGluZyBmaWxlcw==:progress=42\x07",
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let now = Instant::now();
+            runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, now);
+            assert_eq!(runtime.activity(&session), Some("Reading files · 42%"));
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                now + Duration::from_secs(30),
+            );
+            assert_eq!(runtime.activity(&session), Some("Reading files · 42%"));
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            session.kill();
+        }
+
+        #[test]
+        fn codex_title_activity_surfaces_without_psp() {
+            let (session, _receiver) = fixture();
+            session.process_output("\x1b]0;Review changes | working · Read source\x07".as_bytes());
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.activity(&session), Some("Read source"));
+            session.kill();
+        }
+
+        #[test]
+        fn claude_live_row_surfaces_as_activity() {
+            let (session, _receiver) = fixture();
+            session.process_output(
+                "\x1b[2J\x1b[H✻ Reading files… (12s · ↑ 3.1k tokens)\r\n".as_bytes(),
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(
+                runtime.activity(&session),
+                Some("✻ Reading files… (12s · ↑ 3.1k tokens)")
+            );
+            session.kill();
+        }
+
+        #[test]
+        fn activity_strips_control_characters_and_caps_length() {
+            let text = format!("\0Read\x1b\n{}", "🦀".repeat(220));
+            let cleaned = clean_activity(&text).unwrap();
+            assert!(!cleaned.chars().any(char::is_control));
+            assert!(cleaned.chars().count() <= 200);
+            assert!(cleaned.starts_with("Read"));
+        }
+
+        #[test]
+        fn activity_metadata_is_scoped_and_never_completes_a_turn() {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let now = Instant::now();
+            session.process_output("\x1b]0;Review changes | working · Read source\x07".as_bytes());
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+            assert_eq!(runtime.activity(&session), Some("Read source"));
+            let report = |state: &str, msg: &str| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(msg);
+                session.test_program_status(
+                    format!("\x1b]7501;state={state}:msg={encoded}\x07").as_bytes(),
+                );
+            };
+            report("working", "Program activity");
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+            assert_eq!(runtime.activity(&session), Some("Program activity"));
+            let before = runtime.snapshot(&session);
+            report("working", "New detail");
+            let (changed, _) =
+                runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+            assert!(changed);
+            assert_eq!(runtime.activity(&session), Some("New detail"));
+            let after = runtime.snapshot(&session);
+            assert!(after.snapshot_seq > before.snapshot_seq);
+            assert_eq!(after.completion_revision, before.completion_revision);
+            report("idle", "Still current");
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+            assert_eq!(runtime.activity(&session), Some("Still current"));
+            session.test_program_status(b"\x1b]7501;state=clear\x07");
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+            assert_eq!(runtime.activity(&session), Some("Read source"));
+            let hook = std::time::SystemTime::now();
+            session.provider_switched(hook, hook);
+            assert_eq!(
+                runtime.activity(&session),
+                None,
+                "queued reconciliation cannot expose old activity"
+            );
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_secs(6),
+            );
+            assert_eq!(
+                runtime.activity(&session),
+                None,
+                "an unchanged old title must not resurrect activity"
+            );
+            report("working", "Current binding");
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_secs(6),
+            );
+            assert_eq!(
+                runtime.activity(&session),
+                None,
+                "a report inside the switch allowance is still ambiguous"
+            );
+            let msg = base64::engine::general_purpose::STANDARD.encode("Current binding");
+            let wire = format!("\x1b]7501;state=working:msg={msg}\x07");
+            session.process_drained(&super::drained(&[(
+                &wire,
+                hook + crate::listener::SWITCH_SLACK + Duration::from_millis(100),
+            )]));
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_secs(6),
+            );
+            assert_eq!(runtime.activity(&session), Some("Current binding"));
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                true,
+                now + Duration::from_secs(6),
+            );
+            assert_eq!(runtime.activity(&session), None);
+            session.kill();
+        }
+
+        #[test]
+        fn grok_activity_requires_its_current_busy_title() {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            for (title, activity) in [
+                ("⠋ - Reading files… - Topic - grok", Some("Reading files…")),
+                (
+                    "⚠ Action Required - ⠋ - Choosing a route… - Topic - grok",
+                    Some("Choosing a route…"),
+                ),
+                ("Topic - grok", None),
+            ] {
+                session.process_output(format!("\x1b]0;{title}\x07").as_bytes());
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Grok,
+                    &[],
+                    &[],
+                    false,
+                    Instant::now(),
+                );
+                assert_eq!(runtime.activity(&session), activity);
+            }
+            session.kill();
+        }
+
+        #[test]
+        fn progress_keeps_its_suffix_with_bounded_unicode_activity() {
+            let root = crate::program_status::RootStatus {
+                state: crate::program_status::ProgramState::Working,
+                kind: None,
+                title: None,
+                msg: Some(std::sync::Arc::from("🦀".repeat(220))),
+                progress: Some(100),
+            };
+            let activity = program_activity(&root).unwrap();
+            assert!(activity.chars().count() <= 200);
+            assert!(activity.ends_with(" · 100%"));
+            let progress_only = crate::program_status::RootStatus {
+                msg: None,
+                progress: Some(0),
+                ..root
+            };
+            assert_eq!(program_activity(&progress_only).as_deref(), Some("0%"));
+        }
+
+        #[test]
+        fn a_completed_claude_row_retires_the_older_live_activity() {
+            let (session, _receiver) = fixture();
+            session.process_output("\x1b[2J\x1b[H\x1b]0;◐ Topic\x07✻ Reading files… (12s · ↑ 3.1k tokens)\r\n✻ Cooked for 12s · done 12:34 PM\r\n".as_bytes());
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.status, AgentStatus::Working);
+            assert_eq!(runtime.activity(&session), None);
+            session.kill();
+        }
+
+        #[test]
+        fn composer_quoted_live_activity_is_excluded() {
+            let actual_row = "✻ Reading output… (2s · ↑ 7 tokens)";
+            for outside in [false, true] {
+                let (session, _receiver) = fixture();
+                let first = if outside {
+                    actual_row
+                } else {
+                    "Previous output"
+                };
+                let text = format!(
+                    "{first}\n────────────\n❯ Quoted row:\n  ✻ Reading files… (12s · ↑ 3.1k tokens)\n────────────\n? for shortcuts"
+                );
+                session.process_output(
+                    format!(
+                        "\x1b[2J\x1b[H\x1b]0;◐ Current topic\x07\x1b[?2004h{}\x1b[4;5H\x1b[?25h",
+                        text.replace('\n', "\r\n"),
+                    )
+                    .as_bytes(),
+                );
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &[],
+                    &[],
+                    false,
+                    Instant::now(),
+                );
+                assert_eq!(runtime.status, AgentStatus::Working);
+                assert_eq!(runtime.activity(&session), outside.then_some(actual_row));
+                session.kill();
+            }
+        }
+    }
+
     mod program_name_tests {
         use super::{
             AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider, fixture,
@@ -6850,6 +7246,8 @@ mod provider_switch_tests {
                 state: crate::program_status::ProgramState::Blocked,
                 kind: Some(crate::program_status::ProgramStatusKind::Permission),
                 title: None,
+                msg: None,
+                progress: None,
             })
         );
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

@@ -470,6 +470,8 @@ pub(crate) struct RootStatus {
     pub state: ProgramState,
     pub kind: Option<ProgramStatusKind>,
     pub title: Option<Arc<str>>,
+    pub msg: Option<Arc<str>>,
+    pub progress: Option<u8>,
 }
 
 /// The exact UUID-shaped title field accepted by #91. Codex also publishes
@@ -579,6 +581,8 @@ impl ProgramStatusSnapshot {
             state: report.state,
             kind: report.kind,
             title: report.title.map(Arc::from),
+            msg: report.msg.map(Arc::from),
+            progress: report.progress,
         });
     }
 

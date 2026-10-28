@@ -339,6 +339,29 @@ pub enum AgentState {
     Failed,
 }
 
+/// The current evidence behind a terminal's reported lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusSource {
+    Process,
+    Program,
+    Hook,
+    Title,
+    Screen,
+    Bell,
+    Output,
+    Quiet,
+    Settling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBlockedOn {
+    Permission,
+    Question,
+    Auth,
+}
+
 /// One pane's entry in `panes` / `status`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -357,9 +380,19 @@ pub struct AgentInfo {
     pub model: Option<String>,
     /// A coding agent rather than a shell (or an editor/browser pane).
     pub is_agent: bool,
-    /// `None` for editors and browsers.
+    /// The sidebar's lifecycle badge; `None` for editors and browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentState>,
+    /// Live facts used for control decisions when `status` holds a sidebar badge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AgentStatusSource>,
+    /// Bounded, single-line activity supplied by the current provider binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<AgentBlockedOn>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -390,6 +423,23 @@ pub struct AgentInfo {
     pub cwd: Option<String>,
     /// Runs on a remote host over SSH.
     pub remote: bool,
+}
+
+impl AgentInfo {
+    /// State used by control decisions, independent of a retained sidebar badge.
+    pub fn live_state(&self) -> Option<AgentState> {
+        self.live_status.or(self.status)
+    }
+}
+
+/// Functional state from a status/show entry, including replies from older hosts.
+/// A present but malformed live state must not fall back to a finished badge.
+pub fn reported_live_state(info: &serde_json::Value) -> Option<AgentState> {
+    let state = info
+        .get("live_status")
+        .filter(|state| !state.is_null())
+        .or_else(|| info.get("status"))?;
+    serde_json::from_value(state.clone()).ok()
 }
 
 /// An instance's short id, as tmux session names and `muxel ctl` show it.
@@ -1474,7 +1524,17 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   Remote projects are currently refused.
   `new` opens terminal panes; browser presets, including a browser default, are
   not supported yet and receive a refusal.
-- `muxel ctl status [AGENT]` - one agent's status, or every agent's.
+- `muxel ctl status [AGENT]` - one agent's status, or every agent's. Terminal
+  entries in `status`, `panes` and `show.agent` include `source`, optional
+  current `activity`, and `blocked_on` (`permission`, `question`, or `auth`)
+  when a program report identifies why it is blocked. `source` describes the
+  current status evidence: `program`, `hook`, `title`, `screen`, `bell`,
+  `output`, `quiet`, or `process`. `settling` means the evidence cannot yet be
+  attributed to this conversation; its status stays `working`.
+  `status` matches the sidebar, including a completed turn held over Idle.
+  When that badge differs from live facts, `live_status` carries the state used
+  by `wait` and send admission. Attending a completed pane marks its notification
+  read without erasing Done. `activity` is absent when no current source supplies it.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
   blocked, the `question` it's asking with its numbered `options`. `controller`
@@ -1857,6 +1917,10 @@ mod tests {
             model: None,
             is_agent: true,
             status: Some(AgentState::NotRunning),
+            live_status: None,
+            source: None,
+            activity: None,
+            blocked_on: None,
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
@@ -1869,10 +1933,23 @@ mod tests {
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("launch_id").is_none(), "{json}");
+        for key in ["source", "activity", "blocked_on", "live_status"] {
+            assert!(json.get(key).is_none(), "{json}");
+        }
         info.status = Some(AgentState::Idle);
         info.launch_id = Some(id(42));
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["launch_id"], id(42).to_string());
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+        info.status = Some(AgentState::Blocked);
+        info.live_status = None;
+        info.source = Some(super::AgentStatusSource::Program);
+        info.activity = Some("Reading files · 42%".into());
+        info.blocked_on = Some(super::AgentBlockedOn::Question);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["source"], "program");
+        assert_eq!(json["blocked_on"], "question");
+        assert_eq!(json["activity"], "Reading files · 42%");
         assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
     }
 

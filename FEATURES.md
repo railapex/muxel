@@ -412,6 +412,12 @@ feature is added or changed, update the matching entry here in the same change**
   continue using that fallback because tmux does not forward OSC 7501 reports.
   While a Claude root is current, its glyph-less title can name the pane without
   supplying lifecycle status; a title in the root report takes precedence.
+- **Status details** — `ctl status`, `panes`, and `show` report the sidebar's
+  lifecycle badge, its current evidence source, available provider activity,
+  and the reason for a blocked program report. The sidebar row shows activity
+  in its tooltip. Program messages and percentages take precedence over title
+  and screen activity. Binding switches and exits clear old activity. A retained
+  Done badge does not change the live facts used for sending or waiting.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. Screen checks exclude Claude and Codex
