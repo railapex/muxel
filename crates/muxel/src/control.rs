@@ -15,8 +15,8 @@
 
 use anyhow::{Context as _, Result};
 use muxel_core::control::{
-    self, AgentState, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Request,
-    Response, WaitOutcome,
+    self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Request, Response,
+    WaitOutcome,
 };
 use serde_json::{Value, json};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -591,7 +591,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
         if let Some(uuid) = info["uuid"].as_str() {
             target = uuid.to_string();
         }
-        let state: Option<AgentState> = serde_json::from_value(info["status"].clone()).ok();
+        let state = control::reported_live_state(&info);
         if state.is_none() {
             return Err(format!("'{agent}' is not a terminal pane").into());
         }
