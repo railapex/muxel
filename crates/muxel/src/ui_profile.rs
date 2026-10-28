@@ -78,6 +78,7 @@ pub(crate) enum SessionLookupOutcome {
     Resume,
     Fresh,
     NoResume,
+    Failed,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +100,7 @@ fn session_lookup_line(record: SessionLookupRecord) -> String {
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Claude) => "claude",
         Some(SessionProvider::Grok) => "grok",
+        Some(SessionProvider::Muse) => "muse",
         None => "other",
     };
     let outcome = match record.outcome {
@@ -107,6 +109,7 @@ fn session_lookup_line(record: SessionLookupRecord) -> String {
         SessionLookupOutcome::Resume => "resume",
         SessionLookupOutcome::Fresh => "fresh",
         SessionLookupOutcome::NoResume => "no-resume",
+        SessionLookupOutcome::Failed => "failed",
     };
     format!(
         "ui-session-lookup[v1] kind={kind} provider={provider} pane={} elapsed_us={} outcome={outcome}",

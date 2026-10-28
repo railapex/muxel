@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod codex_sessions;
+pub use codex_sessions::{
+    CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_latest_sessions,
+    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
+};
+
+#[cfg(test)]
+mod codex_lookup_tests;
+
 /// What a preset opens: a terminal agent or a web-browser pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PresetKind {
@@ -31,6 +40,8 @@ pub enum InjectionMode {
     CliFlag { flag: String },
     /// Type it into the terminal and press Enter shortly after the agent starts.
     TypeIn,
+    /// Add context through Muse's SessionStart hook, without a user turn.
+    SessionHook,
 }
 
 /// An environment variable applied to an agent's process.
@@ -208,7 +219,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::CliFlag {
@@ -428,7 +439,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--config=model_reasoning_effort={}".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::TypeIn,
@@ -456,15 +467,13 @@ impl AgentPreset {
             effort_flag: Some("--reasoning-effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
-            // No verified hidden instruction transport; never type into a live prompt.
-            injection: InjectionMode::None,
+            injection: InjectionMode::SessionHook,
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
-            // Muse can resume by id, but muxel does not capture its session id.
             session_id_flag: None,
-            resume_flag: None,
+            resume_flag: Some("resume".to_string()),
         }
     }
 
@@ -501,7 +510,16 @@ impl AgentPreset {
             presets.push(Self::cmd());
             presets.push(Self::git_bash());
         }
-        presets.extend([
+        presets.extend(Self::builtin_agents());
+        presets.push(Self::browser());
+        presets
+    }
+
+    /// The built-in agent presets: every default terminal preset that runs an
+    /// agent rather than a shell. Their programs are the agent providers muxel
+    /// knows (see [`is_known_agent_program`]).
+    pub fn builtin_agents() -> [AgentPreset; 10] {
+        [
             Self::claude(),
             Self::opencode(),
             Self::amp(),
@@ -512,33 +530,100 @@ impl AgentPreset {
             Self::ollama(),
             Self::ollama_code(),
             Self::pi(),
-            Self::browser(),
-        ]);
-        presets
+        ]
     }
 
-    /// Compose the full argument list: `model_flag model`, then
-    /// `effort_flag effort`, then the extra args. Pairs are skipped unless both
-    /// the flag and the value are set (and non-empty).
+    /// Compose model, effort, then extra args. A flag containing `{}` emits one
+    /// argument with the value substituted; otherwise it emits flag then value.
     pub fn compose_args(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if let (Some(flag), Some(model)) = (
-            &self.model_flag,
-            self.model.as_ref().filter(|m| !m.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(model.clone());
-        }
-        if let (Some(flag), Some(effort)) = (
-            &self.effort_flag,
-            self.effort.as_ref().filter(|e| !e.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(effort.clone());
+        for (flag, value) in [
+            (&self.model_flag, &self.model),
+            (&self.effort_flag, &self.effort),
+        ] {
+            if let (Some(flag), Some(value)) = (
+                flag.as_ref().filter(|flag| !flag.trim().is_empty()),
+                value.as_ref().filter(|value| !value.is_empty()),
+            ) {
+                if flag.contains("{}") {
+                    out.push(flag.replace("{}", value));
+                } else {
+                    out.push(flag.clone());
+                    out.push(value.clone());
+                }
+            }
         }
         out.extend(self.args.iter().cloned());
         out
     }
+
+    /// Muse presets saved by v18 predate capture support. Detect the capability
+    /// without replaying settings migrations or rewriting users' presets.
+    pub fn effective_resume_flag(&self) -> Option<&str> {
+        self.resume_flag
+            .as_deref()
+            .or_else(|| crate::muse::is_program(self.program.as_deref()).then_some("resume"))
+    }
+}
+
+/// Whether `program` runs one of muxel's built-in agent providers — the program
+/// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
+/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
+/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
+/// user preset runs it.
+pub fn is_known_agent_program(program: Option<&str>) -> bool {
+    fn stem(program: &str) -> Option<String> {
+        let program = program.trim();
+        let leaf = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+        (!stem.is_empty()).then(|| stem.to_string())
+    }
+    let Some(name) = program.and_then(stem) else {
+        return false;
+    };
+    AgentPreset::builtin_agents()
+        .iter()
+        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .any(|known| known == name)
+}
+
+/// Whether launching `program` runs a known agent provider
+/// ([`is_known_agent_program`]) from a place its caller can't choose: an
+/// absolute path, or a bare name that `path` (a `PATH` value) resolves through
+/// absolute entries only. A relative path, or a relative or empty `PATH` entry
+/// reached before the match, resolves against a working directory — for
+/// outside creation, the caller's `--cwd` — so it doesn't count. `found` says
+/// whether a launchable file is at a candidate path (with Windows' extensions).
+pub fn launches_known_agent(
+    program: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+    found: impl Fn(&Path) -> bool,
+) -> bool {
+    let Some(program) = program.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    if !is_known_agent_program(Some(program)) {
+        return false;
+    }
+    if program.contains(['/', '\\']) {
+        return Path::new(program).is_absolute();
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            return false;
+        }
+        if found(&dir.join(program)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Concrete launch parameters resolved from an instance.
@@ -549,6 +634,8 @@ pub struct ResolvedLaunch {
     pub args: Vec<String>,
     /// Text to type into the terminal once the agent is ready (TypeIn injection).
     pub startup_input: Option<String>,
+    /// Invocation-only context supplied by a provider SessionStart hook.
+    pub session_context: Option<String>,
     /// Number of Shift+Tab presses to send before typing (runner "auto mode").
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input`.
@@ -569,22 +656,52 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 /// submitting it again on process restart mutates the resumed transcript. CLI
 /// flags remain launch configuration and may need to be applied on every process.
 pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> ResolvedLaunch {
+    if instance.literal_argv {
+        return ResolvedLaunch {
+            program: instance.program.clone(),
+            args: instance.args.clone(),
+            startup_input: None,
+            session_context: None,
+            auto_mode_presses: 0,
+            submit: false,
+            env: instance
+                .env
+                .iter()
+                .map(|e| (e.key.clone(), e.value.clone()))
+                .collect(),
+        };
+    }
     let mut args = instance.args.clone();
     let mut startup_input = None;
+    let mut session_context = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
-        match &instance.injection {
-            InjectionMode::CliFlag { flag } => {
-                args.push(flag.clone());
-                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        if instance.control_prompt {
+            if !resuming && instance.auto_submit {
+                startup_input = Some(prompt.clone());
             }
-            InjectionMode::TypeIn if !resuming => {
-                // A raw newline is Enter in TUIs without bracketed-paste mode.
-                // Keep the instruction bundle to one startup turn everywhere.
-                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        } else {
+            match &instance.injection {
+                InjectionMode::CliFlag { flag } => {
+                    args.push(flag.clone());
+                    args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn if !resuming => {
+                    // A raw newline is Enter in TUIs without bracketed-paste mode.
+                    // Keep the instruction bundle to one startup turn everywhere.
+                    // Consumed ctl tasks leave no text, including automatically
+                    // assembled instructions, in a later conversation's input.
+                    startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn => {}
+                InjectionMode::None => {}
+                InjectionMode::SessionHook
+                    if crate::muse::is_program(instance.program.as_deref()) =>
+                {
+                    session_context = Some(prompt.clone());
+                }
+                InjectionMode::SessionHook => {}
             }
-            InjectionMode::TypeIn => {}
-            InjectionMode::None => {}
         }
     }
 
@@ -593,12 +710,14 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         args.push(codex_terminal_title_override().to_string());
     }
 
+    let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
     ResolvedLaunch {
         program: instance.program.clone(),
         args,
         startup_input,
+        session_context,
         auto_mode_presses: instance.auto_mode_presses,
-        submit: instance.auto_submit,
+        submit,
         env: instance
             .env
             .iter()
@@ -621,7 +740,15 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
 /// avoids a flush race for host-minted agents. When a session was genuinely
 /// deleted, the caller probes the disk and restarts cleanly.
 pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
-    let resume_flag = preset.resume_flag.as_deref()?;
+    if instance.literal_argv {
+        return None;
+    }
+    if crate::muse::is_program(instance.program.as_deref())
+        && instance.args.iter().any(|arg| arg == "--no-session-log")
+    {
+        return None;
+    }
+    let resume_flag = preset.effective_resume_flag()?;
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
         return Some(vec![resume_flag.to_string(), id.to_string()]);
@@ -764,52 +891,6 @@ pub fn claude_session_cwd(transcript: &Path) -> std::io::Result<Option<PathBuf>>
     Ok(latest)
 }
 
-/// Whether a Codex rollout filename under `~/.codex/sessions` carries
-/// `session_id`. Used to decide if a stored id is still resumable before
-/// `codex resume <id>` without opening rollout contents on the activation path.
-pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
-    let Ok(session_id) = Uuid::parse_str(session_id) else {
-        return false;
-    };
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return false;
-    }
-    let plain_suffix = format!("-{}.jsonl", session_id.hyphenated());
-    let compressed_suffix = format!("-{}.jsonl.zst", session_id.hyphenated());
-    walk_jsonl(&root, &mut |path| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(&plain_suffix) || name.ends_with(&compressed_suffix))
-    })
-}
-
-/// Whether Codex has an exact rollout whose session id and recorded cwd both
-/// match this pane. Used when a later provider-owned terminal title reports an
-/// in-process `/resume` switch: existence alone is not enough when sibling panes
-/// share one directory.
-pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> bool {
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return false;
-    }
-    walk_jsonl(&root, &mut |path| {
-        // Current Codex rollout filenames carry the exact session UUID. Filter
-        // before opening anything so a stale/forged title cannot make the UI
-        // reread every rollout file on every lifecycle tick.
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(session_id))
-        {
-            return false;
-        }
-        codex_session_meta(path).is_some_and(|(id, recorded_cwd)| {
-            id == session_id && paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-        })
-    })
-}
-
 /// Latest saved display name for each Codex session id.
 ///
 /// Codex appends an entry to `~/.codex/session_index.jsonl` when `/rename`
@@ -819,29 +900,9 @@ pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> b
 pub fn codex_session_names(
     home: &Path,
 ) -> std::io::Result<std::collections::HashMap<String, String>> {
-    use std::io::{BufRead, BufReader};
-
-    let mut names = std::collections::HashMap::new();
-    let path = home.join(".codex").join("session_index.jsonl");
-    let file = std::fs::File::open(path)?;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(name) = value
-            .get("thread_name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        else {
-            continue;
-        };
-        names.insert(id.to_string(), name.to_string());
-    }
-    Ok(names)
+    let mut index = CodexSessionNames::default();
+    index.refresh(home)?;
+    Ok(index.into_names())
 }
 
 /// The Codex-owned thread field from a semantic terminal title.
@@ -895,44 +956,7 @@ pub(crate) fn is_codex_thread_id_hint(value: &str) -> bool {
 /// matching recorded cwd exists. This preserves pane identity without trusting
 /// arbitrary OSC title text or a newest-file heuristic.
 pub fn codex_session_id_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<String> {
-    if !is_codex_thread_id_hint(hint) {
-        return None;
-    }
-    let prefix = hint.strip_suffix("...").unwrap_or(hint);
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return None;
-    }
-
-    let mut matched = None;
-    let mut ambiguous = false;
-    walk_jsonl(&root, &mut |path| {
-        // Filter by filename before opening rollouts. Codex rollout filenames
-        // carry the full UUID, including for compressed history files.
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(prefix))
-        {
-            return false;
-        }
-        let Some((id, recorded_cwd)) = codex_session_meta(path) else {
-            return false;
-        };
-        if !id.starts_with(prefix)
-            || Uuid::parse_str(&id).is_err()
-            || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-        {
-            return false;
-        }
-        if matched.as_deref().is_some_and(|current| current != id) {
-            ambiguous = true;
-        } else {
-            matched = Some(id);
-        }
-        false
-    });
-    (!ambiguous).then_some(matched).flatten()
+    codex_session_from_hint(home, hint, cwd).map(|session| session.id)
 }
 
 fn is_codex_title_state(state: &str) -> bool {
@@ -971,48 +995,52 @@ fn is_codex_title_state(state: &str) -> bool {
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
-/// This is a legacy recovery path for a pane that was already started before exact
-/// title binding existed but has no saved session id. New and already-bound panes
-/// use their exact captured id and never replace it with this cwd heuristic.
+/// Explicit Import uses this history search in the background. Restore instead
+/// uses the bounded, ownership-aware [`codex_latest_sessions`] on a worker, and
+/// only for a started pane that has no saved id.
 pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
         return None;
     }
-    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut rollouts = Vec::new();
+    let mut unknown_time = false;
     walk_jsonl(&root, &mut |path| {
         let Ok(meta) = std::fs::metadata(path) else {
-            return false;
+            unknown_time = true;
+            return true;
         };
         let Ok(mtime) = meta.modified() else {
-            return false;
+            unknown_time = true;
+            return true;
         };
-        let Some((id, session_cwd)) = codex_session_meta(path) else {
-            return false;
-        };
-        if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
-            return false;
-        }
-        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
-            best = Some((mtime, id));
-        }
+        rollouts.push((mtime, codex_sessions::filename_id(path), path.to_path_buf()));
         false // scan every rollout to find the newest
-    });
-    best.map(|(_, id)| id)
+    })?;
+    if unknown_time {
+        return None;
+    }
+    codex_sessions::newest_matches(rollouts.into_iter(), cwd, 1, &mut || false)?
+        .into_iter()
+        .next()
+        .map(|session| session.id)
 }
 
 /// Walk Codex rollout files (`*.jsonl` and compressed `*.jsonl.zst`) under `dir`,
-/// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
-/// existence checks); returns whether the walk was stopped.
-fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
+/// calling `visit` on each. `visit` returns `true` to stop the walk early;
+/// returns whether the walk was stopped, or `None` if any
+/// directory or entry could not be read.
+fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> Option<bool> {
+    #[cfg(test)]
+    codex_lookup_tests::record_directory(dir);
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
         let path = entry.path();
-        if path.is_dir() {
-            if walk_jsonl(&path, visit) {
-                return true;
+        let file_type = entry.file_type().ok()?;
+        if file_type.is_dir() {
+            if walk_jsonl(&path, visit)? {
+                return Some(true);
             }
         } else if path
             .file_name()
@@ -1020,32 +1048,58 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
             .is_some_and(|n| n.ends_with(".jsonl") || n.ends_with(".jsonl.zst"))
             && visit(&path)
         {
-            return true;
+            return Some(true);
         }
     }
-    false
+    Some(false)
 }
 
-/// First `session_meta` line in a Codex rollout → `(session_id, cwd)`.
-fn codex_session_meta(path: &Path) -> Option<(String, String)> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path).ok()?;
+/// First top-level `session_meta` line → `(thread id, cwd)`. Only a confirmed
+/// subagent is `Ok(None)`; unreadable or incomplete metadata remains unresolved.
+fn codex_session_meta(path: &Path) -> std::io::Result<Option<(String, String)>> {
+    use std::io::{self, BufRead, BufReader};
+    let invalid_meta = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unresolved Codex session metadata",
+        )
+    };
+    #[cfg(test)]
+    codex_lookup_tests::record_open(path);
+    let file = std::fs::File::open(path)?;
     for line in BufReader::new(file).lines().take(8) {
-        let line = line.ok()?;
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if v.get("type")?.as_str()? != "session_meta" {
+        let line = line?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
             continue;
         }
-        let payload = v.get("payload")?;
+        let payload = v.get("payload").ok_or_else(invalid_meta)?;
+        // A subagent shares its parent's session_id but owns a different thread.
+        // Neither its thread nor its parent's id describes this terminal pane.
+        if payload
+            .get("parent_thread_id")
+            .is_some_and(|parent| !parent.is_null())
+            || payload.get("source").is_some_and(|source| {
+                source.as_str() == Some("subagent") || source.get("subagent").is_some()
+            })
+        {
+            return Ok(None);
+        }
         let id = payload
-            .get("session_id")
-            .or_else(|| payload.get("id"))?
-            .as_str()?
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
             .to_string();
-        let cwd = payload.get("cwd")?.as_str()?.to_string();
-        return Some((id, cwd));
+        let cwd = payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
+            .to_string();
+        return Ok(Some((id, cwd)));
     }
-    None
+    Err(invalid_meta())
 }
 
 pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
@@ -1318,6 +1372,89 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[test]
+    fn known_agents_are_the_builtin_agent_programs_by_basename() {
+        for program in [
+            "claude",
+            "codex",
+            "grok",
+            "opencode",
+            "amp",
+            "muse",
+            "hermes",
+            "ollama",
+            "pi",
+            "/usr/local/bin/codex",
+            r"C:\Users\me\AppData\Roaming\npm\Claude.EXE",
+            "  GROK  ",
+        ] {
+            assert!(is_known_agent_program(Some(program)), "{program}");
+        }
+        for program in [
+            None,
+            Some(""),
+            Some("ssh"),
+            Some("wsl.exe"),
+            Some("python3"),
+            Some("node"),
+            Some("bash"),
+            Some("cmd.exe"),
+            Some("pwsh"),
+            Some("claude-wrapper"),
+            Some("codex.cmd"),
+            Some("/opt/codex/"),
+        ] {
+            assert!(!is_known_agent_program(program), "{program:?}");
+        }
+        // Only a location the caller can't choose counts: an absolute path, or
+        // a bare name found through absolute PATH entries.
+        let root = if cfg!(windows) {
+            r"C:\tools"
+        } else {
+            "/usr/local/bin"
+        };
+        let elsewhere = if cfg!(windows) {
+            r"C:\other"
+        } else {
+            "/opt/other"
+        };
+        let path = |dirs: &[&str]| std::env::join_paths(dirs).unwrap();
+        let installed = |candidate: &Path| candidate.starts_with(root);
+        let absolute = Path::new(root).join("claude");
+        for (program, dirs, expected) in [
+            (absolute.to_str().unwrap(), vec![], true),
+            ("claude", vec![elsewhere, root], true),
+            ("claude", vec![elsewhere], false),
+            ("claude", vec![".", root], false),
+            ("claude", vec!["node_modules/.bin", root], false),
+            ("claude", vec!["", root], false),
+            ("claude", vec![root, "."], true),
+            ("./node_modules/.bin/claude", vec![root], false),
+            ("bin/claude", vec![root], false),
+            ("ssh", vec![root], false),
+        ] {
+            let dirs = path(&dirs);
+            assert_eq!(
+                launches_known_agent(Some(program), Some(dirs.as_os_str()), installed),
+                expected,
+                "{program} via {dirs:?}"
+            );
+        }
+        assert!(!launches_known_agent(Some("claude"), None, installed));
+        assert!(!launches_known_agent(
+            None,
+            Some(path(&[root]).as_os_str()),
+            installed
+        ));
+
+        // The list is the seeded built-ins, not a second copy of them.
+        let defaults = AgentPreset::defaults();
+        for agent in AgentPreset::builtin_agents() {
+            assert!(defaults.iter().any(|preset| preset.name == agent.name));
+            assert!(crate::readaloud::is_agent_program(agent.program.as_deref()));
+        }
+    }
+
     fn instance(preset: &AgentPreset, prompt: Option<&str>) -> Instance {
         let mut i = Instance::from_preset(Uuid::new_v4(), preset);
         i.system_prompt = prompt.map(|p| p.to_string());
@@ -1440,8 +1577,106 @@ mod tests {
             ["--model", "configured-model", "--reasoning-effort", "high"]
         );
         assert_eq!(launch.startup_input, None);
-        assert_eq!(preset.injection, InjectionMode::None);
+        assert_eq!(preset.injection, InjectionMode::SessionHook);
+        assert_eq!(
+            launch.session_context.as_deref(),
+            Some("Project instructions\nwith details")
+        );
         assert_eq!(session_resume_args(&preset, &inst), None);
+    }
+
+    #[test]
+    fn muse_resume_uses_bound_id_and_preserves_overrides() {
+        let mut preset = AgentPreset::muse();
+        preset.model = Some("configured-model".into());
+        preset.effort = Some("medium".into());
+        preset.args = vec!["--worktree".into(), "off".into()];
+        let mut pane = instance(&preset, Some("launch context"));
+        assert_eq!(session_resume_args(&preset, &pane), None);
+        pane.session_id = Some("01a14039-60e8-7532-9187-0cd6f75f15a0".into());
+        pane.session_started = true;
+        let mut args = session_resume_args(&preset, &pane).unwrap();
+        let launch = resolve_launch_for_session(&pane, true);
+        args.extend(launch.args);
+        assert_eq!(
+            args,
+            [
+                "resume",
+                "01a14039-60e8-7532-9187-0cd6f75f15a0",
+                "--model",
+                "configured-model",
+                "--reasoning-effort",
+                "medium",
+                "--worktree",
+                "off"
+            ]
+        );
+        assert!(launch.startup_input.is_none());
+        preset.resume_flag = None;
+        assert!(session_resume_args(&preset, &pane).is_some());
+        pane.args.push("--no-session-log".into());
+        assert!(session_resume_args(&preset, &pane).is_none());
+    }
+
+    #[test]
+    fn muse_full_launch_places_hook_config_before_a_preserved_positional_tail() {
+        let sid = "01a14039-60e8-7532-9187-0cd6f75f15a0";
+        let config = "managed_hooks_path=\"C:/Muxel data/hooks.json\"";
+        for resuming in [false, true] {
+            for positional in [false, true] {
+                let mut preset = AgentPreset::muse();
+                preset.model = Some("configured-model".into());
+                preset.effort = Some("medium".into());
+                preset.args = if positional {
+                    ["--", "preserved prompt", "--literal-tail", "-chooks={}"]
+                        .map(str::to_string)
+                        .to_vec()
+                } else {
+                    ["--worktree", "off"].map(str::to_string).to_vec()
+                };
+                let mut pane = instance(&preset, None);
+                pane.session_id = Some(sid.into());
+                pane.session_started = resuming;
+                let launch = resolve_launch_for_session(&pane, resuming);
+                let mut args = session_resume_args(&preset, &pane).unwrap_or_default();
+                args.extend(launch.args);
+                crate::muse::insert_hook_config(&mut args, config.into());
+                let mut expected = if resuming {
+                    vec!["resume".to_string(), sid.into()]
+                } else {
+                    Vec::new()
+                };
+                expected.extend(
+                    [
+                        "--model",
+                        "configured-model",
+                        "--reasoning-effort",
+                        "medium",
+                    ]
+                    .map(str::to_string),
+                );
+                if positional {
+                    expected.extend(
+                        [
+                            "--config",
+                            config,
+                            "--",
+                            "preserved prompt",
+                            "--literal-tail",
+                            "-chooks={}",
+                        ]
+                        .map(str::to_string),
+                    );
+                } else {
+                    expected.extend(["--worktree", "off", "--config", config].map(str::to_string));
+                }
+                assert_eq!(
+                    args, expected,
+                    "resuming={resuming}, positional={positional}"
+                );
+                assert!(launch.startup_input.is_none());
+            }
+        }
     }
 
     #[test]
@@ -1699,59 +1934,20 @@ mod tests {
             codex_latest_session_id(&tmp, &cwd).as_deref(),
             Some("id-new")
         );
-        assert!(codex_session_matches_cwd(&tmp, "id-new", &cwd));
-        assert!(!codex_session_matches_cwd(
-            &tmp,
-            "id-new",
-            &tmp.join("other")
-        ));
-        assert!(!codex_session_matches_cwd(&tmp, "missing", &cwd));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn codex_session_exists_uses_filename_only() {
-        use std::io::Write;
-
-        let tmp = std::env::temp_dir().join(format!("muxel-codex-exists-{}", Uuid::new_v4()));
-        let day = tmp.join(".codex/sessions/2026/09/04");
-        std::fs::create_dir_all(&day).unwrap();
-        let present_id = Uuid::new_v4().to_string();
-        let compressed_id = Uuid::new_v4().to_string();
-        let content_only_id = Uuid::new_v4().to_string();
-        let path = day.join(format!("rollout-2026-09-04T00-00-00-{present_id}.jsonl"));
-        let mut f = std::fs::File::create(path).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"session_meta","payload":{{"session_id":"{content_only_id}","cwd":"ignored"}}}}"#
-        )
-        .unwrap();
-        std::fs::write(
-            day.join(format!(
-                "rollout-2026-09-04T00-00-01-{compressed_id}.jsonl.zst"
-            )),
-            "contents need not be readable as a rollout",
-        )
-        .unwrap();
-
-        assert!(codex_session_exists(&tmp, &present_id));
-        assert!(codex_session_exists(&tmp, &compressed_id.to_uppercase()));
-        assert!(!codex_session_exists(&tmp, &content_only_id));
-        assert!(!codex_session_exists(&tmp, "not-a-session-uuid"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn truncated_codex_hint_resolves_one_matching_cwd_and_rejects_ambiguity() {
         let tmp = std::env::temp_dir().join(format!("muxel-codex-hint-{}", Uuid::new_v4()));
-        let day = tmp.join(".codex/sessions/2026/09/28");
+        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let second = "019f95d7-db31-7db0-904d-9e08330e0001";
+        let day = codex_sessions::directories(&tmp, first)[0].clone();
         let cwd = tmp.join("project");
         let other = tmp.join("other");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
-        let second = "019f95d7-db31-7db0-904d-9e08330e0001";
         let hint = format!("{}...", &first[..29]);
         let write_rollout = |id: &str, recorded_cwd: &Path| {
             let meta = serde_json::json!({
@@ -2059,7 +2255,7 @@ mod tests {
 
     #[test]
     fn compose_args_skips_unset_model_and_effort() {
-        // Claude has a model_flag but no model set, and no effort_flag.
+        // Configured flags without values add no arguments.
         assert!(AgentPreset::claude().compose_args().is_empty());
     }
 
