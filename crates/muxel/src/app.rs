@@ -67,6 +67,11 @@ mod libraries_ui;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+mod recoverable_close;
+#[cfg(all(test, windows))]
+mod recoverable_close_tests;
+mod recoverable_close_ui;
+mod recoverable_layout;
 #[cfg(all(test, windows))]
 mod remote_reconnect_tests;
 #[cfg(all(test, windows))]
@@ -77,7 +82,8 @@ mod tmux_install_modal;
 mod upkeep;
 
 use popout_lifecycle::loop_heartbeat;
-use restart_guard::{PendingRestarts, RemoteRestartCompletion};
+use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
+use restart_guard::{PendingRestarts, RemoteRestartCompletion, RestartLease};
 
 /// Capture tmux eligibility before removing a pane's metadata. An absent
 /// recorded name still permits the legacy remote-name fallback; a literal pane
@@ -2843,7 +2849,7 @@ pub fn register_actions(cx: &mut App) {
                         this.kill_checked_tmux_sessions();
                     }
                     this.confirm_quit = true;
-                    cx.quit();
+                    this.quit_after_closes(cx);
                 } else {
                     this.quit_kill_tmux_local = false;
                     this.quit_kill_tmux_remote = false;
@@ -2909,6 +2915,7 @@ actions!(
         SplitRight,
         SplitDown,
         ClosePane,
+        UndoClose,
         FocusNext,
         FocusPrev,
         ZoomIn,
@@ -2985,6 +2992,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "SplitRight" => KeyBinding::new(keystroke, SplitRight, context),
         "SplitDown" => KeyBinding::new(keystroke, SplitDown, context),
         "ClosePane" => KeyBinding::new(keystroke, ClosePane, context),
+        "UndoClose" => KeyBinding::new(keystroke, UndoClose, context),
         "FocusNext" => KeyBinding::new(keystroke, FocusNext, context),
         "FocusPrev" => KeyBinding::new(keystroke, FocusPrev, context),
         "ZoomIn" => KeyBinding::new(keystroke, ZoomIn, context),
@@ -4650,6 +4658,16 @@ fn wake_report(relaunched: usize) -> String {
     }
 }
 
+/// A delayed input belongs to one launch and one uninterrupted admission epoch.
+/// Holding then undoing preserves the launch but permanently retires this token.
+struct TerminalInputAdmission {
+    iid: Uuid,
+    session: std::sync::Weak<TerminalSession>,
+    epoch: u64,
+}
+
+type WakeTarget = (Uuid, Uuid, Option<TerminalInputAdmission>);
+
 /// State of a speech-to-text dictation (drives the mic button + recording pill).
 #[derive(Clone, Default, PartialEq)]
 enum SttState {
@@ -4961,6 +4979,15 @@ type SessionResume = (Vec<String>, Option<PathBuf>);
 type PreparedTerminalSpawn = (TerminalSpawnMeta, CommandSpec, (u16, u16));
 
 pub struct MuxelApp {
+    closing: HashMap<Uuid, HeldClose>,
+    close_groups: Vec<CloseGroup>,
+    close_requests: HashMap<Uuid, Uuid>,
+    close_client_counts: HashMap<Uuid, ClientCount>,
+    show_close_list: bool,
+    preserve_close_worktrees: bool,
+    close_tmux_kills: Vec<Task<()>>,
+    close_departure: Option<CloseDeparture>,
+    close_departure_task: Option<Task<()>>,
     workspace: Workspace,
     /// Live terminals, keyed by instance id.
     terminals: HashMap<Uuid, Entity<TerminalView>>,
@@ -5683,13 +5710,11 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
 }
 
 /// Root view for a popped-out pane window: a title bar (with a Dock button)
-/// plus the pane content. The title-bar X asks for confirmation, then closes the
-/// window, which the main app observes (`on_window_closed`) and tears the pane
-/// down. The Dock button re-docks it into the main panes first.
+/// plus the pane content. The title-bar X and native close hook route through
+/// the main app's recoverable-close rule. The Dock button re-docks it directly.
 struct PopoutView {
     view: PaneView,
     iid: Uuid,
-    show_close_confirm: bool,
     /// Profiler-only correlation state. Keeping it on the root that owns the
     /// pane prevents a popped-out terminal from affecting main-app lifecycle
     /// bookkeeping or suppressing the first transition after re-dock.
@@ -5699,6 +5724,22 @@ struct PopoutView {
 
 impl PopoutView {
     fn new(view: PaneView, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        if let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .and_then(|handle| handle.0.upgrade())
+        {
+            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+            let weak = app.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    if let Some(app) = weak.upgrade() {
+                        app.update(cx, |app, cx| app.request_close_instance(iid, cx));
+                    }
+                });
+                false
+            });
+        }
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
         let profile_status = if ui_profile::is_enabled() {
             match &view {
@@ -5752,7 +5793,6 @@ impl PopoutView {
         Self {
             view,
             iid,
-            show_close_confirm: false,
             profile_status,
             profile_window_active,
         }
@@ -5776,16 +5816,6 @@ impl PopoutView {
             PaneView::Terminal(v) => terminal_pane_element(v, false, cx),
             PaneView::Editor(v) => v.clone().into_any_element(),
             PaneView::Browser(v) => v.clone().into_any_element(),
-        }
-    }
-
-    /// Heading + body for the close confirmation, which differs per pane kind
-    /// (only a terminal is actually terminated).
-    fn close_confirm_copy(&self) -> (&'static str, &'static str) {
-        match &self.view {
-            PaneView::Terminal(_) => ("Close terminal?", "This terminal will be terminated."),
-            PaneView::Editor(_) => ("Close editor?", "Unsaved changes will be lost."),
-            PaneView::Browser(_) => ("Close browser?", "This browser pane will be closed."),
         }
     }
 }
@@ -5925,13 +5955,10 @@ enum ConfirmAction {
     DeleteLoop(usize),
     DeleteRemote(usize),
     DeleteIdentity(usize),
-    CloseInstance(Uuid),
-    /// Close every other tab in the pane holding this instance (keeps it).
-    CloseOtherTabs(Uuid),
-    /// Close the tabs to one side of `anchor` (keeps it).
-    CloseTabsSide {
-        anchor: Uuid,
-        right: bool,
+    CloseBatch(Vec<Uuid>),
+    SaveEditorBeforeClose {
+        iid: Uuid,
+        rest: Vec<Uuid>,
     },
     /// Switch the project's git branch (warned — it touches the working tree).
     SwitchBranch {
@@ -5978,8 +6005,8 @@ impl ConfirmAction {
     /// git-panel, host-key dialogs) is main-window chrome and stays there.
     fn pane_instance(&self) -> Option<Uuid> {
         match self {
-            Self::CloseInstance(iid) | Self::CloseOtherTabs(iid) => Some(*iid),
-            Self::CloseTabsSide { anchor, .. } => Some(*anchor),
+            Self::CloseBatch(ids) => ids.first().copied(),
+            Self::SaveEditorBeforeClose { iid, .. } => Some(*iid),
             _ => None,
         }
     }
@@ -6085,6 +6112,7 @@ enum SshRetry {
 }
 
 /// State for the confirmation modal (title/message + the pending action).
+#[derive(Clone)]
 struct PendingConfirm {
     title: SharedString,
     message: SharedString,
@@ -6135,6 +6163,8 @@ enum PasswordAction {
 /// (uncommitted changes and/or unmerged commits), awaiting a Commit / Merge /
 /// Discard / Keep decision (shown in the dispose modal).
 struct WorktreeDispose {
+    close_after: Vec<Uuid>,
+    close_rest: Vec<Uuid>,
     wid: Uuid,
     name: String,
     color: u8,
@@ -6282,11 +6312,12 @@ impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
+        let has_close_confirm = self.central_close_confirm(cx).is_some();
         // A native webview child draws above all gpui content, so it has to go
         // away while the close confirmation sits on top of it.
         if let PaneView::Browser(v) = &self.view {
-            let (v, visible) = (v.clone(), !self.show_close_confirm);
-            let overlay = self.show_close_confirm;
+            let (v, visible) = (v.clone(), !has_close_confirm);
+            let overlay = has_close_confirm;
             v.update(cx, |b, cx| {
                 b.set_native_visible(visible, true, true, overlay, cx)
             });
@@ -6298,6 +6329,14 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
+                if let Some(app) = cx
+                    .try_global::<MuxelHandle>()
+                    .and_then(|handle| handle.0.upgrade())
+                {
+                    app.update(cx, |app, cx| app.undo_latest_close(window, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
                 if let PaneView::Terminal(v) = &this.view {
                     v.read(cx).session().write_user_input(b"\t");
@@ -6319,8 +6358,15 @@ impl Render for PopoutView {
                 // The mouse-down on the title-content row below claims the press.
                 TitleBar::new()
                     .on_close_window(cx.listener(|this, _ev, _window, cx| {
-                        this.show_close_confirm = true;
-                        cx.notify();
+                        let iid = this.iid;
+                        if let Some(app) = cx
+                            .try_global::<MuxelHandle>()
+                            .and_then(|handle| handle.0.upgrade())
+                        {
+                            cx.defer(move |cx| {
+                                app.update(cx, |app, cx| app.request_close_instance(iid, cx));
+                            });
+                        }
                     }))
                     .child(
                         div()
@@ -6371,64 +6417,7 @@ impl Render for PopoutView {
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.content(cx)))
-            .children(self.show_close_confirm.then(|| {
-                modal_backdrop()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev, _w, cx| {
-                            this.show_close_confirm = false;
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .w(px(340.0))
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .p_5()
-                            .bg(cx.theme().background)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .rounded(cx.theme().radius_lg)
-                            .shadow_lg()
-                            .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .child(t(self.close_confirm_copy().0)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(t(self.close_confirm_copy().1)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .gap_2()
-                                    .pt_2()
-                                    .child(
-                                        Button::new("popout-close-cancel")
-                                            .ghost()
-                                            .label(t("Cancel"))
-                                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                                this.show_close_confirm = false;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("popout-close-ok")
-                                            .danger()
-                                            .label(t("Close"))
-                                            .on_click(|_e, window, _cx| window.remove_window()),
-                                    ),
-                            ),
-                    )
-            }));
+            .children(self.render_central_close_confirm(cx));
         ui_profile::finish_render(ui_profile::RenderView::Popout, _render, root)
     }
 }
@@ -7381,6 +7370,15 @@ impl MuxelApp {
         let workspaces = muxel_store::migrate_to_workspaces();
 
         let mut this = Self {
+            closing: HashMap::new(),
+            close_groups: Vec::new(),
+            close_requests: HashMap::new(),
+            close_client_counts: HashMap::new(),
+            show_close_list: false,
+            preserve_close_worktrees: false,
+            close_tmux_kills: Vec::new(),
+            close_departure: None,
+            close_departure_task: None,
             workspace: Workspace::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
@@ -7611,14 +7609,22 @@ impl MuxelApp {
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
         // hands tmux's exit policy back so it exits with its last session.
-        cx.on_app_quit(|this, _cx| {
+        cx.on_app_quit(|this, cx| {
+            this.finalize_all_closes(cx);
             this.persist();
+            this.close_departure = None;
+            this.close_departure_task = None;
+            let kills = std::mem::take(&mut this.close_tmux_kills);
             // Stop serving `muxel ctl` and withdraw its endpoint file.
             this.control = None;
             if cfg!(unix) {
                 integrations::restore_tmux_exit_empty();
             }
-            async {}
+            async move {
+                for kill in kills {
+                    kill.await;
+                }
+            }
         })
         .detach();
 
@@ -7658,7 +7664,8 @@ impl MuxelApp {
                 .map(|app| {
                     app.update(cx, |this, cx| {
                         if this.confirm_quit {
-                            return true;
+                            this.quit_after_closes(cx);
+                            return false;
                         }
                         // Minimize-to-tray: iconify and keep running (the tray is
                         // the way back) instead of prompting to quit.
@@ -7878,8 +7885,9 @@ impl MuxelApp {
     fn claim_remote_window_sizes(&mut self, cx: &mut Context<Self>) {
         let Some(present_at) = self
             .terminals
-            .values()
-            .filter_map(|view| view.read(cx).session().last_user_input())
+            .iter()
+            .filter(|(iid, _)| !self.is_closing(**iid))
+            .filter_map(|(_, view)| view.read(cx).session().last_user_input())
             .max()
         else {
             return;
@@ -7887,6 +7895,7 @@ impl MuxelApp {
         let due: Vec<Uuid> = self
             .terminals
             .iter()
+            .filter(|(iid, _)| !self.is_closing(**iid))
             .filter(|(iid, view)| {
                 let session = view.read(cx).session();
                 !self.size_claimed.contains(iid)
@@ -8653,6 +8662,9 @@ impl MuxelApp {
     }
 
     fn launch_permitted(&self, iid: Uuid, reason: muxel_core::TerminalLaunchReason) -> bool {
+        if self.is_closing(iid) {
+            return false;
+        }
         self.workspace.instance(iid).is_some_and(|i| {
             i.permits_launch(reason)
                 && (!i.literal_argv
@@ -9109,6 +9121,7 @@ impl MuxelApp {
         // launch past its admission deadline still owns its pane and installs.
         if !launch_token_current(&self.terminal_launching, instance_id, token)
             || self.workspace.instance(instance_id).is_none()
+            || self.is_closing(instance_id)
         {
             release_launch_token(&mut self.terminal_launching, instance_id, token);
             return;
@@ -9270,6 +9283,15 @@ impl MuxelApp {
             let origin = Arc::downgrade(view.read(cx).session());
             let app = cx.weak_entity();
             let handler: muxel_terminal::LocalPasteHandler = Arc::new(move |paste, cx: &App| {
+                let Some(session) = origin.upgrade() else {
+                    return;
+                };
+                // Admission belongs to this paste invocation, before either
+                // the app callback or the upload can yield across close/Undo.
+                let input_epoch = session.input_epoch();
+                if !session.accepts_input_epoch(input_epoch) {
+                    return;
+                }
                 let app = app.clone();
                 let origin = origin.clone();
                 cx.spawn(async move |cx| {
@@ -9280,10 +9302,11 @@ impl MuxelApp {
                         if !this
                             .paste_session(instance_id, cx)
                             .is_some_and(|current| Arc::ptr_eq(&current, &origin))
+                            || !origin.accepts_input_epoch(input_epoch)
                         {
                             return;
                         }
-                        this.paste_into_remote(instance_id, paste, cx);
+                        this.paste_into_remote(instance_id, paste, &origin, input_epoch, cx);
                     });
                 })
                 .detach();
@@ -9331,6 +9354,9 @@ impl MuxelApp {
     /// Floating a terminal moves its view between these maps without replacing
     /// the PTY. Pastes follow that same session through pop-out and re-dock.
     fn paste_session(&self, iid: Uuid, cx: &App) -> Option<Arc<TerminalSession>> {
+        if self.is_closing(iid) {
+            return None;
+        }
         let view = self.terminals.get(&iid).or_else(|| {
             self.popouts
                 .get(&iid)
@@ -9350,8 +9376,17 @@ impl MuxelApp {
         &mut self,
         iid: Uuid,
         paste: muxel_terminal::LocalPaste,
+        origin: &Arc<TerminalSession>,
+        input_epoch: u64,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .paste_session(iid, cx)
+            .is_some_and(|current| Arc::ptr_eq(&current, origin))
+            || !origin.accepts_input_epoch(input_epoch)
+        {
+            return;
+        }
         let Some(loc) = self
             .workspace
             .instance(iid)
@@ -9362,12 +9397,7 @@ impl MuxelApp {
         let integrations::RepoLoc::Remote(_) = &loc else {
             return;
         };
-        let Some(session) = self
-            .paste_session(iid, cx)
-            .map(|session| Arc::downgrade(&session))
-        else {
-            return;
-        };
+        let session = Arc::downgrade(origin);
         let unique = format!(
             "{}-{}",
             chrono::Local::now().format("%Y%m%d-%H%M%S"),
@@ -9395,6 +9425,7 @@ impl MuxelApp {
                 if !this
                     .paste_session(iid, cx)
                     .is_some_and(|current| Arc::ptr_eq(&current, &session))
+                    || !session.accepts_input_epoch(input_epoch)
                 {
                     return;
                 }
@@ -9574,6 +9605,7 @@ impl MuxelApp {
             // callback can resolve newer-wins before spawning panes.
             let loc = if first_sync { self.repo_loc(pid) } else { None };
             let host_for_err = host.clone();
+            let layout_epoch = self.layout_push_epoch.get(&pid).copied().unwrap_or(0);
             cx.spawn(async move |this, cx| {
                 let (res, fetched, sessions, has_memory) = cx
                     .background_executor()
@@ -9626,7 +9658,11 @@ impl MuxelApp {
                                 String::new(),
                             );
                         }
-                        if first_sync {
+                        if first_sync
+                            && !this.project_has_closes(pid)
+                            && this.layout_push_epoch.get(&pid).copied().unwrap_or(0)
+                                == layout_epoch
+                        {
                             this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
                             // After the sync, so a session the layout accounts for is
                             // not adopted a second time.
@@ -10794,7 +10830,9 @@ impl MuxelApp {
         let Some(path) = muxel_store::workspace_doc_path(id) else {
             return false;
         };
-        match muxel_store::save_workspace_to(&path, &self.workspace) {
+        let durable =
+            (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
+        match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
             Ok(()) => {
                 self.auto_name_save_due = None;
                 self.clear_save_error(SaveTarget::Workspace);
@@ -10818,9 +10856,16 @@ impl MuxelApp {
         // Re-entering the current workspace is a no-op except for closing the
         // selector — don't tear it down and re-lock (we already hold the lock).
         if self.current_workspace == Some(id) {
+            self.cancel_close_departure();
             self.workspace_busy = None;
             self.show_workspace_selector = false;
             cx.notify();
+            return;
+        }
+        if self.close_departure_task.is_some() {
+            if !matches!(self.close_departure, Some(CloseDeparture::Quit)) {
+                self.close_departure = Some(CloseDeparture::Workspace(id));
+            }
             return;
         }
         // Take the per-workspace lock *before* tearing anything down. If another
@@ -10838,20 +10883,28 @@ impl MuxelApp {
             return;
         };
         self.workspace_busy = None;
-        let persisted = if self.auto_name_save_due.is_some() {
+        self.finalize_all_closes(cx);
+        let persisted = {
             let _phase = ui_profile::phase("workspace", "persist-old", None);
             self.try_persist()
-        } else {
-            true
         };
         if !persisted {
             self.show_workspace_selector = true;
             cx.notify();
             return;
         }
+        self.close_tmux_kills.retain(|task| !task.is_ready());
+        if !self.close_tmux_kills.is_empty() {
+            drop(lock);
+            self.begin_close_departure(CloseDeparture::Workspace(id), cx);
+            return;
+        }
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
+        self.close_requests.clear();
+        self.close_client_counts.clear();
+        self.show_close_list = false;
 
         self.failed_launches.clear();
         self.control_turns.clear();
@@ -12491,7 +12544,8 @@ impl MuxelApp {
                     // machine's own previous write. Taken for a peer's, it would be
                     // adopted over the push — a pane just closed here coming straight
                     // back. The next poll reads the file as it is now.
-                    if this.remote_push_inflight.contains(&pid)
+                    if this.project_has_closes(pid)
+                        || this.remote_push_inflight.contains(&pid)
                         || this.layout_push_epoch.get(&pid).copied().unwrap_or(0) != epoch
                     {
                         continue;
@@ -12514,6 +12568,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_has_closes(pid) {
+            return;
+        }
         let Some(proj) = self.workspace.project(pid) else {
             return;
         };
@@ -12555,6 +12612,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_has_closes(pid) {
+            return;
+        }
         let Some(project) = self.workspace.project(pid) else {
             return;
         };
@@ -12733,6 +12793,9 @@ impl MuxelApp {
         record: &crate::session_binding::ClaimedClaudeRecord,
         home: &std::path::Path,
     ) -> anyhow::Result<crate::session_binding::RecoveredClaudeRecord> {
+        if self.is_closing(iid) {
+            anyhow::bail!("pane is closing");
+        }
         use crate::session_binding::RecoveredClaudeRecord::{Handled, NotYet};
         let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
@@ -12790,6 +12853,9 @@ impl MuxelApp {
     /// Adopt the root session named by a Muse pane's last hook record before
     /// its next launch. Recurring reads run in session discovery.
     fn adopt_muse_session_binding(&mut self, iid: Uuid) {
+        if self.is_closing(iid) {
+            return;
+        }
         let Some(data) = muxel_store::data_dir() else {
             return;
         };
@@ -12872,6 +12938,7 @@ impl MuxelApp {
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.expire_closes(Instant::now(), cx);
         // Remember the grid each pane settled at, so a restart respawns its program
         // already at the right size instead of resizing it after its first paint —
         // which a re-attached tmux session shows as visibly wrong spacing until the
@@ -12879,6 +12946,7 @@ impl MuxelApp {
         let sizes: Vec<(Uuid, (u16, u16))> = self
             .terminals
             .iter()
+            .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| (*iid, view.read(cx).session().size()))
             .collect();
         let mut resized = false;
@@ -12900,6 +12968,7 @@ impl MuxelApp {
         let names: Vec<(Uuid, Option<String>)> = self
             .terminals
             .iter()
+            .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| (*iid, view.read(cx).title()))
             .collect();
         let mut name_changed = false;
@@ -13019,6 +13088,7 @@ impl MuxelApp {
         let snapshot: Vec<Snap> = self
             .terminals
             .iter()
+            .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| {
                 let v = view.read(cx);
                 let TerminalActivitySample {
@@ -13544,6 +13614,9 @@ impl MuxelApp {
     /// command (Settings → Behavior), and typing it is exactly what the user would
     /// do, with no paste-mode markers for an agent's input box to mishandle.
     fn send_continue(&self, iid: Uuid, cx: &App) {
+        if self.is_closing(iid) {
+            return;
+        }
         if let Some(session) = self
             .terminals
             .get(&iid)
@@ -13689,7 +13762,7 @@ impl MuxelApp {
         let inputs: Vec<(Uuid, PaneActivity, String)> = self
             .auto
             .iter()
-            .filter(|(_, a)| a.enabled)
+            .filter(|(iid, a)| a.enabled && !self.is_closing(**iid))
             .filter_map(|(iid, _)| {
                 let v = self.terminals.get(iid)?.read(cx);
                 let activity = match v.status() {
@@ -13780,6 +13853,11 @@ impl MuxelApp {
     /// Watch in-flight loop runs using current evidence from their owned launch
     /// and submitted conversation. A replacement is untracked, never closed.
     fn process_running_loops(&mut self, cx: &mut Context<Self>) {
+        let held: Vec<_> = self
+            .closing
+            .keys()
+            .filter_map(|iid| self.running_loops.remove(iid).map(|run| (*iid, run)))
+            .collect();
         let close = loop_heartbeat(
             &mut self.running_loops,
             &self.terminals,
@@ -13796,6 +13874,7 @@ impl MuxelApp {
                 )
             },
         );
+        self.running_loops.extend(held);
         for iid in close {
             self.close_instance_inner(iid, "loop post-run", cx);
         }
@@ -15005,6 +15084,7 @@ impl MuxelApp {
             || self.password_prompt.is_some()
             || self.auto_message_popup.is_some()
             || self.confirm.is_some()
+            || self.show_close_list
             || self.place_menu.is_some()
             || self.runners_menu.is_some()
             || self.loops_menu.is_some()
@@ -16152,7 +16232,18 @@ impl MuxelApp {
                 if let Some(session) = tmux.recorded_session {
                     let session = SessionTarget::new(session, tmux.socket);
                     if !self.session_kept_for_another_pane(None, &session) {
-                        integrations::kill_tmux_session(&session);
+                        self.close_tmux_kills.retain(|task| !task.is_ready());
+                        self.close_tmux_kills
+                            .push(cx.background_executor().spawn(async move {
+                            if let Err(error) = integrations::close_local_tmux(
+                                &session,
+                                Instant::now() + Duration::from_secs(10),
+                            ) {
+                                log::warn!(
+                                    "could not confirm local tmux close for {session}: {error:#}"
+                                );
+                            }
+                        }));
                     }
                 }
             }
@@ -16450,6 +16541,7 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        self.forget_close(iid);
         self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
         // Invalidate a PTY still being created. Its eventual result sees the
@@ -16500,10 +16592,17 @@ impl MuxelApp {
         self.browsers.remove(&iid);
 
         // Tear down tmux (local or remote) + worktree (capture info before drop).
-        let info = self
-            .workspace
-            .instance(iid)
-            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
+        let info = self.workspace.instance(iid).map(|i| {
+            (
+                InstanceTmux::capture(i),
+                if self.preserve_close_worktrees {
+                    muxel_core::WorktreeCleanup::None
+                } else {
+                    i.worktree_cleanup()
+                },
+                i.project_id,
+            )
+        });
         self.workspace.remove_instance_meta(iid);
         if let Some((tmux, worktree_cleanup, project_id)) = info {
             self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
@@ -16556,6 +16655,8 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            close_after: Vec::new(),
+            close_rest: Vec::new(),
             wid,
             name,
             color,
@@ -16604,6 +16705,8 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            close_after: Vec::new(),
+            close_rest: Vec::new(),
             wid,
             name,
             color,
@@ -16623,6 +16726,8 @@ impl MuxelApp {
         let Some(d) = self.pending_worktree_dispose.pop_front() else {
             return;
         };
+        self.finalize_worktree_choice(&d.close_after, cx);
+        self.request_recoverable_close(d.close_rest.clone(), cx);
         let typed = self
             .dispose_commit_input
             .read(cx)
@@ -16656,6 +16761,8 @@ impl MuxelApp {
         let Some(d) = self.pending_worktree_dispose.pop_front() else {
             return;
         };
+        self.finalize_worktree_choice(&d.close_after, cx);
+        self.request_recoverable_close(d.close_rest.clone(), cx);
         integrations::remove_worktree(&d.root, &d.path);
         integrations::delete_branch(&d.root, &d.branch);
         self.workspace.remove_worktree_meta(d.wid);
@@ -16670,6 +16777,8 @@ impl MuxelApp {
         let Some(d) = self.pending_worktree_dispose.pop_front() else {
             return;
         };
+        self.finalize_worktree_choice(&d.close_after, cx);
+        self.request_recoverable_close(d.close_rest.clone(), cx);
         // Land any uncommitted changes onto the branch first, so the merge
         // includes them. On failure, keep the worktree (no work lost).
         if d.changed > 0 {
@@ -16723,6 +16832,8 @@ impl MuxelApp {
         let Some(d) = self.pending_worktree_dispose.pop_front() else {
             return;
         };
+        self.finalize_worktree_choice(&d.close_after, cx);
+        self.request_recoverable_close(d.close_rest.clone(), cx);
         if let Some(w) = self.workspace.worktree_mut(d.wid) {
             w.detached = true;
         }
@@ -16845,6 +16956,9 @@ impl MuxelApp {
     /// sessions a peer can attach to over SSH). Without tmux a local project has no
     /// attachable sessions, so there's nothing to share.
     fn project_syncs_layout(&self, pid: Uuid) -> bool {
+        if self.project_has_closes(pid) {
+            return false;
+        }
         self.workspace
             .project(pid)
             .is_some_and(|p| p.remote.is_some() || self.use_tmux)
@@ -17099,6 +17213,7 @@ impl MuxelApp {
         }
         self.remote_push_inflight.insert(pid);
         *self.layout_push_epoch.entry(pid).or_default() += 1;
+        let push_epoch = self.layout_push_epoch[&pid];
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -17125,6 +17240,11 @@ impl MuxelApp {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
+                if this.project_has_closes(pid)
+                    || this.layout_push_epoch.get(&pid).copied().unwrap_or(0) != push_epoch
+                {
+                    return;
+                }
                 match res {
                     Ok(Pushed::Written(key, moved)) => {
                         this.remember_layout_synced(pid, key);
@@ -17220,6 +17340,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_has_closes(pid) {
+            return;
+        }
         self.remote_synced.insert(pid);
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
         let Some(proj) = self.workspace.project(pid) else {
@@ -17307,6 +17430,9 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_has_closes(pid) {
+            return;
+        }
         self.backup_local_layout(pid, &local, remote.updated_at);
         let remote_key = remote.content_key();
 
@@ -18311,6 +18437,18 @@ impl MuxelApp {
     /// Remove worktree `wid` entirely: close its panes, delete the worktree + its
     /// branch, drop the registry entry.
     fn discard_worktree(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        let held: Vec<_> = self
+            .workspace
+            .instances_using(wid)
+            .into_iter()
+            .filter(|iid| self.is_closing(*iid))
+            .collect();
+        let preserving = self.preserve_close_worktrees;
+        self.preserve_close_worktrees = true;
+        for iid in held {
+            self.close_instance_inner(iid, "worktree discard", cx);
+        }
+        self.preserve_close_worktrees = preserving;
         let Some(w) = self.workspace.worktree(wid) else {
             return;
         };
@@ -18744,6 +18882,9 @@ impl MuxelApp {
                 this.add_agent(SplitDirection::Vertical, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ClosePane, window, cx| this.close_active(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &UndoClose, window, cx| this.undo_latest_close(window, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &FocusNext, window, cx| this.focus_sibling(1, window, cx)),
             )
@@ -19243,6 +19384,9 @@ impl MuxelApp {
         else {
             return;
         };
+        if self.is_closing(iid) {
+            return;
+        }
         let Some(popout) = self.popouts.remove(&iid) else {
             return;
         };
@@ -19336,68 +19480,9 @@ impl MuxelApp {
         }
     }
 
-    /// Whether closing a pane of this kind should ask for confirmation first.
-    fn confirm_close_for(&self, kind: InstanceKind) -> bool {
-        match kind {
-            InstanceKind::Terminal => self.settings.confirm_close_terminal,
-            InstanceKind::Editor => self.settings.confirm_close_editor,
-            InstanceKind::Diff => self.settings.confirm_close_diff,
-            // Browsers are cheap to reopen (the URL is persisted anyway).
-            InstanceKind::Browser => false,
-        }
-    }
-
-    /// Close a pane, asking first if its kind's confirm-on-close is enabled.
+    /// Apply the shared resource, busy-terminal and worktree close policy.
     fn request_close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        let kind = self
-            .workspace
-            .instance(iid)
-            .map(|i| i.kind)
-            .unwrap_or(InstanceKind::Terminal);
-        // A clean editor (no unsaved changes) has nothing to lose on close, so skip
-        // the confirmation regardless of the confirm-on-close setting.
-        let clean_editor = kind == InstanceKind::Editor
-            && self
-                .editors
-                .get(&iid)
-                .is_none_or(|e| !e.read(cx).is_dirty());
-        // A default-shell pane sitting idle at its prompt (no foreground command),
-        // alone in its pane, has nothing to lose either — skip the prompt. A running
-        // command, another tab in the pane, or an agent (non-shell program) all keep
-        // the confirmation.
-        let idle_lone_shell = self
-            .workspace
-            .instance(iid)
-            .is_some_and(|i| i.kind == InstanceKind::Terminal && i.program.is_none())
-            && self.other_tabs_in_pane(iid).is_empty()
-            && self
-                .terminals
-                .get(&iid)
-                .is_some_and(|v| v.read(cx).session().is_idle_foreground());
-        if self.confirm_close_for(kind) && !clean_editor && !idle_lone_shell {
-            let (noun, verb) = match kind {
-                InstanceKind::Terminal => (t("terminal"), t("terminated")),
-                InstanceKind::Editor => (t("editor"), t("closed")),
-                InstanceKind::Diff | InstanceKind::Browser => (t("diff"), t("closed")),
-            };
-            let name = self
-                .workspace
-                .instance(iid)
-                .map(|i| i.display_name().to_string())
-                .unwrap_or_else(|| tf("this {noun}", &[("noun", &noun)]));
-            self.request_confirm(
-                tf("Close {noun}?", &[("noun", &noun)]),
-                tf(
-                    "“{name}” will be {verb}.",
-                    &[("name", &name), ("verb", &verb)],
-                ),
-                t("Close"),
-                ConfirmAction::CloseInstance(iid),
-                cx,
-            );
-        } else {
-            self.close_instance(iid, cx);
-        }
+        self.request_recoverable_close(vec![iid], cx);
     }
 
     /// Which window the pending confirm dialog belongs in: `Some(pid)` for the
@@ -19406,7 +19491,18 @@ impl MuxelApp {
     /// sits on another monitor, and the modal would open over the main window
     /// while the pane the user just tried to close is somewhere else entirely.
     fn confirm_window_pid(&self) -> Option<Uuid> {
+        if self.confirm_popout_iid().is_some() {
+            return None;
+        }
         self.secondary_pid_for_instance(self.confirm.as_ref()?.action.pane_instance()?)
+    }
+
+    fn confirm_popout_iid(&self) -> Option<Uuid> {
+        self.confirm
+            .as_ref()?
+            .action
+            .pane_instance()
+            .filter(|iid| self.popouts.contains_key(iid))
     }
 
     /// The project window on another monitor that shows pane `iid`, if any. A
@@ -19449,6 +19545,13 @@ impl MuxelApp {
             details,
             action,
         });
+        if let Some(iid) = self.confirm_popout_iid()
+            && let Some(popout) = self.popouts.get(&iid)
+        {
+            let _ = popout
+                .window
+                .update(cx, |_, window, _| window.activate_window());
+        }
         // The dialog renders in the window owning the pane, which may be a project
         // window on another monitor — and the action can be triggered from the main
         // window's sidebar. Raise it, or the dialog is drawn where nobody's looking.
@@ -19481,17 +19584,9 @@ impl MuxelApp {
             ConfirmAction::DeleteLoop(idx) => self.delete_loop(idx, cx),
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
             ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
-            ConfirmAction::CloseInstance(iid) => {
-                self.close_instance(iid, cx);
-                if let Some(next) = self.active_instance {
-                    self.focus_instance(next, window, cx);
-                }
-            }
-            ConfirmAction::CloseOtherTabs(keep) => {
-                self.close_other_tabs_now(keep, window, cx);
-            }
-            ConfirmAction::CloseTabsSide { anchor, right } => {
-                self.close_tabs_side_now(anchor, right, window, cx);
+            ConfirmAction::CloseBatch(ids) => self.accept_close_request(ids, false, cx),
+            ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
+                self.save_editor_before_close(iid, rest, cx)
             }
             ConfirmAction::SwitchBranch { pid, branch } => {
                 self.do_switch_branch(pid, branch, window, cx)
@@ -19761,6 +19856,9 @@ impl MuxelApp {
     /// a resume-capable agent comes back on its saved conversation (e.g. to pick
     /// up an updated harness binary). Other programs (shells, …) start over.
     fn restart_agent(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_closing(iid) {
+            return;
+        }
         #[cfg(windows)]
         if let Err(error) = self.reconcile_grok_before_restart(iid, cx) {
             self.add_event(
@@ -19852,6 +19950,9 @@ impl MuxelApp {
         let host_name = host.name.clone();
         let label = session.to_string();
         let workspace = self.current_workspace;
+        let Some(lease) = self.terminal_restarts.lease(iid) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let (resolving_host, resolving_path, resolving_password) =
                 (host.clone(), control_path.clone(), password.clone());
@@ -19908,6 +20009,7 @@ impl MuxelApp {
                                     &pending,
                                     iid,
                                     Instant::now() + Duration::from_secs(10),
+                                    move || lease.begin_command(),
                                 )
                             })
                             .await;
@@ -20165,42 +20267,8 @@ impl MuxelApp {
 
     /// Close every other tab in `keep`'s pane (pinned included), leaving only
     /// `keep`. Asks once (batch) if any closed tab's kind confirms-on-close.
-    fn close_other_tabs(&mut self, keep: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        let others = self.other_tabs_in_pane(keep);
-        if others.is_empty() {
-            return;
-        }
-        // Prompt if any of the tabs being closed is a kind that asks first.
-        let needs_confirm = others.iter().any(|id| {
-            self.workspace
-                .instance(*id)
-                .is_some_and(|i| self.confirm_close_for(i.kind))
-        });
-        if needs_confirm {
-            let n = others.len();
-            self.request_confirm(
-                t("Close other tabs?"),
-                tn(
-                    "{n} other tab in this pane will be terminated.",
-                    "{n} other tabs in this pane will be terminated.",
-                    n,
-                    &[("n", &n.to_string())],
-                ),
-                t("Close others"),
-                ConfirmAction::CloseOtherTabs(keep),
-                cx,
-            );
-        } else {
-            self.close_other_tabs_now(keep, window, cx);
-        }
-    }
-
-    /// Close the other tabs directly (no per-tab prompt), then focus `keep`.
-    fn close_other_tabs_now(&mut self, keep: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        for id in self.other_tabs_in_pane(keep) {
-            self.close_instance(id, cx);
-        }
-        self.focus_instance(keep, window, cx);
+    fn close_other_tabs(&mut self, keep: Uuid, _window: &mut Window, cx: &mut Context<Self>) {
+        self.request_recoverable_close(self.other_tabs_in_pane(keep), cx);
     }
 
     /// Tabs to the left (`right=false`) or right (`right=true`) of `anchor` in its
@@ -20231,49 +20299,10 @@ impl MuxelApp {
         &mut self,
         anchor: Uuid,
         right: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ids = self.tabs_to_side(anchor, right);
-        if ids.is_empty() {
-            return;
-        }
-        let needs_confirm = ids.iter().any(|id| {
-            self.workspace
-                .instance(*id)
-                .is_some_and(|i| self.confirm_close_for(i.kind))
-        });
-        if needs_confirm {
-            let n = ids.len();
-            let side = if right { "right" } else { "left" };
-            self.request_confirm(
-                t("Close tabs?"),
-                tn(
-                    "{n} tab to the {side} will be terminated.",
-                    "{n} tabs to the {side} will be terminated.",
-                    n,
-                    &[("n", &n.to_string()), ("side", side)],
-                ),
-                t("Close tabs"),
-                ConfirmAction::CloseTabsSide { anchor, right },
-                cx,
-            );
-        } else {
-            self.close_tabs_side_now(anchor, right, window, cx);
-        }
-    }
-
-    fn close_tabs_side_now(
-        &mut self,
-        anchor: Uuid,
-        right: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for id in self.tabs_to_side(anchor, right) {
-            self.close_instance(id, cx);
-        }
-        self.focus_instance(anchor, window, cx);
+        self.request_recoverable_close(self.tabs_to_side(anchor, right), cx);
     }
 
     /// Clear the active terminal's scrollback history.
@@ -20561,7 +20590,11 @@ impl MuxelApp {
             cx.notify();
             return;
         };
-        let target = self.active_instance;
+        let target = self
+            .active_instance
+            .and_then(|iid| self.terminal_input_admission(iid, cx));
+        let wake_targets = self.wake_targets(cx);
+        let workspace = self.current_workspace;
         let engine = self.settings.stt_engine;
         let model = self.settings.stt_model.clone();
         let language = self.settings.stt_language.clone();
@@ -20626,7 +20659,7 @@ impl MuxelApp {
                         // panes instead of being typed into one.
                         if wake_command && muxel_core::stt::matches_wake_phrase(&text, &wake_phrase)
                         {
-                            this.wake_all_panes(window, cx);
+                            this.wake_all_panes(wake_targets, workspace, window, cx);
                         } else {
                             this.insert_transcript(target, &text, autosubmit, window, cx);
                         }
@@ -20750,6 +20783,9 @@ impl MuxelApp {
     /// Read `iid`'s last reply from the top, as a new reading. `false` if the pane
     /// has nothing to read from.
     fn read_aloud_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) -> bool {
+        if self.is_closing(iid) {
+            return false;
+        }
         let Some(source) = self.reply_source(iid, cx) else {
             return false;
         };
@@ -20768,6 +20804,9 @@ impl MuxelApp {
 
     /// Resume `iid`'s reading where it left off.
     fn play_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.is_closing(iid) {
+            return;
+        }
         if let Some((pieces, next)) = self.readings.resume_point(iid) {
             self.begin_read_aloud(Some(iid), cx, move || Utterance::Reading(pieces, next));
         }
@@ -20924,6 +20963,9 @@ impl MuxelApp {
         gather: impl FnOnce() -> Utterance + Send + 'static,
     ) {
         self.hush_read_aloud();
+        if pane.is_some_and(|iid| self.is_closing(iid)) {
+            return;
+        }
         let generation = self.readings.begin(pane);
         let mut voice = self.voice_config();
         cx.notify();
@@ -20939,6 +20981,9 @@ impl MuxelApp {
                 .await;
             let speech = this
                 .update(cx, |this, cx| {
+                    if pane.is_some_and(|iid| this.is_closing(iid)) {
+                        return None;
+                    }
                     let (pieces, from, kept) = match utterance {
                         Utterance::Reading(pieces, from) => (pieces, from, true),
                         Utterance::Notice(notice) => (vec![notice], 0, false),
@@ -20984,6 +21029,9 @@ impl MuxelApp {
     /// Auto-read: read `iid`'s new reply now if the voice is free, otherwise once
     /// what's ahead of it is done.
     fn enqueue_read_aloud(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.is_closing(iid) {
+            return;
+        }
         if self.readings.enqueue(iid) {
             self.read_aloud_pane(iid, cx);
         }
@@ -21101,13 +21149,8 @@ impl MuxelApp {
     /// Only panes with a process take part; an editor has nothing to bring online.
     /// A project shown in a secondary window keeps its own focus: its dead panes
     /// are relaunched without stealing it into this window.
-    fn wake_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.waking {
-            return; // a sweep is already running
-        }
-        // Every agent pane in the workspace, in project order.
-        let targets: Vec<(Uuid, Uuid)> = self
-            .workspace
+    fn wake_targets(&self, cx: &App) -> Vec<WakeTarget> {
+        self.workspace
             .projects
             .iter()
             .flat_map(|p| {
@@ -21116,10 +21159,22 @@ impl MuxelApp {
                     .filter(|iid| {
                         self.launch_permitted(*iid, muxel_core::TerminalLaunchReason::Wake)
                     })
-                    .map(|iid| (p.id, iid))
+                    .map(|iid| (p.id, iid, self.terminal_input_admission(iid, cx)))
                     .collect::<Vec<_>>()
             })
-            .collect();
+            .collect()
+    }
+
+    fn wake_all_panes(
+        &mut self,
+        targets: Vec<WakeTarget>,
+        workspace: Option<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.waking || self.current_workspace != workspace {
+            return;
+        }
         if targets.is_empty() {
             return; // nothing in this workspace has a process to wake
         }
@@ -21131,8 +21186,17 @@ impl MuxelApp {
 
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             let mut relaunched = 0usize;
-            for (pid, iid) in targets {
+            for (pid, iid, admission) in targets {
                 let Ok(was_dead) = this.update_in(cx, |this, window, cx| {
+                    if this.current_workspace != workspace
+                        || !this.launch_permitted(iid, muxel_core::TerminalLaunchReason::Wake)
+                        || match &admission {
+                            Some(admission) => this.admitted_terminal(admission, cx).is_none(),
+                            None => this.paste_session(iid, cx).is_some(),
+                        }
+                    {
+                        return false;
+                    }
                     let elsewhere = this.secondary_windows.iter().any(|s| s.pid == pid);
                     if !elsewhere && this.workspace.active_project != Some(pid) {
                         this.select_project(pid, window, cx);
@@ -21152,12 +21216,17 @@ impl MuxelApp {
 
             let _ = this.update_in(cx, |this, window, cx| {
                 this.waking = false;
+                if this.current_workspace != workspace {
+                    return;
+                }
                 // Back to the pane the user was on when they spoke.
                 if let Some(pid) = home_pid.filter(|p| this.workspace.project(*p).is_some()) {
                     if this.workspace.active_project != Some(pid) {
                         this.select_project(pid, window, cx);
                     }
-                    if let Some(iid) = home_iid.filter(|i| this.workspace.instance(*i).is_some()) {
+                    if let Some(iid) = home_iid
+                        .filter(|i| this.workspace.instance(*i).is_some() && !this.is_closing(*i))
+                    {
                         this.focus_instance(iid, window, cx);
                     }
                 }
@@ -21173,22 +21242,41 @@ impl MuxelApp {
         .detach();
     }
 
-    /// Paste a transcript into pane `iid`'s prompt (bracketed paste, so it lands
+    fn terminal_input_admission(&self, iid: Uuid, cx: &App) -> Option<TerminalInputAdmission> {
+        let session = self.paste_session(iid, cx)?;
+        let epoch = session.input_epoch();
+        session
+            .accepts_input_epoch(epoch)
+            .then(|| TerminalInputAdmission {
+                iid,
+                session: Arc::downgrade(&session),
+                epoch,
+            })
+    }
+
+    fn admitted_terminal(
+        &self,
+        admission: &TerminalInputAdmission,
+        cx: &App,
+    ) -> Option<Arc<TerminalSession>> {
+        let original = admission.session.upgrade()?;
+        let current = self.paste_session(admission.iid, cx)?;
+        (Arc::ptr_eq(&original, &current) && original.accepts_input_epoch(admission.epoch))
+            .then_some(original)
+    }
+
+    /// Paste a transcript into its original prompt (bracketed paste, so it lands
     /// unsubmitted for review — mirrors `send_snippet_to`).
     fn insert_transcript(
         &mut self,
-        target: Option<Uuid>,
+        target: Option<TerminalInputAdmission>,
         text: &str,
         submit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(iid) = target else { return };
-        let Some(session) = self
-            .terminals
-            .get(&iid)
-            .map(|v| v.read(cx).session().clone())
-        else {
+        let Some(target) = target else { return };
+        let Some(session) = self.admitted_terminal(&target, cx) else {
             return;
         };
         session.paste(text);
@@ -21196,7 +21284,7 @@ impl MuxelApp {
             session.mark_turn_submitted();
             session.write_input(b"\r");
         }
-        self.focus_instance(iid, window, cx);
+        self.focus_instance(target.iid, window, cx);
     }
 
     /// Select the Nth tab (1-based) of the active pane.
@@ -21663,7 +21751,7 @@ impl MuxelApp {
             }
             muxel_tray::TrayAction::Quit => {
                 self.confirm_quit = true;
-                cx.quit();
+                self.quit_after_closes(cx);
             }
         }
     }
@@ -23930,7 +24018,7 @@ impl MuxelApp {
                     .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
                         cx.listener(|this, _e, _w, cx| {
                             this.confirm_quit = true;
-                            cx.quit();
+                            this.quit_after_closes(cx);
                         }),
                     ))
                     .child(
@@ -24103,7 +24191,7 @@ impl MuxelApp {
                         .label(t("Quit"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             this.confirm_quit = true;
-                            cx.quit();
+                            this.quit_after_closes(cx);
                         })),
                 )
                 .children(self.current_workspace.is_some().then(|| {
@@ -24112,6 +24200,7 @@ impl MuxelApp {
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             this.workspace_busy = None;
+                            this.cancel_close_departure();
                             this.show_workspace_selector = false;
                             cx.notify();
                         }))
@@ -26426,7 +26515,7 @@ impl MuxelApp {
         Self::minimal_titlebar().on_close_window(cx.listener(|this, _ev, _window, cx| {
             // Nothing is running yet — quit directly (no confirm needed).
             this.confirm_quit = true;
-            cx.quit();
+            this.quit_after_closes(cx);
         }))
     }
 
@@ -26525,6 +26614,7 @@ impl MuxelApp {
                             .child(workspace_name),
                     )
                     .child(div().flex_1())
+                    .child(nodrag(self.render_close_chip(cx)))
                     .child(nodrag(
                         Button::new("global-search")
                             .ghost()
@@ -28824,11 +28914,14 @@ impl MuxelApp {
     }
 
     fn delete_project(&mut self, pid: Uuid, cx: &mut Context<Self>) {
-        let iids = self
+        self.finalize_project_closes(pid, cx);
+        let iids: Vec<_> = self
             .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default();
+            .instances
+            .iter()
+            .filter(|instance| instance.project_id == pid)
+            .map(|instance| instance.id)
+            .collect();
         for iid in iids {
             self.close_instance(iid, cx);
         }
@@ -29753,6 +29846,7 @@ impl MuxelApp {
         let title = pending.title.clone();
         let message = pending.message.clone();
         let confirm_label = pending.confirm_label.clone();
+        let alternative = recoverable_close_ui::close_alternative_label(&pending.action);
         let details = pending.details.clone();
         // Fingerprint rows need width; plain confirms keep the compact card.
         let width = if details.is_empty() { 360.0 } else { 480.0 };
@@ -29815,6 +29909,16 @@ impl MuxelApp {
                                         cx.listener(|this, _e, _w, cx| this.cancel_confirm(cx)),
                                     ),
                             )
+                            .children(alternative.map(|label| {
+                                Button::new("confirm-alternative")
+                                    .ghost()
+                                    .label(label)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.run_close_alternative(cx)
+                                        }),
+                                    )
+                            }))
                             .child(
                                 Button::new("confirm-ok")
                                     .danger()
@@ -30048,7 +30152,7 @@ impl MuxelApp {
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.kill_checked_tmux_sessions();
                                         this.confirm_quit = true;
-                                        cx.quit();
+                                        this.quit_after_closes(cx);
                                     })),
                             ),
                     ),
@@ -31200,7 +31304,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    &t("Confirm before closing a terminal"),
+                    &t("Ask before closing a busy terminal"),
                 ),
             )
             .child(
@@ -33451,9 +33555,12 @@ impl Render for MuxelApp {
             // A pane-scoped confirm belongs to the window showing that pane; when
             // that's a project window on another monitor, it draws there instead.
             .children(
-                (self.confirm.is_some() && self.confirm_window_pid().is_none())
-                    .then(|| self.render_confirm_modal(cx)),
+                (self.confirm.is_some()
+                    && self.confirm_window_pid().is_none()
+                    && self.confirm_popout_iid().is_none())
+                .then(|| self.render_confirm_modal(cx)),
             )
+            .children(self.show_close_list.then(|| self.render_close_list(cx)))
             .children(
                 (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
                     .then(|| self.render_auto_message_popup(cx)),
