@@ -2088,19 +2088,23 @@ impl TerminalSession {
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
-        let submit = match &input {
+        let (input, submit) = match input {
             ControlInput::Submit => {
                 self.scroll_input_to_bottom();
                 self.submission_pending.store(false, Ordering::Release);
-                Some((self.clone(), SystemTime::now()))
+                (input, Some((self.clone(), SystemTime::now())))
             }
             ControlInput::Paste(text) => {
                 self.admit_input(!text.is_empty());
-                None
+                // The bytes a direct paste would send, decided by this
+                // terminal's mode as tmux set it for the pane it shows; tmux
+                // adds the brackets itself, only if the pane asked for them.
+                let text = paste_text(&text, self.is_bracketed_paste());
+                (ControlInput::Paste(text), None)
             }
-            ControlInput::Keys { keys, .. } => {
+            ControlInput::Keys { ref keys, .. } => {
                 self.admit_input(!keys.is_empty());
-                None
+                (input, None)
             }
         };
         ControlWrite::queued(tmux.deliver(input), submit)
@@ -2255,10 +2259,12 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
-        let payload = if self.is_bracketed_paste() {
-            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+        let bracketed = self.is_bracketed_paste();
+        let text = paste_text(text, bracketed);
+        let payload = if bracketed {
+            format!("\x1b[200~{text}\x1b[201~")
         } else {
-            text.replace("\r\n", "\r").replace('\n', "\r")
+            text
         };
         self.try_write_input(payload.as_bytes())
     }
@@ -2994,6 +3000,17 @@ impl TerminalSession {
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
         self.mark_user_input();
         self.write_pointer(&buf);
+    }
+}
+
+/// The text of a paste, without its brackets: inside a bracketed paste ESC is
+/// removed, so the text can't end the paste early and have the rest read as
+/// keys; outside one each line break goes as CR, the Enter a terminal sends.
+fn paste_text(text: &str, bracketed: bool) -> String {
+    if bracketed {
+        text.replace('\x1b', "")
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r")
     }
 }
 

@@ -2087,7 +2087,7 @@ mod tests {
         );
         let buffer = tmux::control_buffer_name(uuid::Uuid::nil());
         assert_eq!(
-            session_tmux_command(&target, &tmux::control_paste_args(&buffer, "%12")),
+            session_tmux_command(&target, &tmux::control_paste_args(&buffer, "%12", true)),
             format!(
                 "{lead} load-buffer -b {buffer} - ';' paste-buffer -d -p -r -b {buffer} -t %12"
             )

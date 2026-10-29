@@ -34,7 +34,9 @@ const PIN_RETRY: Duration = Duration::from_secs(1);
 /// One write `muxel ctl` makes to a terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlInput {
-    /// Text pasted as one paste, bracketed when the program asked for that.
+    /// Text pasted as one paste, as [`crate::TerminalSession::try_paste`]
+    /// pastes it: while the terminal is in bracketed-paste mode, bracketed and
+    /// without ESC; otherwise with each line break sent as CR.
     Paste(String),
     /// Keys pressed together. `app_cursor` is the cursor-key mode a directly
     /// written terminal's arrow bytes are encoded for; tmux encodes keys for its
@@ -263,6 +265,9 @@ impl TmuxInput {
         }
     }
 
+    /// Queue `input` for the pinned pane. A paste's text is already what the
+    /// pane should get: [`crate::TerminalSession::control_write`] prepares it
+    /// as a direct paste would.
     pub(crate) fn deliver(&self, input: ControlInput) -> async_channel::Receiver<Delivered> {
         let (tx, rx) = async_channel::bounded(1);
         if let Err(Job::Deliver(_, tx)) = self.send(Job::Deliver(input, tx)) {
@@ -375,22 +380,36 @@ fn pane_gone(run: &TmuxRunner, pane: &str) -> bool {
 
 fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput) -> Delivered {
     match input {
-        ControlInput::Paste(text) => {
-            let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
-            let pasted = step(
-                run,
-                &tmux::control_paste_args(&buffer, pane),
-                Some(&tmux::control_paste_input(text)),
-            );
-            if pasted.is_err() {
-                // A failed paste leaves its buffer behind.
-                let _ = run(&tmux::delete_buffer_args(&buffer), None);
+        ControlInput::Paste(text) => paste(run, pane, text, true),
+        ControlInput::Keys { keys, .. } => {
+            for key_step in tmux::control_key_steps(keys) {
+                match key_step {
+                    tmux::KeyStep::Send(keys) => {
+                        step(run, &tmux::control_keys_args(pane, &keys), None)?
+                    }
+                    tmux::KeyStep::Paste(text) => paste(run, pane, &text, false)?,
+                }
             }
-            pasted
+            Ok(())
         }
-        ControlInput::Keys { keys, .. } => step(run, &tmux::control_keys_args(pane, keys), None),
         ControlInput::Submit => step(run, &tmux::control_keys_args(pane, &[Key::Enter]), None),
     }
+}
+
+/// Paste `text` byte for byte from a buffer of its own, bracketed (`-p`) only
+/// when `bracket` and the pane asked for it.
+fn paste(run: &TmuxRunner, pane: &str, text: &str, bracket: bool) -> Delivered {
+    let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
+    let pasted = step(
+        run,
+        &tmux::control_paste_args(&buffer, pane, bracket),
+        Some(text.as_bytes()),
+    );
+    if pasted.is_err() {
+        // A failed paste leaves its buffer behind.
+        let _ = run(&tmux::delete_buffer_args(&buffer), None);
+    }
+    pasted
 }
 
 fn step(run: &TmuxRunner, args: &[String], stdin: Option<&[u8]>) -> Delivered {
@@ -421,13 +440,18 @@ fn stderr_line(out: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlInput, ControlWriteError, TmuxInput, TmuxInputRoute};
+    use super::{ControlInput, ControlWrite, ControlWriteError, TmuxInput, TmuxInputRoute};
+    use crate::session::{CommandSpec, TerminalSession};
     use muxel_core::control::Key;
     use parking_lot::Mutex;
     use std::{
         io,
         process::Output,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     #[cfg(unix)]
@@ -486,11 +510,25 @@ mod tests {
         input.deliver(write).recv_blocking().unwrap()
     }
 
+    /// Drive a write to its end, as the app's foreground task awaits it.
+    pub(super) fn finish(write: ControlWrite) -> Result<(), ControlWriteError> {
+        let mut write = std::pin::pin!(write.finish());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let std::task::Poll::Ready(done) = write.as_mut().poll(&mut cx) {
+                return done;
+            }
+            assert!(Instant::now() < deadline, "tmux never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn writes_go_in_order_to_the_pane_pinned_once() {
         let (route, calls) = route(|_| Ok(output(0, "", "")));
         let input = TmuxInput::new(route);
-        deliver(&input, ControlInput::Paste("two\nlines\x1b".into())).unwrap();
+        deliver(&input, ControlInput::Paste("two\nlines".into())).unwrap();
         deliver(
             &input,
             ControlInput::Keys {
@@ -509,10 +547,125 @@ mod tests {
             "the pane is resolved once, then every write targets it"
         );
         assert!(calls[1].0.ends_with(&["-t".to_string(), "%7".to_string()]));
+        assert!(calls[1].0.contains(&"-p".to_string()), "{:?}", calls[1].0);
         assert_eq!(calls[1].1.as_deref(), Some(&b"two\nlines"[..]));
         assert_eq!(calls[2].0, ["send-keys", "-t", "%7", "C-b", "0x63"]);
         assert_eq!(calls[3].0, ["send-keys", "-t", "%7", "Enter"]);
         assert!(calls[2].1.is_none() && calls[3].1.is_none());
+    }
+
+    #[test]
+    fn a_key_outside_ascii_is_pasted_raw_between_the_named_keys() {
+        let (route, calls) = route(|_| Ok(output(0, "", "")));
+        let input = TmuxInput::new(route);
+        deliver(
+            &input,
+            ControlInput::Keys {
+                keys: vec![Key::Char('a'), Key::Char('é'), Key::Enter],
+                app_cursor: false,
+            },
+        )
+        .unwrap();
+        let calls = calls.lock();
+        assert_eq!(calls[1].0, ["send-keys", "-t", "%7", "0x61"]);
+        assert_eq!(calls[2].0[0], "load-buffer");
+        assert!(
+            !calls[2].0.contains(&"-p".to_string()),
+            "a typed character is never bracketed: {:?}",
+            calls[2].0
+        );
+        assert_eq!(calls[2].1.as_deref(), Some("é".as_bytes()));
+        assert_eq!(calls[3].0, ["send-keys", "-t", "%7", "Enter"]);
+        assert_eq!(calls.len(), 4);
+    }
+
+    /// A terminal whose program would be a tmux client, behind a fake tmux
+    /// that records every command and refuses `send-keys` while `refuse` is set.
+    fn tmux_terminal(
+        refuse: Arc<AtomicBool>,
+    ) -> (Arc<TerminalSession>, crate::session::PtyReceiver, Calls) {
+        let calls: Calls = Arc::default();
+        let seen = calls.clone();
+        let route = TmuxInputRoute::new(
+            "muxel_p_1",
+            Arc::new(AtomicBool::new(false)),
+            move |args: &[String], stdin: Option<&[u8]>| {
+                seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
+                Ok(match args[0].as_str() {
+                    "display-message" if args[4] == "#{session_name}:#{pane_id}" => {
+                        output(0, "muxel_p_1:%7\n", "")
+                    }
+                    "display-message" => output(0, "%7\n", ""),
+                    "send-keys" if refuse.load(Ordering::Acquire) => output(1, "", "not now\n"),
+                    _ => output(0, "", ""),
+                })
+            },
+        );
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, rx) =
+            TerminalSession::spawn(spec.with_tmux_input(route), 80, 24).expect("spawn PTY");
+        (session, rx, calls)
+    }
+
+    /// Master pasted into the tmux client what a direct paste sends, by the
+    /// client terminal's own bracketed-paste mode; tmux carried that to the
+    /// pane. Through tmux the pane gets the same bytes.
+    #[test]
+    fn a_paste_through_tmux_sends_what_a_direct_paste_would() {
+        let (session, _rx, calls) = tmux_terminal(Arc::default());
+        let text = "one\r\ntwo\nthree\x1b[1m";
+        finish(session.control_write(ControlInput::Paste(text.into()))).unwrap();
+        // tmux turns on its client's bracketed-paste mode for a pane that asks.
+        session.process_output(b"\x1b[?2004h");
+        assert!(session.is_bracketed_paste());
+        finish(session.control_write(ControlInput::Paste(text.into()))).unwrap();
+        let calls = calls.lock();
+        let pastes: Vec<_> = calls
+            .iter()
+            .filter(|(args, _)| args[0] == "load-buffer")
+            .collect();
+        assert_eq!(pastes.len(), 2);
+        assert_eq!(
+            pastes[0].1.as_deref(),
+            Some(&b"one\rtwo\rthree\x1b[1m"[..]),
+            "outside bracketed paste: line breaks as CR, ESC kept"
+        );
+        assert_eq!(
+            pastes[1].1.as_deref(),
+            Some(&b"one\r\ntwo\nthree[1m"[..]),
+            "inside bracketed paste: line breaks kept, ESC removed"
+        );
+        assert!(
+            pastes
+                .iter()
+                .all(|(args, _)| args.contains(&"-p".to_string())),
+            "tmux brackets either only if the pane asked"
+        );
+        drop(calls);
+        session.kill();
+    }
+
+    /// The Enter of `keys enter` counts as a submitted turn only once tmux
+    /// has taken it.
+    #[test]
+    fn a_submit_tmux_refuses_records_no_submitted_turn() {
+        let refuse = Arc::new(AtomicBool::new(true));
+        let (session, _rx, _calls) = tmux_terminal(refuse.clone());
+        let refused = finish(session.control_write(ControlInput::Submit));
+        assert!(
+            matches!(refused, Err(ControlWriteError::Refused(_))),
+            "{refused:?}"
+        );
+        assert!(!session.has_submitted_turn());
+
+        refuse.store(false, Ordering::Release);
+        finish(session.control_write(ControlInput::Submit)).unwrap();
+        assert!(session.has_submitted_turn());
+        session.kill();
     }
 
     #[test]
@@ -629,7 +782,8 @@ mod tests {
 /// where tmux isn't installed; CI installs it.
 #[cfg(all(test, unix))]
 mod real_tmux_tests {
-    use super::{ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute};
+    use super::tests::finish;
+    use super::{ControlInput, ControlWriteError, TmuxInputRoute};
     use crate::session::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
     use muxel_core::control::Key;
     use std::{
@@ -670,20 +824,6 @@ mod real_tmux_tests {
             child.stdin.take().unwrap().write_all(data)?;
         }
         child.wait_with_output()
-    }
-
-    /// Drive a write to its end, as the app's foreground task awaits it.
-    fn finish(write: ControlWrite) -> Result<(), ControlWriteError> {
-        let mut write = std::pin::pin!(write.finish());
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let std::task::Poll::Ready(done) = write.as_mut().poll(&mut cx) {
-                return done;
-            }
-            assert!(Instant::now() < deadline, "tmux never answered");
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     struct Agent {
@@ -735,11 +875,14 @@ mod real_tmux_tests {
                 session,
                 rx,
             };
+            // A ctl paste is prepared by the client terminal's paste mode, as
+            // a direct paste is, so wait until tmux has set it for the agent.
             agent.until("the client attached and its pane was fixed", |agent| {
                 agent.recv.exists()
                     && agent.screen().contains("agent ready")
                     && agent.format("#{session_attached}") == "1"
                     && agent.session.tmux_input_pane().is_some()
+                    && agent.session.is_bracketed_paste()
             });
             assert!(agent.session.delivers_through_tmux());
             eprintln!(
@@ -899,6 +1042,12 @@ mod real_tmux_tests {
         agent.keys(&extended).unwrap();
         agent.until_received(b"\x02c\x1b[98;5uc");
         assert_eq!(agent.windows(), 1, "esc [ 9 8 ; 5 u c opened a tmux window");
+
+        // Characters outside ASCII arrive as their UTF-8 bytes, unbracketed.
+        agent
+            .keys(&[Key::Char('é'), Key::Char('✓'), Key::Char('x')])
+            .unwrap();
+        agent.until_received("\x02c\x1b[98;5ucé✓x".as_bytes());
 
         // The same two bytes typed into the client do open one: the old path.
         agent.session.write_input(b"\x02c");

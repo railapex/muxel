@@ -1571,10 +1571,16 @@ impl MuxelApp {
                                 if !Arc::ptr_eq(&session, &current_session) {
                                     return Err("the pane restarted".into());
                                 }
-                                if submit {
-                                    session.mark_turn_submitted();
-                                }
-                                Ok(session.control_write(ControlInput::Keys { keys, app_cursor }))
+                                // A press that submits is an Enter (`key_submits`).
+                                // It goes as the submit, so the turn counts as
+                                // submitted only once the Enter is taken.
+                                let input = if submit {
+                                    debug_assert!(keys == [ctl::Key::Enter]);
+                                    ControlInput::Submit
+                                } else {
+                                    ControlInput::Keys { keys, app_cursor }
+                                };
+                                Ok(session.control_write(input))
                             })
                             .unwrap_or_else(|_| Err("muxel is shutting down".into()));
                         let written = match write {

@@ -859,7 +859,9 @@ feature is added or changed, update the matching entry here in the same change**
   `answer`, `keys`, and a `new --prompt` task) goes to the pane's own tmux pane
   through tmux itself: the prompt as one paste from a muxel-named buffer
   (`paste-buffer -p`, bracketed when the agent asked for it, text read from
-  standard input and never parsed as a tmux command), keys with `send-keys`.
+  standard input and never parsed as a tmux command) with the same bytes a
+  direct paste sends, keys with `send-keys` (a character outside ASCII as a
+  raw paste of that character).
   Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
   the user's `bind -n` keys and extended-key encodings in ctl input reach the
   agent as text and never open a window or run a tmux command, and agent panes

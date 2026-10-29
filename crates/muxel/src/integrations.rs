@@ -1966,7 +1966,7 @@ mod tmux_probe_tests {
         let text = "it's; $HOME `id` \"x\" ; display-message boom";
         let out = run_local_tmux_input(
             &server.0,
-            &tmux::control_paste_args(&buffer, &pane),
+            &tmux::control_paste_args(&buffer, &pane, true),
             Some(text.as_bytes()),
         )
         .unwrap();

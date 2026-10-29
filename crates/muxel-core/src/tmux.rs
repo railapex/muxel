@@ -1120,10 +1120,12 @@ pub fn unset_option_if_args(session: &str, option: &str, pattern: &str) -> Optio
 // Caller text never appears in a tmux argument: an argument ending in `;` splits
 // the command list (tmux 2.x `cmd_list_parse`, 3.x `cmd_parse_from_arguments`).
 // Prompt text goes on standard input to `load-buffer -`, and a typed character
-// goes as its code point (`0x3b`). Every other argument is a fixed word, a pane id
-// (`%12`) or a buffer name muxel made. Version floors, from tmux's CHANGES:
-// `display-message -p` 1.2, `load-buffer -` 1.3, `paste-buffer -p` and hex keys
-// 1.7, named buffers 2.0, the `=` exact-session target 2.1.
+// goes as its code point (`0x3b`), or, outside ASCII, on standard input to a raw
+// paste. Every other argument is a fixed word, a pane id (`%12`) or a buffer name
+// muxel made. Version floors, from tmux's CHANGES: `display-message -p` 1.2,
+// `load-buffer -` 1.3, `paste-buffer -p` and hex keys 1.7, named buffers 2.0, the
+// `=` exact-session target 2.1. A hex key above 0x7f is a plain character only
+// from 2.4, which is why those characters are pasted.
 
 /// Arguments for `tmux …` printing `session`'s active pane id, the pane its
 /// client shows. Read it with [`parse_control_pane`]. Like
@@ -1154,14 +1156,15 @@ pub fn control_buffer_name(nonce: Uuid) -> String {
     format!("muxel-ctl-{}", nonce.simple())
 }
 
-/// Arguments for `tmux …` that read the prompt from standard input into
-/// `buffer` and paste it into `pane` as one paste. `-p` brackets it only when
-/// the pane's program asked for bracketed paste; `-r` keeps each LF an LF (by
-/// default `paste-buffer` turns it into CR, which a program reads as Enter
-/// outside a bracketed paste); `-d` deletes the buffer once it is pasted. A
-/// failed paste leaves the buffer: delete it with [`delete_buffer_args`].
-pub fn control_paste_args(buffer: &str, pane: &str) -> Vec<String> {
-    vec![
+/// Arguments for `tmux …` that read text from standard input into `buffer` and
+/// paste it into `pane` as one paste, byte for byte: `-r` stops `paste-buffer`
+/// turning each LF into CR, so the caller decides line endings (a prompt gets
+/// what a direct paste would send). With `bracket`, `-p` brackets the paste
+/// when the pane's program asked for bracketed paste; without it, the bytes
+/// arrive as plain input. `-d` deletes the buffer once it is pasted. A failed
+/// paste leaves the buffer: delete it with [`delete_buffer_args`].
+pub fn control_paste_args(buffer: &str, pane: &str, bracket: bool) -> Vec<String> {
+    let mut args = vec![
         "load-buffer".to_string(),
         "-b".to_string(),
         buffer.to_string(),
@@ -1169,20 +1172,16 @@ pub fn control_paste_args(buffer: &str, pane: &str) -> Vec<String> {
         ";".to_string(),
         "paste-buffer".to_string(),
         "-d".to_string(),
-        "-p".to_string(),
-        "-r".to_string(),
-        "-b".to_string(),
-        buffer.to_string(),
-        "-t".to_string(),
-        pane.to_string(),
-    ]
-}
-
-/// What [`control_paste_args`] reads on standard input for `text`. ESC is
-/// removed, as a direct bracketed paste removes it, so the text can't end the
-/// bracket early and have the rest read as keys.
-pub fn control_paste_input(text: &str) -> Vec<u8> {
-    text.replace('\x1b', "").into_bytes()
+    ];
+    if bracket {
+        args.push("-p".to_string());
+    }
+    args.extend(
+        ["-r", "-b", buffer, "-t", pane]
+            .iter()
+            .map(|arg| (*arg).to_string()),
+    );
+    args
 }
 
 /// Arguments for `tmux …` deleting one of muxel's paste buffers.
@@ -1208,7 +1207,9 @@ pub fn control_pane_exists_args(pane: &str) -> Vec<String> {
 }
 
 /// The tmux key a ctl key presses. A character goes as its code point, which
-/// tmux sends as that character (hex keys since tmux 1.7).
+/// tmux sends as that character (hex keys since tmux 1.7). Only an ASCII
+/// character is that portable: tmux 2.1 to 2.3 read a code point above 0x7f as
+/// a key with modifier bits, so [`control_key_steps`] pastes those instead.
 pub fn key_name(key: crate::control::Key) -> String {
     use crate::control::Key;
     match key {
@@ -1239,6 +1240,33 @@ pub fn control_keys_args(pane: &str, keys: &[crate::control::Key]) -> Vec<String
     let mut args = vec!["send-keys".to_string(), "-t".to_string(), pane.to_string()];
     args.extend(keys.iter().map(|&key| key_name(key)));
     args
+}
+
+/// One tmux command of a ctl key press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStep {
+    /// Keys for [`control_keys_args`]: named keys and ASCII characters.
+    Send(Vec<crate::control::Key>),
+    /// Characters outside ASCII, pasted as their UTF-8 bytes without `-p`
+    /// ([`control_paste_args`]), as typing them sends those bytes. `send-keys`
+    /// takes their code points correctly only from tmux 2.4.
+    Paste(String),
+}
+
+/// The tmux commands that press `keys` in order: runs of keys `send-keys` can
+/// name on any supported tmux, and runs of other characters pasted raw.
+pub fn control_key_steps(keys: &[crate::control::Key]) -> Vec<KeyStep> {
+    use crate::control::Key;
+    let mut steps: Vec<KeyStep> = Vec::new();
+    for &key in keys {
+        match (key, steps.last_mut()) {
+            (Key::Char(c), Some(KeyStep::Paste(text))) if !c.is_ascii() => text.push(c),
+            (Key::Char(c), _) if !c.is_ascii() => steps.push(KeyStep::Paste(c.to_string())),
+            (key, Some(KeyStep::Send(run))) => run.push(key),
+            (key, _) => steps.push(KeyStep::Send(vec![key])),
+        }
+    }
+    steps
 }
 
 #[cfg(test)]
@@ -1275,7 +1303,7 @@ mod tests {
         let buffer = control_buffer_name(Uuid::nil());
         assert_eq!(buffer, "muxel-ctl-00000000000000000000000000000000");
         assert_eq!(
-            control_paste_args(&buffer, "%12"),
+            control_paste_args(&buffer, "%12", true),
             [
                 "load-buffer",
                 "-b",
@@ -1293,6 +1321,23 @@ mod tests {
             ]
         );
         assert_eq!(
+            control_paste_args(&buffer, "%12", false),
+            [
+                "load-buffer",
+                "-b",
+                buffer.as_str(),
+                "-",
+                ";",
+                "paste-buffer",
+                "-d",
+                "-r",
+                "-b",
+                buffer.as_str(),
+                "-t",
+                "%12"
+            ]
+        );
+        assert_eq!(
             delete_buffer_args(&buffer),
             ["delete-buffer", "-b", buffer.as_str()]
         );
@@ -1300,10 +1345,33 @@ mod tests {
             control_pane_exists_args("%12"),
             ["display-message", "-p", "-t", "%12", "#{pane_id}"]
         );
+    }
+
+    #[test]
+    fn keys_outside_ascii_are_pasted_raw_and_the_rest_keep_their_order() {
+        use crate::control::Key;
+        let keys = [
+            Key::Ctrl('b'),
+            Key::Char('c'),
+            Key::Char('é'),
+            Key::Char('✓'),
+            Key::Enter,
+            Key::Char('𝄞'),
+        ];
         assert_eq!(
-            control_paste_input("héllo;\n\x1b[201~wörld ✓"),
-            "héllo;\n[201~wörld ✓".as_bytes()
+            control_key_steps(&keys),
+            [
+                KeyStep::Send(vec![Key::Ctrl('b'), Key::Char('c')]),
+                KeyStep::Paste("é✓".into()),
+                KeyStep::Send(vec![Key::Enter]),
+                KeyStep::Paste("𝄞".into()),
+            ]
         );
+        assert_eq!(
+            control_key_steps(&[Key::Enter]),
+            [KeyStep::Send(vec![Key::Enter])]
+        );
+        assert!(control_key_steps(&[]).is_empty());
     }
 
     #[test]
@@ -1327,7 +1395,7 @@ mod tests {
             "space",
             "ctrl-b",
             ";",
-            "é",
+            "~",
             "1",
         ]
         .iter()
@@ -1356,7 +1424,7 @@ mod tests {
                 "Space",
                 "C-b",
                 "0x3b",
-                "0xe9",
+                "0x7e",
                 "0x31"
             ]
         );
