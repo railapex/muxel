@@ -1879,6 +1879,41 @@ fn review_r3_pane_opened_during_a_worktree_question_gets_its_own_prompt_and_undo
 }
 
 #[test]
+fn review_r3_a_member_closing_another_way_leaves_one_worktree_question() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (captured, _, captured_child) = terminal(cx, window, pid);
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, captured);
+        let draft = path.join("draft.txt");
+        std::fs::write(&draft, "keep this work\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.request_close_instance(captured, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+
+                // The question's only member goes another way, which orphans the
+                // worktree while its question is still showing.
+                app.close_instance_inner(captured, "close (fixture)", cx);
+                assert!(app.workspace.instance(captured).is_none());
+                assert_eq!(
+                    app.pending_worktree_dispose.len(),
+                    1,
+                    "the orphaned worktree queued a second question"
+                );
+                assert!(path.is_dir());
+
+                app.dispose_worktree_keep(cx);
+                assert!(app.pending_worktree_dispose.is_empty());
+                assert!(app.workspace.worktree(wid).unwrap().detached);
+                assert_eq!(std::fs::read_to_string(&draft).unwrap(), "keep this work\n");
+            })
+            .unwrap();
+        wait_for_exit(cx, &captured_child);
+    });
+}
+
+#[test]
 fn review_r3_undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
     with_app(|cx, window| {
         let pid = project(cx, window);
