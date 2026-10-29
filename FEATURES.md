@@ -219,13 +219,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -403,7 +414,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. A marker-based agent whose turn finishes
+  icon, dashboard, and notification dots. Screen checks skip Claude's input box,
+  so a typed or pasted draft can't set a Claude pane's status. Grok's unanswered
+  question card reports **blocked** in a pane without a tmux status bar. A
+  marker-based agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
   notification read without rewriting lifecycle state or age. Sidebar badges include
@@ -426,7 +440,9 @@ feature is added or changed, update the matching entry here in the same change**
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
-  defaults per agent and **editable working/blocked markers per preset**.
+  defaults per agent and **editable working/blocked markers per preset**. Claude's
+  built-in lists give way to its own status-row and permission-form parsers; an
+  edited list matches as written.
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
@@ -1390,7 +1406,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;

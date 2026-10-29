@@ -20,6 +20,25 @@ per 50 ms with one exact trailing deadline; unchanged generations and ordinary
 reads never scan the grid. Render therefore cannot manufacture a lifecycle
 transition by polling more often.
 
+The captured screen includes cursor and bracketed-paste metadata. Claude's status
+sources exclude its input box, whether it holds a draft or the placeholder: the
+rows inside the screen's last rule and the nearest identical rule above it, when
+the first of them starts with `❯`. The box's edges are the same full-width rule;
+a rule typed into a draft is drawn under the prompt, two columns in, so it can't
+pass for an edge. Status recognition may locate the box while a repaint hides or
+moves the cursor; this does not authorize startup input, whose stricter cursor
+guards are unchanged. A real dialog without a box keeps the full screen.
+
+When a Claude pane's marker list is exactly the built-in one (`esc to interrupt`
+for working; `❯ 1.` and `Do you want to proceed` for blocked), Claude's strict
+permission and live-work parsers replace it. A stored preset can't tell the
+seeded list from the same list typed in, so that list counts as the built-in.
+Any other list is the user's own and matches as written outside the input box,
+including strings the built-in list also has. Grok's unanswered question card
+reports Blocked while its title still says Working, when the card's footer is
+the screen's last row. Under a tmux status bar the card isn't read and the
+title's Working stands.
+
 ## Snapshot fields
 
 `TerminalRuntimeSnapshot` holds:
