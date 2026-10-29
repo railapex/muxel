@@ -48,37 +48,16 @@ impl MuxelApp {
         }
     }
 
-    pub(super) fn render_close_chip(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(latest) = self.close_groups.last() else {
-            if !self.close_requests.is_empty() {
-                return div()
-                    .id("recoverable-close-checking")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(div().text_xs().child(t("Checking before close…")))
-                    .child(
-                        Button::new("close-check-cancel")
-                            .ghost()
-                            .xsmall()
-                            .label(t("Cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                // Removing admission tokens invalidates late
-                                // replies; no terminal has been held yet.
-                                this.close_requests.clear();
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element();
-            }
-            return div().into_any_element();
-        };
+    /// Drop every close request still being checked. Late replies find no
+    /// token and do nothing; terminals already counting down keep their Undo.
+    pub(super) fn cancel_close_checks(&mut self, cx: &mut Context<Self>) {
+        self.close_requests.clear();
+        cx.notify();
+    }
+
+    /// The newest group's chip text and the label of its button, which acts on
+    /// that group. A request still being checked has a segment of its own.
+    pub(super) fn close_chip_text(&self, latest: &CloseGroup) -> (SharedString, SharedString) {
         let several = self.close_groups.len() > 1;
         let panes: usize = self
             .close_groups
@@ -86,38 +65,96 @@ impl MuxelApp {
             .map(|group| group.members.len())
             .sum();
         let multiple = panes > 1;
-        let label: SharedString =
-            if (latest.checking || !self.close_requests.is_empty()) && !latest.undoing {
-                t("Checking before close…")
-            } else if !several && latest.needs_decision && !latest.undoing {
-                self.close_decision_label(latest)
-            } else if multiple {
-                tf("{n} closing", &[("n", &panes.to_string())]).into()
-            } else if let Some(caller) = latest.caller.as_deref() {
-                tf(
-                    "Closed {name} by {caller}",
-                    &[
-                        ("name", self.close_group_name(latest).as_ref()),
-                        ("caller", caller),
-                    ],
-                )
-                .into()
-            } else {
-                tf(
-                    "Closed {name}",
-                    &[("name", self.close_group_name(latest).as_ref())],
-                )
-                .into()
-            };
-        let gid = latest.id;
         let decision = !several && latest.needs_decision && !latest.undoing;
-        let undo = if latest.undoing {
+        let label: SharedString = if latest.checking && !latest.undoing {
+            t("Checking before close…")
+        } else if decision {
+            self.close_decision_label(latest)
+        } else if multiple {
+            tf("{n} closing", &[("n", &panes.to_string())]).into()
+        } else if let Some(caller) = latest.caller.as_deref() {
+            tf(
+                "Closed {name} by {caller}",
+                &[
+                    ("name", self.close_group_name(latest).as_ref()),
+                    ("caller", caller),
+                ],
+            )
+            .into()
+        } else {
+            tf(
+                "Closed {name}",
+                &[("name", self.close_group_name(latest).as_ref())],
+            )
+            .into()
+        };
+        let button = if decision {
+            t("Keep")
+        } else if latest.undoing {
             t("Restoring…")
         } else if latest.checking || multiple {
             t("Undo")
         } else {
             countdown_label(latest.deadline)
         };
+        (label, button)
+    }
+
+    fn render_close_check(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("recoverable-close-checking")
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text_xs().child(t("Checking before close…")))
+            .child(
+                Button::new("close-check-cancel")
+                    .ghost()
+                    .xsmall()
+                    .label(t("Cancel"))
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_close_checks(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The newest countdown, and beside it any close request still being
+    /// checked, each with the button that acts on it.
+    pub(super) fn render_close_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let check = (!self.close_requests.is_empty()).then(|| self.render_close_check(cx));
+        let Some(latest) = self.close_groups.last() else {
+            return check.unwrap_or_else(|| div().into_any_element());
+        };
+        let group = self.render_close_group_chip(latest, cx);
+        match check {
+            Some(check) => div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .min_w_0()
+                .child(group)
+                .child(check)
+                .into_any_element(),
+            None => group,
+        }
+    }
+
+    fn render_close_group_chip(&self, latest: &CloseGroup, cx: &mut Context<Self>) -> AnyElement {
+        let several = self.close_groups.len() > 1;
+        let multiple = self
+            .close_groups
+            .iter()
+            .map(|group| group.members.len())
+            .sum::<usize>()
+            > 1;
+        let (label, button) = self.close_chip_text(latest);
+        let gid = latest.id;
+        let decision = !several && latest.needs_decision && !latest.undoing;
         let needs_decision = self
             .close_groups
             .iter()
@@ -167,7 +204,7 @@ impl MuxelApp {
                 Button::new("close-chip-undo")
                     .ghost()
                     .xsmall()
-                    .label(if decision { t("Keep") } else { undo })
+                    .label(button)
                     .disabled(latest.undoing)
                     .tooltip(t("Restore the closed terminals (Ctrl+Alt+Z)"))
                     .on_click(cx.listener(move |this, _, window, cx| {

@@ -112,13 +112,20 @@ feature is added or changed, update the matching entry here in the same change**
   binding, input and completion before expiry; changed work gets Close / Keep.
   Batch closes offer Close all, Close only the idle ones, or Cancel. Queued input
   is cancelled across close and Undo, and hidden panes leave ctl listings;
-  writes refuse with `closing` and `undo_until`.
+  writes refuse with `closing` and `undo_until`. A shell counts down only with
+  prompt evidence, so local tmux shells on Unix, which can't pass OSC 133
+  through, always ask.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
   a muxel worktree with changes or unmerged commits uses its disposal choice
-  directly; a clean, landed worktree follows the terminal countdown policy.
-  Client checks show progress during batch closes. Ordinary saves preserve held
-  panes for crash recovery; workspace switch and quit finalize them.
+  directly; a clean, landed worktree follows the terminal countdown policy. A
+  pane opened in that worktree while its question is showing gets its own
+  prompt and countdown, and a pane brought back by Undo leaves the question.
+  Client checks show progress, beside any running countdown, with their own
+  Cancel; a batch member closed during the check leaves the others to their
+  decision. Ordinary saves preserve held panes for crash recovery; workspace
+  switch and quit finalize them. If that save fails, the first switch stops
+  with a notice and the next one leaves anyway; the pane reopens next time.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 

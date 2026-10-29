@@ -449,10 +449,22 @@ fn wait_for_view(
         {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "owned terminal did not reach expected state"
-        );
+        if Instant::now() >= deadline {
+            let seen = window
+                .read_with(cx, |_, cx| {
+                    let view = view.read(cx);
+                    format!(
+                        "reason {:?}, status {:?}, title {:?}, exited {}, screen {:?}",
+                        view.runtime_snapshot().reason,
+                        view.status(),
+                        view.title(),
+                        view.exited(),
+                        view.visible_text().trim(),
+                    )
+                })
+                .unwrap();
+            panic!("owned terminal did not reach expected state: {seen}");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -577,13 +589,20 @@ fn title_terminal(
             )
             .unwrap();
             // cmd rejects canonical verbatim paths. Pass a local filename and
-            // the same normal cwd used by the verified B2 title fixture.
+            // the same normal cwd used by the verified B2 title fixture. The
+            // `.\` keeps it found when NoDefaultCurrentDirectoryInExePath is set
+            // (Claude Code exports it), which stops cmd searching the cwd.
             let directory = root.to_string_lossy();
             let directory = directory
                 .strip_prefix(r"\\?\")
                 .unwrap_or(&directory)
                 .to_string();
-            let args = vec!["/d".into(), "/q".into(), "/c".into(), filename];
+            let args = vec![
+                "/d".into(),
+                "/q".into(),
+                "/c".into(),
+                format!(r".\{filename}"),
+            ];
             let mut instance = Instance::shell(pid);
             instance.program = Some("codex".into());
             instance.custom_name = Some(name.into());
@@ -1596,6 +1615,313 @@ fn delayed_transcript_refuses_retired_epoch_and_replaced_session_without_changin
                 assert!(!child.exited());
                 assert!(!other_child.exited());
                 assert!(!replacement_child.exited());
+            })
+            .unwrap();
+    });
+}
+
+/// A recorded tmux session sends a close through the client-count probe. tmux
+/// is absent on Windows hosts, so the probe ends quickly with an unknown count.
+fn route_through_client_probe(app: &mut MuxelApp, iid: Uuid) {
+    app.workspace.instance_mut(iid).unwrap().tmux_session =
+        Some(format!("muxel_r3_probe_{}", Uuid::new_v4().simple()));
+}
+
+fn wait_for_close_checks(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        if window
+            .read_with(cx, |app, _| app.close_requests.is_empty())
+            .unwrap()
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "client probe reply never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn review_r3_probe_batch_still_decides_after_one_member_closes_another_way() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (probed, _, probed_child) = terminal(cx, window, pid);
+        let (other, _, other_child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                route_through_client_probe(app, probed);
+                app.request_recoverable_close(vec![probed, other], cx);
+                assert_eq!(
+                    app.close_requests.len(),
+                    2,
+                    "fixture must wait on its client probe"
+                );
+                assert!(app.confirm.is_none());
+                // The batch's other member goes some other way mid-probe.
+                app.close_instance_inner(other, "close (fixture)", cx);
+                assert!(!app.close_requests.contains_key(&other));
+            })
+            .unwrap();
+        wait_for_close_checks(cx, window);
+        window
+            .update(cx, |app, _, cx| {
+                let pending = app
+                    .confirm
+                    .as_ref()
+                    .expect("the remaining member was dropped with its batch");
+                assert!(matches!(
+                    &pending.action,
+                    ConfirmAction::CloseBatch(ids) if ids.as_slice() == [probed]
+                ));
+                assert!(!app.is_closing(probed));
+                assert!(!probed_child.exited());
+                app.cancel_confirm(cx);
+            })
+            .unwrap();
+        wait_for_exit(cx, &other_child);
+    });
+}
+
+#[test]
+fn review_r3_workspace_switch_stops_once_for_an_unsaved_close_then_leaves() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        let (previous, next, old_path) = window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                let previous = app.current_workspace.unwrap();
+                let next = Uuid::new_v4();
+                app.workspaces.workspaces.extend([
+                    WorkspaceMeta {
+                        id: previous,
+                        name: "previous".into(),
+                    },
+                    WorkspaceMeta {
+                        id: next,
+                        name: "target".into(),
+                    },
+                ]);
+                let root = muxel_store::data_dir()
+                    .unwrap()
+                    .join("unsaved-close-target");
+                std::fs::create_dir_all(&root).unwrap();
+                let mut target = Workspace::default();
+                target.add_project(Project::new("target", root));
+                muxel_store::save_workspace_to(
+                    &muxel_store::workspace_doc_path(next).unwrap(),
+                    &target,
+                )
+                .unwrap();
+                app.hold_closes(vec![(pane, false)], None, cx).unwrap();
+                // Replace only this isolated fixture document with a directory,
+                // so every later save fails whatever the account's privileges.
+                let old_path = muxel_store::workspace_doc_path(previous).unwrap();
+                std::fs::remove_file(&old_path).unwrap();
+                std::fs::create_dir(&old_path).unwrap();
+                app.enter_workspace(next, window, cx);
+                assert_eq!(
+                    app.current_workspace,
+                    Some(previous),
+                    "the first switch must stop for the unsaved close"
+                );
+                assert!(app.workspace.instance(pane).is_none());
+                assert!(app.save_errors.contains_key(&SaveTarget::Workspace));
+                assert!(app.notifications.iter().any(|notice| {
+                    matches!(notice.kind, NotifKind::Error)
+                        && notice.title == super::t("Closed terminals weren't saved").as_ref()
+                }));
+                (previous, next, old_path)
+            })
+            .unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                assert_eq!(app.current_workspace, Some(previous));
+                app.enter_workspace(next, window, cx);
+                assert_eq!(
+                    app.current_workspace,
+                    Some(next),
+                    "a store that keeps failing must not trap the user"
+                );
+                assert!(!app.close_persist_pending);
+                assert!(!app.close_flush_warned);
+            })
+            .unwrap();
+        std::fs::remove_dir(&old_path).unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn review_r3_a_new_check_beside_a_countdown_has_its_own_cancel() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (held, _, held_child) = terminal(cx, window, pid);
+        let (probed, _, probed_child) = terminal(cx, window, pid);
+        let group = window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                let group = app.hold_closes(vec![(held, false)], None, cx).unwrap();
+                route_through_client_probe(app, probed);
+                app.request_recoverable_close(vec![probed], cx);
+                assert!(app.close_requests.contains_key(&probed));
+                let latest = app.close_groups.last().unwrap();
+                assert_eq!(latest.id, group);
+                let (label, button) = app.close_chip_text(latest);
+                let name = app.workspace.instance(held).unwrap().display_name();
+                assert_eq!(
+                    label.as_ref(),
+                    super::tf("Closed {name}", &[("name", name)]),
+                    "the countdown's label must not describe the other request"
+                );
+                assert!(
+                    button.chars().any(|c| c.is_ascii_digit()),
+                    "the button must stay this group's Undo countdown: {button}"
+                );
+                app.cancel_close_checks(cx);
+                assert!(app.close_requests.is_empty());
+                assert!(app.is_closing(held), "cancelling the check undid the hold");
+                assert!(app.closing_until(held).is_some());
+                group
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, window, cx| {
+                assert!(app.confirm.is_none(), "a cancelled check still asked");
+                assert!(!app.is_closing(probed));
+                assert!(app.workspace.instance(probed).is_some());
+                assert!(!probed_child.exited());
+                app.undo_close(group, window, cx);
+                assert!(!app.is_closing(held));
+                assert!(Arc::ptr_eq(
+                    app.terminal_view(held).unwrap().read(cx).session(),
+                    &held_child.session
+                ));
+                assert!(!held_child.exited());
+            })
+            .unwrap();
+    });
+}
+
+fn join_worktree(app: &mut MuxelApp, iid: Uuid, wid: Uuid, path: &Path) {
+    let instance = app.workspace.instance_mut(iid).unwrap();
+    instance.worktree_id = Some(wid);
+    instance.worktree_path = Some(path.to_path_buf());
+    instance.worktree_branch = Some("muxel/clean-close-fixture".into());
+}
+
+#[test]
+fn review_r3_pane_opened_during_a_worktree_question_gets_its_own_prompt_and_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (captured, _, captured_child) = terminal(cx, window, pid);
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, captured);
+        let draft = path.join("draft.txt");
+        std::fs::write(&draft, "keep this work\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.request_close_instance(captured, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                assert_eq!(app.pending_worktree_dispose[0].close_after, vec![captured]);
+            })
+            .unwrap();
+        let (fresh, _, fresh_child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, window, cx| {
+                join_worktree(app, fresh, wid, &path);
+                app.request_close_instance(fresh, cx);
+                let pending = &app.pending_worktree_dispose[0];
+                assert_eq!(
+                    pending.close_after,
+                    vec![captured],
+                    "a pane opened after the question joined its answer"
+                );
+                assert!(pending.close_rest.is_empty());
+                let prompt = app
+                    .confirm
+                    .as_ref()
+                    .expect("the new pane gets its own prompt");
+                assert!(matches!(
+                    &prompt.action,
+                    ConfirmAction::CloseBatch(ids) if ids.as_slice() == [fresh]
+                ));
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(fresh));
+                assert!(app.closing_until(fresh).is_some());
+                assert!(!fresh_child.exited());
+
+                // Answering the earlier question while the new pane counts down
+                // asks again, now covering it.
+                app.dispose_worktree_keep(cx);
+                assert!(!app.workspace.worktree(wid).unwrap().detached);
+                assert!(app.is_closing(fresh));
+                assert!(!fresh_child.exited());
+                assert!(!captured_child.exited());
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                let asked = &app.pending_worktree_dispose[0].close_after;
+                assert!(asked.contains(&captured) && asked.contains(&fresh));
+
+                app.dispose_worktree_keep(cx);
+                assert!(app.workspace.instance(captured).is_none());
+                assert!(app.workspace.instance(fresh).is_none());
+                assert!(app.pending_worktree_dispose.is_empty());
+                assert!(app.workspace.worktree(wid).unwrap().detached);
+                assert_eq!(std::fs::read_to_string(&draft).unwrap(), "keep this work\n");
+            })
+            .unwrap();
+        wait_for_exit(cx, &captured_child);
+        wait_for_exit(cx, &fresh_child);
+    });
+}
+
+#[test]
+fn review_r3_undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (held, _, held_child) = terminal(cx, window, pid);
+        let (second, _, second_child) = terminal(cx, window, pid);
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, held);
+        let draft = path.join("draft.txt");
+        std::fs::write(&draft, "keep this work\n").unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                join_worktree(app, second, wid, &path);
+                let group = app.hold_closes(vec![(held, false)], None, cx).unwrap();
+                app.request_close_instance(second, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                assert!(app.pending_worktree_dispose[0].close_after.contains(&held));
+                app.undo_close(group, window, cx);
+                assert!(!app.is_closing(held));
+                assert_eq!(app.pending_worktree_dispose[0].close_after, vec![second]);
+
+                app.dispose_worktree_discard(cx);
+                assert!(
+                    app.workspace.instance(held).is_some(),
+                    "the answer closed a pane that Undo brought back"
+                );
+                assert!(Arc::ptr_eq(
+                    app.terminal_view(held).unwrap().read(cx).session(),
+                    &held_child.session
+                ));
+                assert!(!held_child.exited());
+                assert!(path.is_dir(), "discard removed a worktree still in use");
+                assert_eq!(std::fs::read_to_string(&draft).unwrap(), "keep this work\n");
+                assert!(app.workspace.worktree(wid).is_some());
+                let prompt = app
+                    .confirm
+                    .as_ref()
+                    .expect("the remaining pane is asked about normally");
+                assert!(matches!(
+                    &prompt.action,
+                    ConfirmAction::CloseBatch(ids) if ids.as_slice() == [second]
+                ));
+                assert!(!second_child.exited());
+                app.cancel_confirm(cx);
             })
             .unwrap();
     });

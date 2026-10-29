@@ -185,42 +185,28 @@ impl MuxelApp {
             )
             .await;
             let _ = this.update(cx, |this, cx| {
-                let valid = this.current_workspace == workspace
-                    && ids
-                        .iter()
-                        .all(|iid| this.close_requests.get(iid) == Some(&token));
-                // Superseding just one member invalidates the batch. Retire its
-                // other tokens too, without erasing a newer request's tokens.
-                for iid in &ids {
-                    if this.close_requests.get(iid) == Some(&token) {
-                        this.close_requests.remove(iid);
-                    }
+                // A member closed another way, or taken over by a newer request,
+                // leaves this batch; the others still get their decision. Cancel
+                // and workspace switch clear every token, so nothing remains.
+                let current: Vec<_> = ids
+                    .into_iter()
+                    .filter(|iid| this.close_requests.get(iid) == Some(&token))
+                    .collect();
+                for iid in &current {
+                    this.close_requests.remove(iid);
                 }
                 cx.notify();
-                if !valid {
+                if this.current_workspace != workspace || current.is_empty() {
                     return;
                 }
                 this.close_client_counts.extend(counts);
-                this.plan_close_request(ids, cx);
+                this.plan_close_request(current, cx);
             });
         })
         .detach();
     }
 
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
-        let busy: Vec<_> = ids
-            .iter()
-            .filter(|&&iid| {
-                self.workspace
-                    .instance(iid)
-                    .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
-                    && decide(
-                        self.close_facts(iid, cx),
-                        self.settings.confirm_close_terminal,
-                    ) == CloseDecision::Ask
-            })
-            .copied()
-            .collect();
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
                 .is_some_and(|editor| editor.read(cx).is_dirty())
@@ -234,9 +220,22 @@ impl MuxelApp {
             );
             return;
         }
-        if self.preflight_close_worktrees(&ids, cx) {
+        let Some(ids) = self.preflight_close_worktrees(ids, cx) else {
             return;
-        }
+        };
+        let busy: Vec<_> = ids
+            .iter()
+            .filter(|&&iid| {
+                self.workspace
+                    .instance(iid)
+                    .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
+                    && decide(
+                        self.close_facts(iid, cx),
+                        self.settings.confirm_close_terminal,
+                    ) == CloseDecision::Ask
+            })
+            .copied()
+            .collect();
         if !busy.is_empty() {
             let message = busy
                 .iter()
@@ -535,6 +534,11 @@ impl MuxelApp {
         let mut restart = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
+                // A pane brought back is no longer going away. A disposal
+                // question that counted it must ask again before it acts.
+                for pending in &mut self.pending_worktree_dispose {
+                    pending.close_after.retain(|&member| member != iid);
+                }
                 if let Some(view) = self.terminal_view(iid) {
                     view.read(cx).session().resume_input();
                 }
@@ -790,39 +794,59 @@ impl MuxelApp {
     }
 
     /// A worktree choice is the sole confirmation and finalizes before touching git.
+    /// Returns the ids to plan here, or `None` once a disposal question owns them.
     pub(super) fn preflight_close_worktrees(
         &mut self,
-        ids: &[Uuid],
+        ids: Vec<Uuid>,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<Vec<Uuid>> {
+        // A pane opened in a worktree after its question was shown is not part
+        // of that answer. It gets its own prompt and countdown instead.
+        let uncaptured: HashSet<_> = ids
+            .iter()
+            .copied()
+            .filter(|&iid| {
+                self.workspace
+                    .instance(iid)
+                    .and_then(|instance| instance.worktree_id)
+                    .is_some_and(|wid| {
+                        self.pending_worktree_dispose
+                            .iter()
+                            .any(|d| d.wid == wid && !d.close_after.contains(&iid))
+                    })
+            })
+            .collect();
+        // Repeating a close the question already covers joins it, and the rest
+        // of that request waits for the answer, as it did the first time.
+        if let Some(pending) = self
+            .pending_worktree_dispose
+            .iter_mut()
+            .find(|d| ids.iter().any(|iid| d.close_after.contains(iid)))
+        {
+            for &iid in &ids {
+                if !uncaptured.contains(&iid)
+                    && !pending.close_after.contains(&iid)
+                    && !pending.close_rest.contains(&iid)
+                {
+                    pending.close_rest.push(iid);
+                }
+            }
+            cx.notify();
+            let now: Vec<_> = ids
+                .into_iter()
+                .filter(|iid| uncaptured.contains(iid))
+                .collect();
+            return (!now.is_empty()).then_some(now);
+        }
         let selected: HashSet<_> = ids.iter().copied().collect();
         let worktrees: Vec<_> = ids
             .iter()
+            .filter(|iid| !uncaptured.contains(iid))
             .filter_map(|iid| self.workspace.instance(*iid)?.worktree_id)
             .collect();
         for wid in worktrees {
             let members = self.workspace.instances_using(wid);
             let member_ids: HashSet<_> = members.iter().copied().collect();
-            if let Some(pending) = self
-                .pending_worktree_dispose
-                .iter_mut()
-                .find(|d| d.wid == wid)
-            {
-                for &iid in ids {
-                    let queued = if member_ids.contains(&iid) {
-                        &mut pending.close_after
-                    } else {
-                        &mut pending.close_rest
-                    };
-                    queued.push(iid);
-                }
-                let mut seen = HashSet::new();
-                pending.close_after.retain(|iid| seen.insert(*iid));
-                seen.clear();
-                pending.close_rest.retain(|iid| seen.insert(*iid));
-                cx.notify();
-                return true;
-            }
             if !members
                 .iter()
                 .all(|iid| selected.contains(iid) || self.is_closing(*iid))
@@ -871,9 +895,9 @@ impl MuxelApp {
                 let _ = main.update(cx, |_, window, _| window.activate_window());
             }
             cx.notify();
-            return true;
+            return None;
         }
-        false
+        Some(ids)
     }
 
     /// A pane opened after the question was shown was never part of its answer.

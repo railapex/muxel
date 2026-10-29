@@ -5052,6 +5052,8 @@ pub struct MuxelApp {
     preserve_close_worktrees: bool,
     /// A finalized hold still needs to be removed from the durable document.
     close_persist_pending: bool,
+    /// A workspace switch already stopped once for that unsaved removal.
+    close_flush_warned: bool,
     close_tmux_kills: Vec<Task<()>>,
     close_departure: Option<CloseDeparture>,
     close_departure_task: Option<Task<()>>,
@@ -7444,6 +7446,7 @@ impl MuxelApp {
             show_close_list: false,
             preserve_close_worktrees: false,
             close_persist_pending: false,
+            close_flush_warned: false,
             close_tmux_kills: Vec::new(),
             close_departure: None,
             close_departure_task: None,
@@ -10981,6 +10984,7 @@ impl MuxelApp {
             Ok(()) => {
                 self.auto_name_save_due = None;
                 self.close_persist_pending = false;
+                self.close_flush_warned = false;
                 self.clear_save_error(SaveTarget::Workspace);
                 true
             }
@@ -11034,10 +11038,28 @@ impl MuxelApp {
             let _phase = ui_profile::phase("workspace", "persist-old", None);
             self.try_persist()
         };
-        if !persisted && (self.close_persist_pending || self.auto_name_save_due.is_some()) {
-            self.show_workspace_selector = true;
-            cx.notify();
-            return;
+        if !persisted {
+            // An unsaved automatic title vetoes the switch, as before. A finished
+            // close that couldn't be saved vetoes only the first attempt, with a
+            // notice. The next attempt still tries to save it, then leaves
+            // anyway, as Quit does, so a failing store can't trap the user here.
+            let close_veto = self.close_persist_pending && !self.close_flush_warned;
+            if close_veto {
+                self.close_flush_warned = true;
+                self.add_event(
+                    NotifKind::Error,
+                    t("Closed terminals weren't saved"),
+                    t(
+                        "Switch again to leave anyway. They'll reopen the next time this workspace opens.",
+                    )
+                    .to_string(),
+                );
+            }
+            if close_veto || self.auto_name_save_due.is_some() {
+                self.show_workspace_selector = true;
+                cx.notify();
+                return;
+            }
         }
         self.close_tmux_kills.retain(|task| !task.is_ready());
         if !self.close_tmux_kills.is_empty() {
@@ -11048,6 +11070,9 @@ impl MuxelApp {
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
+        // The old document's save is settled, or given up after one warning.
+        self.close_persist_pending = false;
+        self.close_flush_warned = false;
         self.close_requests.clear();
         self.close_client_counts.clear();
         self.show_close_list = false;
@@ -16796,7 +16821,10 @@ impl MuxelApp {
     /// worktree (clean tree + nothing unmerged); otherwise queue the dispose modal
     /// so uncommitted changes / unmerged commits aren't lost silently.
     fn dispose_worktree_if_orphaned(&mut self, wid: Uuid, cx: &mut Context<Self>) {
-        if !self.workspace.instances_using(wid).is_empty() {
+        // A question already showing for it decides; never queue a second one.
+        if !self.workspace.instances_using(wid).is_empty()
+            || self.pending_worktree_dispose.iter().any(|d| d.wid == wid)
+        {
             return;
         }
         let Some(w) = self.workspace.worktree(wid) else {
