@@ -219,13 +219,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -830,7 +841,10 @@ feature is added or changed, update the matching entry here in the same change**
   returns the same, so a caller can `send` then `wait` without polling. An answer
   to a question counts as a turn too, so `answer` then `wait` works the same way.
 - **Refuses what would go wrong** — `send` won't type into an agent that is
-  working or waiting on a question (unless forced), `answer` only picks an option
+  working, waiting on a question, or still in the grace after a submitted control
+  turn (unless forced). It checks again at paste after the shared tmux claim settles.
+  `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
+  forced. An older host ignores the caller ID. `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands. That
@@ -851,9 +865,10 @@ feature is added or changed, update the matching entry here in the same change**
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
-  the pane closes or restarts. A withheld send fails and attempts to release only
-  its own tmux claim; timeout, command failure or older tmux can leave the claim
-  in place under its existing aging rules.
+  the pane closes or restarts. A failure before a paste attempt releases only its
+  own tmux claim; after a paste attempt it keeps the claim under the normal aging
+  rules, since the prompt may have reached the agent. Timeout, command failure or
+  older tmux can also leave the claim in place.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -866,6 +881,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
+  A send failure after a paste attempt reports `pasted: true`; a writer failure
+  may have left partial input. `working` with `reason: just_submitted` identifies
+  the prior turn's grace when the pane has a provider status or configured screen
+  marker. Activity-only panes can accept consecutive sends. `ctl help COMMAND`
+  shows command help; `-h` and `--help` after a command refuse with exit 2 so a
+  script cannot mistake help for a sent prompt. `--` before literal text keeps
+  those words as prompt text. Unknown verbs suggest a nearby command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
@@ -959,7 +981,11 @@ feature is added or changed, update the matching entry here in the same change**
   crashed lapses once the agent is seen to finish, or when its grace period runs
   out. `show` reports it as `controller`: which computer last typed into the agent
   this way, whether that was this muxel, and whether its turn is still open.
-  `send --force` overrides it.
+  `send --force` overrides it, publishing its marker after the paste within two
+  seconds or withholding Enter. Within one muxel, a second `send` to an agent is
+  refused until the first one's Enter is in. muxel checks once per host whether
+  its tmux can compare markers (2.6 or later); older tmux overwrites the marker
+  and reads it back instead, and leaves it to lapse rather than clearing it.
 
 ## Terminal
 
@@ -1390,7 +1416,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
