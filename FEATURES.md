@@ -219,13 +219,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -401,6 +412,22 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability
+  query before a following DA query, and Claude, Codex, Grok and Muse panes take
+  their reports as status. Working, blocked (including permission, question, or
+  auth kind), and finished states come from the agent while its root report is
+  current; a shell, opencode or Amp pane ignores reports, since anything printed
+  there can carry one. A blocked prompt on screen or in the agent's title still
+  shows **blocked** while the report says Working. A finished Codex turn also
+  reaches **done** when its submitted Working turn reports Idle; protocol `error`
+  uses the existing **done** badge with its error source retained. A Working
+  report before any prompt in the launch, such as Codex's while it resumes a
+  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  process exit, or relaunch returns an unfinished pane to its existing fallback
+  detection. Both local and remote tmux panes continue using that fallback
+  because tmux does not forward OSC 7501 reports. Once Claude has reported in a
+  launch, its glyph-less title names the pane for the rest of that launch without
+  supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes
@@ -440,10 +467,13 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
-  An agent that prints nothing more after the switch settles a couple of seconds
-  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  If no fresh evidence arrives after the switch, a timer settles an idle pane
+  so it accepts sends again; an old prompt or
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
+  An old busy title retires after five seconds of silence when no new submission,
+  fresh title, screen marker or bell sustains it. This returns to Idle without
+  reporting a completed turn.
   A Grok conversation switch releases old loop ownership even if saving fails.
   A confirmed provider switch clears the previous conversation's automatic name,
   including a switch back to the same UUID between reads; a transcript path
@@ -1390,7 +1420,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
