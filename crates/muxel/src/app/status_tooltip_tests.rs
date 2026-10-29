@@ -125,7 +125,9 @@ fn popout_activity_prose_changes_do_not_redraw_the_root_with_a_stable_lifecycle_
                 let mut instance = Instance::shell(pid);
                 instance.program = Some("codex".into());
                 let pane = instance.id;
-                let args = vec!["/d".into(), "/q".into(), "/c".into(), "activity.cmd".into()];
+                // An explicit path: cmd skips the current directory when
+                // NoDefaultCurrentDirectoryInExePath is set.
+                let args = vec!["/d".into(), "/q".into(), "/c".into(), r".\activity.cmd".into()];
                 let spec = CommandSpec::program("cmd.exe", args)
                     .with_cwd(directory)
                     .with_status_program(Some("codex".into()));
