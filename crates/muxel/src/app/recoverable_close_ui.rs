@@ -39,17 +39,44 @@ impl MuxelApp {
     fn close_decision_label(&self, group: &CloseGroup) -> SharedString {
         if group.members.len() == 1 {
             tf(
-                "{name} started working",
+                "Review before closing {name}",
                 &[("name", self.close_group_name(group).as_ref())],
             )
             .into()
         } else {
-            t("A closing terminal started working")
+            t("Review before closing these terminals")
         }
     }
 
     pub(super) fn render_close_chip(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(latest) = self.close_groups.last() else {
+            if !self.close_requests.is_empty() {
+                return div()
+                    .id("recoverable-close-checking")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_xs().child(t("Checking before close…")))
+                    .child(
+                        Button::new("close-check-cancel")
+                            .ghost()
+                            .xsmall()
+                            .label(t("Cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                // Removing admission tokens invalidates late
+                                // replies; no terminal has been held yet.
+                                this.close_requests.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element();
+            }
             return div().into_any_element();
         };
         let several = self.close_groups.len() > 1;
@@ -59,31 +86,34 @@ impl MuxelApp {
             .map(|group| group.members.len())
             .sum();
         let multiple = panes > 1;
-        let label: SharedString = if !several && latest.needs_decision && !latest.undoing {
-            self.close_decision_label(latest)
-        } else if multiple {
-            tf("{n} closing", &[("n", &panes.to_string())]).into()
-        } else if let Some(caller) = latest.caller.as_deref() {
-            tf(
-                "Closed {name} by {caller}",
-                &[
-                    ("name", self.close_group_name(latest).as_ref()),
-                    ("caller", caller),
-                ],
-            )
-            .into()
-        } else {
-            tf(
-                "Closed {name}",
-                &[("name", self.close_group_name(latest).as_ref())],
-            )
-            .into()
-        };
+        let label: SharedString =
+            if (latest.checking || !self.close_requests.is_empty()) && !latest.undoing {
+                t("Checking before close…")
+            } else if !several && latest.needs_decision && !latest.undoing {
+                self.close_decision_label(latest)
+            } else if multiple {
+                tf("{n} closing", &[("n", &panes.to_string())]).into()
+            } else if let Some(caller) = latest.caller.as_deref() {
+                tf(
+                    "Closed {name} by {caller}",
+                    &[
+                        ("name", self.close_group_name(latest).as_ref()),
+                        ("caller", caller),
+                    ],
+                )
+                .into()
+            } else {
+                tf(
+                    "Closed {name}",
+                    &[("name", self.close_group_name(latest).as_ref())],
+                )
+                .into()
+            };
         let gid = latest.id;
         let decision = !several && latest.needs_decision && !latest.undoing;
         let undo = if latest.undoing {
             t("Restoring…")
-        } else if multiple {
+        } else if latest.checking || multiple {
             t("Undo")
         } else {
             countdown_label(latest.deadline)

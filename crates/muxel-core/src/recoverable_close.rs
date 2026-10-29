@@ -17,6 +17,23 @@ pub enum CloseEvidence {
     ShellPrompt,
 }
 
+/// Non-agent prompt evidence, separate from the platform foreground query so
+/// its policy can be exercised on every test host.
+pub fn shell_close_evidence(
+    program: Option<&str>,
+    via_client: bool,
+    foreground_idle: bool,
+    osc133_prompt: bool,
+) -> CloseEvidence {
+    // Foreground ownership proves a prompt only for the direct default shell.
+    // A client or explicit program can own that group while remote work runs.
+    if osc133_prompt || program.is_none() && !via_client && foreground_idle {
+        CloseEvidence::ShellPrompt
+    } else {
+        CloseEvidence::Quiet
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloseFacts {
     pub status: AgentState,
@@ -71,7 +88,9 @@ pub fn may_finalize(before: CloseFacts, now: CloseFacts, forced: bool) -> bool {
 
 #[cfg(test)]
 mod recoverable_close_policy_tests {
-    use super::{CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize};
+    use super::{
+        CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize, shell_close_evidence,
+    };
     use crate::control::AgentState;
     use uuid::Uuid;
 
@@ -86,6 +105,70 @@ mod recoverable_close_policy_tests {
             binding_rev: 3,
             input_rev: 7,
             completion_rev: 2,
+        }
+    }
+
+    #[test]
+    fn review_r2_non_agent_foreground_ownership_does_not_prove_a_shell_prompt() {
+        for program in ["ssh", "python", "node", "wrapper.sh", "bash"] {
+            let evidence = shell_close_evidence(Some(program), false, true, false);
+            assert_eq!(evidence, CloseEvidence::Quiet, "explicit program {program}");
+            assert_eq!(
+                decide(
+                    CloseFacts {
+                        evidence,
+                        ..quiet()
+                    },
+                    true
+                ),
+                CloseDecision::Ask
+            );
+        }
+    }
+
+    #[test]
+    fn review_r2_default_shell_foreground_proof_excludes_tmux_and_remote_clients() {
+        assert_eq!(
+            shell_close_evidence(None, false, true, false),
+            CloseEvidence::ShellPrompt
+        );
+        assert_eq!(
+            shell_close_evidence(None, false, false, false),
+            CloseEvidence::Quiet
+        );
+        // Both tmux and an SSH connection can own the child foreground group
+        // while a command is running beyond that client.
+        let evidence = shell_close_evidence(None, true, true, false);
+        assert_eq!(evidence, CloseEvidence::Quiet);
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    evidence,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Ask
+        );
+    }
+
+    #[test]
+    fn review_r2_explicit_osc133_prompt_remains_protocol_evidence() {
+        for program in [None, Some("custom-shell"), Some("wrapper.sh")] {
+            for via_client in [false, true] {
+                let evidence = shell_close_evidence(program, via_client, false, true);
+                assert_eq!(evidence, CloseEvidence::ShellPrompt);
+                assert_eq!(
+                    decide(
+                        CloseFacts {
+                            evidence,
+                            ..quiet()
+                        },
+                        true
+                    ),
+                    CloseDecision::Hold { forced: false }
+                );
+            }
         }
     }
 

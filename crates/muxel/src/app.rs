@@ -57,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod accomplishments_ui;
+mod close_probes;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
 #[cfg(all(test, windows))]
@@ -4985,6 +4986,8 @@ pub struct MuxelApp {
     close_client_counts: HashMap<Uuid, ClientCount>,
     show_close_list: bool,
     preserve_close_worktrees: bool,
+    /// A finalized hold still needs to be removed from the durable document.
+    close_persist_pending: bool,
     close_tmux_kills: Vec<Task<()>>,
     close_departure: Option<CloseDeparture>,
     close_departure_task: Option<Task<()>>,
@@ -7376,6 +7379,7 @@ impl MuxelApp {
             close_client_counts: HashMap::new(),
             show_close_list: false,
             preserve_close_worktrees: false,
+            close_persist_pending: false,
             close_tmux_kills: Vec::new(),
             close_departure: None,
             close_departure_task: None,
@@ -10822,7 +10826,7 @@ impl MuxelApp {
     }
 
     /// Persist and report whether the write completed. Workspace switching uses
-    /// this to avoid discarding an unsaved auto-title on a failed flush.
+    /// this to preserve an unsaved auto-title or finalized hold on a failed flush.
     fn try_persist(&mut self) -> bool {
         let Some(id) = self.current_workspace else {
             return true; // no workspace chosen yet (selector still open)
@@ -10835,6 +10839,7 @@ impl MuxelApp {
         match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
             Ok(()) => {
                 self.auto_name_save_due = None;
+                self.close_persist_pending = false;
                 self.clear_save_error(SaveTarget::Workspace);
                 true
             }
@@ -10888,7 +10893,7 @@ impl MuxelApp {
             let _phase = ui_profile::phase("workspace", "persist-old", None);
             self.try_persist()
         };
-        if !persisted {
+        if !persisted && (self.close_persist_pending || self.auto_name_save_due.is_some()) {
             self.show_workspace_selector = true;
             cx.notify();
             return;
@@ -16723,7 +16728,7 @@ impl MuxelApp {
     /// Commit the front pending worktree (message = the input, or its name), then
     /// remove it. On commit failure, keep it on disk so no work is lost.
     fn dispose_worktree_commit(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
         self.finalize_worktree_choice(&d.close_after, cx);
@@ -16758,7 +16763,7 @@ impl MuxelApp {
     /// Discard the front pending worktree: force-remove it AND delete its branch,
     /// throwing away both uncommitted changes and any commits.
     fn dispose_worktree_discard(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
         self.finalize_worktree_choice(&d.close_after, cx);
@@ -16774,7 +16779,7 @@ impl MuxelApp {
     /// worktree + its (now-merged) branch. Commits any uncommitted changes first.
     /// On merge failure (e.g. conflicts) keep the worktree and toast the error.
     fn dispose_worktree_merge(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
         self.finalize_worktree_choice(&d.close_after, cx);
@@ -16829,7 +16834,7 @@ impl MuxelApp {
 
     /// Keep the front pending worktree on disk (detached, resumable later).
     fn dispose_worktree_keep(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.pending_worktree_dispose.pop_front() else {
+        let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
         self.finalize_worktree_choice(&d.close_after, cx);

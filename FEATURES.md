@@ -115,8 +115,10 @@ feature is added or changed, update the matching entry here in the same change**
   writes refuse with `closing` and `undo_until`.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
-  a muxel worktree uses its disposal choice directly. Ordinary saves preserve
-  held panes for crash recovery; workspace switch and quit finalize them.
+  a muxel worktree with changes or unmerged commits uses its disposal choice
+  directly; a clean, landed worktree follows the terminal countdown policy.
+  Client checks show progress during batch closes. Ordinary saves preserve held
+  panes for crash recovery; workspace switch and quit finalize them.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 

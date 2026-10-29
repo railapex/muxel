@@ -985,70 +985,436 @@ fn project_finalization_preserves_other_projects_in_a_shared_close_group() {
     });
 }
 
+fn review_r2_clean_worktree(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    pane: Uuid,
+) -> (Uuid, PathBuf) {
+    window
+        .update(cx, |app, _, _| {
+            let root = app.workspace.project(pid).unwrap().root_path.clone();
+            git_fixture(&root, &["init", "--initial-branch=main"]);
+            git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
+            let path = git_fixture_path(
+                muxel_store::data_dir()
+                    .unwrap()
+                    .join("review-r2-clean-worktree"),
+            );
+            git_fixture(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "muxel/clean-close-fixture",
+                    path.to_str().unwrap(),
+                ],
+            );
+            let wid = Uuid::new_v4();
+            app.workspace.add_worktree(Worktree {
+                id: wid,
+                project_id: pid,
+                name: "clean close fixture".into(),
+                path: path.clone(),
+                branch: "muxel/clean-close-fixture".into(),
+                color: 0,
+                detached: false,
+            });
+            let instance = app.workspace.instance_mut(pane).unwrap();
+            instance.worktree_id = Some(wid);
+            instance.worktree_path = Some(path.clone());
+            instance.worktree_branch = Some("muxel/clean-close-fixture".into());
+            assert_eq!(super::integrations::worktree_change_count(&path), 0);
+            let base = super::integrations::repo_head(&root).expect("fixture base HEAD");
+            assert_eq!(
+                super::integrations::worktree_unmerged_count(&path, &base),
+                0
+            );
+            (wid, path)
+        })
+        .unwrap()
+}
+
 #[test]
-fn clean_fully_landed_last_worktree_close_has_no_dispose_modal_or_countdown() {
+fn review_r2_working_clean_last_worktree_asks_and_keeps_undo_until_expiry() {
     with_app(|cx, window| {
         let pid = project(cx, window);
-        let (pane, _, child) = terminal(cx, window, pid);
+        let (pane, view, child) =
+            title_terminal(cx, window, pid, "working worktree fixture", "Working");
+        wait_for_view(cx, window, &view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Working
+        });
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, pane);
         window
-            .update(cx, |app, _, cx| {
-                let root = app.workspace.project(pid).unwrap().root_path.clone();
-                git_fixture(&root, &["init", "--initial-branch=main"]);
-                git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
-                let path = git_fixture_path(
-                    muxel_store::data_dir()
-                        .unwrap()
-                        .join("clean-owned-worktree"),
-                );
-                git_fixture(
-                    &root,
-                    &[
-                        "worktree",
-                        "add",
-                        "-b",
-                        "muxel/clean-close-fixture",
-                        path.to_str().unwrap(),
-                    ],
-                );
-                let wid = Uuid::new_v4();
-                app.workspace.add_worktree(Worktree {
-                    id: wid,
-                    project_id: pid,
-                    name: "clean close fixture".into(),
-                    path: path.clone(),
-                    branch: "muxel/clean-close-fixture".into(),
-                    color: 0,
-                    detached: false,
-                });
-                let instance = app.workspace.instance_mut(pane).unwrap();
-                instance.worktree_id = Some(wid);
-                instance.worktree_path = Some(path.clone());
-                instance.worktree_branch = Some("muxel/clean-close-fixture".into());
-                assert_eq!(super::integrations::worktree_change_count(&path), 0);
-                let base = super::integrations::repo_head(&root).expect("fixture base HEAD");
-                assert_eq!(
-                    super::integrations::worktree_unmerged_count(&path, &base),
-                    0
-                );
+            .update(cx, |app, window, cx| {
                 app.request_close_instance(pane, cx);
                 assert!(
+                    app.confirm.is_some(),
+                    "Working agent in a clean worktree must ask"
+                );
+                assert!(!child.exited(), "close request killed the Working agent");
+                assert!(app.workspace.instance(pane).is_some());
+                assert!(!app.is_closing(pane));
+                assert!(path.is_dir());
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(pane));
+                assert!(app.closing[&pane].forced);
+                assert!(
+                    !child.exited(),
+                    "confirmed close must retain its Undo window"
+                );
+                assert!(path.is_dir());
+                app.undo_latest_close(window, cx);
+                assert!(!app.is_closing(pane));
+                assert!(Arc::ptr_eq(
+                    app.terminal_view(pane).unwrap().read(cx).session(),
+                    &child.session
+                ));
+                assert!(!child.exited());
+                assert!(path.is_dir());
+                assert!(app.workspace.worktree(wid).is_some());
+                app.request_close_instance(pane, cx);
+                assert!(app.confirm.is_some());
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(pane));
+                assert!(path.is_dir());
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(
                     app.pending_worktree_dispose.is_empty(),
-                    "fully landed worktree showed an empty dispose question"
+                    "fully landed worktree should not show a dispose question"
                 );
                 assert!(app.confirm.is_none());
                 assert!(!app.is_closing(pane));
                 assert!(app.close_groups.is_empty());
-                assert!(
-                    app.workspace.instance(pane).is_none(),
-                    "fully landed last pane must close immediately"
-                );
+                assert!(app.workspace.instance(pane).is_none());
                 assert!(app.terminal_view(pane).is_none());
                 assert!(app.workspace.worktree(wid).is_none());
-                assert!(!path.exists(), "fully landed worktree should be removed");
+                assert!(
+                    !path.exists(),
+                    "clean worktree should be removed only at expiry"
+                );
             })
             .unwrap();
         wait_for_exit(cx, &child);
     });
+}
+
+#[test]
+fn review_r2_quiet_clean_last_worktree_counts_down_without_a_prompt() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, view, child) =
+            title_terminal(cx, window, pid, "quiet worktree fixture", "Ready");
+        wait_for_view(cx, window, &view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Idle
+        });
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, pane);
+        window
+            .update(cx, |app, _, cx| {
+                app.request_close_instance(pane, cx);
+                assert!(app.confirm.is_none());
+                assert!(app.pending_worktree_dispose.is_empty());
+                assert!(
+                    app.is_closing(pane),
+                    "quiet clean worktree close must remain recoverable"
+                );
+                assert!(!app.closing[&pane].forced);
+                assert!(!child.exited());
+                assert!(path.is_dir());
+                assert!(app.workspace.worktree(wid).is_some());
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.workspace.instance(pane).is_none());
+                assert!(app.workspace.worktree(wid).is_none());
+                assert!(!path.exists());
+                assert!(app.pending_worktree_dispose.is_empty());
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn review_r2_process_exiting_during_a_quiet_hold_finalizes_at_expiry() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, view, child) = title_terminal(cx, window, pid, "exiting held fixture", "Ready");
+        wait_for_view(cx, window, &view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Idle
+        });
+        window
+            .update(cx, |app, _, cx| {
+                app.request_close_instance(pane, cx);
+                assert!(app.is_closing(pane));
+                assert!(!app.closing[&pane].forced);
+            })
+            .unwrap();
+        child.terminate(0);
+        wait_for_view(cx, window, &view, TerminalView::exited);
+        window
+            .update(cx, |app, _, cx| {
+                assert_eq!(view.read(cx).exit_code(), Some(0));
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(
+                    app.workspace.instance(pane).is_none(),
+                    "exited held pane must not become a started-working decision"
+                );
+                assert!(!app.is_closing(pane));
+                assert!(app.terminal_view(pane).is_none());
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn review_r2_quit_queues_departure_even_when_workspace_persist_fails() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        let (release, waiting) = async_channel::bounded::<()>(1);
+        let (queued, pending, failed, finalized) = window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.hold_closes(vec![(pane, false)], None, cx).unwrap();
+                let path = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                app.close_tmux_kills
+                    .push(cx.background_executor().spawn(async move {
+                        let _ = waiting.recv().await;
+                    }));
+                app.quit_after_closes(cx);
+                let queued = matches!(
+                    app.close_departure,
+                    Some(super::recoverable_close::CloseDeparture::Quit)
+                );
+                let pending = app.close_departure_task.is_some();
+                let failed = app.save_errors.contains_key(&SaveTarget::Workspace);
+                let finalized = app.workspace.instance(pane).is_none();
+                // Clear both pieces before any assertion or channel release. Even
+                // an expected-red unwind must never call application-global Quit.
+                app.close_departure = None;
+                app.close_departure_task = None;
+                std::fs::remove_dir(&path).unwrap();
+                app.try_persist();
+                (queued, pending, failed, finalized)
+            })
+            .unwrap();
+        release.try_send(()).unwrap();
+        cx.run_until_parked();
+        assert!(
+            failed,
+            "fixture did not force a real workspace save failure"
+        );
+        assert!(finalized);
+        assert!(
+            queued,
+            "save failure silently vetoed Quit instead of queuing departure"
+        );
+        assert!(pending);
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn review_r2_ordinary_workspace_switch_is_not_blocked_by_failed_persist() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        let (entered, next) = window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                assert!(app.close_groups.is_empty());
+                assert!(app.auto_name_save_due.is_none());
+                let previous = app.current_workspace.unwrap();
+                let next = Uuid::new_v4();
+                app.workspaces.workspaces.extend([
+                    WorkspaceMeta {
+                        id: previous,
+                        name: "previous".into(),
+                    },
+                    WorkspaceMeta {
+                        id: next,
+                        name: "target".into(),
+                    },
+                ]);
+                let root = muxel_store::data_dir()
+                    .unwrap()
+                    .join("ordinary-switch-target");
+                std::fs::create_dir_all(&root).unwrap();
+                let mut target = Workspace::default();
+                target.add_project(Project::new("target", root));
+                muxel_store::save_workspace_to(
+                    &muxel_store::workspace_doc_path(next).unwrap(),
+                    &target,
+                )
+                .unwrap();
+                assert!(app.try_persist());
+                let path = muxel_store::workspace_doc_path(previous).unwrap();
+                let backup = path.with_extension("ordinary-before-switch.json");
+                std::fs::rename(&path, &backup).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                app.enter_workspace(next, window, cx);
+                let entered = app.current_workspace == Some(next);
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::rename(&backup, &path).unwrap();
+                (entered, next)
+            })
+            .unwrap();
+        assert!(
+            entered,
+            "ordinary switch acquired a new save-success dependency"
+        );
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.current_workspace, Some(next));
+                assert!(app.workspace.instance(pane).is_none());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn review_r2_pending_dispose_merges_unrelated_close_requests_without_duplicates() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        let (first, _, first_child) = terminal(cx, window, pid);
+        let (second, _, second_child) = terminal(cx, window, pid);
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, pane);
+        std::fs::write(path.join("draft.txt"), "keep this work\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app.request_recoverable_close(vec![pane, first], cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                assert_eq!(app.pending_worktree_dispose[0].wid, wid);
+                assert_eq!(app.pending_worktree_dispose[0].close_rest, vec![first]);
+                app.request_recoverable_close(vec![pane, second, first, second], cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                let pending = &app.pending_worktree_dispose[0];
+                assert_eq!(pending.close_after, vec![pane]);
+                assert_eq!(
+                    pending.close_rest.len(),
+                    2,
+                    "pending dispose dropped or duplicated requested panes"
+                );
+                assert!(pending.close_rest.contains(&first));
+                assert!(pending.close_rest.contains(&second));
+                assert!(app.close_groups.is_empty());
+                assert!(!child.exited());
+                assert!(!first_child.exited());
+                assert!(!second_child.exited());
+            })
+            .unwrap();
+    });
+}
+
+fn review_r2_new_worktree_member_survives_dispose_choice(choice: &str) {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (captured, _, captured_child) = terminal(cx, window, pid);
+        let (wid, path) = review_r2_clean_worktree(cx, window, pid, captured);
+        let draft = path.join("draft.txt");
+        std::fs::write(&draft, "keep this work\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                // If an unfixed handler reaches git, keep every operation inside
+                // this disposable fixture without user hooks, identity or signing.
+                let root = &app.workspace.project(pid).unwrap().root_path;
+                for (key, value) in [
+                    ("core.hooksPath", "NUL"),
+                    ("commit.gpgsign", "false"),
+                    ("user.name", "Muxel test"),
+                    ("user.email", "muxel-test@example.invalid"),
+                ] {
+                    git_fixture(root, &["config", "--local", key, value]);
+                }
+                app.request_close_instance(captured, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                assert_eq!(app.pending_worktree_dispose[0].close_after, vec![captured]);
+            })
+            .unwrap();
+        let (uncaptured, new_view, new_child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance_mut(uncaptured).unwrap();
+                instance.worktree_id = Some(wid);
+                instance.worktree_path = Some(path.clone());
+                instance.worktree_branch = Some("muxel/clean-close-fixture".into());
+                match choice {
+                    "discard" => app.dispose_worktree_discard(cx),
+                    "keep" => app.dispose_worktree_keep(cx),
+                    "commit" => app.dispose_worktree_commit(cx),
+                    "merge" => app.dispose_worktree_merge(window, cx),
+                    _ => panic!("unknown fixture dispose choice"),
+                }
+                assert!(
+                    app.workspace.instance(uncaptured).is_some(),
+                    "{choice} closed a pane outside the captured request"
+                );
+                assert!(Arc::ptr_eq(
+                    app.terminal_view(uncaptured).unwrap().read(cx).session(),
+                    &new_child.session
+                ));
+                assert_eq!(app.terminal_view(uncaptured), Some(&new_view));
+                assert!(!new_child.exited());
+                assert!(
+                    path.is_dir(),
+                    "{choice} removed a worktree with a new live pane"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&draft).unwrap(),
+                    "keep this work\n",
+                    "{choice} changed uncaptured live work"
+                );
+                let worktree = app
+                    .workspace
+                    .worktree(wid)
+                    .expect("new pane's worktree stays registered");
+                assert!(
+                    !worktree.detached,
+                    "{choice} detached a worktree still used by the new pane"
+                );
+                assert!(!app.is_closing(uncaptured));
+                if let Some(pending) = app.confirm.as_ref()
+                    && let ConfirmAction::CloseBatch(ids) = &pending.action
+                {
+                    assert!(!ids.contains(&uncaptured));
+                }
+                assert!(
+                    !captured_child.exited(),
+                    "stale disposal should replan the captured close request"
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn review_r2_discard_preserves_a_new_uncaptured_worktree_pane() {
+    review_r2_new_worktree_member_survives_dispose_choice("discard");
+}
+
+#[test]
+fn review_r2_keep_preserves_a_new_uncaptured_worktree_pane() {
+    review_r2_new_worktree_member_survives_dispose_choice("keep");
+}
+
+#[test]
+fn review_r2_commit_preserves_a_new_uncaptured_worktree_pane() {
+    review_r2_new_worktree_member_survives_dispose_choice("commit");
+}
+
+#[test]
+fn review_r2_merge_preserves_a_new_uncaptured_worktree_pane() {
+    review_r2_new_worktree_member_survives_dispose_choice("merge");
 }
 
 #[test]

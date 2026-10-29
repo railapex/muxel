@@ -3,7 +3,7 @@
 use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
-    CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize,
+    CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize, shell_close_evidence,
 };
 use muxel_terminal::TerminalStatusReason;
 
@@ -85,13 +85,18 @@ impl MuxelApp {
         });
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
-                if view.session().shell_at_prompt()
-                    || cfg!(unix) && view.session().is_idle_foreground()
-                {
-                    CloseEvidence::ShellPrompt
-                } else {
-                    CloseEvidence::Quiet
-                }
+                shell_close_evidence(
+                    inst.and_then(|inst| inst.program.as_deref()),
+                    inst.is_some_and(|inst| {
+                        inst.tmux_session.is_some()
+                            || self
+                                .workspace
+                                .project(inst.project_id)
+                                .is_some_and(Project::is_remote)
+                    }),
+                    cfg!(unix) && view.session().is_idle_foreground(),
+                    view.session().shell_at_prompt(),
+                )
             } else if !attributable {
                 CloseEvidence::Settling
             } else {
@@ -167,31 +172,33 @@ impl MuxelApp {
         for &iid in &ids {
             self.close_requests.insert(iid, token);
         }
+        cx.notify();
         let workspace = self.current_workspace;
         cx.spawn(async move |this, cx| {
-            let counts = cx
-                .background_executor()
-                .spawn(async move {
-                    jobs.into_iter()
-                        .map(|(iid, loc, target)| {
-                            let count = integrations::attached_tmux_clients(&loc, &target).ok();
-                            (iid, ClientCount { target, count })
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-                .await;
+            let counts = close_probes::collect(
+                cx.background_executor().clone(),
+                jobs,
+                |(iid, loc, target)| async move {
+                    let count = integrations::attached_tmux_clients(&loc, &target).ok();
+                    (iid, ClientCount { target, count })
+                },
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
-                if this.current_workspace != workspace {
-                    return;
-                }
-                if ids
-                    .iter()
-                    .any(|iid| this.close_requests.get(iid) != Some(&token))
-                {
-                    return;
-                }
+                let valid = this.current_workspace == workspace
+                    && ids
+                        .iter()
+                        .all(|iid| this.close_requests.get(iid) == Some(&token));
+                // Superseding just one member invalidates the batch. Retire its
+                // other tokens too, without erasing a newer request's tokens.
                 for iid in &ids {
-                    this.close_requests.remove(iid);
+                    if this.close_requests.get(iid) == Some(&token) {
+                        this.close_requests.remove(iid);
+                    }
+                }
+                cx.notify();
+                if !valid {
+                    return;
                 }
                 this.close_client_counts.extend(counts);
                 this.plan_close_request(ids, cx);
@@ -237,9 +244,13 @@ impl MuxelApp {
                     let inst = self.workspace.instance(iid).unwrap();
                     let state = match self.close_facts(iid, cx).status {
                         AgentState::Working => t("working"),
-                        AgentState::Idle => t("idle"),
+                        AgentState::Idle | AgentState::Done => {
+                            return tf(
+                                "Muxel cannot confirm that {name} is idle.",
+                                &[("name", inst.display_name())],
+                            );
+                        }
                         AgentState::Blocked => t("waiting for input"),
-                        AgentState::Done => t("done"),
                         AgentState::Exited => t("exited"),
                         AgentState::Starting => t("starting"),
                         AgentState::NotRunning => t("not running"),
@@ -258,7 +269,7 @@ impl MuxelApp {
                 t("Close")
             };
             self.request_confirm(
-                t("Close busy terminals?"),
+                t("Close terminals?"),
                 message,
                 label,
                 ConfirmAction::CloseBatch(ids),
@@ -585,6 +596,9 @@ impl MuxelApp {
                 .flat_map(|g| g.members.iter())
                 .filter_map(|&iid| {
                     self.closing.get(&iid).filter(|held| !held.forced)?;
+                    if self.close_facts(iid, cx).status == AgentState::Exited {
+                        return None;
+                    }
                     self.close_tmux_site(iid)
                         .map(|(loc, target)| (iid, loc, target))
                 })
@@ -597,17 +611,15 @@ impl MuxelApp {
                 group.checking = true;
             }
             cx.spawn(async move |this, cx| {
-                let counts = cx
-                    .background_executor()
-                    .spawn(async move {
-                        jobs.into_iter()
-                            .map(|(iid, loc, target)| {
-                                let count = integrations::attached_tmux_clients(&loc, &target).ok();
-                                (iid, ClientCount { target, count })
-                            })
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .await;
+                let counts = close_probes::collect(
+                    cx.background_executor().clone(),
+                    jobs,
+                    |(iid, loc, target)| async move {
+                        let count = integrations::attached_tmux_clients(&loc, &target).ok();
+                        (iid, ClientCount { target, count })
+                    },
+                )
+                .await;
                 let _ = this.update(cx, |this, cx| {
                     if !this.close_groups.iter().any(|g| g.id == gid) {
                         return;
@@ -637,7 +649,9 @@ impl MuxelApp {
             .filter(|&iid| {
                 self.workspace.instance(iid).is_none()
                     || self.closing.get(&iid).is_none_or(|held| {
-                        may_finalize(held.facts, self.close_facts(iid, cx), held.forced)
+                        let now = self.close_facts(iid, cx);
+                        now.status == AgentState::Exited
+                            || may_finalize(held.facts, now, held.forced)
                     })
             })
             .collect();
@@ -692,9 +706,8 @@ impl MuxelApp {
 
     pub(super) fn quit_after_closes(&mut self, cx: &mut Context<Self>) {
         self.finalize_all_closes(cx);
-        if !self.try_persist() {
-            return;
-        }
+        // Save failures are reported, but must not make an explicit Quit a no-op.
+        self.try_persist();
         self.close_tmux_kills.retain(|task| !task.is_ready());
         if self.close_tmux_kills.is_empty() {
             cx.quit();
@@ -764,7 +777,9 @@ impl MuxelApp {
     pub(super) fn forget_close(&mut self, iid: Uuid) {
         self.close_requests.remove(&iid);
         self.close_client_counts.remove(&iid);
-        self.closing.remove(&iid);
+        if self.closing.remove(&iid).is_some() {
+            self.close_persist_pending = true;
+        }
         for group in &mut self.close_groups {
             group.members.retain(|&member| member != iid);
         }
@@ -787,18 +802,32 @@ impl MuxelApp {
             .collect();
         for wid in worktrees {
             let members = self.workspace.instances_using(wid);
+            let member_ids: HashSet<_> = members.iter().copied().collect();
+            if let Some(pending) = self
+                .pending_worktree_dispose
+                .iter_mut()
+                .find(|d| d.wid == wid)
+            {
+                for &iid in ids {
+                    let queued = if member_ids.contains(&iid) {
+                        &mut pending.close_after
+                    } else {
+                        &mut pending.close_rest
+                    };
+                    queued.push(iid);
+                }
+                let mut seen = HashSet::new();
+                pending.close_after.retain(|iid| seen.insert(*iid));
+                seen.clear();
+                pending.close_rest.retain(|iid| seen.insert(*iid));
+                cx.notify();
+                return true;
+            }
             if !members
                 .iter()
                 .all(|iid| selected.contains(iid) || self.is_closing(*iid))
             {
                 continue;
-            }
-            if self
-                .pending_worktree_dispose
-                .iter()
-                .any(|pending| pending.wid == wid)
-            {
-                return true;
             }
             let Some(worktree) = self.workspace.worktree(wid) else {
                 continue;
@@ -814,16 +843,9 @@ impl MuxelApp {
                 integrations::worktree_unmerged_count(&path, &base)
             });
             if changed == 0 && unmerged == 0 {
-                let rest: Vec<_> = ids
-                    .iter()
-                    .copied()
-                    .filter(|iid| !members.contains(iid))
-                    .collect();
-                for iid in members {
-                    self.close_instance_inner(iid, "close (clean worktree)", cx);
-                }
-                self.request_recoverable_close(rest, cx);
-                return true;
+                // There is no disposal question to authorize killing a busy
+                // terminal. Use the usual confirmation and recoverable hold.
+                continue;
             }
             self.pending_worktree_dispose.push_back(WorktreeDispose {
                 wid,
@@ -841,7 +863,7 @@ impl MuxelApp {
                 close_rest: ids
                     .iter()
                     .copied()
-                    .filter(|iid| !members.contains(iid))
+                    .filter(|iid| !member_ids.contains(iid))
                     .collect(),
                 close_after: members,
             });
@@ -852,6 +874,34 @@ impl MuxelApp {
             return true;
         }
         false
+    }
+
+    /// A pane opened after the question was shown was never part of its answer.
+    /// Re-plan the captured selection rather than touching that pane's worktree.
+    pub(super) fn take_worktree_dispose(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<WorktreeDispose> {
+        let choice = self.pending_worktree_dispose.pop_front()?;
+        let captured: HashSet<_> = choice.close_after.iter().copied().collect();
+        if self
+            .workspace
+            .instances_using(choice.wid)
+            .iter()
+            .any(|iid| !captured.contains(iid))
+        {
+            self.request_recoverable_close(
+                choice
+                    .close_after
+                    .into_iter()
+                    .chain(choice.close_rest)
+                    .collect(),
+                cx,
+            );
+            cx.notify();
+            return None;
+        }
+        Some(choice)
     }
 
     pub(super) fn finalize_worktree_choice(&mut self, ids: &[Uuid], cx: &mut Context<Self>) {
