@@ -826,7 +826,9 @@ fn control_new_policy_write_entry_points_recheck_permission() {
                 callback
                     .find("Arc::ptr_eq(&session,&current_session)")
                     .unwrap(),
-                callback.find("session.write_input(").unwrap(),
+                callback
+                    .find("session.control_write(ControlInput::Keys")
+                    .unwrap(),
             )
         };
         assert!(timer < update && update < gate && gate < same_session && same_session < write);
