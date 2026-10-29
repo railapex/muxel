@@ -1556,46 +1556,43 @@ impl MuxelApp {
                 let through_tmux = session.delivers_through_tmux();
                 let total = presses.len();
                 let receipt = reply.clone();
-                let pressed = cx.spawn(
-                    async move |this: WeakEntity<Self>, cx| -> CtlResult<Value> {
-                        for (i, (keys, submit)) in presses.into_iter().enumerate() {
-                            if i > 0 {
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(KEY_GAP_MS))
-                                    .await;
-                            }
-                            // Recheck each key after its delay. A restarted pane
-                            // must not receive input meant for its previous session.
-                            let write = this
-                                .update(cx, |app, cx| -> CtlResult<ControlWrite> {
-                                    let current_session = app.control_writable(iid, cx)?;
-                                    if !Arc::ptr_eq(&session, &current_session) {
-                                        return Err("the pane restarted".into());
-                                    }
-                                    if submit {
-                                        session.mark_turn_submitted();
-                                    }
-                                    Ok(session
-                                        .control_write(ControlInput::Keys { keys, app_cursor }))
-                                })
-                                .unwrap_or_else(|_| Err("muxel is shutting down".into()));
-                            let written = match write {
-                                Ok(write) => write.finish().await.map_err(keys_failed),
-                                Err(error) => Err(error),
-                            };
-                            if let Err(error) = written {
-                                return Err(ctl::Error {
-                                    message: format!(
-                                        "{}; {i} of {total} keys were pressed before it",
-                                        error.message
-                                    ),
-                                    ..error
-                                });
-                            }
+                let pressed = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    for (i, (keys, submit)) in presses.into_iter().enumerate() {
+                        if i > 0 {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(KEY_GAP_MS))
+                                .await;
                         }
-                        Ok(receipt)
-                    },
-                );
+                        // Recheck each key after its delay. A restarted pane
+                        // must not receive input meant for its previous session.
+                        let write = this
+                            .update(cx, |app, cx| -> CtlResult<ControlWrite> {
+                                let current_session = app.control_writable(iid, cx)?;
+                                if !Arc::ptr_eq(&session, &current_session) {
+                                    return Err("the pane restarted".into());
+                                }
+                                if submit {
+                                    session.mark_turn_submitted();
+                                }
+                                Ok(session.control_write(ControlInput::Keys { keys, app_cursor }))
+                            })
+                            .unwrap_or_else(|_| Err("muxel is shutting down".into()));
+                        let written = match write {
+                            Ok(write) => write.finish().await.map_err(keys_failed),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = written {
+                            return Err(ctl::Error {
+                                message: format!(
+                                    "{}; {i} of {total} keys were pressed before it",
+                                    error.message
+                                ),
+                                ..error
+                            });
+                        }
+                    }
+                    Ok(receipt)
+                });
                 let lead_ms = turn.as_ref().map_or(0, |turn| turn.lead_ms);
                 self.note_control_turn(iid, turn, at.unwrap_or_else(|| now_ms() + lead_ms));
                 if through_tmux {
