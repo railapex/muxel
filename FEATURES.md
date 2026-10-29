@@ -105,8 +105,27 @@ feature is added or changed, update the matching entry here in the same change**
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
-- **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation). Editors and browser panes just close.
+- **Recoverable terminal close** — a closed terminal stays alive, hidden, for
+  15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
+  a popped-out terminal returns to the main window. Busy or uncertain terminals
+  ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
+  binding, input and completion before expiry; changed work gets Close / Keep.
+  Batch closes offer Close all, Close only the idle ones, or Cancel. Queued input
+  is cancelled across close and Undo, and hidden panes leave ctl listings;
+  writes refuse with `closing` and `undo_until`. A shell counts down only with
+  prompt evidence, so local tmux shells on Unix, which can't pass OSC 133
+  through, always ask.
+- **Resource and worktree close** — dirty editors offer Save / Don't Save /
+  Cancel; clean editors, diffs and browsers close immediately. The last pane of
+  a muxel worktree with changes or unmerged commits uses its disposal choice
+  directly; a clean, landed worktree follows the terminal countdown policy. A
+  pane opened in that worktree while its question is showing gets its own
+  prompt and countdown, and a pane brought back by Undo leaves the question.
+  Client checks show progress, beside any running countdown, with their own
+  Cancel; a batch member closed during the check leaves the others to their
+  decision. Ordinary saves preserve held panes for crash recovery; workspace
+  switch and quit finalize them. If that save fails, the first switch stops
+  with a notice and the next one leaves anyway; the pane reopens next time.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 
@@ -219,13 +238,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -1390,7 +1420,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
