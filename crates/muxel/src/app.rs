@@ -82,6 +82,8 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+#[cfg(all(test, windows))]
+mod status_tooltip_tests;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -5652,8 +5654,7 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
-    /// Last rendered lifecycle copy per instance. Age labels change at coarse
-    /// minute/hour/day boundaries without changing the underlying status.
+    /// Last rendered lifecycle label. Activity is read when its tooltip opens.
     last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
@@ -26640,6 +26641,18 @@ impl MuxelApp {
                         );
                     if !is_sel {
                         base = base.hover(move |s| s.bg(hover_col));
+                    }
+                    if !renaming && let Some(terminal) = self.terminals.get(&iid).cloned() {
+                        base = base.tooltip(move |window, cx| {
+                            // Activity can change without a sidebar redraw. Read
+                            // it on hover, including when none existed at render.
+                            let activity = terminal.read(cx).runtime_activity().map(str::to_owned);
+                            match activity {
+                                Some(activity) => gpui_component::tooltip::Tooltip::new(activity)
+                                    .build(window, cx),
+                                None => cx.new(|_| Empty).into(),
+                            }
+                        });
                     }
                     let row = if renaming {
                         base.on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
