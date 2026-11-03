@@ -41,12 +41,24 @@ fn root_of(root: &str) -> &str {
 ///
 /// The same binary on both sides; only the quoting differs.
 pub fn git(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_command(os, repo, args, false)
+}
+
+/// Display-only Git reads must not refresh the index under an optional lock.
+pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_command(os, repo, args, true)
+}
+
+fn git_command(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
     match os {
         RemoteOs::Unix => {
             let mut c = format!("git -C {}", sh_quote(repo));
             for a in args {
                 c.push(' ');
                 c.push_str(&sh_quote(a));
+            }
+            if read_only {
+                c = format!("GIT_OPTIONAL_LOCKS=0 {c}");
             }
             c
         }
@@ -59,6 +71,9 @@ pub fn git(os: RemoteOs, repo: &str, args: &[&str]) -> String {
             // git signals failure by exit code, not a PowerShell error, so the
             // strict prelude alone would not surface it.
             body.push_str("; exit $LASTEXITCODE");
+            if read_only {
+                body = format!("$env:GIT_OPTIONAL_LOCKS='0'; {body}");
+            }
             ps(&body)
         }
     }
@@ -384,8 +399,8 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, list_files, paste_file_name, push_prep, read_file, scan_projects,
-        test_dir, test_file, upload_paste, write_file,
+        ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep, read_file,
+        scan_projects, test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -423,6 +438,19 @@ mod tests {
 
     const WIN: RemoteOs = RemoteOs::Windows;
     const UNIX: RemoteOs = RemoteOs::Unix;
+
+    #[test]
+    fn display_git_disables_optional_locks_inside_each_remote_shell() {
+        assert_eq!(
+            git_read_only(UNIX, "/srv/a b", &["rev-parse", "HEAD"]),
+            "GIT_OPTIONAL_LOCKS=0 git -C '/srv/a b' rev-parse HEAD"
+        );
+        let command = git_read_only(WIN, "C:/a b", &["rev-parse", "HEAD"]);
+        assert_opaque(&command);
+        let script = script_of(&command);
+        assert!(script.contains("$env:GIT_OPTIONAL_LOCKS='0'; & git -C 'C:/a b'"));
+        assert!(script.contains("exit $LASTEXITCODE"));
+    }
 
     #[test]
     fn unix_forms_are_unchanged() {

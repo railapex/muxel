@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -82,6 +83,7 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+mod session_folders;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -5472,6 +5474,8 @@ pub struct MuxelApp {
     /// Cached git status (refreshed each tick) so the sidebar doesn't shell out
     /// per render: each project's current branch, and each worktree's change count.
     project_branches: HashMap<Uuid, Option<String>>,
+    folder_branches: HashMap<session_folders::FolderKey, Option<String>>,
+    folder_filters: HashMap<Uuid, muxel_core::session_folder::FolderFilter>,
     /// Cached branch lists for project context menus. Populated beside
     /// `project_branches` so opening a menu never waits on a git subprocess.
     project_branch_lists: HashMap<Uuid, Vec<String>>,
@@ -7861,6 +7865,8 @@ impl MuxelApp {
             current_preset,
             available_programs,
             project_branches: HashMap::new(),
+            folder_branches: HashMap::new(),
+            folder_filters: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
             codex_session_names: HashMap::new(),
@@ -12918,13 +12924,7 @@ impl MuxelApp {
         }
         self.status_refresh_in_flight = true;
         let presets = self.presets.clone();
-        let locals: Vec<(Uuid, PathBuf)> = self
-            .workspace
-            .projects
-            .iter()
-            .filter(|p| !p.is_remote())
-            .map(|p| (p.id, p.root_path.clone()))
-            .collect();
+        let locals = self.branch_jobs(false);
         let worktrees: Vec<(Uuid, PathBuf)> = self
             .workspace
             .worktrees
@@ -12954,17 +12954,7 @@ impl MuxelApp {
                         let gh = program_on_path("gh");
                         let sshpass = program_on_path("sshpass");
                         let tmux = cfg!(unix) && program_on_path("tmux");
-                        let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
-                            .into_iter()
-                            .map(|(id, root)| {
-                                let loc = integrations::RepoLoc::Local(root);
-                                (
-                                    id,
-                                    integrations::repo_current_branch(&loc),
-                                    integrations::list_branches(&loc),
-                                )
-                            })
-                            .collect();
+                        let branches = session_folders::probe_branches(locals);
                         let changes: Vec<(Uuid, usize)> = worktrees
                             .into_iter()
                             .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
@@ -12998,10 +12988,7 @@ impl MuxelApp {
                 let ids: HashSet<Uuid> = this.workspace.projects.iter().map(|p| p.id).collect();
                 this.project_branches.retain(|id, _| ids.contains(id));
                 this.project_branch_lists.retain(|id, _| ids.contains(id));
-                for (id, b, list) in branches {
-                    this.project_branches.insert(id, b);
-                    this.project_branch_lists.insert(id, list);
-                }
+                this.apply_folder_branches(branches, false);
                 this.worktree_changes = changes.into_iter().collect();
                 match codex_names {
                     Some(Ok(Some(names))) => this.codex_session_names = names,
@@ -13049,28 +13036,7 @@ impl MuxelApp {
         if self.remote_branch_poll_inflight {
             return;
         }
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = self
-            .workspace
-            .projects
-            .iter()
-            .filter_map(|p| {
-                let r = p.remote.as_ref()?;
-                let host = self
-                    .remotes
-                    .iter()
-                    .find(|h| h.id == r.host_id)?
-                    .effective(&self.identities);
-                Some((
-                    p.id,
-                    integrations::RepoLoc::remote(
-                        host,
-                        r.remote_root.clone(),
-                        Self::commands_control_path(r.host_id),
-                        None,
-                    ),
-                ))
-            })
-            .collect();
+        let jobs = self.branch_jobs(true);
         if jobs.is_empty() {
             return;
         }
@@ -13078,22 +13044,11 @@ impl MuxelApp {
         cx.spawn(async move |this, cx| {
             let results = cx
                 .background_executor()
-                .spawn(async move {
-                    jobs.into_iter()
-                        .map(|(pid, loc)| {
-                            let branch = integrations::repo_current_branch(&loc);
-                            let branches = integrations::list_branches(&loc);
-                            (pid, branch, branches)
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .spawn(async move { session_folders::probe_branches(jobs) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.remote_branch_poll_inflight = false;
-                for (pid, branch, branches) in results {
-                    this.project_branches.insert(pid, branch);
-                    this.project_branch_lists.insert(pid, branches);
-                }
+                this.apply_folder_branches(results, true);
                 cx.notify();
             });
         })
@@ -25994,8 +25949,8 @@ impl MuxelApp {
                                     .text_color(cx.theme().muted_foreground)
                             }))
                             .child(
-                                // Name yields/truncates; the branch chip at the end
-                                // stays full.
+                                // Name yields first; the branch also truncates
+                                // before the trailing controls.
                                 div()
                                     .flex_1()
                                     .min_w_0()
@@ -26006,8 +25961,12 @@ impl MuxelApp {
                             )
                             .children(self.project_branches.get(&pid).cloned().flatten().map(
                                 |b| {
+                                    let tooltip = b.clone();
                                     div()
-                                        .flex_none()
+                                        .id(SharedString::from(format!("project-branch-{pid}")))
+                                        .flex_initial()
+                                        .min_w_0()
+                                        .max_w(px(120.0))
                                         .flex()
                                         .items_center()
                                         .gap_1()
@@ -26025,10 +25984,47 @@ impl MuxelApp {
                                                 .flex_none()
                                                 .text_color(cx.theme().muted_foreground),
                                         )
-                                        .child(div().whitespace_nowrap().child(b))
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                                .build(window, cx)
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(b),
+                                        )
                                 },
                             )),
                     )
+                    .children(self.folder_filters.contains_key(&pid).then(|| {
+                        div()
+                            .flex_none()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "clear-folder-filter-{pid}"
+                                )))
+                                .accessibility_id(SharedString::from(format!(
+                                    "muxel.clear-folder-filter.{pid}"
+                                )))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::CircleX)
+                                .label(t("Clear"))
+                                .tooltip(t("Clear folder and branch filter"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.folder_filters.remove(&pid);
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                    }))
                     .children(memory_on.then(|| {
                         div()
                             .flex_none()
@@ -26511,7 +26507,13 @@ impl MuxelApp {
                 let mut ungrouped: Vec<Uuid> = Vec::new();
                 let mut groups: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
                 for iid in project.instances() {
-                    match self.workspace.instance(iid).and_then(|i| i.worktree_id) {
+                    let Some(instance) = self.workspace.instance(iid) else {
+                        continue;
+                    };
+                    if !self.session_matches_filter(project, instance) {
+                        continue;
+                    }
+                    match instance.worktree_id {
                         Some(wid) => match groups.iter_mut().find(|(w, _)| *w == wid) {
                             Some(g) => g.1.push(iid),
                             None => groups.push((wid, vec![iid])),
@@ -26592,10 +26594,57 @@ impl MuxelApp {
                         None => app_title,
                     };
                     let ghost_label: SharedString = display.clone().into();
+                    let hover_col = cx.theme().sidebar_accent.opacity(0.45);
+                    let folder_chip =
+                        inst.filter(|i| i.kind == InstanceKind::Terminal)
+                            .and_then(|i| {
+                                let folder = Self::session_folder(project, i);
+                                let branch = self.session_branch(project, i);
+                                let windows = self.folder_windows(project);
+                                let label = muxel_core::session_folder::chip_label(
+                                    &Self::project_folder(project),
+                                    &folder,
+                                    branch,
+                                    self.project_branches.get(&pid).and_then(|b| b.as_deref()),
+                                    windows,
+                                )?;
+                                let selected = self
+                                    .folder_filters
+                                    .get(&pid)
+                                    .is_some_and(|f| f.is_source(&folder, windows));
+                                let tooltip = match branch {
+                                    Some(branch) => format!("{folder}\n⎇ {branch}"),
+                                    None => folder,
+                                };
+                                Some(
+                                    div()
+                                        .id(SharedString::from(format!("folder-chip-{iid}")))
+                                        .accessibility_id(SharedString::from(format!(
+                                            "muxel.folder-chip.{iid}"
+                                        )))
+                                        .w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(cx.theme().sidebar_foreground)
+                                        .when(selected, |s| s.bg(cx.theme().sidebar_accent))
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                                .build(window, cx)
+                                        })
+                                        .child(label),
+                                )
+                            });
+                    let folder_filter_item = inst
+                        .filter(|i| i.kind == InstanceKind::Terminal)
+                        .map(|i| self.folder_filter_menu_entry(project, i));
                     let is_sel = self.active_instance == Some(iid);
                     let renaming = self.rename == Some(RenameTarget::Instance(iid))
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
-                    let hover_col = cx.theme().sidebar_accent.opacity(0.45);
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
@@ -26668,12 +26717,20 @@ impl MuxelApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground)
-                                    .child(display),
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .text_color(cx.theme().sidebar_foreground)
+                                            .child(display),
+                                    )
+                                    .children(folder_chip),
                             )
                             .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
@@ -26730,6 +26787,23 @@ impl MuxelApp {
                                                 },
                                             )),
                                     )
+                                    .when_some(
+                                        folder_filter_item.clone(),
+                                        |menu, (label, filter)| {
+                                            menu.item(PopupMenuItem::new(label).on_click(
+                                                window.listener_for(
+                                                    &entity,
+                                                    move |this, _, _, cx| {
+                                                        this.toggle_folder_filter(
+                                                            pid,
+                                                            filter.clone(),
+                                                        );
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            ))
+                                        },
+                                    )
                                     .separator()
                                     .item(
                                         PopupMenuItem::new(t("Kill"))
@@ -26753,7 +26827,9 @@ impl MuxelApp {
                     .workspace
                     .worktrees
                     .iter()
-                    .filter(|w| w.project_id == pid && w.detached)
+                    .filter(|w| {
+                        w.project_id == pid && w.detached && !self.folder_filters.contains_key(&pid)
+                    })
                     .map(|w| w.id)
                     .collect();
                 for wid in detached {
