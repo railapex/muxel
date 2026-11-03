@@ -1261,14 +1261,27 @@ fn persisted_status(
     instance: Option<&Instance>,
     restoring: bool,
 ) -> AgentStatus {
+    persisted_activity_status(
+        status,
+        instance.map(|instance| &instance.activity),
+        restoring,
+    )
+}
+
+/// [`persisted_status`] from the saved activity alone, for views that cache it
+/// rather than reading the app while it may be mid-update.
+fn persisted_activity_status(
+    status: AgentStatus,
+    activity: Option<&AgentActivity>,
+    restoring: bool,
+) -> AgentStatus {
     // Completion is lifecycle, not notification state. Idle cannot erase the
     // latest completed turn, and startup Working noise cannot erase it while a
     // restored terminal settles. A real later Working or Blocked observation
     // replaces it.
     if status != AgentStatus::Blocked
-        && instance.is_some_and(|instance| {
-            instance.activity.current_state() == Some(AgentActivityState::Done)
-        })
+        && activity
+            .is_some_and(|activity| activity.current_state() == Some(AgentActivityState::Done))
         && (status != AgentStatus::Working || restoring)
     {
         AgentStatus::Done
@@ -1300,9 +1313,17 @@ fn shown_terminal_status(
     instance: Option<&Instance>,
     restoring: bool,
 ) -> AgentStatus {
+    shown_terminal_activity_status(view, instance.map(|instance| &instance.activity), restoring)
+}
+
+fn shown_terminal_activity_status(
+    view: &TerminalView,
+    activity: Option<&AgentActivity>,
+    restoring: bool,
+) -> AgentStatus {
     let runtime = view.runtime_snapshot();
     let unprompted = unprompted_report_working(&runtime, view.session().has_submitted_turn());
-    persisted_status(runtime.status, instance, restoring || unprompted)
+    persisted_activity_status(runtime.status, activity, restoring || unprompted)
 }
 
 fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
@@ -6350,6 +6371,10 @@ struct PopoutAppState {
     present: bool,
     held: bool,
     confirm: Option<PopoutConfirmState>,
+    /// The lifecycle badge's inputs. Render must not read the app: a popout
+    /// first renders while the app that opens it is still being updated.
+    activity: Option<AgentActivity>,
+    restoring: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -6376,6 +6401,8 @@ impl PopoutAppState {
             present: app.popouts.contains_key(&iid),
             held: app.closing.contains_key(&iid),
             confirm,
+            activity: app.workspace.instance(iid).map(|i| i.activity.clone()),
+            restoring: app.restoring_activity.contains(&iid),
         }
     }
 }
@@ -7007,28 +7034,22 @@ impl Render for PopoutView {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
         let badge = if let PaneView::Terminal(terminal) = &self.view {
-            let app = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade());
-            let (instance, restoring) = app.as_ref().map_or((None, false), |app| {
-                let app = app.read(cx);
-                (
-                    app.workspace.instance(self.iid),
-                    app.restoring_activity.contains(&self.iid),
-                )
-            });
-            let status = shown_terminal_status(terminal.read(cx), instance, restoring);
+            let activity = self.app_state.as_ref().and_then(|s| s.activity.as_ref());
+            let restoring = self.app_state.as_ref().is_some_and(|s| s.restoring);
+            let status = shown_terminal_activity_status(terminal.read(cx), activity, restoring);
             Some(
                 self.badge_clock.tag(
                     status,
-                    instance
-                        .map(|i| {
+                    activity
+                        .map(|activity| {
                             localized_activity_label(
                                 status,
-                                &i.activity,
+                                activity,
                                 chrono::Utc::now().timestamp_millis(),
                             )
                         })
                         .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                    instance.and_then(|i| i.activity.completed_at),
+                    activity.and_then(|activity| activity.completed_at),
                     cx,
                 ),
             )
