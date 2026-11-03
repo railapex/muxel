@@ -28,6 +28,7 @@ pub mod session_discovery;
 mod shell;
 pub mod ssh;
 pub mod startup_flags;
+pub mod status_badge;
 pub mod stt;
 pub mod tmux;
 pub mod tmux_install;

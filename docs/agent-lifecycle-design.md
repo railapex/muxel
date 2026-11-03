@@ -1,5 +1,27 @@
 # Agent lifecycle, attention, and recency
 
+Lifecycle badges use opaque status-coloured backgrounds and choose a readable
+foreground against the resulting colour (at least WCAG 4.5:1). A bundled-theme
+population test covers all four statuses and completion fade bands. The label
+stays fully opaque; only the completion colour settles toward the theme's muted
+background. Working, idle, and blocked retain their colour strength.
+
+Completion recency uses the persisted `completed_at` timestamp, also used by
+`done · 2h`: under ten minutes, under one hour, under one day, and older. Unknown
+completion times use the oldest style; future times use the newest style until
+their first boundary. Sidebar and dashboard labels, tab dots, and terminal
+popout labels share this policy. Attendance does not restart the fade.
+
+Each window collects the next band edge only from indicators intersecting the
+current paint clip. One cancellable wake targets the soonest visible boundary;
+painting re-arms it after that boundary. Hidden or clipped indicators contribute
+no deadline, and a window with no eligible visible completion has no fade wake.
+This adds no periodic age redraw and does not change lifecycle sampling.
+The sampler compares Done completion identity rather than its changing coarse
+age label, so an offscreen completion cannot force minute-by-minute redraws.
+Actual completion changes still invalidate the view; other statuses retain
+their existing coarse-label refresh behavior.
+
 ## Reader
 
 Muxel maintainers implementing or reviewing agent-status detection and its sidebar UI.
