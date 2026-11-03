@@ -53,7 +53,7 @@ extension InstanceKind: Codable {
 /// Persisted metadata for one pane. Port of `Instance`
 /// (`crates/muxel-core/src/lib.rs`). Every field except `id`/`projectId`/`title`
 /// is `#[serde(default)]` in Rust, so decoding tolerates older documents missing
-/// them. Encoding writes all fields (Rust serializes all fields).
+/// them. Optional fields marked skip_serializing_if in Rust are omitted when absent.
 struct Instance: Codable, Equatable, Identifiable {
     var id: String
     var projectId: String
@@ -64,6 +64,8 @@ struct Instance: Codable, Equatable, Identifiable {
     /// preserves this so an iOS layout write-back doesn't strip it from the peer.
     var browserUrl: String?
     var customName: String?
+    /// Stable ctl alias used until the agent publishes its own title.
+    var label: String?
     /// Last program-supplied title. Preserved across remote-layout write-back;
     /// a manual custom name still wins.
     var autoName: String?
@@ -108,6 +110,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case editorPath = "editor_path"
         case browserUrl = "browser_url"
         case customName = "custom_name"
+        case label
         case autoName = "auto_name"
         case program, args
         case literalArgv = "literal_argv"
@@ -156,6 +159,7 @@ struct Instance: Codable, Equatable, Identifiable {
         editorPath = try c.decodeIfPresent(String.self, forKey: .editorPath)
         browserUrl = try c.decodeIfPresent(String.self, forKey: .browserUrl)
         customName = try c.decodeIfPresent(String.self, forKey: .customName)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
         autoName = try c.decodeIfPresent(String.self, forKey: .autoName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
@@ -199,6 +203,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(editorPath, forKey: .editorPath)
         try c.encode(browserUrl, forKey: .browserUrl)
         try c.encode(customName, forKey: .customName)
+        try c.encodeIfPresent(label, forKey: .label)
         try c.encode(autoName, forKey: .autoName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)
@@ -239,6 +244,9 @@ struct Instance: Codable, Equatable, Identifiable {
            UUID(uuidString: autoName.trimmingCharacters(in: .whitespacesAndNewlines)) == nil
         {
             return autoName
+        }
+        if let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return label
         }
         return title
     }

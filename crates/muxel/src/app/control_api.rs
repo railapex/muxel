@@ -1055,6 +1055,7 @@ impl MuxelApp {
             .map(|inst| AgentEntry {
                 id: inst.id,
                 name: inst.display_name(),
+                label: inst.label.as_deref(),
                 project: self
                     .workspace
                     .project(inst.project_id)
@@ -1155,6 +1156,7 @@ impl MuxelApp {
             id: ctl::short_id(inst.id),
             uuid: inst.id,
             name: inst.display_name().to_string(),
+            label: inst.label.clone(),
             project: project.map(|p| p.name.clone()).unwrap_or_default(),
             project_id: ctl::short_id(inst.project_id),
             kind: kind_name(inst.kind).to_string(),
