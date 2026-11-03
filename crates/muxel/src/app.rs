@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -31,6 +32,10 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
+use muxel_core::sidebar::{
+    ActivityBand, SidebarEntry, SidebarSort, instances_by_id, is_unread, notification_in_feed,
+    sidebar_order, unread_count,
+};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
@@ -844,9 +849,9 @@ fn observe_popout_activity(
     now: i64,
 ) -> bool {
     let mut changed = observe_terminal_activity(activity, previous, status, attended, now);
-    // A popout has no main-pane focus callback. Record later attendance once,
-    // rather than rewriting the workspace every tick while Done stays visible.
-    if attended && status == AgentStatus::Done && activity.has_unattended_completion() {
+    // A popout has no main-pane focus callback. Attend unseen events even when
+    // the state has moved on, once rather than rewriting on every status tick.
+    if attended && is_unread(activity) {
         changed |= activity.attend(now);
     }
     changed
@@ -1451,7 +1456,7 @@ struct SampleEffect {
 /// its durable activity (completion and unread state), and the notification.
 fn apply_status_sample(
     record: &mut Option<SeenStatus>,
-    activity: Option<&mut AgentActivity>,
+    mut activity: Option<&mut AgentActivity>,
     sample: StatusSample,
     now: i64,
 ) -> SampleEffect {
@@ -1491,7 +1496,7 @@ fn apply_status_sample(
     };
     let restored_state = activity.as_deref().and_then(AgentActivity::current_state);
     if !preserve_restored
-        && let Some(activity) = activity
+        && let Some(activity) = activity.as_deref_mut()
         && (new_binding
             || completion_pulse
             || activity_needs_observation(previous, status, activity))
@@ -1519,9 +1524,15 @@ fn apply_status_sample(
             effect.activity_changed |=
                 activity.observe(previous_activity, activity_state(status), now);
         }
-        if attended && status == AgentStatus::Done {
-            effect.activity_changed |= activity.attend(now);
-        }
+    }
+    // Reading an event is independent of the current lifecycle state. The
+    // unread guard records attendance once, including after a new turn starts.
+    if !preserve_restored
+        && attended
+        && let Some(activity) = activity
+        && is_unread(activity)
+    {
+        effect.activity_changed |= activity.attend(now);
     }
     // The first live sample after restore describes durable state, not a new
     // event; a new binding's never does.
@@ -1537,6 +1548,134 @@ fn apply_status_sample(
         notify.filter(|_| !attended && !restored)
     };
     effect
+}
+
+#[cfg(test)]
+mod sidebar_attendance_tests {
+    use super::{
+        AgentStatus, SeenStatus, StatusBinding, StatusSample, activity_state, apply_status_sample,
+        observe_popout_activity,
+    };
+    use muxel_core::sidebar::is_unread;
+    use muxel_core::{AgentActivity, AgentActivityState};
+    use muxel_terminal::TerminalStatusCoverage;
+    use uuid::Uuid;
+
+    fn sample(status: AgentStatus, launch: Uuid) -> StatusSample {
+        StatusSample {
+            status,
+            binding: StatusBinding { launch, rev: 0 },
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 0,
+            attributable: true,
+            attended: true,
+            preserve_restored: false,
+        }
+    }
+
+    fn record(status: AgentStatus, launch: Uuid) -> SeenStatus {
+        let sample = sample(status, launch);
+        SeenStatus {
+            status,
+            binding: sample.binding,
+            coverage: sample.coverage,
+            completion_revision: 0,
+        }
+    }
+
+    #[test]
+    fn watched_blocked_event_is_already_attended() {
+        let launch = Uuid::new_v4();
+        let mut record = Some(record(AgentStatus::Working, launch));
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        apply_status_sample(
+            &mut record,
+            Some(&mut activity),
+            sample(AgentStatus::Blocked, launch),
+            200,
+        );
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Blocked));
+        assert_eq!(activity.blocked_at, Some(200));
+        assert!(!is_unread(&activity));
+    }
+
+    #[test]
+    fn attendance_clears_older_events_even_while_working() {
+        for event in [AgentStatus::Done, AgentStatus::Blocked] {
+            let launch = Uuid::new_v4();
+            let mut record = Some(record(AgentStatus::Working, launch));
+            let mut activity = AgentActivity::default();
+            activity.observe(None, AgentActivityState::Working, 100);
+            activity.observe(
+                Some(AgentActivityState::Working),
+                activity_state(event),
+                200,
+            );
+            activity.observe(
+                Some(activity_state(event)),
+                AgentActivityState::Working,
+                300,
+            );
+            let sample = sample(AgentStatus::Working, launch);
+            let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 400);
+            assert!(!is_unread(&activity));
+            assert!(effect.activity_changed);
+            assert!(!effect.changed);
+            assert_eq!(activity.work_started_at, Some(300));
+            assert_eq!(activity.current_state(), Some(AgentActivityState::Working));
+            assert_eq!(
+                activity.completed_at,
+                (event == AgentStatus::Done).then_some(200)
+            );
+            assert_eq!(
+                activity.blocked_at,
+                (event == AgentStatus::Blocked).then_some(200)
+            );
+            assert!(
+                !apply_status_sample(&mut record, Some(&mut activity), sample, 500)
+                    .activity_changed
+            );
+        }
+    }
+
+    #[test]
+    fn popout_attendance_clears_unread_in_every_lifecycle_state() {
+        for event in [AgentStatus::Done, AgentStatus::Blocked] {
+            for status in [event, AgentStatus::Working, AgentStatus::Idle] {
+                let mut activity = AgentActivity::default();
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    activity_state(event),
+                    200,
+                );
+                if status != event {
+                    activity.observe(Some(activity_state(event)), activity_state(status), 300);
+                }
+                let before = activity.clone();
+                assert!(is_unread(&activity));
+                assert!(observe_popout_activity(
+                    &mut activity,
+                    Some(status),
+                    status,
+                    true,
+                    400
+                ));
+                assert!(!is_unread(&activity));
+                assert_eq!(activity.current_state(), before.current_state());
+                assert_eq!(activity.completed_at, before.completed_at);
+                assert_eq!(activity.blocked_at, before.blocked_at);
+                assert!(!observe_popout_activity(
+                    &mut activity,
+                    Some(status),
+                    status,
+                    true,
+                    500
+                ));
+            }
+        }
+    }
 }
 
 fn should_refresh_accomplishments_after_status(
@@ -13885,7 +14024,10 @@ impl MuxelApp {
                 let previous_label = self.last_activity_labels.insert(iid, label.clone());
                 dirty |= previous_label.as_ref() != Some(&label);
             }
-            dirty |= changed;
+            // Attendance can clear unread without changing the displayed status.
+            dirty |= changed
+                || (self.settings.sidebar_sort == SidebarSort::RecentWork
+                    && effect.activity_changed);
             if changed {
                 dirty |= clear_stale_agent_notification(&mut self.notifications, iid, status);
             }
@@ -25289,7 +25431,14 @@ impl MuxelApp {
         let muted = cx.theme().muted_foreground;
         let radius = cx.theme().radius;
         let hover_col = cx.theme().sidebar_accent.opacity(0.45);
-        let has = !self.notifications.is_empty();
+        // Keep the shared collection intact: the tray still shows agent events.
+        let visible = || {
+            self.notifications
+                .iter()
+                .rev()
+                .filter(|n| notification_in_feed(self.settings.sidebar_sort, n.instance.is_some()))
+        };
+        let has = visible().next().is_some();
 
         let header = div()
             .px_3()
@@ -25336,7 +25485,7 @@ impl MuxelApp {
         }
 
         // Newest first.
-        for n in self.notifications.iter().rev() {
+        for n in visible() {
             let nid = n.id;
             let dot = n.kind.dot(cx);
             let title: SharedString = n.title.clone().into();
@@ -25872,6 +26021,22 @@ impl MuxelApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pid = self.workspace.active_project;
         let project_count = self.workspace.projects.len();
+        let instances = instances_by_id(&self.workspace);
+        let now = chrono::Utc::now().timestamp_millis();
+        let sort = self.settings.sidebar_sort;
+        let mut popouts_by_project: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        if sort == SidebarSort::RecentWork {
+            // Popouts leave the layout but must retain a session row when their
+            // feed entry is folded away. Workspace order gives ties a stable order.
+            for instance in &self.workspace.instances {
+                if self.popouts.contains_key(&instance.id) {
+                    popouts_by_project
+                        .entry(instance.project_id)
+                        .or_default()
+                        .push(instance.id);
+                }
+            }
+        }
         let entity = cx.entity();
         let mut list = div()
             .id("sidebar-scroll")
@@ -25899,6 +26064,16 @@ impl MuxelApp {
             let is_first = ix == 0;
             let is_last = ix + 1 == project_count;
             let collapsed = self.collapsed.contains(&pid);
+            let mut pane_ids = project.instances();
+            if let Some(popouts) = popouts_by_project.get(&pid) {
+                let mut seen: HashSet<_> = pane_ids.iter().copied().collect();
+                pane_ids.extend(popouts.iter().copied().filter(|id| seen.insert(*id)));
+            }
+            let unread = if sort == SidebarSort::RecentWork {
+                unread_count(&pane_ids, &instances)
+            } else {
+                0
+            };
             let renaming = self.rename == Some(RenameTarget::Project(pid))
                 && self.rename_origin == Some(RenameOrigin::ProjectSidebar);
             let name: SharedString = project.name.clone().into();
@@ -26029,6 +26204,14 @@ impl MuxelApp {
                                 },
                             )),
                     )
+                    .children((unread > 0).then(|| {
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().primary)
+                            .child(format!("{unread} {}", t("unread")))
+                    }))
                     .children(memory_on.then(|| {
                         div()
                             .flex_none()
@@ -26500,41 +26683,42 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
+                let entries = sidebar_order(&pane_ids, &instances, now, sort);
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
-                if !project.instances().is_empty() {
+                if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                // Group instances by worktree: plain (no-worktree) panes first,
-                // then a subcategory per worktree (a colored subheader followed by
-                // its instances).
-                let mut ungrouped: Vec<Uuid> = Vec::new();
-                let mut groups: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
-                for iid in project.instances() {
-                    match self.workspace.instance(iid).and_then(|i| i.worktree_id) {
-                        Some(wid) => match groups.iter_mut().find(|(w, _)| *w == wid) {
-                            Some(g) => g.1.push(iid),
-                            None => groups.push((wid, vec![iid])),
-                        },
-                        None => ungrouped.push(iid),
-                    }
-                }
-                let mut ordered: Vec<(Option<Uuid>, Uuid)> =
-                    ungrouped.into_iter().map(|i| (None, i)).collect();
-                for (wid, members) in groups {
-                    for iid in members {
-                        ordered.push((Some(wid), iid));
-                    }
-                }
-                let mut shown_wt: HashSet<Uuid> = HashSet::new();
-                for (wid_opt, iid) in ordered {
-                    // Emit the worktree subheader before its first instance.
-                    if let Some(wid) = wid_opt
-                        && shown_wt.insert(wid)
-                    {
-                        list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
-                    }
-                    let inst = self.workspace.instance(iid);
+                for entry in entries {
+                    let iid = match entry {
+                        SidebarEntry::Worktree(wid) => {
+                            list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
+                            continue;
+                        }
+                        SidebarEntry::Band(band) => {
+                            let label = match band {
+                                ActivityBand::Today => t("Today"),
+                                ActivityBand::ThisWeek => t("This week"),
+                                ActivityBand::Older => t("Older"),
+                            };
+                            list = list.child(
+                                div()
+                                    .ml_4()
+                                    .px_2()
+                                    .pt_2()
+                                    .pb_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(label),
+                            );
+                            continue;
+                        }
+                        SidebarEntry::Pane(iid) => iid,
+                    };
+                    let inst = instances.get(&iid).copied();
+                    let popped_out = self.popouts.contains_key(&iid);
+                    let unread = sort == SidebarSort::RecentWork
+                        && inst.is_some_and(|i| is_unread(&i.activity));
                     let program = inst.and_then(|i| i.program.clone());
                     let custom = inst
                         .and_then(|i| i.custom_name.clone())
@@ -26545,11 +26729,11 @@ impl MuxelApp {
                     let loading = self.terminal_is_loading(iid, cx);
                     let stopped = inst.is_some_and(|instance| {
                         instance.is_stopped_literal(
-                            self.terminals.contains_key(&iid),
+                            self.terminal_view(iid).is_some(),
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
+                    let (app_title, status) = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
@@ -26624,6 +26808,22 @@ impl MuxelApp {
                                 cx,
                             ),
                         ))
+                        .children(
+                            (sort == SidebarSort::RecentWork && inst.is_some_and(|i| i.pinned))
+                                .then(|| {
+                                    svg()
+                                        .path("icons/pin.svg")
+                                        .size(px(10.0))
+                                        .flex_none()
+                                        .text_color(cx.theme().muted_foreground)
+                                }),
+                        )
+                        .children(popped_out.then(|| {
+                            Icon::new(IconName::ExternalLink)
+                                .small()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                        }))
                         // Worktree dot (matches the pane outline color).
                         .children(
                             self.instance_worktree_color(iid)
@@ -26646,7 +26846,8 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
-                        base.cursor_pointer()
+                        let row = base
+                            .cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
                             // reset by the drag/release handling, so the pane would
@@ -26660,6 +26861,10 @@ impl MuxelApp {
                                         window,
                                         cx,
                                     );
+                                } else if let Some(popout) = this.popouts.get(&iid) {
+                                    let _ = popout
+                                        .window
+                                        .update(cx, |_, window, _| window.activate_window());
                                 } else {
                                     this.select_instance(iid, window, cx);
                                 }
@@ -26673,8 +26878,16 @@ impl MuxelApp {
                                     .text_ellipsis()
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground)
+                                    .when(unread, |s| s.font_semibold())
                                     .child(display),
                             )
+                            .children(unread.then(|| {
+                                div()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(cx.theme().primary)
+                            }))
                             .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
@@ -26692,58 +26905,66 @@ impl MuxelApp {
                                     .unwrap_or_else(|| status_label(Some(status)).to_string()),
                                 )
                             }))
-                            .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
-                                let label = ghost_label.clone();
-                                cx.new(move |_| DragGhost { label, offset })
-                            })
-                            .on_drop::<DragInstance>(cx.listener(
+                            .when(!popped_out, |row| {
+                                row.on_drag(DragInstance { iid }, move |_, offset, _, cx| {
+                                    let label = ghost_label.clone();
+                                    cx.new(move |_| DragGhost { label, offset })
+                                })
+                            });
+                        // Recent order is independent of layout positions. Accept
+                        // row swaps only when their result can be seen in the list.
+                        let row = if sort == SidebarSort::Layout {
+                            row.on_drop::<DragInstance>(cx.listener(
                                 move |this, p: &DragInstance, _w, cx| {
                                     this.swap_terminals(p.iid, iid, cx)
                                 },
                             ))
                             .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
-                            .context_menu({
-                                let entity = entity.clone();
-                                move |menu, window, _cx| {
-                                    menu.item(
-                                        PopupMenuItem::new(t("Rename"))
-                                            .icon(Icon::empty().path("icons/pencil.svg"))
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.start_rename_instance(
-                                                        iid,
-                                                        RenameOrigin::InstanceSidebar,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            )),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t("Duplicate"))
-                                            .icon(IconName::Copy)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.duplicate_instance(iid, window, cx)
-                                                },
-                                            )),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t("Kill"))
-                                            .icon(IconName::CircleX)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, _window, cx| {
-                                                    this.request_close_instance(iid, cx)
-                                                },
-                                            )),
-                                    )
-                                }
-                            })
-                            .into_any_element()
+                        } else {
+                            row
+                        };
+                        row.context_menu({
+                            let entity = entity.clone();
+                            move |menu, window, _cx| {
+                                menu.item(
+                                    PopupMenuItem::new(t("Rename"))
+                                        .icon(Icon::empty().path("icons/pencil.svg"))
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.start_rename_instance(
+                                                    iid,
+                                                    RenameOrigin::InstanceSidebar,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t("Duplicate"))
+                                        .icon(IconName::Copy)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.duplicate_instance(iid, window, cx)
+                                            },
+                                        )),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(t("Kill"))
+                                        .icon(IconName::CircleX)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.request_close_instance(iid, cx)
+                                            },
+                                        )),
+                                )
+                            }
+                        })
+                        .into_any_element()
                     };
                     list = list.child(row);
                 }
@@ -31955,6 +32176,26 @@ impl MuxelApp {
                     .child(self.pane_border_btn("off", &t("Off"), cx))
                     .child(self.pane_border_btn("subtle", &t("Subtle"), cx))
                     .child(self.pane_border_btn("bold", &t("Bold"), cx)),
+            )
+            .child(self.settings_label(&t("Sidebar order"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(self.option_btn(
+                        "sidebar-sort-layout",
+                        t("Layout"),
+                        self.settings.sidebar_sort == SidebarSort::Layout,
+                        cx,
+                        |s| s.sidebar_sort = SidebarSort::Layout,
+                    ))
+                    .child(self.option_btn(
+                        "sidebar-sort-work",
+                        t("Recent work"),
+                        self.settings.sidebar_sort == SidebarSort::RecentWork,
+                        cx,
+                        |s| s.sidebar_sort = SidebarSort::RecentWork,
+                    )),
             )
             .into_any_element()
     }

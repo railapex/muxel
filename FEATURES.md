@@ -564,7 +564,7 @@ feature is added or changed, update the matching entry here in the same change**
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name
   badge on a uniform pane, a per-tab color dot, and a matching dot in the sidebar.
-- **Sidebar grouping** — panes are grouped under colored worktree subheaders;
+- **Sidebar grouping** — in Layout order, panes are grouped under colored worktree subheaders;
   rename a worktree inline or from the context menu.
 - **Dispose flow** — when a worktree's last pane closes (or its agent exits), a
   clean worktree is removed silently; otherwise a modal offers **Commit & close**,
@@ -749,8 +749,9 @@ feature is added or changed, update the matching entry here in the same change**
   focused — no toast pops over the app you're already looking at (the in-app feed
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
-- **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
-  events **and** all app messages (git results, SSH connections, and save errors —
+- **In-app NOTIFICATIONS sidebar** — in Layout order, a category above PROJECTS
+  collecting agent events **and** all app messages (git results, SSH connections,
+  and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
   everything that used to be a pop-up toast goes here instead; persistent save
   failures report once per cause, not on every autosave). Agent rows are
@@ -1288,6 +1289,21 @@ feature is added or changed, update the matching entry here in the same change**
   project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
+- **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
+  (the default) or **Recent work**. Recent work lists pinned sessions first in
+  each project, then newest work first in Today (under 24 hours), This week
+  (under seven days), and Older bands. Attendance never makes old work fresh.
+  Sessions without work follow in layout order; project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work;
+  their external-window icon marks rows that raise an existing window on click.
+  Layout retains worktree subheaders and row swapping;
+  recent rows can still be dragged onto panes.
+- **Unread sessions** — in Recent work, a dot and bold name mark a completion or
+  blocked event since the session was last attended. Only attendance clears the
+  mark, even if another turn starts; Done persists. Project rows show the unread
+  count even when collapsed. Agent notifications appear on these session rows
+  instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
+  and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
