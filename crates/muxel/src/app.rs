@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -2103,6 +2104,15 @@ fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: 
         _ => word.to_string(),
     };
     age.map_or(word.clone(), |age| format!("{word} · {age}"))
+}
+
+fn saved_activity_status(activity: &AgentActivity) -> AgentStatus {
+    match activity.current_state() {
+        Some(AgentActivityState::Working) => AgentStatus::Working,
+        Some(AgentActivityState::Blocked) => AgentStatus::Blocked,
+        Some(AgentActivityState::Done) => AgentStatus::Done,
+        _ => AgentStatus::Idle,
+    }
 }
 
 /// Asset path for an agent's icon, chosen from its program name.
@@ -5657,6 +5667,8 @@ pub struct MuxelApp {
     last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
+    /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
+    dormant_instances: HashSet<Uuid>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8022,6 +8034,7 @@ impl MuxelApp {
             last_status: HashMap::new(),
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
+            dormant_instances: HashSet::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -8188,6 +8201,33 @@ impl MuxelApp {
         // Normally a no-op.
         muxel_core::dedupe_instances(&mut workspace);
         self.workspace = workspace;
+        let local_projects: HashSet<_> = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|project| !project.is_remote())
+            .map(|project| project.id)
+            .collect();
+        let now = chrono::Utc::now().timestamp_millis();
+        self.dormant_instances = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| {
+                instance.kind == InstanceKind::Terminal
+                    && !instance.use_tmux
+                    && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
+                    && local_projects.contains(&instance.project_id)
+                    && muxel_core::should_restore_dormant(
+                        &instance.activity,
+                        self.settings.dormant_after_days,
+                        now,
+                        false,
+                        instance.pinned,
+                    )
+            })
+            .map(|instance| instance.id)
+            .collect();
         let active = self
             .workspace
             .active_project
@@ -9171,6 +9211,18 @@ impl MuxelApp {
         if self.is_closing(iid) {
             return false;
         }
+        // Focus removes dormancy before requesting Restore. Background restore,
+        // Undo and recovery must not wake other old sessions as a side effect.
+        if self.is_dormant(iid)
+            && !matches!(
+                reason,
+                muxel_core::TerminalLaunchReason::NewPane
+                    | muxel_core::TerminalLaunchReason::RunAgain
+                    | muxel_core::TerminalLaunchReason::Restart
+            )
+        {
+            return false;
+        }
         self.workspace.instance(iid).is_some_and(|i| {
             i.permits_launch(reason)
                 && (!i.literal_argv
@@ -10073,6 +10125,38 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         let _phase = ui_profile::phase("activation", "ensure-project", None);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(project) = self.workspace.project(pid)
+            && !project.is_remote()
+        {
+            let panes: HashSet<_> = project.instances().into_iter().collect();
+            for instance in self
+                .workspace
+                .instances
+                .iter()
+                .filter(|instance| panes.contains(&instance.id))
+            {
+                let iid = instance.id;
+                let dormant = instance.kind == InstanceKind::Terminal
+                    && !instance.use_tmux
+                    && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
+                    && !self.terminals.contains_key(&iid)
+                    && !self.terminal_launching.contains_key(&iid)
+                    && !self.failed_launches.contains_key(&iid)
+                    && muxel_core::should_restore_dormant(
+                        &instance.activity,
+                        self.settings.dormant_after_days,
+                        now,
+                        self.active_instance == Some(iid),
+                        instance.pinned,
+                    );
+                if dormant {
+                    self.dormant_instances.insert(iid);
+                } else {
+                    self.dormant_instances.remove(&iid);
+                }
+            }
+        }
         // Make sure the shared memory file/gitignore exist (once per session) —
         // handles fresh clones where `.muxel/` was git-ignored away.
         if self
@@ -10848,7 +10932,10 @@ impl MuxelApp {
             self.workspace
                 .project(pid)
                 .map(|p| p.instances())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|iid| !self.is_dormant(*iid))
+                .collect(),
             self.active_instance,
             |iid| self.workspace.instance(iid).map(|i| i.kind) == Some(InstanceKind::Terminal),
         );
@@ -11326,6 +11413,9 @@ impl MuxelApp {
 
     fn spawn_project_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let _phase = ui_profile::phase("activation", "spawn-project-pane", Some(iid));
+        if self.is_dormant(iid) {
+            return;
+        }
         // A workspace can change while a deferred activation task is yielding.
         // UUIDs from the old document must become no-ops, never fallback shells.
         let Some((kind, pid)) = self.workspace.instance(iid).map(|i| (i.kind, i.project_id)) else {
@@ -12044,6 +12134,28 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_project_with_pane_focus(pid, attend_first_pane, true, window, cx);
+    }
+
+    /// Creation will select its new pane. Reconcile the project as usual without
+    /// opening its old preferred dormant session on the way there.
+    fn select_project_for_new_pane(
+        &mut self,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_project_with_pane_focus(pid, false, false, window, cx);
+    }
+
+    fn select_project_with_pane_focus(
+        &mut self,
+        pid: Uuid,
+        attend_first_pane: bool,
+        focus_first_pane: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let _phase = ui_profile::phase("workspace", "select-project", None);
         // Multi-window routing: a project shown in another window is RAISED, not
         // stolen (one project renders in exactly one window at a time).
@@ -12080,12 +12192,17 @@ impl MuxelApp {
         {
             self.current_preset = idx;
         }
-        self.active_instance = self
-            .workspace
-            .project(pid)
-            .and_then(|p| p.preferred_instance());
+        self.active_instance = if focus_first_pane {
+            self.workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance())
+        } else {
+            None
+        };
         if let Some(iid) = self.active_instance {
             self.focus_instance_with_attendance(iid, attend_first_pane, window, cx);
+        } else if !focus_first_pane {
+            window.focus(&self.focus_handle, cx);
         }
         self.ensure_project_terminals_deferred(pid, window, cx);
         // Keep the file browser, and a per-project hotbar view, pointed at the
@@ -12146,6 +12263,14 @@ impl MuxelApp {
         let _phase = ui_profile::phase("workspace", "focus-pane", Some(iid));
         ui_profile::focus_action(reason, Some(iid), window);
         self.active_instance = Some(iid);
+        if self.dormant_instances.remove(&iid) {
+            self.spawn_terminal_deferred(
+                iid,
+                muxel_core::TerminalLaunchReason::Restore,
+                window,
+                cx,
+            );
+        }
         if attend {
             // Deliberately selecting a pane clears its pending notification.
             self.clear_notifications_for(iid);
@@ -16833,6 +16958,7 @@ impl MuxelApp {
         worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
+        self.dormant_instances.remove(&iid);
         if let Some(data_dir) = muxel_store::data_dir() {
             crate::session_binding::clear_muse_binding(&data_dir, iid);
         }
@@ -22153,9 +22279,17 @@ impl MuxelApp {
 
     /// Toggle a tab's pinned flag, then re-order its pane so pinned tabs stay in
     /// the leftmost block (stable within each group).
-    fn toggle_pin(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+    fn toggle_pin(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(inst) = self.workspace.instance_mut(iid) {
             inst.pinned = !inst.pinned;
+        }
+        if self.tab_is_pinned(iid) && self.dormant_instances.remove(&iid) {
+            self.spawn_terminal_deferred(
+                iid,
+                muxel_core::TerminalLaunchReason::Restore,
+                window,
+                cx,
+            );
         }
         self.reflow_pins(iid);
         self.persist();
@@ -22347,6 +22481,11 @@ impl MuxelApp {
         if let Some(pid) = target_pid
             && self.workspace.active_project != Some(pid)
         {
+            // Stage the requested pane itself. Opening a different project must
+            // not wake its old preferred session on the way to this target.
+            if target_in_layout && let Some(project) = self.workspace.project_mut(pid) {
+                project.last_focused_instance = Some(iid);
+            }
             // The target pane is attended below. Do not consume the first pane's
             // unseen completion merely because project selection stages it first.
             self.select_project_with_attendance(pid, false, window, cx);
@@ -23526,6 +23665,58 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn is_dormant(&self, iid: Uuid) -> bool {
+        self.dormant_instances.contains(&iid)
+            && !self.terminals.contains_key(&iid)
+            && !self.terminal_launching.contains_key(&iid)
+    }
+
+    fn terminal_dormant(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let inst = self.workspace.instance(iid);
+        let folder = inst.and_then(Instance::working_directory).or_else(|| {
+            inst.and_then(|i| self.workspace.project(i.project_id))
+                .map(|p| p.root_path.as_path())
+        });
+        div()
+            .id(format!("terminal-dormant-{iid}"))
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                inst.map(|i| i.display_name().to_string())
+                    .unwrap_or_default(),
+            )
+            .children(inst.and_then(|i| i.auto_name.clone()))
+            .children(inst.map(|i| {
+                localized_activity_label(
+                    saved_activity_status(&i.activity),
+                    &i.activity,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            }))
+            .child(
+                folder
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .child(t("Starts when you open it"))
+            .child(
+                Button::new(format!("start-dormant-{iid}"))
+                    .label(t("Start"))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_instance(iid, window, cx)
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         // gpui-component defaults to ease-in-out, which visibly accelerates and
         // decelerates every 800 ms. Terminal startup wants a steady activity cue.
@@ -23708,6 +23899,8 @@ impl MuxelApp {
                     && !self.terminal_launching.contains_key(&iid)
                 {
                     self.literal_stopped(iid, cx)
+                } else if self.is_dormant(iid) {
+                    self.terminal_dormant(iid, cx)
                 } else if let Some(err) = self.failed_launches.get(&iid) {
                     // The launch failed completely (fallback shell included):
                     // show the error in place; the toolbar Restart retries.
@@ -24070,7 +24263,11 @@ impl MuxelApp {
                             .gap_1()
                             .px_1()
                             .h_full()
-                            .max_w(px(180.0));
+                            // A dormant pill also carries saved status/age. Keep
+                            // a name budget instead of letting that badge take
+                            // the ordinary 180px pill's entire width.
+                            .max_w(px(if self.is_dormant(tab) { 320.0 } else { 180.0 }))
+                            .when(self.is_dormant(tab), |pill| pill.flex_none());
                         // The active tab gets a themed (accent) underline so the
                         // selection is obvious at a glance without an oversized box;
                         // the others keep just the right divider between pills.
@@ -24163,7 +24360,9 @@ impl MuxelApp {
                                                 .icon(Icon::empty().path("icons/pin.svg"))
                                                 .on_click(window.listener_for(
                                                     &entity,
-                                                    move |this, _, _w, cx| this.toggle_pin(tab, cx),
+                                                    move |this, _, window, cx| {
+                                                        this.toggle_pin(tab, window, cx)
+                                                    },
                                                 )),
                                         );
                                     // Relaunch on the saved conversation (resume-capable
@@ -24312,13 +24511,31 @@ impl MuxelApp {
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_w_0()
+                                    .min_w(px(if self.is_dormant(tab) { 64.0 } else { 0.0 }))
                                     .pl_1()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .child(tab_title),
                             )
+                            .children(self.is_dormant(tab).then(|| {
+                                let activity = self.workspace.instance(tab).map(|i| &i.activity);
+                                let status = activity
+                                    .map(saved_activity_status)
+                                    .unwrap_or(AgentStatus::Idle);
+                                let age = activity
+                                    .map(|activity| {
+                                        localized_activity_label(
+                                            status,
+                                            activity,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                div()
+                                    .flex_none()
+                                    .child(status_tag(status, format!("{age} · {}", t("dormant"))))
+                            }))
                             // A tab being read aloud says so — even when another tab
                             // of its pane is showing — and pauses or resumes on click.
                             .children({
@@ -26581,7 +26798,15 @@ impl MuxelApp {
                     } else if let Some(bv) = self.browsers.get(&iid) {
                         (bv.read(cx).tab_title(), AgentStatus::Idle)
                     } else {
-                        (meta, AgentStatus::Idle)
+                        (
+                            meta,
+                            if self.is_dormant(iid) {
+                                inst.map(|i| saved_activity_status(&i.activity))
+                                    .unwrap_or(AgentStatus::Idle)
+                            } else {
+                                AgentStatus::Idle
+                            },
+                        )
                     };
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
@@ -26646,6 +26871,48 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
+                        let dormant = self.is_dormant(iid);
+                        let badge = if loading {
+                            status_tag(AgentStatus::Working, t("loading").to_string())
+                        } else if stopped {
+                            status_tag(AgentStatus::Idle, t("stopped").to_string())
+                        } else {
+                            status_tag(
+                                status,
+                                inst.map(|instance| {
+                                    let label = localized_activity_label(
+                                        status,
+                                        &instance.activity,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
+                                    if dormant {
+                                        format!("{label} · {}", t("dormant"))
+                                    } else {
+                                        label
+                                    }
+                                })
+                                .unwrap_or_else(|| status_label(Some(status)).to_string()),
+                            )
+                        };
+                        let details = div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .when(dormant, |details| details.flex_col().items_start().gap_1())
+                            .when(!dormant, |details| details.items_center().gap_2())
+                            .child(
+                                div()
+                                    .when(!dormant, |name| name.flex_1())
+                                    .when(dormant, |name| name.w_full())
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(cx.theme().sidebar_foreground)
+                                    .child(display),
+                            )
+                            .child(div().flex_none().child(badge));
                         base.cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
@@ -26664,34 +26931,7 @@ impl MuxelApp {
                                     this.select_instance(iid, window, cx);
                                 }
                             }))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground)
-                                    .child(display),
-                            )
-                            .child(div().flex_none().child(if loading {
-                                status_tag(AgentStatus::Working, t("loading").to_string())
-                            } else if stopped {
-                                status_tag(AgentStatus::Idle, t("stopped").to_string())
-                            } else {
-                                status_tag(
-                                    status,
-                                    inst.map(|instance| {
-                                        localized_activity_label(
-                                            status,
-                                            &instance.activity,
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                )
-                            }))
+                            .child(details)
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
                                 let label = ghost_label.clone();
                                 cx.new(move |_| DragGhost { label, offset })
@@ -31994,6 +32234,10 @@ impl MuxelApp {
     }
 
     fn render_settings_behavior(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dormant_days = match self.settings.dormant_after_days {
+            0 => 3,
+            days => days,
+        };
         let global_default = self
             .presets
             .iter()
@@ -32015,6 +32259,30 @@ impl MuxelApp {
         v_flex()
             .gap_3()
             .max_w(px(520.0))
+            .child(self.check_row(
+                Checkbox::new("b-dormant")
+                    .checked(self.settings.dormant_after_days > 0)
+                    .on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                        this.settings.dormant_after_days = if *checked { 3 } else { 0 };
+                        this.persist_settings();
+                        cx.notify();
+                    })),
+                &tf("Start sessions not worked on in {days} days only when opened", &[("days", &dormant_days.to_string())]),
+            ))
+            .child(div().flex().items_center().gap_2()
+                .child(Button::new("dormant-days-less").small().label("−")
+                    .disabled(self.settings.dormant_after_days <= 1)
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.settings.dormant_after_days = this.settings.dormant_after_days.saturating_sub(1).max(1);
+                        this.persist_settings(); cx.notify();
+                    })))
+                .child(tf("{days} days (applies on next project open or launch)", &[("days", &dormant_days.to_string())]))
+                .child(Button::new("dormant-days-more").small().label("+")
+                    .disabled(self.settings.dormant_after_days == 0)
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.settings.dormant_after_days = this.settings.dormant_after_days.saturating_add(1);
+                        this.persist_settings(); cx.notify();
+                    }))))
             .child(
                 self.check_row(
                     Checkbox::new("b-notif")

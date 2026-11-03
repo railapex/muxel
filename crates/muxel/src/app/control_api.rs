@@ -194,6 +194,7 @@ enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    Focus(Uuid),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -835,6 +836,48 @@ impl MuxelApp {
             Err(error) => ctl::Response::err(error),
         };
         match self.control_command(command, caller_instance_id, cx) {
+            Answer::Focus(iid) => {
+                let app = cx.weak_entity();
+                let workspace = self.current_workspace;
+                let handle = self
+                    .popouts
+                    .get(&iid)
+                    .map(|p| p.window.into())
+                    .or_else(|| {
+                        self.workspace
+                            .instance(iid)
+                            .and_then(|i| self.window_showing(i.project_id))
+                    })
+                    .or(self.main_window);
+                cx.defer(move |cx| {
+                    let result = handle
+                        .and_then(|handle| {
+                            Self::update_in_window(&app, handle, cx, |this, window, cx| {
+                                if this.current_workspace != workspace
+                                    || this.workspace.instance(iid).is_none()
+                                {
+                                    return Err("the pane's workspace has changed".into());
+                                }
+                                if !this.settings.control_enabled {
+                                    return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
+                                }
+                                if let Some(until) = this.closing_until(iid) {
+                                    return Err(ctl::Error::closing(until));
+                                }
+                                if let Some(popout) = this.popouts.get(&iid) {
+                                    window.focus(&popout.view.focus_handle(cx), cx);
+                                } else {
+                                    this.select_instance(iid, window, cx);
+                                }
+                                this.persist();
+                                window.activate_window();
+                                Ok(json!({ "uuid": iid, "focused": true }))
+                            })
+                        })
+                        .unwrap_or_else(|| Err("no muxel window is available".into()));
+                    let _ = reply.send(respond(result));
+                });
+            }
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -931,6 +974,7 @@ impl MuxelApp {
         if matches!(
             &command,
             Command::New { .. }
+                | Command::Focus { .. }
                 | Command::Send { .. }
                 | Command::Answer { .. }
                 | Command::Keys { .. }
@@ -971,6 +1015,10 @@ impl MuxelApp {
                     .and_then(|iid| self.control_info_of(iid, now, cx))
                     .map(|info| json!(info)),
             ),
+            Command::Focus { agent } => match self.control_resolve(&agent) {
+                Ok(iid) => Answer::Focus(iid),
+                Err(error) => Answer::Now(Err(error)),
+            },
             Command::Show { agent, full } => match self.control_resolve(&agent) {
                 Ok(iid) => self.control_show(iid, full, now, cx),
                 Err(error) => Answer::Now(Err(error)),
@@ -1164,6 +1212,7 @@ impl MuxelApp {
             is_agent: inst.kind == InstanceKind::Terminal
                 && readaloud::is_agent_program(inst.program.as_deref()),
             status,
+            not_running_reason: self.is_dormant(inst.id).then(|| "dormant".to_string()),
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
                 status,
@@ -1322,6 +1371,13 @@ impl MuxelApp {
     }
 
     fn control_screen(&self, iid: Uuid, lines: Option<usize>, cx: &App) -> Answer {
+        if self.is_dormant(iid) {
+            return Answer::Now(Err(ctl::Error::new(
+                ErrorCode::NotRunning,
+                "that pane is dormant; open it in muxel or use ctl focus to start it",
+            )
+            .with_reason("dormant")));
+        }
         let lines = lines
             .unwrap_or(ctl::SCREEN_LINES)
             .clamp(1, ctl::SCREEN_LINES_MAX);
@@ -1355,6 +1411,13 @@ impl MuxelApp {
             .instance(iid)
             .ok_or("that agent has just closed")?;
         let name = inst.display_name();
+        if self.is_dormant(iid) {
+            return Err(ctl::Error::new(
+                ErrorCode::NotRunning,
+                format!("'{name}' is dormant; open it in muxel or use ctl focus to start it"),
+            )
+            .with_reason("dormant"));
+        }
         if inst.kind != InstanceKind::Terminal {
             return Err(format!(
                 "'{name}' is {} pane, not a terminal",
