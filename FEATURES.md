@@ -1289,7 +1289,14 @@ feature is added or changed, update the matching entry here in the same change**
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
-  branch icon (refreshed live).
+  branch icon (refreshed live). Long labels ellipsize within the header; hover for
+  the full branch name.
+- **Session folder chips** — terminal rows show their launch folder's short name
+  when it differs from the project root, plus its current Git branch when known.
+  Root sessions show just the branch. Click a chip to show sessions in that folder
+  or on that known branch; click it again or the project's clear button to reset.
+  Background refresh supplies the sidebar and `ctl panes` / `status` `branch`
+  field. Running programs' later directory changes are not tracked.
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its

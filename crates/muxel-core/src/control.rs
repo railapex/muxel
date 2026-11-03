@@ -481,6 +481,9 @@ pub struct AgentInfo {
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Current Git branch from the launch folder's background cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Runs on a remote host over SSH.
     pub remote: bool,
 }
@@ -2298,6 +2301,27 @@ mod tests {
     }
 
     #[test]
+    fn cached_branch_is_additive_and_separate_from_worktree_creation_branch() {
+        let mut old_response = serde_json::json!({
+            "id": "11111111", "uuid": id(7), "name": "shell",
+            "project": "repo", "project_id": "22222222", "kind": "terminal",
+            "preset": "Shell", "is_agent": false, "awaiting_reply": false,
+            "focused": false, "remote": false, "cwd": "/repo/env",
+            "worktree_branch": "original-at-creation"
+        });
+        let old: AgentInfo = serde_json::from_value(old_response.clone()).unwrap();
+        assert_eq!(old.branch, None);
+        assert!(serde_json::to_value(old).unwrap().get("branch").is_none());
+        old_response["branch"] = serde_json::json!("checked-out-now");
+        let current: AgentInfo = serde_json::from_value(old_response).unwrap();
+        assert_eq!(current.branch.as_deref(), Some("checked-out-now"));
+        assert_eq!(
+            current.worktree_branch.as_deref(),
+            Some("original-at-creation")
+        );
+    }
+
+    #[test]
     fn an_agent_shows_its_launch_id_only_while_it_runs() {
         let mut info = AgentInfo {
             id: short_id(id(7)),
@@ -2319,6 +2343,7 @@ mod tests {
             pane: Some(1),
             worktree_branch: None,
             cwd: None,
+            branch: None,
             remote: false,
         };
         let json = serde_json::to_value(&info).unwrap();
