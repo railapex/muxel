@@ -1773,7 +1773,7 @@ feature is added or changed, update the matching entry here in the same change**
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
   labels, timings and short pane ids, with no
   terminal content, session ids, titles or paths.
-- **Profiler isolation** — muxel's profiler switches and log paths stay with the
+- **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
   process that enabled them. Panes, runners and helper commands start without
   those settings; a nested muxel can enable its own profiler independently.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
