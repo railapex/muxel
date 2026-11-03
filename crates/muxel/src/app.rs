@@ -9462,6 +9462,11 @@ impl MuxelApp {
     /// (Not `last_status`: that's re-derived from the live terminal every tick and
     /// only feeds transition notifications, so a stale previous value is harmless.)
     fn reset_terminal_runtime(&mut self, iid: Uuid) {
+        if let Some(instance) = self.workspace.instance_mut(iid)
+            && instance.reset_auto_name_for_launch()
+        {
+            self.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+        }
         // A respawn replaces any exited view; its next exit is a fresh event.
         self.exit_logged.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
@@ -13447,6 +13452,14 @@ impl MuxelApp {
                     .instances
                     .iter()
                     .filter_map(|instance| {
+                        if instance
+                            .label
+                            .as_deref()
+                            .is_some_and(|label| !label.trim().is_empty())
+                            && this.terminal_view(instance.id).is_none()
+                        {
+                            return None;
+                        }
                         let remote = this
                             .workspace
                             .project(instance.project_id)
@@ -14025,6 +14038,10 @@ impl MuxelApp {
         let names: Vec<(Uuid, Option<String>, Option<String>)> = self
             .terminals
             .iter()
+            .chain(
+                popout_terminal_views(&self.terminals, &self.popouts, PopOut::terminal_view)
+                    .map(|(iid, _, terminal)| (iid, terminal)),
+            )
             .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| {
                 let view = view.read(cx);
@@ -23978,11 +23995,17 @@ impl MuxelApp {
                 .workspace
                 .project(instance.project_id)
                 .is_some_and(Project::is_remote);
-            let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
-            let program_name = self
-                .terminals
-                .get(&iid)
-                .and_then(|v| v.read(cx).program_auto_title());
+            let terminal = self.terminal_view(iid);
+            if instance
+                .label
+                .as_deref()
+                .is_some_and(|label| !label.trim().is_empty())
+                && terminal.is_none()
+            {
+                return instance.display_name().to_string().into();
+            }
+            let live_title = terminal.and_then(|v| v.read(cx).title());
+            let program_name = terminal.and_then(|v| v.read(cx).program_auto_title());
             if let Some(name) = authoritative_terminal_auto_title(
                 instance,
                 &self.codex_session_names,
@@ -27321,7 +27344,7 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminal_view(iid) {
+                    let (agent_title, status) = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
@@ -27340,8 +27363,7 @@ impl MuxelApp {
                                     live_title.as_deref(),
                                     program_name.as_deref(),
                                 )
-                            })
-                            .unwrap_or(meta),
+                            }),
                             shown_terminal_status(
                                 view,
                                 inst,
@@ -27349,12 +27371,12 @@ impl MuxelApp {
                             ),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (ed.read(cx).title(), AgentStatus::Idle)
+                        (Some(ed.read(cx).title()), AgentStatus::Idle)
                     } else if let Some(bv) = self.browsers.get(&iid) {
-                        (bv.read(cx).tab_title(), AgentStatus::Idle)
+                        (Some(bv.read(cx).tab_title()), AgentStatus::Idle)
                     } else {
                         (
-                            meta,
+                            None,
                             if self.is_dormant(iid) {
                                 inst.map(|i| saved_activity_status(&i.activity))
                                     .unwrap_or(AgentStatus::Idle)
@@ -27363,6 +27385,9 @@ impl MuxelApp {
                             },
                         )
                     };
+                    let tooltip =
+                        inst.and_then(|instance| instance.name_tooltip(agent_title.as_deref()));
+                    let app_title = agent_title.unwrap_or(meta);
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
                     // A user-assigned name fully replaces the agent's own title
@@ -27429,14 +27454,25 @@ impl MuxelApp {
                     if !is_sel {
                         base = base.hover(move |s| s.bg(hover_col));
                     }
-                    if !renaming && let Some(terminal) = self.terminals.get(&iid).cloned() {
+                    // One tooltip per element (gpui asserts): the name and starting
+                    // label, then the agent's live activity.
+                    let terminal = self.terminals.get(&iid).cloned();
+                    if !renaming && (terminal.is_some() || tooltip.is_some()) {
                         base = base.tooltip(move |window, cx| {
                             // Activity can change without a sidebar redraw. Read
                             // it on hover, including when none existed at render.
-                            let activity = terminal.read(cx).runtime_activity().map(str::to_owned);
-                            match activity {
-                                Some(activity) => gpui_component::tooltip::Tooltip::new(activity)
-                                    .build(window, cx),
+                            let activity = terminal
+                                .as_ref()
+                                .and_then(|terminal| terminal.read(cx).runtime_activity())
+                                .map(str::to_owned);
+                            let text = match (tooltip.clone(), activity) {
+                                (Some(name), Some(activity)) => Some(format!("{name}\n{activity}")),
+                                (name, activity) => name.or(activity),
+                            };
+                            match text {
+                                Some(text) => {
+                                    gpui_component::tooltip::Tooltip::new(text).build(window, cx)
+                                }
                                 None => cx.new(|_| Empty).into(),
                             }
                         });

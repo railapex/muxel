@@ -853,9 +853,10 @@ feature is added or changed, update the matching entry here in the same change**
   accepts an existing absolute directory, including a linked worktree outside
   the project root; it defaults to the root. Automatic memory and accomplishments
   instructions still address the project's files when the launch directory differs.
-  `--name` names the tab (1–100 visible characters; `--from` likewise), and
-  `--split right|down` creates a pane. Both refuse control, bidi, zero-width and
-  line-separator characters.
+  `--name` supplies a starting label; `--name-fixed` keeps a fixed name. Choose
+  one. Names and `--from` labels accept 1–100 visible characters and refuse
+  control, bidi, zero-width and line-separator characters.
+  `--split right|down` creates a pane.
   Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
   the new pane, its project and window only when the request was approved with
@@ -1378,6 +1379,10 @@ feature is added or changed, update the matching entry here in the same change**
   editor and commits on Enter or blur without the opening click prematurely
   saving it. Bare session UUIDs and transient startup titles such as `cmd.exe`
   or the agent executable name are never used as display names.
+  A `ctl new --name` label yields to the agent's useful title after launch and
+  stays available as a control alias and in `status`/`panes`. Saved titles from
+  an earlier launch do not displace the starting label. Row tooltips show the
+  current agent title and retained label; manual inline names remain sticky.
 - **Resizable sidebar** — drag to resize (up to half the window); width persists.
 - **Fullscreen mode** — `F11` (rebindable) toggles OS fullscreen with the sidebar
   fully hidden. A floating pill at the left edge brings the sidebar back without

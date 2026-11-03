@@ -588,6 +588,10 @@ pub struct Instance {
     /// User-assigned name; when set it fully replaces the agent's own title.
     #[serde(default)]
     pub custom_name: Option<String>,
+    /// Stable outside-control alias. An agent's own title replaces it on screen;
+    /// manual names remain separate, sticky overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Last title reported by the running program. This is kept separate from
     /// `custom_name` so a manual rename remains an explicit, stable override.
     #[serde(default)]
@@ -792,7 +796,52 @@ impl Instance {
                     .as_deref()
                     .filter(|name| is_useful_auto_name_for_program(name, self.program.as_deref()))
             })
+            .or_else(|| {
+                self.label
+                    .as_deref()
+                    .filter(|label| !label.trim().is_empty())
+            })
             .unwrap_or(&self.title)
+    }
+
+    /// A new terminal must publish its own title before replacing a starting
+    /// label. An auto name saved by the previous launch is not that publication.
+    pub fn reset_auto_name_for_launch(&mut self) -> bool {
+        self.label
+            .as_deref()
+            .is_some_and(|label| !label.trim().is_empty())
+            && self.auto_name.take().is_some()
+    }
+
+    /// Named rows expose the agent's title and retained routing label on hover.
+    /// Values are plain text; no application-specific field names appear in UI.
+    pub fn name_tooltip(&self, live_title: Option<&str>) -> Option<String> {
+        let label = self.label.as_deref().filter(|name| !name.trim().is_empty());
+        if label.is_none()
+            && self
+                .custom_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
+            return None;
+        }
+        let title = live_title
+            .filter(|name| {
+                self.kind != InstanceKind::Terminal
+                    || is_useful_auto_name_for_program(name, self.program.as_deref())
+            })
+            .or_else(|| {
+                self.auto_name
+                    .as_deref()
+                    .filter(|name| is_useful_auto_name_for_program(name, self.program.as_deref()))
+            })
+            .unwrap_or(&self.title);
+        let mut tooltip = title.to_string();
+        if let Some(label) = label.filter(|label| *label != title) {
+            tooltip.push('\n');
+            tooltip.push_str(label);
+        }
+        Some(tooltip)
     }
 
     /// Record a useful program-supplied title. Returns whether persisted state
@@ -848,6 +897,7 @@ impl Instance {
             editor_path: None,
             browser_url: None,
             custom_name: None,
+            label: None,
             auto_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
@@ -919,6 +969,7 @@ impl Instance {
             editor_path: path,
             browser_url: None,
             custom_name: None,
+            label: None,
             auto_name: None,
             program: None,
             args: Vec::new(),

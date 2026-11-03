@@ -21,6 +21,9 @@ pub enum NewPlacement {
 pub struct NewOptions {
     pub cwd: Option<PathBuf>,
     pub name: Option<String>,
+    /// `name` is a sticky manual override rather than a starting label. Keeping
+    /// its text in `name` lets older hosts honor --name-fixed too.
+    pub name_fixed: bool,
     pub placement: NewPlacement,
     /// Legacy wire field. The host uses `focus`; CLI serialization mirrors the
     /// requested behavior here so older hosts also preserve focus by default.
@@ -52,6 +55,9 @@ pub const MAX_PROMPT_CHARS: usize = 10_000;
 impl NewOptions {
     /// Also checked by the server: callers may send JSON without using the CLI.
     pub fn validate(&self) -> Result<(), String> {
+        if self.name_fixed && self.name.is_none() {
+            return Err("--name-fixed needs a name".into());
+        }
         for (name, value) in [("model", &self.model), ("effort", &self.effort)] {
             if let Some(value) = value
                 && (value.is_empty()
@@ -68,7 +74,12 @@ impl NewOptions {
         }
         // Both are drawn as plain text: the name on tabs, the sidebar and the
         // phone, the caller on the approval card.
-        for (flag, value) in [("--name", &self.name), ("--from", &self.from)] {
+        let name_flag = if self.name_fixed {
+            "--name-fixed"
+        } else {
+            "--name"
+        };
+        for (flag, value) in [(name_flag, &self.name), ("--from", &self.from)] {
             if let Some(value) = value
                 && (value.trim().is_empty()
                     || value.chars().count() > MAX_LABEL_CHARS
@@ -221,7 +232,16 @@ impl NewOptions {
             }
         };
         instance.control_created = true;
-        instance.custom_name = self.name.clone();
+        instance.custom_name = if self.name_fixed {
+            self.name.clone()
+        } else {
+            None
+        };
+        instance.label = if self.name_fixed {
+            None
+        } else {
+            self.name.clone()
+        };
         instance.launch_dir = Some(
             self.cwd
                 .clone()
@@ -253,7 +273,14 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
                 break;
             }
             "--cwd" => options.cwd = Some(PathBuf::from(value()?)),
-            "--name" => options.name = Some(value()?),
+            "--name" | "--name-fixed" => {
+                let fixed = arg == "--name-fixed";
+                if options.name.is_some() && options.name_fixed != fixed {
+                    return Err("--name and --name-fixed are mutually exclusive".into());
+                }
+                options.name = Some(value()?);
+                options.name_fixed = fixed;
+            }
             "--preset" => options.preset = Some(value()?),
             "--model" => options.model = Some(value()?),
             "--effort" => options.effort = Some(value()?),
