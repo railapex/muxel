@@ -7,8 +7,13 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::TerminalPalette;
-use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
+use crate::listener::{
+    EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter, session_thread_field,
+};
 use crate::profile;
+use crate::program_status::{
+    Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
+};
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -29,6 +34,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
+
+#[path = "input_hold.rs"]
+mod input_hold;
+pub(crate) use input_hold::InputGate;
+use input_hold::{ShellMarks, ShellPrompt};
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -695,6 +705,10 @@ pub struct CommandSpec {
     /// Where that task's startup reads the provider's title when the PTY can't
     /// see it (a tmux-wrapped pane). Unused by any other automation.
     pub title_source: Option<TitleSource>,
+    /// Set when this command is a tmux client: outside-control input then goes
+    /// to its tmux pane through tmux, never through the client. See
+    /// [`crate::control_input`].
+    pub tmux_input: Option<crate::TmuxInputRoute>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -737,6 +751,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -763,6 +778,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -846,6 +862,11 @@ impl CommandSpec {
         self.title_source = Some(source);
         self
     }
+
+    pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
+        self.tmux_input = Some(route);
+        self
+    }
 }
 
 /// How long the requested size must hold steady before we actually resize. A
@@ -864,6 +885,54 @@ const NO_MOUSE_PRESS: u8 = u8::MAX;
 struct QueuedWrite {
     bytes: Vec<u8>,
     queued_at: Option<Instant>,
+    /// Protocol query replies have no actor epoch and keep flowing while held.
+    epoch: Option<u64>,
+}
+
+impl QueuedWrite {
+    fn admitted(&self, gate: &InputGate) -> bool {
+        self.epoch.is_none_or(|epoch| gate.accepts(epoch))
+    }
+}
+
+#[cfg(test)]
+mod input_hold_queue_tests {
+    use super::{ChannelWriter, InputGate, QueuedWrite};
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn queued_ctl_writes_die_with_the_close_even_after_undo() {
+        let gate = Arc::new(InputGate::default());
+        let (tx, rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let mut actor = ChannelWriter {
+            tx: tx.clone(),
+            profile: false,
+            closed: Arc::new(AtomicBool::new(false)),
+            gate: Some(gate.clone()),
+        };
+        let mut protocol = ChannelWriter {
+            tx,
+            profile: false,
+            closed: actor.closed.clone(),
+            gate: None,
+        };
+        actor.write_all(b"queued keys").unwrap();
+        actor.write_all(b"\r").unwrap();
+        gate.hold();
+        assert!(actor.write_all(b"held").is_err());
+        protocol.write_all(b"\x1b[0n").unwrap();
+        gate.resume();
+        actor.write_all(b"new input").unwrap();
+        let accepted: Vec<_> = rx
+            .try_iter()
+            .flatten()
+            .filter(|write| write.admitted(&gate))
+            .map(|write| write.bytes)
+            .collect();
+        assert_eq!(accepted, [b"\x1b[0n".to_vec(), b"new input".to_vec()]);
+    }
 }
 
 fn queue_delay_excluding_profiler(
@@ -884,6 +953,7 @@ struct ChannelWriter {
     tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     profile: bool,
     closed: Arc<AtomicBool>,
+    gate: Option<Arc<InputGate>>,
 }
 
 impl Write for ChannelWriter {
@@ -894,10 +964,23 @@ impl Write for ChannelWriter {
                 "pty child exited",
             ));
         }
+        let epoch = self.gate.as_ref().map(|gate| gate.epoch());
+        if self
+            .gate
+            .as_ref()
+            .zip(epoch)
+            .is_some_and(|(gate, epoch)| !gate.accepts(epoch))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal is closing",
+            ));
+        }
         self.tx
             .send(Some(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
+                epoch,
             }))
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
         Ok(buf.len())
@@ -1138,9 +1221,16 @@ impl OutputReadClock {
 
 pub struct TerminalSession {
     pub id: Uuid,
+    launched_at: SystemTime,
     launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    program_status_observer: Mutex<Observer>,
+    program_status_generation: AtomicU64,
+    /// Lets the throughput benchmark compare the drain with and without the
+    /// OSC 7501 observer on one session.
+    #[cfg(test)]
+    observe_program_status_for_bench: AtomicBool,
     read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
@@ -1152,6 +1242,8 @@ pub struct TerminalSession {
     /// on Unix the reader harvests the child status after EOF.
     killer: SharedChildKiller,
     input_closed: Arc<AtomicBool>,
+    input_gate: Arc<InputGate>,
+    shell_prompt: Arc<ShellPrompt>,
     input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
@@ -1161,6 +1253,9 @@ pub struct TerminalSession {
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
+    /// Current root OSC 7501 report from this PTY launch. Child-id records do
+    /// not drive pane status; a provider binding switch clears the root.
+    program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     title_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
@@ -1240,6 +1335,9 @@ pub struct TerminalSession {
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
     interactive_until: Mutex<Option<Instant>>,
+    /// The tmux route for outside-control input, when this terminal's program
+    /// is a tmux client (see [`crate::control_input`]).
+    tmux_input: Option<crate::control_input::TmuxInput>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1351,6 +1449,14 @@ impl TerminalSession {
         self.launch_resumed
     }
 
+    pub fn launched_at(&self) -> SystemTime {
+        self.launched_at
+    }
+
+    pub fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1405,6 +1511,7 @@ impl TerminalSession {
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        let launched_at = SystemTime::now();
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -1502,6 +1609,9 @@ impl TerminalSession {
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
         let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
         let input_closed = Arc::new(AtomicBool::new(false));
+        let input_gate = Arc::new(InputGate::default());
+        let worker_gate = input_gate.clone();
+        let shell_prompt = Arc::new(ShellPrompt::default());
         let worker_closed = input_closed.clone();
         let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
@@ -1521,6 +1631,9 @@ impl TerminalSession {
                         )
                     });
                     let write_started = write.queued_at.map(|_| Instant::now());
+                    if !write.admitted(&worker_gate) {
+                        continue;
+                    }
                     let result = pipe_writer.write_all(&write.bytes);
                     if result.is_ok() {
                         let _ = pipe_writer.flush();
@@ -1547,6 +1660,7 @@ impl TerminalSession {
             tx: write_tx.clone(),
             profile: profile_writes.is_some(),
             closed: input_closed.clone(),
+            gate: Some(input_gate.clone()),
         })));
         // The Windows slave shares ConPTY ownership with the master. Release
         // it before the monitor can close the console after a fast child exit.
@@ -1567,7 +1681,17 @@ impl TerminalSession {
 
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
-        let replies = Arc::new(Replies::new(writer.clone()));
+        let reply_writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
+            tx: write_tx.clone(),
+            profile: profile_writes.is_some(),
+            closed: input_closed.clone(),
+            gate: None,
+        })));
+        let replies = Arc::new(Replies::new(reply_writer));
+        let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        if matches!(&spec.binding, LaunchBinding::Known(_)) {
+            program_status.lock().adopt_binding(1);
+        }
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1578,6 +1702,7 @@ impl TerminalSession {
             .spawn({
                 let input_closed = input_closed.clone();
                 let input_stop = write_tx.clone();
+                let shell_prompt = shell_prompt.clone();
                 move || {
                     read_loop(
                         reader,
@@ -1589,6 +1714,7 @@ impl TerminalSession {
                         InputShutdown {
                             closed: input_closed,
                             stop: input_stop,
+                            shell_prompt,
                         },
                     )
                 }
@@ -1655,19 +1781,27 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launched_at,
             launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            program_status_observer: Mutex::new(Observer::default()),
+            program_status_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            observe_program_status_for_bench: AtomicBool::new(true),
             read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
             output_queue,
             killer,
             input_closed,
+            input_gate: input_gate.clone(),
+            shell_prompt,
             input_stop: write_tx,
             child_pid,
             title,
             evidence,
+            program_status,
             title_generation,
             title_changed_at,
             session_id_hint,
@@ -1704,6 +1838,11 @@ impl TerminalSession {
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
             interactive_until: Mutex::new(None),
+            // ctl input through tmux honours the same close hold.
+            tmux_input: spec
+                .tmux_input
+                .clone()
+                .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -1750,7 +1889,7 @@ impl TerminalSession {
         // parses the incoming bytes in the same advance call. Give the replay
         // its old time and the new bytes their own time.
         const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
-        if processor.sync_timeout().sync_timeout().is_some()
+        let fresh = if processor.sync_timeout().sync_timeout().is_some()
             && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
         {
             self.evidence
@@ -1759,11 +1898,84 @@ impl TerminalSession {
             processor.stop_sync(term);
             clock.sync_since = None;
             clock.next_sync_since = None;
-            self.evidence.lock().begin_read(incoming_at);
+            self.evidence.lock().begin_read(incoming_at)
         } else {
-            self.evidence.lock().begin_read(effective_at);
-        }
+            self.evidence.lock().begin_read(effective_at)
+        };
+        self.observe_program_status(bytes, fresh);
         processor.advance(term, bytes);
+    }
+
+    /// Observe each timed segment before VTE can defer its title callbacks.
+    /// Capacity replay has already separated the old frame from these bytes,
+    /// so the observer and the listener receive the same attribution time.
+    fn observe_program_status(&self, bytes: &[u8], fresh: bool) {
+        #[cfg(test)]
+        if !self
+            .observe_program_status_for_bench
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut observer = self.program_status_observer.lock();
+        let mut rest = bytes;
+        loop {
+            // Plain output, and escapes that can't start an OSC or a reset,
+            // raise no event; skip them instead of feeding VTE byte by byte.
+            rest = &rest[observer.inert_prefix(rest)..];
+            let Some((&byte, tail)) = rest.split_first() else {
+                break;
+            };
+            rest = tail;
+            let generation = self.program_status_generation.load(Ordering::Acquire);
+            let Some(event) = observer.advance_at(byte, fresh, generation) else {
+                continue;
+            };
+            if let ProgramStatusEvent::Title(ref title) = event
+                && let Some(thread) = session_thread_field(title)
+                && let Some(key) = ThreadKey::from_field(thread)
+            {
+                let evidence = self.evidence.lock();
+                let carry = evidence.can_carry_initial_working();
+                let confirms_launch = !evidence.first_thread_switches(thread);
+                drop(evidence);
+                let mut status = self.program_status.lock();
+                if fresh && self.program_status_generation.load(Ordering::Acquire) == generation {
+                    status.observe_title(key, carry, confirms_launch);
+                }
+            }
+            match event {
+                ProgramStatusEvent::Report(report) => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        if report.id.is_none() {
+                            log::debug!(
+                                "program status source=osc7501 report state={:?} kind={:?}",
+                                report.state,
+                                report.kind
+                            );
+                        }
+                        status.apply(report);
+                    }
+                }
+                ProgramStatusEvent::Reset => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.clear();
+                    }
+                }
+                ProgramStatusEvent::ShellPrompt => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.shell_prompt();
+                    }
+                }
+                ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => {}
+            }
+        }
     }
 
     /// Collects alacritty damage for the next paint (partial row rebuild) and
@@ -1844,26 +2056,8 @@ impl TerminalSession {
             }
             parsed = true;
         }
-        // Synchronized updates (DECSET 2026): vte BUFFERS everything between
-        // BSU/ESU instead of applying it, and expiring a stuck window is the
-        // embedder's job (alacritty services this in its event loop; vte's
-        // deadline is 150ms). Without this check, an app that opens a window
-        // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap. Replay
-        // keeps the opening read time of the buffered frame.
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|d| Instant::now() >= d)
-        {
-            self.evidence
-                .lock()
-                .begin_read(clock.effective_at(SystemTime::now()));
-            processor.stop_sync(&mut *term);
-            clock.sync_since = None;
-            clock.next_sync_since = None;
-            profile::sync_expired();
-        }
+        // Expiry without another read uses the same original frame time.
+        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
         self.evidence.lock().end_read();
         if parsed {
             let screen = term.screen_lines() as i32;
@@ -1995,8 +2189,29 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.check_input_gate()?;
+        self.admit_input(!data.is_empty());
+        self.try_write_raw(data)?;
+        self.shell_prompt.submitted(data);
+        Ok(())
+    }
+
+    /// Refuse input while the terminal is held for closing.
+    fn check_input_gate(&self) -> std::io::Result<()> {
+        if self.accepts_input_epoch(self.input_epoch()) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal is closing",
+            ))
+        }
+    }
+
+    /// The bookkeeping every input write does before its bytes go anywhere.
+    fn admit_input(&self, nonempty: bool) {
         self.scroll_input_to_bottom();
-        if !data.is_empty() {
+        if nonempty {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
             self.advance_input(Some(submitted_enter));
             if submitted_enter {
@@ -2006,7 +2221,6 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-        self.try_write_raw(data)
     }
 
     /// Admit a complete submission (Enter, or text ending in Enter) and commit
@@ -2014,6 +2228,16 @@ impl TerminalSession {
     /// submission evidence unchanged, with no marker for a later key to consume.
     /// Success means queued bytes, not confirmation that the child consumed them.
     pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        // This API admits a known prompt after `paste_prompt` has checked
+        // the pane and input revision. Generic keyboard Enter uses
+        // `mark_turn_submitted` and cannot prove prompt intent.
+        self.try_submit(data, true)
+    }
+
+    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
+    /// and a plain one otherwise.
+    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
+        self.check_input_gate()?;
         self.scroll_input_to_bottom();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
@@ -2023,14 +2247,91 @@ impl TerminalSession {
         self.submission_pending.store(false, Ordering::Release);
         writer.write_all(data)?;
         writer.flush()?;
+        self.shell_prompt.submitted(data);
         if !data.is_empty() {
-            self.evidence.lock().record_submission(submitted_at);
-            self.turn_submitted.store(true, Ordering::Relaxed);
-            self.advance_input(Some(true));
-            self.mark_interactive();
-            self.trigger_runtime();
+            self.commit_submission(submitted_at, prompt);
         }
         Ok(())
+    }
+
+    /// The facts an admitted submission commits together. A `prompt` one
+    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
+    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
+    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.advance_input(Some(true));
+        self.mark_interactive();
+        self.trigger_runtime();
+    }
+
+    /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
+    /// tmux client gets it at its agent's tmux pane through tmux, queued in order
+    /// behind this terminal's earlier ctl writes; any other terminal gets the
+    /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
+    /// [`Self::try_submit_input`]. Either way the input revision and draft bit
+    /// move as for a PTY write, and a submit's facts are committed only once it
+    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
+        use crate::{ControlInput, ControlWrite, ControlWriteError};
+        let Some(tmux) = &self.tmux_input else {
+            let written = match &input {
+                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Keys { keys, app_cursor } => self.try_write_input(
+                    &keys
+                        .iter()
+                        .flat_map(|key| key.bytes(*app_cursor))
+                        .collect::<Vec<u8>>(),
+                ),
+                ControlInput::Submit => self.try_submit_input(b"\r"),
+                ControlInput::SubmitKey => self.try_submit(b"\r", false),
+            };
+            return ControlWrite::done(
+                written.map_err(|error| ControlWriteError::Closed(error.to_string())),
+            );
+        };
+        // Held for closing, the pane takes no ctl input by this route either.
+        // A write queued before the hold dies on the worker, even after Undo.
+        let epoch = self.input_epoch();
+        if !self.accepts_input_epoch(epoch) {
+            return ControlWrite::done(Err(ControlWriteError::Closed(
+                "terminal is closing".into(),
+            )));
+        }
+        let submit = match &input {
+            ControlInput::Submit | ControlInput::SubmitKey => {
+                self.scroll_input_to_bottom();
+                self.submission_pending.store(false, Ordering::Release);
+                let prompt = input == ControlInput::Submit;
+                Some((self.clone(), SystemTime::now(), prompt))
+            }
+            ControlInput::Paste(text) => {
+                self.admit_input(!text.is_empty());
+                None
+            }
+            ControlInput::Keys { keys, .. } => {
+                self.admit_input(!keys.is_empty());
+                None
+            }
+        };
+        ControlWrite::queued(tmux.deliver(input, epoch), submit)
+    }
+
+    /// Whether outside-control input reaches this terminal through tmux.
+    pub fn delivers_through_tmux(&self) -> bool {
+        self.tmux_input.is_some()
+    }
+
+    /// The tmux pane id outside-control input goes to, once found.
+    pub fn tmux_input_pane(&self) -> Option<String> {
+        self.tmux_input.as_ref()?.pinned_pane()
     }
 
     fn scroll_input_to_bottom(&self) {
@@ -2050,6 +2351,30 @@ impl TerminalSession {
     /// Input from another client of the same tmux session is not counted.
     pub fn input_rev(&self) -> u64 {
         self.input_snapshot().0
+    }
+
+    /// Hide-time cancellation: old queued input stays invalid after Undo.
+    pub fn hold_input(&self) {
+        self.input_gate.hold();
+        self.submission_pending.store(false, Ordering::Release);
+    }
+
+    pub fn resume_input(&self) {
+        self.input_gate.resume();
+    }
+
+    pub fn input_epoch(&self) -> u64 {
+        self.input_gate.epoch()
+    }
+
+    pub fn accepts_input_epoch(&self, epoch: u64) -> bool {
+        self.input_gate.accepts(epoch)
+    }
+
+    /// Only launch-local OSC 133 A/B establish a shell prompt. No output means
+    /// unknown, including Windows shells without shell integration.
+    pub fn shell_at_prompt(&self) -> bool {
+        self.shell_prompt.at_prompt()
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -2103,7 +2428,24 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
-        self.evidence.lock().record_submission(SystemTime::now());
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return;
+        }
+        let submitted_at = SystemTime::now();
+        self.evidence.lock().record_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Explicit prompt submission from a path that supplied the prompt text.
+    /// Keyboard Enter alone can select a resume item, even after arrow input.
+    pub fn mark_prompt_submitted(&self) {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return;
+        }
+        let submitted_at = SystemTime::now();
+        let mut evidence = self.evidence.lock();
+        evidence.record_prompt_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
     }
@@ -2118,6 +2460,10 @@ impl TerminalSession {
     /// identity or submission never establishes or transfers that ownership.
     pub fn first_submission_binding(&self) -> Option<u64> {
         self.evidence.lock().first_submission_binding()
+    }
+
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.evidence.lock().initial_unbound_submission()
     }
 
     /// The input revision and draft bit. Ordinary non-empty input writes (keys,
@@ -2196,6 +2542,9 @@ impl TerminalSession {
     /// advances the input revision, but it isn't text: the draft bit and the
     /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return;
+        }
         if !data.is_empty() {
             self.advance_input(None);
         }
@@ -2701,8 +3050,15 @@ impl TerminalSession {
         to: SystemTime,
         learned_at: SystemTime,
     ) {
+        // A sequence begun before this boundary cannot become a new binding's
+        // report just because its terminator arrives in a later PTY read.
+        self.program_status_generation
+            .fetch_add(1, Ordering::AcqRel);
         let evidence = &mut *self.evidence.lock();
         let switch = evidence.switch_binding(from, to, learned_at);
+        self.program_status
+            .lock()
+            .adopt_binding(evidence.binding_rev());
         if switch.bell {
             self.bell.store(false, Ordering::Relaxed);
         }
@@ -2725,6 +3081,77 @@ impl TerminalSession {
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
+    }
+
+    /// The embedder owns vte's synchronized-update timeout. The view uses this
+    /// deadline to revisit a title/report held by a BSU without more PTY bytes.
+    pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
+        self.processor.lock().sync_timeout().sync_timeout()
+    }
+
+    fn flush_expired_sync_locked(
+        &self,
+        term: &mut Term<MuxelListener>,
+        processor: &mut Processor,
+        clock: &mut OutputReadClock,
+    ) -> bool {
+        let Some(deadline) = processor.sync_timeout().sync_timeout() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.evidence
+            .lock()
+            .begin_read(clock.effective_at(SystemTime::now()));
+        processor.stop_sync(term);
+        clock.sync_since = None;
+        clock.next_sync_since = None;
+        self.evidence.lock().end_read();
+        profile::sync_expired();
+        true
+    }
+
+    fn flush_expired_program_status_sync(&self) {
+        let mut term = self.term.lock();
+        let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
+        if self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock) {
+            self.bump_content();
+            self.trigger_runtime();
+        }
+    }
+
+    pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        self.flush_expired_program_status_sync();
+        // A synchronized update may have supplied a new UUID title while VTE
+        // still holds its callback. The observer is then ahead of #91.
+        // The listener takes hint before evidence for a title callback. Keep
+        // that order here when recovering from an over-budget title.
+        let hint_thread = self
+            .session_id_hint
+            .lock()
+            .as_deref()
+            .and_then(session_thread_field)
+            .and_then(ThreadKey::from_field);
+        let binding_rev = self.evidence.lock().binding_rev();
+        let mut status = self.program_status.lock();
+        if status.binding_revision > binding_rev {
+            return status.launch_facts();
+        }
+        if status.binding_revision < binding_rev {
+            // An overlong title can be rejected by the observer's OSC budget
+            // while alacritty still emits it. The listener proves a newer
+            // binding; retire old PSP facts and accept later fresh reports.
+            status.recover_binding(binding_rev, hint_thread);
+        }
+        status.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_program_status(&self, wire: &[u8]) {
+        self.process_output(wire);
+        self.trigger_runtime();
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -2761,6 +3188,11 @@ impl TerminalSession {
     pub fn clear_bell(&self) {
         self.bell.store(false, Ordering::Relaxed);
         self.trigger_runtime();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&self, idle: Duration) {
+        *self.last_output.lock() = Instant::now() - idle;
     }
 
     /// Time since output was last processed (for idle detection).
@@ -3624,11 +4056,12 @@ impl HangupChild {
     }
 }
 
-/// The writer's existing closed flag and stop channel, handed to the reader
-/// together so ending its stream stops input before reaping the child.
+/// Shared input state handed to the reader. Ending its stream stops input
+/// before reaping the child; OSC 133 evidence is observed before UI admission.
 struct InputShutdown {
     closed: Arc<AtomicBool>,
     stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    shell_prompt: Arc<ShellPrompt>,
 }
 
 /// Drain PTY output before publishing Exit. Windows gets child status from a
@@ -3647,6 +4080,7 @@ fn read_loop(
     #[cfg(unix)]
     let mut child = HangupChild::new(child, tx.queue_state());
     let mut buf = [0u8; PTY_READ_BUFFER_BYTES];
+    let mut shell_marks = ShellMarks::default();
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
     // torn down. Any other error is recorded so the app can log/show it.
@@ -3688,6 +4122,7 @@ fn read_loop(
                 // Before the bytes reach the UI: replies that wait on the UI's
                 // drain can miss the asker's window and be read as typing.
                 immediate_replies.advance(&buf[..n]);
+                shell_marks.advance(&buf[..n], &input_shutdown.shell_prompt);
                 if !tx.send_output(buf[..n].to_vec(), timing, read_at) {
                     // The stream has ended: the receiver dropped, or the
                     // session dropped while the receiver was behind. Stop the
@@ -5880,6 +6315,149 @@ mod runtime_fact_tests {
     }
 
     #[test]
+    fn fresh_program_reports_survive_capacity_replay_of_an_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\", b"\x1b"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut report = b"\x1b]7501;state=working".to_vec();
+            report.extend_from_slice(ending);
+            let mut output = PtyOutput::default();
+            output.push(&report, fresh);
+            session.process_drained(&output);
+            if ending == b"\x1b" {
+                assert_eq!(session.program_status_snapshot().root, None);
+                let mut output = PtyOutput::default();
+                output.push(b"\\", fresh);
+                session.process_drained(&output);
+            }
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_cannot_refresh_an_old_partial_program_report() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let prefix = b"\x1b]7501;state=done";
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL - prefix.len(), 0);
+            frame.extend_from_slice(prefix);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            output.push(ending, fresh);
+            session.process_drained(&output);
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(session.program_status_snapshot().root, None);
+            let mut output = PtyOutput::default();
+            output.push(b"\x1b]7501;state=working\x07", fresh);
+            session.process_drained(&output);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn queued_and_cross_boundary_reports_cannot_restore_a_retired_binding() {
+        let session = fixture();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10);
+        let mut first = PtyOutput::default();
+        first.push(b"\x1b]7501;state=working\x07", old);
+        session.process_drained(&first);
+        assert!(session.program_status_snapshot().root.is_some());
+
+        session.provider_switched_at(now, now, now);
+        let mut queued = PtyOutput::default();
+        queued.push(b"\x1b]7501;state=done\x07", old);
+        session.process_drained(&queued);
+        let snapshot = session.program_status_snapshot();
+        assert_eq!(snapshot.root, None);
+        assert_eq!(snapshot.explicit_completions, 0);
+
+        let mut ambiguous_start = PtyOutput::default();
+        ambiguous_start.push(b"\x1b]7501;state=done", now + Duration::from_secs(1));
+        session.process_drained(&ambiguous_start);
+        let mut fresh_end = PtyOutput::default();
+        fresh_end.push(b"\x07", now + Duration::from_secs(10));
+        session.process_drained(&fresh_end);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        // The first half of this frame is parsed before another switch; its
+        // terminator arrives in a fresh read after the boundary.
+        let before = now + Duration::from_secs(20);
+        let mut partial = PtyOutput::default();
+        partial.push(b"\x1b]7501;state=done", before);
+        session.process_drained(&partial);
+        session.provider_switched_at(before, before, before);
+        let mut ending = PtyOutput::default();
+        ending.push(b"\x07", before + Duration::from_secs(10));
+        session.process_drained(&ending);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        let mut new = PtyOutput::default();
+        new.push(
+            b"\x1b]7501;state=working\x07",
+            before + Duration::from_secs(11),
+        );
+        session.process_drained(&new);
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.kill();
+    }
+
+    #[test]
     fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
         struct RefuseSubmission {
             on_flush: bool,
@@ -5906,6 +6484,7 @@ mod runtime_fact_tests {
             assert!(session.try_submit_input(b"\r").is_err());
             assert_eq!(session.input_snapshot(), pasted);
             assert!(!session.has_submitted_turn());
+            assert_eq!(session.first_submission_at(), None);
             assert!(!session.runtime_evidence(None).submitted);
             assert!(!session.submission_pending.load(Ordering::Acquire));
             assert!(events.is_empty());
@@ -5919,6 +6498,7 @@ mod runtime_fact_tests {
             session.try_submit_input(b"\r").unwrap();
             assert_eq!(session.input_snapshot(), (pasted.0 + 2, false));
             assert!(session.has_submitted_turn());
+            assert!(session.first_submission_at().is_some());
             assert!(session.runtime_evidence(None).submitted);
             assert_eq!(events.try_recv(), Ok(()));
             session.kill();
@@ -5961,6 +6541,9 @@ mod runtime_fact_tests {
         session.try_submit_input(b"\r").unwrap();
         let submitted = session.input_snapshot();
         let hook_at = hook_at.lock().expect("hook published during admission");
+        let first_submission_at = session.first_submission_at().expect("Enter submitted");
+        assert!(first_submission_at >= session.launched_at());
+        assert!(first_submission_at <= hook_at);
         // Muxel learns of the hook after the writer returns. Its timestamp,
         // not the time the report was read, decides who received the Enter.
         session.provider_switched_at(hook_at, hook_at, SystemTime::now());
@@ -5970,6 +6553,7 @@ mod runtime_fact_tests {
         // A later submission really does belong to the replacement.
         *session.writer.lock() = Box::new(std::io::sink());
         session.try_submit_input(b"\r").unwrap();
+        assert_eq!(session.first_submission_at(), Some(first_submission_at));
         let later_submitted = session.runtime_evidence(None).submitted;
         session.kill();
 
@@ -6091,6 +6675,40 @@ mod tests {
         let reply = std::fs::read(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
         assert_eq!(String::from_utf8_lossy(&reply), "\x1b[>0;2501;1c");
+    }
+
+    #[test]
+    fn program_status_answer_reaches_a_unix_child_before_da() {
+        let out = std::env::temp_dir().join(format!("muxel-psp-{}", Uuid::new_v4()));
+        let expected = format!("{}\x1b[?6c", crate::program_status::CAPABILITY_REPLY);
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; head -c {} > '{}'",
+            expected.len(),
+            out.display()
+        );
+        let (session, rx) = TerminalSession::spawn(
+            CommandSpec::program("/bin/sh", vec!["-c".into(), script]),
+            80,
+            24,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Ok(PtyChunk::Output(_)) | Err(async_channel::TryRecvError::Empty) => {}
+            }
+            if Instant::now() > deadline {
+                session.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reply = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(reply, expected.as_bytes());
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
@@ -7028,5 +7646,213 @@ mod input_rev_tests {
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_ne!(session.input_rev(), wheeled);
         session.kill();
+    }
+}
+
+/// Drain throughput with and without the OSC 7501 observer. Benchmarks, so
+/// ignored; run with `cargo test -p muxel-terminal --lib throughput_bench --
+/// --ignored --nocapture --test-threads=1` (add `--release` for an optimized build).
+#[cfg(test)]
+mod throughput_bench {
+    use super::{CommandSpec, PtyChunk, TerminalSession};
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// One PTY read (`PTY_READ_BUFFER_BYTES`).
+    const CHUNK: usize = 64 << 10;
+    const DRAIN_TOTAL: usize = 64 << 20;
+    const DRAIN_RUNS: usize = 5;
+    const PTY_TOTAL: usize = 4 << 20;
+    const PTY_RUNS: usize = 3;
+    const SENTINEL: &[u8] = b"MUXEL_BENCH_END";
+
+    fn repeat_to(unit: &[u8], len: usize) -> Vec<u8> {
+        unit.iter().copied().cycle().take(len).collect()
+    }
+
+    fn workloads(len: usize) -> Vec<(&'static str, Vec<u8>)> {
+        let mut text = Vec::new();
+        let mut colored = Vec::new();
+        let mut tui = Vec::new();
+        for n in 0..4096 {
+            text.extend_from_slice(
+                format!(
+                    "{n:06} warning: unused variable `report` in crates/muxel-terminal/src/view.rs:{n}\r\n"
+                )
+                .as_bytes(),
+            );
+            colored.extend_from_slice(
+                format!(
+                    "\x1b[1m\x1b[32m   Compiling\x1b[0m muxel-terminal v0.3.3 (\x1b[4mD:/dev/muxel/crates/muxel-terminal\x1b[24m) \x1b[38;5;244m[{n}/4096]\x1b[39m\r\n"
+                )
+                .as_bytes(),
+            );
+            // A full-screen agent repaint: cursor moves and SGR every few words.
+            let row = n % 40 + 1;
+            tui.extend_from_slice(
+                format!(
+                    "\x1b[{row};1H\x1b[2K\x1b[38;2;110;110;110m│\x1b[0m \x1b[1m{n:05}\x1b[22m \x1b[38;2;200;160;80mReading\x1b[39m src/view.rs \x1b[2m(esc to interrupt)\x1b[22m"
+                )
+                .as_bytes(),
+            );
+        }
+        vec![
+            ("yes", repeat_to(b"y\r\n", len)),
+            ("plain text", repeat_to(&text, len)),
+            ("colored build log", repeat_to(&colored, len)),
+            ("TUI repaint", repeat_to(&tui, len)),
+        ]
+    }
+
+    fn mb_per_s(bytes: usize, elapsed: Duration) -> f64 {
+        bytes as f64 / elapsed.as_secs_f64() / 1e6
+    }
+
+    fn summary(rates: &mut [f64]) -> (f64, f64, f64) {
+        rates.sort_by(f64::total_cmp);
+        (rates[0], rates[rates.len() / 2], rates[rates.len() - 1])
+    }
+
+    fn report(name: &str, off: &mut [f64], on: &mut [f64]) {
+        let (off_min, off_median, off_max) = summary(off);
+        let (on_min, on_median, on_max) = summary(on);
+        println!(
+            "{name:>18}: off {off_median:7.1} MB/s ({off_min:.1}-{off_max:.1}), on {on_median:7.1} MB/s ({on_min:.1}-{on_max:.1}), observer cost {:+.1}%",
+            (off_median / on_median - 1.0) * 100.0
+        );
+    }
+
+    fn quiet() -> CommandSpec {
+        if cfg!(windows) {
+            CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            )
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        }
+    }
+
+    fn drain(session: &TerminalSession, chunk: &[u8], observe: bool) -> f64 {
+        session
+            .observe_program_status_for_bench
+            .store(observe, Ordering::Relaxed);
+        let started = Instant::now();
+        for _ in 0..DRAIN_TOTAL / chunk.len() {
+            session.process_output(chunk);
+        }
+        mb_per_s(DRAIN_TOTAL, started.elapsed())
+    }
+
+    /// The UI drain alone: PTY-sized reads parsed into one session's grid.
+    #[test]
+    #[ignore = "benchmark"]
+    fn observer_cost_in_the_drain() {
+        let (session, _rx) = TerminalSession::spawn(quiet(), 120, 40).expect("spawn");
+        println!(
+            "drain: {} MiB per run in {} KiB reads, {DRAIN_RUNS} runs each, median (min-max)",
+            DRAIN_TOTAL >> 20,
+            CHUNK >> 10
+        );
+        for (name, chunk) in workloads(CHUNK) {
+            drain(&session, &chunk, true); // fill the grid and scrollback first
+            let (mut off, mut on) = (Vec::new(), Vec::new());
+            for _ in 0..DRAIN_RUNS {
+                off.push(drain(&session, &chunk, false));
+                on.push(drain(&session, &chunk, true));
+            }
+            report(name, &mut off, &mut on);
+        }
+        session.kill();
+    }
+
+    fn cat(path: &Path) -> CommandSpec {
+        if cfg!(windows) {
+            let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("cmd.exe");
+            CommandSpec::program(
+                cmd.to_string_lossy(),
+                ["/d", "/q", "/c", "type"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain([path.to_string_lossy().into_owned()])
+                    .chain(["&", "echo", "MUXEL_BENCH_END"].map(String::from))
+                    .collect(),
+            )
+        } else {
+            CommandSpec::program(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    format!("cat '{}'; echo MUXEL_BENCH_END", path.display()),
+                ],
+            )
+        }
+    }
+
+    /// Spawn to sentinel: the child writes the file through the platform PTY
+    /// while this thread drains it like the view does.
+    fn through_pty(path: &Path, observe: bool) -> (f64, usize) {
+        let started = Instant::now();
+        let (session, rx) = TerminalSession::spawn(cat(path), 120, 40).expect("spawn");
+        session
+            .observe_program_status_for_bench
+            .store(observe, Ordering::Relaxed);
+        let deadline = started + Duration::from_secs(300);
+        let mut received = 0;
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    session.process_output(&bytes);
+                    received += bytes.len();
+                    carry.extend_from_slice(&bytes[..bytes.len().min(SENTINEL.len())]);
+                    let seen = carry.windows(SENTINEL.len()).any(|w| w == SENTINEL)
+                        || bytes.windows(SENTINEL.len()).any(|w| w == SENTINEL);
+                    if seen {
+                        break;
+                    }
+                    carry.clear();
+                    carry.extend_from_slice(&bytes[bytes.len().saturating_sub(SENTINEL.len())..]);
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Err(async_channel::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "no sentinel after 300 s");
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let rate = mb_per_s(PTY_TOTAL, started.elapsed());
+        session.kill();
+        (rate, received)
+    }
+
+    /// `cat`/`type` of a large file in a pane, end to end.
+    #[test]
+    #[ignore = "benchmark"]
+    fn observer_cost_through_a_real_pty() {
+        let dir = std::env::temp_dir().join(format!("muxel-bench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        println!(
+            "pty: {} MiB file per run, {PTY_RUNS} runs each, rate = file bytes / spawn-to-sentinel",
+            PTY_TOTAL >> 20
+        );
+        for (name, content) in workloads(PTY_TOTAL).into_iter().take(3) {
+            let path = dir.join(format!("{}.txt", name.replace(' ', "-")));
+            std::fs::write(&path, &content).unwrap();
+            let (mut off, mut on) = (Vec::new(), Vec::new());
+            let mut received = 0;
+            for _ in 0..PTY_RUNS {
+                off.push(through_pty(&path, false).0);
+                let (rate, bytes) = through_pty(&path, true);
+                on.push(rate);
+                received = bytes;
+            }
+            println!("{name:>18}: {received} bytes reached the drain");
+            report(name, &mut off, &mut on);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

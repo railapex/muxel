@@ -105,8 +105,45 @@ feature is added or changed, update the matching entry here in the same change**
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
-- **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation). Editors and browser panes just close.
+- **Recoverable terminal close** — a closed terminal stays alive, hidden, for
+  15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
+  a popped-out terminal returns to the main window. Busy or uncertain terminals
+  ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
+  binding, input and completion before expiry; changed work gets Close / Keep.
+  An OSC 7501 report counts as quiet only while idle or finished; an `error`
+  report asks, and any turn a report finishes during the countdown is changed
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  Queued input, written to the terminal or sent through tmux, is cancelled
+  across close and Undo, and hidden panes leave ctl listings; writes refuse
+  with `closing` and `undo_until`. A shell counts down only with prompt
+  evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
+  always ask. A tmux pane that only looks dead here (never connected, a
+  failed restart, a detached client) asks too, since closing it kills a
+  session that may still run its agent; its client exiting mid-countdown also
+  turns into Close / Keep. Undo reattaches a pane whose launch or reconnect was
+  in flight, and restarts only a pane whose restart was queued. A held pane
+  stays in the shared layout until its close is final, so other machines and
+  the iOS app keep syncing, and their edits are adopted, while it counts down.
+  A countdown that runs out finishes only after the next read of the shared
+  layout, showing "Checking before close…" until then, so edits a peer made
+  while this machine slept are adopted, not overwritten. When that layout
+  can't be read (its host is offline or reconnecting, or no read lands within
+  30 seconds), the close asks Close or Keep instead.
+- **Resource and worktree close** — dirty editors offer Save / Don't Save /
+  Cancel; clean editors, diffs and browsers close immediately. The last pane of
+  a muxel worktree with changes or unmerged commits uses its disposal choice
+  directly; a clean, landed worktree follows the terminal countdown policy. A
+  pane opened in that worktree while its question is showing gets its own
+  prompt and countdown, and a pane brought back by Undo leaves the question.
+  Client checks show progress, beside any running countdown, with their own
+  Cancel; a batch member closed during the check leaves the others to their
+  decision. Ordinary saves preserve held panes for crash recovery; workspace
+  switch and quit (or logout) finish running countdowns, but keep a pane
+  still being checked or waiting for Close / Keep, which reopens next time.
+  Removing a project waits for that decision. If that save fails, the first
+  switch stops with a notice and the next one leaves anyway; the pane reopens
+  next time. Saving an untitled editor on close writes the path picked in the
+  save dialog on this machine, as Save As does.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 
@@ -219,13 +256,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -401,9 +449,31 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability
+  query before a following DA query, and Claude, Codex, Grok and Muse panes take
+  their reports as status. Working, blocked (including permission, question, or
+  auth kind), and finished states come from the agent while its root report is
+  current; a shell, opencode or Amp pane ignores reports, since anything printed
+  there can carry one. A blocked prompt on screen or in the agent's title still
+  shows **blocked** while the report says Working. A finished Codex turn also
+  reaches **done** when its submitted Working turn reports Idle; protocol `error`
+  uses the existing **done** badge with its error source retained. A Working
+  report before any prompt in the launch, such as Codex's while it resumes a
+  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  process exit, or relaunch returns an unfinished pane to its existing fallback
+  detection. Both local and remote tmux panes continue using that fallback
+  because tmux does not forward OSC 7501 reports. Once Claude has reported in a
+  launch, its glyph-less title names the pane for the rest of that launch without
+  supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. A marker-based agent whose turn finishes
+  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
+  status, while permission forms and hints outside the box still do. A draft can
+  still count, as before, where muxel can't pick out the box whole: a rule drawn
+  below it, a draft line that lands on the box's edge, or bash mode's `!` prompt.
+  Grok's unanswered question card reports **blocked** in a pane without a tmux
+  status bar. A marker-based agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
   notification read without rewriting lifecycle state or age. Sidebar badges include
@@ -426,7 +496,9 @@ feature is added or changed, update the matching entry here in the same change**
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
-  defaults per agent and **editable working/blocked markers per preset**.
+  defaults per agent and **editable working/blocked markers per preset**. On a
+  Claude pane, built-in and edited lists alike match outside its input box,
+  alongside Claude's own status-row and permission-form parsers.
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
@@ -440,10 +512,13 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
-  An agent that prints nothing more after the switch settles a couple of seconds
-  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  If no fresh evidence arrives after the switch, a timer settles an idle pane
+  so it accepts sends again; an old prompt or
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
+  An old busy title retires after five seconds of silence when no new submission,
+  fresh title, screen marker or bell sustains it. This returns to Idle without
+  reporting a completed turn.
   A Grok conversation switch releases old loop ownership even if saving fails.
   A confirmed provider switch clears the previous conversation's automatic name,
   including a switch back to the same UUID between reads; a transcript path
@@ -830,7 +905,10 @@ feature is added or changed, update the matching entry here in the same change**
   returns the same, so a caller can `send` then `wait` without polling. An answer
   to a question counts as a turn too, so `answer` then `wait` works the same way.
 - **Refuses what would go wrong** — `send` won't type into an agent that is
-  working or waiting on a question (unless forced), `answer` only picks an option
+  working, waiting on a question, or still in the grace after a submitted control
+  turn (unless forced). It checks again at paste after the shared tmux claim settles.
+  `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
+  forced. An older host ignores the caller ID. `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands. That
@@ -851,9 +929,41 @@ feature is added or changed, update the matching entry here in the same change**
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
-  the pane closes or restarts. A withheld send fails and attempts to release only
-  its own tmux claim; timeout, command failure or older tmux can leave the claim
-  in place under its existing aging rules.
+  the pane closes or restarts. A failure that typed nothing (before a paste, or
+  a paste tmux refused) releases only its own tmux claim; once a prompt or key
+  may have reached the agent it keeps the claim under the normal aging rules.
+  Timeout, command failure or older tmux can also leave the claim in place.
+- **Typed through tmux, not its client** — for a pane kept in tmux, local or
+  over SSH, every `ctl` write (`send`'s paste and Enter and its one Codex retry,
+  `answer`, `keys`, and a `new --prompt` task) goes to the pane's own tmux pane
+  through tmux itself: the prompt as one paste from a muxel-named buffer
+  (`paste-buffer -p`, bracketed when the agent asked for it, text read from
+  standard input and never parsed as a tmux command), keys with `send-keys` (a
+  character outside ASCII as a raw paste of that character). muxel can't see
+  whether the agent's pane asked for bracketed paste, so the paste is the same
+  bytes either way, the ones tmux's own paste sends: each line break a CR, and
+  no ESC, so a prompt can never end the bracket early or start a sequence.
+  Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
+  the user's `bind -n` keys and extended-key encodings in ctl input reach the
+  agent as text and never open a window or run a tmux command, and agent panes
+  need no shell grant. The first ctl write to a terminal finds the agent's own
+  tmux pane, the one its session was created with (the session's lowest pane
+  id; in a session muxel created with a program, that pane must also have been
+  started with a command, which a plain shell split never is, though muxel
+  doesn't check which command), whichever pane the user left active, and keeps
+  it by pane id, so input stays with the agent after the user opens other
+  windows or splits. If it can't be found or has gone, input
+  is refused with `tmux_pane_unresolved` and nothing is typed, never
+  redirected; after a failed lookup the next waits 2 seconds, doubling to at
+  most 2 minutes, so a host that can't be reached isn't asked again on every
+  write. Writes to one pane stay in order; `keys` replies once tmux has taken
+  every key, and a press that fails after earlier ones went in is
+  `keys_partly_pressed`. A remote pane takes ctl input only over SSH commands
+  run beside its terminal: where the host refuses them, input is refused rather
+  than typed through the client, and without a shared SSH connection each
+  command, and so each key press, makes its own login. Panes not kept in tmux
+  take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
+  a remote host; local tmux panes already need 3.2.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -865,11 +975,24 @@ feature is added or changed, update the matching entry here in the same change**
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
-  receipt confirms writer admission with `pasted: true`.
+  receipt confirms writer admission with `pasted: true` (for a pane kept in
+  tmux, that tmux pasted it into the agent's tmux pane).
+  A send failure once its paste may have gone in reports `pasted: true`: a writer
+  failure, or a paste tmux didn't answer, may have left partial input. A paste
+  tmux refused, or one refused as `tmux_pane_unresolved`, typed nothing and has
+  no `pasted`. Through tmux, a `keys` or `answer` failure once a key may have
+  gone in reports `pasted: true` too. `working` with `reason: just_submitted`
+  identifies the prior turn's grace when the pane has a provider status or
+  configured screen marker. Activity-only panes can accept consecutive sends.
+  `ctl help COMMAND` shows command help; `-h` and `--help` after a command refuse
+  with exit 2 so a script cannot mistake help for a sent prompt. `--` before
+  literal text keeps those words as prompt text. Unknown verbs suggest a nearby
+  command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
-  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
+  `retry_unanswered` when tmux didn't answer for the retry Enter); once
   Enter is in, the reply is always this receipt, never an error. muxel doesn't
   wait when the pane can't show a receipt — an unsupported provider, or no
   readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
@@ -959,7 +1082,13 @@ feature is added or changed, update the matching entry here in the same change**
   crashed lapses once the agent is seen to finish, or when its grace period runs
   out. `show` reports it as `controller`: which computer last typed into the agent
   this way, whether that was this muxel, and whether its turn is still open.
-  `send --force` overrides it.
+  `send --force` overrides it, publishing its marker after the paste within two
+  seconds or withholding Enter. Within one muxel, a second `send` to an agent is
+  refused until the first one's Enter is in (for a pane kept in tmux, until tmux
+  has taken it, since the paste and Enter are tmux commands too). muxel checks
+  once per host whether its tmux can compare markers (2.6 or later); older tmux
+  overwrites the marker and reads it back instead, and leaves it to lapse rather
+  than clearing it.
 
 ## Terminal
 
@@ -1390,7 +1519,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
@@ -1485,12 +1620,9 @@ feature is added or changed, update the matching entry here in the same change**
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
   (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
-  confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits **cleanly** (an
-  abnormal exit always leaves a tombstone pane instead). The terminal
-  confirmation is skipped for an untouched **shell** pane — one sitting idle at
-  its prompt with no foreground command and no other tabs — since closing it
-  loses nothing.
+  confirmation, "Ask before closing a busy terminal" (on by default; see
+  Recoverable terminal close), and auto-close a pane when its process exits
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

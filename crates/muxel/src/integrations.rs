@@ -9,11 +9,12 @@ use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::tmux::{ServerOrigin, SessionTarget, Socket};
+use muxel_core::tmux::{ClaimWrite, ServerOrigin, SessionTarget, Socket};
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
     accomplishments_header, memory_header, remote_ops, ssh,
 };
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1726,9 +1727,10 @@ mod tmux_server_origin_tests {
 mod tmux_probe_tests {
     use super::{
         ensure_tmux_server, kill_tmux_session_confirmed, local_tmux_has_session_confirmed,
-        local_tmux_root, restart_local_tmux, tmux_on,
+        local_tmux_root, restart_local_tmux, run_local_tmux_input, run_tmux_input, tmux_on,
     };
     use muxel_core::tmux::{SERVER_MARK_ENV, SessionTarget, Socket};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     /// A named server no other test or muxel uses, killed when dropped. It reads no
@@ -1929,6 +1931,119 @@ mod tmux_probe_tests {
             None,
             "not marked as muxel's"
         );
+    }
+
+    /// A local pane's ctl input runner, on a real server: it finds the pane,
+    /// pastes text it is given on standard input (never in an argument, where
+    /// tmux would split `;` into another command), and reports tmux's refusal
+    /// as a failed command rather than as an error starting it.
+    #[test]
+    fn ctl_input_runs_on_the_panes_server_with_its_text_on_stdin() {
+        use muxel_core::control::Key;
+        use muxel_core::tmux;
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start_with(&[]);
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recv = dir.join("agent.bin");
+        let agent = format!("stty raw -echo; exec cat > '{}'", recv.display());
+        let status = tmux_on(&server.0)
+            .args(["new-session", "-d", "-s", "agent", "sh", "-c", &agent])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !recv.exists() {
+            assert!(Instant::now() < until, "the agent never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(&server.0, &tmux::control_pane_args("agent"), None).unwrap();
+        let pane = tmux::parse_control_pane("agent", &String::from_utf8_lossy(&out.stdout), true)
+            .expect("the agent's pane");
+        let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
+        let text = "it's; $HOME `id` \"x\" ; display-message boom";
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_paste_args(&buffer, &pane, true),
+            Some(text.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args(&pane, &[Key::Char(';'), Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = format!("{text};\r");
+        let until = Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&recv).unwrap_or_default() != expected.as_bytes() {
+            assert!(
+                Instant::now() < until,
+                "the agent got {:?}",
+                String::from_utf8_lossy(&std::fs::read(&recv).unwrap_or_default())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args("%999", &[Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(!out.status.success(), "a missing pane is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ctl input command answers within its deadline, even when the child
+    /// exits but leaves something holding its output open, or never exits.
+    #[test]
+    fn ctl_input_commands_answer_within_their_deadline() {
+        let within = Duration::from_millis(500);
+        let started = Instant::now();
+        let mut lingering = Command::new("sh");
+        lingering.args(["-c", "sleep 30 & echo started"]);
+        let error = run_tmux_input(lingering, None, false, within)
+            .expect_err("a reply still open at the deadline is unanswered");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "cat >/dev/null; sleep 30"]);
+        let error = run_tmux_input(stuck, Some(b"never read to the end"), false, within)
+            .expect_err("a command that never exits is unanswered");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "cat; echo done >&2"]);
+        let out = run_tmux_input(quick, Some(b"echoed"), false, within).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"echoed");
+        assert_eq!(out.stderr, b"done\n");
     }
 }
 
@@ -2370,6 +2485,209 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
     muxel_core::import::conversation_summary(&String::from_utf8_lossy(&head))
 }
 
+/// Read the number of clients attached to this exact tmux session.
+/// Blocking, for background callers only. Socket discovery and the query share
+/// a two-second deadline; unavailable sessions and invalid replies are errors.
+pub fn attached_tmux_clients(loc: &RepoLoc, target: &SessionTarget) -> Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut target = profile_tmux_target(target);
+    if matches!(loc, RepoLoc::Local(_)) {
+        target = resolve_tmux_owner_with(&target, |socket| {
+            local_tmux_has_session_confirmed(socket, &target.name, deadline)
+        })?;
+    }
+    let cmd = attached_tmux_clients_command(loc, &target)?;
+    let out = run_tmux_output_until(cmd, deadline)?;
+    parse_attached_tmux_clients(&target.name, out.status.success(), &out.stdout, &out.stderr)
+}
+
+fn attached_tmux_clients_command(loc: &RepoLoc, target: &SessionTarget) -> Result<Command> {
+    // Include the session name because display-message can succeed with an
+    // empty/default format context when the requested target has disappeared.
+    let args = vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        format!("={}:", target.name),
+        "#{session_name}:#{session_attached}".into(),
+    ];
+    let mut cmd = match loc {
+        RepoLoc::Local(_) => {
+            let socket = target
+                .socket
+                .as_ref()
+                .context("tmux session owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(&args);
+            cmd
+        }
+        RepoLoc::Remote(conn) => {
+            if conn.host.os.is_windows() {
+                bail!("tmux is unavailable on Windows remote hosts");
+            }
+            remote_ssh_command(conn, ssh::session_tmux_command(target, &args))
+        }
+    };
+    cmd.stdin(Stdio::null());
+    Ok(cmd)
+}
+
+fn parse_attached_tmux_clients(
+    session: &str,
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<usize> {
+    if !success {
+        bail!(
+            "couldn't query attached tmux clients: {}",
+            String::from_utf8_lossy(stderr).trim()
+        );
+    }
+    let reply = std::str::from_utf8(stdout).context("invalid tmux client count encoding")?;
+    let reply = reply.strip_suffix('\n').unwrap_or(reply);
+    let reply = reply.strip_suffix('\r').unwrap_or(reply);
+    let count = reply
+        .strip_prefix(session)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+        .context("tmux client count did not identify the requested session")?;
+    count.parse().context("invalid tmux client count")
+}
+
+#[cfg(test)]
+mod attached_tmux_client_tests {
+    use super::{RepoLoc, attached_tmux_clients_command, parse_attached_tmux_clients};
+    use muxel_core::tmux::{SessionTarget, Socket};
+    use muxel_core::{RemoteHost, RemoteOs, ssh};
+    use std::path::Path;
+
+    #[test]
+    fn attached_count_accepts_zero_one_and_multiple_clients() {
+        for count in [0, 1, 2, 23, usize::MAX] {
+            for ending in ["", "\n", "\r\n"] {
+                let reply = format!("work :{count}{ending}");
+                assert_eq!(
+                    parse_attached_tmux_clients("work ", true, reply.as_bytes(), b"").unwrap(),
+                    count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attached_count_rejects_missing_wrong_or_malformed_session_reply() {
+        for reply in [
+            "",
+            "0",
+            "work2:0",
+            "work:",
+            "work:-1",
+            "work:+1",
+            "work:1 2",
+            "work: 1",
+            "work:1\nwork:0",
+            "work:1\n\n",
+            "work:1.0",
+            "work:999999999999999999999999999999999999999999999999",
+        ] {
+            assert!(parse_attached_tmux_clients("work", true, reply.as_bytes(), b"").is_err());
+        }
+        assert!(parse_attached_tmux_clients("work", true, b"work:\xff", b"").is_err());
+        assert!(parse_attached_tmux_clients("work", false, b"work:0\n", b"no server").is_err());
+    }
+
+    #[test]
+    fn attached_count_local_command_uses_exact_target_and_recorded_socket() {
+        let target = SessionTarget::new("work '名", Some(Socket::Named("peer 'socket".into())));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        assert_eq!(cmd.get_program(), "tmux");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "peer 'socket",
+                "display-message",
+                "-p",
+                "-t",
+                "=work '名:",
+                "#{session_name}:#{session_attached}",
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_count_isolated_command_never_selects_regular_sockets() {
+        let target =
+            SessionTarget::new("work", None).for_profile(Some(Path::new("/isolated-count")));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(&args[..2], target.socket.as_ref().unwrap().args());
+        assert!(!args.contains(&"mxl"));
+        assert!(
+            attached_tmux_clients_command(
+                &RepoLoc::Local("/unused".into()),
+                &SessionTarget::new("work", None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attached_count_remote_command_quotes_session_and_socket_and_reuses_connection() {
+        let target =
+            SessionTarget::new("work '名;echo", Some(Socket::Named("peer 'socket".into())));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        assert_eq!(cmd.get_program(), "ssh");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args.contains(&"ControlPath=/control-count"),
+            cfg!(not(target_os = "windows"))
+        );
+        assert!(args.contains(&"BatchMode=yes"));
+        let script = args.last().unwrap();
+        assert!(script.contains(&ssh::sh_quote("=work '名;echo:")));
+        assert!(script.contains(&ssh::sh_quote("peer 'socket")));
+        assert!(script.ends_with("'#{session_name}:#{session_attached}'"));
+    }
+
+    #[test]
+    fn attached_count_refuses_windows_remote_hosts() {
+        let mut host = RemoteHost::new("test", "test.example");
+        host.os = RemoteOs::Windows;
+        let loc = RepoLoc::remote(host, "C:/unused".into(), "/control-count".into(), None);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(attached_tmux_clients_command(&loc, &target).is_err());
+    }
+
+    #[test]
+    fn attached_count_isolated_remote_query_has_no_legacy_socket_probe() {
+        let target = SessionTarget::new("work", Some(Socket::Default))
+            .for_profile(Some(Path::new("/isolated-count")));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        let script = args.last().unwrap().to_str().unwrap();
+        let socket_args = target.socket.as_ref().unwrap().args();
+        assert!(script.contains(&socket_args[1]));
+        assert!(!script.contains("has-session"));
+    }
+}
+
 /// Run `tmux <args>` on the server holding `session`, where its project's sessions
 /// live: on this machine, or on its SSH host (reusing the host's ControlMaster).
 /// `None` for a Windows host, which has no tmux.
@@ -2398,6 +2716,131 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
     };
     cmd.stdin(Stdio::null());
     Some(cmd)
+}
+
+/// How long one outside-control tmux command may take before it counts as
+/// unanswered.
+const TMUX_INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One outside-control input command (`muxel_terminal::TmuxInputRoute`) on the
+/// local tmux server `socket` a pane's client attached to, with `stdin` as its
+/// standard input. Blocking and bounded.
+pub fn run_local_tmux_input(
+    socket: &Socket,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = tmux_on(socket.clone());
+    cmd.args(args);
+    run_tmux_input(cmd, stdin, false, TMUX_INPUT_DEADLINE)
+}
+
+/// The same on a remote pane's host, over the host's commands master, on the
+/// server holding `session` (as the shared claim is read and written). The
+/// input text travels on ssh's standard input, never in the command line.
+pub fn run_remote_tmux_input(
+    conn: &RemoteConn,
+    session: &SessionTarget,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    if conn.host.os.is_windows() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a Windows host has no tmux",
+        ));
+    }
+    let cmd = remote_ssh_command(conn, ssh::session_tmux_command(session, args));
+    run_tmux_input(cmd, stdin, true, TMUX_INPUT_DEADLINE)
+}
+
+fn run_tmux_input(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    over_ssh: bool,
+    within: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write as _};
+    use std::sync::mpsc::Receiver;
+    // Each pipe is read on its own thread and collected within the one
+    // deadline: a process the child left behind (a backgrounded ssh master,
+    // say) can hold a pipe open after the child exits, and must not hold the
+    // caller with it. A thread left reading ends when that pipe closes.
+    fn drain(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+        rx
+    }
+    let unanswered = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no answer within {} seconds", within.as_secs_f32()),
+        )
+    };
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    // Written from its own thread, so a child that never reads can't hold this
+    // one past the deadline. It ends when the child's end of the pipe closes,
+    // and nothing waits for it.
+    if let Some((data, mut pipe)) = stdin.zip(child.stdin.take()) {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&data);
+        });
+    }
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+    let deadline = Instant::now() + within;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                // The whole process group on Unix (ssh under `sshpass` sits in
+                // its own session on sshpass's pty and is hung up when sshpass
+                // dies), the whole tree on Windows.
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(unanswered());
+            }
+        }
+    };
+    let collect = |pipe: Option<Receiver<Vec<u8>>>| match pipe {
+        Some(pipe) => pipe
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| unanswered()),
+        None => Ok(Vec::new()),
+    };
+    let stdout = collect(stdout)?;
+    let stderr = collect(stderr)?;
+    // ssh exits 255 for its own failures, which can come after the remote
+    // command ran.
+    if over_ssh && status.code() == Some(255) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("ssh failed: {}", String::from_utf8_lossy(&stderr).trim()),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
@@ -2544,28 +2987,199 @@ pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Opti
         session,
         &muxel_core::tmux::show_option_args(&session.name, option),
     )?;
+    option_value(&out)
+}
+
+/// A `show-options -qv` reply's value: `None` when the option is unset or the
+/// command failed.
+fn option_value(out: &std::process::Output) -> Option<String> {
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
-/// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(
+/// How `session`'s tmux server can publish a claim. Probed once per host and
+/// remembered for this process; a probe that can't run is not remembered, and
+/// the conditional write it falls back to fails the same way an unreachable
+/// tmux always has, leaving the send unclaimed.
+pub fn tmux_claim_write(loc: &RepoLoc, session: &SessionTarget) -> ClaimWrite {
+    static HOSTS: std::sync::OnceLock<Mutex<HashMap<String, ClaimWrite>>> =
+        std::sync::OnceLock::new();
+    claim_write_cached(HOSTS.get_or_init(Default::default), tmux_host(loc), || {
+        let probe = muxel_core::tmux::match_format_probe_args(&session.name);
+        let out = tmux_at(loc, session, &probe)?;
+        out.status.success().then(|| {
+            muxel_core::tmux::claim_write_from_probe(&String::from_utf8_lossy(&out.stdout))
+        })
+    })
+}
+
+/// The machine whose tmux runs `loc`'s sessions. Local panes all use this
+/// machine's tmux; a remote one is the SSH login's.
+fn tmux_host(loc: &RepoLoc) -> String {
+    match loc {
+        RepoLoc::Local(_) => "local".into(),
+        RepoLoc::Remote(c) => format!(
+            "ssh:{}@{}:{}",
+            c.host.user,
+            c.host.hostname,
+            c.host.port.unwrap_or(22)
+        ),
+    }
+}
+
+fn claim_write_cached(
+    hosts: &Mutex<HashMap<String, ClaimWrite>>,
+    host: String,
+    probe: impl FnOnce() -> Option<ClaimWrite>,
+) -> ClaimWrite {
+    if let Some(known) = hosts.lock().unwrap_or_else(|e| e.into_inner()).get(&host) {
+        return *known;
+    }
+    // No lock across the probe: it may wait on SSH. Racing first probes of
+    // one host learn the same answer.
+    let Some(found) = probe() else {
+        return ClaimWrite::Conditional;
+    };
+    hosts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(host, found);
+    found
+}
+
+/// Publish a claim through one tmux server command, conditionally where the
+/// server can compare it with the pre-paste observation. A false `if-shell`
+/// branch exits cleanly; the caller reads the option back to learn whether its
+/// nonce won.
+pub fn set_tmux_claim(
     loc: &RepoLoc,
     session: &SessionTarget,
     option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
     value: &str,
 ) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(&session.name, option, value);
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
     let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
     if !out.status.success() {
         bail!(
-            "tmux set-option failed: {}",
+            "tmux claim set-option failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+fn claim_write_args(
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Vec<String>> {
+    muxel_core::tmux::claim_write_args(&session.name, option, write, expected_pattern, value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote the tmux claim safely"))
+}
+
+/// Publish a forced send's claim between its paste and Enter, then read it
+/// back. Both commands share one two-second deadline, as claim cleanup does,
+/// so an SSH stall withholds Enter within that bound rather than holding the
+/// pasted prompt for the connect timeout. Returns the value read back.
+pub fn publish_tmux_claim_bounded(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
+    let target = BoundedTmux::find(loc, session, deadline, &lifecycle)?;
+    let show = muxel_core::tmux::show_option_args(&target.session.name, option);
+    publish_claim_until(
+        target.command(&args)?,
+        || target.command(&show),
+        deadline,
+        &lifecycle,
+    )
+}
+
+/// [`publish_tmux_claim_bounded`] for prepared commands: `read` runs only after
+/// `write` succeeds, and both stop at `deadline`.
+fn publish_claim_until(
+    write: Command,
+    read: impl FnOnce() -> Result<Command>,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<Option<String>> {
+    run_claim_command(write, deadline, lifecycle)?;
+    let out = run_tmux_output_with(read()?, deadline, lifecycle)?;
+    Ok(option_value(&out))
+}
+
+/// Replace an unreadable or uncomparable claim only if its raw bytes have not
+/// changed. A unique temporary option holds the expected value outside the
+/// command string, where arbitrary option bytes cannot become tmux syntax.
+pub fn normalize_tmux_option_if_raw(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    raw: &str,
+    normalized: &str,
+) -> Result<()> {
+    let temp = format!("@muxel-ctl-expected-{}", uuid::Uuid::new_v4().simple());
+    let set = muxel_core::tmux::set_option_args(&session.name, &temp, raw);
+    let Some(set_out) = tmux_at(loc, session, &set) else {
+        bail!("tmux isn't reachable for session “{session}”");
+    };
+    if !set_out.status.success() {
+        bail!(
+            "tmux could not prepare claim repair: {}",
+            String::from_utf8_lossy(&set_out.stderr).trim()
+        );
+    }
+    let update =
+        muxel_core::tmux::set_option_if_option_args(&session.name, option, &temp, normalized)
+            .ok_or_else(|| anyhow::anyhow!("can't prepare conditional tmux claim repair safely"))?;
+    let updated = tmux_at(loc, session, &update);
+    let cleanup = vec![
+        "set-option".to_string(),
+        "-qu".to_string(),
+        "-t".to_string(),
+        format!("={}:", session.name),
+        temp,
+    ];
+    if tmux_at(loc, session, &cleanup).is_none_or(|out| !out.status.success()) {
+        log::warn!("muxel ctl: couldn't clean temporary claim comparison option for {session}");
+    }
+    let Some(out) = updated else {
+        bail!("tmux isn't reachable for session “{session}” during claim repair");
+    };
+    if !out.status.success() {
+        bail!(
+            "tmux conditional claim repair failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Restore the displaced claim after a pre-paste refusal with the same bounded
+/// conditional command used by claim cleanup.
+pub fn restore_tmux_option_if(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    pattern: &str,
+    value: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::set_option_if_args(&session.name, option, Some(pattern), value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim restoration safely"))?;
+    run_bounded_tmux_claim_command(loc, session, args)
 }
 
 /// Give claim cleanup two seconds before terminating its command.
@@ -2575,26 +3189,73 @@ pub fn unset_tmux_option_if(
     option: &str,
     pattern: &str,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let lifecycle = GitEnv::production();
-    let session = profile_tmux_target(session);
     let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
-    let cmd = match loc {
-        RepoLoc::Local(_) => {
-            let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {
+    run_bounded_tmux_claim_command(loc, session, args)
+}
+
+/// How long a claim command may run where it can hold up typing: cleanup and
+/// restore after a send, and a forced send's publish between paste and Enter.
+const CLAIM_COMMAND_BOUND: Duration = Duration::from_secs(2);
+
+fn run_bounded_tmux_claim_command(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    args: Vec<String>,
+) -> Result<()> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let cmd = BoundedTmux::find(loc, session, deadline, &lifecycle)?.command(&args)?;
+    run_claim_command(cmd, deadline, &lifecycle)
+}
+
+/// Where bounded claim commands run: a local socket found within the
+/// deadline, or the session's SSH host.
+struct BoundedTmux<'a> {
+    loc: &'a RepoLoc,
+    session: SessionTarget,
+    socket: Option<Socket>,
+}
+
+impl<'a> BoundedTmux<'a> {
+    fn find(
+        loc: &'a RepoLoc,
+        session: &SessionTarget,
+        deadline: Instant,
+        lifecycle: &GitEnv,
+    ) -> Result<Self> {
+        let session = profile_tmux_target(session);
+        let socket = match loc {
+            RepoLoc::Local(_) => Some(bounded_tmux_socket(
+                &session,
+                deadline,
+                lifecycle,
+                |socket| {
+                    let mut cmd = tmux_on(socket);
+                    cmd.args(muxel_core::tmux::has_session_args(&session.name));
+                    cmd
+                },
+            )?),
+            RepoLoc::Remote(_) => None,
+        };
+        Ok(Self {
+            loc,
+            session,
+            socket,
+        })
+    }
+
+    fn command(&self, args: &[String]) -> Result<Command> {
+        match &self.socket {
+            Some(socket) => {
                 let mut cmd = tmux_on(socket);
-                cmd.args(muxel_core::tmux::has_session_args(&session.name));
-                cmd
-            })?;
-            let mut cmd = tmux_on(socket);
-            cmd.args(args);
-            cmd
+                cmd.args(args);
+                Ok(cmd)
+            }
+            None => tmux_command_at(self.loc, &self.session, args)
+                .ok_or_else(|| anyhow::anyhow!("tmux is unavailable")),
         }
-        RepoLoc::Remote(_) => tmux_command_at(loc, &session, &args)
-            .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?,
-    };
-    run_claim_cleanup(cmd, deadline, &lifecycle)
+    }
 }
 
 fn bounded_tmux_socket(
@@ -2613,11 +3274,11 @@ fn bounded_tmux_socket(
     })
 }
 
-fn run_claim_cleanup(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
+fn run_claim_command(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
     match run_tmux_until(cmd, deadline, lifecycle)? {
         Some(status) if status.success() => Ok(()),
-        Some(status) => bail!("tmux claim cleanup failed: {status}"),
-        None => bail!("tmux claim cleanup timed out"),
+        Some(status) => bail!("tmux claim command failed: {status}"),
+        None => bail!("tmux claim command timed out"),
     }
 }
 
@@ -2643,11 +3304,47 @@ fn run_tmux_until(
     Ok(status)
 }
 
-/// Kill a tmux session on its owner, resolving legacy bindings first. Best-effort.
-pub fn kill_tmux_session(session: &SessionTarget) {
-    let _ = tmux_on(local_tmux_socket(session))
-        .args(muxel_core::tmux::kill_session_args(&session.name))
-        .output();
+/// Close a local tmux session on its recorded or confirmed legacy owner.
+/// Discovery, kill and absence confirmation share one deadline. Every child is
+/// supervised and reaped by the bounded runner; failure never authorizes a kill
+/// on another server or a migration to it. Run only on a background executor.
+pub fn close_local_tmux(session: &SessionTarget, deadline: Instant) -> Result<()> {
+    let session = profile_tmux_target(session);
+    close_local_tmux_with(
+        &session,
+        deadline,
+        |socket, deadline| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+        |owner, deadline| {
+            let socket = owner
+                .socket
+                .as_ref()
+                .context("tmux close owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(muxel_core::tmux::kill_session_args(&owner.name));
+            // kill-session can fail because the session already exited. Only
+            // the checked absence probe below decides whether close succeeded.
+            run_tmux_output_until(cmd, deadline)?;
+            Ok(())
+        },
+    )
+}
+
+fn close_local_tmux_with(
+    session: &SessionTarget,
+    deadline: Instant,
+    mut probe: impl FnMut(&Socket, Instant) -> Result<bool>,
+    kill: impl FnOnce(&SessionTarget, Instant) -> Result<()>,
+) -> Result<()> {
+    let owner = resolve_tmux_owner_with(session, |socket| probe(socket, deadline))?;
+    kill(&owner, deadline)?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if probe(socket, deadline)? {
+        bail!("tmux session “{owner}” is still running");
+    }
+    Ok(())
 }
 
 /// Restart requires a confirmed teardown; a failed kill must never turn into a
@@ -2769,11 +3466,16 @@ fn restart_local_tmux_with(
     Ok((owner, next))
 }
 
-pub fn restart_remote_tmux(
+/// Restart a pinned remote owner. `begin_command` admits each kill and the
+/// subsequent migration/verification phase immediately before command planning.
+/// Its returned guard stays alive through that phase's I/O, so cancellation can
+/// refuse new work while the caller waits for already-admitted work to drain.
+pub fn restart_remote_tmux<G>(
     loc: &RepoLoc,
     session: &SessionTarget,
     instance: uuid::Uuid,
     deadline: Instant,
+    begin_command: impl FnMut() -> Option<G>,
 ) -> Result<SessionTarget> {
     let RepoLoc::Remote(conn) = loc else {
         bail!("not a remote project")
@@ -2798,24 +3500,45 @@ pub fn restart_remote_tmux(
                     .any(|row| &row.socket == socket && row.name == target.name))
         })?;
     }
-    let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
-    let out = run_tmux_output_until(cmd, deadline)?;
-    if !out.status.success() {
-        bail!("{}", ssh_error_message(&out))
+    guarded_remote_restart(
+        begin_command,
+        || {
+            let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
+            let out = run_tmux_output_until(cmd, deadline)?;
+            if !out.status.success() {
+                bail!("{}", ssh_error_message(&out))
+            }
+            Ok(())
+        },
+        || {
+            if session.socket == Some(Socket::Default) {
+                remote_tmux_launch_target(loc, &session, instance, true, deadline)
+            } else {
+                let rows = ssh::parse_session_listings_for_migration_on(
+                    &remote_session_names(conn, session.socket.as_slice(), deadline)?,
+                    session.socket.as_slice(),
+                )
+                .context("couldn't confirm the tmux session's owner")?;
+                if rows.iter().any(|row| row.name == session.name) {
+                    bail!("tmux session “{session}” is still running");
+                }
+                Ok(session.clone())
+            }
+        },
+    )
+}
+
+fn guarded_remote_restart<G>(
+    mut begin_command: impl FnMut() -> Option<G>,
+    kill: impl FnOnce() -> Result<()>,
+    next_target: impl FnOnce() -> Result<SessionTarget>,
+) -> Result<SessionTarget> {
+    {
+        let _command = begin_command().context("remote restart was cancelled before kill")?;
+        kill()?;
     }
-    if session.socket == Some(Socket::Default) {
-        remote_tmux_launch_target(loc, &session, instance, true, deadline)
-    } else {
-        let rows = ssh::parse_session_listings_for_migration_on(
-            &remote_session_names(conn, session.socket.as_slice(), deadline)?,
-            session.socket.as_slice(),
-        )
-        .context("couldn't confirm the tmux session's owner")?;
-        if rows.iter().any(|row| row.name == session.name) {
-            bail!("tmux session “{session}” is still running");
-        }
-        Ok(session.clone())
-    }
+    let _command = begin_command().context("remote restart was cancelled before migration")?;
+    next_target()
 }
 
 /// Resolve a legacy close without mutating either server. The caller must save
@@ -3877,6 +4600,164 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let killed = std::cell::Cell::new(false);
+        let probes = std::cell::RefCell::new(Vec::new());
+        let target = SessionTarget::new("work", None);
+        close_local_tmux_with(
+            &target,
+            deadline,
+            |socket, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                probes.borrow_mut().push(socket.clone());
+                Ok(!killed.get() && *socket == Socket::Default)
+            },
+            |owner, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                assert_eq!(owner.name, "work");
+                assert_eq!(owner.socket, Some(Socket::Default));
+                killed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(killed.get());
+        assert_eq!(
+            *probes.borrow(),
+            [Socket::Private, Socket::Default, Socket::Default]
+        );
+    }
+
+    #[test]
+    fn local_close_keeps_named_owner_and_fails_closed_on_uncertain_or_live_session() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let target = SessionTarget::new("work", Some(Socket::Named("recorded-peer".into())));
+        let killed = std::cell::Cell::new(false);
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    assert!(killed.get(), "recorded owner needs no discovery probes");
+                    Ok(true)
+                },
+                |owner, _| {
+                    assert_eq!(owner, &target);
+                    killed.set(true);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        let uncertain = SessionTarget::new("work", None);
+        assert!(
+            close_local_tmux_with(
+                &uncertain,
+                deadline,
+                |_, _| anyhow::bail!("socket discovery timed out"),
+                |_, _| panic!("unconfirmed legacy owner must never be killed"),
+            )
+            .is_err()
+        );
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |_, _| panic!("failed kill must not query another server"),
+                |_, _| anyhow::bail!("kill timed out"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_close_expired_deadline_refuses_before_running_a_command() {
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(close_local_tmux(&target, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn cancelled_remote_restart_refuses_before_planning_a_kill() {
+        let planned = std::cell::Cell::new(false);
+        let result = guarded_remote_restart(
+            || None::<()>,
+            || {
+                planned.set(true);
+                Ok(())
+            },
+            || panic!("cancelled restart must not plan migration or verification"),
+        );
+        assert!(result.is_err());
+        assert!(!planned.get());
+    }
+
+    #[test]
+    fn remote_restart_rechecks_admission_before_migration_after_a_kill() {
+        let active = std::cell::Cell::new(true);
+        let migrated = std::cell::Cell::new(false);
+        let admissions = std::cell::Cell::new(0);
+        let result = guarded_remote_restart(
+            || {
+                admissions.set(admissions.get() + 1);
+                active.get().then_some(())
+            },
+            || {
+                active.set(false); // Hold lands while the admitted kill runs.
+                Ok(())
+            },
+            || {
+                migrated.set(true);
+                Ok(SessionTarget::new("work", Some(Socket::Private)))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(admissions.get(), 2);
+        assert!(!migrated.get());
+    }
+
+    #[test]
+    fn remote_restart_retains_each_command_guard_until_its_operation_returns() {
+        struct Guard<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let in_flight = std::cell::Cell::new(0);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        let result = guarded_remote_restart(
+            || {
+                in_flight.set(in_flight.get() + 1);
+                Some(Guard(&in_flight))
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(())
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(target.clone())
+            },
+        );
+        assert_eq!(result.unwrap(), target);
+        assert_eq!(in_flight.get(), 0);
+        assert!(
+            guarded_remote_restart(
+                || {
+                    in_flight.set(in_flight.get() + 1);
+                    Some(Guard(&in_flight))
+                },
+                || anyhow::bail!("kill failed"),
+                || panic!("failed kill must not migrate"),
+            )
+            .is_err()
+        );
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[test]
     fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {
         let root = Path::new("/isolated-migration");
         let isolated = Socket::isolated(root);
@@ -3945,7 +4826,7 @@ mod tests {
     fn claim_cleanup_stops_a_command_that_does_not_finish() {
         let lifecycle = GitEnv::for_tests();
         let started = Instant::now();
-        let err = run_claim_cleanup(
+        let err = run_claim_command(
             hanging_tmux_command(),
             started + Duration::from_millis(50),
             &lifecycle,
@@ -3954,6 +4835,120 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    fn shell_command(script: &str) -> Command {
+        if cfg!(windows) {
+            let mut cmd = command("cmd.exe");
+            cmd.args(["/D", "/C", script]);
+            cmd
+        } else {
+            let mut cmd = command("/bin/sh");
+            cmd.args(["-c", script]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn forced_claim_publish_and_readback_share_one_deadline() {
+        // A stalled write stops at the deadline and the readback never runs.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = publish_claim_until(
+            hanging_tmux_command(),
+            || Ok(shell_command("echo never")),
+            deadline,
+            &lifecycle,
+        )
+        .expect_err("a stalled publish must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+
+        // The readback gets only what is left of the same deadline.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let err = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(hanging_tmux_command()),
+            started + Duration::from_secs(1),
+            &lifecycle,
+        )
+        .expect_err("a stalled readback must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 2);
+
+        let lifecycle = GitEnv::for_tests();
+        let read = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(shell_command("echo v1-claim")),
+            Instant::now() + Duration::from_secs(10),
+            &lifecycle,
+        )
+        .unwrap();
+        assert_eq!(read.as_deref(), Some("v1-claim"));
+    }
+
+    #[test]
+    fn claim_write_is_probed_once_per_host_and_an_unanswered_probe_is_retried() {
+        let hosts = Mutex::new(HashMap::new());
+        let probes = std::cell::Cell::new(0);
+        let probe = |answer: Option<ClaimWrite>| {
+            probes.set(probes.get() + 1);
+            answer
+        };
+        // Unreachable tmux: try conditionally now, and probe again next time.
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(None)),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Unconditional
+            ))),
+            ClaimWrite::Unconditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Unconditional,
+            "a host's answer is remembered"
+        );
+        assert_eq!(probes.get(), 2);
+        assert_eq!(
+            claim_write_cached(&hosts, "local".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(probes.get(), 3);
+    }
+
+    #[test]
+    fn claim_probes_are_keyed_by_the_tmux_host() {
+        let remote = |user: &str, hostname: &str, port| {
+            let mut host = RemoteHost::new("label", hostname);
+            host.user = user.into();
+            host.port = port;
+            RepoLoc::remote(host, "/srv".into(), "/tmp/cm".into(), None)
+        };
+        assert_eq!(tmux_host(&RepoLoc::Local("/a".into())), "local");
+        assert_eq!(tmux_host(&RepoLoc::Local("/b".into())), "local");
+        assert_eq!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(22)))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("you", "box", None))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(2222)))
+        );
     }
 
     #[test]
