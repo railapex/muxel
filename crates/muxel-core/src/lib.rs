@@ -27,6 +27,7 @@ pub mod recoverable_close;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
+pub mod sidebar;
 pub mod ssh;
 pub mod startup_flags;
 pub mod status_badge;
@@ -171,11 +172,11 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Working) {
                     self.work_started_at = Some(now);
                 }
-                self.blocked_at = None;
             }
             AgentActivityState::Blocked => {
                 if previous != Some(AgentActivityState::Blocked)
-                    && !(previous.is_none() && self.blocked_at.is_some())
+                    && !(previous.is_none()
+                        && previous_persisted == Some(AgentActivityState::Blocked))
                 {
                     self.blocked_at = Some(now);
                 }
@@ -189,13 +190,8 @@ impl AgentActivity {
                 {
                     self.completed_at = Some(now);
                 }
-                self.blocked_at = None;
             }
-            AgentActivityState::Idle => {
-                if previous == Some(AgentActivityState::Blocked) {
-                    self.blocked_at = None;
-                }
-            }
+            AgentActivityState::Idle => {}
         }
         if self.last_state.is_some() || previous_persisted != Some(status) {
             self.last_state = Some(status);
@@ -812,13 +808,15 @@ impl Instance {
         true
     }
 
-    /// A duplicated pane copies launch settings, not the source conversation.
+    /// A duplicated pane copies launch settings, not the source conversation or
+    /// its activity. The copy has done no work and has nothing unread of its own.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        self.activity = AgentActivity::default();
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -1922,6 +1920,10 @@ pub fn merge_peer_instances(
                 if instance.instruction_injection.is_none() {
                     instance.instruction_injection = mine.instruction_injection.clone();
                 }
+            } else {
+                // Work and attendance are observations on this machine. A new
+                // peer pane starts fresh; its own runtime samples record them.
+                instance.activity = AgentActivity::default();
             }
             instance
         })
@@ -2661,6 +2663,9 @@ pub struct Settings {
     /// Start old local PTY sessions only when opened. Zero disables dormancy.
     #[serde(default)]
     pub dormant_after_days: u32,
+    /// Sidebar presentation only; navigation and pane layout keep their order.
+    #[serde(default)]
+    pub sidebar_sort: sidebar::SidebarSort,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3160,6 +3165,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             dormant_after_days: 0,
+            sidebar_sort: sidebar::SidebarSort::default(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,
