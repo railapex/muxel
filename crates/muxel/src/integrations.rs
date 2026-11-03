@@ -2402,6 +2402,7 @@ pub fn remote_tmux_launch_target(
         name: session.name.clone(),
         socket: session.socket.clone(),
         instance,
+        local_close_token: None,
     }
     .resolve_owner(&sessions, profile_tmux_socket())
     .target();
@@ -3383,25 +3384,131 @@ pub fn resolve_local_tmux_close(
 /// Discovery, kill and absence confirmation share one deadline. Every child is
 /// supervised and reaped by the bounded runner; failure never authorizes a kill
 /// on another server or a migration to it. Run only on a background executor.
-pub fn close_local_tmux(session: &SessionTarget, deadline: Instant) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalTmuxClose {
+    Gone,
+    Preserved,
+}
+
+pub fn close_local_tmux(
+    session: &SessionTarget,
+    token: uuid::Uuid,
+    initialize: bool,
+    deadline: Instant,
+) -> Result<LocalTmuxClose> {
     let session = profile_tmux_target(session);
+    let socket = session
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if initialize {
+        let mut cmd = tmux_on(socket);
+        cmd.args(muxel_core::tmux::set_option_args(
+            &session.name,
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION,
+            &token.to_string(),
+        ));
+        let out = run_tmux_output_until(cmd, deadline)?;
+        if !out.status.success() {
+            if !local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+                return Ok(LocalTmuxClose::Gone);
+            }
+            bail!(
+                "couldn't bind tmux close generation: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let id = std::cell::RefCell::new(None::<String>);
     close_local_tmux_with(
         &session,
         deadline,
-        |socket, deadline| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+        |socket, deadline| {
+            let Some((observed_id, observed_token)) =
+                local_close_generation(socket, &session.name, deadline)?
+            else {
+                return Ok(false);
+            };
+            if observed_token != Some(token) {
+                return Ok(false);
+            }
+            let mut expected = id.borrow_mut();
+            if let Some(expected) = expected.as_ref() {
+                Ok(*expected == observed_id)
+            } else {
+                *expected = Some(observed_id);
+                Ok(true)
+            }
+        },
         |owner, deadline| {
             let socket = owner
                 .socket
                 .as_ref()
                 .context("tmux close owner is unknown")?;
             let mut cmd = tmux_on(socket);
-            cmd.args(muxel_core::tmux::kill_session_args(&owner.name));
-            // kill-session can fail because the session already exited. Only
-            // the checked absence probe below decides whether close succeeded.
+            let id = id.borrow();
+            let args = muxel_core::tmux::kill_local_generation_args(
+                &owner.name,
+                id.as_deref().context("tmux generation was not observed")?,
+                token,
+            )
+            .context("invalid tmux session id")?;
+            cmd.args(args);
+            // The server compares the token and id again in the same command
+            // queue as kill-session. A peer restart cannot transfer the kill.
             run_tmux_output_until(cmd, deadline)?;
             Ok(())
         },
-    )
+    )?;
+    if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+        Ok(LocalTmuxClose::Preserved)
+    } else {
+        Ok(LocalTmuxClose::Gone)
+    }
+}
+
+fn local_close_generation(
+    socket: &Socket,
+    session: &str,
+    deadline: Instant,
+) -> Result<Option<(String, Option<uuid::Uuid>)>> {
+    let mut cmd = tmux_on(socket);
+    // Keep imported Unicode names intact even with the runner's C locale.
+    cmd.arg("-u");
+    cmd.args([
+        "display-message".to_string(),
+        "-p".into(),
+        "-t".into(),
+        format!("={session}:"),
+        // tmux sanitizes control characters (including tabs) under the
+        // runner's LC_ALL=C. Colons remain printable; parse from the right
+        // so the session name cannot change the id/token boundaries.
+        format!(
+            "#{{session_name}}:#{{session_id}}:#{{{}}}",
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION
+        ),
+    ]);
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if out.status.success() {
+        let text = String::from_utf8(out.stdout).context("tmux generation is not UTF-8")?;
+        let line = text.strip_suffix('\n').unwrap_or(&text);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some((prefix, token)) = line.rsplit_once(':')
+            && let Some((name, id)) = prefix.rsplit_once(':')
+            && name == session
+            && id.strip_prefix('$').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        {
+            return Ok(Some((id.into(), uuid::Uuid::parse_str(token).ok())));
+        }
+    }
+    // display-message may succeed without a target. An invalid response is
+    // never proof of absence; only has-session can confirm that.
+    if !local_tmux_has_session_confirmed(socket, session, deadline)? {
+        return Ok(None);
+    }
+    bail!("couldn't read the generation of tmux session “{session}”")
 }
 
 fn close_local_tmux_with(
@@ -3411,6 +3518,13 @@ fn close_local_tmux_with(
     kill: impl FnOnce(&SessionTarget, Instant) -> Result<()>,
 ) -> Result<()> {
     let owner = resolve_tmux_owner_with(session, |socket| probe(socket, deadline))?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if !probe(socket, deadline)? {
+        return Ok(());
+    }
     kill(&owner, deadline)?;
     let socket = owner
         .socket
@@ -4104,6 +4218,9 @@ fn probe_ssh_command_config(
     ceiling: Option<&Path>,
     deadline: Instant,
 ) -> SshConfigProbe {
+    if Instant::now() >= deadline {
+        return SshConfigProbe::Failed;
+    }
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };
@@ -4717,6 +4834,20 @@ mod tests {
     }
 
     #[test]
+    fn review_close_retry_cannot_kill_when_the_original_generation_is_gone() {
+        let target = SessionTarget::new("same-name-replacement", Some(Socket::Private));
+        // The expected generation no longer exists. A name still present on
+        // that server can be a peer's replacement, never permission to kill it.
+        close_local_tmux_with(
+            &target,
+            Instant::now() + Duration::from_secs(2),
+            |_, _| Ok(false),
+            |_, _| panic!("kill reached the replacement after the original generation was gone"),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let killed = std::cell::Cell::new(false);
@@ -4742,7 +4873,12 @@ mod tests {
         assert!(killed.get());
         assert_eq!(
             *probes.borrow(),
-            [Socket::Private, Socket::Default, Socket::Default]
+            [
+                Socket::Private,
+                Socket::Default,
+                Socket::Default,
+                Socket::Default
+            ]
         );
     }
 
@@ -4757,7 +4893,6 @@ mod tests {
                 deadline,
                 |socket, _| {
                     assert_eq!(Some(socket), target.socket.as_ref());
-                    assert!(killed.get(), "recorded owner needs no discovery probes");
                     Ok(true)
                 },
                 |owner, _| {
@@ -4782,7 +4917,10 @@ mod tests {
             close_local_tmux_with(
                 &target,
                 deadline,
-                |_, _| panic!("failed kill must not query another server"),
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    Ok(true)
+                },
                 |_, _| anyhow::bail!("kill timed out"),
             )
             .is_err()
@@ -4792,7 +4930,7 @@ mod tests {
     #[test]
     fn local_close_expired_deadline_refuses_before_running_a_command() {
         let target = SessionTarget::new("work", Some(Socket::Private));
-        assert!(close_local_tmux(&target, Instant::now()).is_err());
+        assert!(close_local_tmux(&target, uuid::Uuid::new_v4(), false, Instant::now()).is_err());
     }
 
     #[test]
