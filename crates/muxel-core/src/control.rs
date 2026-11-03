@@ -439,6 +439,9 @@ pub struct AgentInfo {
     pub id: String,
     pub uuid: Uuid,
     pub name: String,
+    /// Stable outside-control alias, retained after an agent changes its title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub project: String,
     pub project_id: String,
     /// `terminal`, `editor` or `browser`.
@@ -539,6 +542,7 @@ pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
 pub struct AgentEntry<'a> {
     pub id: Uuid,
     pub name: &'a str,
+    pub label: Option<&'a str>,
     pub project: &'a str,
 }
 
@@ -569,7 +573,8 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits), a name, or `project/name` when names repeat.
+/// four or more hex digits), a display name or retained label, or `project/name`
+/// when names repeat. Each pane contributes at most one candidate.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -598,7 +603,11 @@ pub fn resolve_agent(
     };
     let hits: Vec<&AgentEntry> = agents
         .iter()
-        .filter(|a| normalize(a.name) == name)
+        .filter(|a| {
+            normalize(a.name) == name
+                || a.label
+                    .is_some_and(|label| !label.trim().is_empty() && normalize(label) == name)
+        })
         .filter(|a| project.as_ref().is_none_or(|p| normalize(a.project) == *p))
         .collect();
     match hits.as_slice() {
@@ -1258,7 +1267,7 @@ usage: muxel ctl <command> [args]
 
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
-  new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+  new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
               [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
@@ -1324,7 +1333,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1699,9 +1708,13 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
-- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
   project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  `--name` supplies a starting label. A useful agent title received after launch
+  replaces it on screen. The label remains a resolver alias and a `label` field
+  in `panes`/`status`; the row tooltip keeps it visible. `--name-fixed` instead
+  keeps a sticky name, like an inline rename. The two options are exclusive.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
@@ -2298,11 +2311,12 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_shows_its_launch_id_only_while_it_runs() {
+    fn agent_info_optional_launch_id_and_label_round_trip() {
         let mut info = AgentInfo {
             id: short_id(id(7)),
             uuid: id(7),
             name: "Claude".into(),
+            label: None,
             project: "p".into(),
             project_id: "11111111".into(),
             kind: "terminal".into(),
@@ -2323,10 +2337,17 @@ mod tests {
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("launch_id").is_none(), "{json}");
+        assert!(
+            json.get("label").is_none(),
+            "unnamed replies keep their old shape"
+        );
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+        info.label = Some("starting label".into());
         info.status = Some(AgentState::Idle);
         info.launch_id = Some(id(42));
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["launch_id"], id(42).to_string());
+        assert_eq!(json["label"], "starting label");
         assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
     }
 
@@ -2397,16 +2418,19 @@ mod tests {
             AgentEntry {
                 id: a,
                 name: "✳ Claude",
+                label: None,
                 project: "muxel",
             },
             AgentEntry {
                 id: b,
                 name: "Codex",
+                label: None,
                 project: "muxel",
             },
             AgentEntry {
                 id: c,
                 name: "Codex",
+                label: None,
                 project: "Other Repo",
             },
         ];
