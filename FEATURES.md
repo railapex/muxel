@@ -1370,9 +1370,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Session folder chips** — terminal rows show their launch folder's short name
   when it differs from the project root, plus its current Git branch when known.
   Root sessions stay single-line unless their known branch differs from the
-  project header; then they show the branch only. Click a chip to show sessions
-  in that folder or on that known branch; click it again or the project's clear
-  button to reset.
+  project header; then they show the branch only. Right-click a row to show only
+  sessions in that folder or on that known branch; **Show all sessions** on the
+  same row or the project's clear button resets.
   Background refresh supplies the sidebar and `ctl panes` / `status` `branch`
   field. Running programs' later directory changes are not tracked.
 - **Project git** — right-click a git project for: git diff (opens the diff pane;

@@ -8,9 +8,11 @@ shown before their first commit too. Detached HEADs
 and folders outside Git omit the branch. Long labels truncate within the title
 column so the status badge keeps its space. Hover for the full path and branch.
 
-Clicking a chip filters that project's sidebar rows to the same full folder **or**
-the same known branch. Matching basenames alone do not count, and unknown branches
-never match each other. Clicking the same chip again clears the filter. The
+A chip is a label: clicking it selects the pane, like the rest of the row.
+Right-click a terminal row and choose **Show only this folder** (or **…folder and
+branch**) to filter that project's sidebar rows to the same full folder **or** the
+same known branch. Matching basenames alone do not count, and unknown branches
+never match each other. **Show all sessions** on the same row clears the filter. The
 project header also has a clear button, including while collapsed or after the
 original session closes. Filtering affects only the sidebar, not the pane layout.
 Filters are not persisted.

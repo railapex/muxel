@@ -1,5 +1,7 @@
 //! Background launch-folder branch snapshots, shared by sidebar and ctl.
 use super::{MuxelApp, integrations};
+use crate::i18n::t;
+use gpui::SharedString;
 use muxel_core::session_folder::{FolderFilter, folder_key};
 use muxel_core::{Instance, Project, RemoteOs};
 use std::collections::{HashMap, HashSet};
@@ -90,6 +92,27 @@ impl MuxelApp {
                 self.folder_windows(project),
             )
         })
+    }
+
+    /// The row menu's filter entry. The row that started a filter offers to clear it.
+    pub(super) fn folder_filter_menu_entry(
+        &self,
+        project: &Project,
+        instance: &Instance,
+    ) -> (SharedString, FolderFilter) {
+        let folder = Self::session_folder(project, instance);
+        let branch = self.session_branch(project, instance);
+        let windows = self.folder_windows(project);
+        let filtering = self
+            .folder_filters
+            .get(&project.id)
+            .is_some_and(|f| f.is_source(&folder, windows));
+        let label = match (filtering, branch) {
+            (true, _) => t("Show all sessions"),
+            (false, Some(_)) => t("Show only this folder and branch"),
+            (false, None) => t("Show only this folder"),
+        };
+        (label, FolderFilter::new(&folder, branch, windows))
     }
 
     pub(super) fn toggle_folder_filter(&mut self, project: Uuid, clicked: FolderFilter) {
