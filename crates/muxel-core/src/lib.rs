@@ -118,7 +118,8 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    /// Latest work, completion or blocked transition, in Unix milliseconds.
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
@@ -222,7 +223,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -258,6 +259,93 @@ fn state_with_age(state: &str, at: Option<i64>, now: i64) -> String {
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
+
+/// Defer an old local PTY until opened. Unknown ages start normally; attendance
+/// does not count as work. Active and pinned panes always start.
+pub fn should_restore_dormant(
+    activity: &AgentActivity,
+    days: u32,
+    now: i64,
+    active: bool,
+    pinned: bool,
+) -> bool {
+    days > 0
+        && !active
+        && !pinned
+        && activity
+            .last_work_at()
+            .is_some_and(|at| now.saturating_sub(at) >= i64::from(days) * DAY_MS)
+}
+
+#[cfg(test)]
+mod dormant_restore_tests {
+    use super::{AgentActivity, DAY_MS, Settings, should_restore_dormant};
+
+    #[test]
+    fn dormant_threshold_uses_latest_work_and_includes_exact_boundary() {
+        let activity = AgentActivity {
+            work_started_at: Some(DAY_MS),
+            completed_at: Some(2 * DAY_MS),
+            blocked_at: Some(3 * DAY_MS),
+            last_attended_at: Some(9 * DAY_MS),
+            ..Default::default()
+        };
+        assert_eq!(activity.last_work_at(), Some(3 * DAY_MS));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS - 1,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            2 * DAY_MS,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn dormant_restore_exempts_active_pinned_unknown_and_disabled() {
+        let old = AgentActivity {
+            completed_at: Some(0),
+            ..Default::default()
+        };
+        for (days, active, pinned) in [(0, false, false), (3, true, false), (3, false, true)] {
+            assert!(!should_restore_dormant(
+                &old,
+                days,
+                9 * DAY_MS,
+                active,
+                pinned
+            ));
+        }
+        assert!(!should_restore_dormant(
+            &AgentActivity::default(),
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert_eq!(Settings::default().dormant_after_days, 0);
+    }
+}
 
 fn age_millis(at: Option<i64>, now: i64) -> Option<i64> {
     at.map(|at| now.saturating_sub(at).max(0))
@@ -2566,6 +2654,9 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Start old local PTY sessions only when opened. Zero disables dormancy.
+    #[serde(default)]
+    pub dormant_after_days: u32,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3064,6 +3155,7 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            dormant_after_days: 0,
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,

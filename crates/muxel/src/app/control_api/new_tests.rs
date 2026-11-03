@@ -110,9 +110,10 @@ impl MuxelApp {
         }
     }
 
-    fn select_project(&mut self, pid: Uuid, _: &mut Window, _: &mut Context<Self>) {
+    fn select_project_for_new_pane(&mut self, pid: Uuid, _: &mut Window, _: &mut Context<Self>) {
         self.selections += 1;
         self.workspace.active_project = Some(pid);
+        self.active_instance = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -143,6 +144,13 @@ impl MuxelApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
+        if focus {
+            assert_eq!(self.workspace.active_project, Some(pid));
+            assert_eq!(
+                self.active_instance, None,
+                "focused creation must not select an old pane during project reconciliation"
+            );
+        }
         self.placements += 1;
         if self.reject_placement {
             return;

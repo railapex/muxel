@@ -107,6 +107,8 @@ pub enum Command {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// Deliberately open an existing pane, starting it if dormant.
+    Focus { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
         agent: String,
@@ -453,6 +455,9 @@ pub struct AgentInfo {
     /// `None` for editors and browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentState>,
+    /// Why a terminal is not running. `dormant` means it starts when opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_running_reason: Option<String>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -492,14 +497,7 @@ pub fn short_id(id: Uuid) -> String {
 
 /// The latest lifecycle transition an agent has recorded (unix ms).
 pub fn status_since(activity: &AgentActivity) -> Option<i64> {
-    [
-        activity.work_started_at,
-        activity.completed_at,
-        activity.blocked_at,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    activity.last_work_at()
 }
 
 /// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has
@@ -1265,6 +1263,7 @@ usage: muxel ctl <command> [args]
                                  --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
+  focus AGENT                    open a pane; start it if dormant
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
@@ -1332,6 +1331,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "status" => {
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
         }
+        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, starting it if dormant.",
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
         }
@@ -1368,6 +1368,7 @@ fn unknown_command_error(command: &str) -> String {
             "new",
             "new-status",
             "status",
+            "focus",
             "show",
             "screen",
             "send",
@@ -1502,6 +1503,12 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             at_most(1)?;
             Command::Status {
                 agent: words.first().cloned(),
+            }
+        }
+        "focus" => {
+            at_most(1)?;
+            Command::Focus {
+                agent: agent(&words)?,
             }
         }
         "show" => {
@@ -1699,6 +1706,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
+  starting it through normal restore if dormant. This changes keyboard focus.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
   project's active group (a new tab by default). PROJECT resolves as for `panes`.
@@ -1895,6 +1904,12 @@ hosts ignore this caller ID, so check the target when driving one.
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
   start. `not_running` - the pane hasn't been started this session; the user has
   to open it in muxel.
+
+Old local sessions may be dormant: `status` and `panes` report
+`status: "not_running", not_running_reason: "dormant"`. `show` includes this
+reason; `screen`, `send`, `keys`, and `answer` refuse with `not_running` and
+`reason: "dormant"`, even with `--force`. `focus` opens and resumes the session.
+An approved `new --focus` also leaves other dormant sessions asleep.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to
@@ -2311,6 +2326,7 @@ mod tests {
             model: None,
             is_agent: true,
             status: Some(AgentState::NotRunning),
+            not_running_reason: None,
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
@@ -2722,6 +2738,14 @@ Steps:
     #[test]
     fn cli_parses_commands_flags_and_literal_text() {
         assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
+        assert_eq!(
+            parse_cli(&words(&["focus", "old-session"])),
+            Ok(CliCommand::Request(Command::Focus {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["focus"])).is_err());
+        assert!(parse_cli(&words(&["focus", "a", "b"])).is_err());
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
