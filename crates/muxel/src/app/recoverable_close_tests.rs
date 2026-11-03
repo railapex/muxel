@@ -239,6 +239,17 @@ fn held_panes_allow_ctl_reads_but_refuse_input_with_current_close_state() {
                     assert_eq!(refusal.code, Some(ErrorCode::Closing));
                     assert_eq!(refusal.undo_until, None);
                     assert_eq!(refusal.reason.as_deref(), Some(state));
+                    // Focusing would make the hidden, input-held pane active.
+                    let focus = muxel_core::control::Command::Focus {
+                        agent: held.to_string(),
+                    };
+                    match app.control_command(focus, None, cx) {
+                        super::control_api::Answer::Now(Err(refusal)) => {
+                            assert_eq!(refusal.code, Some(ErrorCode::Closing), "{state}");
+                            assert_eq!(refusal.reason.as_deref(), Some(state));
+                        }
+                        _ => panic!("ctl focus admitted a pane held for close ({state})"),
+                    }
                 }
                 app.close_groups
                     .iter_mut()

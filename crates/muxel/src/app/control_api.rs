@@ -935,8 +935,9 @@ impl MuxelApp {
                                 if !this.settings.control_enabled {
                                     return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
                                 }
-                                if let Some(until) = this.closing_until(iid) {
-                                    return Err(ctl::Error::closing(until));
+                                // The close may have begun since admission.
+                                if let Some(error) = this.closing_control_error(iid) {
+                                    return Err(error);
                                 }
                                 if let Some(popout) = this.popouts.get(&iid) {
                                     window.focus(&popout.view.focus_handle(cx), cx);
@@ -1090,7 +1091,12 @@ impl MuxelApp {
                     .map(|info| json!(info)),
             ),
             Command::Focus { agent } => match self.control_resolve(&agent) {
-                Ok(iid) => Answer::Focus(iid),
+                // A held pane is out of the layout in every close stage, not
+                // only while its countdown runs.
+                Ok(iid) => match self.closing_control_error(iid) {
+                    Some(error) => Answer::Now(Err(error)),
+                    None => Answer::Focus(iid),
+                },
                 Err(error) => Answer::Now(Err(error)),
             },
             Command::Show { agent, full } => match self.control_resolve(&agent) {
