@@ -24857,7 +24857,8 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_default();
-                                let completed_at = activity.and_then(|activity| activity.completed_at);
+                                let completed_at =
+                                    activity.and_then(|activity| activity.completed_at);
                                 div().flex_none().child(self.badge_clock.tag(
                                     status,
                                     format!("{age} · {}", t("dormant")),
@@ -27243,8 +27244,12 @@ impl MuxelApp {
                                 cx,
                             )
                         } else if stopped {
-                            self.badge_clock
-                                .tag(AgentStatus::Idle, t("stopped").to_string(), None, cx)
+                            self.badge_clock.tag(
+                                AgentStatus::Idle,
+                                t("stopped").to_string(),
+                                None,
+                                cx,
+                            )
                         } else {
                             self.badge_clock.tag(
                                 status,
