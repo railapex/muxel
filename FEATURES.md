@@ -60,6 +60,14 @@ feature is added or changed, update the matching entry here in the same change**
   supersedes it. Editors, diffs and browsers open
   without waiting on terminals, and switching projects cancels the old project's
   pending waves.
+- **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can start sessions not worked
+  on in N days only when opened (off by default; enabling starts at 3 days).
+  Old local PTY panes retain their name, lifecycle status and age with a dormant
+  marker and a lightweight placeholder, without starting a process. Opening or
+  focusing one resumes it through the normal restore path. The focused pane,
+  pinned panes and panes with no work history always start; SSH and local tmux
+  restores keep their existing behavior. `ctl status`/`panes` expose
+  `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
