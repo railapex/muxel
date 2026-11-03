@@ -65,7 +65,7 @@ impl FolderFilter {
         self.folder == folder_key(folder, windows)
     }
 
-    /// Clicking the same chip clears; another chip replaces the selection.
+    /// Choosing the same folder clears; another folder replaces the selection.
     pub fn toggle(current: &mut Option<Self>, clicked: Self) {
         *current = if current.as_ref().is_some_and(|f| f.folder == clicked.folder) {
             None

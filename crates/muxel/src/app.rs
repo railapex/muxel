@@ -26608,9 +26608,6 @@ impl MuxelApp {
                                     self.project_branches.get(&pid).and_then(|b| b.as_deref()),
                                     windows,
                                 )?;
-                                let filter = muxel_core::session_folder::FolderFilter::new(
-                                    &folder, branch, windows,
-                                );
                                 let selected = self
                                     .folder_filters
                                     .get(&pid)
@@ -26625,13 +26622,6 @@ impl MuxelApp {
                                         .accessibility_id(SharedString::from(format!(
                                             "muxel.folder-chip.{iid}"
                                         )))
-                                        .role(Role::Button)
-                                        .aria_label(SharedString::from(label.clone()))
-                                        .aria_toggled(if selected {
-                                            gpui::accesskit::Toggled::True
-                                        } else {
-                                            gpui::accesskit::Toggled::False
-                                        })
                                         .w_full()
                                         .min_w_0()
                                         .overflow_hidden()
@@ -26642,24 +26632,16 @@ impl MuxelApp {
                                         .text_xs()
                                         .text_color(cx.theme().sidebar_foreground)
                                         .when(selected, |s| s.bg(cx.theme().sidebar_accent))
-                                        .hover(move |s| s.bg(hover_col))
-                                        .cursor_pointer()
                                         .tooltip(move |window, cx| {
                                             gpui_component::tooltip::Tooltip::new(tooltip.clone())
                                                 .build(window, cx)
                                         })
-                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                            window.prevent_default();
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_folder_filter(pid, filter.clone());
-                                            cx.notify();
-                                        }))
                                         .child(label),
                                 )
                             });
+                    let folder_filter_item = inst
+                        .filter(|i| i.kind == InstanceKind::Terminal)
+                        .map(|i| self.folder_filter_menu_entry(project, i));
                     let is_sel = self.active_instance == Some(iid);
                     let renaming = self.rename == Some(RenameTarget::Instance(iid))
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
@@ -26804,6 +26786,23 @@ impl MuxelApp {
                                                     this.duplicate_instance(iid, window, cx)
                                                 },
                                             )),
+                                    )
+                                    .when_some(
+                                        folder_filter_item.clone(),
+                                        |menu, (label, filter)| {
+                                            menu.item(PopupMenuItem::new(label).on_click(
+                                                window.listener_for(
+                                                    &entity,
+                                                    move |this, _, _, cx| {
+                                                        this.toggle_folder_filter(
+                                                            pid,
+                                                            filter.clone(),
+                                                        );
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            ))
+                                        },
                                     )
                                     .separator()
                                     .item(
