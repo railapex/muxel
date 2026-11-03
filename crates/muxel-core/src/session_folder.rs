@@ -16,8 +16,15 @@ pub fn folder_key(path: &str, windows: bool) -> String {
     }
 }
 
-/// A root session needs only a branch; other folders remain identifiable without Git.
-pub fn chip_label(root: &str, folder: &str, branch: Option<&str>, windows: bool) -> Option<String> {
+/// Root rows only repeat a branch when it differs from the project header.
+/// Other folders remain identifiable without Git.
+pub fn chip_label(
+    root: &str,
+    folder: &str,
+    branch: Option<&str>,
+    project_branch: Option<&str>,
+    windows: bool,
+) -> Option<String> {
     let different = folder_key(root, windows) != folder_key(folder, windows);
     let separator = |c| c == '/' || (windows && c == '\\');
     let short = folder
@@ -29,8 +36,8 @@ pub fn chip_label(root: &str, folder: &str, branch: Option<&str>, windows: bool)
     match (different, branch.filter(|b| !b.is_empty())) {
         (true, Some(branch)) => Some(format!("{short}  ⎇ {branch}")),
         (true, None) => Some(short.to_string()),
-        (false, Some(branch)) => Some(format!("⎇ {branch}")),
-        (false, None) => None,
+        (false, Some(branch)) if Some(branch) != project_branch => Some(format!("⎇ {branch}")),
+        (false, _) => None,
     }
 }
 
@@ -74,26 +81,56 @@ mod tests {
 
     #[test]
     fn root_and_external_folder_chip_decisions() {
-        assert_eq!(chip_label("/repo", "/repo/", None, false), None);
+        assert_eq!(chip_label("/repo", "/repo/", None, None, false), None);
         assert_eq!(
-            chip_label("/repo", "/repo", Some("main"), false).as_deref(),
+            chip_label("/repo", "/repo", Some("main"), None, false).as_deref(),
             Some("⎇ main")
         );
         assert_eq!(
-            chip_label("/repo", "/env/ember/", None, false).as_deref(),
+            chip_label("/repo", "/env/ember/", None, None, false).as_deref(),
             Some("ember")
         );
         assert_eq!(
-            chip_label("/repo", "/env/ember", Some("fix/dates"), false).as_deref(),
+            chip_label("/repo", "/env/ember", Some("fix/dates"), None, false).as_deref(),
             Some("ember  ⎇ fix/dates")
         );
-        assert_eq!(chip_label("C:/Repo", "c:\\repo\\", None, true), None);
-        assert_eq!(chip_label("/", "/", None, false), None);
+        assert_eq!(chip_label("C:/Repo", "c:\\repo\\", None, None, true), None);
+        assert_eq!(chip_label("/", "/", None, None, false), None);
         assert_eq!(folder_key("C:/", true), "c:");
-        assert_eq!(chip_label("/repo", "/", None, false).as_deref(), Some("/"));
         assert_eq!(
-            chip_label("/repo", "/tmp/one\\two", None, false).as_deref(),
+            chip_label("/repo", "/", None, None, false).as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            chip_label("/repo", "/tmp/one\\two", None, None, false).as_deref(),
             Some("one\\two")
+        );
+    }
+
+    #[test]
+    fn root_rows_only_show_branch_when_it_differs_from_header() {
+        let cases = [
+            ("/repo/", Some("main"), Some("main"), None),
+            ("/repo", Some("topic"), Some("main"), Some("⎇ topic")),
+            (
+                "/env/ember",
+                Some("main"),
+                Some("main"),
+                Some("ember  ⎇ main"),
+            ),
+            ("/repo", None, Some("main"), None),
+            ("/repo", Some("topic"), None, Some("⎇ topic")),
+        ];
+        for (folder, branch, header, expected) in cases {
+            assert_eq!(
+                chip_label("/repo", folder, branch, header, false).as_deref(),
+                expected,
+                "folder={folder}, branch={branch:?}, header={header:?}"
+            );
+        }
+        assert_eq!(
+            chip_label("C:/Repo", "c:\\repo\\", Some("main"), Some("main"), true),
+            None
         );
     }
 

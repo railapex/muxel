@@ -2,7 +2,8 @@
 
 A terminal's sidebar row identifies its stored launch folder. A folder outside
 the project root shows its basename and current Git branch. A session at the root
-shows only the branch; a root without a known branch has no chip. Branches are
+shows a branch-only chip when its known branch differs from the project header's
+branch. Otherwise it has no chip and stays single-line. Branches are
 shown before their first commit too. Detached HEADs
 and folders outside Git omit the branch. Long labels truncate within the title
 column so the status badge keeps its space. Hover for the full path and branch.

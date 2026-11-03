@@ -26605,6 +26605,7 @@ impl MuxelApp {
                                     &Self::project_folder(project),
                                     &folder,
                                     branch,
+                                    self.project_branches.get(&pid).and_then(|b| b.as_deref()),
                                     windows,
                                 )?;
                                 let filter = muxel_core::session_folder::FolderFilter::new(
