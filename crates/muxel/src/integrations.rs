@@ -716,8 +716,9 @@ pub fn push_remote_layout(loc: &RepoLoc, json: &str) -> Result<()> {
     write_remote_file(loc, &remote_layout_abs(root), json)
 }
 
-/// `git <args>` at `loc`; trimmed single-line stdout on success, else `None`.
+/// A display-only Git read at `loc`; trimmed stdout on success, else `None`.
 fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
+    // git_output is the shared lock-free display read, local and remote.
     let out = git_output(loc, args).ok().filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
@@ -1058,10 +1059,10 @@ pub fn repo_head(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "HEAD"])
 }
 
-/// The repo's current branch name (e.g. `main`); `None` when detached (`"HEAD"`)
-/// or git fails. Used only for display. Works for local or remote repos.
+/// The repo's current branch, including before its first commit. `None` when
+/// detached or Git fails. Used only for display; works for local and remote repos.
 pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
-    git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
+    git_line_loc(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
 /// Run a git command in `dir` and return its trimmed single-line stdout on
@@ -4673,6 +4674,47 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_branch_covers_unborn_checkout_and_detached_head() {
+        let repo = lib_temp_dir();
+        let git = |args: &[&str]| {
+            let out = command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "initial"]);
+        let loc = RepoLoc::Local(repo.clone());
+        assert_eq!(
+            repo_current_branch(&loc).as_deref(),
+            Some("initial"),
+            "an unborn branch is still the current branch"
+        );
+        git(&[
+            "-c",
+            "user.name=Muxel Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("topic"));
+        git(&["checkout", "-q", "--detach", "HEAD"]);
+        assert_eq!(repo_current_branch(&loc), None);
+        std::fs::remove_dir_all(repo).unwrap();
+    }
 
     #[test]
     fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {

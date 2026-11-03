@@ -26,6 +26,7 @@ pub mod readaloud;
 pub mod recoverable_close;
 pub mod remote_ops;
 pub mod session_discovery;
+pub mod session_folder;
 mod shell;
 pub mod sidebar;
 pub mod ssh;
