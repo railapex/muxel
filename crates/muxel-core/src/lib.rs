@@ -8,6 +8,7 @@ mod appimage;
 pub mod audio;
 pub mod autopilot;
 pub mod build_identity;
+pub mod child_env;
 pub mod control;
 pub mod diff;
 pub mod geometry;
