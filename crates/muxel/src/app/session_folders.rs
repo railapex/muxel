@@ -2,10 +2,12 @@
 use super::{MuxelApp, integrations};
 use crate::i18n::t;
 use gpui::SharedString;
+use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::session_folder::{FolderFilter, folder_key};
 use muxel_core::{Instance, Project, RemoteOs};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -37,6 +39,30 @@ pub(super) fn probe_branches(jobs: Vec<BranchJob>) -> Vec<BranchResult> {
             list: job.is_root.then(|| integrations::list_branches(&job.loc)),
             key: job.key,
             host_snapshot: job.host_snapshot,
+        })
+        .collect()
+}
+
+/// The local jobs whose HEAD or branches moved, or whose backstop passed. Reading
+/// the stamp costs file reads; the git processes it avoids are the expensive part.
+pub(super) fn due_local_jobs(
+    jobs: Vec<BranchJob>,
+    gate: &mut RefreshGate<FolderKey, integrations::GitRefStamp>,
+    now: Instant,
+) -> Vec<BranchJob> {
+    let keys: HashSet<FolderKey> = jobs.iter().map(|job| job.key.clone()).collect();
+    gate.retain(|key| keys.contains(key));
+    jobs.into_iter()
+        .filter(|job| {
+            let integrations::RepoLoc::Local(dir) = &job.loc else {
+                return true;
+            };
+            let stamp = integrations::git_ref_stamp(dir);
+            if !gate.due(&job.key, &stamp, now) {
+                return false;
+            }
+            gate.record(job.key.clone(), stamp, now);
+            true
         })
         .collect()
 }
