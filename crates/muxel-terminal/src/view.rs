@@ -570,22 +570,24 @@ impl RuntimeStatusState {
                     && self.provider_screen.is_none()
             }
         };
-        // A row from before a switch isn't this conversation's turn to hold, and it
-        // still reads as work until a title can confirm it. A current report is this
-        // conversation's own evidence, and it never draws the glyph that would confirm
-        // the row, so it decides on a reporting pane.
-        let background_unattributed = settling || (self.screen_held && program_root.is_none());
+        // A switch doesn't change this. Until a new turn says otherwise the pane has
+        // nothing running in its foreground, and a reporting Claude's title never draws
+        // the glyph that would end the screen hold, so waiting on that would pin it busy
+        // for the shell's whole life. The screen hold still keeps it from alerting, and
+        // work that ends under it gets no wake grace: this conversation has run no turn.
+        let ended_before_a_turn =
+            self.provider_background.is_none() && self.screen_held && program_root.is_none();
         let (background_holds, background_deadline) = self.background_hold.observe(
             self.provider_background,
-            exited || !turn_over || background_unattributed,
+            exited || !turn_over || ended_before_a_turn,
             now,
         );
         if let Some(deadline) = background_deadline {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
         // Only an expired hold stops listed work reading as Working.
-        let background_reads_working = background_holds
-            || (self.provider_background.is_some() && (!turn_over || background_unattributed));
+        let background_reads_working =
+            background_holds || (self.provider_background.is_some() && !turn_over);
         let provider_screen = self
             .provider_screen
             .or(background_reads_working.then_some(AgentStatus::Working));
@@ -8891,6 +8893,98 @@ mod provider_switch_tests {
             assert_eq!(held.status, AgentStatus::Working);
             assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
             assert!(held.attributable, "this is the new conversation's own turn");
+            assert_eq!(held.completion_revision, 0, "a count would float the pane");
+            session.kill();
+        }
+
+        /// A switch leaves no report until the next turn, and a reporting Claude's title
+        /// never draws the glyph that would confirm a footer. So the footer alone must
+        /// not pin the pane busy: its composer is free and the limit still runs.
+        #[test]
+        fn listed_work_after_a_switch_leaves_the_composer_free() {
+            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n> /clear\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let hook = SystemTime::now() - Duration::from_secs(30);
+            session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+            let mut sample = |at: Duration| {
+                draw(&session, Some("Claude Code"), &screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + at,
+                );
+                runtime.snapshot(&session)
+            };
+            let cleared = sample(Duration::ZERO);
+            assert_eq!(cleared.status, AgentStatus::Working);
+            assert_eq!(
+                cleared.reason,
+                TerminalStatusReason::BackgroundWork,
+                "a send admits on this reason"
+            );
+            assert!(!cleared.attributable);
+            let past = sample(BACKGROUND_HOLD + Duration::from_secs(1));
+            assert_ne!(past.status, AgentStatus::Working, "a dev server isn't work");
+            assert!(past.background.is_some());
+            assert_eq!(past.completion_revision, 0, "no turn ran");
+            session.kill();
+        }
+
+        /// The binding switch clears the old report, so one read while the switch settles
+        /// is this conversation's own. It holds as it would a moment later.
+        #[test]
+        fn a_report_during_a_switch_settle_holds_too() {
+            use crate::listener::SWITCH_SLACK;
+            use crate::session::PtyOutput;
+            use crate::view::TerminalStatusReason;
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let hook = SystemTime::now();
+            session.provider_switched_at(hook, hook, hook);
+            // A title read inside the window can't end the settle.
+            draw(&session, Some("Sure"), &screen);
+            session.mark_turn_submitted();
+            let mut report = |state: &str, after_ms: u64| {
+                let mut output = PtyOutput::default();
+                output.push(
+                    format!("\x1b]7501;state={state}\x07").as_bytes(),
+                    hook + SWITCH_SLACK + Duration::from_millis(after_ms),
+                );
+                session.process_drained(&output);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_millis(after_ms),
+                );
+                runtime.snapshot(&session)
+            };
+            report("working", 100);
+            let held = report("done", 200);
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
             assert_eq!(held.completion_revision, 0, "a count would float the pane");
             session.kill();
         }
