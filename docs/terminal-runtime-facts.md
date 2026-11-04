@@ -362,9 +362,12 @@ nothing on its terminal says so.
 
 A held turn takes no completion: the report that started the hold would otherwise stamp
 the pane as finished. The release is its own status change. A switch reads the same way:
-`/clear` beside a running shell leaves no report until the next turn, and a reporting
-Claude's title has no glyph to end the screen hold, so the pane holds and takes prompts,
-and the screen hold only keeps it from alerting. A hook would add exact kinds
+`/clear` beside a running shell leaves no report until the next turn, and only a title
+reading Working would end the screen hold, which no title does between turns. So the pane
+holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
 but fires only at turn end, so it can't see work ending between turns, and it needs a
 helper on the host.
 
