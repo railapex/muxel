@@ -34,8 +34,18 @@ pub fn instances_by_id(workspace: &Workspace) -> InstancesById<'_> {
     workspace.instances.iter().map(|i| (i.id, i)).collect()
 }
 
+/// A session's place in Recent work: when it last finished or asked for something.
+/// Starting a turn doesn't count, so typing in a session leaves the list where it
+/// is. A session with neither event yet goes by its latest start.
+pub fn recent_work_at(activity: &AgentActivity) -> Option<i64> {
+    activity
+        .completed_at
+        .max(activity.blocked_at)
+        .or(activity.work_started_at)
+}
+
 pub fn activity_band(activity: &AgentActivity, now: i64) -> Option<ActivityBand> {
-    activity.last_work_at().map(|at| band_at(at, now))
+    recent_work_at(activity).map(|at| band_at(at, now))
 }
 
 fn band_at(at: i64, now: i64) -> ActivityBand {
@@ -103,7 +113,7 @@ pub fn sidebar_order(
             (
                 id,
                 instance
-                    .and_then(|i| i.activity.last_work_at())
+                    .and_then(|i| recent_work_at(&i.activity))
                     .map(|at| at.min(now)),
                 instance.is_some_and(|i| i.pinned),
             )
@@ -180,6 +190,83 @@ mod tests {
         }));
         workspace.projects.push(project.clone());
         (project, workspace, ids)
+    }
+
+    fn pane_order(project: &Project, workspace: &Workspace) -> Vec<Uuid> {
+        sidebar_order(
+            &project.instances(),
+            &instances_by_id(workspace),
+            NOW,
+            SidebarSort::RecentWork,
+        )
+        .into_iter()
+        .filter_map(|entry| match entry {
+            SidebarEntry::Pane(id) => Some(id),
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn starting_a_turn_keeps_the_row_until_it_finishes_or_asks() {
+        for outcome in [AgentActivityState::Done, AgentActivityState::Blocked] {
+            let (project, mut workspace, ids) =
+                fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+            let older = &mut workspace.instance_mut(ids[1]).unwrap().activity;
+            older.observe(
+                Some(AgentActivityState::Done),
+                AgentActivityState::Working,
+                NOW - 500,
+            );
+            assert_eq!(pane_order(&project, &workspace), vec![ids[0], ids[1]]);
+
+            let older = &mut workspace.instance_mut(ids[1]).unwrap().activity;
+            older.observe(Some(AgentActivityState::Working), outcome, NOW - 100);
+            assert_eq!(pane_order(&project, &workspace), vec![ids[1], ids[0]]);
+        }
+    }
+
+    #[test]
+    fn a_new_turn_on_old_work_stays_in_its_band() {
+        let (project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 40 * DAY)]);
+        workspace.instance_mut(ids[1]).unwrap().activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Working,
+            NOW - 500,
+        );
+        assert_eq!(
+            sidebar_order(
+                &project.instances(),
+                &instances_by_id(&workspace),
+                NOW,
+                SidebarSort::RecentWork
+            ),
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                SidebarEntry::Pane(ids[0]),
+                SidebarEntry::Band(ActivityBand::Older),
+                SidebarEntry::Pane(ids[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_outcome_yet_sorts_by_its_start() {
+        let (project, mut workspace, ids) = fixture(vec![
+            worked(NOW - 2_000),
+            AgentActivity::default(),
+            AgentActivity::default(),
+        ]);
+        workspace.instance_mut(ids[2]).unwrap().activity.observe(
+            None,
+            AgentActivityState::Working,
+            NOW - 1_000,
+        );
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![ids[2], ids[0], ids[1]]
+        );
     }
 
     #[test]
