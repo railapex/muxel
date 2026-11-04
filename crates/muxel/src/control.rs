@@ -299,7 +299,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             agent,
             timeout_secs,
             full,
-        } => wait(&agent, Duration::from_secs(timeout_secs), full),
+            turn,
+        } => wait(&agent, Duration::from_secs(timeout_secs), full, turn),
     };
     match result {
         Ok(value) => {
@@ -592,7 +593,7 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
 
 /// `wait`: check on the agent until its turn ends (it finishes, blocks on a
 /// question or exits) or `timeout` passes, then show it.
-fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Error> {
+fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value, control::Error> {
     let started = Instant::now();
     // Pin the agent by uuid: its name follows its title, which can change mid-turn.
     let mut target = agent.to_string();
@@ -612,6 +613,9 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
         background = info["background"].clone();
         if info["startup_error"].is_string() {
             break WaitOutcome::SubmissionFailed;
+        }
+        if turn && info["turn_over"].as_bool().unwrap_or(false) {
+            break WaitOutcome::Finished;
         }
         if let Some(outcome) = control::wait_outcome(state, awaiting) {
             break outcome;

@@ -1191,6 +1191,7 @@ impl MuxelApp {
             background: self
                 .terminal_view(inst.id)
                 .and_then(|view| view.read(cx).runtime_snapshot().background),
+            turn_over: self.control_turn_over(inst, now, cx),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
@@ -1467,6 +1468,18 @@ impl MuxelApp {
             in_flight: None,
             reply,
         })
+    }
+
+    /// A turn held for its background work is over, unless a prompt sent since then
+    /// hasn't started yet, whose reply this would pass off as the previous one.
+    fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
+        self.terminal_view(inst.id).is_some_and(|view| {
+            view.read(cx).runtime_snapshot().reason
+                == muxel_terminal::TerminalStatusReason::BackgroundWork
+        }) && !self
+            .control_turns
+            .get(&inst.id)
+            .is_some_and(|turn| turn.awaiting_reply(Some(AgentState::Done), &inst.activity, now))
     }
 
     /// The state a prompt is admitted against, here and by a peer sharing the pane.
