@@ -16,6 +16,23 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Work an agent's screen says is still running beside its turn. Read from the
+/// screen every time, so it is never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundWork {
+    pub shells: u32,
+    pub monitors: u32,
+    /// Running subagents, which the agent's screen may name without a count.
+    pub subagents: bool,
+}
+
+impl BackgroundWork {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 mod new;
 pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
@@ -467,6 +484,9 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// What the agent's own screen says is still running beside its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
     /// A startup task that failed before provider acceptance. The terminal itself
     /// may still be running, for example at a folder-trust menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2314,6 +2334,7 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            background: None,
             startup_error: None,
             focused: false,
             pane: Some(1),

@@ -383,6 +383,19 @@ fn runtime_control_state(
     }
 }
 
+/// A turn held at Working for its background work is over, and its prompt is free.
+fn send_admission_state(
+    state: Option<AgentState>,
+    reason: Option<muxel_terminal::TerminalStatusReason>,
+) -> Option<AgentState> {
+    if state == Some(AgentState::Working)
+        && reason == Some(muxel_terminal::TerminalStatusReason::BackgroundWork)
+    {
+        return Some(AgentState::Done);
+    }
+    state
+}
+
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
     if !admission.force {
         if admission.just_submitted {
@@ -1175,6 +1188,9 @@ impl MuxelApp {
                 .control_turns
                 .get(&inst.id)
                 .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+            background: self
+                .terminal_view(inst.id)
+                .and_then(|view| view.read(cx).runtime_snapshot().background),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
@@ -1455,10 +1471,14 @@ impl MuxelApp {
 
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
-        let state = inst.and_then(|inst| self.control_state(inst, cx));
-        let coverage = self
+        let runtime = self
             .terminal_view(iid)
-            .map(|view| view.read(cx).runtime_snapshot().coverage);
+            .map(|view| view.read(cx).runtime_snapshot());
+        let state = send_admission_state(
+            inst.and_then(|inst| self.control_state(inst, cx)),
+            runtime.map(|runtime| runtime.reason),
+        );
+        let coverage = runtime.map(|runtime| runtime.coverage);
         let just_submitted = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 just_submitted_turn(turn, coverage, state, &inst.activity, now_ms())
@@ -2625,6 +2645,24 @@ mod prompt_submission_tests {
                     .any(|at| tmux_matches(tail, &rest[at..]))
             }),
         }
+    }
+
+    /// A turn held for its background work is over, so a prompt goes in. A turn
+    /// actually running still refuses.
+    #[test]
+    fn send_goes_to_a_turn_held_only_for_its_background_work() {
+        use muxel_terminal::TerminalStatusReason as Reason;
+        let state =
+            |reason| super::send_admission_state(Some(super::AgentState::Working), Some(reason));
+        assert_eq!(state(Reason::BackgroundWork), Some(super::AgentState::Done));
+        assert_eq!(
+            state(Reason::ProgramStatus(None)),
+            Some(super::AgentState::Working)
+        );
+        assert_eq!(
+            state(Reason::ProviderScreen),
+            Some(super::AgentState::Working)
+        );
     }
 
     #[test]
@@ -4040,6 +4078,7 @@ mod runtime_control_tests {
         let revision = session.binding_revision();
         let activity = AgentActivity::default();
         let cached = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Done,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -4056,6 +4095,7 @@ mod runtime_control_tests {
         session.provider_switched(now, now);
         for old_status in [AgentStatus::Idle, AgentStatus::Done] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status: old_status,
                 ..cached
             };
@@ -4090,6 +4130,7 @@ mod runtime_control_tests {
             AgentStatus::Idle,
         ] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status,
                 attributable: false,
                 binding_rev: session.binding_revision(),
