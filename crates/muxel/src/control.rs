@@ -596,6 +596,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
     let started = Instant::now();
     // Pin the agent by uuid: its name follows its title, which can change mid-turn.
     let mut target = agent.to_string();
+    let mut background: Value;
     let outcome = loop {
         let info = request(Command::Status {
             agent: Some(target.clone()),
@@ -608,6 +609,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
             return Err(format!("'{agent}' is not a terminal pane").into());
         }
         let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        background = info["background"].clone();
         if info["startup_error"].is_string() {
             break WaitOutcome::SubmissionFailed;
         }
@@ -627,6 +629,9 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
         "outcome": outcome,
         "waited_secs": started.elapsed().as_secs(),
     });
+    if !background.is_null() {
+        shown["wait"]["background"] = background;
+    }
     Ok(shown)
 }
 

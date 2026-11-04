@@ -1460,7 +1460,7 @@ impl MuxelApp {
             input,
             turn,
             site: self.control_claim_site(inst),
-            state: self.control_state(inst, cx),
+            state: self.control_admission_state(inst, cx),
             activity: inst.activity.clone(),
             force,
             launch_id: None,
@@ -1469,16 +1469,21 @@ impl MuxelApp {
         })
     }
 
+    /// The state a prompt is admitted against, here and by a peer sharing the pane.
+    fn control_admission_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        send_admission_state(
+            self.control_state(inst, cx),
+            self.terminal_view(inst.id)
+                .map(|view| view.read(cx).runtime_snapshot().reason),
+        )
+    }
+
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
-        let runtime = self
+        let state = inst.and_then(|inst| self.control_admission_state(inst, cx));
+        let coverage = self
             .terminal_view(iid)
-            .map(|view| view.read(cx).runtime_snapshot());
-        let state = send_admission_state(
-            inst.and_then(|inst| self.control_state(inst, cx)),
-            runtime.map(|runtime| runtime.reason),
-        );
-        let coverage = runtime.map(|runtime| runtime.coverage);
+            .map(|view| view.read(cx).runtime_snapshot().coverage);
         let just_submitted = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 just_submitted_turn(turn, coverage, state, &inst.activity, now_ms())

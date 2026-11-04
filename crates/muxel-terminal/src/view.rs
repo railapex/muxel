@@ -570,9 +570,11 @@ impl RuntimeStatusState {
                     && self.provider_screen.is_none()
             }
         };
-        // A row from before a switch isn't this conversation's turn to hold. It
-        // still reads as work until a title can confirm it.
-        let background_unattributed = settling || self.screen_held;
+        // A row from before a switch isn't this conversation's turn to hold, and it
+        // still reads as work until a title can confirm it. A current report is this
+        // conversation's own evidence, and it never draws the glyph that would confirm
+        // the row, so it decides on a reporting pane.
+        let background_unattributed = settling || (self.screen_held && program_root.is_none());
         let (background_holds, background_deadline) = self.background_hold.observe(
             self.provider_background,
             exited || !turn_over || background_unattributed,
@@ -594,10 +596,18 @@ impl RuntimeStatusState {
             .or(blocked_marker.then_some(AgentStatus::Blocked))
             .or(working_marker.then_some(AgentStatus::Working));
         // Only a title read after the window can confirm a held marker; one
-        // the settle deadline accepted may be the old conversation's too.
+        // the settle deadline accepted may be the old conversation's too. Listed work
+        // can't pin that on a reporting pane, whose title stays without a glyph.
+        let held_marker = if program_root.is_some() {
+            self.provider_screen
+                .or(blocked_marker.then_some(AgentStatus::Blocked))
+                .or(working_marker.then_some(AgentStatus::Working))
+        } else {
+            screen_marker
+        };
         self.screen_held = screen_hold_after(
             self.screen_held,
-            screen_marker,
+            held_marker,
             fresh_title.filter(|_| evidence.title_fresh),
         );
         // The two-second evidence settle accepts uncertain titles as level
@@ -1339,6 +1349,10 @@ fn grok_panel_background(screen: &str) -> BackgroundWork {
 
 fn grok_background(screen: &str) -> Option<BackgroundWork> {
     let mut work = grok_panel_background(screen);
+    if !work.is_empty() {
+        return Some(work);
+    }
+    // Older Grok draws counted rows instead of the panel.
     for line in screen.lines() {
         let counts = live_background_counts(
             line,
@@ -1429,16 +1443,6 @@ fn claude_screen_work(screen: &str) -> ClaudeScreenWork {
                     background: found,
                 };
             }
-        } else if let Some(work) = live_background_counts(line, &["·"], &["command"], true) {
-            let shells = work.into_iter().map(|(count, _)| count).sum();
-            let background = background.or(Some(BackgroundWork {
-                shells,
-                ..BackgroundWork::default()
-            }));
-            return ClaudeScreenWork {
-                foreground: false,
-                background,
-            };
         }
         if is_claude_completed_foreground_row(line) {
             return ClaudeScreenWork {
@@ -8840,6 +8844,57 @@ mod provider_switch_tests {
             }
         }
 
+        /// `/clear` and `/resume` switch the conversation while a shell lives on. The
+        /// next turn's own report decides, and a reporting Claude's title stays without
+        /// the glyph that would confirm the footer, so nothing else can release the guard.
+        #[test]
+        fn a_finished_turn_still_holds_after_a_conversation_switch() {
+            use crate::view::TerminalStatusReason;
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let mut sample = |at: u64, state: Option<&[u8]>| {
+                draw(&session, Some("Sure"), &screen);
+                if let Some(state) = state {
+                    session.test_program_status(state);
+                }
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_secs(at),
+                );
+                runtime.snapshot(&session)
+            };
+            let hook = SystemTime::now() - Duration::from_secs(30);
+            session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+            let during = sample(0, None);
+            assert_eq!(
+                during.status,
+                AgentStatus::Working,
+                "the old row still reads as work"
+            );
+            assert!(!during.attributable);
+
+            session.mark_turn_submitted();
+            sample(1, Some(b"\x1b]7501;state=working\x07"));
+            let held = sample(2, Some(b"\x1b]7501;state=done\x07"));
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            assert!(held.attributable, "this is the new conversation's own turn");
+            assert_eq!(held.completion_revision, 0, "a count would float the pane");
+            session.kill();
+        }
+
         /// A pane in tmux gets no report, only titles. Same rule.
         #[test]
         fn a_finished_turn_holds_without_a_program_report_too() {
@@ -8929,6 +8984,15 @@ mod provider_switch_tests {
             ] {
                 assert_eq!(read(footer), (None, None), "{footer}");
             }
+            // Nor does a quoted row stand against an empty footer.
+            let row = "· 1 command still running · send a message to interrupt";
+            let quoted_row = crate::view::provider_screen_read(
+                TitleProvider::Claude,
+                &format!(
+                    "{HEADER}\n● The row read:\n{row}\n\n  [>_>] pane\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents"
+                ),
+            );
+            assert_eq!(quoted_row, (None, None));
             // A reply quoting a footer is not one, and the real footer below decides.
             let quoted = crate::view::provider_screen_read(
                 TitleProvider::Claude,
@@ -8990,6 +9054,14 @@ mod provider_switch_tests {
             assert_eq!(
                 read("v Watchers 1\n♦ Loop say the word tick   every 2 minutes (next in 1m9s)"),
                 None
+            );
+            // One command is one shell, even if an older row is still drawn too.
+            assert_eq!(
+                read("◎ 1 command still running\nv Tasks 1\n· Run Build"),
+                Some(BackgroundWork {
+                    shells: 1,
+                    ..Default::default()
+                })
             );
             // A reply describing a panel is not directly above the composer.
             assert_eq!(
