@@ -2467,6 +2467,7 @@ pub fn remote_tmux_launch_target(
         socket: session.socket.clone(),
         instance,
         local_close_token: None,
+        worktree: Default::default(),
     }
     .resolve_owner(&sessions, profile_tmux_socket())
     .target();
