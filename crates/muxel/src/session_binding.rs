@@ -2663,18 +2663,33 @@ mod tests {
         let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
         assert_eq!(
-            args[11..],
-            ["new-session", "-A", "-s", "s", "-e", &own, "--", "claude"]
+            args[new..],
+            [
+                "new-session",
+                "-A",
+                "-s",
+                "s",
+                "-e",
+                &own,
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -c \"$1\"",
+                "muxel-agent",
+                "claude"
+            ]
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
         let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
-        assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
+        assert_eq!(args[new..], ["new-session", "-A", "-s", "s"]);
     }
 
     /// muxel's own server is named ahead of everything else the client is told; a
@@ -2723,11 +2738,25 @@ mod tests {
         assert_eq!(launch.env.len(), 3);
         assert_eq!(
             &launch.args[new + 10..],
-            ["--", "agent", "two words", "", "--flag"]
+            [
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"",
+                "muxel-agent",
+                "agent",
+                "two words",
+                "",
+                "--flag"
+            ]
         );
         // No profile values are installed globally on this profile's server.
         assert_eq!(
-            &launch.args[2..new],
+            launch.args[2..8]
+                .iter()
+                .chain(launch.args[new - 5..new].iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             [
                 "-u",
                 "set",
