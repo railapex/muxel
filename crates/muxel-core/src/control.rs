@@ -111,7 +111,8 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
-    /// Open a terminal in a project's active tab group.
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
     New {
         project: String,
         #[serde(flatten)]
@@ -1421,7 +1422,8 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
+Open a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1810,8 +1812,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
   starting it through normal restore if dormant. This changes keyboard focus.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
-  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
   `--name` supplies a starting label. A useful agent title received after launch
   replaces it on screen. The label remains a resolver alias and a `label` field
   in `panes`/`status`; the row tooltip keeps it visible. `--name-fixed` instead
