@@ -1,11 +1,11 @@
 //! Sidebar ordering and unread decisions over persisted activity, without UI or I/O.
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentActivity, Instance, Workspace};
+use crate::{AgentActivity, Instance, InstanceKind, Workspace};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarSort {
@@ -26,6 +26,9 @@ pub enum SidebarEntry {
     Worktree(Uuid),
     Band(ActivityBand),
     Pane(Uuid),
+    /// A file, diff or page drawn under the session row before it, which
+    /// opened it. Recent work only.
+    Nested(Uuid),
 }
 
 pub type InstancesById<'a> = HashMap<Uuid, &'a Instance>;
@@ -68,6 +71,24 @@ pub fn is_unread(activity: &AgentActivity) -> bool {
         .is_some_and(|event| activity.last_attended_at.is_none_or(|seen| event > seen))
 }
 
+/// The session row resource `id` nests under in Recent work: the session that
+/// last opened it, when that session is one of `listed` (the project's rows).
+/// A session that has closed, is held for Undo, or sits in another project
+/// leaves the resource as an ordinary row. Sessions never nest and only
+/// sessions take nested rows, so nesting is one level deep.
+pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) -> Option<Uuid> {
+    let instance = instances.get(&id)?;
+    if instance.kind == InstanceKind::Terminal {
+        return None;
+    }
+    instance.opened_by.filter(|session| {
+        listed.contains(session)
+            && instances
+                .get(session)
+                .is_some_and(|session| session.kind == InstanceKind::Terminal)
+    })
+}
+
 /// A presentation filter only; callers retain the events for desktop/tray use.
 pub fn notification_in_feed(sort: SidebarSort, agent_event: bool) -> bool {
     sort == SidebarSort::Layout || !agent_event
@@ -75,7 +96,9 @@ pub fn notification_in_feed(sort: SidebarSort, agent_event: bool) -> bool {
 
 /// The caller supplies this project's visible pane ids, including live popouts
 /// in recent mode. Layout preserves existing worktree groups. Recent work is flat,
-/// so worktree membership cannot hold older sessions above newer work.
+/// so worktree membership cannot hold older sessions above newer work, except
+/// that a file, diff or page follows the session that opened it
+/// ([`nests_under`]), newest open first.
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
@@ -105,7 +128,34 @@ pub fn sidebar_order(
         return plain;
     }
 
-    let mut panes: Vec<_> = pane_ids
+    let listed: HashSet<Uuid> = pane_ids.iter().copied().collect();
+    let mut top = Vec::new();
+    let mut nested: HashMap<Uuid, Vec<(Uuid, Option<i64>)>> = HashMap::new();
+    for &id in pane_ids {
+        match nests_under(id, instances, &listed) {
+            Some(session) => nested
+                .entry(session)
+                .or_default()
+                .push((id, instances.get(&id).and_then(|i| i.opened_at))),
+            None => top.push(id),
+        }
+    }
+    // Newest open first; the sort is stable, so ties keep layout order.
+    for children in nested.values_mut() {
+        children.sort_by_key(|(_, at)| Reverse(*at));
+    }
+    let row = |out: &mut Vec<SidebarEntry>, id: Uuid| {
+        out.push(SidebarEntry::Pane(id));
+        if let Some(children) = nested.get(&id) {
+            out.extend(
+                children
+                    .iter()
+                    .map(|(child, _)| SidebarEntry::Nested(*child)),
+            );
+        }
+    };
+
+    let mut panes: Vec<_> = top
         .iter()
         .copied()
         .map(|id| {
@@ -121,10 +171,10 @@ pub fn sidebar_order(
         .collect();
     panes.sort_by_key(|(_, at, pinned)| (!pinned, Reverse(*at)));
     let pinned = panes.iter().take_while(|(_, _, pinned)| *pinned).count();
-    let mut out: Vec<_> = panes[..pinned]
-        .iter()
-        .map(|(id, _, _)| SidebarEntry::Pane(*id))
-        .collect();
+    let mut out = Vec::new();
+    for &(id, _, _) in &panes[..pinned] {
+        row(&mut out, id);
+    }
     // Pinned rows have a pin glyph instead of an age heading; their ages must
     // not cause Older → Today headings to repeat across the pinned boundary.
     let mut bands = panes[pinned..]
@@ -142,7 +192,7 @@ pub fn sidebar_order(
             out.push(SidebarEntry::Band(band));
         }
         current = band;
-        out.push(SidebarEntry::Pane(id));
+        row(&mut out, id);
     }
     out
 }
@@ -205,6 +255,187 @@ mod tests {
             _ => None,
         })
         .collect()
+    }
+
+    /// A file in `project`'s single tab group, opened by `session` at `at`
+    /// (or by no session).
+    fn file(
+        workspace: &mut Workspace,
+        project: &mut Project,
+        session: Option<Uuid>,
+        at: i64,
+    ) -> Uuid {
+        let mut instance = Instance::editor(project.id, None);
+        instance.record_opener(session, at);
+        let id = instance.id;
+        workspace.add_instance(instance);
+        if let Some(PaneNode::Leaf(leaf)) = &mut project.layout {
+            leaf.tabs.push(id);
+        }
+        id
+    }
+
+    fn recent(project: &Project, workspace: &Workspace) -> Vec<SidebarEntry> {
+        sidebar_order(
+            &project.instances(),
+            &instances_by_id(workspace),
+            NOW,
+            SidebarSort::RecentWork,
+        )
+    }
+
+    #[test]
+    fn files_nest_newest_first_under_the_session_that_last_opened_them() {
+        use SidebarEntry::{Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, b) = (ids[0], ids[1]);
+        let plan = file(&mut workspace, &mut project, Some(a), 10);
+        let notes = file(&mut workspace, &mut project, Some(a), 20);
+        let page = file(&mut workspace, &mut project, Some(b), 5);
+        let loose = file(&mut workspace, &mut project, None, 0);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(a),
+                Nested(notes),
+                Nested(plan),
+                Pane(b),
+                Nested(page),
+                Pane(loose)
+            ]
+        );
+
+        // B finishes a turn: it moves above A and takes its page along.
+        workspace.instance_mut(b).unwrap().activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            NOW - 500,
+        );
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(b),
+                Nested(page),
+                Pane(a),
+                Nested(notes),
+                Nested(plan),
+                Pane(loose)
+            ]
+        );
+
+        // B opens the plan again: the last opener wins, and it is B's newest.
+        workspace
+            .instance_mut(plan)
+            .unwrap()
+            .record_opener(Some(b), 30);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(b),
+                Nested(plan),
+                Nested(page),
+                Pane(a),
+                Nested(notes),
+                Pane(loose)
+            ]
+        );
+        // Reopening it from the file browser names no session and moves nothing.
+        workspace
+            .instance_mut(plan)
+            .unwrap()
+            .record_opener(None, 40);
+        assert_eq!(recent(&project, &workspace)[1], Nested(plan));
+
+        // Layout order ignores openers.
+        assert_eq!(
+            sidebar_order(
+                &project.instances(),
+                &instances_by_id(&workspace),
+                NOW,
+                SidebarSort::Layout
+            ),
+            [a, b, plan, notes, page, loose].map(Pane).to_vec()
+        );
+    }
+
+    #[test]
+    fn nested_rows_ride_in_the_pinned_block_without_band_labels() {
+        use SidebarEntry::{Band, Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 40 * DAY)]);
+        let (recent_session, old) = (ids[0], ids[1]);
+        workspace.instance_mut(old).unwrap().pinned = true;
+        let page = file(&mut workspace, &mut project, Some(old), 10);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(old), Nested(page), Pane(recent_session)]
+        );
+        workspace.instance_mut(old).unwrap().pinned = false;
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Band(ActivityBand::Today),
+                Pane(recent_session),
+                Band(ActivityBand::Older),
+                Pane(old),
+                Nested(page)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_whose_session_is_not_listed_shows_as_an_ordinary_row() {
+        // Closed, held for Undo, or in another project: the session is in the
+        // workspace but not among this project's rows.
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let gone = Instance::shell(project.id);
+        let session = gone.id;
+        workspace.add_instance(gone);
+        let orphan = file(&mut workspace, &mut project, Some(session), 10);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![SidebarEntry::Pane(ids[0]), SidebarEntry::Pane(orphan)]
+        );
+    }
+
+    #[test]
+    fn a_page_opened_from_a_file_belongs_to_the_files_session() {
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let session = ids[0];
+        let plan = file(&mut workspace, &mut project, Some(session), 10);
+        let loose = file(&mut workspace, &mut project, None, 0);
+        assert_eq!(workspace.opener_session(session), Some(session));
+        assert_eq!(workspace.opener_session(plan), Some(session));
+        assert_eq!(workspace.opener_session(loose), None);
+        // Once the session has gone, its file speaks for no one.
+        workspace.remove_instance_meta(session);
+        assert_eq!(workspace.opener_session(plan), None);
+    }
+
+    #[test]
+    fn the_opener_stays_on_this_machine() {
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let plan = file(&mut workspace, &mut project, Some(ids[0]), 10);
+        workspace.projects[0] = project.clone();
+        let opened = crate::RemoteLayout::capture(&project, &workspace, 1);
+        assert!(!opened.to_json().contains("opened_"));
+
+        // Opening it is not a layout change, and a peer's copy keeps ours.
+        let mut unopened = workspace.clone();
+        unopened.instance_mut(plan).unwrap().opened_by = None;
+        unopened.instance_mut(plan).unwrap().opened_at = None;
+        let before = crate::RemoteLayout::capture(&project, &unopened, 1);
+        assert_eq!(opened.content_key(), before.content_key());
+        let peer = crate::RemoteLayout::parse(&opened.to_json(), &opened.remote_root).unwrap();
+        let merged = crate::merge_peer_instances(&workspace.instances, peer.instances, project.id);
+        let mine = merged.iter().find(|i| i.id == plan).unwrap();
+        assert_eq!((mine.opened_by, mine.opened_at), (Some(ids[0]), Some(10)));
+
+        // This machine's own save keeps it.
+        let saved: Workspace =
+            serde_json::from_str(&serde_json::to_string(&workspace).unwrap()).unwrap();
+        assert_eq!(saved.instance(plan).unwrap().opened_by, Some(ids[0]));
     }
 
     #[test]

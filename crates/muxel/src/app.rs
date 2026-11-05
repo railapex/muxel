@@ -76,6 +76,8 @@ mod conpty_test_support;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
+#[cfg(all(test, windows))]
+mod opener_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
@@ -15863,6 +15865,7 @@ impl MuxelApp {
             if let Some(instance) = self.workspace.instance_mut(iid) {
                 instance.browser_url = Some(url.clone());
             }
+            self.record_reopen(iid, origin);
             if let Some(view) = self.browsers.get(&iid).cloned() {
                 view.update(cx, |v, cx| {
                     if v.url() == url {
@@ -16192,6 +16195,9 @@ impl MuxelApp {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
             }
+            if self.record_reopen(iid, origin) {
+                self.persist();
+            }
             self.focus_instance(iid, window, cx);
             return Some(iid);
         }
@@ -16309,6 +16315,9 @@ impl MuxelApp {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
             }
+            if self.record_reopen(iid, origin) {
+                self.persist();
+            }
             self.focus_instance(iid, window, cx);
             return;
         }
@@ -16332,10 +16341,14 @@ impl MuxelApp {
     fn place_resource_instance(
         &mut self,
         pid: Uuid,
-        instance: Instance,
+        mut instance: Instance,
         origin: ResourceOrigin,
         placement: Option<PlacementMode>,
     ) -> bool {
+        instance.record_opener(
+            self.opener_session(origin),
+            chrono::Utc::now().timestamp_millis(),
+        );
         let iid = instance.id;
         let kind = instance.kind;
         let kinds: HashMap<Uuid, InstanceKind> = self
@@ -16370,6 +16383,28 @@ impl MuxelApp {
             self.workspace.add_instance(instance);
         }
         placed
+    }
+
+    /// The session behind a resource open from `origin`, for
+    /// [`Instance::opened_by`]. Chrome opens have none.
+    fn opener_session(&self, origin: ResourceOrigin) -> Option<Uuid> {
+        origin
+            .opener()
+            .and_then(|pane| self.workspace.opener_session(pane))
+    }
+
+    /// `origin` opened resource `iid` again while it was open. The last
+    /// session to open it owns it in the sidebar. Returns whether that changed
+    /// anything to save.
+    fn record_reopen(&mut self, iid: Uuid, origin: ResourceOrigin) -> bool {
+        let Some(session) = self.opener_session(origin) else {
+            return false;
+        };
+        let Some(instance) = self.workspace.instance_mut(iid) else {
+            return false;
+        };
+        instance.record_opener(Some(session), chrono::Utc::now().timestamp_millis());
+        true
     }
 
     fn open_editor_resources(&self) -> Vec<(Uuid, Entity<EditorView>)> {
@@ -26886,7 +26921,7 @@ impl MuxelApp {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
                 for entry in entries {
-                    let iid = match entry {
+                    let (iid, nested) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
@@ -26909,7 +26944,9 @@ impl MuxelApp {
                             );
                             continue;
                         }
-                        SidebarEntry::Pane(iid) => iid,
+                        SidebarEntry::Pane(iid) => (iid, false),
+                        // Under the session that opened it, one step further in.
+                        SidebarEntry::Nested(iid) => (iid, true),
                     };
                     let inst = instances.get(&iid).copied();
                     let popped_out = self.popouts.contains_key(&iid);
@@ -26979,7 +27016,7 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
-                        .ml_4()
+                        .ml(rems(if nested { 2.0 } else { 1.0 }))
                         .mr_1()
                         .px_2()
                         .py_1()

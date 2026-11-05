@@ -618,6 +618,17 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// For a file, diff or page: the session that last opened it (a link
+    /// clicked in it, its diff button, or a file or page that session opened).
+    /// Recent work nests the resource under that session. `None` when only
+    /// muxel's own chrome opened it. Kept on this machine: the shared layout
+    /// leaves it out, as it does a pane's activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<Uuid>,
+    /// When `opened_by` last opened it, in Unix milliseconds. A session's
+    /// nested resources go newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -738,6 +749,20 @@ impl Instance {
         if self.control_prompt {
             self.system_prompt = None;
         }
+        // The user made the copy; no session opened it.
+        self.opened_by = None;
+        self.opened_at = None;
+    }
+
+    /// `session` opened this resource at `now`, either for the first time or
+    /// again while it was already open: the last opener wins. An open no
+    /// session asked for (`None`: the file browser, palette or sidebar) leaves
+    /// an earlier opener in place.
+    pub fn record_opener(&mut self, session: Option<Uuid>, now: i64) {
+        if let Some(session) = session {
+            self.opened_by = Some(session);
+            self.opened_at = Some(now);
+        }
     }
 
     /// A plain shell instance.
@@ -795,6 +820,8 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
         }
     }
 
@@ -864,6 +891,8 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
         }
     }
 }
@@ -1394,6 +1423,23 @@ impl Workspace {
         self.worktrees.retain(|w| w.id != id);
     }
 
+    /// The session behind an open that pane `pane` asked for, recorded as the
+    /// resource's [`Instance::opened_by`]: the pane itself when it is a session
+    /// (a terminal), or the live session that opened it when it is a file,
+    /// diff or page. A page opened from a file Claude opened is Claude's too.
+    pub fn opener_session(&self, pane: Uuid) -> Option<Uuid> {
+        let is_session = |id: Uuid| {
+            self.instance(id)
+                .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+        };
+        if is_session(pane) {
+            return Some(pane);
+        }
+        self.instance(pane)?
+            .opened_by
+            .filter(|&session| is_session(session))
+    }
+
     /// Instance ids currently referencing `worktree_id`.
     pub fn instances_using(&self, worktree_id: Uuid) -> Vec<Uuid> {
         self.instances
@@ -1459,7 +1505,8 @@ pub struct RemoteLayout {
     pub accomplishments_enabled: Option<bool>,
 }
 
-// Local Workspace persistence keeps receipts; only the shared document omits them.
+// Local Workspace persistence keeps receipts and openers; only the shared
+// document omits them.
 fn serialize_shared_instances<S: serde::Serializer>(
     instances: &[Instance],
     serializer: S,
@@ -1468,9 +1515,14 @@ fn serialize_shared_instances<S: serde::Serializer>(
 
     let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
     for instance in instances {
-        if instance.claude_hook_record.is_some() {
+        if instance.claude_hook_record.is_some()
+            || instance.opened_by.is_some()
+            || instance.opened_at.is_some()
+        {
             let mut shared = instance.clone();
             shared.claude_hook_record = None;
+            shared.opened_by = None;
+            shared.opened_at = None;
             sequence.serialize_element(&shared)?;
         } else {
             sequence.serialize_element(instance)?;
@@ -1550,7 +1602,8 @@ impl RemoteLayout {
     /// Per-machine state is left out, so it never reads as a layout change: the
     /// owning project's id (every machine has its own id for the same project) and
     /// what this machine observes of a pane — its program-supplied title, terminal
-    /// grid, agent activity and consumed hook receipts. Counting those pushed the
+    /// grid, agent activity, consumed hook receipts and which session opened a
+    /// file or page. Counting those pushed the
     /// layout on every resize and agent turn, and made two peers look out of sync
     /// when nothing differed.
     pub fn content_key(&self) -> String {
@@ -1593,6 +1646,8 @@ impl RemoteLayout {
                 instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                instance.opened_by = None;
+                instance.opened_at = None;
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
@@ -1784,8 +1839,8 @@ pub fn observed_close_revision(current: Option<u64>) -> u64 {
 /// A peer layout's instances as this machine should hold them: every one the peer
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
-/// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content. A validated rollout path survives a peer
+/// program-supplied title, terminal grid, agent activity and the session that
+/// opened it), which is per-machine and never part of the shared content. A validated rollout path survives a peer
 /// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
@@ -1798,11 +1853,17 @@ pub fn merge_peer_instances(
             // A peer's consumed receipt says nothing about this machine, even
             // when this is the first time it has seen the pane.
             instance.claude_hook_record = None;
+            // Which session opened a file is this machine's to know: the
+            // shared document never carries it.
+            instance.opened_by = None;
+            instance.opened_at = None;
             if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
                 instance.auto_name = mine.auto_name.clone();
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                instance.opened_by = mine.opened_by;
+                instance.opened_at = mine.opened_at;
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()

@@ -1346,6 +1346,12 @@ feature is added or changed, update the matching entry here in the same change**
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
   recent rows can still be dragged onto panes.
+- **Files nest under their session** — in Recent work, a file, diff or page a
+  session opened (a terminal link, its diff button, or a link in a file it
+  opened) shows indented under that session's row and moves with it, newest
+  first. Opening it again from another session moves it there; the file
+  browser and palette leave it where it is. Once that session closes, or if it's
+  in another project, the resource is an ordinary row again.
 - **Unread sessions** — in Recent work, a dot and bold name mark a completion or
   blocked event since the session was last attended. Only attendance clears the
   mark, even if another turn starts; Done persists. Project rows show the unread

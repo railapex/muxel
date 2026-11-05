@@ -29,6 +29,24 @@ session above newer work. Worktree color dots remain; detached worktrees retain
 their action subheaders. Row-to-row swaps are available in Layout; dragging a
 session onto a pane remains available in either order.
 
+In Recent work, a file, diff or web page that a session opened (a link
+clicked in its terminal, its diff button) shows directly under that session's
+row, indented, and moves with it. A session's resources go newest open first.
+Opening a resource that is already open counts as opening it again: the last
+session to open it owns it, so reopening a file from a second session moves it
+there. An open no session asked for (the file browser, the palette, the
+sidebar) leaves the owner as it was. A page opened from a file, such as an HTML
+preview or a link in the file, belongs to the file's session, so nesting is one
+level deep. When the owning session has closed, is counting down to close, or
+is in another project, the resource is an ordinary row. Layout order ignores
+owners, and tab strips don't change.
+
+The owner is `opened_by` (the session's instance id) and `opened_at` (Unix
+milliseconds) on the resource's instance in this machine's `workspace.json`.
+`sidebar::nests_under` owns the nesting decision. The shared layout document
+leaves both fields out and they never count as a layout change, so other
+machines and the iOS app don't see them, the same as a pane's activity.
+
 Recent work includes live popped-out sessions even though they are outside the
 pane layout. Their rows carry an external-window icon; clicking raises that
 window, and attending it clears unread through the normal window attendance
