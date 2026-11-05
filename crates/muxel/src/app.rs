@@ -6684,9 +6684,13 @@ enum ConfirmAction {
     DeleteRemote(usize),
     DeleteIdentity(usize),
     CloseBatch(Vec<Uuid>),
+    /// `rest` is the close request being planned. `rides_with` names the
+    /// session in it that `iid` would close with (Recent work), when `iid`
+    /// wasn't asked for itself.
     SaveEditorBeforeClose {
         iid: Uuid,
         rest: Vec<Uuid>,
+        rides_with: Option<Uuid>,
     },
     /// Switch the project's git branch (warned — it touches the working tree).
     SwitchBranch {
@@ -16185,12 +16189,12 @@ impl MuxelApp {
         } else {
             path.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         };
-        // Reuse an already-open editor for this exact path.
+        // Reuse an already-open editor for this exact path. One held to close
+        // with its session isn't open any more; this opens a fresh one.
         if let Some(p) = &path
-            && let Some(iid) = self
-                .editors
-                .iter()
-                .find_map(|(iid, ed)| (ed.read(cx).path() == Some(p.as_path())).then_some(*iid))
+            && let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
+                (ed.read(cx).path() == Some(p.as_path()) && !self.is_closing(*iid)).then_some(*iid)
+            })
         {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
@@ -16310,7 +16314,7 @@ impl MuxelApp {
         // Reuse an already-open diff pane for the same directory: refresh + focus.
         if let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
             let ed = ed.read(cx);
-            (ed.diff_dir() == Some(dir.as_path())).then_some(*iid)
+            (ed.diff_dir() == Some(dir.as_path()) && !self.is_closing(*iid)).then_some(*iid)
         }) {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
@@ -17540,6 +17544,13 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        // Files held to ride with this session finish with it.
+        let followers: Vec<Uuid> = self
+            .closing
+            .iter()
+            .filter(|(_, held)| held.follows == Some(iid))
+            .map(|(&follower, _)| follower)
+            .collect();
         self.forget_close(iid);
         self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
@@ -17614,6 +17625,9 @@ impl MuxelApp {
         if self.active_instance == Some(iid) {
             self.active_instance =
                 survivor.or_else(|| self.workspace.active().and_then(|p| p.first_instance()));
+        }
+        for follower in followers {
+            self.close_instance_inner(follower, reason, cx);
         }
         self.persist();
         cx.notify();
@@ -20685,7 +20699,26 @@ impl MuxelApp {
     }
 
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
-        self.confirm = None;
+        // Cancel on a file that would have closed with its session keeps that
+        // file open, as an ordinary row from now on, and the session still
+        // closes. Any other Cancel drops the whole request.
+        if let Some(PendingConfirm {
+            action:
+                ConfirmAction::SaveEditorBeforeClose {
+                    iid,
+                    rest,
+                    rides_with: Some(_),
+                },
+            ..
+        }) = self.confirm.take()
+        {
+            if let Some(instance) = self.workspace.instance_mut(iid) {
+                instance.opened_by = None;
+                instance.opened_at = None;
+            }
+            self.persist();
+            self.request_recoverable_close(rest, cx);
+        }
         cx.notify();
     }
 
@@ -20704,7 +20737,7 @@ impl MuxelApp {
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
             ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
             ConfirmAction::CloseBatch(ids) => self.accept_close_request(ids, false, cx),
-            ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
+            ConfirmAction::SaveEditorBeforeClose { iid, rest, .. } => {
                 self.save_editor_before_close(iid, rest, cx)
             }
             ConfirmAction::SwitchBranch { pid, branch } => {

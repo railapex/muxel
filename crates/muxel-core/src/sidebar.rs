@@ -89,6 +89,28 @@ pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) 
     })
 }
 
+/// The files, diffs and pages that close with `sessions` when the user closes
+/// them in Recent work: each one whose last opener is one of them. A resource
+/// another session opened again since belongs to that session and stays.
+/// Returns `(resource, session)` pairs in workspace order.
+pub fn closes_with<'a>(
+    sort: SidebarSort,
+    sessions: &[Uuid],
+    instances: impl IntoIterator<Item = &'a Instance>,
+) -> Vec<(Uuid, Uuid)> {
+    if sort != SidebarSort::RecentWork {
+        return Vec::new();
+    }
+    instances
+        .into_iter()
+        .filter(|instance| instance.kind != InstanceKind::Terminal)
+        .filter_map(|instance| {
+            let session = instance.opened_by.filter(|s| sessions.contains(s))?;
+            Some((instance.id, session))
+        })
+        .collect()
+}
+
 /// A presentation filter only; callers retain the events for desktop/tray use.
 pub fn notification_in_feed(sort: SidebarSort, agent_event: bool) -> bool {
     sort == SidebarSort::Layout || !agent_event
@@ -346,8 +368,13 @@ mod tests {
             .unwrap()
             .record_opener(None, 40);
         assert_eq!(recent(&project, &workspace)[1], Nested(plan));
+        // Closing A takes only what A opened last; B took the plan.
+        assert_eq!(
+            closes_with(SidebarSort::RecentWork, &[a], &workspace.instances),
+            vec![(notes, a)]
+        );
 
-        // Layout order ignores openers.
+        // Layout order ignores openers, and closes nothing with a session.
         assert_eq!(
             sidebar_order(
                 &project.instances(),
@@ -357,6 +384,7 @@ mod tests {
             ),
             [a, b, plan, notes, page, loose].map(Pane).to_vec()
         );
+        assert!(closes_with(SidebarSort::Layout, &[a, b], &workspace.instances).is_empty());
     }
 
     #[test]

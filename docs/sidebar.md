@@ -47,6 +47,18 @@ milliseconds) on the resource's instance in this machine's `workspace.json`.
 leaves both fields out and they never count as a layout change, so other
 machines and the iOS app don't see them, the same as a pane's activity.
 
+Closing a session yourself in Recent work (its tab, its pane, Close
+terminals, or a worktree's disposal choice) closes the resources it owns at
+that moment, chosen by `sidebar::closes_with`. They join the session's
+recoverable close as followers: they have no close evidence of their own,
+finish when the session's close does, and return with it on Undo or Keep. A
+session that closes at once, such as one whose process has exited, takes them
+at once too. An unsaved editor gets the usual Save / Don't Save / Cancel
+question before anything closes; Cancel keeps that editor, clears its owner so
+it shows as an ordinary row, and lets the session close. Popped-out resources
+stay open, since their views belong to their own windows. An agent exiting on
+its own, Layout order, and closes from other machines leave resources alone.
+
 Recent work includes live popped-out sessions even though they are outside the
 pane layout. Their rows carry an external-window icon; clicking raises that
 window, and attending it clears unread through the normal window attendance

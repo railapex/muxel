@@ -2,12 +2,13 @@
 
 use super::popout_lifecycle_tests::with_app;
 use super::{
-    ConfirmAction, EditorSnapshot, Instance, MuxelApp, NotifKind, Project, SaveTarget, Workspace,
-    WorkspaceMeta,
+    ConfirmAction, EditorSnapshot, EditorView, Instance, MuxelApp, NotifKind, Project, SaveTarget,
+    Workspace, WorkspaceMeta,
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::{PaneNode, Worktree, add_tab};
+use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
+use muxel_core::{PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
 };
@@ -1957,6 +1958,197 @@ fn undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
                 ));
                 assert!(!second_child.exited());
                 app.cancel_confirm(cx);
+            })
+            .unwrap();
+    });
+}
+
+/// An editor split beside `pid`'s first pane, opened by `session` (or by none).
+fn opened_file(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    session: Option<Uuid>,
+    dirty: bool,
+) -> (Uuid, Entity<EditorView>) {
+    window
+        .update(cx, |app, window, cx| {
+            let mut instance = Instance::editor(pid, None);
+            instance.record_opener(session, chrono::Utc::now().timestamp_millis());
+            let iid = instance.id;
+            let snapshot = EditorSnapshot {
+                text: "draft".into(),
+                path: None,
+                language: "text".into(),
+                cursor: None,
+                dirty,
+                external_change: None,
+                disk_stamp: None,
+                show_rendered: false,
+                diff_dir: None,
+            };
+            let editor = snapshot.build(app.editor_config(), window, cx);
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            let anchor = project.first_instance().unwrap();
+            assert!(split(
+                &mut project.layout,
+                anchor,
+                SplitDirection::Horizontal,
+                iid
+            ));
+            app.editors.insert(iid, editor.clone());
+            (iid, editor)
+        })
+        .unwrap()
+}
+
+#[test]
+fn closing_a_session_in_recent_work_takes_its_files_into_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, child) = terminal(cx, window, pid);
+        let (other, _, _other_child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        let (shared, _) = opened_file(cx, window, pid, Some(session), false);
+        let (loose, _) = opened_file(cx, window, pid, None, false);
+        window
+            .update(cx, |app, window, cx| {
+                // The other session opened `shared` again: the last opener wins.
+                app.workspace
+                    .instance_mut(shared)
+                    .unwrap()
+                    .record_opener(Some(other), chrono::Utc::now().timestamp_millis());
+                // Busy closes count down without asking, so no prompt intervenes.
+                app.settings.confirm_close_terminal = false;
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                // Layout order: the session closes alone.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                app.request_close_instance(session, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan));
+                app.undo_latest_close(window, cx);
+
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert_eq!(app.close_groups.len(), 1);
+                assert_eq!(app.close_groups[0].members, vec![session, plan]);
+                let shown: Vec<_> = before
+                    .iter()
+                    .copied()
+                    .filter(|id| ![session, plan].contains(id))
+                    .collect();
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), shown);
+                assert!(!app.is_closing(shared) && !app.is_closing(loose));
+                assert!(
+                    app.editors.contains_key(&plan),
+                    "a held file keeps its buffer"
+                );
+                let (label, button) = app.close_chip_text(&app.close_groups[0]);
+                let name = app.workspace.instance(session).unwrap().display_name();
+                assert_eq!(
+                    label.as_ref(),
+                    super::tf("Closed {name}", &[("name", name)]),
+                    "the chip names the session, not its files"
+                );
+                assert!(button.chars().any(|c| c.is_ascii_digit()), "{button}");
+
+                // One Undo brings both back where they were.
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(!app.is_closing(session) && !app.is_closing(plan));
+                assert!(app.close_groups.is_empty());
+                assert!(!child.exited());
+
+                // Left to finish, the file goes when its session does.
+                app.request_close_instance(session, cx);
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.workspace.instance(session).is_none());
+                assert!(app.workspace.instance(plan).is_none());
+                assert!(!app.editors.contains_key(&plan));
+                assert!(app.workspace.instance(shared).is_some());
+                assert!(app.workspace.instance(loose).is_some());
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn a_file_riding_with_a_session_waits_for_its_decision() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                // A quiet hold whose session can't show it is still quiet at
+                // the deadline becomes Close / Keep. Its file must not go first.
+                app.hold_closes_with(vec![(session, false)], vec![(plan, session)], None, cx)
+                    .unwrap();
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.close_groups[0].needs_decision);
+                assert!(app.is_closing(plan));
+                assert!(app.workspace.instance(plan).is_some());
+                app.undo_latest_close(window, cx);
+                assert!(
+                    app.workspace
+                        .project(pid)
+                        .unwrap()
+                        .instances()
+                        .contains(&plan)
+                );
+                assert!(!app.is_closing(plan));
+                assert!(
+                    app.terminal_view(plan).is_none(),
+                    "Keep never launches a file"
+                );
+                assert!(!child.exited());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (draft, editor) = opened_file(cx, window, pid, Some(session), true);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert!(matches!(
+                    app.confirm.as_ref().map(|pending| &pending.action),
+                    Some(ConfirmAction::SaveEditorBeforeClose {
+                        iid,
+                        rides_with: Some(rider),
+                        ..
+                    }) if *iid == draft && *rider == session
+                ));
+                assert!(!app.is_closing(session), "the save question comes first");
+                app.cancel_confirm(cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(draft));
+                assert!(editor.read(cx).is_dirty());
+                assert_eq!(editor.read(cx).text(cx), "draft");
+                // Kept, it no longer rides with the session, even after Undo.
+                app.undo_latest_close(window, cx);
+                let project = app.workspace.project(pid).unwrap();
+                let rows = sidebar_order(
+                    &project.instances(),
+                    &instances_by_id(&app.workspace),
+                    chrono::Utc::now().timestamp_millis(),
+                    SidebarSort::RecentWork,
+                );
+                assert!(rows.contains(&SidebarEntry::Pane(draft)), "{rows:?}");
+                app.request_close_instance(session, cx);
+                assert!(app.confirm.is_none());
+                assert!(!app.is_closing(draft));
             })
             .unwrap();
     });

@@ -17,10 +17,30 @@ pub(super) fn close_alternative_label(action: &ConfirmAction) -> Option<SharedSt
 }
 
 impl MuxelApp {
+    /// The panes a group is named and counted by: its sessions. Files riding
+    /// with a session close and come back with it, unnamed.
+    fn close_group_sessions(&self, group: &CloseGroup) -> Vec<Uuid> {
+        let sessions: Vec<_> = group
+            .members
+            .iter()
+            .copied()
+            .filter(|iid| {
+                self.closing
+                    .get(iid)
+                    .is_none_or(|held| held.follows.is_none())
+            })
+            .collect();
+        if sessions.is_empty() {
+            group.members.clone()
+        } else {
+            sessions
+        }
+    }
+
     fn close_group_name(&self, group: &CloseGroup) -> SharedString {
-        if group.members.len() == 1 {
-            group
-                .members
+        let sessions = self.close_group_sessions(group);
+        if sessions.len() == 1 {
+            sessions
                 .first()
                 .and_then(|&iid| self.workspace.instance(iid))
                 .map(|instance| SharedString::from(instance.display_name().to_string()))
@@ -29,8 +49,8 @@ impl MuxelApp {
             tn(
                 "{n} terminal",
                 "{n} terminals",
-                group.members.len(),
-                &[("n", &group.members.len().to_string())],
+                sessions.len(),
+                &[("n", &sessions.len().to_string())],
             )
             .into()
         }
@@ -39,7 +59,7 @@ impl MuxelApp {
     fn close_decision_label(&self, group: &CloseGroup) -> SharedString {
         if group.layout_unread {
             t("Couldn't read the shared layout")
-        } else if group.members.len() == 1 {
+        } else if self.close_group_sessions(group).len() == 1 {
             tf(
                 "Review before closing {name}",
                 &[("name", self.close_group_name(group).as_ref())],
@@ -64,7 +84,7 @@ impl MuxelApp {
         let panes: usize = self
             .close_groups
             .iter()
-            .map(|group| group.members.len())
+            .map(|group| self.close_group_sessions(group).len())
             .sum();
         let multiple = panes > 1;
         let decision = !several && latest.needs_decision && !latest.undoing;
@@ -151,7 +171,7 @@ impl MuxelApp {
         let multiple = self
             .close_groups
             .iter()
-            .map(|group| group.members.len())
+            .map(|group| self.close_group_sessions(group).len())
             .sum::<usize>()
             > 1;
         let (label, button) = self.close_chip_text(latest);
@@ -387,7 +407,7 @@ impl MuxelApp {
                 self.confirm = None;
                 self.accept_close_request(ids, true, cx);
             }
-            ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
+            ConfirmAction::SaveEditorBeforeClose { iid, rest, .. } => {
                 self.confirm = None;
                 self.close_instance_inner(iid, "close (without saving)", cx);
                 self.request_recoverable_close(
