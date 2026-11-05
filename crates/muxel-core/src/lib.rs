@@ -2183,6 +2183,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -4244,6 +4245,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4328,6 +4330,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4342,6 +4345,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4357,6 +4361,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4510,6 +4515,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4562,6 +4568,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4609,6 +4616,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4651,6 +4659,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -5048,11 +5057,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -5210,6 +5221,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -5258,6 +5270,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
