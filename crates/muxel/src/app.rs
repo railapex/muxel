@@ -17531,14 +17531,19 @@ impl MuxelApp {
     ) {
         self.dormant_instances.remove(&iid);
         if let muxel_core::WorktreeCleanup::Registered(wid) = &worktree_cleanup {
-            let uncaptured = self
+            let ends_answer = self
                 .deferred_worktree_dispose
                 .get(&project_id)
                 .and_then(|choices| choices.get(wid))
-                .is_some_and(|answer| !answer.choice.close_after.contains(&iid));
-            if uncaptured {
-                // This member may be gone before the original hold expires.
-                // Its files were never covered by the earlier answer.
+                .is_some_and(|answer| {
+                    !answer.accepted || !answer.choice.close_after.contains(&iid)
+                });
+            if ends_answer {
+                // An uncaptured member's files were never covered by the answer.
+                // A captured one leaving before its close was accepted (exiting,
+                // say) ends that close. A sibling still open would otherwise let
+                // a later close run the answer over what this pane wrote since.
+                // An accepted close marks its answer before closing anything.
                 self.take_deferred_worktree_dispose(project_id, *wid);
             }
         }
@@ -17716,6 +17721,9 @@ impl MuxelApp {
         closed.worktree = worktree;
         let closed = closed.clone();
         if !self.try_persist() {
+            // The worktree now looks kept, as after a failed kill. A retry that
+            // later finds the session gone must not run the answer over it.
+            self.drop_answers_behind_kill(project_id, iid);
             self.keep_closed_worktree(iid, &cleanup);
             muxel_store::append_event_log(
                 "close: local tmux kill deferred; couldn't save its ledger",
@@ -17731,32 +17739,7 @@ impl MuxelApp {
     }
 
     fn cancel_local_close(&mut self, pid: Uuid, iid: Uuid) {
-        // A kept/replaced session also cancels file actions that were waiting
-        // for it. They must never run as successful teardown.
-        let closed_worktree = self.workspace.project(pid).and_then(|project| {
-            project
-                .closed_sessions
-                .iter()
-                .find(|closed| closed.instance == iid)
-                .map(|closed| closed.worktree.clone())
-        });
-        if let Some(answers) = self.deferred_worktree_dispose.get_mut(&pid) {
-            let cancelled: HashSet<Uuid> = answers
-                .iter()
-                .filter(|(_, answer)| {
-                    closed_worktree
-                        .as_ref()
-                        .is_none_or(|worktree| worktree.may_be(&answer.choice.path))
-                })
-                .map(|(&wid, _)| wid)
-                .collect();
-            answers.retain(|wid, _| !cancelled.contains(wid));
-            if answers.is_empty() {
-                self.deferred_worktree_dispose.remove(&pid);
-            }
-            self.workspace
-                .detach_unused_worktrees(|worktree| cancelled.contains(&worktree.id));
-        }
+        self.drop_answers_behind_kill(pid, iid);
         if let Some(project) = self.workspace.project_mut(pid) {
             project.forget_closed_session(iid);
         }
@@ -17764,6 +17747,37 @@ impl MuxelApp {
             reaped.retain(|closed| closed.instance != iid);
         }
         self.persist();
+    }
+
+    /// A kept, replaced or failed kill also cancels the file actions that may
+    /// have been waiting for it. They must never run as successful teardown, even
+    /// if a later retry confirms the kill. Returns whether a worktree was detached.
+    fn drop_answers_behind_kill(&mut self, pid: Uuid, iid: Uuid) -> bool {
+        let closed_worktree = self.workspace.project(pid).and_then(|project| {
+            project
+                .closed_sessions
+                .iter()
+                .find(|closed| closed.instance == iid)
+                .map(|closed| closed.worktree.clone())
+        });
+        let Some(answers) = self.deferred_worktree_dispose.get_mut(&pid) else {
+            return false;
+        };
+        let cancelled: HashSet<Uuid> = answers
+            .iter()
+            .filter(|(_, answer)| {
+                closed_worktree
+                    .as_ref()
+                    .is_none_or(|worktree| worktree.may_be(&answer.choice.path))
+            })
+            .map(|(&wid, _)| wid)
+            .collect();
+        answers.retain(|wid, _| !cancelled.contains(wid));
+        if answers.is_empty() {
+            self.deferred_worktree_dispose.remove(&pid);
+        }
+        self.workspace
+            .detach_unused_worktrees(|worktree| cancelled.contains(&worktree.id))
     }
 
     fn retry_local_closes(&mut self, pid: Uuid, cx: &mut Context<Self>) {
@@ -17784,10 +17798,31 @@ impl MuxelApp {
                 self.cancel_local_close(pid, closed.instance);
                 continue;
             }
+            // Settle the worktree its pane ran in, as the first attempt would
+            // have. A sibling's kill that confirmed meanwhile left that to this one.
+            // A legacy pane still on that path counts only by path, which the
+            // registered cleanup can't see, so that worktree is left alone.
+            let cleanup = match &closed.worktree {
+                muxel_core::tmux::ClosedWorktree::In(path)
+                    if !self.workspace.instances.iter().any(|instance| {
+                        instance.worktree_id.is_none()
+                            && instance.worktree_path.as_ref() == Some(path)
+                    }) =>
+                {
+                    self.workspace
+                        .worktrees
+                        .iter()
+                        .find(|w| w.project_id == pid && w.path == *path)
+                        .map_or(muxel_core::WorktreeCleanup::None, |w| {
+                            muxel_core::WorktreeCleanup::Registered(w.id)
+                        })
+                }
+                _ => muxel_core::WorktreeCleanup::None,
+            };
             self.start_local_close(
                 pid,
                 closed,
-                muxel_core::WorktreeCleanup::None,
+                cleanup,
                 false,
                 Instant::now() + Duration::from_secs(10),
                 cx,
@@ -17917,6 +17952,11 @@ impl MuxelApp {
                 muxel_store::append_event_log(&format!(
                     "close: local tmux teardown for [{iid}] failed: {error:#}; activation retries only a stamped session and otherwise keeps it"
                 ));
+                // The ledger entry stays for that retry. The worktree now looks
+                // kept, so the answer must not run when the retry confirms.
+                if self.drop_answers_behind_kill(project_id, iid) {
+                    self.persist();
+                }
                 self.keep_closed_worktree(iid, &cleanup);
             }
         }
@@ -18489,10 +18529,15 @@ impl MuxelApp {
     /// kill. Busy confirmation and the Undo hold still own the close.
     fn choose_worktree_dispose(
         &mut self,
-        d: WorktreeDispose,
+        mut d: WorktreeDispose,
         action: WorktreeDisposeAction,
         cx: &mut Context<Self>,
     ) {
+        // A pane gone before the answer was given isn't waiting on it. Keeping
+        // only those still here lets acceptance treat any that go missing later
+        // as having left first.
+        d.close_after
+            .retain(|iid| self.workspace.instance(*iid).is_some());
         let live = d
             .close_after
             .iter()
@@ -20427,35 +20472,29 @@ impl MuxelApp {
     /// Remove worktree `wid` entirely: close its panes, delete the worktree + its
     /// branch, drop the registry entry.
     fn discard_worktree(&mut self, wid: Uuid, cx: &mut Context<Self>) {
-        let held: Vec<_> = self
-            .workspace
-            .instances_using(wid)
-            .into_iter()
-            .filter(|iid| self.is_closing(*iid))
-            .collect();
+        // Close every pane, held or not, while the registry entry still exists,
+        // so each kill's ledger entry records this worktree; one saved after it
+        // went would count as any worktree. Preserving skips the dispose prompt.
         let preserving = self.preserve_close_worktrees;
         self.preserve_close_worktrees = true;
-        for iid in held {
+        for iid in self.workspace.instances_using(wid) {
             self.close_instance_inner(iid, "worktree discard", cx);
         }
         self.preserve_close_worktrees = preserving;
         let Some(w) = self.workspace.worktree(wid) else {
             return;
         };
+        let pid = w.project_id;
         let path = w.path.clone();
         let branch = w.branch.clone();
         let root = self
             .workspace
-            .project(w.project_id)
+            .project(pid)
             .map(|p| p.root_path.clone())
             .unwrap_or_default();
-        let instances = self.workspace.instances_using(wid);
-        // Drop the registry entry first so each close skips the dispose prompt
-        // (dispose_worktree_if_orphaned no-ops when the worktree is gone).
+        // An answer waiting on these panes has nothing left to act on.
+        self.take_deferred_worktree_dispose(pid, wid);
         self.workspace.remove_worktree_meta(wid);
-        for iid in instances {
-            self.close_instance(iid, cx);
-        }
         integrations::remove_worktree(&root, &path);
         integrations::delete_branch(&root, &branch);
         self.worktree_changes.remove(&wid);
