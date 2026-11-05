@@ -158,7 +158,7 @@ pub fn unread_count(pane_ids: &[Uuid], instances: &InstancesById) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentActivityState, LeafData, PaneNode, Project};
+    use crate::{AgentActivityState, PaneNode, Project};
 
     const DAY: i64 = 86_400_000;
     const NOW: i64 = 400 * DAY;
@@ -183,11 +183,11 @@ mod tests {
             ids.push(instance.id);
             workspace.add_instance(instance);
         }
-        project.layout = Some(PaneNode::Leaf(LeafData {
-            pane_id: Uuid::new_v4(),
-            tabs: ids.clone(),
-            active: 0,
-        }));
+        let mut layout = PaneNode::leaf(ids.first().copied().unwrap_or_else(Uuid::new_v4));
+        if let PaneNode::Leaf(leaf) = &mut layout {
+            leaf.tabs = ids.clone();
+        }
+        project.layout = Some(layout);
         workspace.projects.push(project.clone());
         (project, workspace, ids)
     }
