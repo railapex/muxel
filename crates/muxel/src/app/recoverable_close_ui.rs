@@ -53,7 +53,9 @@ impl MuxelApp {
     /// Drop every close request still being checked. Late replies find no
     /// token and do nothing; terminals already counting down keep their Undo.
     pub(super) fn cancel_close_checks(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self.close_requests.keys().copied().collect();
         self.close_requests.clear();
+        self.drop_unaccepted_worktree_answers(&ids);
         cx.notify();
     }
 
@@ -390,7 +392,7 @@ impl MuxelApp {
             ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
                 self.confirm = None;
                 self.close_instance_inner(iid, "close (without saving)", cx);
-                self.request_recoverable_close(
+                self.continue_close_request(
                     rest.into_iter().filter(|&other| other != iid).collect(),
                     cx,
                 );
@@ -406,13 +408,10 @@ fn main_app(cx: &App) -> Option<Entity<MuxelApp>> {
 }
 
 impl PopoutView {
-    pub(super) fn central_close_confirm(&self, cx: &App) -> Option<PendingConfirm> {
-        let app = main_app(cx)?;
-        app.read(cx)
-            .confirm
-            .as_ref()
-            .filter(|pending| pending.action.pane_instance() == Some(self.iid))
-            .cloned()
+    pub(super) fn central_close_confirm(&self, _cx: &App) -> Option<PendingConfirm> {
+        // Initial window drawing can run inside the app update that opens it.
+        // Read the snapshot delivered by the observer, never the borrowed app.
+        self.close_confirm.clone()
     }
 
     fn cancel_central_close_confirm(&self, cx: &mut Context<Self>) {
