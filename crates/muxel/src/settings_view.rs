@@ -90,7 +90,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("JumpToProject7", "ctrl-7", None),
     ("JumpToProject8", "ctrl-8", None),
     ("JumpToProject9", "ctrl-9", None),
-    // New pane running the Nth agent preset (in the preset-list order).
+    // New tab in the focused pane running the Nth agent preset (in the
+    // preset-list order).
     ("NewAgent1", "ctrl-alt-1", None),
     ("NewAgent2", "ctrl-alt-2", None),
     ("NewAgent3", "ctrl-alt-3", None),
@@ -114,6 +115,8 @@ pub enum SettingsSection {
     Appearance,
     Editor,
     Behavior,
+    /// Alert sounds for agents that finish or get blocked.
+    Sounds,
     Speech,
     ReadAloud,
     Agents,

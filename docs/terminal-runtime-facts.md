@@ -140,6 +140,23 @@ the reducer resets its latches and reads the new binding's title edges from its
 start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
 from the current title without a completion edge.
 
+On Windows, every Grok discovery poll still reads the current registry and
+records that read's actual start and finish. Only the process ancestry snapshot
+is reused. A changed registry row (including a different identity or timestamp
+on the same PID), pane root PID, or pane launch refreshes it immediately. Stable
+inputs reuse one snapshot for at most 30 seconds; an empty registry or root set
+skips process enumeration, and a failed empty snapshot is retried next poll.
+The worker shares the snapshot by reference rather than copying the machine's
+process population for each poll. Root observations are shared across staggered
+pane batches; a pane missing from one batch is not treated as a process change.
+Inactive observations are pruned on refresh. Poll cadence, newest-registration
+selection, ownership checks and switch-interval calculation stay the same.
+
+An unchanged stale registry can retain old ancestry until that freshness limit;
+registry changes always invalidate it before selecting a new conversation.
+This bounds steady-state enumeration cost without adding a backoff delay to
+in-process conversation switches.
+
 - A pinned `--session-id` or `--resume` launch begins at binding revision one,
   as does a provider with no binding source. Its first matching UUID title
   confirms that binding; a different UUID begins a replacement binding.
@@ -158,6 +175,7 @@ from the current title without a completion edge.
   to the return of this read. Unrelated panes and unresolved polls cannot advance
   that lower bound. A two-second
   slack allows for delayed reports and reads; it is not a bound on either delay.
+
   Around the interval lies an ambiguity window, from its start less the slack
   to whichever is later: when muxel learned of the switch, or the interval's
   end plus the slack.
@@ -323,6 +341,34 @@ Its input timestamp is captured before publishing bytes and committed only
 after admission succeeds, so a resume hook caused by that Enter cannot make
 the selector count as a submission to the replacement conversation.
 
+For ctl delivery through tmux, input is refused while the target pane is in
+copy mode (`tmux_pane_in_mode`). Muxel preserves the user's scroll position;
+the user must leave copy mode before a caller retries. Enter is checked too,
+so entering copy mode after a paste yields an error with `pasted: true` rather
+than a successful submission receipt. A reported server version of 2.4 or newer
+uses an atomic mode check/write in tmux's command queue. Older or unreported
+versions use a separate `display-message` mode check before each write. This
+preserves legacy support without invoking tmux 2.1's unsafe `if-shell -t`
+target lookup on a vanished pane. The legacy path adds a round trip and has a
+small race if the user enters copy mode between the check and Enter. Stock
+2.2/2.3 take that path too because `#{version}` arrived in 2.4; muxel checks the
+server, not a client binary that may have been upgraded while it kept running.
+The existing pane lookup also reads the server version. Muxel caches that
+capability with the pinned pane without another version round trip.
+An unanswered Enter may already have started a turn, so ctl sets its
+local `just_submitted` guard before releasing the send's in-flight marker.
+
+A new agent's launch records `$TMUX_PANE` in the session's
+`@muxel_control_pane` option before exec-ing the program. A program with no
+arguments still runs through the user's shell, as tmux does with a lone command
+string, so `npx opencode` and shell-only PATH keep working. The launch wrapper
+does not run on reattach. First ctl delivery caches that record, which remains
+authoritative after joins, moves and default-command splits. Sessions without
+the option retain the lowest-pane lookup; a vanished recorded pane never
+redirects input to another pane. If moving the only pane destroys its source
+session before the first ctl lookup, its session record is gone too; delivery
+refuses as unresolved. A pin already cached before that move remains usable.
+
 ## Coverage boundary
 
 The reducer keeps the existing no-hook classifier. Provider titles, visible
@@ -331,3 +377,18 @@ evidence for the fields they describe. Quiet visible output never proves that
 a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
+
+## Popout refresh
+
+Popout roots observe their pane entity for title, status and content, and the
+theme global for appearance changes. App notifications invalidate a popout
+only when its own presence, recoverable-close hold or close confirmation
+changes. The confirmation snapshot includes its displayed text and button labels;
+opening, changing and cancelling it all invalidate that popout. Theme palette
+refresh also visits popout-owned terminals, updating their painting and OSC
+color-query palette; unchanged palettes do not invalidate terminal content.
+
+Rendering uses the snapshot rather than reading the app entity, since initial
+window drawing can run inside the app update that opens the window. A recoverable
+close still removes the popout window while retaining its terminal; Undo
+restores that same terminal through the existing close lifecycle.

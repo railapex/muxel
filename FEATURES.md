@@ -73,6 +73,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
+  add the new agent as a tab in the focused pane, so starting an agent never adds
+  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
+  split buttons and dragging a tab to an edge still make a new pane.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -102,6 +106,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
   Terminals and editors move across; a browser pane is re-created in the new window
   at the same URL (a native webview belongs to the window that built it).
+- **Independent refresh** — popouts follow their own pane's title, status and
+  content, theme changes, and their own close state. Unrelated app updates,
+  including sidebar and other panes' activity, do not request a popout render.
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
@@ -488,7 +495,10 @@ feature is added or changed, update the matching entry here in the same change**
   by Claude and Grok remain **working** even when their titles look idle. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
-  Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
+  Grok redraw gaps do not forge completion. Panes judged by output activity
+  (shells, and agents whose titles can't be read) ignore a tmux status bar's
+  repaints, so its clock turning over doesn't flash an idle shell to **working**.
+  Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID. The index is checked
   for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
@@ -560,6 +570,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **First-class worktrees** — named, color-coded git worktrees shared by one or
   more panes; toggle "create a git worktree" when spawning.
+- **Read-only git displays** — background polling, change counts, branch labels,
+  and diffs disable optional git locks locally and over SSH. Reading a pane's
+  repository does not refresh its index or contend with an agent staging files.
 - **Inheritance** — a new tab or split joins its pane's worktree; a duplicate
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name
@@ -721,7 +734,7 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  tab beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
@@ -734,7 +747,7 @@ feature is added or changed, update the matching entry here in the same change**
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
 - **Browser as a preset** — the built-in **Browser** preset opens a web-browser
-  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  pane; pick it anywhere you pick an agent (the toolbar's agent dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
@@ -749,6 +762,18 @@ feature is added or changed, update the matching entry here in the same change**
   focused — no toast pops over the app you're already looking at (the in-app feed
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
+- **Sound alerts** (Settings → Sounds) — a chime when an agent finishes, and a
+  different one when it's blocked waiting on you, in a pane you aren't looking at
+  (even while muxel is focused, so another pane's agent can call you over). Agents
+  only — a shell finishing a command never chimes. The built-in sounds are
+  synthesized by muxel (a rising two-note chime for done, a double knock for
+  blocked); either can be replaced with your own WAV, AIFF, MP3, OGG, FLAC or M4A
+  file (Play to preview, cut to 10 s; a file that won't play falls back to the
+  built-in), with on/off per alert and a volume setting. No spam: an alert must
+  hold for a moment before it rings, a pane then stays quiet for that alert until
+  you've looked at it (or five minutes pass) however often it flips between working
+  and done, and alerts that land together play as one chime. The desktop toast for
+  the same event stays silent so the two never double up.
 - **In-app NOTIFICATIONS sidebar** — in Layout order, a category above PROJECTS
   collecting agent events **and** all app messages (git results, SSH connections,
   and save errors —
@@ -783,8 +808,10 @@ feature is added or changed, update the matching entry here in the same change**
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
-  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
-  plain and prompt launches, retained on restart. The preset needs Model flag /
+  that project's toolbar preset. Run from one of that project's panes, the tab
+  joins the caller's own group; otherwise it joins the focused group.
+  `--model M` and `--effort E` select per-pane values for plain and prompt
+  launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
@@ -947,13 +974,12 @@ feature is added or changed, update the matching entry here in the same change**
   Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
   the user's `bind -n` keys and extended-key encodings in ctl input reach the
   agent as text and never open a window or run a tmux command, and agent panes
-  need no shell grant. The first ctl write to a terminal finds the agent's own
-  tmux pane, the one its session was created with (the session's lowest pane
-  id; in a session muxel created with a program, that pane must also have been
-  started with a command, which a plain shell split never is, though muxel
-  doesn't check which command), whichever pane the user left active, and keeps
-  it by pane id, so input stays with the agent after the user opens other
-  windows or splits. If it can't be found or has gone, input
+  need no shell grant. A newly created agent records its initial tmux pane id
+  before starting the program; reattaching keeps that record. Input stays with
+  that id even after `join-pane`, `move-pane`, or default-command splits.
+  Older or adopted sessions fall back to the lowest pane id (which must have
+  a start command for an agent). The first ctl write caches the id for the
+  terminal's life. If it can't be found or has gone, input
   is refused with `tmux_pane_unresolved` and nothing is typed, never
   redirected; after a failed lookup the next waits 2 seconds, doubling to at
   most 2 minutes, so a host that can't be reached isn't asked again on every
@@ -965,13 +991,27 @@ feature is added or changed, update the matching entry here in the same change**
   command, and so each key press, makes its own login. Panes not kept in tmux
   take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
   a remote host; local tmux panes already need 3.2.
+  A pane in copy mode refuses input with `tmux_pane_in_mode`, preserving the
+  user's scroll position. Leave copy mode before retrying. When the server
+  reports version 2.4 or newer, the check and write share tmux's command queue.
+  Older servers, and servers that cannot report their version, use a separate
+  check before every write. That adds a round trip and leaves a small race if
+  the user enters copy mode between the check and Enter. Stock 2.2 and 2.3 also
+  use this legacy path because the server-version format arrived in 2.4.
+  If copy mode begins after a
+  prompt was pasted, the Enter failure carries `pasted: true`; inspect the
+  screen before retrying. An unanswered Enter sets the same local turn guard
+  as an acknowledged Enter, since it may already have started the agent.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
   Activity and attendance follow the same conversation attribution as docked
   terminals; redocking uncertain state preserves existing attention cards.
   On Windows, Grok conversation discovery follows the live terminal in either
-  window.
+  window. It reads Grok's registry on every discovery poll, reusing process
+  ancestry for up to 30 seconds while registrations and pane PID/launches are
+  unchanged. Registry or pane-process changes refresh ancestry immediately;
+  steady polling avoids repeatedly enumerating every process on the machine.
   Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
@@ -1249,10 +1289,16 @@ feature is added or changed, update the matching entry here in the same change**
   position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
-- **Resource tab grouping** — files, diffs, and browser pages opened by default join
-  the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement. Opening another resource as a tab
-  preserves the surrounding split geometry, including narrow resource columns.
+- **Resources open beside their pane** — a file, diff or web page opened from a
+  pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
+  new-window link) opens as a tab in the pane next to it: the one on its right,
+  or on its left when it sits at the right edge. A pane with no neighbour in its
+  row splits once, and its later opens join that new column. Files opened from
+  the file browser, palette, find panel, sidebar or git panel join the nearest
+  pane of the same type instead. An already-open file or page is focused and
+  refreshed wherever it is, and explicit New Tab and New Pane commands still use
+  the requested placement. Opening a resource as a tab preserves the surrounding
+  split geometry, including narrow resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
@@ -1276,8 +1322,9 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
-  changes", the project menu, or a worktree) rather than splitting off a new pane.
+  directory. From a pane's diff button it opens as a tab beside that pane; from
+  the project menu or a worktree's **View changes** it joins the nearest diff
+  tab, if there is one.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
@@ -1623,8 +1670,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Speech, Read
-  Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
+- **Settings modal** — sections for Appearance, Editor, Behavior, Sounds, Speech,
+  Read Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
   Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
@@ -1632,10 +1679,10 @@ feature is added or changed, update the matching entry here in the same change**
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
-  `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
-  to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
+  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+  switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
+  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
@@ -1726,9 +1773,17 @@ feature is added or changed, update the matching entry here in the same change**
 ## Platform & distribution
 
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
-  session lookup durations and outcomes, plus the remaining launch-time resume
-  lookup. Records contain fixed labels, timings and short pane ids, with no
+  session lookup hits, outcome changes and slow calls, with per-minute counts
+  and maximum durations for all discovery polls. Launch-time resume lookups
+  always log. Both profiler logs keep stable live paths and dated history
+  (14 local dates and 256 MiB per family by default, tunable with
+  `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
+  intervals aggregate totals and maxima over 30 seconds. Records contain fixed
+  labels, timings and short pane ids, with no
   terminal content, session ids, titles or paths.
+- **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
+  process that enabled them. Panes, runners and helper commands start without
+  those settings; a nested muxel can enable its own profiler independently.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain

@@ -94,7 +94,8 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
-    /// Open a terminal in a project's active tab group.
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
     New {
         project: String,
         #[serde(flatten)]
@@ -297,6 +298,8 @@ pub enum ErrorCode {
     /// A pane behind tmux takes ctl input only through tmux, at the agent's own
     /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
     TmuxPaneUnresolved,
+    /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
+    TmuxPaneInMode,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -1317,7 +1320,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1693,8 +1696,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
-  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
@@ -1868,6 +1873,19 @@ after a failed lookup the next waits a little longer each time, up to two
 minutes. A remote agent's input needs muxel's background SSH commands to that
 host to work.
 
+Newly created agents record their pane id before the program starts. That
+record survives pane moves and splits; reattaches preserve it. Older or adopted
+sessions use the lowest-pane lookup. Copy mode refuses input with
+`tmux_pane_in_mode`, leaving the user's scroll position intact. Leave copy mode
+before retrying. If the prompt was already pasted before Enter was refused,
+the failure has `pasted: true`: inspect `screen` before resending. An unanswered
+Enter also guards the turn as just submitted, because it may have landed.
+Servers reporting version 2.4+ check mode and write in one tmux command queue.
+Older or unreported server versions check separately before each write, adding
+a round trip. That legacy path has a small race if the user enters copy mode
+between the check and Enter; stock 2.2/2.3 use it too (server version reporting
+arrived in 2.4). There is no new tmux version requirement.
+
 AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
 at. PROJECT is a project's id or name. muxels on different computers that share
@@ -1916,6 +1934,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   need to restart the agent.
 - `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
   `screen` before pressing any again.
+- `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
+  copy mode before retrying. A failure after a paste instead has `pasted: true`.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2201,6 +2221,7 @@ mod tests {
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
