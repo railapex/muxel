@@ -612,10 +612,11 @@ impl RuntimeStatusState {
             }
         };
         // A switch doesn't change this. Until a new turn says otherwise the pane has
-        // nothing running in its foreground, and a reporting Claude's title never draws
-        // the glyph that would end the screen hold, so waiting on that would pin it busy
-        // for the shell's whole life. The screen hold still keeps it from alerting, and
-        // work that ends under it gets no wake grace: this conversation has run no turn.
+        // nothing running in its foreground. Only a title reading Working would end the
+        // screen hold, and between turns Claude's title reads Idle, or has no glyph at all
+        // once it has reported, so waiting on that would pin it busy for the shell's whole
+        // life. The screen hold still keeps it from alerting, and work that ends under it
+        // gets no wake grace: this conversation has run no turn.
         let ended_before_a_turn =
             self.provider_background.is_none() && self.screen_held && program_root.is_none();
         let (background_holds, background_deadline) = self.background_hold.observe(
@@ -9210,8 +9211,8 @@ mod provider_switch_tests {
         }
 
         /// `/clear` and `/resume` switch the conversation while a shell lives on. The
-        /// next turn's own report decides, and a reporting Claude's title stays without
-        /// the glyph that would confirm the footer, so nothing else can release the guard.
+        /// next turn's own report decides. Between turns no title reads Working, the only
+        /// thing that would confirm the footer, so nothing else can release the guard.
         #[test]
         fn a_finished_turn_still_holds_after_a_conversation_switch() {
             use crate::view::TerminalStatusReason;
@@ -9260,8 +9261,8 @@ mod provider_switch_tests {
             session.kill();
         }
 
-        /// A switch leaves no report until the next turn, and a reporting Claude's title
-        /// never draws the glyph that would confirm a footer. So the footer alone must
+        /// A switch leaves no report until the next turn, and between turns no title reads
+        /// Working, the only thing that would confirm a footer. So the footer alone must
         /// not pin the pane busy: its composer is free and the limit still runs.
         #[test]
         fn listed_work_after_a_switch_leaves_the_composer_free() {
