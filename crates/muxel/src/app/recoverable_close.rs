@@ -606,8 +606,9 @@ impl MuxelApp {
     }
 
     /// [`Self::hold_closes_with`] with no followers, for tests that exercise
-    /// the hold itself. Every caller is a Windows-only PTY test.
-    #[cfg(all(test, windows))]
+    /// the hold itself: the Windows PTY tests and the layout tests that run on
+    /// every platform.
+    #[cfg(test)]
     pub(super) fn hold_closes(
         &mut self,
         ids: Vec<(Uuid, bool)>,
