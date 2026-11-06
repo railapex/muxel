@@ -22,12 +22,14 @@ pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
+pub mod sidebar;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -122,7 +124,7 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
@@ -171,11 +173,11 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Working) {
                     self.work_started_at = Some(now);
                 }
-                self.blocked_at = None;
             }
             AgentActivityState::Blocked => {
                 if previous != Some(AgentActivityState::Blocked)
-                    && !(previous.is_none() && self.blocked_at.is_some())
+                    && !(previous.is_none()
+                        && previous_persisted == Some(AgentActivityState::Blocked))
                 {
                     self.blocked_at = Some(now);
                 }
@@ -189,13 +191,8 @@ impl AgentActivity {
                 {
                     self.completed_at = Some(now);
                 }
-                self.blocked_at = None;
             }
-            AgentActivityState::Idle => {
-                if previous == Some(AgentActivityState::Blocked) {
-                    self.blocked_at = None;
-                }
-            }
+            AgentActivityState::Idle => {}
         }
         if self.last_state.is_some() || previous_persisted != Some(status) {
             self.last_state = Some(status);
@@ -226,7 +223,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -621,6 +618,17 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// For a file, diff or page: the session that last opened it (a link
+    /// clicked in it, its diff button, or a file or page that session opened).
+    /// Recent work nests the resource under that session. `None` when only
+    /// muxel's own chrome opened it. Kept on this machine: the shared layout
+    /// leaves it out, as it does a pane's activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<Uuid>,
+    /// When `opened_by` last opened it, in Unix milliseconds. A session's
+    /// nested resources go newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -725,19 +733,35 @@ impl Instance {
         true
     }
 
-    /// A duplicated pane copies launch settings, not the source conversation.
+    /// A duplicated pane copies launch settings, not the source conversation or
+    /// its activity. The copy has done no work and has nothing unread of its own.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        self.activity = AgentActivity::default();
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
         // approved, never to a copy of its pane.
         if self.control_prompt {
             self.system_prompt = None;
+        }
+        // The user made the copy; no session opened it.
+        self.opened_by = None;
+        self.opened_at = None;
+    }
+
+    /// `session` opened this resource at `now`, either for the first time or
+    /// again while it was already open: the last opener wins. An open no
+    /// session asked for (`None`: the file browser, palette or sidebar) leaves
+    /// an earlier opener in place.
+    pub fn record_opener(&mut self, session: Option<Uuid>, now: i64) {
+        if let Some(session) = session {
+            self.opened_by = Some(session);
+            self.opened_at = Some(now);
         }
     }
 
@@ -796,6 +820,8 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
         }
     }
 
@@ -865,6 +891,8 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
         }
     }
 }
@@ -1121,7 +1149,7 @@ pub struct Project {
     pub layout_updated_at: Option<u64>,
     /// Panes closed on this project's host whose tmux session muxel has not yet
     /// confirmed dead. Persisted because the confirmation may have to wait for the
-    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// next connect or local project activation — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
@@ -1173,21 +1201,54 @@ impl Project {
     /// the host confirms it is gone. Idempotent per instance: closing, failing to
     /// confirm, and closing again leaves one entry.
     ///
-    /// Capped, oldest first: a host that is never reachable again would otherwise
-    /// grow the ledger without bound, and an entry that old has long stopped
-    /// protecting anything — its instance is gone from the workspace.
+    /// Remote history is capped, oldest first. Local pending kills must all
+    /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
+        let previous = self.closed_sessions.iter().find(|closed| {
+            closed.instance == instance
+                && closed.name == session.name
+                && (closed.socket == session.socket || closed.socket.is_none())
+        });
+        let local_close_token = previous.and_then(|closed| closed.local_close_token);
+        let worktree = self
+            .closed_sessions
+            .iter()
+            .find(|closed| closed.instance == instance)
+            .map_or_else(Default::default, |closed| closed.worktree.clone());
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
             socket: session.socket,
             instance,
+            local_close_token,
+            worktree,
         });
-        let over = self
+        if self.is_remote() {
+            let over = self
+                .closed_sessions
+                .len()
+                .saturating_sub(MAX_CLOSED_SESSIONS);
+            self.closed_sessions.drain(..over);
+        }
+    }
+
+    /// Record where a remembered close's pane ran.
+    pub fn set_closed_worktree(&mut self, instance: Uuid, worktree: tmux::ClosedWorktree) {
+        if let Some(closed) = self
             .closed_sessions
-            .len()
-            .saturating_sub(MAX_CLOSED_SESSIONS);
-        self.closed_sessions.drain(..over);
+            .iter_mut()
+            .find(|closed| closed.instance == instance)
+        {
+            closed.worktree = worktree;
+        }
+    }
+
+    /// Whether an unconfirmed kill could be for a pane that ran in the worktree
+    /// at `path`. Other panes' kills say nothing about those files.
+    pub fn close_pending_in(&self, path: &std::path::Path) -> bool {
+        self.closed_sessions
+            .iter()
+            .any(|closed| closed.worktree.may_be(path))
     }
 
     /// Forget a close whose session the host has confirmed gone.
@@ -1395,6 +1456,37 @@ impl Workspace {
         self.worktrees.retain(|w| w.id != id);
     }
 
+    /// The session behind an open that pane `pane` asked for, recorded as the
+    /// resource's [`Instance::opened_by`]: the pane itself when it is a session
+    /// (a terminal), or the live session that opened it when it is a file,
+    /// diff or page. A page opened from a file Claude opened is Claude's too.
+    pub fn opener_session(&self, pane: Uuid) -> Option<Uuid> {
+        let is_session = |id: Uuid| {
+            self.instance(id)
+                .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+        };
+        if is_session(pane) {
+            return Some(pane);
+        }
+        self.instance(pane)?
+            .opened_by
+            .filter(|&session| is_session(session))
+    }
+
+    /// Where `instance` runs, for its close's ledger entry. Capture before
+    /// removing its metadata.
+    pub fn closed_worktree_of(&self, instance: &Instance) -> tmux::ClosedWorktree {
+        match (instance.worktree_id, &instance.worktree_path) {
+            (Some(id), _) => self
+                .worktree(id)
+                .map_or(tmux::ClosedWorktree::Unknown, |worktree| {
+                    tmux::ClosedWorktree::In(worktree.path.clone())
+                }),
+            (None, Some(path)) => tmux::ClosedWorktree::In(path.clone()),
+            (None, None) => tmux::ClosedWorktree::Outside,
+        }
+    }
+
     /// Instance ids currently referencing `worktree_id`.
     pub fn instances_using(&self, worktree_id: Uuid) -> Vec<Uuid> {
         self.instances
@@ -1406,6 +1498,26 @@ impl Workspace {
 
     /// Next color index for a new worktree in `project_id`: the lowest unused
     /// slot 0..8 among the project's live (non-detached) worktrees, wrapping.
+    /// Detach each worktree `candidate` selects that no pane uses. The sidebar
+    /// lists a pane-less worktree only when detached, so one left attached can't
+    /// be reached. Instances held for close still count as using theirs. Returns
+    /// whether anything changed.
+    pub fn detach_unused_worktrees(&mut self, candidate: impl Fn(&Worktree) -> bool) -> bool {
+        let used: std::collections::HashSet<Uuid> = self
+            .instances
+            .iter()
+            .filter_map(|i| i.worktree_id)
+            .collect();
+        let mut changed = false;
+        for worktree in &mut self.worktrees {
+            if !worktree.detached && !used.contains(&worktree.id) && candidate(worktree) {
+                worktree.detached = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn next_worktree_color(&self, project_id: Uuid) -> u8 {
         let used: Vec<u8> = self
             .worktrees
@@ -1460,7 +1572,8 @@ pub struct RemoteLayout {
     pub accomplishments_enabled: Option<bool>,
 }
 
-// Local Workspace persistence keeps receipts; only the shared document omits them.
+// Local Workspace persistence keeps receipts and openers; only the shared
+// document omits them.
 fn serialize_shared_instances<S: serde::Serializer>(
     instances: &[Instance],
     serializer: S,
@@ -1469,9 +1582,14 @@ fn serialize_shared_instances<S: serde::Serializer>(
 
     let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
     for instance in instances {
-        if instance.claude_hook_record.is_some() {
+        if instance.claude_hook_record.is_some()
+            || instance.opened_by.is_some()
+            || instance.opened_at.is_some()
+        {
             let mut shared = instance.clone();
             shared.claude_hook_record = None;
+            shared.opened_by = None;
+            shared.opened_at = None;
             sequence.serialize_element(&shared)?;
         } else {
             sequence.serialize_element(instance)?;
@@ -1551,7 +1669,8 @@ impl RemoteLayout {
     /// Per-machine state is left out, so it never reads as a layout change: the
     /// owning project's id (every machine has its own id for the same project) and
     /// what this machine observes of a pane — its program-supplied title, terminal
-    /// grid, agent activity and consumed hook receipts. Counting those pushed the
+    /// grid, agent activity, consumed hook receipts and which session opened a
+    /// file or page. Counting those pushed the
     /// layout on every resize and agent turn, and made two peers look out of sync
     /// when nothing differed.
     pub fn content_key(&self) -> String {
@@ -1594,6 +1713,8 @@ impl RemoteLayout {
                 instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                instance.opened_by = None;
+                instance.opened_at = None;
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
@@ -1785,8 +1906,8 @@ pub fn observed_close_revision(current: Option<u64>) -> u64 {
 /// A peer layout's instances as this machine should hold them: every one the peer
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
-/// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content. A validated rollout path survives a peer
+/// program-supplied title, terminal grid, agent activity and the session that
+/// opened it), which is per-machine and never part of the shared content. A validated rollout path survives a peer
 /// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
@@ -1799,11 +1920,17 @@ pub fn merge_peer_instances(
             // A peer's consumed receipt says nothing about this machine, even
             // when this is the first time it has seen the pane.
             instance.claude_hook_record = None;
+            // Which session opened a file is this machine's to know: the
+            // shared document never carries it.
+            instance.opened_by = None;
+            instance.opened_at = None;
             if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
                 instance.auto_name = mine.auto_name.clone();
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                instance.opened_by = mine.opened_by;
+                instance.opened_at = mine.opened_at;
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()
@@ -1834,6 +1961,10 @@ pub fn merge_peer_instances(
                 if instance.instruction_injection.is_none() {
                     instance.instruction_injection = mine.instruction_injection.clone();
                 }
+            } else {
+                // Work and attendance are observations on this machine. A new
+                // peer pane starts fresh; its own runtime samples record them.
+                instance.activity = AgentActivity::default();
             }
             instance
         })
@@ -1972,6 +2103,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -2574,6 +2706,9 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Sidebar presentation only; navigation and pane layout keep their order.
+    #[serde(default)]
+    pub sidebar_sort: sidebar::SidebarSort,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3089,6 +3224,7 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            sidebar_sort: sidebar::SidebarSort::default(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,
@@ -3880,12 +4016,48 @@ mod closed_session_tests {
     use uuid::Uuid;
 
     #[test]
+    fn local_close_ledger_survives_a_large_batch_and_restart() {
+        let mut project = Project::new("local", "/local");
+        let ids: std::collections::HashSet<_> = (0..128)
+            .map(|n| {
+                let id = Uuid::new_v4();
+                project.remember_closed_session(format!("local-{n}").into(), id);
+                project
+                    .closed_sessions
+                    .last_mut()
+                    .unwrap()
+                    .local_close_token = Some(id);
+                id
+            })
+            .collect();
+        let saved = serde_json::to_vec(&project).unwrap();
+        let restored: Project = serde_json::from_slice(&saved).unwrap();
+        assert!(
+            restored
+                .closed_sessions
+                .iter()
+                .all(|entry| entry.local_close_token == Some(entry.instance))
+        );
+        let retryable: std::collections::HashSet<_> = restored
+            .closed_sessions
+            .iter()
+            .map(|c| c.instance)
+            .collect();
+        assert_eq!(
+            retryable, ids,
+            "a crash must not lose any unconfirmed local kill"
+        );
+    }
+
+    #[test]
     fn closing_the_same_pane_twice_leaves_one_entry() {
         let mut p = Project::new("app", "/srv/app");
         let iid = Uuid::new_v4();
         p.remember_closed_session("muxel_app_1".into(), iid);
+        p.closed_sessions[0].local_close_token = Some(iid);
         p.remember_closed_session("muxel_app_1".into(), iid);
         assert_eq!(p.closed_sessions.len(), 1);
+        assert_eq!(p.closed_sessions[0].local_close_token, Some(iid));
         assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
         assert!(p.closed_sessions.is_empty());
         assert!(
@@ -3899,6 +4071,10 @@ mod closed_session_tests {
     #[test]
     fn the_ledger_is_capped_oldest_first() {
         let mut p = Project::new("app", "/srv/app");
+        p.remote = Some(super::RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/srv/app".into(),
+        });
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();
@@ -3985,6 +4161,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4069,6 +4246,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4083,6 +4261,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4098,6 +4277,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4251,6 +4431,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4303,6 +4484,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4350,6 +4532,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4392,6 +4575,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4789,11 +4973,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -4951,6 +5137,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -4999,6 +5186,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -5054,6 +5242,94 @@ mod worktree_registry_tests {
         assert_eq!(ws.worktree(wid).map(|w| w.color), Some(2));
         ws.remove_worktree_meta(wid);
         assert!(ws.worktree(wid).is_none());
+    }
+
+    #[test]
+    fn a_pending_kill_only_holds_the_worktree_its_pane_ran_in() {
+        use std::path::Path;
+        let mut project = Project::new("p", "/repo");
+        let (mine, theirs) = (Path::new("/wt/mine"), Path::new("/wt/theirs"));
+        assert!(!project.close_pending_in(mine));
+        let target = |name: &str| tmux::SessionTarget::new(name, Some(tmux::Socket::Private));
+
+        let outside = Uuid::new_v4();
+        project.remember_closed_session(target("outside"), outside);
+        project.set_closed_worktree(outside, tmux::ClosedWorktree::Outside);
+        assert!(!project.close_pending_in(mine));
+
+        let member = Uuid::new_v4();
+        project.remember_closed_session(target("member"), member);
+        project.set_closed_worktree(member, tmux::ClosedWorktree::In(mine.into()));
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        // Resolving the owner later re-remembers the close, sometimes under the
+        // name the host really has. It must stay scoped.
+        project.remember_closed_session(target("member"), member);
+        assert!(project.close_pending_in(mine));
+        project.remember_closed_session(target("member-resolved"), member);
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        assert!(project.forget_closed_session(member));
+        assert!(!project.close_pending_in(mine));
+    }
+
+    #[test]
+    fn a_close_saved_before_worktrees_were_recorded_could_be_any_of_them() {
+        let closed: tmux::ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "older",
+            "instance": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert_eq!(closed.worktree, tmux::ClosedWorktree::Unknown);
+        assert!(closed.worktree.may_be(std::path::Path::new("/wt/any")));
+        let round: tmux::ClosedSession = serde_json::from_value(
+            serde_json::to_value(tmux::ClosedSession {
+                worktree: tmux::ClosedWorktree::In("/wt/mine".into()),
+                ..closed
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round.worktree, tmux::ClosedWorktree::In("/wt/mine".into()));
+    }
+
+    #[test]
+    fn a_closing_instance_records_the_worktree_it_ran_in() {
+        let mut workspace = Workspace::default();
+        let project = Uuid::new_v4();
+        let registered = Worktree {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: "w".into(),
+            path: "/wt/registered".into(),
+            branch: "b".into(),
+            color: 0,
+            detached: false,
+        };
+        let wid = registered.id;
+        workspace.add_worktree(registered);
+        let mut instance = Instance::shell(project);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Outside
+        );
+        instance.worktree_path = Some("/wt/legacy".into());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/legacy".into())
+        );
+        instance.worktree_id = Some(wid);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/registered".into())
+        );
+        instance.worktree_id = Some(Uuid::new_v4());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Unknown
+        );
     }
 
     #[test]
