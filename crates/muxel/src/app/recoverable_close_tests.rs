@@ -8,7 +8,7 @@ use super::{
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
 use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
-use muxel_core::{PaneNode, SplitDirection, Worktree, add_tab, split};
+use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
 };
@@ -3558,4 +3558,158 @@ fn a_held_page_is_not_reused_while_its_session_counts_down() {
             })
             .unwrap();
     });
+}
+
+/// An exited session closes at once, with no countdown. In Recent work its
+/// files still go with it.
+#[test]
+fn a_session_that_closes_at_once_takes_its_files() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, view, child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        let (loose, _) = opened_file(cx, window, pid, None, false);
+        child.terminate(0);
+        wait_for_view(cx, window, &view, TerminalView::exited);
+        window
+            .update(cx, |app, _, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert!(app.close_groups.is_empty(), "an exited session has no hold");
+                assert!(app.workspace.instance(session).is_none());
+                assert!(
+                    app.workspace.instance(plan).is_none(),
+                    "its file closes with it"
+                );
+                assert!(!app.editors.contains_key(&plan));
+                assert!(app.workspace.instance(loose).is_some());
+            })
+            .unwrap();
+    });
+}
+
+/// The worktree question shows first, the file is edited while it does, and
+/// the session's close then asks about the file. Cancel keeps the file; the
+/// session's close goes on with the answer already given, without asking again.
+#[test]
+fn cancel_on_a_riding_file_keeps_the_worktree_answer_its_session_has() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, session);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                // Edited while the worktree question showed.
+                let edited = EditorSnapshot {
+                    text: "edited".into(),
+                    path: None,
+                    language: "text".into(),
+                    cursor: None,
+                    dirty: true,
+                    external_change: None,
+                    disk_stamp: None,
+                    show_rendered: false,
+                    diff_dir: None,
+                }
+                .build(app.editor_config(), window, cx);
+                app.editors.insert(plan, edited);
+                app.dispose_worktree_discard(cx);
+                assert!(matches!(
+                    app.confirm.as_ref().map(|pending| &pending.action),
+                    Some(ConfirmAction::SaveEditorBeforeClose {
+                        iid,
+                        rides_with: Some(rider),
+                        ..
+                    }) if *iid == plan && *rider == session
+                ));
+                app.cancel_confirm(cx);
+                assert!(app.is_closing(session), "the session's close goes on");
+                assert!(!app.is_closing(plan));
+                assert!(
+                    app.pending_worktree_dispose.is_empty(),
+                    "the worktree asked again"
+                );
+                assert!(
+                    app.deferred_worktree_dispose
+                        .get(&pid)
+                        .and_then(|answers| answers.get(&wid))
+                        .is_some_and(|answer| answer.accepted),
+                    "the answer was dropped"
+                );
+                app.undo_latest_close(window, cx);
+            })
+            .unwrap();
+    });
+}
+
+/// A file held with its session is one more close in geometry's replay, in
+/// the order it left. Here that order decides who gets the space: the session
+/// has no pane it was split from, so its space goes to its neighbour, its own
+/// file, which then hands everything to the pane it was split from. Two holds
+/// come back exactly, sizes included, whichever is undone first.
+#[test]
+fn a_file_held_with_its_session_comes_back_exactly_beside_another_hold() {
+    for session_first in [true, false] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (session, _, _session_child) = terminal(cx, window, pid);
+            let (other, _, _other_child) = terminal(cx, window, pid);
+            let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+            let (left, _) = opened_file(cx, window, pid, None, false);
+            let (right, _) = opened_file(cx, window, pid, None, false);
+            window
+                .update(cx, |app, window, cx| {
+                    app.settings.confirm_close_terminal = false;
+                    app.settings.sidebar_sort = SidebarSort::RecentWork;
+                    let beside = Uuid::new_v4();
+                    let leaf = |pane_id, tab, split_from| {
+                        PaneNode::Leaf(LeafData {
+                            pane_id,
+                            tabs: vec![tab],
+                            active: 0,
+                            split_from,
+                        })
+                    };
+                    let before = Some(PaneNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        sizes: vec![0.1, 0.2, 0.3, 0.25, 0.15],
+                        children: vec![
+                            leaf(Uuid::new_v4(), session, None),
+                            leaf(Uuid::new_v4(), plan, Some(beside)),
+                            leaf(Uuid::new_v4(), left, None),
+                            leaf(beside, right, None),
+                            leaf(Uuid::new_v4(), other, None),
+                        ],
+                    });
+                    app.workspace.project_mut(pid).unwrap().layout = before.clone();
+                    app.request_close_instance(session, cx);
+                    app.request_close_instance(other, cx);
+                    assert_eq!(app.close_groups.len(), 2);
+                    assert_eq!(app.close_groups[0].members, vec![session, plan]);
+                    let (first, second) = if session_first {
+                        (app.close_groups[0].id, app.close_groups[1].id)
+                    } else {
+                        (app.close_groups[1].id, app.close_groups[0].id)
+                    };
+                    app.undo_close(first, window, cx);
+                    app.undo_close(second, window, cx);
+                    let after = &app.workspace.project(pid).unwrap().layout;
+                    assert!(
+                        after
+                            .as_ref()
+                            .zip(before.as_ref())
+                            .is_some_and(|(after, before)| after.same_layout(before)),
+                        "session first {session_first}: {after:?} != {before:?}"
+                    );
+                })
+                .unwrap();
+        });
+    }
 }

@@ -58,7 +58,8 @@ takes them at once too. An unsaved editor gets a Save / Don't Save / Cancel
 question before anything closes, naming the file and the session taking it,
 since the user clicked the session rather than the file. Cancel keeps that
 editor, clears its owner so it shows as an ordinary row, and lets the session
-close. Close other tabs and Close tabs to the side keep the tab they were
+close. The same close request goes on, so a worktree answer already given for
+the session still stands. Close other tabs and Close tabs to the side keep the tab they were
 chosen from: if its owner is among the tabs closing, the owner is cleared
 first. Popped-out resources stay open, since their views belong to their own
 windows. An agent exiting on its own, Layout order, and closes from other

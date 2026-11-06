@@ -91,6 +91,9 @@ fn a_link_opens_beside_the_pane_it_was_clicked_in_not_the_focused_one() {
             assert_eq!(app.editors.len(), 1, "the link opened no editor");
             assert_eq!(group(app, pid, opened), [z, opened], "beside Y, not X");
             assert_eq!(group(app, pid, y), [y]);
+            // Y opened it, so in Recent work it nests and closes with Y.
+            let opener = |app: &MuxelApp, iid| app.workspace.instance(iid).unwrap().opened_by;
+            assert_eq!(opener(app, opened), Some(y));
 
             // A middle-click lands in the same place and gives focus back to X.
             app.focus_instance(x, window, cx);
@@ -102,6 +105,7 @@ fn a_link_opens_beside_the_pane_it_was_clicked_in_not_the_focused_one() {
             assert_eq!(app.editors.len(), 2, "the link opened no editor");
             assert_eq!(group(app, pid, z).len(), 3, "beside Y, not X");
             assert_eq!(group(app, pid, z)[..2], [z, opened]);
+            assert_eq!(opener(app, group(app, pid, z)[2]), Some(y));
             assert_eq!(app.active_instance, Some(x));
         })
         .unwrap();

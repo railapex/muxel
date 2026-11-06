@@ -524,22 +524,27 @@ impl MuxelApp {
             .into_iter()
             .filter(|&(iid, _)| !self.close_editor_dirty(iid, cx))
             .collect();
+        // A session closing now is gone once it has closed, so find its files
+        // while it is still here.
+        let now: Vec<_> = steps
+            .iter()
+            .filter(|(_, step)| *step == AcceptedClose::Now)
+            .map(|&(iid, _)| iid)
+            .collect();
+        let with_closed = self.close_dependents(&now);
         let mut holds = Vec::new();
-        let mut closed = Vec::new();
         for (iid, step) in steps {
             match step {
                 // Its session is held here, so it rides in that hold instead.
                 AcceptedClose::Now if followers.iter().any(|&(follower, _)| follower == iid) => {}
-                AcceptedClose::Now => {
-                    self.close_instance_inner(iid, "close", cx);
-                    closed.push(iid);
-                }
+                AcceptedClose::Now => self.close_instance_inner(iid, "close", cx),
                 AcceptedClose::Hold { forced } => holds.push((iid, forced)),
                 AcceptedClose::Stays => {}
             }
         }
-        for (iid, _) in self.close_dependents(&closed) {
-            if !self.close_editor_dirty(iid, cx) {
+        for (iid, _) in with_closed {
+            // A file the user closed too has gone already.
+            if self.workspace.instance(iid).is_some() && !self.close_editor_dirty(iid, cx) {
                 self.close_instance_inner(iid, "close (with its session)", cx);
             }
         }
