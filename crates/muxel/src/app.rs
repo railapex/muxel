@@ -15838,6 +15838,27 @@ impl MuxelApp {
         self.open_browser_in_project(pid, url, origin, placement, window, cx)
     }
 
+    /// The page in `pid`'s layout already showing `url`. Web resources require
+    /// an exact URL match. Local files reuse by decoded path so raw/file URI
+    /// spellings and source fragments share one pane. A page held for Undo
+    /// has left the layout, so it is never reused.
+    #[cfg(not(target_os = "linux"))]
+    fn browser_to_reuse(&self, pid: Uuid, url: &str) -> Option<Uuid> {
+        self.workspace
+            .project(pid)?
+            .instances()
+            .into_iter()
+            .find(|iid| {
+                self.workspace.instance(*iid).is_some_and(|instance| {
+                    instance.kind == InstanceKind::Browser
+                        && instance
+                            .browser_url
+                            .as_deref()
+                            .is_some_and(|existing| same_browser_resource(existing, url))
+                })
+            })
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn open_browser_in_project(
         &mut self,
@@ -15848,24 +15869,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
-        // Web resources require an exact URL match. Local files reuse by decoded
-        // path so raw/file URI spellings and source fragments share one pane.
-        if let Some(iid) = self
-            .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default()
-            .into_iter()
-            .find(|iid| {
-                self.workspace.instance(*iid).is_some_and(|instance| {
-                    instance.kind == InstanceKind::Browser
-                        && instance
-                            .browser_url
-                            .as_deref()
-                            .is_some_and(|existing| same_browser_resource(existing, &url))
-                })
-            })
-        {
+        if let Some(iid) = self.browser_to_reuse(pid, &url) {
             if let Some(instance) = self.workspace.instance_mut(iid) {
                 instance.browser_url = Some(url.clone());
             }
@@ -20712,11 +20716,7 @@ impl MuxelApp {
             ..
         }) = self.confirm.take()
         {
-            if let Some(instance) = self.workspace.instance_mut(iid) {
-                instance.opened_by = None;
-                instance.opened_at = None;
-            }
-            self.persist();
+            self.clear_opener(iid);
             self.request_recoverable_close(rest, cx);
         }
         cx.notify();
@@ -21420,7 +21420,34 @@ impl MuxelApp {
     /// Close every other tab in `keep`'s pane (pinned included), leaving only
     /// `keep`. Asks once (batch) if any closed tab's kind confirms-on-close.
     fn close_other_tabs(&mut self, keep: Uuid, _window: &mut Window, cx: &mut Context<Self>) {
-        self.request_recoverable_close(self.other_tabs_in_pane(keep), cx);
+        let others = self.other_tabs_in_pane(keep);
+        self.keep_out_of_close(keep, &others);
+        self.request_recoverable_close(others, cx);
+    }
+
+    /// `keep` is the tab the user chose to keep while `closing` closes around
+    /// it. A file whose owning session is among them would close with that
+    /// session (Recent work), so it stops riding with it first, as Cancel on
+    /// its save question does.
+    fn keep_out_of_close(&mut self, keep: Uuid, closing: &[Uuid]) {
+        if !self
+            .close_dependents(closing)
+            .iter()
+            .any(|&(iid, _)| iid == keep)
+        {
+            return;
+        }
+        self.clear_opener(keep);
+    }
+
+    /// `iid` no longer belongs to any session: it shows as an ordinary row and
+    /// closes only by itself.
+    fn clear_opener(&mut self, iid: Uuid) {
+        if let Some(instance) = self.workspace.instance_mut(iid) {
+            instance.opened_by = None;
+            instance.opened_at = None;
+        }
+        self.persist();
     }
 
     /// Tabs to the left (`right=false`) or right (`right=true`) of `anchor` in its
@@ -21454,7 +21481,9 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_recoverable_close(self.tabs_to_side(anchor, right), cx);
+        let side = self.tabs_to_side(anchor, right);
+        self.keep_out_of_close(anchor, &side);
+        self.request_recoverable_close(side, cx);
     }
 
     /// Clear the active terminal's scrollback history.

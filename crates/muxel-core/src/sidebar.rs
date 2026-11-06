@@ -75,7 +75,8 @@ pub fn is_unread(activity: &AgentActivity) -> bool {
 /// last opened it, when that session is one of `listed` (the project's rows).
 /// A session that has closed, is held for Undo, or sits in another project
 /// leaves the resource as an ordinary row. Sessions never nest and only
-/// sessions take nested rows, so nesting is one level deep.
+/// sessions take nested rows, so nesting is one level deep. A pinned resource
+/// nests only under a pinned session, so its pin keeps it in the pinned block.
 pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) -> Option<Uuid> {
     let instance = instances.get(&id)?;
     if instance.kind == InstanceKind::Terminal {
@@ -83,30 +84,35 @@ pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) 
     }
     instance.opened_by.filter(|session| {
         listed.contains(session)
-            && instances
-                .get(session)
-                .is_some_and(|session| session.kind == InstanceKind::Terminal)
+            && instances.get(session).is_some_and(|session| {
+                session.kind == InstanceKind::Terminal && (session.pinned || !instance.pinned)
+            })
     })
 }
 
 /// The files, diffs and pages that close with `sessions` when the user closes
-/// them in Recent work: each one whose last opener is one of them. A resource
-/// another session opened again since belongs to that session and stays.
-/// Returns `(resource, session)` pairs in workspace order.
-pub fn closes_with<'a>(
+/// them in Recent work: each one in a session's project whose last opener is
+/// that session. A resource another session opened again since belongs to that
+/// session and stays. Returns `(resource, session)` pairs in workspace order.
+pub fn closes_with(
     sort: SidebarSort,
     sessions: &[Uuid],
-    instances: impl IntoIterator<Item = &'a Instance>,
+    instances: &[Instance],
 ) -> Vec<(Uuid, Uuid)> {
     if sort != SidebarSort::RecentWork {
         return Vec::new();
     }
+    let projects: HashMap<Uuid, Uuid> = instances
+        .iter()
+        .filter(|i| i.kind == InstanceKind::Terminal && sessions.contains(&i.id))
+        .map(|i| (i.id, i.project_id))
+        .collect();
     instances
-        .into_iter()
+        .iter()
         .filter(|instance| instance.kind != InstanceKind::Terminal)
         .filter_map(|instance| {
-            let session = instance.opened_by.filter(|s| sessions.contains(s))?;
-            Some((instance.id, session))
+            let session = instance.opened_by?;
+            (projects.get(&session) == Some(&instance.project_id)).then_some((instance.id, session))
         })
         .collect()
 }
@@ -409,6 +415,44 @@ mod tests {
                 Pane(old),
                 Nested(page)
             ]
+        );
+    }
+
+    #[test]
+    fn a_pinned_file_stays_in_the_pinned_block_under_an_unpinned_session() {
+        use SidebarEntry::{Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, b) = (ids[0], ids[1]);
+        let plan = file(&mut workspace, &mut project, Some(b), 10);
+        workspace.instance_mut(plan).unwrap().pinned = true;
+        // B isn't pinned, so the plan leads the list on its own pin.
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(plan), Pane(a), Pane(b)]
+        );
+        // Pin B as well and the plan nests under it inside the pinned block.
+        workspace.instance_mut(b).unwrap().pinned = true;
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(b), Nested(plan), Pane(a)]
+        );
+    }
+
+    #[test]
+    fn a_file_in_another_project_never_closes_with_the_session() {
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let session = ids[0];
+        let here = file(&mut workspace, &mut project, Some(session), 10);
+        // Opened from this session while another project was active.
+        let other = Project::new("other", "/other");
+        let mut away = Instance::editor(other.id, None);
+        away.record_opener(Some(session), 20);
+        workspace.projects.push(other);
+        workspace.add_instance(away);
+        assert_eq!(
+            closes_with(SidebarSort::RecentWork, &[session], &workspace.instances),
+            vec![(here, session)]
         );
     }
 

@@ -307,9 +307,34 @@ impl MuxelApp {
             )
             .find(|&(iid, _)| self.close_editor_dirty(iid, cx))
         {
+            // The user clicked the session, not the file, so say which file
+            // and why it is closing before Don't Save can lose its edits.
+            let name = |iid| {
+                self.workspace
+                    .instance(iid)
+                    .map(|inst| inst.display_name().to_string())
+                    .unwrap_or_default()
+            };
+            let (title, message) = match rides_with {
+                Some(session) => {
+                    let (file, session) = (name(iid), name(session));
+                    (
+                        tf("Save changes to {file}?", &[("file", &file)]),
+                        tf(
+                            "{session} opened {file} and is closing, so the file closes too. \
+                             Save your changes, close it without saving, or Cancel to keep it open.",
+                            &[("file", &file), ("session", &session)],
+                        ),
+                    )
+                }
+                None => (
+                    t("Save changes before closing?").to_string(),
+                    t("Save your changes, or close without saving.").to_string(),
+                ),
+            };
             self.request_confirm(
-                t("Save changes before closing?"),
-                t("Save your changes, or close without saving."),
+                title,
+                message,
                 t("Save"),
                 ConfirmAction::SaveEditorBeforeClose {
                     iid,

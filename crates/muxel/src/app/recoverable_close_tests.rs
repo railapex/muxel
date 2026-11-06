@@ -2119,6 +2119,8 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
         let (draft, editor) = opened_file(cx, window, pid, Some(session), true);
         window
             .update(cx, |app, window, cx| {
+                app.workspace.instance_mut(session).unwrap().custom_name = Some("Claude".into());
+                app.workspace.instance_mut(draft).unwrap().custom_name = Some("plan.md".into());
                 app.settings.confirm_close_terminal = false;
                 app.settings.sidebar_sort = SidebarSort::RecentWork;
                 app.request_close_instance(session, cx);
@@ -2130,6 +2132,15 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
                         ..
                     }) if *iid == draft && *rider == session
                 ));
+                // The user clicked the session's ×, not the file's: the
+                // question says which file and why it is closing.
+                let pending = app.confirm.as_ref().unwrap();
+                assert!(pending.title.contains("plan.md"), "{}", pending.title);
+                assert!(
+                    pending.message.contains("plan.md") && pending.message.contains("Claude"),
+                    "{}",
+                    pending.message
+                );
                 assert!(!app.is_closing(session), "the save question comes first");
                 app.cancel_confirm(cx);
                 assert!(app.is_closing(session));
@@ -2149,6 +2160,84 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
                 app.request_close_instance(session, cx);
                 assert!(app.confirm.is_none());
                 assert!(!app.is_closing(draft));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn closing_the_other_tabs_keeps_a_file_that_shares_its_sessions_pane() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                // Opened beside another session, then reopened from this one:
+                // the file is a tab in its own session's pane.
+                let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                assert!(muxel_core::remove(layout, plan));
+                assert!(add_tab(layout, session, plan));
+                app.settings.confirm_close_terminal = false;
+                let now = chrono::Utc::now().timestamp_millis();
+
+                // Layout order has no riders, so the owner is left alone.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                app.close_other_tabs(plan, window, cx);
+                assert!(app.is_closing(session) && !app.is_closing(plan));
+                assert_eq!(
+                    app.workspace.instance(plan).unwrap().opened_by,
+                    Some(session)
+                );
+                app.undo_latest_close(window, cx);
+
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.close_other_tabs(plan, window, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan), "the tab the user kept stays open");
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), vec![plan]);
+                assert_eq!(app.workspace.instance(plan).unwrap().opened_by, None);
+                app.undo_latest_close(window, cx);
+
+                // Closing the tabs to its left keeps it the same way.
+                app.workspace
+                    .instance_mut(plan)
+                    .unwrap()
+                    .record_opener(Some(session), now);
+                app.close_tabs_side(plan, false, window, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan));
+                app.undo_latest_close(window, cx);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_held_page_is_not_reused_while_its_session_counts_down() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, window, cx| {
+                let url = "https://example.com/plan";
+                let mut page = Instance::browser(pid, url.into());
+                page.record_opener(Some(session), chrono::Utc::now().timestamp_millis());
+                let page_id = page.id;
+                app.workspace.add_instance(page);
+                let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                assert!(split(layout, session, SplitDirection::Horizontal, page_id));
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                assert_eq!(app.browser_to_reuse(pid, url), Some(page_id));
+
+                app.request_close_instance(session, cx);
+                assert_eq!(app.close_groups[0].members, vec![session, page_id]);
+                // A held page has left the layout, so the same link opens a
+                // fresh page and the held one still goes with its session.
+                assert_eq!(app.browser_to_reuse(pid, url), None);
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.browser_to_reuse(pid, url), Some(page_id));
             })
             .unwrap();
     });
