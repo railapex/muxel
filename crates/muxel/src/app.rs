@@ -77,6 +77,8 @@ mod control_api;
 mod hotbar;
 mod libraries_ui;
 #[cfg(all(test, windows))]
+mod opener_tests;
+#[cfg(all(test, windows))]
 mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
@@ -6845,9 +6847,13 @@ enum ConfirmAction {
     DeleteRemote(usize),
     DeleteIdentity(usize),
     CloseBatch(Vec<Uuid>),
+    /// `rest` is the close request being planned. `rides_with` names the
+    /// session in it that `iid` would close with (Recent work), when `iid`
+    /// wasn't asked for itself.
     SaveEditorBeforeClose {
         iid: Uuid,
         rest: Vec<Uuid>,
+        rides_with: Option<Uuid>,
     },
     /// Switch the project's git branch (warned — it touches the working tree).
     SwitchBranch {
@@ -16182,6 +16188,27 @@ impl MuxelApp {
         }
     }
 
+    /// The page in `pid`'s layout already showing `url`. Web resources require
+    /// an exact URL match. Local files reuse by decoded path so raw/file URI
+    /// spellings and source fragments share one pane. A page held for Undo
+    /// has left the layout, so it is never reused.
+    #[cfg(not(target_os = "linux"))]
+    fn browser_to_reuse(&self, pid: Uuid, url: &str) -> Option<Uuid> {
+        self.workspace
+            .project(pid)?
+            .instances()
+            .into_iter()
+            .find(|iid| {
+                self.workspace.instance(*iid).is_some_and(|instance| {
+                    instance.kind == InstanceKind::Browser
+                        && instance
+                            .browser_url
+                            .as_deref()
+                            .is_some_and(|existing| same_browser_resource(existing, url))
+                })
+            })
+    }
+
     /// Open the embedded browser pane on `url` in `pid`, placed as `placement`
     /// asks or else by where `origin` is (or seeding an empty project), or focus
     /// and refresh the pane already showing it. Returns the instance id. (Linux
@@ -16197,27 +16224,11 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
-        // Web resources require an exact URL match. Local files reuse by decoded
-        // path so raw/file URI spellings and source fragments share one pane.
-        if let Some(iid) = self
-            .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default()
-            .into_iter()
-            .find(|iid| {
-                self.workspace.instance(*iid).is_some_and(|instance| {
-                    instance.kind == InstanceKind::Browser
-                        && instance
-                            .browser_url
-                            .as_deref()
-                            .is_some_and(|existing| same_browser_resource(existing, &url))
-                })
-            })
-        {
+        if let Some(iid) = self.browser_to_reuse(pid, &url) {
             if let Some(instance) = self.workspace.instance_mut(iid) {
                 instance.browser_url = Some(url.clone());
             }
+            self.record_reopen(iid, origin);
             if let Some(view) = self.browsers.get(&iid).cloned() {
                 view.update(cx, |v, cx| {
                     if v.url() == url {
@@ -16537,15 +16548,18 @@ impl MuxelApp {
         } else {
             path.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         };
-        // Reuse an already-open editor for this exact path.
+        // Reuse an already-open editor for this exact path. One held to close
+        // with its session isn't open any more; this opens a fresh one.
         if let Some(p) = &path
-            && let Some(iid) = self
-                .editors
-                .iter()
-                .find_map(|(iid, ed)| (ed.read(cx).path() == Some(p.as_path())).then_some(*iid))
+            && let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
+                (ed.read(cx).path() == Some(p.as_path()) && !self.is_closing(*iid)).then_some(*iid)
+            })
         {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
+            }
+            if self.record_reopen(iid, origin) {
+                self.persist();
             }
             self.focus_resource(iid, window, cx);
             return Some(iid);
@@ -16659,10 +16673,13 @@ impl MuxelApp {
         // Reuse an already-open diff pane for the same directory: refresh + focus.
         if let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
             let ed = ed.read(cx);
-            (ed.diff_dir() == Some(dir.as_path())).then_some(*iid)
+            (ed.diff_dir() == Some(dir.as_path()) && !self.is_closing(*iid)).then_some(*iid)
         }) {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
+            }
+            if self.record_reopen(iid, origin) {
+                self.persist();
             }
             self.focus_resource(iid, window, cx);
             return;
@@ -16706,10 +16723,14 @@ impl MuxelApp {
     fn place_resource_instance(
         &mut self,
         pid: Uuid,
-        instance: Instance,
+        mut instance: Instance,
         origin: ResourceOrigin,
         placement: Option<PlacementMode>,
     ) -> bool {
+        instance.record_opener(
+            self.opener_session(origin),
+            chrono::Utc::now().timestamp_millis(),
+        );
         let iid = instance.id;
         let kind = instance.kind;
         let kinds: HashMap<Uuid, InstanceKind> = self
@@ -16744,6 +16765,28 @@ impl MuxelApp {
             self.workspace.add_instance(instance);
         }
         placed
+    }
+
+    /// The session behind a resource open from `origin`, for
+    /// [`Instance::opened_by`]. Chrome opens have none.
+    fn opener_session(&self, origin: ResourceOrigin) -> Option<Uuid> {
+        origin
+            .opener()
+            .and_then(|pane| self.workspace.opener_session(pane))
+    }
+
+    /// `origin` opened resource `iid` again while it was open. The last
+    /// session to open it owns it in the sidebar. Returns whether that changed
+    /// anything to save.
+    fn record_reopen(&mut self, iid: Uuid, origin: ResourceOrigin) -> bool {
+        let Some(session) = self.opener_session(origin) else {
+            return false;
+        };
+        let Some(instance) = self.workspace.instance_mut(iid) else {
+            return false;
+        };
+        instance.record_opener(Some(session), chrono::Utc::now().timestamp_millis());
+        true
     }
 
     fn open_editor_resources(&self) -> Vec<(Uuid, Entity<EditorView>)> {
@@ -18322,6 +18365,13 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        // Files held to ride with this session finish with it.
+        let followers: Vec<Uuid> = self
+            .closing
+            .iter()
+            .filter(|(_, held)| held.follows == Some(iid))
+            .map(|(&follower, _)| follower)
+            .collect();
         self.forget_close(iid);
         self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
@@ -18404,6 +18454,9 @@ impl MuxelApp {
         if self.active_instance == Some(iid) {
             self.active_instance =
                 survivor.or_else(|| self.workspace.active().and_then(|p| p.first_instance()));
+        }
+        for follower in followers {
+            self.close_instance_inner(follower, reason, cx);
         }
         self.persist();
         cx.notify();
@@ -21659,8 +21712,28 @@ impl MuxelApp {
     }
 
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
-        self.cancel_close_prompt_answers();
-        self.confirm = None;
+        // Cancel on a file that would have closed with its session keeps that
+        // file open, as an ordinary row from now on, and the rest of the same
+        // request goes on, with any worktree answer it already has. Any other
+        // Cancel drops the whole request and the answers given for it.
+        if let Some(PendingConfirm {
+            action:
+                ConfirmAction::SaveEditorBeforeClose {
+                    iid,
+                    rest,
+                    rides_with: Some(_),
+                },
+            ..
+        }) = &self.confirm
+        {
+            let (iid, rest) = (*iid, rest.clone());
+            self.confirm = None;
+            self.clear_opener(iid);
+            self.continue_close_request(rest, cx);
+        } else {
+            self.cancel_close_prompt_answers();
+            self.confirm = None;
+        }
         cx.notify();
     }
 
@@ -21679,7 +21752,7 @@ impl MuxelApp {
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
             ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
             ConfirmAction::CloseBatch(ids) => self.accept_close_request(ids, false, cx),
-            ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
+            ConfirmAction::SaveEditorBeforeClose { iid, rest, .. } => {
                 self.save_editor_before_close(iid, rest, cx)
             }
             ConfirmAction::SwitchBranch { pid, branch } => {
@@ -22366,7 +22439,34 @@ impl MuxelApp {
     /// Close every other tab in `keep`'s pane (pinned included), leaving only
     /// `keep`. Asks once (batch) if any closed tab's kind confirms-on-close.
     fn close_other_tabs(&mut self, keep: Uuid, _window: &mut Window, cx: &mut Context<Self>) {
-        self.request_recoverable_close(self.other_tabs_in_pane(keep), cx);
+        let others = self.other_tabs_in_pane(keep);
+        self.keep_out_of_close(keep, &others);
+        self.request_recoverable_close(others, cx);
+    }
+
+    /// `keep` is the tab the user chose to keep while `closing` closes around
+    /// it. A file whose owning session is among them would close with that
+    /// session (Recent work), so it stops riding with it first, as Cancel on
+    /// its save question does.
+    fn keep_out_of_close(&mut self, keep: Uuid, closing: &[Uuid]) {
+        if !self
+            .close_dependents(closing)
+            .iter()
+            .any(|&(iid, _)| iid == keep)
+        {
+            return;
+        }
+        self.clear_opener(keep);
+    }
+
+    /// `iid` no longer belongs to any session: it shows as an ordinary row and
+    /// closes only by itself.
+    fn clear_opener(&mut self, iid: Uuid) {
+        if let Some(instance) = self.workspace.instance_mut(iid) {
+            instance.opened_by = None;
+            instance.opened_at = None;
+        }
+        self.persist();
     }
 
     /// Tabs to the left (`right=false`) or right (`right=true`) of `anchor` in its
@@ -22400,7 +22500,9 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_recoverable_close(self.tabs_to_side(anchor, right), cx);
+        let side = self.tabs_to_side(anchor, right);
+        self.keep_out_of_close(anchor, &side);
+        self.request_recoverable_close(side, cx);
     }
 
     /// Clear the active terminal's scrollback history.
@@ -28124,7 +28226,7 @@ impl MuxelApp {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
                 for entry in entries {
-                    let iid = match entry {
+                    let (iid, nested) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
@@ -28147,7 +28249,9 @@ impl MuxelApp {
                             );
                             continue;
                         }
-                        SidebarEntry::Pane(iid) => iid,
+                        SidebarEntry::Pane(iid) => (iid, false),
+                        // Under the session that opened it, one step further in.
+                        SidebarEntry::Nested(iid) => (iid, true),
                     };
                     let inst = instances.get(&iid).copied();
                     let popped_out = self.popouts.contains_key(&iid);
@@ -28274,7 +28378,7 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
-                        .ml_4()
+                        .ml(rems(if nested { 2.0 } else { 1.0 }))
                         .mr_1()
                         .px_2()
                         .py_1()

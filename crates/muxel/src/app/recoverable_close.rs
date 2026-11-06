@@ -25,6 +25,10 @@ pub(super) struct HeldClose {
     pub forced: bool,
     pub launch: HeldLaunch,
     pub restart_lease: Option<RestartLease>,
+    /// A file, diff or page closing with the session it names (Recent work).
+    /// It has no close evidence of its own: it finishes when that session's
+    /// close does, and comes back with it on Undo or Keep.
+    pub follows: Option<Uuid>,
 }
 
 pub(super) struct CloseGroup {
@@ -331,16 +335,82 @@ impl MuxelApp {
         .detach();
     }
 
+    /// The files, diffs and pages that close with `sessions` (Recent work),
+    /// each with the session it rides with. A popped-out one stays open: its
+    /// view belongs to its own window, which a hold can't keep for Undo.
+    pub(super) fn close_dependents(&self, sessions: &[Uuid]) -> Vec<(Uuid, Uuid)> {
+        muxel_core::sidebar::closes_with(
+            self.settings.sidebar_sort,
+            sessions,
+            &self.workspace.instances,
+        )
+        .into_iter()
+        .filter(|(iid, _)| !self.is_closing(*iid) && !self.popouts.contains_key(iid))
+        .collect()
+    }
+
+    fn close_editor_dirty(&self, iid: Uuid, cx: &App) -> bool {
+        self.close_editor(iid)
+            .is_some_and(|editor| editor.read(cx).is_dirty())
+    }
+
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
-        if let Some(&iid) = ids.iter().find(|&&iid| {
-            self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
-        }) {
+        // An unsaved file that would close with a session asks too, naming
+        // that session so Cancel keeps just the file.
+        let sessions: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|&iid| {
+                self.workspace
+                    .instance(iid)
+                    .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
+            })
+            .collect();
+        let dependents = self.close_dependents(&sessions);
+        if let Some((iid, rides_with)) = ids
+            .iter()
+            .map(|&iid| (iid, None))
+            .chain(
+                dependents
+                    .iter()
+                    .map(|&(iid, session)| (iid, Some(session))),
+            )
+            .find(|&(iid, _)| self.close_editor_dirty(iid, cx))
+        {
+            // The user clicked the session, not the file, so say which file
+            // and why it is closing before Don't Save can lose its edits.
+            let name = |iid| {
+                self.workspace
+                    .instance(iid)
+                    .map(|inst| inst.display_name().to_string())
+                    .unwrap_or_default()
+            };
+            let (title, message) = match rides_with {
+                Some(session) => {
+                    let (file, session) = (name(iid), name(session));
+                    (
+                        tf("Save changes to {file}?", &[("file", &file)]),
+                        tf(
+                            "{session} opened {file} and is closing, so the file closes too. \
+                             Save your changes, close it without saving, or Cancel to keep it open.",
+                            &[("file", &file), ("session", &session)],
+                        ),
+                    )
+                }
+                None => (
+                    t("Save changes before closing?").to_string(),
+                    t("Save your changes, or close without saving.").to_string(),
+                ),
+            };
             self.request_confirm(
-                t("Save changes before closing?"),
-                t("Save your changes, or close without saving."),
+                title,
+                message,
                 t("Save"),
-                ConfirmAction::SaveEditorBeforeClose { iid, rest: ids },
+                ConfirmAction::SaveEditorBeforeClose {
+                    iid,
+                    rest: ids,
+                    rides_with,
+                },
                 cx,
             );
             return;
@@ -428,6 +498,10 @@ impl MuxelApp {
         self.accept_close_request(ids, false, cx);
     }
 
+    /// Close what the user asked to close. Every caller is a close the user
+    /// made (a tab, a pane, Close terminals), so in Recent work each session
+    /// takes the files it last opened: they join its hold, or close with it
+    /// when it closes at once. An agent exiting on its own never comes here.
     pub(super) fn accept_close_request(
         &mut self,
         ids: Vec<Uuid>,
@@ -465,15 +539,42 @@ impl MuxelApp {
             steps.push((iid, step));
         }
         self.settle_worktree_answers(&steps);
+        // A file still unsaved here changed after its question: it stays open.
+        let held: Vec<_> = steps
+            .iter()
+            .filter(|(_, step)| matches!(step, AcceptedClose::Hold { .. }))
+            .map(|&(iid, _)| iid)
+            .collect();
+        let followers: Vec<_> = self
+            .close_dependents(&held)
+            .into_iter()
+            .filter(|&(iid, _)| !self.close_editor_dirty(iid, cx))
+            .collect();
+        // A session closing now is gone once it has closed, so find its files
+        // while it is still here.
+        let now: Vec<_> = steps
+            .iter()
+            .filter(|(_, step)| *step == AcceptedClose::Now)
+            .map(|&(iid, _)| iid)
+            .collect();
+        let with_closed = self.close_dependents(&now);
         let mut holds = Vec::new();
         for (iid, step) in steps {
             match step {
+                // Its session is held here, so it rides in that hold instead.
+                AcceptedClose::Now if followers.iter().any(|&(follower, _)| follower == iid) => {}
                 AcceptedClose::Now => self.close_instance_inner(iid, "close", cx),
                 AcceptedClose::Hold { forced } => holds.push((iid, forced)),
                 AcceptedClose::Stays => {}
             }
         }
-        self.hold_closes(holds, None, cx);
+        for (iid, _) in with_closed {
+            // A file the user closed too has gone already.
+            if self.workspace.instance(iid).is_some() && !self.close_editor_dirty(iid, cx) {
+                self.close_instance_inner(iid, "close (with its session)", cx);
+            }
+        }
+        self.hold_closes_with(holds, followers, None, cx);
     }
 
     /// A file answer covers a close only if that close takes every pane it counted.
@@ -530,9 +631,26 @@ impl MuxelApp {
         }
     }
 
+    /// [`Self::hold_closes_with`] with no followers, for tests that exercise
+    /// the hold itself: the Windows PTY tests and the layout tests that run on
+    /// every platform.
+    #[cfg(test)]
     pub(super) fn hold_closes(
         &mut self,
         ids: Vec<(Uuid, bool)>,
+        caller: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
+        self.hold_closes_with(ids, Vec::new(), caller, cx)
+    }
+
+    /// Hold `ids` (each with whether its close is already confirmed) in one
+    /// group, with `followers`: `(file, session)` pairs that ride with a
+    /// session of `ids` held here.
+    pub(super) fn hold_closes_with(
+        &mut self,
+        ids: Vec<(Uuid, bool)>,
+        followers: Vec<(Uuid, Uuid)>,
         caller: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -552,8 +670,19 @@ impl MuxelApp {
             focus: self.active_instance,
             caller,
         };
-        for (iid, forced) in ids {
-            if self.is_closing(iid) {
+        let entries = ids
+            .into_iter()
+            .map(|(iid, forced)| (iid, forced, None))
+            .chain(
+                followers
+                    .into_iter()
+                    .map(|(iid, session)| (iid, true, Some(session))),
+            );
+        for (iid, forced, follows) in entries {
+            // A follower rides only with a session this group holds.
+            if self.is_closing(iid)
+                || follows.is_some_and(|session| !group.members.contains(&session))
+            {
                 continue;
             }
             let Some(inst) = self.workspace.instance(iid) else {
@@ -591,6 +720,7 @@ impl MuxelApp {
                     forced,
                     launch,
                     restart_lease,
+                    follows,
                 },
             );
             group.members.push(iid);
@@ -838,6 +968,10 @@ impl MuxelApp {
             self.focus_instance(iid, window, cx);
         }
         for (iid, held) in restored {
+            // A file back with its session has no process to bring back.
+            if held.follows.is_some() {
+                continue;
+            }
             let view = match self.terminal_view(iid) {
                 Some(view) if !view.read(cx).exited() => HeldView::Running,
                 Some(_) => HeldView::Ended,
@@ -943,7 +1077,8 @@ impl MuxelApp {
                 continue;
             }
             // A confirmed close is final at its deadline. It must not wait for
-            // unrelated quiet members' remote client-count probes.
+            // unrelated quiet members' remote client-count probes. A file
+            // waits for its session, which takes it along when it goes.
             let forced: Vec<_> = self
                 .close_groups
                 .iter()
@@ -951,7 +1086,11 @@ impl MuxelApp {
                 .into_iter()
                 .flat_map(|g| &g.members)
                 .copied()
-                .filter(|iid| self.closing.get(iid).is_some_and(|held| held.forced))
+                .filter(|iid| {
+                    self.closing
+                        .get(iid)
+                        .is_some_and(|held| held.forced && held.follows.is_none())
+                })
                 .collect();
             for iid in forced {
                 self.close_instance_inner(iid, "close (confirmed countdown)", cx);
@@ -1083,10 +1222,19 @@ impl MuxelApp {
             .copied()
             .filter(|&iid| {
                 self.workspace.instance(iid).is_none()
-                    || self.closing.get(&iid).is_none_or(|held| {
-                        let now = self.close_facts(iid, cx);
-                        exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
-                    })
+                    || self
+                        .closing
+                        .get(&iid)
+                        .is_none_or(|held| match held.follows {
+                            // Its session went another way (a peer closed it):
+                            // nothing is left to come back with.
+                            Some(session) => !self.is_closing(session),
+                            None => {
+                                let now = self.close_facts(iid, cx);
+                                exit_proves_closed(now)
+                                    || may_finalize(held.facts, now, held.forced)
+                            }
+                        })
             })
             .collect();
         for iid in ready {

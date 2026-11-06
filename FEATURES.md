@@ -1426,6 +1426,21 @@ feature is added or changed, update the matching entry here in the same change**
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
   recent rows can still be dragged onto panes.
+- **Files nest under their session** — in Recent work, a file, diff or page a
+  session opened (a terminal link, its diff button, or a link in a file it
+  opened) shows indented under that session's row and moves with it, newest
+  first. Opening it again from another session moves it there; the file
+  browser and palette leave it where it is. Once that session closes, or if it's
+  in another project, the resource is an ordinary row again. A pinned file stays
+  with the pins unless its session is pinned too.
+- **Files close with their session** — in Recent work, closing a session (its
+  tab, its pane, or Close terminals) also closes the files, diffs and pages it
+  last opened. They join the session's countdown, so one Undo brings them all
+  back. An unsaved file asks first, naming the file and the session taking it:
+  Cancel keeps it open as an ordinary row while the session still closes. A
+  file another session reopened stays, and so does a popped-out one or the tab
+  you chose Close other tabs from. An agent exiting on its own never takes its
+  files.
 - **Unread sessions** — in Recent work, a dot and bold name mark a completion or
   blocked event since the session was last attended. Only attendance clears the
   mark, even if another turn starts; Done persists. Project rows show the unread
