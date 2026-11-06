@@ -166,15 +166,34 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     }
 }
 
+/// `Command::output` for git, also recorded by the UI profiler when it's on
+/// (`ui_profile::git_launched`; the caller label comes from
+/// `ui_profile::git_caller`).
+trait ProfiledOutput {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl ProfiledOutput for Command {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
+        if !crate::ui_profile::is_enabled() {
+            return self.output();
+        }
+        let started = Instant::now();
+        let out = self.output();
+        crate::ui_profile::git_launched(self, started.elapsed(), &out);
+        out
+    }
+}
+
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
-    git_command_at(loc, args, true).output()
+    git_command_at(loc, args, true).profiled_output()
 }
 
 /// Mutations deliberately keep git's normal locking behavior.
 fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
-    git_command_at(loc, args, false).output()
+    git_command_at(loc, args, false).profiled_output()
 }
 
 const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
@@ -398,7 +417,7 @@ fn git_ignores(root: &Path, path: &str) -> bool {
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "-q", "--", path])
-        .output()
+        .profiled_output()
         .is_ok_and(|o| o.status.success())
 }
 
@@ -1020,7 +1039,7 @@ pub fn is_git_repo(path: &Path) -> bool {
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
+        .profiled_output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -1032,7 +1051,7 @@ pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Resul
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
         .arg(worktree_path)
-        .output()
+        .profiled_output()
         .context("running `git worktree add`")?;
     if !output.status.success() {
         bail!(
@@ -1053,7 +1072,7 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -1072,9 +1091,71 @@ pub fn repo_head(repo: &Path) -> Option<String> {
 }
 
 /// The repo's current branch, including before its first commit. `None` when
-/// detached or Git fails. Used only for display; works for local and remote repos.
+/// detached or git fails. Used only for display; works for local and remote
+/// repos. A local repo on a branch is answered from its HEAD file, so the status
+/// poll starts no git process for it; anything else asks git.
 pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
+    if let RepoLoc::Local(dir) = loc
+        && let Some(branch) = branch_from_head_file(dir)
+    {
+        return Some(branch);
+    }
     git_line_loc(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+}
+
+/// The branch `dir`'s HEAD file names, when it holds exactly what git writes for
+/// a branch (`ref: refs/heads/<name>` and a newline) in the git dir found as git
+/// finds it (a `.git` directory, or a linked worktree's `.git` file). That is
+/// what `git symbolic-ref --quiet --short HEAD` prints there, born or not.
+/// `None` for anything else, which the caller asks git about: a detached HEAD,
+/// a HEAD naming another kind of ref, reftable's placeholder HEAD, a name git
+/// would print as `heads/<name>` (see [`short_name_is_taken`]), no `.git`
+/// found, or a file that can't be read.
+fn branch_from_head_file(dir: &Path) -> Option<String> {
+    let git_dir = find_git_dir(dir)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.strip_prefix("ref: refs/heads/")?.strip_suffix('\n')?;
+    let plain = !branch.is_empty()
+        && branch != ".invalid"
+        && !branch.chars().any(|c| c.is_whitespace() || c.is_control());
+    (plain && !short_name_is_taken(&git_dir, branch)).then(|| branch.to_string())
+}
+
+/// Whether a ref other than `refs/heads/<name>` could also be called `<name>`:
+/// one at `<name>`, `refs/<name>`, `refs/tags/<name>`, `refs/remotes/<name>` or
+/// `refs/remotes/<name>/HEAD`, loose or in `packed-refs`. git then shortens the
+/// branch to `heads/<name>`, in [`list_branches`] too, so only git can say what
+/// it would print. A `packed-refs` that exists but can't be read counts as taken.
+fn short_name_is_taken(git_dir: &Path, name: &str) -> bool {
+    let common = common_git_dir(git_dir);
+    let others = [
+        name.to_string(),
+        format!("refs/{name}"),
+        format!("refs/tags/{name}"),
+        format!("refs/remotes/{name}"),
+        format!("refs/remotes/{name}/HEAD"),
+    ];
+    if others
+        .iter()
+        .any(|r| git_dir.join(r).is_file() || common.join(r).is_file())
+    {
+        return true;
+    }
+    match std::fs::read_to_string(common.join("packed-refs")) {
+        Ok(packed) => packed.lines().any(|line| {
+            line.split_once(' ')
+                .is_some_and(|(_, r)| others.iter().any(|o| o == r))
+        }),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Where a git dir's shared refs live: the main repo's git dir for a linked
+/// worktree (its `commondir` file), else the git dir itself.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|_| git_dir.to_path_buf())
 }
 
 /// A cheap stamp of the git metadata [`repo_current_branch`] and [`list_branches`]
@@ -1097,9 +1178,7 @@ pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
         return GitRefStamp::default();
     };
     // A linked worktree's branches live in the main repo's git dir.
-    let common = std::fs::read_to_string(git_dir.join("commondir"))
-        .map(|rel| git_dir.join(rel.trim()))
-        .unwrap_or_else(|_| git_dir.clone());
+    let common = common_git_dir(&git_dir);
     let file_stamp = |path: PathBuf| {
         let meta = std::fs::metadata(path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
@@ -1148,7 +1227,7 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1166,7 +1245,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -1181,7 +1260,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
-        .output()
+        .profiled_output()
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
@@ -1189,7 +1268,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
-            .output();
+            .profiled_output();
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
@@ -1202,7 +1281,7 @@ pub fn delete_branch(repo: &Path, branch: &str) {
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
-        .output();
+        .profiled_output();
 }
 
 /// Stage **all** changes (tracked, untracked, and deletions) and commit them at
@@ -1387,7 +1466,7 @@ pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
-        .output()
+        .profiled_output()
         .context("running `git push`")?;
     if !out.status.success() {
         bail!("git push: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -1432,7 +1511,7 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
             .arg("-C")
             .arg(worktree_path)
             .args(args)
-            .output()
+            .profiled_output()
             .context("running git")
     };
     let reset = run(&["reset", "--hard", base_ref])?;
@@ -1454,12 +1533,12 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
-        .output();
+        .profiled_output();
     let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
-        .output();
+        .profiled_output();
 }
 
 /// Maximum diff text we load into the viewer (bytes), so a giant diff can't
@@ -1477,7 +1556,7 @@ pub fn git_diff(dir: &Path) -> String {
             .arg(dir)
             .arg("--no-pager")
             .args(args)
-            .output()
+            .profiled_output()
     };
 
     // Resolve the repo root (also our "is this a git repo?" check, in one call).
@@ -7690,6 +7769,126 @@ mod tests {
         assert_eq!(plain, git_ref_stamp(&dir));
         git_out(&dir, &["init", "-q", "-b", "main"]);
         assert_ne!(git_ref_stamp(&dir), plain);
+        lib_cleanup(&dir);
+    }
+
+    /// What git itself answers for the current branch.
+    fn git_symbolic_branch(dir: &Path) -> Option<String> {
+        let out = command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn head_file_branch_matches_git_without_running_it() {
+        let repo = TestRepo::init();
+        let answers = |dir: &Path, state: &str| {
+            let from_file = branch_from_head_file(dir);
+            assert!(from_file.is_some(), "{state}: answered from the file");
+            assert_eq!(from_file, git_symbolic_branch(dir), "{state}");
+        };
+        answers(repo.path(), "unborn");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        answers(repo.path(), "on a branch");
+        repo.git(&["checkout", "-q", "-b", "feature/x"]);
+        let deeper = repo.path().join("src");
+        std::fs::create_dir_all(&deeper).unwrap();
+        answers(&deeper, "nested branch name, from a subdirectory");
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        answers(&wt, "linked worktree");
+
+        // git can't read this repo any more, yet the branch still comes back:
+        // it was read without starting git.
+        std::fs::write(repo.path().join(".git").join("config"), "[core\n").unwrap();
+        assert_eq!(
+            git_symbolic_branch(repo.path()),
+            None,
+            "git rejects the config"
+        );
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("feature/x"));
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn head_file_leaves_every_other_head_to_git() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let asks_git = |dir: &Path, state: &str| {
+            assert_eq!(
+                branch_from_head_file(dir),
+                None,
+                "{state}: not from the file"
+            );
+            let loc = RepoLoc::Local(dir.to_path_buf());
+            assert_eq!(
+                repo_current_branch(&loc),
+                git_symbolic_branch(dir),
+                "{state}"
+            );
+        };
+        let head = repo.path().join(".git").join("HEAD");
+
+        repo.git(&["checkout", "-q", "--detach"]);
+        asks_git(repo.path(), "detached");
+        repo.git(&["symbolic-ref", "HEAD", "refs/remotes/origin/main"]);
+        asks_git(repo.path(), "HEAD names a remote-tracking ref");
+        std::fs::write(&head, "ref: refs/heads/main").unwrap();
+        asks_git(repo.path(), "no trailing newline, unlike git's own");
+        assert_eq!(git_symbolic_branch(repo.path()).as_deref(), Some("main"));
+
+        // Another ref with the branch's short name: git prints `heads/<name>`.
+        repo.git(&["checkout", "-q", "-b", "v1"]);
+        repo.git(&["tag", "v1"]);
+        asks_git(repo.path(), "a loose tag with the branch's name");
+        assert_eq!(
+            git_symbolic_branch(repo.path()).as_deref(),
+            Some("heads/v1")
+        );
+        repo.git(&["pack-refs", "--all"]);
+        asks_git(repo.path(), "a packed tag with the branch's name");
+        repo.git(&["tag", "-d", "v1"]);
+        repo.git(&["update-ref", "refs/remotes/v1/HEAD", "HEAD"]);
+        asks_git(repo.path(), "a remote named like the branch");
+
+        repo.git(&["checkout", "-q", "main"]);
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        let link = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let admin = link.trim().strip_prefix("gitdir:").unwrap().trim();
+        std::fs::remove_dir_all(admin).unwrap();
+        asks_git(&wt, "linked worktree whose git dir is gone");
+
+        let plain = lib_temp_dir();
+        asks_git(&plain, "not a repository");
+        lib_cleanup(&plain);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn a_reftable_repo_asks_git_for_its_branch() {
+        let dir = lib_temp_dir();
+        let init = command("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q", "--ref-format=reftable", "-b", "trunk"])
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            eprintln!("skipping: this git has no reftable support");
+            return lib_cleanup(&dir);
+        }
+        assert_eq!(branch_from_head_file(&dir), None, "HEAD is a placeholder");
+        let loc = RepoLoc::Local(dir.clone());
+        assert_eq!(repo_current_branch(&loc), git_symbolic_branch(&dir));
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("trunk"));
         lib_cleanup(&dir);
     }
 }

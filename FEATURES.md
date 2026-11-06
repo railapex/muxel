@@ -1429,7 +1429,9 @@ feature is added or changed, update the matching entry here in the same change**
   instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
   and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
-  branch icon (refreshed live). Long labels ellipsize within the header; hover for
+  branch icon (refreshed live), including a new repo's branch before its first
+  commit. A local repo's branch is read from its HEAD file, without starting git.
+  Long labels ellipsize within the header; hover for
   the full branch name.
 - **Session folder chips** — terminal rows show their launch folder's short name
   when it differs from the project root, plus its current Git branch when known.
@@ -1868,7 +1870,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
   session lookup hits, outcome changes and slow calls, with per-minute counts
   and maximum durations for all discovery polls. Launch-time resume lookups
-  always log. Both profiler logs keep stable live paths and dated history
+  always log. Every local `git` run gets a record (which poll ran it, the
+  subcommand, its time, and whether it printed the same as last time).
+  Both profiler logs keep stable live paths and dated history
   (14 local dates and 256 MiB per family by default, tunable with
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
