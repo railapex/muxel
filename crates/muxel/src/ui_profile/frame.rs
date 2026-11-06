@@ -37,7 +37,6 @@
 //! Records carry fixed labels, counts and durations only.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -332,12 +331,13 @@ impl Interval {
 thread_local! {
     static FRAMES: RefCell<Vec<FrameAcc>> = const { RefCell::new(Vec::new()) };
     static INTERVAL: RefCell<Option<Interval>> = const { RefCell::new(None) };
-    static TRACE: RefCell<Option<gpui::profiler::FrameTimingCollector>> = const { RefCell::new(None) };
 }
 
-static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// GPUI's own record of one `Window::draw`.
+/// GPUI's own record of one `Window::draw`. The private GPUI pin keeps its
+/// frame trace behind its `profiler` feature, which muxel doesn't enable, so
+/// this build never receives one: frames report `post` (paint end to arena
+/// clear) instead of `tail` and `present`, and no `pre` or draw queue.
+#[allow(dead_code)]
 struct DrawTiming {
     window: u64,
     draw_start: Instant,
@@ -346,39 +346,12 @@ struct DrawTiming {
     invalidations: u64,
 }
 
-/// Turn on GPUI's frame trace and start collecting from this frame on. The
-/// GPUI dependency of this module is this function and [`take_draw_timings`].
-fn start_gpui_trace() {
-    if !TRACE_ENABLED.swap(true, Ordering::Relaxed) {
-        gpui::profiler::set_frame_trace_enabled(true);
-    }
-    TRACE.with(|trace| {
-        trace
-            .borrow_mut()
-            .get_or_insert_with(gpui::profiler::FrameTimingCollector::new);
-    });
-}
+/// No frame trace on the private GPUI pin (see [`DrawTiming`]).
+fn start_gpui_trace() {}
 
-/// GPUI draws recorded since the last call, oldest first.
+/// No frame trace on the private GPUI pin (see [`DrawTiming`]).
 fn take_draw_timings() -> Vec<DrawTiming> {
-    TRACE.with(|trace| {
-        trace
-            .borrow_mut()
-            .as_mut()
-            .map_or_else(Vec::new, |collector| {
-                collector
-                    .collect_unseen()
-                    .into_iter()
-                    .map(|timing| DrawTiming {
-                        window: timing.window_id.as_u64(),
-                        draw_start: timing.draw_start,
-                        draw_end: timing.draw_end,
-                        dirty_at: timing.dirty_at,
-                        invalidations: timing.invalidations,
-                    })
-                    .collect()
-            })
-    })
+    Vec::new()
 }
 
 /// Open a frame for one root-view render. Called on the UI thread when
