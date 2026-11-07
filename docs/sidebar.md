@@ -57,6 +57,14 @@ unread. The mark survives subsequent state changes and clears only when the
 session is attended. Done and its age remain after attendance. Project headers
 show their unread count whether expanded or collapsed.
 
+`sidebar::is_unread` is the one read rule. The mark, the tiers above, and the
+outline pill of a read Done all use it: the pill's test,
+`AgentActivity::has_unattended_completion`, is `is_unread` restricted to a Done
+session, so a Done row's pill and mark cannot disagree. The pill can only say
+read or unread while the row shows Done. The mark also flags a finish whose
+agent has started again, and tells an unseen question from a seen one, which
+the blocked pill shows alike.
+
 Agent events are omitted from the Recent work notification feed because the
 session itself moves up and carries unread. App messages such as git results,
 SSH errors and save failures remain in NOTIFICATIONS. This is a presentation

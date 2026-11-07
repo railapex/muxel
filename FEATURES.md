@@ -1371,8 +1371,10 @@ feature is added or changed, update the matching entry here in the same change**
   recent rows can still be dragged onto panes.
 - **Unread sessions** — in Recent work, a dot and bold name mark a completion or
   blocked event since the session was last attended. Only attendance clears the
-  mark, even if another turn starts; Done persists. Project rows show the unread
-  count even when collapsed. Agent notifications appear on these session rows
+  mark, even if another turn starts; Done persists. The mark and a read done's
+  outline pill follow the same rule, so a done row's pill and mark always agree;
+  the mark also keeps an unseen finish or question visible after the agent moves
+  on. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
   instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
   and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
