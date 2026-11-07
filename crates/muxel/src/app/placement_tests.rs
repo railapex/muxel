@@ -136,10 +136,13 @@ fn a_link_opens_beside_the_pane_it_was_clicked_in_not_the_focused_one() {
                 pane: y,
             };
             app.on_open_link(&link, window, cx);
-            let opened = app.active_instance.unwrap();
             assert_eq!(app.editors.len(), 1, "the link opened no editor");
+            let opened = *app.editors.keys().next().unwrap();
             assert_eq!(group(app, pid, opened), [z, opened], "beside Y, not X");
             assert_eq!(group(app, pid, y), [y]);
+            // It shows in front of its group, and the keys stay with X.
+            assert_eq!(front_tab(app, pid, z), opened);
+            assert_eq!(app.active_instance, Some(x), "the Ctrl+click took focus");
             // Y opened it, so in Recent work it nests and closes with Y.
             let opener = |app: &MuxelApp, iid| app.workspace.instance(iid).unwrap().opened_by;
             assert_eq!(opener(app, opened), Some(y));
@@ -325,20 +328,40 @@ fn two_windows(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>) -> TwoWind
     }
 }
 
+/// The terminal gestures that open a link without taking the keys.
+#[derive(Clone, Copy, Debug)]
+enum Quiet {
+    MiddleClick,
+    CtrlClick,
+}
+
+impl Quiet {
+    const ALL: [Quiet; 2] = [Quiet::MiddleClick, Quiet::CtrlClick];
+}
+
 impl TwoWindows {
-    /// A middle-click on `url` in pane `from`, shown in `window`.
-    fn middle_click(
+    /// `gesture` on `url` in pane `from`, shown in `window`.
+    fn click(
         &self,
         cx: &mut TestAppContext,
         main: WindowHandle<MuxelApp>,
         window: impl Into<AnyWindowHandle>,
+        gesture: Quiet,
         url: String,
         from: Uuid,
     ) {
         let app = main.entity(cx).unwrap();
-        let link = muxel_terminal::OpenLinkBackground { url, pane: from };
         cx.update_window(window.into(), |_, window, cx| {
-            app.update(cx, |app, cx| app.on_open_link_background(&link, window, cx))
+            app.update(cx, |app, cx| match gesture {
+                Quiet::MiddleClick => {
+                    let link = muxel_terminal::OpenLinkBackground { url, pane: from };
+                    app.on_open_link_background(&link, window, cx)
+                }
+                Quiet::CtrlClick => {
+                    let link = muxel_terminal::OpenLink { url, pane: from };
+                    app.on_open_link(&link, window, cx)
+                }
+            })
         })
         .unwrap();
         cx.run_until_parked();
@@ -372,87 +395,95 @@ impl TwoWindows {
 }
 
 #[test]
-fn a_background_open_leaves_each_windows_focus_its_own() {
-    with_app(|cx, main| {
-        let w = two_windows(cx, main);
-        let d = main
-            .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
+fn a_quiet_open_leaves_each_windows_focus_its_own() {
+    for gesture in Quiet::ALL {
+        with_app(|cx, main| {
+            let w = two_windows(cx, main);
+            let d = main
+                .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
+                .unwrap();
+
+            // A click on a path in B, in the second window.
+            let url = muxel_terminal::file_uri(&d);
+            w.click(cx, main, w.secondary, gesture, url.clone(), w.b);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a new file"));
+            main.read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 3, "the link opened no editor");
+                assert_eq!(group(app, w.other, w.c).len(), 2, "beside B, in C's group");
+            })
             .unwrap();
 
-        // A middle-click on a path in B, in the second window.
-        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
-        w.assert_focus_kept(cx, main, "a new file");
-        main.read_with(cx, |app, _| {
-            assert_eq!(app.editors.len(), 3, "the link opened no editor");
-            assert_eq!(group(app, w.other, w.c).len(), 2, "beside B, in C's group");
-        })
-        .unwrap();
-
-        // The same path middle-clicked in the main window reuses that file.
-        let caller = main
-            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            // The same path clicked in the main window reuses that file.
+            let caller = main
+                .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+                .unwrap();
+            w.click(cx, main, main, gesture, url, caller);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a reused file"));
+            main.read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 3, "the file opened twice");
+            })
             .unwrap();
-        w.middle_click(cx, main, main, muxel_terminal::file_uri(&d), caller);
-        w.assert_focus_kept(cx, main, "a reused file");
-        main.read_with(cx, |app, _| {
-            assert_eq!(app.editors.len(), 3, "the file opened twice");
-        })
-        .unwrap();
-    });
+        });
+    }
 }
 
 /// Going to a link's line moves the editor's cursor, which focuses the editor
 /// in the window the open runs in.
 #[test]
-fn a_background_link_to_a_line_leaves_each_windows_focus_its_own() {
-    with_app(|cx, main| {
-        let w = two_windows(cx, main);
-        let e = main
-            .update(cx, |app, _, _| text_file(app, w.other, "e.txt"))
-            .unwrap();
-        let url = format!("{}#L2", muxel_terminal::file_uri(&e));
+fn a_quiet_link_to_a_line_leaves_each_windows_focus_its_own() {
+    for gesture in Quiet::ALL {
+        with_app(|cx, main| {
+            let w = two_windows(cx, main);
+            let e = main
+                .update(cx, |app, _, _| text_file(app, w.other, "e.txt"))
+                .unwrap();
+            let url = format!("{}#L2", muxel_terminal::file_uri(&e));
 
-        w.middle_click(cx, main, w.secondary, url.clone(), w.b);
-        w.assert_focus_kept(cx, main, "a new file at a line");
-        // Again from the main window, where the file is the other window's.
-        let caller = main
-            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            w.click(cx, main, w.secondary, gesture, url.clone(), w.b);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a new file at a line"));
+            // Again from the main window, where the file is the other window's.
+            let caller = main
+                .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+                .unwrap();
+            w.click(cx, main, main, gesture, url, caller);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a reused file at a line"));
+            main.read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 3, "the file opened twice");
+            })
             .unwrap();
-        w.middle_click(cx, main, main, url, caller);
-        w.assert_focus_kept(cx, main, "a reused file at a line");
-        main.read_with(cx, |app, _| {
-            assert_eq!(app.editors.len(), 3, "the file opened twice");
-        })
-        .unwrap();
-    });
+        });
+    }
 }
 
 /// Reopening a clean file that changed on disk reloads it, which focuses its
 /// editor in the window the open runs in.
 #[test]
-fn a_background_reopen_of_a_changed_file_leaves_each_windows_focus_its_own() {
-    with_app(|cx, main| {
-        let w = two_windows(cx, main);
-        let d = main
-            .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
-            .unwrap();
-        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
+fn a_quiet_reopen_of_a_changed_file_leaves_each_windows_focus_its_own() {
+    for gesture in Quiet::ALL {
+        with_app(|cx, main| {
+            let w = two_windows(cx, main);
+            let d = main
+                .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
+                .unwrap();
+            let url = muxel_terminal::file_uri(&d);
+            w.click(cx, main, w.secondary, gesture, url.clone(), w.b);
 
-        std::fs::write(&d, "changed\n").unwrap();
-        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
-        w.assert_focus_kept(cx, main, "a reload in the file's window");
-        // Again from the main window, where the file is the other window's.
-        std::fs::write(&d, "changed again\n").unwrap();
-        let caller = main
-            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            std::fs::write(&d, "changed\n").unwrap();
+            w.click(cx, main, w.secondary, gesture, url.clone(), w.b);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a reload in its window"));
+            // Again from the main window, where the file is the other window's.
+            std::fs::write(&d, "changed again\n").unwrap();
+            let caller = main
+                .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+                .unwrap();
+            w.click(cx, main, main, gesture, url, caller);
+            w.assert_focus_kept(cx, main, &format!("{gesture:?}, a reload from elsewhere"));
+            main.read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 3, "the file opened twice");
+            })
             .unwrap();
-        w.middle_click(cx, main, main, muxel_terminal::file_uri(&d), caller);
-        w.assert_focus_kept(cx, main, "a reload from another window");
-        main.read_with(cx, |app, _| {
-            assert_eq!(app.editors.len(), 3, "the file opened twice");
-        })
-        .unwrap();
-    });
+        });
+    }
 }
 
 /// A live terminal in `pid`, made in `window`: a shell that prints a line and
@@ -627,6 +658,9 @@ fn a_link_in_a_popped_out_terminal_opens_in_its_projects_window() {
             cx.run_until_parked();
         };
 
+        let secondary_focus = focused(cx, secondary);
+
+        // A Ctrl+click shows the file there and moves no focus.
         let link = muxel_terminal::OpenLink {
             url: muxel_terminal::file_uri(&first),
             pane: term,
@@ -641,11 +675,10 @@ fn a_link_in_a_popped_out_terminal_opens_in_its_projects_window() {
                 opened
             })
             .unwrap();
-        let opened_focus = editor_focus(cx, main, opened);
-        assert_eq!(focused(cx, secondary), Some(opened_focus.clone()));
+        assert_eq!(focused(cx, secondary), secondary_focus);
         assert_eq!(focused(cx, popout), Some(term_focus.clone()));
 
-        // A middle-click opens beside it and moves no focus.
+        // So does a middle-click, beside it.
         let link = muxel_terminal::OpenLinkBackground {
             url: muxel_terminal::file_uri(&second),
             pane: term,
@@ -656,7 +689,7 @@ fn a_link_in_a_popped_out_terminal_opens_in_its_projects_window() {
             assert_eq!(group(app, pid, opened).len(), 2);
         })
         .unwrap();
-        assert_eq!(focused(cx, secondary), Some(opened_focus));
+        assert_eq!(focused(cx, secondary), secondary_focus);
         assert_eq!(focused(cx, popout), Some(term_focus.clone()));
     });
 }
@@ -739,14 +772,8 @@ fn reopening_a_file_or_diff_shown_in_another_window_focuses_it_there() {
         let todo_editor = open_file(cx, main, secondary, first, &todo, near);
         let main_focus = focused(cx, main);
 
-        main.update(cx, |app, window, cx| {
-            let link = muxel_terminal::OpenLink {
-                url: muxel_terminal::file_uri(&notes),
-                pane: caller,
-            };
-            app.on_open_link(&link, window, cx);
-        })
-        .unwrap();
+        // Reopened from the second project, as the file browser does.
+        open_file(cx, main, main, second, &notes, ResourceOrigin::Pane(caller));
         assert_eq!(
             focused(cx, main),
             main_focus,
@@ -777,8 +804,9 @@ fn reopening_a_file_or_diff_shown_in_another_window_focuses_it_there() {
         })
         .unwrap();
 
-        // Going to a line, and reloading a changed file, both focus the editor
-        // in the window they run in: here, the main window.
+        // A Ctrl+click on a line of a changed file there. Going to the line,
+        // and the reload, both focus the editor in the window they run in:
+        // here, the main window. Each window keeps its own focus.
         std::fs::write(&todo, "changed\n").unwrap();
         main.update(cx, |app, window, cx| {
             let link = muxel_terminal::OpenLink {
@@ -796,8 +824,14 @@ fn reopening_a_file_or_diff_shown_in_another_window_focuses_it_there() {
         );
         assert_eq!(
             focused(cx, secondary),
-            Some(editor_focus(cx, main, todo_editor))
+            Some(editor_focus(cx, main, diff)),
+            "the Ctrl+click moved the second window's focus"
         );
+        main.read_with(cx, |app, cx| {
+            assert_eq!(app.editors[&todo_editor].read(cx).text(cx), "changed\n");
+            assert_eq!(app.active_instance, Some(diff));
+        })
+        .unwrap();
     });
 }
 
@@ -819,8 +853,15 @@ fn reopening_a_file_behind_the_dashboard_shows_it() {
             .unwrap();
         let secondary = secondary_window(cx, main, second);
         let secondary_focus = focused(cx, secondary);
+        // Opening the file focused it; the main window's focus moves off it.
+        let elsewhere = cx.update(|cx| cx.focus_handle());
+        main.update(cx, |_, window, cx| window.focus(&elsewhere, cx))
+            .unwrap();
+        let main_focus = focused(cx, main);
+        assert_eq!(main_focus, Some(elsewhere.clone()));
 
-        // A Ctrl+click on its path in the second window.
+        // A Ctrl+click on its path in the second window shows it there and
+        // moves no focus.
         let app = main.entity(cx).unwrap();
         let link = muxel_terminal::OpenLink {
             url: muxel_terminal::file_uri(&notes),
@@ -831,17 +872,29 @@ fn reopening_a_file_behind_the_dashboard_shows_it() {
         })
         .unwrap();
         cx.run_until_parked();
+        let shown = |cx: &mut TestAppContext, open: &str| {
+            main.read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 1, "{open}: the file opened twice");
+                assert_eq!(
+                    app.main_view,
+                    MainView::Panes,
+                    "{open}: the Dashboard hides the file"
+                );
+                assert_eq!(app.workspace.active_project, Some(first), "{open}");
+            })
+            .unwrap();
+        };
+        shown(cx, "Ctrl+click");
+        assert_eq!(focused(cx, main), main_focus, "the Ctrl+click took focus");
+        assert_eq!(focused(cx, secondary), secondary_focus);
 
-        main.read_with(cx, |app, _| {
-            assert_eq!(app.editors.len(), 1, "the file opened twice");
-            assert_eq!(
-                app.main_view,
-                MainView::Panes,
-                "the Dashboard hides the file"
-            );
-            assert_eq!(app.workspace.active_project, Some(first));
-        })
-        .unwrap();
+        // Opened from the second window as the file browser does, it's focused.
+        main.update(cx, |app, _, _| app.main_view = MainView::Dashboard)
+            .unwrap();
+        let origin = ResourceOrigin::Pane(caller);
+        open_file(cx, main, secondary, second, &notes, origin);
+        cx.run_until_parked();
+        shown(cx, "file browser");
         assert_eq!(focused(cx, main), Some(editor_focus(cx, main, open)));
         assert_eq!(focused(cx, secondary), secondary_focus);
     });
@@ -918,5 +971,98 @@ fn reopening_a_file_no_window_shows_from_a_second_window_focuses_it_only_in_the_
             })
             .unwrap();
         }
+    });
+}
+
+/// A link clicked in a rendered Markdown file resolves against the file's
+/// folder and opens beside the file's pane, which keeps the focus.
+#[test]
+fn a_rendered_markdown_link_opens_beside_its_file_without_taking_focus() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let root = main
+            .read_with(cx, |app, _| {
+                app.workspace.project(pid).unwrap().root_path.clone()
+            })
+            .unwrap();
+        for dir in ["docs", "src"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let readme = root.join("docs").join("README.md");
+        std::fs::write(&readme, "[guide](guide.md)\n").unwrap();
+        std::fs::write(root.join("docs").join("guide.md"), "# Guide\n").unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {\n}\n").unwrap();
+        let near = ResourceOrigin::Chrome { near: None };
+        let md = open_file(cx, main, main, pid, &readme, near);
+        let md_focus = editor_focus(cx, main, md);
+        let view = main
+            .read_with(cx, |app, _| app.editors[&md].entity_id())
+            .unwrap();
+        let click = |cx: &mut TestAppContext, href: &str, background: bool| {
+            cx.update(|cx| MuxelApp::open_rendered_link(view, href, background, cx));
+            cx.run_until_parked();
+        };
+        let opened = |cx: &mut TestAppContext, name: &str| {
+            main.read_with(cx, |app, cx| {
+                app.editors
+                    .iter()
+                    .find(|(_, e)| {
+                        e.read(cx)
+                            .path()
+                            .and_then(|p| p.file_name())
+                            .is_some_and(|n| n == name)
+                    })
+                    .map(|(iid, _)| *iid)
+            })
+            .unwrap()
+        };
+
+        // A plain click: the guide opens rendered beside the README, in front.
+        click(cx, "guide.md", false);
+        let guide = opened(cx, "guide.md").expect("the link opened nothing");
+        main.read_with(cx, |app, cx| {
+            assert!(app.editors[&guide].read(cx).show_rendered());
+            assert_ne!(
+                group(app, pid, guide),
+                group(app, pid, md),
+                "beside, not over it"
+            );
+            assert_eq!(front_tab(app, pid, guide), guide);
+            assert_eq!(app.active_instance, Some(md), "the click took focus");
+        })
+        .unwrap();
+        assert_eq!(focused(cx, main), Some(md_focus.clone()));
+
+        // A plain click on a line in another folder joins it there.
+        click(cx, "../src/main.rs#L2", false);
+        let code = opened(cx, "main.rs").expect("the line link opened nothing");
+        main.read_with(cx, |app, cx| {
+            assert_eq!(group(app, pid, code), [guide, code]);
+            assert_eq!(app.editors[&code].read(cx).cursor(cx).line, 1);
+        })
+        .unwrap();
+        assert_eq!(
+            focused(cx, main),
+            Some(md_focus.clone()),
+            "the line took focus"
+        );
+
+        // A middle-click or Ctrl+click on the guide reuses it in the background.
+        click(cx, "guide.md#top", true);
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the guide opened twice");
+            assert_eq!(app.active_instance, Some(md));
+        })
+        .unwrap();
+        assert_eq!(focused(cx, main), Some(md_focus.clone()));
+
+        // An anchor in the file, a scheme muxel won't follow and a broken link
+        // open nothing.
+        for href in ["#guide", "javascript:alert(1)", "missing.md"] {
+            click(cx, href, false);
+            let count = main.read_with(cx, |app, _| app.editors.len()).unwrap();
+            assert_eq!(count, 3, "{href} opened an editor");
+        }
+        assert_eq!(focused(cx, main), Some(md_focus));
     });
 }

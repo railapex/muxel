@@ -1276,15 +1276,21 @@ feature is added or changed, update the matching entry here in the same change**
   `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink` or agent markdown
   links), a literal Markdown inline link, a `file://` URI, or a **file path**
   (Windows/Unix absolute, `~/`, or relative to the pane's working directory).
-  Local files open in a muxel editor pane; only paths that exist are
+  It shows beside the terminal and the keys stay in the terminal; click into
+  the file or page to type there. Local files open in a muxel editor pane; only paths that exist are
   clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  focus in any window; browser target=_blank, window.open, Ctrl+click, and
-  middle-click requests stay in the source project and open as Muxel tabs, a
-  popped-out terminal's in its project's window. Right-clicking a terminal link
-  opens link actions instead of copying or pasting through the PTY.
+  focus in any window. In a browser page, a middle-click or `Ctrl`/`Cmd`+click
+  on a link opens it in a background tab beside the page, and the page keeps the
+  keys; on Windows the link menu's **Open link in new tab**, in place of "Open
+  link in new window", does the same. A target=_blank link and window.open open
+  a tab in front. Page links open as Muxel tabs in the page's project, in the
+  window showing it, and a popped-out terminal's in its project's window. A page
+  opens only web links this way, never a local file or another app's link, and
+  no more than ten at once and about three a second after. Right-clicking a
+  terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -1357,6 +1363,13 @@ feature is added or changed, update the matching entry here in the same change**
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text). Paragraphs combining inline
   images and line breaks render without crashing, including linked HTML images.
+  Links in rendered Markdown resolve against the file's folder (`other.md`,
+  `../src/main.rs#L10`, `my%20notes.md`) and open beside the file as a terminal
+  link does: a click shows it and keeps the keys where they are, and a
+  middle-click or `Ctrl`/`Cmd`+click opens it in the background. Web links
+  follow the built-in browser setting and `mailto:` links go to the mail app.
+  Other schemes, network paths and broken links do nothing, and a `#heading`
+  link doesn't scroll the file.
 - **Copy as rich text** — a rendered Markdown pane's header has a **Copy as rich
   text** button (also in the Ctrl+P palette) that copies the whole document as
   formatted HTML, with the Markdown source as the plain-text fallback. Pasting into
@@ -1388,14 +1401,20 @@ feature is added or changed, update the matching entry here in the same change**
   new column. Opens with no pane behind them (the file browser, palette, find
   panel, sidebar or git panel) join the nearest pane of the same type instead,
   and so do links from a popped-out terminal, which has left the layout; those
-  open in the window showing the terminal's project. A middle-click or **Open in
-  new tab** places the resource the same way and leaves focus where it is in
-  every window, even when the file jumps to a line or reloads. A file already
-  open anywhere, or a page already open in the same project, is refreshed and
-  focused where it is: the window showing its project comes to the front, or the
-  main window switches to that project. When that's another window, the one the
-  link was clicked in keeps its own focus. A resource focused in the main window is
-  shown even when the Dashboard or another hotbar view covered the panes. Explicit New
+  open in the window showing the terminal's project. A terminal link's
+  Ctrl+click or **Open link**, and a click on a rendered Markdown link, show the
+  resource without taking the keys: it comes to the front of its group and every
+  window keeps its focus, even when the file jumps to a line or reloads. A
+  middle-click or **Open in new tab** opens it the same way in the background. A
+  tab holding a window's focus stays in front of its group either way. A file
+  already open anywhere, or a page already open in the same project, is
+  refreshed where it is. A foreground open, such as the file browser's or a
+  page's own new-window link, focuses it there: the window showing its project
+  comes to the front, or the main window switches to that project. When that's
+  another window, the one the link was clicked in keeps its own focus. A link
+  that shows a resource whose project no window shows opens it that way too,
+  since the main window has to switch to see it. A resource focused or shown in
+  the main window comes out from behind the Dashboard or another hotbar view. Explicit New
   Tab and New Pane commands still use the requested placement. Opening a
   resource as a tab preserves the surrounding split geometry, including narrow
   resource columns.
