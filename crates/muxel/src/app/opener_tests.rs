@@ -1,7 +1,7 @@
 //! Which session a file or page belongs to, through the app's real open paths.
 
 use super::popout_lifecycle_tests::with_app;
-use super::{Instance, MuxelApp, Project, ResourceOrigin};
+use super::{Instance, MuxelApp, OpenFocus, Project, ResourceOrigin};
 use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
 use muxel_core::{PaneNode, add_tab};
 use uuid::Uuid;
@@ -39,6 +39,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                         pid,
                         Some(plan_path.clone()),
                         ResourceOrigin::Pane(first_id),
+                        OpenFocus::Focus,
                         window,
                         cx,
                     )
@@ -51,6 +52,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                         pid,
                         Some(plan_path.clone()),
                         ResourceOrigin::Pane(second_id),
+                        OpenFocus::Focus,
                         window,
                         cx,
                     )
@@ -65,6 +67,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                     ResourceOrigin::Chrome {
                         near: Some(first_id),
                     },
+                    OpenFocus::Focus,
                     window,
                     cx,
                 )
@@ -77,6 +80,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                         pid,
                         Some(notes_path),
                         ResourceOrigin::Pane(plan),
+                        OpenFocus::Focus,
                         window,
                         cx,
                     )
