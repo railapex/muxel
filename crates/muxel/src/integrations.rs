@@ -6,6 +6,8 @@ use crate::i18n::{t, tf};
 use crate::test_support::{GitStopReason, GitTimingReceipt, GitTimings};
 use anyhow::{Context, Result, bail};
 use muxel_core::accomplishments::{self, Accomplishment};
+#[cfg(windows)]
+use muxel_core::git_for_windows::GitProgram;
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
@@ -36,6 +38,117 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         cmd.creation_flags(0x0800_0000);
     }
     cmd
+}
+
+/// `git`, for every local git muxel runs.
+#[cfg(not(windows))]
+fn git_command() -> Command {
+    command("git")
+}
+
+/// `git`, for every local git muxel runs. When `git` on `PATH` is Git for Windows'
+/// launcher (`cmd\git.exe`), this is the git.exe the launcher would start, with the
+/// variables it would set, so a call is two processes instead of three (see
+/// [`muxel_core::git_for_windows`]). Resolved on first use, and again once that
+/// git.exe is gone.
+#[cfg(windows)]
+fn git_command() -> Command {
+    #[cfg(test)]
+    if let Some(cmd) = TEST_GIT_PROGRAM.with_borrow(|program| program.as_ref().map(git_command_for))
+    {
+        return cmd;
+    }
+    static PROGRAM: std::sync::Mutex<Option<GitProgram>> = std::sync::Mutex::new(None);
+    let mut program = PROGRAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    git_command_for(current_git_program(&mut program, resolve_git_program))
+}
+
+/// The resolved git, resolved again when it was a git.exe that no longer exists:
+/// a Git for Windows update can move it (v2.56 moved it from mingw64 to ucrt64),
+/// and muxel outlives updates. One file check a call, against the process saved.
+#[cfg(windows)]
+fn current_git_program(
+    program: &mut Option<GitProgram>,
+    resolve: impl FnOnce() -> GitProgram,
+) -> &GitProgram {
+    if let Some(GitProgram::Direct { exe, .. }) = program
+        && !exe.is_file()
+    {
+        *program = None;
+    }
+    program.get_or_insert_with(resolve)
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests: what `git_command` starts on this thread instead of the resolved git.
+    static TEST_GIT_PROGRAM: std::cell::RefCell<Option<GitProgram>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn git_command_for(program: &GitProgram) -> Command {
+    match program {
+        GitProgram::Path => command("git"),
+        GitProgram::Direct { exe, env } => {
+            let mut cmd = command(exe);
+            cmd.envs(env.iter().map(|(key, value)| (key, value)));
+            cmd
+        }
+    }
+}
+
+/// What `command("git")` would start, searched in std's order: muxel's own
+/// directory, the system and Windows directories, then `PATH`.
+#[cfg(windows)]
+fn resolve_git_program() -> GitProgram {
+    use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+    let mut dirs: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .into_iter()
+        .collect();
+    dirs.extend(windows_dir(GetSystemDirectoryW));
+    dirs.extend(windows_dir(GetWindowsDirectoryW));
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    muxel_core::git_for_windows::resolve(dirs, &ThisMachine)
+}
+
+/// A directory from `GetSystemDirectoryW` or `GetWindowsDirectoryW`.
+#[cfg(windows)]
+fn windows_dir(get: unsafe fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; 1024];
+    // SAFETY: both calls write at most `buf.len()` units into the buffer and
+    // return the length written, or the size needed when it doesn't fit.
+    let len = unsafe { get(Some(&mut buf)) } as usize;
+    (len > 0 && len < buf.len()).then(|| OsString::from_wide(&buf[..len]).into())
+}
+
+#[cfg(windows)]
+struct ThisMachine;
+
+#[cfg(windows)]
+impl muxel_core::git_for_windows::Host for ThisMachine {
+    fn var(&self, key: &str) -> Option<OsString> {
+        std::env::var_os(key)
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn read_to_string(&self, path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+    fn system_dir(&self) -> Option<PathBuf> {
+        windows_dir(windows::Win32::System::SystemInformation::GetSystemDirectoryW)
+    }
 }
 
 /// Reap stale muxel AppImage squashfuse mounts left in `$TMPDIR` by prior
@@ -204,7 +317,7 @@ fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
             let mut cmd = if read_only {
                 git_read_command()
             } else {
-                command("git")
+                git_command()
             };
             cmd.arg("-C").arg(path).args(args);
             cmd
@@ -222,7 +335,7 @@ fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
 
 /// Shared default for background/display git reads.
 fn git_read_command() -> Command {
-    read_only_git(command("git"))
+    read_only_git(git_command())
 }
 
 fn read_only_git(mut cmd: Command) -> Command {
@@ -1046,7 +1159,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 
 /// Create a worktree at `worktree_path` on a new `branch`, based on `repo`.
 pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Result<()> {
-    let output = command("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
@@ -1633,7 +1746,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
 /// failure (e.g. conflicts) abort the merge so the repo isn't left mid-merge,
 /// and return the error.
 pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
-    let out = command("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
@@ -1641,7 +1754,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
-        let _ = command("git")
+        let _ = git_command()
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
@@ -1654,7 +1767,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
 /// Delete `branch` from `repo` (force). Best-effort — only valid once the branch
 /// is no longer checked out in any worktree.
 pub fn delete_branch(repo: &Path, branch: &str) {
-    let _ = command("git")
+    let _ = git_command()
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
@@ -1839,7 +1952,7 @@ pub fn git_commit_paths(loc: &RepoLoc, msg: &str, paths: &[String]) -> Result<St
 
 /// Push the worktree's `branch` to `origin` (setting upstream). Errors on failure.
 pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
-    let out = command("git")
+    let out = git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
@@ -1884,7 +1997,7 @@ fn gh(dir: &Path, args: &[&str]) -> Result<()> {
 /// stays (clean, at the base). Errors on git failure.
 pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<()> {
     let run = |args: &[&str]| {
-        command("git")
+        git_command()
             .arg("-C")
             .arg(worktree_path)
             .args(args)
@@ -1905,13 +2018,13 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
 
 /// Remove a worktree (force) and prune stale entries. Best-effort.
 pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
-    let _ = command("git")
+    let _ = git_command()
         .arg("-C")
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
         .profiled_output();
-    let _ = command("git")
+    let _ = git_command()
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
@@ -4675,7 +4788,7 @@ pub type RenameFn = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Syn
 pub type RemoveDirFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 impl GitEnv {
-    /// Plain `git` from the user's `PATH`.
+    /// `git` from the user's `PATH`, started like every local git (`git_command`).
     pub fn production() -> Self {
         Self {
             program: OsString::from("git"),
@@ -4748,7 +4861,11 @@ impl GitEnv {
     /// `GIT_CEILING_DIRECTORIES` so git never finds a repository above it; git
     /// ignores an entry equal to `cwd`, so it must be a strict ancestor of `cwd`.
     fn base_command(&self, cwd: Option<&Path>, ceiling: Option<&Path>) -> Option<Command> {
-        let mut cmd = command(self.resolve_program()?);
+        let mut cmd = if self.path_override.is_none() && self.program == "git" {
+            git_command()
+        } else {
+            command(self.resolve_program()?)
+        };
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -6242,6 +6359,167 @@ mod tests {
         remove_worktree(&repo, &worktree);
         delete_branch(&repo, "muxel/test");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A display read starts the git `git_command` resolved, with its variables. The
+    /// stand-in records its arguments and one variable, then fails.
+    #[cfg(windows)]
+    #[test]
+    fn a_display_read_starts_the_resolved_git() {
+        let dir = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = dir.join("started.txt");
+        let stand_in = dir.join("git.cmd");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "@echo %GIT_DIRECT_MARK% %*>\"{}\"\r\n@exit /b 1\r\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        TEST_GIT_PROGRAM.set(Some(GitProgram::Direct {
+            exe: stand_in,
+            env: vec![("GIT_DIRECT_MARK".into(), "resolved".into())],
+        }));
+        let _ = git_diff(&dir, None);
+        TEST_GIT_PROGRAM.set(None);
+        let started = std::fs::read_to_string(&record).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        // std quotes some arguments for a batch file (`-c "diff.autoRefreshIndex=false"`).
+        assert_eq!(
+            started.trim().replace('"', ""),
+            format!(
+                "resolved -c diff.autoRefreshIndex=false -C {} --no-pager rev-parse --show-toplevel",
+                dir.display()
+            ),
+        );
+    }
+
+    /// A git.exe resolved earlier that has since gone (a Git for Windows update moved
+    /// it) is looked up again instead of failing every later call; one that is still
+    /// there, or plain `git`, is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_resolved_git_that_has_gone_is_looked_up_again() {
+        let dir = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("git.exe");
+        std::fs::write(&exe, "").unwrap();
+        let direct = GitProgram::Direct {
+            exe: exe.clone(),
+            env: Vec::new(),
+        };
+        let mut program = None;
+        assert_eq!(
+            current_git_program(&mut program, || direct.clone()),
+            &direct
+        );
+        assert_eq!(
+            current_git_program(&mut program, || unreachable!("looked up while it exists")),
+            &direct
+        );
+        std::fs::remove_file(&exe).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            current_git_program(&mut program, || GitProgram::Path),
+            &GitProgram::Path
+        );
+        assert_eq!(
+            current_git_program(&mut program, || unreachable!("plain git looked up again")),
+            &GitProgram::Path
+        );
+    }
+
+    /// What git's children (hooks, aliases, textconv drivers, credential helpers) see
+    /// when Git for Windows' launcher starts git and when muxel starts it directly, from
+    /// a Start-menu muxel's environment: the launcher's `cmd` first on `PATH`, and no
+    /// `HOME`, `MSYSTEM` or `PLINK_PROTOCOL`. Skips only without a Git for Windows
+    /// install. Only variable names are printed.
+    #[cfg(windows)]
+    #[test]
+    fn a_direct_git_gives_its_children_the_launchers_environment() {
+        use muxel_core::git_for_windows::Host;
+        struct StartMenu(OsString);
+        impl Host for StartMenu {
+            fn var(&self, key: &str) -> Option<OsString> {
+                match key {
+                    "PATH" => Some(self.0.clone()),
+                    "HOME" | "MSYSTEM" | "PLINK_PROTOCOL" => None,
+                    _ => ThisMachine.var(key),
+                }
+            }
+            fn is_file(&self, path: &Path) -> bool {
+                ThisMachine.is_file(path)
+            }
+            fn is_dir(&self, path: &Path) -> bool {
+                ThisMachine.is_dir(path)
+            }
+            fn read_to_string(&self, path: &Path) -> Option<String> {
+                ThisMachine.read_to_string(path)
+            }
+            fn system_dir(&self) -> Option<PathBuf> {
+                ThisMachine.system_dir()
+            }
+        }
+        // Whichever git is on PATH, its exec path is <top>\<msystem>\libexec\git-core
+        // and the launcher is <top>\cmd\git.exe.
+        let cmd_dir = command("git")
+            .arg("--exec-path")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+            .and_then(|exec_path| exec_path.ancestors().nth(3).map(|top| top.join("cmd")))
+            .filter(|dir| dir.join("git.exe").is_file());
+        let Some(cmd_dir) = cmd_dir else {
+            eprintln!("skipped: no Git for Windows install");
+            return;
+        };
+        let path = std::env::join_paths(std::iter::once(cmd_dir.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let program = muxel_core::git_for_windows::resolve(
+            std::env::split_paths(&path),
+            &StartMenu(path.clone()),
+        );
+        assert!(
+            matches!(program, GitProgram::Direct { .. }),
+            "{} resolved to {program:?}",
+            cmd_dir.display()
+        );
+        let mut launcher = command(cmd_dir.join("git.exe"));
+        launcher
+            .env("PATH", &path)
+            .env_remove("HOME")
+            .env_remove("MSYSTEM")
+            .env_remove("PLINK_PROTOCOL");
+        let seen_by_children = |mut git: Command| {
+            let out = git
+                .args(["-c", "alias.e=!env | LC_ALL=C sort", "e"])
+                .output()
+                .expect("git starts");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let direct = seen_by_children(git_command_for(&program));
+        let launched = seen_by_children(launcher);
+        let differing: std::collections::BTreeSet<&str> = direct
+            .symmetric_difference(&launched)
+            .map(|line| {
+                line.split_once('=')
+                    .map_or("<continued value>", |(name, _)| name)
+            })
+            .collect();
+        assert!(differing.is_empty(), "variables that differ: {differing:?}");
     }
 
     #[test]

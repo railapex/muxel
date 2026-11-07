@@ -15,6 +15,8 @@ pub mod diff;
 pub mod diff_schedule;
 pub mod file_watch;
 pub mod geometry;
+#[cfg(windows)]
+pub mod git_for_windows;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
