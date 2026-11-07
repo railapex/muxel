@@ -91,6 +91,8 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                 let rows = sidebar_order(
                     &project.instances(),
                     &instances_by_id(&app.workspace),
+                    &|_| None,
+                    None,
                     chrono::Utc::now().timestamp_millis(),
                     SidebarSort::RecentWork,
                 );
