@@ -6074,8 +6074,8 @@ pub struct MuxelApp {
     /// What each live registration with `file_watch` wakes.
     watch_targets: HashMap<muxel_core::file_watch::WatchId, watching::WatchTarget>,
     /// Providers whose watch was tried: its registration, or `None` when the
-    /// provider polls for the rest of the run. Claude's is tried for the first
-    /// Claude pane discovery looks up.
+    /// provider polls for the rest of the run. Claude's and Muse's are each
+    /// tried for the first pane of theirs that discovery looks up.
     provider_watches: HashMap<
         muxel_core::session_discovery::SessionProvider,
         Option<muxel_core::file_watch::WatchId>,
