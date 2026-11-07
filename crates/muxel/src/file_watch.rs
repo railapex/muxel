@@ -2,20 +2,25 @@
 //! [`WatchRouter`] routes to registrations, so every watched target shares one
 //! backend (one inotify instance on Linux, one stream on macOS).
 //!
-//! Claude's session hook records are registered today ([`claude_records`]).
+//! Claude's session hook records are registered ([`claude_records`]).
 //! Without the watch each Claude pane opens its record path every two seconds,
 //! and almost always finds nothing: the hook writes only after `/clear`,
 //! `/resume` or `/fork`. Discovery still polls slowly while watched
 //! ([`muxel_core::session_discovery::WATCHED_HOOK_FALLBACK`]), because a
 //! watcher can lose events, and at the usual cadence when it can't watch.
+//!
+//! So are diff panes' sources ([`diff_sources`]): a visible diff pane runs
+//! `git diff` when a tracked file or HEAD's branch changes, instead of every
+//! 1.5 s (see [`muxel_core::diff_schedule`]).
 
+use crate::integrations::DiffPlan;
 use muxel_core::file_watch::{
-    DirNames, Drained, EventKind, OsWatch, Recursion, WatchEvent, WatchFilter, WatchId,
-    WatchRouter, WatchSpec,
+    DirNames, Drained, EventKind, OsWatch, Recursion, TrackedFiles, WatchEvent, WatchFilter,
+    WatchId, WatchRouter, WatchSpec,
 };
 use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// `dir` under every name a backend may report it by.
@@ -42,6 +47,99 @@ pub(crate) fn claude_records(dir: &Path) -> WatchSpec {
         },
         lose_on,
     }
+}
+
+/// The most directories one diff pane watches where each is its own watch
+/// (inotify, whose recursive mode walks and watches every directory, ignored
+/// ones like `target/` too). A larger checkout's pane polls while visible.
+pub(crate) const DIFF_WATCH_DIRS: usize = 4096;
+
+/// What a diff pane over `dir` watches, by `plan`: the tracked files under
+/// `dir`, HEAD and the index, and the branch HEAD names. `None` where the
+/// pane polls instead: an unsettled repository (see [`DiffPlan::settled`]),
+/// a `dir` that can't be resolved, or more directories than
+/// [`DIFF_WATCH_DIRS`]. It reads the disk, so it runs off the UI thread.
+pub(crate) fn diff_sources(dir: &Path, plan: &DiffPlan) -> Option<WatchSpec> {
+    // Windows and macOS watch a tree with one handle or stream.
+    let per_dir = !cfg!(any(windows, target_os = "macos"));
+    diff_sources_with(dir, plan, per_dir, DIFF_WATCH_DIRS)
+}
+
+/// [`diff_sources`], watching each directory on its own when `per_dir`, and
+/// at most `budget` paths.
+fn diff_sources_with(
+    dir: &Path,
+    plan: &DiffPlan,
+    per_dir: bool,
+    budget: usize,
+) -> Option<WatchSpec> {
+    if !plan.settled {
+        return None;
+    }
+    let real_root = dir.canonicalize().ok()?;
+    let root = DirNames::new(dir.to_path_buf(), Some(real_root.clone()));
+    let mut paths: Vec<(PathBuf, Recursion)> = Vec::new();
+    let mut watch = |path: PathBuf, recursion: Recursion| {
+        if !paths.iter().any(|(watched, _)| *watched == path) {
+            paths.push((path, recursion));
+        }
+    };
+    watch(
+        dir.to_path_buf(),
+        if per_dir {
+            Recursion::Dir
+        } else {
+            Recursion::Tree
+        },
+    );
+    // A git file under every name its event may carry: as git printed it,
+    // canonical, and under `dir`'s name when the tree watch reports it.
+    // Its folder is watched unless that tree covers it already; a folder
+    // that doesn't exist yet (`reftable/`, a packed branch's) isn't, and
+    // the index or HEAD changing when it appears sends the pane to re-plan.
+    let mut git_file = |file: &Path| -> Option<DirNames> {
+        let name = file.file_name()?;
+        let parent = file.parent()?;
+        let real_parent = parent.canonicalize().ok();
+        let mut names = DirNames::new(
+            file.to_path_buf(),
+            real_parent.as_ref().map(|real| real.join(name)),
+        );
+        let under_root = real_parent
+            .as_ref()
+            .and_then(|real| real.strip_prefix(&real_root).ok())
+            .map(|rel| dir.join(rel));
+        if let Some(rel) = &under_root {
+            names = names.also(rel.join(name));
+        }
+        if real_parent.is_some() && (per_dir || under_root.is_none()) {
+            watch(parent.to_path_buf(), Recursion::Dir);
+        }
+        Some(names)
+    };
+    let relist = plan
+        .state
+        .iter()
+        .filter_map(|file| git_file(file))
+        .collect();
+    let refs = plan.refs.iter().filter_map(|file| git_file(file)).collect();
+    let tracked = TrackedFiles::new(root.clone(), plan.tracked.iter().cloned(), refs, relist);
+    if per_dir {
+        // A tracked directory that's gone gets its watch when it comes
+        // back: its parent's watch reports that, and the pane re-plans.
+        for rel in &tracked.dirs {
+            let path = dir.join(rel);
+            if path.is_dir() {
+                watch(path, Recursion::Dir);
+            }
+        }
+    }
+    (paths.len() <= budget).then(|| WatchSpec {
+        paths,
+        filter: WatchFilter::Tracked(Arc::new(tracked)),
+        // Gone with its directory; a recreated one isn't watched.
+        lose_on: vec![root],
+    })
 }
 
 fn watch_event(event: &notify::Event) -> WatchEvent {
@@ -141,6 +239,18 @@ impl FileWatch {
         Ok(id)
     }
 
+    /// Give a registration a new spec, adding and dropping only the OS
+    /// watches that differ. If one can't be added the registration is
+    /// dropped and the error returned, so its owner polls.
+    pub fn respec(&mut self, id: WatchId, spec: WatchSpec) -> anyhow::Result<()> {
+        let ops = lock(&self.router).respec(id, spec);
+        if let Err(error) = self.apply(&ops) {
+            self.unregister(id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Drop a registration, and the OS watches nothing else needs.
     pub fn unregister(&mut self, id: WatchId) {
         let ops = lock(&self.router).unregister(id);
@@ -223,9 +333,7 @@ pub(crate) mod test_backend {
             })
         }
 
-        /// The backend reports `event` while alive. Only the app's watcher
-        /// tests play one, and they run on Windows alone.
-        #[cfg(windows)]
+        /// The backend reports `event` while alive.
         pub fn send(&self, event: notify::Result<notify::Event>) {
             self.handler
                 .lock()
@@ -286,10 +394,12 @@ pub(crate) mod test_backend {
 #[cfg(test)]
 mod tests {
     use super::test_backend::TestBackend;
-    use super::{FileWatch, claude_records};
-    use muxel_core::file_watch::{Change, WatchId};
+    use super::{FileWatch, claude_records, diff_sources, diff_sources_with};
+    use crate::integrations::diff_plan;
+    use crate::test_support::{TestRepo, git_out, short_temp_path};
+    use muxel_core::file_watch::{Change, Recursion, WatchId};
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
@@ -328,7 +438,17 @@ mod tests {
         id: WatchId,
         done: impl Fn(&Change) -> bool,
     ) -> Change {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        gather_for(watch, signal, id, Duration::from_secs(10), done)
+    }
+
+    fn gather_for(
+        watch: &FileWatch,
+        signal: &async_channel::Receiver<()>,
+        id: WatchId,
+        within: Duration,
+        done: impl Fn(&Change) -> bool,
+    ) -> Change {
+        let deadline = Instant::now() + within;
         let mut seen = Change::default();
         while !done(&seen) && Instant::now() < deadline {
             if signal.try_recv().is_err() {
@@ -338,11 +458,109 @@ mod tests {
             for (from, change) in watch.take().changes {
                 assert_eq!(from, id);
                 seen.hits.extend(change.hits);
+                seen.touched |= change.touched;
+                seen.relist |= change.relist;
                 seen.rescan |= change.rescan;
                 seen.lost |= change.lost;
             }
         }
         seen
+    }
+
+    /// Each watched path, resolved, and whether it's watched as a tree.
+    fn resolved(paths: &[(PathBuf, Recursion)]) -> HashSet<(PathBuf, bool)> {
+        paths
+            .iter()
+            .map(|(path, recursion)| (path.canonicalize().unwrap(), *recursion == Recursion::Tree))
+            .collect()
+    }
+
+    /// A tree backend watches the diff's folder once, its git files inside
+    /// it. A per-directory one watches each folder holding tracked files
+    /// (no untracked one) and git's, and past its budget the pane polls.
+    #[test]
+    fn a_diff_watches_its_tree_once_or_each_tracked_directory() {
+        let repo = TestRepo::init();
+        repo.commit(&[("top.txt", ""), ("a/x.rs", ""), ("a/b/y.rs", "")], "seed");
+        std::fs::create_dir_all(repo.path().join("untracked/deep")).unwrap();
+        let root = repo.path();
+        let plan = diff_plan(root).expect("a work tree");
+        let tree = diff_sources_with(root, &plan, false, 1).expect("within budget");
+        assert_eq!(
+            resolved(&tree.paths),
+            HashSet::from([(root.canonicalize().unwrap(), true)])
+        );
+        let git = root.join(".git");
+        let each: Vec<_> = [
+            root.to_path_buf(),
+            root.join("a"),
+            root.join("a").join("b"),
+            git.clone(),
+            git.join("refs").join("heads"),
+        ]
+        .into_iter()
+        .map(|dir| (dir, Recursion::Dir))
+        .collect();
+        let per_dir = diff_sources_with(root, &plan, true, each.len()).expect("within budget");
+        assert_eq!(resolved(&per_dir.paths), resolved(&each));
+        assert!(diff_sources_with(root, &plan, true, each.len() - 1).is_none());
+    }
+
+    /// Real writes reach a diff pane's watch through the platform's backend,
+    /// in a main checkout and in a linked worktree, whose git files live in
+    /// the main repository: an edit to a tracked file, `git add` (the index,
+    /// which re-lists), and the branch moving. An untracked file doesn't.
+    #[test]
+    fn a_diff_wakes_for_real_tracked_and_git_writes_through_the_platform_watcher() {
+        let repo = TestRepo::init();
+        repo.commit(&[("notes.txt", "first\n"), ("src/lib.rs", "")], "seed");
+        let linked = short_temp_path();
+        repo.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            &linked.to_string_lossy(),
+        ]);
+        for dir in [repo.path().to_path_buf(), linked.clone()] {
+            let plan = diff_plan(&dir).expect("a work tree");
+            let spec = diff_sources(&dir, &plan).expect("watchable");
+            let (mut watch, signal) = FileWatch::start().unwrap();
+            let id = watch.register(spec).unwrap();
+            let at = dir.display().to_string();
+
+            // Each step first lets the last one's trailing events pass.
+            let settle = || gather_for(&watch, &signal, id, Duration::from_millis(500), |_| false);
+
+            std::fs::write(dir.join("scratch.txt"), "new\n").unwrap();
+            assert!(!settle().touched, "{at}: an untracked file");
+
+            std::fs::write(dir.join("src").join("lib.rs"), "// edited\n").unwrap();
+            let seen = gather(&watch, &signal, id, |seen| seen.touched);
+            assert!(seen.touched && !seen.relist, "{at}: a tracked edit");
+            settle();
+
+            git_out(&dir, &["add", "scratch.txt"]);
+            assert!(
+                gather(&watch, &signal, id, |seen| seen.relist).relist,
+                "{at}: git add"
+            );
+            settle();
+
+            // A commit that moves the branch alone, without the index.
+            let commit = git_out(
+                &dir,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "x"],
+            );
+            git_out(&dir, &["update-ref", "HEAD", commit.trim()]);
+            let seen = gather(&watch, &signal, id, |seen| seen.touched);
+            assert!(seen.touched && !seen.relist, "{at}: the branch moved");
+            assert!(!seen.lost, "{at}");
+            drop(watch);
+        }
+        repo.git(&["worktree", "remove", "--force", &linked.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&linked);
     }
 
     /// Deleting or renaming the hook directory or its parent through the real

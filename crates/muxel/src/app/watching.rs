@@ -1,7 +1,7 @@
 //! The app's side of its one file watcher ([`FileWatch`]): starting it with
 //! the first registration, and handing each registration's news to what it
-//! wakes. A target whose watch is lost polls for the rest of the run, as it
-//! would have without one.
+//! wakes. A target whose watch is lost polls for the rest of the run (a diff
+//! pane, until it re-plans), as it would have without one.
 
 use super::MuxelApp;
 use crate::file_watch::FileWatch;
@@ -9,17 +9,20 @@ use crate::ui_profile;
 use gpui::Context;
 use muxel_core::file_watch::{WatchId, WatchSpec};
 use muxel_core::session_discovery::SessionProvider;
+use uuid::Uuid;
 
 /// What a registration wakes.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WatchTarget {
     /// A provider's session discovery.
     Provider(SessionProvider),
+    /// A diff pane's refresh schedule.
+    Diff(Uuid),
 }
 
 impl MuxelApp {
     /// Register `spec` for `target`, starting the watcher with the first.
-    fn watch(
+    pub(super) fn watch(
         &mut self,
         spec: WatchSpec,
         target: WatchTarget,
@@ -97,6 +100,7 @@ impl MuxelApp {
             return;
         };
         let drained = watch.take();
+        let now = cx.background_executor().now();
         let mut lost = Vec::new();
         for (id, change) in drained.changes {
             let Some(target) = self.watch_targets.get(&id).copied() else {
@@ -114,6 +118,23 @@ impl MuxelApp {
                         ui_profile::session_watch(provider, "rescan");
                     }
                 }
+                WatchTarget::Diff(pane) => {
+                    if change.lost {
+                        lost.push(id);
+                        continue;
+                    }
+                    if change.touched {
+                        self.diff_panes.schedule.changed(pane, Some(now));
+                    }
+                    if change.rescan {
+                        self.diff_panes.schedule.changed(pane, None);
+                    }
+                    if change.relist
+                        && let Some(source) = self.diff_panes.sources.get_mut(&pane)
+                    {
+                        source.replan = true;
+                    }
+                }
             }
         }
         if drained.failed {
@@ -124,14 +145,20 @@ impl MuxelApp {
             self.lose_watch(id);
         }
         self.sync_provider_session_ids(cx);
+        self.pump_diffs(cx);
+    }
+
+    /// Drop `id` and forget its target, which its owner has dealt with.
+    pub(super) fn drop_watch(&mut self, id: WatchId) -> Option<WatchTarget> {
+        if let Some(Some(watch)) = self.file_watch.as_mut() {
+            watch.unregister(id);
+        }
+        self.watch_targets.remove(&id)
     }
 
     /// `id` is blind: drop it, and its target polls for the rest of the run.
     fn lose_watch(&mut self, id: WatchId) {
-        if let Some(Some(watch)) = self.file_watch.as_mut() {
-            watch.unregister(id);
-        }
-        if let Some(target) = self.watch_targets.remove(&id) {
+        if let Some(target) = self.drop_watch(id) {
             self.unwatch_target(target);
         }
     }
@@ -143,6 +170,7 @@ impl MuxelApp {
                 self.session_discoveries.set_watched(provider, false);
                 ui_profile::session_watch(provider, "failed");
             }
+            WatchTarget::Diff(pane) => self.diff_unwatched(pane),
         }
     }
 
@@ -154,5 +182,6 @@ impl MuxelApp {
             self.unwatch_target(target);
         }
         self.sync_provider_session_ids(cx);
+        self.pump_diffs(cx);
     }
 }

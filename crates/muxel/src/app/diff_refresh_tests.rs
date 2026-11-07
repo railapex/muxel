@@ -1,14 +1,24 @@
-//! Diff panes run `git diff` only while on screen. Draws real frames with no
-//! PTY, so it runs on every desktop test host.
+//! Diff panes run `git diff` only while on screen, and a watched one only
+//! when its files change. Draws real frames with no PTY, so it runs on every
+//! desktop test host.
 use super::{MuxelApp, Project};
+use crate::file_watch::FileWatch;
+use crate::file_watch::test_backend::TestBackend;
 use crate::test_support::TestRepo;
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
+use muxel_core::diff_schedule::{MIN_GAP, POLL};
+use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Longer than one tick of the diff timer.
+/// Longer than the poll of a pane without a watch.
 const DIFF_TICK: Duration = Duration::from_millis(1600);
+/// Past a watched pane's quiet period and its gap after the last refresh,
+/// short of the poll: only a watch's wake refreshes the pane within it.
+const SOON: Duration = MIN_GAP.saturating_add(Duration::from_millis(100));
+const _: () = assert!(SOON.as_millis() < POLL.as_millis());
 
 struct Fixture {
     pid: Uuid,
@@ -45,6 +55,9 @@ fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>, &Fixtu
             // The diff timer stays live; the others would add unrelated work.
             app._status_timer = gpui::Task::ready(());
             app._update_timer = gpui::Task::ready(());
+            // No watcher, so panes poll while visible, unless a test hands
+            // the app one (`watch_with`).
+            app.file_watch = Some(None);
             let pid = app
                 .workspace
                 .add_project(Project::new("diff fixture", a.path().to_path_buf()));
@@ -110,8 +123,135 @@ fn diff_text(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, iid: Uuid)
 }
 
 fn tick(cx: &mut TestAppContext) {
-    cx.executor().advance_clock(DIFF_TICK);
+    wait(cx, DIFF_TICK);
+}
+
+fn wait(cx: &mut TestAppContext, time: Duration) {
+    cx.executor().advance_clock(time);
     cx.run_until_parked();
+}
+
+/// Give the app a watcher whose events the test plays.
+fn watch_with(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> TestBackend {
+    let backend = TestBackend::default();
+    let (watch, signal) = FileWatch::start_with(|handler| backend.build(handler)).unwrap();
+    window
+        .update(cx, |app, _, cx| app.follow_file_watch(watch, signal, cx))
+        .unwrap();
+    backend
+}
+
+fn watched(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, iid: Uuid) -> bool {
+    window
+        .update(cx, |app, _, _| app.diff_panes.sources[&iid].watch.is_some())
+        .unwrap()
+}
+
+/// A's diff pane, watched through a test backend, past its first refresh
+/// and the check after the watch began, so nothing is due but the backstop.
+fn watched_diff(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    fx: &Fixture,
+) -> (TestBackend, Uuid) {
+    let backend = watch_with(cx, window);
+    let iid = open_diff(cx, window, fx, &fx.a);
+    assert!(watched(cx, window, iid), "the pane watches its repository");
+    wait(cx, 2 * MIN_GAP);
+    (backend, iid)
+}
+
+fn send(backend: &TestBackend, kind: notify::EventKind, paths: &[PathBuf]) {
+    let mut event = notify::Event::new(kind);
+    for path in paths {
+        event = event.add_path(path.clone());
+    }
+    backend.send(Ok(event));
+}
+
+fn modified(backend: &TestBackend, path: PathBuf) {
+    send(
+        backend,
+        notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+        &[path],
+    );
+}
+
+#[test]
+fn a_tracked_edit_refreshes_a_visible_diff_without_a_tick() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        add_line(&fx.a);
+        modified(&backend, fx.a.path().join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, window, iid).contains("+second"));
+    });
+}
+
+#[test]
+fn writes_under_an_untracked_directory_start_no_git() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        // The tracked edit goes unreported, so only a refresh started by
+        // the other writes, or a poll, would show it.
+        add_line(&fx.a);
+        let root = fx.a.path();
+        send(
+            &backend,
+            notify::EventKind::Create(CreateKind::File),
+            &[root.join("target/debug/out.o"), root.join("scratch.txt")],
+        );
+        modified(&backend, root.join("target"));
+        modified(&backend, root.to_path_buf());
+        wait(cx, 3 * POLL);
+        assert!(
+            !diff_text(cx, window, iid).contains("+second"),
+            "no git ran"
+        );
+        // The pane is live: its tracked file's event refreshes it.
+        modified(&backend, root.join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, window, iid).contains("+second"));
+    });
+}
+
+#[test]
+fn a_commit_on_the_branch_refreshes_the_diff() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        add_line(&fx.a);
+        modified(&backend, fx.a.path().join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, window, iid).contains("+second"));
+        fx.a.commit(&[], "second");
+        // Only the branch's ref is reported moving, as git renames it into
+        // place.
+        let heads = fx.a.path().join(".git").join("refs").join("heads");
+        send(
+            &backend,
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[heads.join("main.lock"), heads.join("main")],
+        );
+        wait(cx, SOON);
+        assert!(!diff_text(cx, window, iid).contains("+second"));
+    });
+}
+
+#[test]
+fn a_lost_diff_watch_puts_the_pane_back_on_its_poll() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        send(
+            &backend,
+            notify::EventKind::Remove(RemoveKind::Folder),
+            &[fx.a.path().to_path_buf()],
+        );
+        cx.run_until_parked();
+        assert!(!watched(cx, window, iid));
+        add_line(&fx.a);
+        tick(cx);
+        assert!(diff_text(cx, window, iid).contains("+second"));
+    });
 }
 
 #[test]

@@ -1349,10 +1349,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
   changes", the project menu, or a worktree) rather than splitting off a new pane.
-  While it's on screen, docked or popped out, it refreshes every 1.5 s and keeps
-  your scroll position. A pane hidden behind another tab, another view or a
-  maximized pane runs no git, and refreshes as soon as it's shown. The ↻ button,
-  reopening and popping out never wait on git.
+  While it's on screen, docked or popped out, it refreshes when a tracked file
+  under its folder changes or HEAD's branch moves, once the writes have been
+  quiet for 0.3 s (at most 2 s into a steady stream, and at most once a second),
+  and keeps your scroll position. New untracked files and build output don't
+  wake it, and it re-checks every 30 s anyway. Where the folder can't be watched
+  (a checkout with more than 4096 tracked folders on Linux, or git pointed
+  elsewhere by `GIT_DIR`), it refreshes every 1.5 s instead. A pane hidden
+  behind another tab, another view or a maximized pane runs no git, and
+  refreshes as soon as it's shown if it may be stale. The ↻ button, reopening
+  and popping out never wait on git. On Windows, while the pane is open its
+  folder and the folders above it can't be renamed.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
