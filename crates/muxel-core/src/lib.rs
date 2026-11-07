@@ -12,6 +12,8 @@ pub mod chime;
 pub mod control;
 pub mod diff;
 pub mod geometry;
+#[cfg(windows)]
+pub mod git_for_windows;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
