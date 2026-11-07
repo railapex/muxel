@@ -1291,9 +1291,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then whichever most recently finished or needed attention, in
-  Today (under 24 hours), This week (under seven days), and Older bands. Starting
-  a turn doesn't move a session, and neither does looking at it.
+  each project, then the rest in Today (under 24 hours), This week (under seven
+  days), and Older bands. Within a band, sessions that need you (unread, or
+  asking for something) come first, newest first; then working sessions in the
+  order each started, so one that starts a turn joins the bottom of them; then
+  the rest, newest finish first. A working session counts as Today however long
+  ago it last finished. The focused session keeps its place until focus moves
+  on, so reading it doesn't move it, unless it starts working.
   Sessions without work follow in layout order; project order and keyboard
   navigation stay the same. Live popped-out sessions remain in Recent work;
   their external-window icon marks rows that raise an existing window on click.
