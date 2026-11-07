@@ -41,9 +41,28 @@ fn root_of(root: &str) -> &str {
 ///
 /// The same binary on both sides; only the quoting differs.
 pub fn git(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_with_policy(os, repo, args, false)
+}
+
+/// Display reads avoid optional locks without requiring Git 2.15's CLI flag.
+pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_with_policy(os, repo, args, true)
+}
+
+fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
+    let policy = if read_only {
+        " -c diff.autoRefreshIndex=false"
+    } else {
+        ""
+    };
     match os {
         RemoteOs::Unix => {
-            let mut c = format!("git -C {}", sh_quote(repo));
+            let env = if read_only {
+                "GIT_OPTIONAL_LOCKS=0 "
+            } else {
+                ""
+            };
+            let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
             for a in args {
                 c.push(' ');
                 c.push_str(&sh_quote(a));
@@ -51,7 +70,12 @@ pub fn git(os: RemoteOs, repo: &str, args: &[&str]) -> String {
             c
         }
         RemoteOs::Windows => {
-            let mut body = format!("& git -C {}", ps_quote(repo));
+            let env = if read_only {
+                "$env:GIT_OPTIONAL_LOCKS='0'; "
+            } else {
+                ""
+            };
+            let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
             for a in args {
                 body.push(' ');
                 body.push_str(&ps_quote(a));
@@ -73,7 +97,7 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
         RemoteOs::Unix => {
             let q = sh_quote(root);
             format!(
-                "cd {q} && (git ls-files --cached --others --exclude-standard 2>/dev/null \
+                "cd {q} && (GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard 2>/dev/null \
                  || find . -type f -not -path '*/.git/*') | head -n {cap}"
             )
         }
@@ -87,8 +111,8 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
             // slashed so both branches emit the same shape and the caller has
             // one thing to parse.
             ps(&format!(
-                "Set-Location -LiteralPath {q}; \
-                 $files = & git ls-files --cached --others --exclude-standard 2>$null; \
+                "Set-Location -LiteralPath {q}; $env:GIT_OPTIONAL_LOCKS='0'; \
+                 $files = & git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard 2>$null; \
                  if ($LASTEXITCODE -ne 0 -or $null -eq $files) {{ \
                  $root = (Get-Location).Path; \
                  $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force \
@@ -182,7 +206,8 @@ pub fn test_file(os: RemoteOs, path: &str) -> String {
 }
 
 /// Create `<root>/<dir>`, seed `<root>/<dir>/<file>` with `header` when absent,
-/// and make sure `<ignore_line>` is in `.gitignore`. Idempotent.
+/// and make sure git ignores `<ignore_line>`, adding it to `.gitignore` when no
+/// ignore source covers it yet. Idempotent.
 pub fn ensure_seeded_file(
     os: RemoteOs,
     root: &str,
@@ -195,12 +220,12 @@ pub fn ensure_seeded_file(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {file} || printf '%s' {hdr} > {file}; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             file = sh_quote(rel_file),
             hdr = sh_quote(header),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -232,12 +257,12 @@ pub fn push_prep(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {rel} && cp -f {rel} {bak} || true; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             rel = sh_quote(rel_file),
             bak = sh_quote(rel_bak),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -254,8 +279,22 @@ pub fn push_prep(
     }
 }
 
-/// The PowerShell half of "add this line to .gitignore unless it is already
-/// there", shared by the two callers above.
+/// The POSIX shell half of "add this line to .gitignore unless git already
+/// ignores it", shared by the two callers above.
+///
+/// `git check-ignore` covers the ignore sources other than `.gitignore`, such
+/// as `.git/info/exclude` and `core.excludesFile`. A missing git or a root
+/// outside a repository makes it fail, so the line is appended as before.
+fn append_gitignore_sh(ignore_line: &str) -> String {
+    let ign = sh_quote(ignore_line);
+    format!(
+        "grep -qxF {ign} .gitignore 2>/dev/null \
+         || git check-ignore -q -- {ign} 2>/dev/null \
+         || printf '%s\\n' {ign} >> .gitignore"
+    )
+}
+
+/// The PowerShell twin of [`append_gitignore_sh`].
 ///
 /// Matched against the whole trimmed line, mirroring `grep -qxF`, so a
 /// `.muxel/` entry is not considered present because some other line happens to
@@ -267,6 +306,9 @@ fn append_gitignore_ps(ignore_line: &str) -> String {
          $have = (Test-Path -LiteralPath $gi -PathType Leaf) -and \
          ((Get-Content -LiteralPath $gi -ErrorAction SilentlyContinue | \
          ForEach-Object {{ $_.Trim() }}) -contains {ign}); \
+         if (-not $have -and (Get-Command git -ErrorAction SilentlyContinue)) {{ \
+         try {{ & git check-ignore -q -- {ign} 2>$null; $have = $LASTEXITCODE -eq 0 }} \
+         catch {{ $have = $false }} }}; \
          if (-not $have) {{ Add-Content -LiteralPath $gi -Value {ign} }}"
     )
 }
@@ -384,8 +426,8 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, list_files, paste_file_name, push_prep, read_file, scan_projects,
-        test_dir, test_file, upload_paste, write_file,
+        ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep, read_file,
+        scan_projects, test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -433,7 +475,9 @@ mod tests {
         assert_eq!(test_dir(UNIX, "/srv/app"), "test -d /srv/app");
         assert_eq!(test_file(UNIX, "/srv/a b"), "test -f '/srv/a b'");
         assert!(read_file(UNIX, "/tmp/x", 2_000_000).starts_with("if [ -f /tmp/x ]"));
-        assert!(list_files(UNIX, "/srv/app/", 500).starts_with("cd /srv/app && (git ls-files"));
+        assert!(list_files(UNIX, "/srv/app/", 500).starts_with(
+            "cd /srv/app && (GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false ls-files"
+        ));
     }
 
     #[test]
@@ -505,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn remote_git_reads_use_environment_policy_without_new_git_flags() {
+        assert_eq!(
+            git_read_only(UNIX, "/srv/a b", &["status", "--porcelain"]),
+            "GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false -C '/srv/a b' status --porcelain"
+        );
+        let s = script_of(&git_read_only(WIN, "C:/a b", &["status"]));
+        assert!(s.contains("$env:GIT_OPTIONAL_LOCKS='0'; & git -c diff.autoRefreshIndex=false -C 'C:/a b' 'status'"), "{s}");
+        assert!(s.contains("exit $LASTEXITCODE"), "{s}");
+        for cmd in [
+            git(UNIX, "/srv/app", &["add", "."]),
+            script_of(&git(WIN, "C:/p", &["add", "."])),
+        ] {
+            assert!(!cmd.contains("GIT_OPTIONAL_LOCKS"), "mutation: {cmd}");
+        }
+    }
+
+    #[test]
     fn windows_scripts_stop_on_the_first_error() {
         for cmd in [
             write_file(WIN, "C:/p/a"),
@@ -560,7 +621,8 @@ mod tests {
     fn windows_list_files_prefers_git_then_walks() {
         let s = script_of(&list_files(WIN, "C:/p", 42));
         assert!(
-            s.contains("git ls-files --cached --others --exclude-standard"),
+            s.contains("$env:GIT_OPTIONAL_LOCKS='0';")
+                && s.contains("git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard"),
             "{s}"
         );
         assert!(s.contains("Get-ChildItem"), "{s}");
@@ -596,6 +658,48 @@ mod tests {
         ));
         assert!(s.contains("-contains '.muxel/'"), "{s}");
         assert!(s.contains("$_.Trim()"), "{s}");
+    }
+
+    /// Both hosts ask git before appending, so a `.muxel/` that
+    /// `.git/info/exclude` already ignores leaves `.gitignore` alone.
+    #[test]
+    fn gitignore_append_defers_to_git_check_ignore() {
+        for cmd in [
+            ensure_seeded_file(UNIX, "/p", ".muxel", ".muxel/M.md", "h", ".muxel/"),
+            push_prep(
+                UNIX,
+                "/p",
+                ".muxel",
+                ".muxel/w.json",
+                ".muxel/b.json",
+                ".muxel/",
+            ),
+        ] {
+            assert!(
+                cmd.contains(
+                    "grep -qxF .muxel/ .gitignore 2>/dev/null \
+                     || git check-ignore -q -- .muxel/ 2>/dev/null \
+                     || printf '%s\\n' .muxel/ >> .gitignore"
+                ),
+                "{cmd}"
+            );
+        }
+        let s = script_of(&ensure_seeded_file(
+            WIN,
+            "C:/p",
+            ".muxel",
+            ".muxel/M.md",
+            "h",
+            ".muxel/",
+        ));
+        assert!(
+            s.contains(
+                "try { & git check-ignore -q -- '.muxel/' 2>$null; $have = $LASTEXITCODE -eq 0 } \
+                 catch { $have = $false }"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("Get-Command git"), "{s}");
     }
 
     #[test]

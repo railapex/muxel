@@ -102,6 +102,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
   Terminals and editors move across; a browser pane is re-created in the new window
   at the same URL (a native webview belongs to the window that built it).
+- **Independent refresh** — popouts follow their own pane's title, status and
+  content, theme changes, and their own close state. Unrelated app updates,
+  including sidebar and other panes' activity, do not request a popout render.
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
@@ -112,10 +115,17 @@ feature is added or changed, update the matching entry here in the same change**
   binding, input and completion before expiry; changed work gets Close / Keep.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
-  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
+  file answer needs the close to take every pane of its worktree, so leaving
+  one open, or one exiting or closed by a peer before the close is accepted,
+  drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
-  with `closing` and `undo_until`. A shell counts down only with prompt
+  with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
+  still work. `undo_until` is present only during the countdown; checks,
+  Close / Keep and restoration report their state without an expired deadline.
+  If the pane disappears while `wait` polls or collects its result, `wait`
+  returns `exited` with an explanation. A shell counts down only with prompt
   evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
   always ask. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
@@ -128,18 +138,41 @@ feature is added or changed, update the matching entry here in the same change**
   layout, showing "Checking before close…" until then, so edits a peer made
   while this machine slept are adopted, not overwritten. When that layout
   can't be read (its host is offline or reconnecting, or no read lands within
-  30 seconds), the close asks Close or Keep instead.
+  30 seconds), the close asks Close or Keep instead. Explicit Close also waits
+  for a read begun after the click; a Close offered because the layout cannot
+  be read explicitly proceeds without it.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
-  a muxel worktree with changes or unmerged commits uses its disposal choice
-  directly; a clean, landed worktree follows the terminal countdown policy. A
+  a muxel worktree with changes or unmerged commits asks what to do with its files,
+  then follows the same busy confirmation and countdown with Undo as other
+  terminals. Commit / Merge / Discard / Keep run only after the close finishes
+  and tmux teardown is confirmed; Undo, Cancel, Quit, switching workspace or a
+  failed tmux kill cancels the file action and keeps the files, with the worktree
+  listed in the sidebar. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
-  switch and quit (or logout) finish running countdowns, but keep a pane
+  switch and quit (or logout) finish unshared running countdowns, but keep shared
+  closes until a fresh layout read can run on the next visit. A layout is shared
+  for a remote project and whenever the tmux setting is on, which is the default,
+  so unshared means a local project with that setting off. An explicit Close of a
+  shared pane also waits for the next layout read. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
+  Local tmux closes save a pending kill before teardown and retry it on project
+  activation after layout reconciliation. A pane that reappeared or now shows
+  that session cancels its retry. Retries match the original close's generation
+  token; a same-name replacement is kept, and unverified legacy closes are
+  cancelled without killing. The event log records the retained target; Import
+  keeps its existing server-discovery scope and excludes pending kills on that host.
+  Local worktree cleanup waits for confirmed session death. A remote close keeps
+  its worktree on the host and logs why. Legacy worktrees are kept when
+  dirty, unmerged or still shared by another pane.
+  Removing a project never waits on those kills. One already running finishes in
+  the background and an older unconfirmed one gets a last try, but nothing retries
+  after that. A session that survives keeps running, the removal says so, and
+  Import lists it. A held pane's file answer is dropped, and its files stay.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the
@@ -467,7 +500,9 @@ feature is added or changed, update the matching entry here in the same change**
   supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  icon, dashboard, and notification dots. A **done** you haven't looked at stays
+  bright green; once you focus its pane, its sidebar and dashboard icons dim and
+  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
@@ -490,7 +525,10 @@ feature is added or changed, update the matching entry here in the same change**
   by Claude and Grok remain **working** even when their titles look idle. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
-  Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
+  Grok redraw gaps do not forge completion. Panes judged by output activity
+  (shells, and agents whose titles can't be read) ignore a tmux status bar's
+  repaints, so its clock turning over doesn't flash an idle shell to **working**.
+  Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID. The index is checked
   for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
@@ -562,6 +600,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **First-class worktrees** — named, color-coded git worktrees shared by one or
   more panes; toggle "create a git worktree" when spawning.
+- **Read-only git displays** — background polling, change counts, branch labels,
+  and diffs disable optional git locks locally and over SSH. Reading a pane's
+  repository does not refresh its index or contend with an agent staging files.
 - **Inheritance** — a new tab or split joins its pane's worktree; a duplicate
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name
@@ -751,6 +792,18 @@ feature is added or changed, update the matching entry here in the same change**
   focused — no toast pops over the app you're already looking at (the in-app feed
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
+- **Sound alerts** (Settings → Sounds) — a chime when an agent finishes, and a
+  different one when it's blocked waiting on you, in a pane you aren't looking at
+  (even while muxel is focused, so another pane's agent can call you over). Agents
+  only — a shell finishing a command never chimes. The built-in sounds are
+  synthesized by muxel (a rising two-note chime for done, a double knock for
+  blocked); either can be replaced with your own WAV, AIFF, MP3, OGG, FLAC or M4A
+  file (Play to preview, cut to 10 s; a file that won't play falls back to the
+  built-in), with on/off per alert and a volume setting. No spam: an alert must
+  hold for a moment before it rings, a pane then stays quiet for that alert until
+  you've looked at it (or five minutes pass) however often it flips between working
+  and done, and alerts that land together play as one chime. The desktop toast for
+  the same event stays silent so the two never double up.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
   events **and** all app messages (git results, SSH connections, and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
@@ -948,13 +1001,12 @@ feature is added or changed, update the matching entry here in the same change**
   Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
   the user's `bind -n` keys and extended-key encodings in ctl input reach the
   agent as text and never open a window or run a tmux command, and agent panes
-  need no shell grant. The first ctl write to a terminal finds the agent's own
-  tmux pane, the one its session was created with (the session's lowest pane
-  id; in a session muxel created with a program, that pane must also have been
-  started with a command, which a plain shell split never is, though muxel
-  doesn't check which command), whichever pane the user left active, and keeps
-  it by pane id, so input stays with the agent after the user opens other
-  windows or splits. If it can't be found or has gone, input
+  need no shell grant. A newly created agent records its initial tmux pane id
+  before starting the program; reattaching keeps that record. Input stays with
+  that id even after `join-pane`, `move-pane`, or default-command splits.
+  Older or adopted sessions fall back to the lowest pane id (which must have
+  a start command for an agent). The first ctl write caches the id for the
+  terminal's life. If it can't be found or has gone, input
   is refused with `tmux_pane_unresolved` and nothing is typed, never
   redirected; after a failed lookup the next waits 2 seconds, doubling to at
   most 2 minutes, so a host that can't be reached isn't asked again on every
@@ -966,13 +1018,27 @@ feature is added or changed, update the matching entry here in the same change**
   command, and so each key press, makes its own login. Panes not kept in tmux
   take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
   a remote host; local tmux panes already need 3.2.
+  A pane in copy mode refuses input with `tmux_pane_in_mode`, preserving the
+  user's scroll position. Leave copy mode before retrying. When the server
+  reports version 2.4 or newer, the check and write share tmux's command queue.
+  Older servers, and servers that cannot report their version, use a separate
+  check before every write. That adds a round trip and leaves a small race if
+  the user enters copy mode between the check and Enter. Stock 2.2 and 2.3 also
+  use this legacy path because the server-version format arrived in 2.4.
+  If copy mode begins after a
+  prompt was pasted, the Enter failure carries `pasted: true`; inspect the
+  screen before retrying. An unanswered Enter sets the same local turn guard
+  as an acknowledged Enter, since it may already have started the agent.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
   Activity and attendance follow the same conversation attribution as docked
   terminals; redocking uncertain state preserves existing attention cards.
   On Windows, Grok conversation discovery follows the live terminal in either
-  window.
+  window. It reads Grok's registry on every discovery poll, reusing process
+  ancestry for up to 30 seconds while registrations and pane PID/launches are
+  unchanged. Registry or pane-process changes refresh ancestry immediately;
+  steady polling avoids repeatedly enumerating every process on the machine.
   Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
@@ -1608,8 +1674,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Speech, Read
-  Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
+- **Settings modal** — sections for Appearance, Editor, Behavior, Sounds, Speech,
+  Read Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
   Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
@@ -1711,9 +1777,17 @@ feature is added or changed, update the matching entry here in the same change**
 ## Platform & distribution
 
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
-  session lookup durations and outcomes, plus the remaining launch-time resume
-  lookup. Records contain fixed labels, timings and short pane ids, with no
+  session lookup hits, outcome changes and slow calls, with per-minute counts
+  and maximum durations for all discovery polls. Launch-time resume lookups
+  always log. Both profiler logs keep stable live paths and dated history
+  (14 local dates and 256 MiB per family by default, tunable with
+  `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
+  intervals aggregate totals and maxima over 30 seconds. Records contain fixed
+  labels, timings and short pane ids, with no
   terminal content, session ids, titles or paths.
+- **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
+  process that enabled them. Panes, runners and helper commands start without
+  those settings; a nested muxel can enable its own profiler independently.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain

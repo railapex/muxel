@@ -14,6 +14,7 @@ pub(super) fn status_tag(status: AgentStatus, label: impl Into<SharedString>) ->
     StatusPill {
         status,
         label: label.into(),
+        outline: false,
     }
 }
 
@@ -24,12 +25,25 @@ pub(super) fn status_tag(status: AgentStatus, label: impl Into<SharedString>) ->
 pub(super) struct StatusPill {
     status: AgentStatus,
     label: SharedString,
+    outline: bool,
+}
+
+impl StatusPill {
+    /// Draw with [`outline_colors`] instead of a fill.
+    pub(super) fn outline(mut self) -> Self {
+        self.outline = true;
+        self
+    }
 }
 
 impl RenderOnce for StatusPill {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let (fill, label, border) = pill_colors(self.status, theme);
+        let (fill, label, border) = if self.outline {
+            outline_colors(self.status, theme)
+        } else {
+            pill_colors(self.status, theme)
+        };
         div()
             .flex()
             .items_center()
@@ -72,6 +86,18 @@ pub(super) fn pill_colors(status: AgentStatus, theme: &Theme) -> (Hsla, Hsla, Hs
         gpui::white()
     };
     (fill, label, border)
+}
+
+/// An outline pill's colours, as `Tag::outline` draws them: no fill, and the
+/// status colour as label and border.
+pub(super) fn outline_colors(status: AgentStatus, theme: &Theme) -> (Hsla, Hsla, Hsla) {
+    let (label, border) = match status {
+        AgentStatus::Working => (theme.primary, theme.primary),
+        AgentStatus::Idle => (theme.muted_foreground, theme.border),
+        AgentStatus::Blocked => (theme.warning, theme.warning),
+        AgentStatus::Done => (theme.success, theme.success),
+    };
+    (gpui::transparent_white(), label, border)
 }
 
 /// `top` composited over `bottom`, which is assumed opaque.
