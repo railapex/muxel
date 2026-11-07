@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// One registration with the router.
@@ -40,8 +41,92 @@ impl DirNames {
         Self(names)
     }
 
+    /// These names and `name` too, when it's another.
+    pub fn also(mut self, name: PathBuf) -> Self {
+        if !self.is(&name) {
+            self.0.push(name);
+        }
+        self
+    }
+
     pub fn is(&self, path: &Path) -> bool {
         self.0.iter().any(|name| name == path)
+    }
+
+    /// `path` relative to this directory, under whichever name it's below.
+    pub fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        self.0.iter().find_map(|name| path.strip_prefix(name).ok())
+    }
+}
+
+/// What a diff pane's text depends on: `git diff HEAD -- .` shows tracked
+/// files only, so only those and the git state behind HEAD can change it.
+#[derive(Debug)]
+pub struct TrackedFiles {
+    /// The diff's directory.
+    pub root: DirNames,
+    /// Tracked files under `root`, relative to it, as `git ls-files` lists them.
+    pub files: HashSet<PathBuf>,
+    /// The directories holding them and their ancestors below `root`.
+    pub dirs: HashSet<PathBuf>,
+    /// HEAD's target: the current branch's loose ref, `packed-refs`, reftable's
+    /// `tables.list`. A change there re-runs the diff.
+    pub refs: Vec<DirNames>,
+    /// HEAD and the index. A change there re-runs the diff and re-lists the
+    /// tracked files: an add, a removal, a branch switch.
+    pub relist: Vec<DirNames>,
+}
+
+impl TrackedFiles {
+    pub fn new(
+        root: DirNames,
+        files: impl IntoIterator<Item = PathBuf>,
+        refs: Vec<DirNames>,
+        relist: Vec<DirNames>,
+    ) -> Self {
+        let files: HashSet<PathBuf> = files.into_iter().collect();
+        let mut dirs = HashSet::new();
+        for file in &files {
+            for dir in file.ancestors().skip(1) {
+                if dir.as_os_str().is_empty() || !dirs.insert(dir.to_path_buf()) {
+                    break;
+                }
+            }
+        }
+        Self {
+            root,
+            files,
+            dirs,
+            refs,
+            relist,
+        }
+    }
+
+    /// Route one event's paths. A tracked file counts for any change. A
+    /// tracked directory counts when it's created, removed or renamed, and
+    /// re-lists too, so a watch per directory follows it; its write time
+    /// moving only means an entry inside changed, which a tracked file's own
+    /// event reports.
+    fn route(&self, event: &WatchEvent, change: &mut Change) {
+        let moved = matches!(
+            event.kind,
+            EventKind::Create | EventKind::Remove | EventKind::Rename
+        );
+        for path in &event.paths {
+            if self.relist.iter().any(|name| name.is(path)) {
+                change.touched = true;
+                change.relist = true;
+            } else if self.refs.iter().any(|name| name.is(path)) {
+                change.touched = true;
+            } else if let Some(rel) = self.root.relative(path) {
+                if self.files.contains(rel) {
+                    change.touched = true;
+                } else if moved && self.dirs.contains(rel) {
+                    change.touched = true;
+                    change.relist = true;
+                }
+            }
+        }
     }
 }
 
@@ -51,6 +136,8 @@ pub enum WatchFilter {
     /// `<dir>/<pane>.json`, the extension in any ASCII case: that pane. A
     /// session hook installs its record under that name.
     RecordFiles { dir: DirNames },
+    /// A diff pane's sources.
+    Tracked(Arc<TrackedFiles>),
 }
 
 /// What a registration asks for.
@@ -91,6 +178,10 @@ pub struct WatchEvent {
 pub struct Change {
     /// Panes the events named.
     pub hits: HashSet<Uuid>,
+    /// Something the registration's target depends on changed.
+    pub touched: bool,
+    /// What it depends on may have changed too (see [`TrackedFiles::relist`]).
+    pub relist: bool,
     /// Events may have been lost: every pane of the target is due.
     pub rescan: bool,
     /// Blind from now on. It routes nothing more; its owner goes back to
@@ -100,11 +191,13 @@ pub struct Change {
 
 impl Change {
     fn is_empty(&self) -> bool {
-        self.hits.is_empty() && !self.rescan && !self.lost
+        self.hits.is_empty() && !self.touched && !self.rescan && !self.lost
     }
 
     fn merge(&mut self, other: Change) {
         self.hits.extend(other.hits);
+        self.touched |= other.touched;
+        self.relist |= other.relist;
         self.rescan |= other.rescan;
         self.lost |= other.lost;
     }
@@ -236,6 +329,42 @@ impl WatchRouter {
         ops
     }
 
+    /// Give a registration a new spec, keeping its id and anything pending.
+    /// Returns the OS watch calls to apply: only for the paths whose watch
+    /// changes, so events on a path both specs share keep arriving.
+    pub fn respec(&mut self, id: WatchId, spec: WatchSpec) -> Vec<OsWatch> {
+        let Some(registration) = self.registrations.get_mut(&id) else {
+            return Vec::new();
+        };
+        let old = std::mem::replace(&mut registration.spec, spec);
+        let new = &registration.spec;
+        let mut paths: Vec<&PathBuf> = Vec::new();
+        for (path, _) in old.paths.iter().chain(&new.paths) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        let mut ops = Vec::new();
+        for path in paths {
+            let users = self.os.entry(path.clone()).or_default();
+            let was = depth(users);
+            users.retain(|(user, _)| *user != id);
+            users.extend(
+                new.paths
+                    .iter()
+                    .filter(|(wanted, _)| wanted == path)
+                    .map(|(_, recursion)| (id, *recursion)),
+            );
+            let now = depth(users);
+            if now.is_none() {
+                self.os.remove(path);
+            }
+            retarget(path, was, now, &mut ops);
+        }
+        self.rescan_others_if_restarted(id, &ops);
+        ops
+    }
+
     fn rescan_others_if_restarted(&mut self, changed: WatchId, ops: &[OsWatch]) {
         if !self.restarts_stream || ops.is_empty() {
             return;
@@ -275,6 +404,7 @@ impl WatchRouter {
                             .filter(|path| path.parent().is_some_and(|parent| dir.is(parent)))
                             .filter_map(|path| record_pane(path)),
                     ),
+                    WatchFilter::Tracked(tracked) => tracked.route(event, &mut change),
                 }
             }
             if !change.is_empty() {
@@ -324,12 +454,78 @@ impl WatchRouter {
 #[cfg(test)]
 mod tests {
     use super::{
-        Change, DirNames, EventKind, OsWatch, Recursion, WatchEvent, WatchFilter, WatchId,
-        WatchRouter, WatchSpec,
+        Change, DirNames, EventKind, OsWatch, Recursion, TrackedFiles, WatchEvent, WatchFilter,
+        WatchId, WatchRouter, WatchSpec,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn a_diff_wakes_for_tracked_files_and_git_state_only() {
+        let root = PathBuf::from("repo");
+        let git = root.join(".git");
+        let tracked = TrackedFiles::new(
+            names(&root),
+            ["src/main.rs", "README.md"].map(PathBuf::from),
+            vec![
+                names(&git.join("refs/heads/main")),
+                names(&git.join("packed-refs")),
+            ],
+            vec![names(&git.join("HEAD")), names(&git.join("index"))],
+        );
+        let mut router = WatchRouter::new(false);
+        router.register(WatchSpec {
+            paths: vec![(root.clone(), Recursion::Tree)],
+            filter: WatchFilter::Tracked(Arc::new(tracked)),
+            lose_on: Vec::new(),
+        });
+        // A build, a new file beside tracked ones, git's own writes, a tracked
+        // directory's write time, a read.
+        for (kind, path) in [
+            (EventKind::Create, root.join("target/debug/muxel.exe")),
+            (EventKind::Modify, root.join("target")),
+            (EventKind::Create, root.join("src/scratch.rs")),
+            (EventKind::Modify, root.join("src")),
+            (EventKind::Create, git.join("objects/ab/cdef")),
+            (EventKind::Modify, git.join("logs/HEAD")),
+            (EventKind::Access, root.join("README.md")),
+        ] {
+            router.event(&event(kind, &[path]));
+        }
+        assert_eq!(change(&mut router), Change::default());
+        let touched = Change {
+            touched: true,
+            ..Change::default()
+        };
+        router.event(&event(EventKind::Modify, &[root.join("src/main.rs")]));
+        assert_eq!(change(&mut router), touched);
+        // The branch moving re-runs the diff.
+        router.event(&event(
+            EventKind::Rename,
+            &[
+                git.join("refs/heads/main.lock"),
+                git.join("refs/heads/main"),
+            ],
+        ));
+        assert_eq!(change(&mut router), touched);
+        // The index or HEAD changing, or a tracked directory coming or going,
+        // re-lists as well.
+        let relist = Change {
+            relist: true,
+            ..touched
+        };
+        router.event(&event(
+            EventKind::Rename,
+            &[git.join("index.lock"), git.join("index")],
+        ));
+        assert_eq!(change(&mut router), relist);
+        for kind in [EventKind::Rename, EventKind::Remove, EventKind::Create] {
+            router.event(&event(kind, &[root.join("src")]));
+            assert_eq!(change(&mut router), relist, "{kind:?}");
+        }
+    }
 
     fn root_path() -> PathBuf {
         Path::new("data").join("bindings").join("claude")
@@ -574,6 +770,55 @@ mod tests {
             vec![OsWatch::Unwatch(muse_dir), OsWatch::Unwatch(parent)]
         );
         assert!(router.unregister(muse).is_empty());
+    }
+
+    /// A diff pane re-lists after `git add`: its new spec keeps the watches it
+    /// shares with the old one open, and news it gathered meanwhile stays.
+    #[test]
+    fn a_respec_moves_only_the_watches_that_differ() {
+        let root = PathBuf::from("repo");
+        let spec = |files: &[&str], dirs: &[&str]| WatchSpec {
+            paths: dirs
+                .iter()
+                .map(|dir| (root.join(dir), Recursion::Dir))
+                .collect(),
+            filter: WatchFilter::Tracked(Arc::new(TrackedFiles::new(
+                names(&root),
+                files.iter().map(PathBuf::from),
+                Vec::new(),
+                Vec::new(),
+            ))),
+            lose_on: Vec::new(),
+        };
+        let touched = |router: &mut WatchRouter| -> Vec<WatchId> {
+            router
+                .take()
+                .changes
+                .into_iter()
+                .filter(|(_, change)| change.touched)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let mut router = WatchRouter::new(false);
+        let (id, _) = router.register(spec(&["a/old.rs", "b/kept.rs"], &["a", "b"]));
+        // Another pane on the same repository shares `a`.
+        let (other, _) = router.register(spec(&["a/old.rs"], &["a"]));
+        router.event(&event(EventKind::Modify, &[root.join("b/kept.rs")]));
+        // Its last file under `a` is gone, but the other pane still needs `a`.
+        let ops = router.respec(id, spec(&["b/kept.rs", "c/new.rs"], &["b", "c"]));
+        assert_eq!(ops, vec![OsWatch::Watch(root.join("c"), Recursion::Dir)]);
+        assert_eq!(touched(&mut router), vec![id], "news from before stays");
+        router.event(&event(EventKind::Modify, &[root.join("c/new.rs")]));
+        assert_eq!(touched(&mut router), vec![id], "the new list routes");
+        router.event(&event(EventKind::Modify, &[root.join("a/old.rs")]));
+        assert_eq!(touched(&mut router), vec![other], "the old one doesn't");
+        assert_eq!(
+            router.respec(id, spec(&[], &[])),
+            vec![
+                OsWatch::Unwatch(root.join("b")),
+                OsWatch::Unwatch(root.join("c")),
+            ]
+        );
     }
 
     #[test]
