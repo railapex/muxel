@@ -1,5 +1,27 @@
 # Agent lifecycle, attention, and recency
 
+Lifecycle badges use opaque status-coloured backgrounds and choose a readable
+foreground against the resulting colour (at least WCAG 4.5:1). A bundled-theme
+population test covers all four statuses and completion fade bands. The label
+stays fully opaque; only the completion colour settles toward the theme's muted
+background. Working, idle, and blocked retain their colour strength.
+
+Completion recency uses the persisted `completed_at` timestamp, also used by
+`done · 2h`: under ten minutes, under one hour, under one day, and older. Unknown
+completion times use the oldest style; future times use the newest style until
+their first boundary. Sidebar and dashboard labels, tab dots, and terminal
+popout labels share this policy. Attendance does not restart the fade.
+
+Each window collects the next band edge only from indicators intersecting the
+current paint clip. One cancellable wake targets the soonest visible boundary;
+painting re-arms it after that boundary. Hidden or clipped indicators contribute
+no deadline, and a window with no eligible visible completion has no fade wake.
+This adds no periodic age redraw and does not change lifecycle sampling.
+The sampler compares Done completion identity rather than its changing coarse
+age label, so an offscreen completion cannot force minute-by-minute redraws.
+Actual completion changes still invalidate the view; other statuses retain
+their existing coarse-label refresh behavior.
+
 ## Reader
 
 Muxel maintainers implementing or reviewing agent-status detection and its sidebar UI.
@@ -231,7 +253,8 @@ Transition rules are pure and live in `muxel-core`:
 - entering Done records `completed_at` once for that completion;
 - every transition records the latest lifecycle state;
 - attending records `last_attended_at` without changing lifecycle state;
-- leaving Blocked for Working, Idle, or Done clears the active `blocked_at` value;
+- leaving Blocked records the new state while retaining `blocked_at` as the last
+  blocked event, so sidebar unread survives until attendance (see [Sidebar](sidebar.md));
 - PTY-only activity remains a runtime fallback and never records completion.
 
 V1 does not store an event log or run ring buffer. The fields leave room for a
@@ -444,7 +467,7 @@ cargo build -p muxel
 
 - Next unattended agent command.
 - Recent Agents palette sorted independently of the stable tree.
-- Project-level blocked/unseen rollups.
+- Project-level blocked counts (unread counts are available in Recent work).
 - Capped run history and overnight digest.
 - Per-provider capability diagnostics and update guidance.
 - Configurable stale thresholds or playful labels such as `ancient`.

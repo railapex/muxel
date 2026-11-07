@@ -134,14 +134,21 @@ impl MuxelApp {
                     .map_err(|error| error.to_string())?,
             );
         }
-        let target = self
-            .active_instance
-            .filter(|iid| {
-                project
-                    .layout
-                    .as_ref()
-                    .is_some_and(|l| l.leaf_containing(*iid).is_some())
-            })
+        // A pane's own request opens in its group, where the agent asking can
+        // be seen beside what it started; any other caller gets the group the
+        // user has focused. The caller's id is declared, not verified, so it
+        // counts only as the approval card shows it, a live terminal, and only
+        // among this project's own groups.
+        let in_project = |iid: &Uuid| {
+            project
+                .layout
+                .as_ref()
+                .is_some_and(|l| l.leaf_containing(*iid).is_some())
+        };
+        let target = options
+            .requesting_pane
+            .filter(|iid| self.terminals.contains_key(iid) && in_project(iid))
+            .or_else(|| self.active_instance.filter(in_project))
             .or_else(|| project.preferred_instance());
         let iid = instance.id;
         // Taking focus moves the user's keystrokes (a password, say) into the
@@ -179,7 +186,9 @@ impl MuxelApp {
                 cx,
             );
         } else {
-            self.select_project(pid, window, cx);
+            // Keep reconciliation before placement, without selecting the old
+            // preferred session while the requested new pane does not exist.
+            self.select_project_for_new_pane(pid, window, cx);
             self.place_and_spawn(
                 pid,
                 instance,
@@ -189,7 +198,9 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            window.activate_window();
+            if self.workspace.instance(iid).is_some() {
+                window.activate_window();
+            }
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);
