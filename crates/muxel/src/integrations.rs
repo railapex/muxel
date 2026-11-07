@@ -49,7 +49,8 @@ fn git_command() -> Command {
 /// `git`, for every local git muxel runs. When `git` on `PATH` is Git for Windows'
 /// launcher (`cmd\git.exe`), this is the git.exe the launcher would start, with the
 /// variables it would set, so a call is two processes instead of three (see
-/// [`muxel_core::git_for_windows`]). Resolved once.
+/// [`muxel_core::git_for_windows`]). Resolved on first use, and again once that
+/// git.exe is gone.
 #[cfg(windows)]
 fn git_command() -> Command {
     #[cfg(test)]
@@ -57,8 +58,27 @@ fn git_command() -> Command {
     {
         return cmd;
     }
-    static PROGRAM: std::sync::OnceLock<GitProgram> = std::sync::OnceLock::new();
-    git_command_for(PROGRAM.get_or_init(resolve_git_program))
+    static PROGRAM: std::sync::Mutex<Option<GitProgram>> = std::sync::Mutex::new(None);
+    let mut program = PROGRAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    git_command_for(current_git_program(&mut program, resolve_git_program))
+}
+
+/// The resolved git, resolved again when it was a git.exe that no longer exists:
+/// a Git for Windows update can move it (v2.56 moved it from mingw64 to ucrt64),
+/// and muxel outlives updates. One file check a call, against the process saved.
+#[cfg(windows)]
+fn current_git_program(
+    program: &mut Option<GitProgram>,
+    resolve: impl FnOnce() -> GitProgram,
+) -> &GitProgram {
+    if let Some(GitProgram::Direct { exe, .. }) = program
+        && !exe.is_file()
+    {
+        *program = None;
+    }
+    program.get_or_insert_with(resolve)
 }
 
 #[cfg(all(windows, test))]
@@ -5741,6 +5761,41 @@ mod tests {
                 "resolved -c diff.autoRefreshIndex=false -C {} --no-pager rev-parse --show-toplevel",
                 dir.display()
             ),
+        );
+    }
+
+    /// A git.exe resolved earlier that has since gone (a Git for Windows update moved
+    /// it) is looked up again instead of failing every later call; one that is still
+    /// there, or plain `git`, is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_resolved_git_that_has_gone_is_looked_up_again() {
+        let dir = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("git.exe");
+        std::fs::write(&exe, "").unwrap();
+        let direct = GitProgram::Direct {
+            exe: exe.clone(),
+            env: Vec::new(),
+        };
+        let mut program = None;
+        assert_eq!(
+            current_git_program(&mut program, || direct.clone()),
+            &direct
+        );
+        assert_eq!(
+            current_git_program(&mut program, || unreachable!("looked up while it exists")),
+            &direct
+        );
+        std::fs::remove_file(&exe).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            current_git_program(&mut program, || GitProgram::Path),
+            &GitProgram::Path
+        );
+        assert_eq!(
+            current_git_program(&mut program, || unreachable!("plain git looked up again")),
+            &GitProgram::Path
         );
     }
 
