@@ -1358,8 +1358,8 @@ feature is added or changed, update the matching entry here in the same change**
   elsewhere by `GIT_DIR`), it refreshes every 1.5 s instead. A pane hidden
   behind another tab, another view or a maximized pane runs no git, and
   refreshes as soon as it's shown if it may be stale. The ↻ button, reopening
-  and popping out never wait on git. On Windows, while the pane is open its
-  folder and the folders above it can't be renamed.
+  and popping out never wait on git. On Windows, while the pane is open the
+  folders above its folder can't be renamed.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
