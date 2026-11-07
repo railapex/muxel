@@ -141,6 +141,9 @@ pub enum WatchFilter {
     /// Anything inside `<dir>/<pane>/`: that pane. Muse's hook keeps each
     /// pane's records in a directory of its own.
     PaneDirs { dir: DirNames },
+    /// `<dir>/<name>`, the name in any ASCII case: the whole target. A
+    /// file every pane shares, such as Grok's session registry.
+    FileName { dir: DirNames, name: String },
 }
 
 /// What a registration asks for.
@@ -422,6 +425,15 @@ impl WatchRouter {
                             .iter()
                             .filter_map(|path| pane_dir_entry(dir, path)),
                     ),
+                    WatchFilter::FileName { dir, name } => {
+                        change.touched |= event.paths.iter().any(|path| {
+                            path.parent().is_some_and(|parent| dir.is(parent))
+                                && path
+                                    .file_name()
+                                    .and_then(|file| file.to_str())
+                                    .is_some_and(|file| file.eq_ignore_ascii_case(name))
+                        });
+                    }
                 }
             }
             if !change.is_empty() {
@@ -688,6 +700,43 @@ mod tests {
         ));
         let change = change(&mut router);
         assert_eq!(change.hits, HashSet::from([temp, renamed]));
+        assert!(!change.rescan && !change.lost);
+    }
+
+    /// Grok's registration: a write of the registry wakes the whole target;
+    /// the other files beside it (credentials, logs, locks) and files of the
+    /// same name elsewhere don't.
+    #[test]
+    fn only_the_shared_file_wakes_its_target() {
+        let dir = root_path().with_file_name("grok");
+        let mut router = WatchRouter::new(false);
+        router.register(WatchSpec {
+            paths: vec![(dir.clone(), Recursion::Dir)],
+            filter: WatchFilter::FileName {
+                dir: names(&dir),
+                name: "active_sessions.json".into(),
+            },
+            lose_on: vec![names(&dir)],
+        });
+        for (kind, path) in [
+            (EventKind::Modify, dir.join("auth.json")),
+            (EventKind::Create, dir.join("active_sessions.json.lock")),
+            (
+                EventKind::Create,
+                dir.join("logs").join("active_sessions.json"),
+            ),
+            (EventKind::Modify, root_path().join("active_sessions.json")),
+            (EventKind::Access, dir.join("active_sessions.json")),
+        ] {
+            router.event(&event(kind, &[path]));
+        }
+        assert_eq!(change(&mut router), Change::default());
+        router.event(&event(
+            EventKind::Rename,
+            &[dir.join("tmp-1234"), dir.join("Active_Sessions.JSON")],
+        ));
+        let change = change(&mut router);
+        assert!(change.touched && change.hits.is_empty());
         assert!(!change.rescan && !change.lost);
     }
 

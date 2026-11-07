@@ -10,6 +10,8 @@ use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
     validated_codex_session_id,
 };
+#[cfg(windows)]
+use crate::file_watch::grok_registry;
 use crate::file_watch::{claude_records, muse_panes};
 use crate::{session_binding, ui_profile};
 use gpui::{App, AsyncApp, Context, WeakEntity};
@@ -864,6 +866,12 @@ impl MuxelApp {
                 }
             }
         }
+        #[cfg(windows)]
+        if !self.provider_watches.contains_key(&SessionProvider::Grok)
+            && keys.iter().any(|key| key.provider == SessionProvider::Grok)
+        {
+            self.start_grok_registry_watch(cx);
+        }
         self.session_discoveries.reconcile(&self.workspace);
         let requests: Vec<_> = keys
             .into_iter()
@@ -883,25 +891,23 @@ impl MuxelApp {
             let home = home.clone();
             let data_dir = data_dir.clone();
             #[cfg(windows)]
-            let previous_grok_reads = requests
-                .iter()
-                .filter_map(|request| {
-                    self.grok_read_for(&request.key)
-                        .map(|read| (request.key.pane, (read.started, read.finished)))
-                })
-                .collect();
+            let grok = GrokInputs {
+                previous_reads: requests
+                    .iter()
+                    .filter_map(|request| {
+                        self.grok_read_for(&request.key)
+                            .map(|read| (request.key.pane, (read.started, read.finished)))
+                    })
+                    .collect(),
+                watched: self.session_discoveries.watched(SessionProvider::Grok),
+            };
             #[cfg(not(windows))]
-            let previous_grok_reads = HashMap::new();
+            let grok = GrokInputs::default();
             cx.spawn(async move |this, cx| {
                 let (batch, data_dir) = cx
                     .background_executor()
                     .spawn(async move {
-                        let batch = discover_sessions(
-                            requests,
-                            &home,
-                            data_dir.as_deref(),
-                            previous_grok_reads,
-                        );
+                        let batch = discover_sessions(requests, &home, data_dir.as_deref(), grok);
                         (batch, data_dir)
                     })
                     .await;
@@ -910,6 +916,25 @@ impl MuxelApp {
                 });
             })
             .detach();
+        }
+    }
+
+    /// Watch Grok's session registry, once it exists. A write it reports runs
+    /// every Grok pane's lookup at once; between writes they wait for the
+    /// fallback. Failing to watch leaves them polling as they would without
+    /// it. Grok's folder is its own to create, so until it does, the next
+    /// lookup tries again.
+    #[cfg(windows)]
+    fn start_grok_registry_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = super::grok_home_dir().filter(|dir| dir.is_dir()) else {
+            return;
+        };
+        let watched = self.watch_provider(SessionProvider::Grok, || Ok(grok_registry(&dir)), cx);
+        if let Err(error) = watched {
+            log::warn!(
+                "could not watch Grok's session registry in {}; polling instead: {error:#}",
+                dir.display()
+            );
         }
     }
 
@@ -1423,14 +1448,25 @@ impl MuxelApp {
     }
 }
 
+/// What a lookup batch's Grok panes carry from the UI.
+#[derive(Default)]
+struct GrokInputs {
+    /// Each pane's previous registry read, as `(started, finished)`.
+    previous_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
+    /// A watcher reports every registry write, so ancestry is reused longer.
+    watched: bool,
+}
+
 fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-    previous_grok_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
+    grok: GrokInputs,
 ) -> DiscoveryBatch {
     #[cfg(not(windows))]
-    let _ = previous_grok_reads;
+    let _ = grok;
+    #[cfg(windows)]
+    let previous_grok_reads = grok.previous_reads;
     #[cfg(windows)]
     let mut grok_snapshot = None;
     #[cfg(windows)]
@@ -1541,7 +1577,8 @@ fn discover_sessions(
                                 started,
                                 finished: SystemTime::now(),
                             };
-                            let parents = grok_snapshot::process_snapshot(&grok_roots, &active);
+                            let parents =
+                                grok_snapshot::process_snapshot(&grok_roots, &active, grok.watched);
                             (read, active, parents)
                         });
                         let previous = previous_grok_reads
@@ -2355,6 +2392,53 @@ mod grok_regressions {
                     );
                 })
                 .unwrap();
+        });
+    }
+
+    /// Grok registers a conversation for a live pane's process. With the
+    /// registry watched, the pane binds with no discovery poll after the
+    /// write: the status tick is stopped, so only the watcher's wake can run
+    /// the lookup.
+    #[test]
+    fn a_registry_write_wakes_grok_panes() {
+        with_app(|cx, window| {
+            let home = muxel_store::data_dir().unwrap().join("grok-home");
+            let grok = home.join(".grok");
+            std::fs::create_dir_all(&grok).unwrap();
+            let _home = super::super::claude_test_home(Some(home));
+            let (id, session) = checked_update(window, cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.current_workspace = Some(Uuid::new_v4());
+                pane(app, window, cx)
+            });
+            let _stop = StopChild(session.clone());
+            // Nothing is registered yet; the first lookup starts the watcher.
+            checked_update(window, cx, |app, _, cx| app.sync_provider_session_ids(cx));
+            cx.run_until_parked();
+            let pid = session.child_pid().unwrap();
+            let next = Uuid::new_v4().to_string();
+            let rows = serde_json::json!([{
+                "session_id": next,
+                "pid": pid,
+                "opened_at": chrono::Utc::now().to_rfc3339(),
+            }]);
+            std::fs::write(grok.join(super::super::GROK_REGISTRY), rows.to_string()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let bound = loop {
+                cx.run_until_parked();
+                let bound = checked_update(window, cx, |app, _, _| {
+                    app.workspace.instance(id).unwrap().session_id.clone()
+                });
+                if bound.as_deref() == Some(next.as_str()) || Instant::now() >= deadline {
+                    break bound;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(
+                bound.as_deref(),
+                Some(next.as_str()),
+                "the registry write waited for a poll"
+            );
         });
     }
 }

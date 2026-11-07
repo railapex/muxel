@@ -14,6 +14,8 @@
 //! So are diff panes' sources ([`diff_sources`]): a visible diff pane runs
 //! `git diff` when a tracked file or HEAD's branch changes, instead of every
 //! 1.5 s (see [`muxel_core::diff_schedule`]).
+//! On Windows so is Grok's session registry (`grok_registry`), which each
+//! Grok pane otherwise reads every one to two seconds.
 
 use crate::integrations::DiffPlan;
 use muxel_core::file_watch::{
@@ -159,6 +161,28 @@ pub(crate) fn muse_panes(dir: &Path) -> WatchSpec {
         paths,
         filter: WatchFilter::PaneDirs {
             dir: dir_names(dir),
+        },
+        lose_on,
+    }
+}
+
+/// Grok's session registry, `active_sessions.json` in Grok's folder `dir`,
+/// which also holds credentials, logs and locks that change on their own.
+/// Every Grok pane reads it, so a write wakes them all. The parent is watched
+/// as for [`claude_records`], since only it reports `dir` going away.
+#[cfg(windows)]
+pub(crate) fn grok_registry(dir: &Path) -> WatchSpec {
+    let mut paths = vec![(dir.to_path_buf(), Recursion::Dir)];
+    let mut lose_on = vec![dir_names(dir)];
+    if let Some(parent) = dir.parent() {
+        paths.push((parent.to_path_buf(), Recursion::Dir));
+        lose_on.push(dir_names(parent));
+    }
+    WatchSpec {
+        paths,
+        filter: WatchFilter::FileName {
+            dir: dir_names(dir),
+            name: crate::app::GROK_REGISTRY.into(),
         },
         lose_on,
     }
