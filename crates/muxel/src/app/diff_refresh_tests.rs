@@ -147,6 +147,10 @@ fn a_diff_pane_shown_after_a_change_refreshes_at_once() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "a pop-out's gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
 fn a_popped_out_diff_pane_keeps_refreshing() {
     with_app(|cx, window, fx| {
         let a = open_diff(cx, window, fx, &fx.a);
