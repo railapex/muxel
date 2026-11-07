@@ -5815,7 +5815,10 @@ pub struct MuxelApp {
     /// The clipboard "Copy as rich text" writes HTML through, opened on first
     /// use. Kept for the app's lifetime: on Linux the copied data is served from
     /// this process and disappears when the last handle drops.
-    rich_clipboard: Option<arboard::Clipboard>,
+    rich_clipboard: Option<Box<dyn RichClipboard>>,
+    /// The Markdown to mail HTML conversion "Copy as rich text" runs in the
+    /// background. A test swaps in one that counts its calls.
+    rich_copy_convert: fn(&str, &str) -> String,
     /// Live browser panes, keyed by instance id (parallel to `editors`). On
     /// Linux these are placeholder views — the real browser is a separate window.
     browsers: HashMap<Uuid, Entity<crate::browser::BrowserView>>,
@@ -7930,6 +7933,19 @@ mod link_source_tests {
     }
 }
 
+/// Where "Copy as rich text" puts its HTML and plain-text fallback: the system
+/// clipboard through arboard, or a recorder in tests.
+trait RichClipboard {
+    fn write_html(&mut self, html: String, text: String) -> Result<(), String>;
+}
+
+impl RichClipboard for arboard::Clipboard {
+    fn write_html(&mut self, html: String, text: String) -> Result<(), String> {
+        self.set_html(html, Some(text))
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl MuxelApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Main, window);
@@ -8412,6 +8428,7 @@ impl MuxelApp {
             terminals: HashMap::new(),
             editors: HashMap::new(),
             rich_clipboard: None,
+            rich_copy_convert: muxel_core::rich_copy::markdown_to_html,
             browsers: HashMap::new(),
             active_instance: None,
             presets,
@@ -17351,34 +17368,76 @@ impl MuxelApp {
 
     /// Copy pane `iid`'s whole Markdown document as HTML a mail client keeps on
     /// paste, with the Markdown source as the plain-text fallback.
+    ///
+    /// The conversion runs in the background, since raw HTML can make it slow
+    /// (html5ever's time grows with the square of the unclosed tags). While it
+    /// runs, another copy of the same pane is ignored.
     fn copy_rich_text(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         let Some(editor) = self.editors.get(&iid).cloned() else {
             return;
         };
-        let markdown = editor.read(cx).text(cx);
-        let mut html = muxel_core::rich_copy::markdown_to_html(&markdown, &t("Image"));
-        // Linux readers get these bytes bare. arboard's Windows (CF_HTML) and
-        // macOS wrappers already declare UTF-8.
-        if cfg!(target_os = "linux") {
-            html.insert_str(0, r#"<meta charset="utf-8">"#);
+        let Some(markdown) = editor.update(cx, |editor, cx| editor.begin_rich_copy(cx)) else {
+            return;
+        };
+        let (convert, image_label) = (self.rich_copy_convert, t("Image"));
+        let conversion = cx.background_spawn(async move {
+            let mut html = convert(&markdown, &image_label);
+            // Linux readers get these bytes bare. arboard's Windows (CF_HTML) and
+            // macOS wrappers already declare UTF-8.
+            if cfg!(target_os = "linux") {
+                html.insert_str(0, r#"<meta charset="utf-8">"#);
+            }
+            (html, markdown)
+        });
+        // Only weak handles wait on the conversion, so it keeps neither the app
+        // nor the editor alive.
+        let editor = editor.downgrade();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let (html, markdown) = conversion.await;
+            let _ = this.update(cx, |this, cx| {
+                this.write_rich_copy(iid, &editor, html, markdown, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// Put pane `iid`'s finished conversion on the clipboard, then show the
+    /// check or the error. Nothing is written if the pane has closed.
+    fn write_rich_copy(
+        &mut self,
+        iid: Uuid,
+        editor: &WeakEntity<EditorView>,
+        html: String,
+        markdown: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = editor.upgrade() else {
+            return;
+        };
+        editor.update(cx, |editor, _| editor.end_rich_copy());
+        // A closed pane's editor can outlive it while another task holds it,
+        // such as a remote file's load, so the pane must still show it.
+        if self.editors.get(&iid) != Some(&editor) {
+            return;
         }
+        // On the UI thread, like gpui's own clipboard write: on Windows both open
+        // the clipboard, empty it and set the formats synchronously. arboard
+        // retries the open for up to 25 ms while another process holds it.
         let clipboard = match self.rich_clipboard.take() {
             Some(clipboard) => Ok(clipboard),
-            None => arboard::Clipboard::new(),
+            None => arboard::Clipboard::new()
+                .map(|clipboard| Box::new(clipboard) as Box<dyn RichClipboard>)
+                .map_err(|error| error.to_string()),
         };
         let result = clipboard.and_then(|clipboard| {
             self.rich_clipboard
                 .insert(clipboard)
-                .set_html(html, Some(markdown))
+                .write_html(html, markdown)
         });
         match result {
             Ok(()) => editor.update(cx, |editor, cx| editor.flash_rich_text_copied(cx)),
             Err(error) => {
-                self.add_event(
-                    NotifKind::Error,
-                    t("Couldn't copy as rich text"),
-                    error.to_string(),
-                );
+                self.add_event(NotifKind::Error, t("Couldn't copy as rich text"), error);
                 cx.notify();
             }
         }
@@ -25772,6 +25831,10 @@ impl MuxelApp {
                                     } else {
                                         IconName::Copy
                                     })
+                                    // Also the accessible name, which gpui-component's
+                                    // Button takes only from its label. It stays put
+                                    // while the icon shows the check.
+                                    .label(t("Copy as rich text"))
                                     .tooltip(if copied {
                                         t("Copied")
                                     } else {
