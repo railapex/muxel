@@ -7,6 +7,8 @@ mod agent;
 mod appimage;
 pub mod audio;
 pub mod autopilot;
+pub mod child_env;
+pub mod chime;
 pub mod control;
 pub mod diff;
 pub mod geometry;
@@ -22,10 +24,12 @@ mod pane;
 pub mod path_paste;
 pub mod readaloud;
 pub mod recoverable_close;
+pub mod refresh_gate;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
 pub mod sidebar;
+pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
 pub mod stt;
@@ -1115,7 +1119,7 @@ pub struct Project {
     pub layout_updated_at: Option<u64>,
     /// Panes closed on this project's host whose tmux session muxel has not yet
     /// confirmed dead. Persisted because the confirmation may have to wait for the
-    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// next connect or local project activation — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
@@ -1167,21 +1171,54 @@ impl Project {
     /// the host confirms it is gone. Idempotent per instance: closing, failing to
     /// confirm, and closing again leaves one entry.
     ///
-    /// Capped, oldest first: a host that is never reachable again would otherwise
-    /// grow the ledger without bound, and an entry that old has long stopped
-    /// protecting anything — its instance is gone from the workspace.
+    /// Remote history is capped, oldest first. Local pending kills must all
+    /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
+        let previous = self.closed_sessions.iter().find(|closed| {
+            closed.instance == instance
+                && closed.name == session.name
+                && (closed.socket == session.socket || closed.socket.is_none())
+        });
+        let local_close_token = previous.and_then(|closed| closed.local_close_token);
+        let worktree = self
+            .closed_sessions
+            .iter()
+            .find(|closed| closed.instance == instance)
+            .map_or_else(Default::default, |closed| closed.worktree.clone());
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
             socket: session.socket,
             instance,
+            local_close_token,
+            worktree,
         });
-        let over = self
+        if self.is_remote() {
+            let over = self
+                .closed_sessions
+                .len()
+                .saturating_sub(MAX_CLOSED_SESSIONS);
+            self.closed_sessions.drain(..over);
+        }
+    }
+
+    /// Record where a remembered close's pane ran.
+    pub fn set_closed_worktree(&mut self, instance: Uuid, worktree: tmux::ClosedWorktree) {
+        if let Some(closed) = self
             .closed_sessions
-            .len()
-            .saturating_sub(MAX_CLOSED_SESSIONS);
-        self.closed_sessions.drain(..over);
+            .iter_mut()
+            .find(|closed| closed.instance == instance)
+        {
+            closed.worktree = worktree;
+        }
+    }
+
+    /// Whether an unconfirmed kill could be for a pane that ran in the worktree
+    /// at `path`. Other panes' kills say nothing about those files.
+    pub fn close_pending_in(&self, path: &std::path::Path) -> bool {
+        self.closed_sessions
+            .iter()
+            .any(|closed| closed.worktree.may_be(path))
     }
 
     /// Forget a close whose session the host has confirmed gone.
@@ -1389,6 +1426,20 @@ impl Workspace {
         self.worktrees.retain(|w| w.id != id);
     }
 
+    /// Where `instance` runs, for its close's ledger entry. Capture before
+    /// removing its metadata.
+    pub fn closed_worktree_of(&self, instance: &Instance) -> tmux::ClosedWorktree {
+        match (instance.worktree_id, &instance.worktree_path) {
+            (Some(id), _) => self
+                .worktree(id)
+                .map_or(tmux::ClosedWorktree::Unknown, |worktree| {
+                    tmux::ClosedWorktree::In(worktree.path.clone())
+                }),
+            (None, Some(path)) => tmux::ClosedWorktree::In(path.clone()),
+            (None, None) => tmux::ClosedWorktree::Outside,
+        }
+    }
+
     /// Instance ids currently referencing `worktree_id`.
     pub fn instances_using(&self, worktree_id: Uuid) -> Vec<Uuid> {
         self.instances
@@ -1400,6 +1451,26 @@ impl Workspace {
 
     /// Next color index for a new worktree in `project_id`: the lowest unused
     /// slot 0..8 among the project's live (non-detached) worktrees, wrapping.
+    /// Detach each worktree `candidate` selects that no pane uses. The sidebar
+    /// lists a pane-less worktree only when detached, so one left attached can't
+    /// be reached. Instances held for close still count as using theirs. Returns
+    /// whether anything changed.
+    pub fn detach_unused_worktrees(&mut self, candidate: impl Fn(&Worktree) -> bool) -> bool {
+        let used: std::collections::HashSet<Uuid> = self
+            .instances
+            .iter()
+            .filter_map(|i| i.worktree_id)
+            .collect();
+        let mut changed = false;
+        for worktree in &mut self.worktrees {
+            if !worktree.detached && !used.contains(&worktree.id) && candidate(worktree) {
+                worktree.detached = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn next_worktree_color(&self, project_id: Uuid) -> u8 {
         let used: Vec<u8> = self
             .worktrees
@@ -2154,6 +2225,10 @@ pub fn migrate_worktrees(workspace: &mut Workspace) {
     }
 }
 
+fn default_sound_volume() -> u8 {
+    sound_alert::DEFAULT_VOLUME
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2781,6 +2856,23 @@ pub struct Settings {
     /// Stop after about this many characters, at a sentence (0 = read it all).
     #[serde(default)]
     pub read_aloud_max_chars: u32,
+    // --- Sound alerts (see `sound_alert`) ---
+    /// Chime when an agent finishes a turn in a pane you aren't watching.
+    #[serde(default = "default_true")]
+    pub sound_on_done: bool,
+    /// Chime when an agent is blocked waiting on you.
+    #[serde(default = "default_true")]
+    pub sound_on_blocked: bool,
+    /// The user's own sound for Done (WAV, MP3, OGG, FLAC, …); `None` plays the
+    /// built-in chime (`chime`).
+    #[serde(default)]
+    pub sound_done_file: Option<PathBuf>,
+    /// The user's own sound for Blocked; `None` plays the built-in chime.
+    #[serde(default)]
+    pub sound_blocked_file: Option<PathBuf>,
+    /// Alert volume, 0–100.
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: u8,
     // --- Outside control (`muxel ctl`; see `control`) ---
     /// Let other programs on this computer (an orchestrating agent such as Grok
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
@@ -3132,6 +3224,11 @@ impl Default for Settings {
             read_aloud_short_paths: true,
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
+            sound_on_done: true,
+            sound_on_blocked: true,
+            sound_done_file: None,
+            sound_blocked_file: None,
+            sound_volume: sound_alert::DEFAULT_VOLUME,
             control_enabled: false,
             control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
@@ -3557,6 +3654,31 @@ mod settings_tests {
     }
 
     #[test]
+    fn sound_alerts_default_on_for_old_configs() {
+        // A config from before sound alerts: both chimes on, built-in sounds,
+        // the default volume.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(s.sound_on_done && s.sound_on_blocked);
+        assert!(s.sound_done_file.is_none() && s.sound_blocked_file.is_none());
+        assert_eq!(s.sound_volume, sound_alert::DEFAULT_VOLUME);
+        // Saved choices come back, through the TOML the settings file uses.
+        let mut s = Settings {
+            sound_on_done: false,
+            sound_blocked_file: Some(PathBuf::from("/sounds/knock.ogg")),
+            sound_volume: 35,
+            ..Settings::default()
+        };
+        s = toml::from_str(&toml::to_string(&s).expect("save")).expect("load");
+        assert!(!s.sound_on_done && s.sound_on_blocked);
+        assert_eq!(
+            sound_alert::AlertSound::Blocked.file(&s),
+            Some(std::path::Path::new("/sounds/knock.ogg"))
+        );
+        assert_eq!(sound_alert::AlertSound::Done.file(&s), None);
+        assert_eq!(s.sound_volume, 35);
+    }
+
+    #[test]
     fn outside_control_is_off_for_old_and_new_configs() {
         // Nothing outside muxel can drive its agents until the user says so.
         let s: Settings = serde_json::from_str("{}").expect("parse");
@@ -3831,12 +3953,48 @@ mod closed_session_tests {
     use uuid::Uuid;
 
     #[test]
+    fn local_close_ledger_survives_a_large_batch_and_restart() {
+        let mut project = Project::new("local", "/local");
+        let ids: std::collections::HashSet<_> = (0..128)
+            .map(|n| {
+                let id = Uuid::new_v4();
+                project.remember_closed_session(format!("local-{n}").into(), id);
+                project
+                    .closed_sessions
+                    .last_mut()
+                    .unwrap()
+                    .local_close_token = Some(id);
+                id
+            })
+            .collect();
+        let saved = serde_json::to_vec(&project).unwrap();
+        let restored: Project = serde_json::from_slice(&saved).unwrap();
+        assert!(
+            restored
+                .closed_sessions
+                .iter()
+                .all(|entry| entry.local_close_token == Some(entry.instance))
+        );
+        let retryable: std::collections::HashSet<_> = restored
+            .closed_sessions
+            .iter()
+            .map(|c| c.instance)
+            .collect();
+        assert_eq!(
+            retryable, ids,
+            "a crash must not lose any unconfirmed local kill"
+        );
+    }
+
+    #[test]
     fn closing_the_same_pane_twice_leaves_one_entry() {
         let mut p = Project::new("app", "/srv/app");
         let iid = Uuid::new_v4();
         p.remember_closed_session("muxel_app_1".into(), iid);
+        p.closed_sessions[0].local_close_token = Some(iid);
         p.remember_closed_session("muxel_app_1".into(), iid);
         assert_eq!(p.closed_sessions.len(), 1);
+        assert_eq!(p.closed_sessions[0].local_close_token, Some(iid));
         assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
         assert!(p.closed_sessions.is_empty());
         assert!(
@@ -3850,6 +4008,10 @@ mod closed_session_tests {
     #[test]
     fn the_ledger_is_capped_oldest_first() {
         let mut p = Project::new("app", "/srv/app");
+        p.remote = Some(super::RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/srv/app".into(),
+        });
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();
@@ -5005,6 +5167,94 @@ mod worktree_registry_tests {
         assert_eq!(ws.worktree(wid).map(|w| w.color), Some(2));
         ws.remove_worktree_meta(wid);
         assert!(ws.worktree(wid).is_none());
+    }
+
+    #[test]
+    fn a_pending_kill_only_holds_the_worktree_its_pane_ran_in() {
+        use std::path::Path;
+        let mut project = Project::new("p", "/repo");
+        let (mine, theirs) = (Path::new("/wt/mine"), Path::new("/wt/theirs"));
+        assert!(!project.close_pending_in(mine));
+        let target = |name: &str| tmux::SessionTarget::new(name, Some(tmux::Socket::Private));
+
+        let outside = Uuid::new_v4();
+        project.remember_closed_session(target("outside"), outside);
+        project.set_closed_worktree(outside, tmux::ClosedWorktree::Outside);
+        assert!(!project.close_pending_in(mine));
+
+        let member = Uuid::new_v4();
+        project.remember_closed_session(target("member"), member);
+        project.set_closed_worktree(member, tmux::ClosedWorktree::In(mine.into()));
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        // Resolving the owner later re-remembers the close, sometimes under the
+        // name the host really has. It must stay scoped.
+        project.remember_closed_session(target("member"), member);
+        assert!(project.close_pending_in(mine));
+        project.remember_closed_session(target("member-resolved"), member);
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        assert!(project.forget_closed_session(member));
+        assert!(!project.close_pending_in(mine));
+    }
+
+    #[test]
+    fn a_close_saved_before_worktrees_were_recorded_could_be_any_of_them() {
+        let closed: tmux::ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "older",
+            "instance": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert_eq!(closed.worktree, tmux::ClosedWorktree::Unknown);
+        assert!(closed.worktree.may_be(std::path::Path::new("/wt/any")));
+        let round: tmux::ClosedSession = serde_json::from_value(
+            serde_json::to_value(tmux::ClosedSession {
+                worktree: tmux::ClosedWorktree::In("/wt/mine".into()),
+                ..closed
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round.worktree, tmux::ClosedWorktree::In("/wt/mine".into()));
+    }
+
+    #[test]
+    fn a_closing_instance_records_the_worktree_it_ran_in() {
+        let mut workspace = Workspace::default();
+        let project = Uuid::new_v4();
+        let registered = Worktree {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: "w".into(),
+            path: "/wt/registered".into(),
+            branch: "b".into(),
+            color: 0,
+            detached: false,
+        };
+        let wid = registered.id;
+        workspace.add_worktree(registered);
+        let mut instance = Instance::shell(project);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Outside
+        );
+        instance.worktree_path = Some("/wt/legacy".into());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/legacy".into())
+        );
+        instance.worktree_id = Some(wid);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/registered".into())
+        );
+        instance.worktree_id = Some(Uuid::new_v4());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Unknown
+        );
     }
 
     #[test]
