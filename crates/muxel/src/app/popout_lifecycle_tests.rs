@@ -59,7 +59,10 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
     with_app_drawing(false, run);
 }
 
-fn with_app_drawing(draw: bool, run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+pub(super) fn with_app_drawing(
+    draw: bool,
+    run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>),
+) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.wip/lifecycle-tests")
         .join(Uuid::new_v4().to_string());
@@ -301,6 +304,7 @@ fn popout_renders_its_title_status_close_confirmation_and_theme_updates() {
             super::ConfirmAction::SaveEditorBeforeClose {
                 iid: pane,
                 rest: vec![other],
+                rides_with: None,
             },
         ] {
             reset();

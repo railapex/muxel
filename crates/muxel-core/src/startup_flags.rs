@@ -33,6 +33,16 @@ mod tests {
         ] {
             assert!(names_flag(OsStr::new(arg), "--user-data-dir"), "{arg}");
         }
+        for arg in [
+            "--uat-root",
+            "--UAT-ROOT",
+            "-uat-root",
+            "---uat-root",
+            "--Uat-Root=dir",
+            "--uat-root:dir",
+        ] {
+            assert!(names_flag(OsStr::new(arg), "--uat-root"), "{arg}");
+        }
     }
 
     #[test]
@@ -40,12 +50,22 @@ mod tests {
         for arg in ["--settings", "--user-data", "project", "--user", "", "---"] {
             assert!(!names_flag(OsStr::new(arg), "--user-data-dir"), "{arg}");
         }
+        for arg in [
+            "--settings",
+            "--user-data-dir",
+            "project",
+            "--uat",
+            "",
+            "---",
+        ] {
+            assert!(!names_flag(OsStr::new(arg), "--uat-root"), "{arg}");
+        }
     }
 
     #[test]
     fn ordinary_positional_arguments_and_empty_names_do_not_match() {
-        for arg in ["user-data-dir", "version", "versioned-project"] {
-            for name in ["--user-data-dir", "--version"] {
+        for arg in ["uat-root", "user-data-dir", "version", "versioned-project"] {
+            for name in ["--uat-root", "--user-data-dir", "--version"] {
                 assert!(!names_flag(OsStr::new(arg), name), "{arg}");
             }
         }
