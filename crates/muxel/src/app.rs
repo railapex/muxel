@@ -3638,9 +3638,13 @@ fn grok_home_dir() -> Option<PathBuf> {
         .or_else(|| home_dir().map(|home| home.join(".grok")))
 }
 
+/// Grok's session registry, in its folder ([`grok_home_dir`]).
+#[cfg(windows)]
+pub(crate) const GROK_REGISTRY: &str = "active_sessions.json";
+
 #[cfg(windows)]
 fn read_grok_active_sessions() -> Vec<GrokActiveSession> {
-    let Some(path) = grok_home_dir().map(|home| home.join("active_sessions.json")) else {
+    let Some(path) = grok_home_dir().map(|home| home.join(GROK_REGISTRY)) else {
         return Vec::new();
     };
     let Ok(bytes) = std::fs::read(path) else {

@@ -8,6 +8,9 @@
 //! `/resume` or `/fork`. Discovery still polls slowly while watched
 //! ([`muxel_core::session_discovery::WATCHED_HOOK_FALLBACK`]), because a
 //! watcher can lose events, and at the usual cadence when it can't watch.
+//!
+//! On Windows so is Grok's session registry (`grok_registry`), which each
+//! Grok pane otherwise reads every one to two seconds.
 
 use muxel_core::file_watch::{
     DirNames, Drained, EventKind, OsWatch, Recursion, WatchEvent, WatchFilter, WatchId,
@@ -39,6 +42,28 @@ pub(crate) fn claude_records(dir: &Path) -> WatchSpec {
         paths,
         filter: WatchFilter::RecordFiles {
             dir: dir_names(dir),
+        },
+        lose_on,
+    }
+}
+
+/// Grok's session registry, `active_sessions.json` in Grok's folder `dir`,
+/// which also holds credentials, logs and locks that change on their own.
+/// Every Grok pane reads it, so a write wakes them all. The parent is watched
+/// as for [`claude_records`], since only it reports `dir` going away.
+#[cfg(windows)]
+pub(crate) fn grok_registry(dir: &Path) -> WatchSpec {
+    let mut paths = vec![(dir.to_path_buf(), Recursion::Dir)];
+    let mut lose_on = vec![dir_names(dir)];
+    if let Some(parent) = dir.parent() {
+        paths.push((parent.to_path_buf(), Recursion::Dir));
+        lose_on.push(dir_names(parent));
+    }
+    WatchSpec {
+        paths,
+        filter: WatchFilter::FileName {
+            dir: dir_names(dir),
+            name: crate::app::GROK_REGISTRY.into(),
         },
         lose_on,
     }

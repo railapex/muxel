@@ -5,7 +5,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long ancestry is reused while Grok's registry is polled.
 const MAX_AGE: Duration = Duration::from_secs(30);
+
+/// How long ancestry is reused while a watcher reports every registry write.
+/// Lookups then run on those writes, launches and the 30 s fallback, so at
+/// [`MAX_AGE`] nearly every one would enumerate the processes again. A row or
+/// root that changed still refreshes at once.
+const WATCHED_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 struct Snapshot {
     roots: HashMap<(u32, Instant), Instant>,
@@ -18,11 +25,25 @@ struct Snapshot {
 struct Cache(Option<Snapshot>);
 
 impl Cache {
+    #[cfg(test)]
     fn parents(
         &mut self,
         roots: &[(u32, Instant)],
         active: &[GrokActiveSession],
         now: Instant,
+        snapshot: impl FnOnce() -> HashMap<u32, u32>,
+    ) -> Arc<HashMap<u32, u32>> {
+        self.parents_within(roots, active, now, MAX_AGE, snapshot)
+    }
+
+    /// The ancestry to match `active` against `roots`: the cached one while
+    /// the rows and roots are the same and it's younger than `max_age`.
+    fn parents_within(
+        &mut self,
+        roots: &[(u32, Instant)],
+        active: &[GrokActiveSession],
+        now: Instant,
+        max_age: Duration,
         snapshot: impl FnOnce() -> HashMap<u32, u32>,
     ) -> Arc<HashMap<u32, u32>> {
         if roots.is_empty() || active.is_empty() {
@@ -32,7 +53,7 @@ impl Cache {
         if let Some(cached) = &mut self.0
             && roots.iter().all(|root| cached.roots.contains_key(root))
             && cached.active == active
-            && now.saturating_duration_since(cached.at) < MAX_AGE
+            && now.saturating_duration_since(cached.at) < max_age
         {
             for root in roots {
                 cached.roots.entry(*root).and_modify(|seen| *seen = now);
@@ -47,7 +68,7 @@ impl Cache {
             .0
             .take()
             .map_or_else(HashMap::new, |cached| cached.roots);
-        known_roots.retain(|_, seen| now.saturating_duration_since(*seen) < MAX_AGE);
+        known_roots.retain(|_, seen| now.saturating_duration_since(*seen) < max_age);
         known_roots.extend(roots.iter().map(|&root| (root, now)));
         // An empty ToolHelp read is a failure, not a reusable observation of an
         // empty machine. Retry it on the next registry poll.
@@ -61,19 +82,22 @@ impl Cache {
     }
 }
 
+/// `watched`: a watcher reports every write of Grok's registry.
 #[cfg(windows)]
 pub(super) fn process_snapshot(
     roots: &[(u32, Instant)],
     active: &[GrokActiveSession],
+    watched: bool,
 ) -> Arc<HashMap<u32, u32>> {
     static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Cache(None));
     CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .parents(
+        .parents_within(
             roots,
             active,
             Instant::now(),
+            if watched { WATCHED_MAX_AGE } else { MAX_AGE },
             super::super::process_parent_map,
         )
 }
@@ -130,6 +154,51 @@ mod tests {
             active_grok_session_for_process(10, &active, &refreshed).is_none(),
             "stale process ancestry must age out"
         );
+    }
+
+    /// Watched, lookups run on registry writes and the 30 s fallback. With no
+    /// write between them, the fallbacks of five minutes share one population;
+    /// a row or root that changed still refreshes at once.
+    #[test]
+    fn a_watched_registry_reuses_ancestry_until_rows_or_roots_change() {
+        let mut cache = Cache::default();
+        let calls = Cell::new(0);
+        let now = Instant::now();
+        let at = |seconds| now + Duration::from_secs(seconds);
+        let load = || {
+            calls.set(calls.get() + 1);
+            HashMap::from([(12, 11), (11, 10), (13, 10)])
+        };
+        let roots = [(10, now)];
+        let active = [registration("a", 12, 1)];
+        for seconds in (0..300).step_by(30) {
+            cache.parents_within(&roots, &active, at(seconds), WATCHED_MAX_AGE, load);
+        }
+        assert_eq!(calls.get(), 1, "fallback lookups reuse one population");
+        let rows = [registration("a", 12, 1), registration("b", 13, 2)];
+        let parents = cache.parents_within(&roots, &rows, at(290), WATCHED_MAX_AGE, load);
+        assert_eq!(
+            calls.get(),
+            2,
+            "a registered conversation refreshes at once"
+        );
+        assert_eq!(
+            active_grok_session_for_process(10, &rows, &parents)
+                .unwrap()
+                .session_id,
+            "b"
+        );
+        let relaunched = [(10, at(290))];
+        cache.parents_within(&relaunched, &rows, at(290), WATCHED_MAX_AGE, load);
+        assert_eq!(calls.get(), 3, "a relaunched pane refreshes at once");
+        cache.parents_within(
+            &relaunched,
+            &rows,
+            at(290) + WATCHED_MAX_AGE,
+            WATCHED_MAX_AGE,
+            load,
+        );
+        assert_eq!(calls.get(), 4, "and ancestry still ages out");
     }
 
     #[test]

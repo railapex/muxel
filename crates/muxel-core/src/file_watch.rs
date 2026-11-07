@@ -51,6 +51,9 @@ pub enum WatchFilter {
     /// `<dir>/<pane>.json`, the extension in any ASCII case: that pane. A
     /// session hook installs its record under that name.
     RecordFiles { dir: DirNames },
+    /// `<dir>/<name>`, the name in any ASCII case: the whole target. A
+    /// file every pane shares, such as Grok's session registry.
+    FileName { dir: DirNames, name: String },
 }
 
 /// What a registration asks for.
@@ -91,6 +94,8 @@ pub struct WatchEvent {
 pub struct Change {
     /// Panes the events named.
     pub hits: HashSet<Uuid>,
+    /// Something the registration's target depends on changed.
+    pub touched: bool,
     /// Events may have been lost: every pane of the target is due.
     pub rescan: bool,
     /// Blind from now on. It routes nothing more; its owner goes back to
@@ -100,11 +105,12 @@ pub struct Change {
 
 impl Change {
     fn is_empty(&self) -> bool {
-        self.hits.is_empty() && !self.rescan && !self.lost
+        self.hits.is_empty() && !self.touched && !self.rescan && !self.lost
     }
 
     fn merge(&mut self, other: Change) {
         self.hits.extend(other.hits);
+        self.touched |= other.touched;
         self.rescan |= other.rescan;
         self.lost |= other.lost;
     }
@@ -275,6 +281,15 @@ impl WatchRouter {
                             .filter(|path| path.parent().is_some_and(|parent| dir.is(parent)))
                             .filter_map(|path| record_pane(path)),
                     ),
+                    WatchFilter::FileName { dir, name } => {
+                        change.touched |= event.paths.iter().any(|path| {
+                            path.parent().is_some_and(|parent| dir.is(parent))
+                                && path
+                                    .file_name()
+                                    .and_then(|file| file.to_str())
+                                    .is_some_and(|file| file.eq_ignore_ascii_case(name))
+                        });
+                    }
                 }
             }
             if !change.is_empty() {
@@ -428,6 +443,43 @@ mod tests {
             &[file(&format!("{shouted}.JSON"))],
         ));
         assert_eq!(change(&mut router).hits, HashSet::from([renamed, shouted]));
+    }
+
+    /// Grok's registration: a write of the registry wakes the whole target;
+    /// the other files beside it (credentials, logs, locks) and files of the
+    /// same name elsewhere don't.
+    #[test]
+    fn only_the_shared_file_wakes_its_target() {
+        let dir = root_path().with_file_name("grok");
+        let mut router = WatchRouter::new(false);
+        router.register(WatchSpec {
+            paths: vec![(dir.clone(), Recursion::Dir)],
+            filter: WatchFilter::FileName {
+                dir: names(&dir),
+                name: "active_sessions.json".into(),
+            },
+            lose_on: vec![names(&dir)],
+        });
+        for (kind, path) in [
+            (EventKind::Modify, dir.join("auth.json")),
+            (EventKind::Create, dir.join("active_sessions.json.lock")),
+            (
+                EventKind::Create,
+                dir.join("logs").join("active_sessions.json"),
+            ),
+            (EventKind::Modify, root_path().join("active_sessions.json")),
+            (EventKind::Access, dir.join("active_sessions.json")),
+        ] {
+            router.event(&event(kind, &[path]));
+        }
+        assert_eq!(change(&mut router), Change::default());
+        router.event(&event(
+            EventKind::Rename,
+            &[dir.join("tmp-1234"), dir.join("Active_Sessions.JSON")],
+        ));
+        let change = change(&mut router);
+        assert!(change.touched && change.hits.is_empty());
+        assert!(!change.rescan && !change.lost);
     }
 
     #[test]

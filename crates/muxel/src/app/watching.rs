@@ -107,6 +107,10 @@ impl MuxelApp {
                     for pane in change.hits {
                         self.session_discoveries.wake(provider, pane);
                     }
+                    if change.touched {
+                        // A file all its panes read, such as Grok's registry.
+                        self.session_discoveries.wake_provider(provider);
+                    }
                     if change.lost {
                         lost.push(id);
                     } else if change.rescan {

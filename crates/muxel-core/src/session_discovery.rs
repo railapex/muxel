@@ -106,7 +106,8 @@ pub struct SessionDiscoveries {
 
 impl SessionDiscoveries {
     /// Record whether `provider`'s hook directory is watched. While it is, a
-    /// pane whose lookup found no record waits for [`Self::wake`] or
+    /// pane whose next change a write will announce (a Claude pane with no
+    /// record, any Grok pane) waits for [`Self::wake`] or
     /// [`WATCHED_HOOK_FALLBACK`]. Either change wakes the provider's panes:
     /// a new watcher may have missed writes made before it started, and
     /// without one the quiet panes must go back to polling now.
@@ -123,6 +124,22 @@ impl SessionDiscoveries {
 
     pub fn watched(&self, provider: SessionProvider) -> bool {
         self.watched.contains(&provider)
+    }
+
+    /// Whether the pane can wait for its watcher's wake (or the fallback)
+    /// after this result, because what it looks for next is announced by a
+    /// write in the watched directory.
+    ///
+    /// - Claude: a miss with no record waiting. The hook writes the record.
+    /// - Grok: any result. Every change a lookup can find (a conversation
+    ///   registered, a switch inside the process, a row dropped) is a write
+    ///   of the one registry file, which wakes every Grok pane.
+    fn quiet(&self, provider: SessionProvider, found: bool, hook_record: bool) -> bool {
+        self.watched(provider)
+            && match provider {
+                SessionProvider::Grok => true,
+                _ => !found && !hook_record,
+            }
     }
 
     /// `provider`'s hook record for the pane changed: its next lookup is due
@@ -234,7 +251,7 @@ impl SessionDiscoveries {
         now: Instant,
         found: bool,
     ) -> bool {
-        let quiet = !found && self.watched(request.key.provider);
+        let quiet = self.quiet(request.key.provider, found, false);
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
@@ -272,8 +289,7 @@ impl SessionDiscoveries {
         found: bool,
         evidence: LookupEvidence,
     ) -> bool {
-        // Only a miss with nothing waiting can rely on the watcher's wake.
-        let quiet = !found && !evidence.hook_record && self.watched(request.key.provider);
+        let quiet = self.quiet(request.key.provider, found, evidence.hook_record);
         let owner = evidence
             .rejected_owner
             .map(|(owner, session_id)| CodexOwnershipRejection {
@@ -428,7 +444,7 @@ impl SessionDiscovery {
         self.finish_with_quiet(request, current, now, found, false)
     }
 
-    /// As [`Self::finish`]. A `quiet` miss (a watcher will wake the pane)
+    /// As [`Self::finish`]. A `quiet` result (a watcher will wake the pane)
     /// waits [`WATCHED_HOOK_FALLBACK`] instead. A wake during the lookup makes
     /// the next one due at once.
     fn finish_with_quiet(
@@ -450,7 +466,11 @@ impl SessionDiscovery {
         self.codex_owner = None;
         let delay = if found {
             self.misses = 0;
-            Duration::from_secs(1)
+            if quiet {
+                WATCHED_HOOK_FALLBACK
+            } else {
+                Duration::from_secs(1)
+            }
         } else {
             self.misses = self.misses.saturating_add(1);
             let cap = match request.key.provider {
@@ -950,6 +970,39 @@ mod tests {
         assert!(discoveries.begin(grok.clone(), half).is_none());
         discoveries.wake(SessionProvider::Grok, grok.pane);
         assert!(discoveries.begin(grok, half).is_some());
+    }
+
+    #[test]
+    fn a_watched_grok_pane_waits_for_its_own_wake() {
+        let key = SessionDiscoveryKey {
+            provider: SessionProvider::Grok,
+            hint: None,
+            ..key()
+        };
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Grok, true);
+        let now = Instant::now();
+        // Not registered yet. Unwatched, it would look again within a second.
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        assert!(discoveries.begin(key.clone(), now + 2 * SECOND).is_none());
+        // A registry write wakes every Grok pane.
+        discoveries.wake_provider(SessionProvider::Grok);
+        let woken = now + 2 * SECOND;
+        let request = discoveries.begin(key.clone(), woken).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), woken, true));
+        // Found. Unwatched, it would look again a second later.
+        assert!(discoveries.begin(key.clone(), woken + 2 * SECOND).is_none());
+        let fallback = woken + WATCHED_HOOK_FALLBACK;
+        assert!(
+            discoveries
+                .begin(key.clone(), fallback - Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(
+            discoveries.begin(key, fallback).is_some(),
+            "a lost event still gets polled"
+        );
     }
 
     #[test]

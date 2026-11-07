@@ -1007,9 +1007,13 @@ feature is added or changed, update the matching entry here in the same change**
   Activity and attendance follow the same conversation attribution as docked
   terminals; redocking uncertain state preserves existing attention cards.
   On Windows, Grok conversation discovery follows the live terminal in either
-  window. It reads Grok's registry on every discovery poll, reusing process
-  ancestry for up to 30 seconds while registrations and pane PID/launches are
-  unchanged. Registry or pane-process changes refresh ancestry immediately;
+  window. A watcher on Grok's folder reports each write of its registry, and
+  every Grok pane reads it then, and otherwise every thirty seconds for events
+  a watcher loses. Process ancestry is reused for up to five minutes while
+  registrations and pane PID/launches are unchanged. Where the folder can't be
+  watched (not created yet, removed, or the watcher fails), Grok panes read the
+  registry on every discovery poll instead, reusing ancestry for up to 30
+  seconds. Registry or pane-process changes refresh ancestry immediately;
   steady polling avoids repeatedly enumerating every process on the machine.
   Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
