@@ -19,6 +19,7 @@
 //! dates and 256 MiB per family (`MUXEL_PROFILE_KEEP_DAYS` / `MUXEL_PROFILE_MAX_BYTES`).
 //! Steady discovery misses aggregate in per-minute summaries; hits, changes,
 //! calls of at least 5 ms, and every launch lookup retain individual records.
+//! Every local `git` run gets a `ui-prof[git v1]` record (see `git.rs`).
 //!
 //! When disabled: single OnceLock check, no flusher, no probe work.
 //!
@@ -43,8 +44,10 @@ use uuid::Uuid;
 
 mod focus;
 mod frame;
+mod git;
 mod lookups;
 pub(crate) use frame::Region;
+pub use git::{git_caller, git_launched};
 use muxel_terminal::profile_log::{ProfileLog, ProfileLogLimits};
 
 #[cfg(target_os = "windows")]
@@ -147,6 +150,22 @@ pub(crate) fn session_lookup_finished(
     });
 }
 
+/// A provider's hook-directory watcher started (`watching`), stopped being
+/// trusted (`failed`), or reported lost events (`rescan`).
+pub(crate) fn session_watch(
+    provider: muxel_core::session_discovery::SessionProvider,
+    state: &'static str,
+) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    let provider = format!("{provider:?}").to_ascii_lowercase();
+    emit(&format!(
+        "ui-prof[session-watch v1] provider={provider} state={state}"
+    ));
+}
+
 enum DeferredRecord {
     SessionLookup {
         at: SystemTime,
@@ -159,6 +178,10 @@ enum DeferredRecord {
     StaticLine {
         at: SystemTime,
         line: &'static str,
+    },
+    GitLaunch {
+        at: SystemTime,
+        launch: Box<git::GitLaunch>,
     },
     Phase {
         at: SystemTime,
@@ -842,6 +865,7 @@ fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
 
 fn deferred_writer(rx: Receiver<DeferredRecord>) {
     let mut lookups = lookups::Lookups::default();
+    let mut git_repeats = git::Repeats::default();
     let mut last_summary = Instant::now();
     loop {
         // Check even during a sustained queue flood. All summary formatting and
@@ -860,6 +884,7 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
         match record {
             DeferredRecord::Line { at, line } => emit_at(at, &line),
             DeferredRecord::StaticLine { at, line } => emit_at(at, line),
+            DeferredRecord::GitLaunch { at, launch } => emit_at(at, &git_repeats.line(&launch)),
             DeferredRecord::SessionLookup { at, record } => {
                 if lookups.observe(record, Instant::now()) {
                     emit_at(at, &session_lookup_line(record));

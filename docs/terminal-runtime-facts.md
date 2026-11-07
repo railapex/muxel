@@ -1,10 +1,86 @@
 # Terminal runtime facts
 
 `TerminalView` keeps one runtime snapshot for each live PTY launch. Its readers
-(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`)
+(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`,
+`runtime_activity()`)
 return the stored snapshot; they never parse terminal rows or advance status.
 Attribution also checks the session's current binding revision, so a switch
 invalidates cached facts before its queued reconciliation runs.
+
+## Recoverable close and outside control
+
+A held terminal keeps its process and runtime snapshot. It leaves ctl listings,
+but `status`, `show`, `screen` and `wait` can still address it by id or name.
+Input, including forced sends and delayed keys, refuses with `closing`.
+`undo_until` is present only during an active countdown. Otherwise `reason`
+is `counting_down`, `checking`, `awaiting_decision` or `restoring`, with no
+deadline. `counting_down` covers a hold whose monotonic grace period continues
+after its wall-clock deadline elapsed, such as across suspend. Keep or
+Undo in the app restores input. A pane removed while `wait` polls or collects
+its result returns an `exited` error explaining that it closed or left the
+workspace.
+
+For shared layouts, expiry waits for a read begun after the deadline was
+noticed. Explicit Close starts a fresh read barrier after the click, including
+when an earlier expiry read succeeded before suspend. Malformed or failed
+reads and reads overtaken by a local push do not release that barrier. A
+confirmed missing local layout does. Unreadable layouts offer an explicit
+Close without reading or Keep. Quit and workspace departure restore shared
+closes instead of committing removal without a fresh comparison.
+
+Local tmux removal saves a pending kill and a fresh close token in the project's
+ledger before I/O, then saves any resolved legacy server owner before killing.
+Only the original in-memory attempt can stamp that token on the session. A
+retry never stamps; the tmux server compares the saved token and observed
+session id before killing that exact id. A replacement, including a new server
+reusing an id, does not inherit the stamp. A mismatch preserves the session
+and files; an unknown or failed query retains the ledger. The ten-second bound
+starts at the final close, after any Undo hold. The first stamp identifies the
+session present when that attempt runs, not at the original click, and a forced
+close doesn't recheck the pane during its hold, so a peer's replacement in that
+window isn't detected. An attempt that fails before stamping leaves nothing to
+prove, so the next activation cancels it and keeps the session.
+
+Worktree answers run only through their hold's final close. Quit and workspace
+departure void them: files stay, and a worktree left without a pane is detached
+so the sidebar still lists it. Loading a workspace applies the same rule to local
+worktrees saved attached with no pane.
+
+Activation reconciles shared layout before replay, and cancels any close whose
+instance reappeared or whose target a current pane shows. Closes without a
+verifiable token are cancelled without killing. The event log retains the target's
+name and any known server. Import keeps its existing discovery scope; an arbitrary
+recorded server outside that scope needs an explicit reattach. Import excludes
+pending closes from every project on the same host. Automatic worktree cleanup
+runs only after confirmed local session death; unconfirmed remote teardown
+keeps the worktree and logs why.
+
+Worktree choices still pass through busy confirmation and the Undo countdown.
+A file answer runs only if the close it was given for is accepted and takes every
+captured pane. Close only the idle ones leaving one open, a replaced prompt, a
+newer close, a cancelled client check, or any captured pane leaving before
+acceptance (exiting, or closed by a peer through the shared layout), even with
+others still open, each drop the answer, and the worktree asks again when its
+last pane goes.
+
+The selected file action waits until the captured panes have closed and the kills
+for that worktree's panes are confirmed. Each ledger entry records the worktree its
+pane ran in, so another pane's kill holds nothing back; an entry saved before that
+was recorded counts as any worktree. A worktree with its own kill still running
+waits without a notice. A local one whose kill fails, can't be saved to the ledger
+or can't be confirmed is kept and detached, so the sidebar still lists it; an
+activation retry settles it as the first attempt would have. A remote one is never removed on close.
+It stays on the host and attached, since a peer's panes may use it. Undo, Cancel, a new worktree member, or a
+failed or unsaved kill or preserved session for that worktree cancels the pending file action, so a retry that
+confirms the kill later leaves the files alone. Dirty,
+unmerged or shared legacy worktrees are kept rather than force-removed.
+
+Project removal never waits on the ledger, which goes with the project. Kills
+already running finish in the background, older unconfirmed entries get one last
+try, and nothing retries after that. A session that survives keeps running on its
+host, the removal says so, and Import lists it. A held pane's file answer is dropped
+and its files stay. A worktree whose kill finishes after removal also stays on disk,
+as no project is left to act from.
 
 ## Reconciliation edges
 
@@ -60,9 +136,10 @@ bar the card isn't read and the title's Working stands.
   unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
   attributable (see below), the binding, completion readiness, coverage, or
-  completion revision changes, and when the launch observes a completion in
-  any binding (`TerminalView::launch_completion_revision`, which a held close
-  compares and a binding switch doesn't reset);
+  completion revision, or cached activity changes, and when the launch
+  observes a completion in any binding
+  (`TerminalView::launch_completion_revision`, which a held close compares and
+  a binding switch doesn't reset);
 - `input_rev`: advances before ordinary non-empty input writes reach
   the PTY writer; fallible control submissions commit it after successful writer
   admission. Keys, pastes, sends, and mouse and wheel reports count. Focus
@@ -74,6 +151,50 @@ bar the card isn't read and the title's Working stands.
   are both Done, or new Working/Blocked reports follow a completion in one drain;
 - the status, whether it is attributable, its strongest reason,
   completion readiness, and evidence coverage.
+
+## Status provenance and activity
+
+Terminal entries in `ctl status`, `panes`, and `show.agent` share one projection.
+Their `status` uses the sidebar's lifecycle rule: Done survives later Idle and
+attendance, and can remain visible while a restored terminal starts. Optional
+`live_status` records the different live state when that happens. Client `wait`,
+send admission, launch identity, reply ownership, and question/controller logic
+use live facts. Older hosts without `live_status` remain supported.
+
+`source` names the current status evidence:
+
+| Runtime reason | Source |
+| --- | --- |
+| Process exit or app process lifecycle | `process` |
+| Root program report, including error | `program` |
+| Existing provider lifecycle hook (Muse) | `hook` |
+| Provider title | `title` |
+| Provider screen or configured marker | `screen` |
+| Bell | `bell` |
+| Recent output | `output` |
+| Output quiet | `quiet` |
+| Not attributable to the current binding | `settling` |
+
+Settling remains Working even if a previous binding left a Done badge. A current
+Blocked root may also supply `blocked_on`: `permission`, `question`, or `auth`.
+Other sources omit the kind. Nonterminal panes omit these provenance fields.
+
+Activity is cached outside the Copy runtime snapshot. The current root retains
+shared `msg` text and integer `progress`; its message and percentage remain
+available while that report is current. Otherwise Working/Blocked may use
+validated Codex/Grok title activity or Claude's current live foreground row.
+The screen consumer uses the same captured provider context as status parsing;
+composer filtering applies when that adapter is present. An unchanged old title
+does not restore activity after a binding switch. Exit and binding retirement
+clear it. Root reports remain authoritative for lifecycle; fallback activity
+does not add a status override.
+
+Every activity value is one line with control characters removed and at most
+200 Unicode characters, including any percentage suffix. Empty activity is
+absent. Reads do not parse output or flush synchronized frames. Metadata-only
+changes advance `snapshot_seq`; they never create a completion revision or
+notification. Sidebar redraws follow lifecycle and visible-label changes, not
+activity counters. Its tooltip reads current cached activity when opened.
 
 ## Program status reports
 
@@ -165,8 +286,10 @@ in-process conversation switches.
   in exact order. Earlier frames, and a bell that rang before it, are retired;
   a bell after it, even in the same drained batch, survives.
 - Claude's `SessionStart` hook and Grok's session registry report a switch out
-  of band, on a clock that can't be ordered exactly against PTY output, and
-  muxel reads them up to a tick later. The report places the switch in an
+  of band, on a clock that can't be ordered exactly against PTY output. Muxel
+  reads Grok's up to a tick later, and Claude's when its directory watcher
+  reports the write (up to a tick later without one; at worst thirty seconds
+  later when the watcher loses the event). The report places the switch in an
   interval: the hook's own timestamp (for an older muxel's hook, its record's
   write time); Grok's registration time through the last instant it can stand
   for (a time written in whole seconds, to the end of that second); or, for a
@@ -377,6 +500,27 @@ evidence for the fields they describe. Quiet visible output never proves that
 a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
+
+Background work is read from the same screen. Claude 2.1.318's footer lists it live
+in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
+clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
+a finished turn's `1 shell still running` row stays on screen after the shell ends, so
+an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
+the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
+is a scheduled wake, not running work. Codex's report already stays Working while a
+background terminal runs. Its parent reads finished while a spawned agent runs, and
+nothing on its terminal says so.
+
+A held turn takes no completion: the report that started the hold would otherwise stamp
+the pane as finished. The release is its own status change. A switch reads the same way:
+`/clear` beside a running shell leaves no report until the next turn, and only a title
+reading Working would end the screen hold, which no title does between turns. So the pane
+holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
+but fires only at turn end, so it can't see work ending between turns, and it needs a
+helper on the host.
 
 ## Popout refresh
 
