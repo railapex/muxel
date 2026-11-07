@@ -231,7 +231,8 @@ Transition rules are pure and live in `muxel-core`:
 - entering Done records `completed_at` once for that completion;
 - every transition records the latest lifecycle state;
 - attending records `last_attended_at` without changing lifecycle state;
-- leaving Blocked for Working, Idle, or Done clears the active `blocked_at` value;
+- leaving Blocked records the new state while retaining `blocked_at` as the last
+  blocked event, so sidebar unread survives until attendance (see [Sidebar](sidebar.md));
 - PTY-only activity remains a runtime fallback and never records completion.
 
 V1 does not store an event log or run ring buffer. The fields leave room for a
@@ -455,7 +456,7 @@ cargo build -p muxel
 
 - Next unattended agent command.
 - Recent Agents palette sorted independently of the stable tree.
-- Project-level blocked/unseen rollups.
+- Project-level blocked counts (unread counts are available in Recent work).
 - Capped run history and overnight digest.
 - Per-provider capability diagnostics and update guidance.
 - Configurable stale thresholds or playful labels such as `ancient`.

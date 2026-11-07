@@ -1,7 +1,8 @@
 # Terminal runtime facts
 
 `TerminalView` keeps one runtime snapshot for each live PTY launch. Its readers
-(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`)
+(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`,
+`runtime_activity()`)
 return the stored snapshot; they never parse terminal rows or advance status.
 Attribution also checks the session's current binding revision, so a switch
 invalidates cached facts before its queued reconciliation runs.
@@ -135,9 +136,10 @@ bar the card isn't read and the title's Working stands.
   unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
   attributable (see below), the binding, completion readiness, coverage, or
-  completion revision changes, and when the launch observes a completion in
-  any binding (`TerminalView::launch_completion_revision`, which a held close
-  compares and a binding switch doesn't reset);
+  completion revision, or cached activity changes, and when the launch
+  observes a completion in any binding
+  (`TerminalView::launch_completion_revision`, which a held close compares and
+  a binding switch doesn't reset);
 - `input_rev`: advances before ordinary non-empty input writes reach
   the PTY writer; fallible control submissions commit it after successful writer
   admission. Keys, pastes, sends, and mouse and wheel reports count. Focus
@@ -149,6 +151,50 @@ bar the card isn't read and the title's Working stands.
   are both Done, or new Working/Blocked reports follow a completion in one drain;
 - the status, whether it is attributable, its strongest reason,
   completion readiness, and evidence coverage.
+
+## Status provenance and activity
+
+Terminal entries in `ctl status`, `panes`, and `show.agent` share one projection.
+Their `status` uses the sidebar's lifecycle rule: Done survives later Idle and
+attendance, and can remain visible while a restored terminal starts. Optional
+`live_status` records the different live state when that happens. Client `wait`,
+send admission, launch identity, reply ownership, and question/controller logic
+use live facts. Older hosts without `live_status` remain supported.
+
+`source` names the current status evidence:
+
+| Runtime reason | Source |
+| --- | --- |
+| Process exit or app process lifecycle | `process` |
+| Root program report, including error | `program` |
+| Existing provider lifecycle hook (Muse) | `hook` |
+| Provider title | `title` |
+| Provider screen or configured marker | `screen` |
+| Bell | `bell` |
+| Recent output | `output` |
+| Output quiet | `quiet` |
+| Not attributable to the current binding | `settling` |
+
+Settling remains Working even if a previous binding left a Done badge. A current
+Blocked root may also supply `blocked_on`: `permission`, `question`, or `auth`.
+Other sources omit the kind. Nonterminal panes omit these provenance fields.
+
+Activity is cached outside the Copy runtime snapshot. The current root retains
+shared `msg` text and integer `progress`; its message and percentage remain
+available while that report is current. Otherwise Working/Blocked may use
+validated Codex/Grok title activity or Claude's current live foreground row.
+The screen consumer uses the same captured provider context as status parsing;
+composer filtering applies when that adapter is present. An unchanged old title
+does not restore activity after a binding switch. Exit and binding retirement
+clear it. Root reports remain authoritative for lifecycle; fallback activity
+does not add a status override.
+
+Every activity value is one line with control characters removed and at most
+200 Unicode characters, including any percentage suffix. Empty activity is
+absent. Reads do not parse output or flush synchronized frames. Metadata-only
+changes advance `snapshot_seq`; they never create a completion revision or
+notification. Sidebar redraws follow lifecycle and visible-label changes, not
+activity counters. Its tooltip reads current cached activity when opened.
 
 ## Program status reports
 
@@ -240,8 +286,11 @@ in-process conversation switches.
   in exact order. Earlier frames, and a bell that rang before it, are retired;
   a bell after it, even in the same drained batch, survives.
 - Claude's `SessionStart` hook and Grok's session registry report a switch out
-  of band, on a clock that can't be ordered exactly against PTY output, and
-  muxel reads them up to a tick later. The report places the switch in an
+  of band, on a clock that can't be ordered exactly against PTY output. Muxel
+  reads Grok's up to a tick later, and Claude's when its directory watcher
+  reports the write (up to two seconds later without one, or while the record
+  can't be read; at worst thirty seconds later when the watcher loses the
+  event). The report places the switch in an
   interval: the hook's own timestamp (for an older muxel's hook, its record's
   write time); Grok's registration time through the last instant it can stand
   for (a time written in whole seconds, to the end of that second); or, for a
@@ -452,6 +501,27 @@ evidence for the fields they describe. Quiet visible output never proves that
 a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
+
+Background work is read from the same screen. Claude 2.1.318's footer lists it live
+in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
+clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
+a finished turn's `1 shell still running` row stays on screen after the shell ends, so
+an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
+the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
+is a scheduled wake, not running work. Codex's report already stays Working while a
+background terminal runs. Its parent reads finished while a spawned agent runs, and
+nothing on its terminal says so.
+
+A held turn takes no completion: the report that started the hold would otherwise stamp
+the pane as finished. The release is its own status change. A switch reads the same way:
+`/clear` beside a running shell leaves no report until the next turn, and only a title
+reading Working would end the screen hold, which no title does between turns. So the pane
+holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
+but fires only at turn end, so it can't see work ending between turns, and it needs a
+helper on the host.
 
 ## Popout refresh
 

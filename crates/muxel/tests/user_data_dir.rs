@@ -1,4 +1,5 @@
-//! `muxel --user-data-dir DIR ctl …`, through the real binary: the flag is taken
+//! `muxel --user-data-dir DIR ctl …` and its private `--uat-root` alias, through
+//! the real binary: the flag is taken
 //! at startup, the store puts the endpoint file under `DIR/data`, and an explicit
 //! flag wins over an inherited `MUXEL_USER_DATA_DIR`. An effective isolated root
 //! refuses a foreign `MUXEL_CONTROL` instead of routing to another profile.
@@ -85,8 +86,11 @@ impl FakeMuxel {
             "{} got another's token",
             self.name
         );
-        let mut reply = serde_json::to_string(&Response::ok(json!({ "muxel": self.name })))
-            .expect("encode reply");
+        let mut reply = serde_json::to_string(&Response::ok(json!({
+            "muxel": self.name,
+            "command": request.command,
+        })))
+        .expect("encode reply");
         reply.push('\n');
         (&stream).write_all(reply.as_bytes()).expect("reply");
     }
@@ -105,7 +109,7 @@ fn response(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // This test may itself run in a muxel pane.
+    // This test may itself run in a muxel pane or inherit a private UAT root.
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("MUXEL_") {
             command.env_remove(key);
@@ -237,9 +241,13 @@ fn an_explicit_user_data_dir_picks_the_muxel_ctl_reaches() {
 
     let mut joined = OsString::from("--user-data-dir=");
     joined.push(&flagged);
+    let mut uat_joined = OsString::from("--uat-root=");
+    uat_joined.push(&flagged);
     for flag in [
         vec![OsString::from("--user-data-dir"), flagged.clone().into()],
         vec![joined],
+        vec![OsString::from("--uat-root"), flagged.clone().into()],
+        vec![uat_joined],
     ] {
         let mut args = flag.clone();
         args.extend(["ctl".into(), "projects".into()]);
@@ -288,5 +296,192 @@ fn invalid_user_data_dir_flags_exit_before_startup() {
         let (output, _) = response(&args, &[("MUXEL_USER_DATA_DIR", &root.0)], &[]);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_user_data_dir"));
+    }
+}
+
+#[test]
+fn an_inherited_uat_root_obeys_isolated_control_policy() {
+    let root = Root::new();
+    let uat = root.0.join("uat");
+    let expected = uat.join("data").join(ENDPOINT_FILE);
+    let foreign = root.0.join("foreign").join(ENDPOINT_FILE);
+    let user = root.0.join("user");
+    let user_endpoint = user.join("data").join(ENDPOINT_FILE);
+    let a = FakeMuxel::publish("foreign", &foreign);
+    let b = FakeMuxel::publish("uat", &expected);
+    let c = FakeMuxel::publish("user", &user_endpoint);
+    let fakes = [&a, &b, &c];
+    let args = ["ctl".into(), "projects".into()];
+    let (output, reply) = response(
+        &args,
+        &[("MUXEL_UAT_ROOT", &uat), ("MUXEL_CONTROL", &foreign)],
+        &fakes,
+    );
+    assert_eq!(output.status.code(), Some(1), "{reply}");
+    let error = reply["error"].as_str().expect("typed conflict");
+    assert!(
+        error.contains("isolated_endpoint_conflict")
+            && error.contains("uat")
+            && error.contains("foreign"),
+        "{error}"
+    );
+    assert_eq!(reached(&args, &[("MUXEL_UAT_ROOT", &uat)], &fakes), "uat");
+    assert_eq!(
+        reached(
+            &args,
+            &[("MUXEL_UAT_ROOT", &uat), ("MUXEL_CONTROL", &expected)],
+            &fakes
+        ),
+        "uat"
+    );
+    assert_eq!(
+        reached(
+            &args,
+            &[
+                ("MUXEL_UAT_ROOT", &uat),
+                ("MUXEL_USER_DATA_DIR", &user),
+                ("MUXEL_CONTROL", &user_endpoint)
+            ],
+            &fakes
+        ),
+        "user"
+    );
+}
+
+#[test]
+fn invalid_uat_root_flags_exit_before_startup() {
+    let root = Root::new();
+    let mut joined = OsString::from("--uat-root=");
+    joined.push(&root.0);
+    for args in [
+        vec!["--uat-root".into()],
+        vec!["--uat-root=".into()],
+        vec!["--uat-root".into(), "".into()],
+        vec!["--uat-root=relative".into()],
+        vec!["--uat-root".into(), "relative".into()],
+        vec!["--uat-root".into(), "--version".into()],
+        vec!["--uat-root:root".into()],
+        vec!["--uat-rooted=root".into()],
+        vec!["--UAT-ROOT".into(), root.0.clone().into()],
+        vec!["-uat-root".into(), root.0.clone().into()],
+        vec!["---uat-root".into(), root.0.clone().into()],
+        vec!["--Uat-Root=dir".into()],
+        vec!["--uat-root".into(), root.0.clone().into(), joined],
+    ] {
+        let (output, _) = response(&args, &[("MUXEL_USER_DATA_DIR", &root.0)], &[]);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_uat_root"));
+    }
+}
+
+#[test]
+fn invalid_identity_flags_exit_before_startup() {
+    let root = Root::new();
+    for args in [
+        vec!["--version".into(), "--build-info-json".into()],
+        vec!["--build-info-json".into(), "--version".into()],
+        vec!["--version".into(), "--version".into()],
+        vec!["--build-info-json".into(), "--build-info-json".into()],
+        vec!["--version=".into()],
+        vec!["--version=1".into()],
+        vec!["--build-info-json=json".into()],
+        vec!["--VERSION".into()],
+        vec!["-version".into()],
+        vec!["---version".into()],
+        vec!["--BUILD-INFO-JSON".into()],
+        vec!["-build-info-json".into()],
+        vec!["---build-info-json".into()],
+        vec!["--version".into(), "--settings".into()],
+        vec!["--settings".into(), "--build-info-json".into()],
+    ] {
+        let (output, _) = response(&args, &[("MUXEL_USER_DATA_DIR", &root.0)], &[]);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid_build_identity_arguments")
+        );
+        assert!(!root.0.join("config").exists() && !root.0.join("data").exists());
+    }
+}
+
+#[test]
+fn identity_queries_consume_both_root_flag_forms_before_output() {
+    let root = Root::new();
+    let mut user_joined = OsString::from("--user-data-dir=");
+    user_joined.push(&root.0);
+    let mut uat_joined = OsString::from("--uat-root=");
+    uat_joined.push(&root.0);
+    for flags in [
+        vec!["--user-data-dir".into(), root.0.clone().into()],
+        vec![user_joined],
+        vec!["--uat-root".into(), root.0.clone().into()],
+        vec![uat_joined],
+    ] {
+        for query in ["--version", "--build-info-json"] {
+            let mut args = flags.clone();
+            args.push(query.into());
+            let (output, reply) = response(&args, &[], &[]);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if query == "--build-info-json" {
+                assert_eq!(reply["version"], env!("CARGO_PKG_VERSION"));
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION"))
+                );
+            }
+            assert!(!root.0.join("config").exists() && !root.0.join("data").exists());
+        }
+    }
+}
+
+#[test]
+fn uat_alias_preserves_root_and_identity_looking_ctl_payloads() {
+    let root = Root::new();
+    let endpoint = root.0.join("data").join(ENDPOINT_FILE);
+    let fake = FakeMuxel::publish("uat-payload", &endpoint);
+    for payload in [
+        "--UAT-ROOT=foreign",
+        "--USER-DATA-DIR=foreign",
+        "--BUILD-INFO-JSON",
+        "---version",
+    ] {
+        let (output, reply) = response(
+            &[
+                "--uat-root".into(),
+                root.0.clone().into(),
+                "ctl".into(),
+                "send".into(),
+                "pane".into(),
+                "--".into(),
+                payload.into(),
+            ],
+            &[],
+            &[&fake],
+        );
+        assert!(output.status.success(), "{payload}: {reply}");
+        assert_eq!(reply["muxel"], "uat-payload");
+        assert_eq!(reply["command"]["text"], payload);
+        assert_eq!(reply["command"]["agent"], "pane");
+    }
+}
+
+#[test]
+fn mixed_private_and_public_roots_refuse_before_identity_or_gui_startup() {
+    let root = Root::new();
+    for query in ["--version", "--build-info-json"] {
+        let args = [
+            "--uat-root".into(),
+            root.0.clone().into(),
+            "--user-data-dir".into(),
+            root.0.join("other").into(),
+            query.into(),
+        ];
+        let (output, _) = response(&args, &[], &[]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_user_data_dir"));
+        assert!(!root.0.join("config").exists() && !root.0.join("data").exists());
     }
 }

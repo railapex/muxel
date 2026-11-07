@@ -194,6 +194,7 @@ pub(super) enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    Focus(Uuid),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -381,6 +382,94 @@ fn runtime_control_state(
         AgentStatus::Blocked => AgentState::Blocked,
         AgentStatus::Done => AgentState::Done,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ControlStatusFields {
+    status: Option<AgentState>,
+    live_status: Option<AgentState>,
+    source: Option<ctl::AgentStatusSource>,
+    blocked_on: Option<ctl::AgentBlockedOn>,
+}
+
+fn control_status_fields(
+    live: Option<AgentState>,
+    runtime: Option<(muxel_terminal::TerminalRuntimeSnapshot, u64)>,
+    instance: Option<&Instance>,
+    restoring: bool,
+) -> ControlStatusFields {
+    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+    let mut fields = ControlStatusFields {
+        status: live,
+        live_status: None,
+        source: None,
+        blocked_on: None,
+    };
+    let Some(live) = live else {
+        return fields;
+    };
+    if matches!(
+        live,
+        AgentState::Starting | AgentState::Exited | AgentState::NotRunning | AgentState::Failed
+    ) {
+        fields.source = Some(ctl::AgentStatusSource::Process);
+        return fields;
+    }
+    let Some((runtime, binding)) = runtime else {
+        fields.source = Some(ctl::AgentStatusSource::Process);
+        return fields;
+    };
+    if !runtime.is_attributable_to(binding) {
+        fields.status = Some(AgentState::Working);
+        fields.source = Some(ctl::AgentStatusSource::Settling);
+        return fields;
+    }
+    let display = match persisted_status(runtime.status, instance, restoring) {
+        AgentStatus::Working => AgentState::Working,
+        AgentStatus::Idle => AgentState::Idle,
+        AgentStatus::Blocked => AgentState::Blocked,
+        AgentStatus::Done => AgentState::Done,
+    };
+    fields.status = Some(display);
+    fields.live_status = (display != live).then_some(live);
+    fields.source = Some(match runtime.reason {
+        TerminalStatusReason::ProcessExit => ctl::AgentStatusSource::Process,
+        TerminalStatusReason::ProgramStatus(_) | TerminalStatusReason::ProgramStatusError => {
+            ctl::AgentStatusSource::Program
+        }
+        TerminalStatusReason::ProviderHook => ctl::AgentStatusSource::Hook,
+        TerminalStatusReason::ProviderTitle => ctl::AgentStatusSource::Title,
+        TerminalStatusReason::ProviderScreen
+        | TerminalStatusReason::BackgroundWork
+        | TerminalStatusReason::BlockedMarker
+        | TerminalStatusReason::WorkingMarker => ctl::AgentStatusSource::Screen,
+        TerminalStatusReason::Bell => ctl::AgentStatusSource::Bell,
+        TerminalStatusReason::RecentOutput => ctl::AgentStatusSource::Output,
+        TerminalStatusReason::Quiet => ctl::AgentStatusSource::Quiet,
+    });
+    if display == AgentState::Blocked
+        && let TerminalStatusReason::ProgramStatus(Some(kind)) = runtime.reason
+    {
+        fields.blocked_on = Some(match kind {
+            ProgramStatusKind::Permission => ctl::AgentBlockedOn::Permission,
+            ProgramStatusKind::Question => ctl::AgentBlockedOn::Question,
+            ProgramStatusKind::Auth => ctl::AgentBlockedOn::Auth,
+        });
+    }
+    fields
+}
+
+/// A turn held at Working for its background work is over, and its prompt is free.
+fn send_admission_state(
+    state: Option<AgentState>,
+    reason: Option<muxel_terminal::TerminalStatusReason>,
+) -> Option<AgentState> {
+    if state == Some(AgentState::Working)
+        && reason == Some(muxel_terminal::TerminalStatusReason::BackgroundWork)
+    {
+        return Some(AgentState::Done);
+    }
+    state
 }
 
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
@@ -835,6 +924,49 @@ impl MuxelApp {
             Err(error) => ctl::Response::err(error),
         };
         match self.control_command(command, caller_instance_id, cx) {
+            Answer::Focus(iid) => {
+                let app = cx.weak_entity();
+                let workspace = self.current_workspace;
+                let handle = self
+                    .popouts
+                    .get(&iid)
+                    .map(|p| p.window.into())
+                    .or_else(|| {
+                        self.workspace
+                            .instance(iid)
+                            .and_then(|i| self.window_showing(i.project_id))
+                    })
+                    .or(self.main_window);
+                cx.defer(move |cx| {
+                    let result = handle
+                        .and_then(|handle| {
+                            Self::update_in_window(&app, handle, cx, |this, window, cx| {
+                                if this.current_workspace != workspace
+                                    || this.workspace.instance(iid).is_none()
+                                {
+                                    return Err("the pane's workspace has changed".into());
+                                }
+                                if !this.settings.control_enabled {
+                                    return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
+                                }
+                                // The close may have begun since admission.
+                                if let Some(error) = this.closing_control_error(iid) {
+                                    return Err(error);
+                                }
+                                if let Some(popout) = this.popouts.get(&iid) {
+                                    window.focus(&popout.view.focus_handle(cx), cx);
+                                } else {
+                                    this.select_instance(iid, window, cx);
+                                }
+                                this.persist();
+                                window.activate_window();
+                                Ok(json!({ "uuid": iid, "focused": true }))
+                            })
+                        })
+                        .unwrap_or_else(|| Err("no muxel window is available".into()));
+                    let _ = reply.send(respond(result));
+                });
+            }
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -931,6 +1063,7 @@ impl MuxelApp {
         if matches!(
             &command,
             Command::New { .. }
+                | Command::Focus { .. }
                 | Command::Send { .. }
                 | Command::Answer { .. }
                 | Command::Keys { .. }
@@ -971,6 +1104,15 @@ impl MuxelApp {
                     .and_then(|iid| self.control_info_of(iid, now, cx))
                     .map(|info| json!(info)),
             ),
+            Command::Focus { agent } => match self.control_resolve(&agent) {
+                // A held pane is out of the layout in every close stage, not
+                // only while its countdown runs.
+                Ok(iid) => match self.closing_control_error(iid) {
+                    Some(error) => Answer::Now(Err(error)),
+                    None => Answer::Focus(iid),
+                },
+                Err(error) => Answer::Now(Err(error)),
+            },
             Command::Show { agent, full } => match self.control_resolve(&agent) {
                 Ok(iid) => self.control_show(iid, full, now, cx),
                 Err(error) => Answer::Now(Err(error)),
@@ -1055,6 +1197,7 @@ impl MuxelApp {
             .map(|inst| AgentEntry {
                 id: inst.id,
                 name: inst.display_name(),
+                label: inst.label.as_deref(),
                 project: self
                     .workspace
                     .project(inst.project_id)
@@ -1142,7 +1285,32 @@ impl MuxelApp {
         cx: &App,
     ) -> AgentInfo {
         let project = self.workspace.project(inst.project_id);
-        let status = self.control_state(inst, cx);
+        let live = self.control_state(inst, cx);
+        let runtime = self.terminals.get(&inst.id).map(|view| {
+            let view = view.read(cx);
+            (
+                view.runtime_snapshot(),
+                view.session().binding_revision(),
+                view.runtime_activity().map(str::to_owned),
+            )
+        });
+        let fields = control_status_fields(
+            live,
+            runtime
+                .as_ref()
+                .map(|(snapshot, binding, _)| (*snapshot, *binding)),
+            Some(inst),
+            self.restoring_activity.contains(&inst.id),
+        );
+        let activity = if matches!(
+            live,
+            Some(AgentState::Working | AgentState::Blocked | AgentState::Idle | AgentState::Done)
+        ) && fields.source != Some(ctl::AgentStatusSource::Settling)
+        {
+            runtime.and_then(|(_, _, activity)| activity)
+        } else {
+            None
+        };
         let preset = inst
             .preset_id
             .and_then(|id| self.presets.iter().find(|p| p.id == id))
@@ -1162,6 +1330,7 @@ impl MuxelApp {
             id: ctl::short_id(inst.id),
             uuid: inst.id,
             name: inst.display_name().to_string(),
+            label: inst.label.clone(),
             project: project.map(|p| p.name.clone()).unwrap_or_default(),
             project_id: ctl::short_id(inst.project_id),
             kind: kind_name(inst.kind).to_string(),
@@ -1170,10 +1339,15 @@ impl MuxelApp {
             model: ctl::flag_value(&inst.args, &model_flag),
             is_agent: inst.kind == InstanceKind::Terminal
                 && readaloud::is_agent_program(inst.program.as_deref()),
-            status,
+            status: fields.status,
+            live_status: fields.live_status,
+            source: fields.source,
+            activity,
+            blocked_on: fields.blocked_on,
+            not_running_reason: self.is_dormant(inst.id).then(|| "dormant".to_string()),
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
-                status,
+                live,
                 self.terminals
                     .get(&inst.id)
                     .map(|view| view.read(cx).session().id),
@@ -1181,7 +1355,11 @@ impl MuxelApp {
             awaiting_reply: self
                 .control_turns
                 .get(&inst.id)
-                .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+                .is_some_and(|turn| turn.awaiting_reply(live, &inst.activity, now)),
+            background: self
+                .terminal_view(inst.id)
+                .and_then(|view| view.read(cx).runtime_snapshot().background),
+            turn_over: self.control_turn_over(inst, now, cx),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
@@ -1190,6 +1368,9 @@ impl MuxelApp {
             pane,
             worktree_branch: inst.worktree_branch.clone(),
             cwd,
+            branch: project
+                .and_then(|p| self.session_branch(p, inst))
+                .map(str::to_owned),
             remote: project.is_some_and(|p| p.remote.is_some()),
         }
     }
@@ -1329,6 +1510,13 @@ impl MuxelApp {
     }
 
     fn control_screen(&self, iid: Uuid, lines: Option<usize>, cx: &App) -> Answer {
+        if self.is_dormant(iid) {
+            return Answer::Now(Err(ctl::Error::new(
+                ErrorCode::NotRunning,
+                "that pane is dormant; open it in muxel or use ctl focus to start it",
+            )
+            .with_reason("dormant")));
+        }
         let lines = lines
             .unwrap_or(ctl::SCREEN_LINES)
             .clamp(1, ctl::SCREEN_LINES_MAX);
@@ -1362,6 +1550,13 @@ impl MuxelApp {
             .instance(iid)
             .ok_or("that agent has just closed")?;
         let name = inst.display_name();
+        if self.is_dormant(iid) {
+            return Err(ctl::Error::new(
+                ErrorCode::NotRunning,
+                format!("'{name}' is dormant; open it in muxel or use ctl focus to start it"),
+            )
+            .with_reason("dormant"));
+        }
         if inst.kind != InstanceKind::Terminal {
             return Err(format!(
                 "'{name}' is {} pane, not a terminal",
@@ -1451,7 +1646,7 @@ impl MuxelApp {
             input,
             turn,
             site: self.control_claim_site(inst),
-            state: self.control_state(inst, cx),
+            state: self.control_admission_state(inst, cx),
             activity: inst.activity.clone(),
             force,
             launch_id: None,
@@ -1460,9 +1655,30 @@ impl MuxelApp {
         })
     }
 
+    /// A turn held for its background work is over, unless a prompt sent since then
+    /// hasn't started yet, whose reply this would pass off as the previous one.
+    fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
+        self.terminal_view(inst.id).is_some_and(|view| {
+            view.read(cx).runtime_snapshot().reason
+                == muxel_terminal::TerminalStatusReason::BackgroundWork
+        }) && !self
+            .control_turns
+            .get(&inst.id)
+            .is_some_and(|turn| turn.awaiting_reply(Some(AgentState::Done), &inst.activity, now))
+    }
+
+    /// The state a prompt is admitted against, here and by a peer sharing the pane.
+    fn control_admission_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        send_admission_state(
+            self.control_state(inst, cx),
+            self.terminal_view(inst.id)
+                .map(|view| view.read(cx).runtime_snapshot().reason),
+        )
+    }
+
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
-        let state = inst.and_then(|inst| self.control_state(inst, cx));
+        let state = inst.and_then(|inst| self.control_admission_state(inst, cx));
         let coverage = self
             .terminal_view(iid)
             .map(|view| view.read(cx).runtime_snapshot().coverage);
@@ -2553,7 +2769,7 @@ fn claim_agent_with(
 /// `show`'s `controller`: which muxel last typed into the agent through `muxel
 /// ctl`, and whether that turn is still open as far as this muxel can see.
 fn controller_value(claim: &ctl::Claim, shown: &Value, activity: &AgentActivity) -> Value {
-    let state: Option<AgentState> = serde_json::from_value(shown["agent"]["status"].clone()).ok();
+    let state = ctl::reported_live_state(&shown["agent"]);
     json!({
         "host": claim.host,
         "at": claim.at,
@@ -2595,7 +2811,7 @@ fn show_value(
         .map(|text| (text, "transcript"))
         .or_else(|| readaloud::prompt_from_screen(&screen).map(|text| (text, "screen")))
         .or_else(|| sent.map(|text| (text, "muxel")));
-    let question = (info.status == Some(AgentState::Blocked))
+    let question = (info.live_state() == Some(AgentState::Blocked))
         .then(|| ctl::pending_question(visible))
         .flatten();
     json!({
@@ -2640,6 +2856,24 @@ mod prompt_submission_tests {
                     .any(|at| tmux_matches(tail, &rest[at..]))
             }),
         }
+    }
+
+    /// A turn held for its background work is over, so a prompt goes in. A turn
+    /// actually running still refuses.
+    #[test]
+    fn send_goes_to_a_turn_held_only_for_its_background_work() {
+        use muxel_terminal::TerminalStatusReason as Reason;
+        let state =
+            |reason| super::send_admission_state(Some(super::AgentState::Working), Some(reason));
+        assert_eq!(state(Reason::BackgroundWork), Some(super::AgentState::Done));
+        assert_eq!(
+            state(Reason::ProgramStatus(None)),
+            Some(super::AgentState::Working)
+        );
+        assert_eq!(
+            state(Reason::ProviderScreen),
+            Some(super::AgentState::Working)
+        );
     }
 
     #[test]
@@ -4085,6 +4319,226 @@ mod prompt_submission_tests {
 }
 
 #[cfg(test)]
+mod status_provenance_tests {
+    use super::{
+        AgentState, AgentStatus, SendAdmission, control_status_fields, ctl, runtime_control_state,
+    };
+    use muxel_core::{AgentActivityState, AgentPreset, Instance};
+    use muxel_terminal::{
+        ProgramStatusKind, TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+    };
+    use uuid::Uuid;
+
+    fn check_send_state(state: Option<AgentState>, force: bool) -> super::CtlResult<()> {
+        super::check_send_state(SendAdmission {
+            state,
+            just_submitted: false,
+            force,
+        })
+    }
+
+    fn sample(status: AgentStatus, reason: TerminalStatusReason) -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            background: None,
+            status,
+            attributable: true,
+            reason,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            launch_id: Uuid::new_v4(),
+            binding_rev: 1,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+            completion_revision: 0,
+        }
+    }
+
+    fn completed_instance() -> Instance {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance
+            .activity
+            .observe(None, AgentActivityState::Working, 100);
+        instance.activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200,
+        );
+        instance
+    }
+
+    #[test]
+    fn ctl_status_reports_program_source_under_psp() {
+        let runtime = sample(
+            AgentStatus::Working,
+            TerminalStatusReason::ProgramStatus(None),
+        );
+        let fields =
+            control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false);
+        assert_eq!(fields.status, Some(AgentState::Working));
+        assert_eq!(fields.source, Some(ctl::AgentStatusSource::Program));
+    }
+
+    #[test]
+    fn unattributable_status_reports_settling_and_stays_working() {
+        let instance = completed_instance();
+        for (attributable, current_binding) in [(false, 1), (true, 2)] {
+            let runtime = TerminalRuntimeSnapshot {
+                attributable,
+                ..sample(AgentStatus::Done, TerminalStatusReason::ProviderTitle)
+            };
+            let live = runtime_control_state(runtime, current_binding);
+            let fields = control_status_fields(
+                Some(live),
+                Some((runtime, current_binding)),
+                Some(&instance),
+                true,
+            );
+            assert_eq!(fields.status, Some(AgentState::Working));
+            assert_eq!(fields.source, Some(ctl::AgentStatusSource::Settling));
+            assert_eq!(fields.blocked_on, None);
+            assert!(check_send_state(Some(live), false).is_err());
+            assert_eq!(ctl::wait_outcome(Some(live), false), None);
+        }
+    }
+
+    #[test]
+    fn blocked_on_comes_from_psp_kind() {
+        for (kind, blocked_on) in [
+            (
+                ProgramStatusKind::Permission,
+                ctl::AgentBlockedOn::Permission,
+            ),
+            (ProgramStatusKind::Question, ctl::AgentBlockedOn::Question),
+            (ProgramStatusKind::Auth, ctl::AgentBlockedOn::Auth),
+        ] {
+            let runtime = sample(
+                AgentStatus::Blocked,
+                TerminalStatusReason::ProgramStatus(Some(kind)),
+            );
+            let fields =
+                control_status_fields(Some(AgentState::Blocked), Some((runtime, 1)), None, false);
+            assert_eq!(fields.blocked_on, Some(blocked_on));
+        }
+    }
+
+    #[test]
+    fn ctl_status_holds_done_over_idle_until_attended() {
+        let mut instance = completed_instance();
+        let runtime = sample(AgentStatus::Idle, TerminalStatusReason::Quiet);
+        let fields = control_status_fields(
+            Some(AgentState::Idle),
+            Some((runtime, 1)),
+            Some(&instance),
+            false,
+        );
+        assert_eq!(fields.status, Some(AgentState::Done));
+        assert_eq!(fields.live_status, Some(AgentState::Idle));
+        instance.activity.attend(300);
+        // Upstream preserves lifecycle Done after attendance too; unread is separate.
+        let attended = control_status_fields(
+            Some(AgentState::Idle),
+            Some((runtime, 1)),
+            Some(&instance),
+            false,
+        );
+        assert_eq!(attended.status, Some(AgentState::Done));
+    }
+
+    #[test]
+    fn send_to_held_done_pane_still_goes_through() {
+        let instance = completed_instance();
+        assert_eq!(
+            super::persisted_status(AgentStatus::Idle, Some(&instance), false),
+            AgentStatus::Done
+        );
+        let runtime = sample(AgentStatus::Idle, TerminalStatusReason::Quiet);
+        let live = runtime_control_state(runtime, 1);
+        assert_eq!(live, AgentState::Idle);
+        assert!(check_send_state(Some(live), false).is_ok());
+        assert_eq!(
+            ctl::wait_outcome(Some(live), false),
+            Some(ctl::WaitOutcome::Finished)
+        );
+    }
+
+    #[test]
+    fn a_restored_done_badge_cannot_finish_wait_while_live_facts_are_working() {
+        let instance = completed_instance();
+        let runtime = sample(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
+        let fields = control_status_fields(
+            Some(AgentState::Working),
+            Some((runtime, 1)),
+            Some(&instance),
+            true,
+        );
+        assert_eq!(fields.status, Some(AgentState::Done));
+        assert_eq!(fields.live_status, Some(AgentState::Working));
+        let response =
+            serde_json::json!({"status": fields.status, "live_status": fields.live_status});
+        let live = ctl::reported_live_state(&response);
+        assert_eq!(ctl::wait_outcome(live, false), None);
+        assert!(check_send_state(live, false).is_err());
+    }
+
+    #[test]
+    fn sources_and_kinds_keep_their_wire_contract() {
+        for (reason, source) in [
+            (TerminalStatusReason::ProcessExit, "process"),
+            (TerminalStatusReason::ProgramStatus(None), "program"),
+            (TerminalStatusReason::ProgramStatusError, "program"),
+            (TerminalStatusReason::ProviderHook, "hook"),
+            (TerminalStatusReason::ProviderTitle, "title"),
+            (TerminalStatusReason::ProviderScreen, "screen"),
+            (TerminalStatusReason::BlockedMarker, "screen"),
+            (TerminalStatusReason::WorkingMarker, "screen"),
+            (TerminalStatusReason::Bell, "bell"),
+            (TerminalStatusReason::RecentOutput, "output"),
+            (TerminalStatusReason::Quiet, "quiet"),
+        ] {
+            let runtime = sample(AgentStatus::Working, reason);
+            let fields =
+                control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false);
+            assert_eq!(
+                serde_json::to_value(fields.source).unwrap(),
+                serde_json::json!(source)
+            );
+        }
+        let runtime = sample(
+            AgentStatus::Working,
+            TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Permission)),
+        );
+        assert_eq!(
+            control_status_fields(Some(AgentState::Working), Some((runtime, 1)), None, false)
+                .blocked_on,
+            None
+        );
+        assert_eq!(control_status_fields(None, None, None, false).source, None);
+    }
+
+    #[test]
+    fn wait_state_is_backward_compatible_and_rejects_a_malformed_live_value() {
+        for response in [
+            serde_json::json!({"status": "done"}),
+            serde_json::json!({"status": "done", "live_status": null}),
+            serde_json::json!({"status": "done", "live_status": "idle"}),
+        ] {
+            assert_eq!(
+                ctl::wait_outcome(ctl::reported_live_state(&response), false),
+                Some(ctl::WaitOutcome::Finished)
+            );
+        }
+        let working = serde_json::json!({"status": "done", "live_status": "working"});
+        assert_eq!(
+            ctl::wait_outcome(ctl::reported_live_state(&working), false),
+            None
+        );
+        let malformed = serde_json::json!({"status": "done", "live_status": "unknown"});
+        assert_eq!(ctl::reported_live_state(&malformed), None);
+    }
+}
+
+#[cfg(test)]
 mod runtime_control_tests {
     use super::{
         AgentState, AgentStatus, SendAdmission, check_send_state, ctl, runtime_control_state,
@@ -4117,6 +4571,7 @@ mod runtime_control_tests {
         let revision = session.binding_revision();
         let activity = AgentActivity::default();
         let cached = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Done,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -4133,6 +4588,7 @@ mod runtime_control_tests {
         session.provider_switched(now, now);
         for old_status in [AgentStatus::Idle, AgentStatus::Done] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status: old_status,
                 ..cached
             };
@@ -4167,6 +4623,7 @@ mod runtime_control_tests {
             AgentStatus::Idle,
         ] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status,
                 attributable: false,
                 binding_rev: session.binding_revision(),

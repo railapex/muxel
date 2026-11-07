@@ -20,7 +20,15 @@ feature is added or changed, update the matching entry here in the same change**
   and clicking the button again returns to the panes.
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
+- **Closing gives space back** — a new pane takes half of the pane it was split
+  from, and when it goes (closed, its last tab closed, or dragged elsewhere) that
+  space returns to the pane it came from, so every other pane is left exactly as
+  it was. A pane dragged next to another pane takes half of that pane the same way.
+  A pane from a layout saved before this existed gives its space to the pane before
+  it (or after it, if it was first).
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
+  When the pane you're shrinking reaches its minimum, the drag keeps going and
+  shrinks the next pane along, until every pane on that side is at its minimum.
   Cached terminals receive the final size after the drag, so responsive TUIs redraw
   without requiring a keypress or scroll.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
@@ -57,15 +65,26 @@ feature is added or changed, update the matching entry here in the same change**
   silent command cannot stall the rest. A launch still running after 20 seconds
   stops holding back the others and keeps showing "Starting terminal…" until its
   process comes up, or until Restart, closing the pane or leaving the project
-  supersedes it. Editors, diffs and browsers open
+  supersedes it. Once the process is up, a terminal that has printed nothing
+  keeps the spinner for at most a minute and then shows its blank screen, so a
+  silent program can't keep the window redrawing. Editors, diffs and browsers open
   without waiting on terminals, and switching projects cancels the old project's
   pending waves.
+- **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can start sessions not worked
+  on in N days only when opened (off by default; enabling starts at 3 days).
+  Old local PTY panes retain their name, lifecycle status and age with a dormant
+  marker and a lightweight placeholder, without starting a process. Opening or
+  focusing one resumes it through the normal restore path. The focused pane,
+  pinned panes and panes with no work history always start; SSH and local tmux
+  restores keep their existing behavior. `ctl status`/`panes` expose
+  `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
   remain. While a pane is maximized, selecting another agent (sidebar,
   notification, tray) moves the maximize to it, so that agent comes up full-size
-  instead of hiding behind.
+  instead of hiding behind. A file, diff or page that opens in another pane ends
+  the maximize, so it shows beside the pane that opened it.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 
@@ -73,6 +92,12 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
+  add the new agent as a tab in the focused pane, so starting an agent never adds
+  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
+  split buttons and dragging a tab to an edge still make a new pane. In a
+  per-monitor project window, the toolbar and shortcuts act on that window's
+  project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -309,7 +334,13 @@ feature is added or changed, update the matching entry here in the same change**
   sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  indexes take one stat. A Claude pane reads its hook record when a watcher on
+  the hook directory reports it written, so `/clear` or `/resume` rebinds at
+  once, and otherwise every thirty seconds, for events a watcher loses. A
+  record that can't be adopted or read yet is retried every two seconds. Where
+  the watcher can't start, reports an error, stops, or loses its directory (it,
+  or the directory above it, was removed or renamed), Claude retries
+  unresolved results with backoff, as Grok does, for the rest of the run.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
@@ -498,6 +529,12 @@ feature is added or changed, update the matching entry here in the same change**
   because tmux does not forward OSC 7501 reports. Once Claude has reported in a
   launch, its glyph-less title names the pane for the rest of that launch without
   supplying lifecycle status; a title in the current root report takes precedence.
+- **Status details** — `ctl status`, `panes`, and `show` report the sidebar's
+  lifecycle badge, its current evidence source, available provider activity,
+  and the reason for a blocked program report. The sidebar row shows activity
+  in its tooltip. Program messages and percentages take precedence over title
+  and screen activity. Binding switches and exits clear old activity. A retained
+  Done badge does not change the live facts used for sending or waiting.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays
@@ -521,8 +558,19 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Claude's
+  permission forms report **blocked**, and background work listed by Claude's footer
+  or Grok's panel holds a finished turn at **working**, labelled with what's running
+  (`working · 1 shell`). That covers tmux and SSH panes too, and it beats Claude's own
+  finished report. A held turn doesn't alert or move in Recent, and it reads **done**
+  once when the work ends and the agent has had a moment to wake for it. Shells and
+  monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
+  the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
+  finished turn. Subagents hold until they end. Closing a pane asks while anything is
+  listed as running, and `ctl status` reports it as `background`. `ctl send` still
+  delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
+  keeps waiting through a hold, so it returns the agent's reply after the work, and
+  lists what's still running if it times out first; `ctl wait --turn` stops as soon
+  as the turn is over instead. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity
@@ -607,7 +655,7 @@ feature is added or changed, update the matching entry here in the same change**
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name
   badge on a uniform pane, a per-tab color dot, and a matching dot in the sidebar.
-- **Sidebar grouping** — panes are grouped under colored worktree subheaders;
+- **Sidebar grouping** — in Layout order, panes are grouped under colored worktree subheaders;
   rename a worktree inline or from the context menu.
 - **Dispose flow** — when a worktree's last pane closes (or its agent exits), a
   clean worktree is removed silently; otherwise a modal offers **Commit & close**,
@@ -764,7 +812,7 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  tab beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
@@ -777,7 +825,7 @@ feature is added or changed, update the matching entry here in the same change**
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
 - **Browser as a preset** — the built-in **Browser** preset opens a web-browser
-  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  pane; pick it anywhere you pick an agent (the toolbar's agent dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
@@ -804,8 +852,9 @@ feature is added or changed, update the matching entry here in the same change**
   you've looked at it (or five minutes pass) however often it flips between working
   and done, and alerts that land together play as one chime. The desktop toast for
   the same event stays silent so the two never double up.
-- **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
-  events **and** all app messages (git results, SSH connections, and save errors —
+- **In-app NOTIFICATIONS sidebar** — in Layout order, a category above PROJECTS
+  collecting agent events **and** all app messages (git results, SSH connections,
+  and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
   everything that used to be a pop-up toast goes here instead; persistent save
   failures report once per cause, not on every autosave). Agent rows are
@@ -837,8 +886,10 @@ feature is added or changed, update the matching entry here in the same change**
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
-  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
-  plain and prompt launches, retained on restart. The preset needs Model flag /
+  that project's toolbar preset. Run from one of that project's panes, the tab
+  joins the caller's own group; otherwise it joins the focused group.
+  `--model M` and `--effort E` select per-pane values for plain and prompt
+  launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
@@ -868,9 +919,10 @@ feature is added or changed, update the matching entry here in the same change**
   accepts an existing absolute directory, including a linked worktree outside
   the project root; it defaults to the root. Automatic memory and accomplishments
   instructions still address the project's files when the launch directory differs.
-  `--name` names the tab (1–100 visible characters; `--from` likewise), and
-  `--split right|down` creates a pane. Both refuse control, bidi, zero-width and
-  line-separator characters.
+  `--name` supplies a starting label; `--name-fixed` keeps a fixed name. Choose
+  one. Names and `--from` labels accept 1–100 visible characters and refuse
+  control, bidi, zero-width and line-separator characters.
+  `--split right|down` creates a pane.
   Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
   the new pane, its project and window only when the request was approved with
@@ -1229,9 +1281,10 @@ feature is added or changed, update the matching entry here in the same change**
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs. Right-clicking a
-  terminal link opens link actions instead of copying or pasting through the PTY.
+  focus in any window; browser target=_blank, window.open, Ctrl+click, and
+  middle-click requests stay in the source project and open as Muxel tabs, a
+  popped-out terminal's in its project's window. Right-clicking a terminal link
+  opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -1304,6 +1357,15 @@ feature is added or changed, update the matching entry here in the same change**
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text). Paragraphs combining inline
   images and line breaks render without crashing, including linked HTML images.
+- **Copy as rich text** — a rendered Markdown pane's header has a **Copy as rich
+  text** button (also in the Ctrl+P palette) that copies the whole document as
+  formatted HTML, with the Markdown source as the plain-text fallback. Pasting into
+  Outlook, Gmail or a word processor keeps headings, lists, bold, links, code and
+  bordered tables; task items show ☐/☑, web images come along, and local images
+  become an `[Image: alt]` placeholder to insert by hand. Links to files beside the
+  document become their text; links within it keep their targets. Raw HTML keeps
+  only the elements and attributes mail understands and only web and mail links;
+  script and style tags paste as text, as GitHub shows them.
 - **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
   text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
   from a focused terminal.
@@ -1313,13 +1375,30 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
+  position and leaves keyboard focus where it was, so an agent rewriting an open file
+  doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
-- **Resource tab grouping** — files, diffs, and browser pages opened by default join
-  the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement. Opening another resource as a tab
-  preserves the surrounding split geometry, including narrow resource columns.
+- **Resources open beside their pane** — a file, diff or web page opened from a
+  pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
+  new-window link) opens as a tab in the pane next to it, whatever that pane
+  holds: the one on its right, or on its left when it sits at the right edge. A
+  link goes beside the pane it was clicked in, even one that didn't have focus.
+  A pane with no neighbour in its row splits once, and its later opens join that
+  new column. Opens with no pane behind them (the file browser, palette, find
+  panel, sidebar or git panel) join the nearest pane of the same type instead,
+  and so do links from a popped-out terminal, which has left the layout; those
+  open in the window showing the terminal's project. A middle-click or **Open in
+  new tab** places the resource the same way and leaves focus where it is in
+  every window, even when the file jumps to a line or reloads. A file already
+  open anywhere, or a page already open in the same project, is refreshed and
+  focused where it is: the window showing its project comes to the front, or the
+  main window switches to that project. When that's another window, the one the
+  link was clicked in keeps its own focus. A resource focused in the main window is
+  shown even when the Dashboard or another hotbar view covered the panes. Explicit New
+  Tab and New Pane commands still use the requested placement. Opening a
+  resource as a tab preserves the surrounding split geometry, including narrow
+  resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
@@ -1343,8 +1422,9 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
-  changes", the project menu, or a worktree) rather than splitting off a new pane.
+  directory. From a pane's diff button it opens as a tab beside that pane; from
+  the project menu or a worktree's **View changes** it joins the nearest diff
+  tab, if there is one.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
@@ -1356,8 +1436,52 @@ feature is added or changed, update the matching entry here in the same change**
   project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
+- **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
+  (the default) or **Recent work**. Recent work lists pinned sessions first in
+  each project, then whichever most recently finished or needed attention, in
+  Today (under 24 hours), This week (under seven days), and Older bands. Starting
+  a turn doesn't move a session, and neither does looking at it.
+  Sessions without work follow in layout order; project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work;
+  their external-window icon marks rows that raise an existing window on click.
+  Layout retains worktree subheaders and row swapping;
+  recent rows can still be dragged onto panes.
+- **Files nest under their session** — in Recent work, a file, diff or page a
+  session opened (a terminal link, its diff button, or a link in a file it
+  opened) shows indented under that session's row and moves with it, newest
+  first. Opening it again from another session moves it there; the file
+  browser and palette leave it where it is. Once that session closes, or if it's
+  in another project, the resource is an ordinary row again. A pinned file stays
+  with the pins unless its session is pinned too.
+- **Files close with their session** — in Recent work, closing a session (its
+  tab, its pane, or Close terminals) also closes the files, diffs and pages it
+  last opened. They join the session's countdown, so one Undo brings them all
+  back. An unsaved file asks first, naming the file and the session taking it:
+  Cancel keeps it open as an ordinary row while the session still closes. A
+  file another session reopened stays, and so does a popped-out one or the tab
+  you chose Close other tabs from. An agent exiting on its own never takes its
+  files.
+- **Unread sessions** — in Recent work, a dot and bold name mark a completion or
+  blocked event since the session was last attended. Only attendance clears the
+  mark, even if another turn starts; Done persists. Project rows show the unread
+  count even when collapsed. Agent notifications appear on these session rows
+  instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
+  and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
-  branch icon (refreshed live).
+  branch icon (refreshed live), including a new repo's branch before its first
+  commit, spelled as the switch-branch menu spells it. A local repo's branch is
+  read from its HEAD file without starting git whenever the files settle what
+  git would print; unusual setups (a bare repo, a symbolic branch, a name
+  another ref shares, `GIT_DIR` and similar variables) ask git. Long labels
+  ellipsize within the header; hover for the full branch name.
+- **Session folder chips** — terminal rows show their launch folder's short name
+  when it differs from the project root, plus its current Git branch when known.
+  Root sessions stay single-line unless their known branch differs from the
+  project header; then they show the branch only. Right-click a row to show only
+  sessions in that folder or on that known branch; **Show all sessions** on the
+  same row or the project's clear button resets.
+  Background refresh supplies the sidebar and `ctl panes` / `status` `branch`
+  field. Running programs' later directory changes are not tracked.
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its
@@ -1378,6 +1502,10 @@ feature is added or changed, update the matching entry here in the same change**
   editor and commits on Enter or blur without the opening click prematurely
   saving it. Bare session UUIDs and transient startup titles such as `cmd.exe`
   or the agent executable name are never used as display names.
+  A `ctl new --name` label yields to the agent's useful title after launch and
+  stays available as a control alias and in `status`/`panes`. Saved titles from
+  an earlier launch do not displace the starting label. Row tooltips show the
+  current agent title and retained label; manual inline names remain sticky.
 - **Resizable sidebar** — drag to resize (up to half the window); width persists.
 - **Fullscreen mode** — `F11` (rebindable) toggles OS fullscreen with the sidebar
   fully hidden. A floating pill at the left edge brings the sidebar back without
@@ -1671,6 +1799,10 @@ feature is added or changed, update the matching entry here in the same change**
   Credentials are not migrated from the default profile; if a root cannot be
   resolved when first used, its fallback keychain name may differ from a later
   resolved name.
+- **Private UAT root alias** — dogfood builds also accept `--uat-root DIR` for an
+  absolute isolated profile and enter its seeded current workspace after terms
+  are accepted. Combining it with `--user-data-dir` is refused; arguments after
+  `ctl` remain command payload.
 
 ## Settings & theming
 
@@ -1683,10 +1815,10 @@ feature is added or changed, update the matching entry here in the same change**
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
-  `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
-  to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
+  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+  switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
+  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
@@ -1779,7 +1911,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
   session lookup hits, outcome changes and slow calls, with per-minute counts
   and maximum durations for all discovery polls. Launch-time resume lookups
-  always log. Both profiler logs keep stable live paths and dated history
+  always log. Local `git` runs get a record (which poll ran it, the
+  subcommand, its time, and whether it printed the same as last time), except
+  team-library jobs, and records a saturated queue drops are only counted.
+  Both profiler logs keep stable live paths and dated history
   (14 local dates and 256 MiB per family by default, tunable with
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
@@ -1809,6 +1944,9 @@ feature is added or changed, update the matching entry here in the same change**
   and exit, without opening a window, so asking the binary for its version never
   starts a second muxel that would take over the running one's `muxel ctl`
   endpoint and window position.
+- **Exact dogfood build identity** — `muxel --build-info-json` reports the embedded
+  commit, branch, profile and source cleanliness before opening a window. Debug
+  window titles and the update dialog also identify the build.
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
   AppImage that crashes or is SIGKILLed can't unmount its squashfuse mount, and a
   dead leftover mount makes any filesystem scan (a desktop monitor's periodic
