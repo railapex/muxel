@@ -178,7 +178,11 @@ feature is added or changed, update the matching entry here in the same change**
   with permission notifications marking a blocked turn. Where the title can't
   be read (under tmux, or on a remote host) the dot follows output activity,
   and local hooks still mark blocked and finished turns. Hook records are read
-  in the background. SessionStart context
+  in the background, when a watcher on the hook folder reports one written, so
+  a state change shows at once. A pane whose record has been found otherwise
+  rereads it every thirty seconds, for events a watcher loses; before that,
+  and wherever the watcher can't start or fails, every one to two seconds.
+  SessionStart context
   delivers file-link, memory and custom instructions without submitting a turn.
   Hooks are configured per launch outside the project; existing user, project
   and managed hooks are preserved. Only permission notifications invoke the

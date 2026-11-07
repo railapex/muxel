@@ -2,10 +2,12 @@
 //! [`WatchRouter`] routes to registrations, so every watched target shares one
 //! backend (one inotify instance on Linux, one stream on macOS).
 //!
-//! Claude's session hook records are registered today ([`claude_records`]).
-//! Without the watch each Claude pane opens its record path every two seconds,
-//! and almost always finds nothing: the hook writes only after `/clear`,
-//! `/resume` or `/fork`. Discovery still polls slowly while watched
+//! Claude's and Muse's session hook records are registered
+//! ([`claude_records`], [`muse_panes`]). Without the watch each Claude pane
+//! opens its record path every two seconds, and almost always finds nothing:
+//! the hook writes only after `/clear`, `/resume` or `/fork`. Each bound Muse
+//! pane re-reads its record every second for a state change its hook writes.
+//! Discovery still polls slowly while watched
 //! ([`muxel_core::session_discovery::WATCHED_HOOK_FALLBACK`]), because a
 //! watcher can lose events, and at the usual cadence when it can't watch.
 
@@ -38,6 +40,26 @@ pub(crate) fn claude_records(dir: &Path) -> WatchSpec {
     WatchSpec {
         paths,
         filter: WatchFilter::RecordFiles {
+            dir: dir_names(dir),
+        },
+        lose_on,
+    }
+}
+
+/// Muse's session hook records: `<pane>/launch.json` and `<pane>/<nonce>.json`
+/// in the hook directory `dir`, so the whole tree is watched. The parent is
+/// watched as for [`claude_records`] (the two share it), and losing either
+/// detaches the watch likewise.
+pub(crate) fn muse_panes(dir: &Path) -> WatchSpec {
+    let mut paths = vec![(dir.to_path_buf(), Recursion::Tree)];
+    let mut lose_on = vec![dir_names(dir)];
+    if let Some(parent) = dir.parent() {
+        paths.push((parent.to_path_buf(), Recursion::Dir));
+        lose_on.push(dir_names(parent));
+    }
+    WatchSpec {
+        paths,
+        filter: WatchFilter::PaneDirs {
             dir: dir_names(dir),
         },
         lose_on,
@@ -407,5 +429,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(seen.hits, HashSet::from([pane]));
         assert!(!seen.lost);
+    }
+
+    /// A Muse pane launched while its hook directory is watched: the launch
+    /// creates the pane's directory, and the hook's record written into it
+    /// later wakes exactly that pane. On Linux notify watches the new
+    /// directory only once it has seen it created; a record written before
+    /// then is missed, which is why discovery keeps polling a Muse pane until
+    /// it has found its record. Closing the pane still removes its directory
+    /// under the watch.
+    #[test]
+    fn a_new_pane_directory_then_its_record_wakes_the_pane() {
+        use crate::session_binding;
+        let root = std::env::temp_dir().join(format!("muxel-muse-watch-{}", Uuid::new_v4()));
+        let (data, share) = (root.join("data"), root.join("share"));
+        let dir = session_binding::muse_binding_dir(&data);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut watch, signal) = FileWatch::start().unwrap();
+        let id = watch.register(super::muse_panes(&dir)).unwrap();
+        let env = [
+            ("XDG_CONFIG_HOME", root.join("config")),
+            ("XDG_DATA_HOME", share),
+        ]
+        .map(|(key, path)| (key.to_string(), path.display().to_string()));
+        let pane = Uuid::new_v4();
+        assert!(session_binding::prepare_muse_hooks(&data, pane, &env, &[], None, false).is_some());
+        // The hook runs once Muse has started: well after its directory.
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = watch.take();
+        let launch: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join(pane.to_string()).join("launch.json")).unwrap(),
+        )
+        .unwrap();
+        let nonce: Uuid = serde_json::from_value(launch["launch_id"].clone()).unwrap();
+        let session = Uuid::new_v4().to_string();
+        let event = serde_json::json!({
+            "session_id": session, "cwd": root,
+            "hook_event_name": "Notification", "notification_type": "permission_prompt",
+        });
+        let written = session_binding::write_muse_binding_from_reader(
+            &data,
+            pane,
+            nonce,
+            &session,
+            event.to_string().as_bytes(),
+        );
+        let seen = gather(&watch, &signal, id, |seen| seen.hits.contains(&pane));
+        session_binding::clear_muse_binding(&data, pane);
+        let cleared = !dir.join(pane.to_string()).exists();
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&root);
+        written.unwrap();
+        assert_eq!(seen.hits, HashSet::from([pane]));
+        assert!(!seen.lost);
+        assert!(
+            cleared,
+            "a closed pane's directory is removed while watched"
+        );
     }
 }

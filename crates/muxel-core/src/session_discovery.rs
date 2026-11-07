@@ -106,7 +106,8 @@ pub struct SessionDiscoveries {
 
 impl SessionDiscoveries {
     /// Record whether `provider`'s hook directory is watched. While it is, a
-    /// pane whose lookup found no record waits for [`Self::wake`] or
+    /// pane whose next change a write will announce (a Claude pane with no
+    /// record, a bound Muse pane) waits for [`Self::wake`] or
     /// [`WATCHED_HOOK_FALLBACK`]. Either change wakes the provider's panes:
     /// a new watcher may have missed writes made before it started, and
     /// without one the quiet panes must go back to polling now.
@@ -123,6 +124,26 @@ impl SessionDiscoveries {
 
     pub fn watched(&self, provider: SessionProvider) -> bool {
         self.watched.contains(&provider)
+    }
+
+    /// Whether the pane can wait for its watcher's wake (or the fallback)
+    /// after this result, because what it looks for next is announced by a
+    /// write in the watched directory.
+    ///
+    /// - Claude: a miss with no record waiting. The hook writes the record.
+    /// - Muse: a hit. Its hook rewrites the pane's record on every state
+    ///   change, so a bound pane needn't re-read it every second. A miss
+    ///   keeps the short cadence: a record whose conversation isn't in the
+    ///   session store yet announces nothing more, and on Linux notify adds
+    ///   the watch for a new pane directory only after it sees it created,
+    ///   so a record written in between is found by the poll alone. Once a
+    ///   lookup has found the record, its directory is watched.
+    fn quiet(&self, provider: SessionProvider, found: bool, hook_record: bool) -> bool {
+        self.watched(provider)
+            && match provider {
+                SessionProvider::Muse => found,
+                _ => !found && !hook_record,
+            }
     }
 
     /// `provider`'s hook record for the pane changed: its next lookup is due
@@ -234,7 +255,7 @@ impl SessionDiscoveries {
         now: Instant,
         found: bool,
     ) -> bool {
-        let quiet = !found && self.watched(request.key.provider);
+        let quiet = self.quiet(request.key.provider, found, false);
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
@@ -272,8 +293,7 @@ impl SessionDiscoveries {
         found: bool,
         evidence: LookupEvidence,
     ) -> bool {
-        // Only a miss with nothing waiting can rely on the watcher's wake.
-        let quiet = !found && !evidence.hook_record && self.watched(request.key.provider);
+        let quiet = self.quiet(request.key.provider, found, evidence.hook_record);
         let owner = evidence
             .rejected_owner
             .map(|(owner, session_id)| CodexOwnershipRejection {
@@ -428,7 +448,7 @@ impl SessionDiscovery {
         self.finish_with_quiet(request, current, now, found, false)
     }
 
-    /// As [`Self::finish`]. A `quiet` miss (a watcher will wake the pane)
+    /// As [`Self::finish`]. A `quiet` result (a watcher will wake the pane)
     /// waits [`WATCHED_HOOK_FALLBACK`] instead. A wake during the lookup makes
     /// the next one due at once.
     fn finish_with_quiet(
@@ -450,7 +470,11 @@ impl SessionDiscovery {
         self.codex_owner = None;
         let delay = if found {
             self.misses = 0;
-            Duration::from_secs(1)
+            if quiet {
+                WATCHED_HOOK_FALLBACK
+            } else {
+                Duration::from_secs(1)
+            }
         } else {
             self.misses = self.misses.saturating_add(1);
             let cap = match request.key.provider {
@@ -983,6 +1007,47 @@ mod tests {
             discoveries.begin(key, now + 2 * SECOND).is_none(),
             "nothing waits now"
         );
+    }
+
+    #[test]
+    fn a_watched_muse_hit_waits_for_its_own_wake() {
+        let key = SessionDiscoveryKey {
+            provider: SessionProvider::Muse,
+            hint: None,
+            ..key()
+        };
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Muse, true);
+        let mut now = Instant::now();
+        // Until a lookup finds the record, misses keep the short cadence: on
+        // Linux a new pane directory's first record can land before its watch.
+        for delay in [SECOND, 2 * SECOND] {
+            let request = discoveries
+                .begin(key.clone(), now)
+                .expect("a miss keeps the short cadence");
+            assert!(discoveries.finish(&request, Some(&key), now, false));
+            now += delay;
+        }
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, true));
+        // Unwatched, a hit looks again a second later.
+        assert!(discoveries.begin(key.clone(), now + 2 * SECOND).is_none());
+        discoveries.wake(SessionProvider::Muse, key.pane);
+        let woken = now + 2 * SECOND;
+        let request = discoveries.begin(key.clone(), woken).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), woken, true));
+        let fallback = woken + WATCHED_HOOK_FALLBACK;
+        assert!(
+            discoveries
+                .begin(key.clone(), fallback - Duration::from_millis(1))
+                .is_none()
+        );
+        let request = discoveries
+            .begin(key.clone(), fallback)
+            .expect("a lost event still gets polled");
+        // A miss after a hit is back on the short cadence.
+        assert!(discoveries.finish(&request, Some(&key), fallback, false));
+        assert!(discoveries.begin(key, fallback + SECOND).is_some());
     }
 
     #[test]

@@ -10,9 +10,10 @@ use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
     validated_codex_session_id,
 };
-use crate::file_watch::claude_records;
+use crate::file_watch::{claude_records, muse_panes};
 use crate::{session_binding, ui_profile};
 use gpui::{App, AsyncApp, Context, WeakEntity};
+use muxel_core::file_watch::WatchSpec;
 use muxel_core::session_discovery::{
     LookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
@@ -852,15 +853,16 @@ impl MuxelApp {
             .iter()
             .filter_map(|instance| self.session_discovery_key_for_instance(instance, cx))
             .collect();
-        // Before the first Claude lookup, so none can miss a write the watcher
-        // would have reported.
-        if !self.provider_watches.contains_key(&SessionProvider::Claude)
-            && keys
-                .iter()
-                .any(|key| key.provider == SessionProvider::Claude)
-            && let Some(data_dir) = data_dir.as_deref()
-        {
-            self.start_claude_binding_watch(data_dir, cx);
+        // Before a provider's first lookup, so none can miss a write the
+        // watcher would have reported.
+        if let Some(data_dir) = data_dir.as_deref() {
+            for provider in [SessionProvider::Claude, SessionProvider::Muse] {
+                if !self.provider_watches.contains_key(&provider)
+                    && keys.iter().any(|key| key.provider == provider)
+                {
+                    self.start_hook_watch(provider, data_dir, cx);
+                }
+            }
         }
         self.session_discoveries.reconcile(&self.workspace);
         let requests: Vec<_> = keys
@@ -911,23 +913,35 @@ impl MuxelApp {
         }
     }
 
-    /// Watch the Claude hook directory, once. A write it reports runs
+    /// Watch `provider`'s hook directory, once. A write it reports runs
     /// discovery at once instead of at the next tick. Failing to watch leaves
-    /// Claude panes polling as they would without it.
-    fn start_claude_binding_watch(&mut self, data_dir: &Path, cx: &mut Context<Self>) {
-        let dir = session_binding::claude_binding_dir(data_dir);
+    /// the provider's panes polling as they would without it.
+    fn start_hook_watch(
+        &mut self,
+        provider: SessionProvider,
+        data_dir: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let (dir, spec): (_, fn(&Path) -> WatchSpec) = match provider {
+            SessionProvider::Claude => (
+                session_binding::claude_binding_dir(data_dir),
+                claude_records,
+            ),
+            SessionProvider::Muse => (session_binding::muse_binding_dir(data_dir), muse_panes),
+            SessionProvider::Codex | SessionProvider::Grok => return,
+        };
         // Created first, so the watch can resolve its canonical name.
         let watched = self.watch_provider(
-            SessionProvider::Claude,
+            provider,
             || {
                 std::fs::create_dir_all(&dir)?;
-                Ok(claude_records(&dir))
+                Ok(spec(&dir))
             },
             cx,
         );
         if let Err(error) = watched {
             log::warn!(
-                "could not watch Claude session hook records in {}; polling instead: {error:#}",
+                "could not watch {provider:?} session hook records in {}; polling instead: {error:#}",
                 dir.display()
             );
         }
@@ -2639,6 +2653,154 @@ mod claude_watch_regressions {
             let bound = bound_within(cx, window, pane, &next, Duration::from_secs(5), true);
             session.kill();
             assert_eq!(bound.as_deref(), Some(next.as_str()));
+        });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod muse_watch_regressions {
+    use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
+    use crate::session_binding;
+    use gpui::{AppContext as _, TestAppContext, WindowHandle};
+    use muxel_core::{Instance, Project};
+    use muxel_terminal::{AgentStatus, CommandSpec, TerminalLaunch, TerminalView};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// A live Muse pane launched with muxel's hooks, with the status tick
+    /// stopped, so only what a test does (or the watcher reports) runs
+    /// discovery. Returns the pane, its PTY session, its launch's nonce and
+    /// its session store.
+    fn muse_pane(
+        cx: &mut TestAppContext,
+        window: WindowHandle<MuxelApp>,
+        data: &Path,
+    ) -> (
+        Uuid,
+        std::sync::Arc<muxel_terminal::TerminalSession>,
+        Uuid,
+        PathBuf,
+    ) {
+        let share = data.join("share");
+        let env = [
+            ("XDG_CONFIG_HOME", data.join("muse-config")),
+            ("XDG_DATA_HOME", share.clone()),
+        ]
+        .map(|(key, path)| (key.to_string(), path.display().to_string()));
+        let (pane, session) = window
+            .update(cx, |app: &mut MuxelApp, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.current_workspace = Some(Uuid::new_v4());
+                let project_id = app.workspace.add_project(Project::new("muse", data));
+                let mut instance = Instance::shell(project_id);
+                instance.program = Some("muse".into());
+                let pane = instance.id;
+                app.workspace.add_instance(instance);
+                assert!(
+                    session_binding::prepare_muse_hooks(data, pane, &env, &[], None, false)
+                        .is_some()
+                );
+                let mut spec = CommandSpec::program(
+                    "cmd.exe",
+                    vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+                );
+                spec.status_program = Some("muse".into());
+                let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                let session = view.read(cx).session().clone();
+                app.terminals.insert(pane, view);
+                app.terminal_launches.insert(pane, (Instant::now(), false));
+                (pane, session)
+            })
+            .unwrap();
+        let launch: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                session_binding::muse_binding_dir(data)
+                    .join(pane.to_string())
+                    .join("launch.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let nonce = serde_json::from_value(launch["launch_id"].clone()).unwrap();
+        (pane, session, nonce, share.join("muse"))
+    }
+
+    /// Muse's hook for `conversation`, as it runs on `event`. The
+    /// conversation is in the session store, as Muse keeps it.
+    fn muse_hook(
+        data: &Path,
+        store: &Path,
+        pane: Uuid,
+        nonce: Uuid,
+        conversation: &str,
+        event: serde_json::Value,
+    ) {
+        let log = store.join(format!("sessions/2026/11/07/{conversation}"));
+        std::fs::create_dir_all(&log).unwrap();
+        std::fs::write(log.join("session.jsonl"), "").unwrap();
+        let mut event = event;
+        event["session_id"] = conversation.into();
+        event["cwd"] = data.display().to_string().into();
+        session_binding::write_muse_binding_from_reader(
+            data,
+            pane,
+            nonce,
+            conversation,
+            event.to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// Run the app until `done` holds or ten seconds pass, with no status
+    /// tick. Returns whether it held.
+    fn within(
+        cx: &mut TestAppContext,
+        window: WindowHandle<MuxelApp>,
+        done: impl Fn(&MuxelApp, &gpui::App) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let held = window.update(cx, |app, _, cx| done(app, cx)).unwrap();
+            if held || Instant::now() >= deadline {
+                return held;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A bound Muse pane's hook reports a permission prompt. Its status
+    /// shows it with no discovery poll after the write: the status tick is
+    /// stopped, so only the watcher's wake can run the lookup.
+    #[test]
+    fn a_muse_state_change_shows_without_a_poll() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let _home = claude_test_home(Some(data.join("home")));
+            let (pane, session, nonce, store) = muse_pane(cx, window, &data);
+            let conversation = Uuid::new_v4().to_string();
+            let started = serde_json::json!({"hook_event_name": "SessionStart"});
+            muse_hook(&data, &store, pane, nonce, &conversation, started);
+            // The first lookup binds the pane, and starts the watcher.
+            window
+                .update(cx, |app, _, cx| app.sync_provider_session_ids(cx))
+                .unwrap();
+            let bound = within(cx, window, |app, _| {
+                app.workspace.instance(pane).unwrap().session_id.as_deref()
+                    == Some(conversation.as_str())
+            });
+            let prompt = serde_json::json!({
+                "hook_event_name": "Notification", "notification_type": "permission_prompt",
+            });
+            muse_hook(&data, &store, pane, nonce, &conversation, prompt);
+            let blocked = within(cx, window, |app, cx| {
+                app.terminals[&pane].read(cx).status() == AgentStatus::Blocked
+            });
+            session.kill();
+            assert!(bound);
+            assert!(blocked, "the hook's state waited for a poll");
         });
     }
 }

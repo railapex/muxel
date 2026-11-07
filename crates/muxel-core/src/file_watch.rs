@@ -43,6 +43,11 @@ impl DirNames {
     pub fn is(&self, path: &Path) -> bool {
         self.0.iter().any(|name| name == path)
     }
+
+    /// `path` relative to this directory, under whichever name it's below.
+    pub fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        self.0.iter().find_map(|name| path.strip_prefix(name).ok())
+    }
 }
 
 /// How an event under a registration's paths becomes a change.
@@ -51,6 +56,9 @@ pub enum WatchFilter {
     /// `<dir>/<pane>.json`, the extension in any ASCII case: that pane. A
     /// session hook installs its record under that name.
     RecordFiles { dir: DirNames },
+    /// Anything inside `<dir>/<pane>/`: that pane. Muse's hook keeps each
+    /// pane's records in a directory of its own.
+    PaneDirs { dir: DirNames },
 }
 
 /// What a registration asks for.
@@ -180,6 +188,14 @@ fn record_pane(path: &Path) -> Option<Uuid> {
     Uuid::parse_str(name.get(..split)?).ok()
 }
 
+/// The pane whose directory under `dir` holds `path`: `<dir>/<pane>/…`. The
+/// pane directory's own entry in `dir` isn't one of its records.
+fn pane_dir_entry(dir: &DirNames, path: &Path) -> Option<Uuid> {
+    let mut parts = dir.relative(path)?.components();
+    let pane = Uuid::parse_str(parts.next()?.as_os_str().to_str()?).ok()?;
+    parts.next().map(|_| pane)
+}
+
 impl WatchRouter {
     /// `restarts_stream`: the backend restarts its event stream whenever the
     /// watched set changes (macOS).
@@ -274,6 +290,12 @@ impl WatchRouter {
                             .iter()
                             .filter(|path| path.parent().is_some_and(|parent| dir.is(parent)))
                             .filter_map(|path| record_pane(path)),
+                    ),
+                    WatchFilter::PaneDirs { dir } => change.hits.extend(
+                        event
+                            .paths
+                            .iter()
+                            .filter_map(|path| pane_dir_entry(dir, path)),
                     ),
                 }
             }
@@ -428,6 +450,54 @@ mod tests {
             &[file(&format!("{shouted}.JSON"))],
         ));
         assert_eq!(change(&mut router).hits, HashSet::from([renamed, shouted]));
+    }
+
+    /// Muse's registration routes anything inside a pane's directory, under
+    /// either of the directory's names, to that pane.
+    #[test]
+    fn a_write_inside_a_pane_directory_wakes_that_pane() {
+        let dir = root_path().with_file_name("muse");
+        let canonical = Path::new("canonical").join("muse");
+        let mut router = WatchRouter::new(false);
+        router.register(WatchSpec {
+            paths: vec![(dir.clone(), Recursion::Tree)],
+            filter: WatchFilter::PaneDirs {
+                dir: DirNames::new(dir.clone(), Some(canonical.clone())),
+            },
+            lose_on: vec![names(&dir)],
+        });
+        let (temp, renamed) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let nonce = Uuid::from_u128(3);
+        for (kind, path) in [
+            // A new pane's directory itself, and other entries of `dir`.
+            (EventKind::Create, dir.join(Uuid::from_u128(4).to_string())),
+            (EventKind::Create, dir.join("settings.json")),
+            (
+                EventKind::Create,
+                dir.join("not-a-pane").join("launch.json"),
+            ),
+            (EventKind::Modify, root_path().join(format!("{temp}.json"))),
+            (
+                EventKind::Access,
+                dir.join(temp.to_string()).join("launch.json"),
+            ),
+        ] {
+            router.event(&event(kind, &[path]));
+        }
+        assert_eq!(change(&mut router), Change::default());
+        router.event(&event(
+            EventKind::Create,
+            &[dir.join(temp.to_string()).join(format!("{nonce}.4242.tmp"))],
+        ));
+        router.event(&event(
+            EventKind::Rename,
+            &[canonical
+                .join(renamed.to_string())
+                .join(format!("{nonce}.json"))],
+        ));
+        let change = change(&mut router);
+        assert_eq!(change.hits, HashSet::from([temp, renamed]));
+        assert!(!change.rescan && !change.lost);
     }
 
     #[test]
