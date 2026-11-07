@@ -6,7 +6,7 @@
 use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
+use gpui_component::input::{Input, InputEvent, InputState, Position, RopeExt as _, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
 use std::path::{Path, PathBuf};
@@ -55,6 +55,12 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// "Copy as rich text" just succeeded: the header shows a check briefly.
+    rich_copied: bool,
+    /// Counts copies, so an earlier copy's timer can't clear a later one's check.
+    rich_copy_count: u64,
+    /// A rich-text copy is converting in the background.
+    rich_copy_converting: bool,
     /// Latest external change that could not be applied without discarding edits.
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
@@ -102,6 +108,22 @@ pub(crate) fn read_disk_change(path: &Path, known: Option<DiskStamp>) -> Option<
     match std::fs::read_to_string(path) {
         Ok(content) => Some(DiskChange::Content { stamp, content }),
         Err(_) => Some(DiskChange::Unavailable { stamp }),
+    }
+}
+
+/// Whether a click on a rendered Markdown link opens it in the background: a
+/// middle-click or Ctrl+click (Cmd+click on macOS) does, and a plain click
+/// shows it without taking focus. `None` for a click that opens nothing, such
+/// as a right-click or a long press.
+fn link_in_background(event: &ClickEvent) -> Option<bool> {
+    match event {
+        ClickEvent::Mouse(click) => match click.up.button {
+            MouseButton::Left => Some(click.up.modifiers.secondary()),
+            MouseButton::Middle => Some(true),
+            _ => None,
+        },
+        ClickEvent::Keyboard(_) => Some(false),
+        ClickEvent::Touch(touch) => (!touch.long_press).then_some(false),
     }
 }
 
@@ -221,21 +243,25 @@ impl EditorView {
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: stamp,
         }
     }
 
-    /// Create a read-only git-diff view of `dir`, syntax-highlighted via the
-    /// "diff" grammar (green additions / red deletions / `@@` hunks). The buffer
-    /// is never saved; `refresh_diff` re-runs `git diff`.
+    /// Create a read-only git-diff view of `dir` showing `content`,
+    /// syntax-highlighted via the "diff" grammar (green additions / red
+    /// deletions / `@@` hunks). The buffer is never saved. `git diff` runs off
+    /// the UI thread and arrives through `set_diff_content`.
     pub fn diff(
         dir: PathBuf,
+        content: String,
         config: EditorConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = crate::integrations::git_diff(&dir);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("diff")
@@ -253,6 +279,9 @@ impl EditorView {
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: None,
         }
@@ -292,32 +321,68 @@ impl EditorView {
         }
     }
 
+    /// Whether "Copy as rich text" is offered: rendered Markdown only.
+    pub fn can_copy_rich_text(&self) -> bool {
+        self.is_markdown && self.show_rendered
+    }
+
+    /// Whether a rich-text copy just succeeded (the header shows a check).
+    pub fn rich_text_copied(&self) -> bool {
+        self.rich_copied
+    }
+
+    /// Start a rich-text copy: the document to convert, or `None` while an
+    /// earlier copy is still converting, so a repeated click is ignored. An
+    /// earlier copy's check goes, so it can't sit beside this one's error.
+    pub fn begin_rich_copy(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if self.rich_copy_converting {
+            return None;
+        }
+        self.rich_copy_converting = true;
+        if self.rich_copied {
+            self.rich_copied = false;
+            cx.notify();
+        }
+        Some(self.text(cx))
+    }
+
+    /// The conversion `begin_rich_copy` started has finished.
+    pub fn end_rich_copy(&mut self) {
+        self.rich_copy_converting = false;
+    }
+
+    /// Show the copied check for a moment.
+    pub fn flash_rich_text_copied(&mut self, cx: &mut Context<Self>) {
+        self.rich_copy_count += 1;
+        let count = self.rich_copy_count;
+        self.rich_copied = true;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rich_copy_count == count {
+                    this.rich_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// The directory a diff pane is showing (for dedup), if any.
     pub fn diff_dir(&self) -> Option<&Path> {
         self.diff_dir.as_deref()
     }
 
-    /// Re-run `git diff` for a diff pane and replace the shown text (synchronous;
-    /// used by the manual refresh button and pop-out/restore).
-    pub fn refresh_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.diff_dir.clone() else {
-            return;
-        };
-        let content = crate::integrations::git_diff(&dir);
-        self.apply_diff_text(content, window, cx);
-    }
-
-    /// Replace a diff pane's text with already-computed `content` (used by the
-    /// periodic background refresh so `git diff` doesn't run on the UI thread).
+    /// Replace a diff pane's text with background-computed `content`, keeping
+    /// the user's scroll position. Does nothing when the text is unchanged (so an
+    /// idle diff never jumps) or when this isn't a diff pane.
     pub fn set_diff_content(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff_dir.is_some() {
-            self.apply_diff_text(content, window, cx);
+        if self.diff_dir.is_none() {
+            return;
         }
-    }
-
-    /// Swap in new diff text while keeping the user's scroll position. Does
-    /// nothing when the text is unchanged (so an idle diff never jumps).
-    fn apply_diff_text(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| {
             if &*s.value() == content.as_str() {
                 return;
@@ -415,6 +480,12 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Swap in the file's contents from disk, keeping the cursor and scroll
+    /// position, and without moving focus. The cursor goes back with
+    /// `set_selected_range`, which only moves it. gpui-component's
+    /// `set_cursor_position` also focuses the input, and then a file an agent
+    /// rewrites while it's open in a clean editor would take the keys from
+    /// whatever had them, the agent's own terminal included.
     fn replace_disk_content(
         &mut self,
         content: String,
@@ -429,7 +500,8 @@ impl EditorView {
             let cursor = s.cursor_position();
             s.set_value(content, window, cx);
             s.set_scroll_offset(offset, cx);
-            s.set_cursor_position(cursor, window, cx);
+            let at = s.text().position_to_offset(&cursor);
+            s.set_selected_range(at..at, cx);
         });
         self.dirty = false;
         cx.notify();
@@ -614,11 +686,32 @@ impl Render for EditorView {
         // edits made in raw mode show here when toggled back).
         } else if self.is_markdown && self.show_rendered {
             let src = self.input.read(cx).value().to_string();
+            let editor = cx.entity_id();
             div()
                 .id("md-view")
                 .size_full()
                 .bg(cx.theme().background)
-                .child(markdown(src).selectable(true).scrollable(true).p_4())
+                .child(
+                    markdown(src)
+                        .selectable(true)
+                        .scrollable(true)
+                        // Without a handler, gpui-component hands the raw href
+                        // to the OS, which can't place `other.md` and bypasses
+                        // muxel's browser.
+                        .on_link_click(move |href, event, _, cx| {
+                            if let Some(background) = link_in_background(event) {
+                                let href = href.to_string();
+                                // The click lands mid-render of this window,
+                                // which the open may need to update.
+                                cx.defer(move |cx| {
+                                    crate::app::MuxelApp::open_rendered_link(
+                                        editor, &href, background, cx,
+                                    );
+                                });
+                            }
+                        })
+                        .p_4(),
+                )
                 .into_any_element()
         } else {
             let family: SharedString = if self.config.font_family.trim().is_empty() {
@@ -707,8 +800,15 @@ pub fn language_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskChange, disk_stamp, language_for_path, read_disk_change};
-    use std::path::Path;
+    use super::{
+        DiskChange, EditorConfig, EditorView, Position, disk_stamp, language_for_path,
+        read_disk_change,
+    };
+    use gpui::{
+        AppContext, Context, Entity, FocusHandle, IntoElement, Render, TestAppContext, Window,
+        WindowHandle,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn detects_languages_by_extension() {
@@ -769,5 +869,166 @@ mod tests {
             Some(DiskChange::Unavailable { .. })
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A test window's root. The editor under test isn't drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// A clean editor on `notes.txt`, in a test window with nothing focused.
+    /// Fields drop in order, and `cx` checks for leaked entities when it
+    /// drops, so it comes last.
+    struct Reload {
+        editor: Entity<EditorView>,
+        window: WindowHandle<Blank>,
+        root: PathBuf,
+        path: PathBuf,
+        cx: TestAppContext,
+    }
+
+    impl Reload {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "muxel-editor-reload-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, "one\n").unwrap();
+            let mut cx = TestAppContext::single();
+            cx.skip_drawing();
+            cx.update(gpui_component::init);
+            let window = cx.add_window(|_, _| Blank);
+            let open = Some(path.clone());
+            let editor = window
+                .update(&mut cx, |_, window, cx| {
+                    cx.new(|cx| EditorView::open(open, EditorConfig::default(), window, cx))
+                })
+                .unwrap();
+            Self {
+                editor,
+                window,
+                root,
+                path,
+                cx,
+            }
+        }
+
+        fn focused(&mut self) -> Option<FocusHandle> {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focused(cx))
+                .unwrap()
+        }
+
+        fn focus(&mut self, handle: &FocusHandle) {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focus(handle, cx))
+                .unwrap();
+        }
+
+        fn cursor(&self) -> Position {
+            self.editor
+                .read_with(&self.cx, |editor, cx| editor.cursor(cx))
+        }
+
+        fn goto(&mut self, line: u32, character: u32) {
+            let editor = self.editor.clone();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.goto_position(line, character, window, cx)
+                    })
+                })
+                .unwrap();
+        }
+
+        /// The disk poll finding the file rewritten as `text`, by an agent say.
+        /// The poll compares modified time and length, and a quick rewrite can
+        /// keep the time, so `text` is a different length from what's there.
+        fn poll(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            let stamp = editor.read_with(&self.cx, |editor, _| editor.disk_stamp());
+            std::fs::write(&self.path, text).unwrap();
+            let change = read_disk_change(&self.path, stamp).expect("the poll saw no change");
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.apply_disk_change(change, window, cx)
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+
+        /// Reopening the file after it was rewritten as `text`.
+        fn reopen(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            std::fs::write(&self.path, text).unwrap();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx))
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+    }
+
+    impl Drop for Reload {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_reload_from_disk_leaves_focus_with_the_pane_that_has_it() {
+        let mut reload = Reload::new("elsewhere");
+        // Another pane has focus: the terminal of the agent rewriting the file, say.
+        let elsewhere = reload.cx.update(|cx| cx.focus_handle());
+        reload.focus(&elsewhere);
+        reload.poll("two lines\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere.clone()),
+            "the poll's reload took focus"
+        );
+        reload.reopen("three lines now\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere),
+            "reopening the file took focus"
+        );
+    }
+
+    #[test]
+    fn a_reload_from_disk_with_nothing_focused_focuses_nothing() {
+        let mut reload = Reload::new("unfocused");
+        assert_eq!(reload.focused(), None);
+        reload.poll("two lines\n");
+        assert_eq!(reload.focused(), None, "the poll's reload took focus");
+    }
+
+    #[test]
+    fn a_reload_from_disk_keeps_the_cursor_on_its_line() {
+        let mut reload = Reload::new("cursor");
+        reload.poll("one\nsecond line\n");
+        reload.goto(1, 5);
+        // The line above the cursor grows.
+        reload.poll("one more\nsecond line\n");
+        assert_eq!(reload.cursor(), Position::new(1, 5));
+        // The cursor's own line shrinks past it, leaving it at the line's end.
+        reload.poll("one more\nsec\n");
+        assert_eq!(reload.cursor(), Position::new(1, 3));
     }
 }

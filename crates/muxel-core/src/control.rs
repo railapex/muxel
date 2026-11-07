@@ -16,6 +16,23 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Work an agent's screen says is still running beside its turn. Read from the
+/// screen every time, so it is never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundWork {
+    pub shells: u32,
+    pub monitors: u32,
+    /// Running subagents, which the agent's screen may name without a count.
+    pub subagents: bool,
+}
+
+impl BackgroundWork {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 mod new;
 pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
@@ -94,7 +111,8 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
-    /// Open a terminal in a project's active tab group.
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
     New {
         project: String,
         #[serde(flatten)]
@@ -107,6 +125,8 @@ pub enum Command {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// Deliberately open an existing pane, starting it if dormant.
+    Focus { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
         agent: String,
@@ -439,6 +459,29 @@ pub enum AgentState {
     Failed,
 }
 
+/// The current evidence behind a terminal's reported lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusSource {
+    Process,
+    Program,
+    Hook,
+    Title,
+    Screen,
+    Bell,
+    Output,
+    Quiet,
+    Settling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBlockedOn {
+    Permission,
+    Question,
+    Auth,
+}
+
 /// One pane's entry in `panes` / `status`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -446,6 +489,9 @@ pub struct AgentInfo {
     pub id: String,
     pub uuid: Uuid,
     pub name: String,
+    /// Stable outside-control alias, retained after an agent changes its title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub project: String,
     pub project_id: String,
     /// `terminal`, `editor` or `browser`.
@@ -457,9 +503,22 @@ pub struct AgentInfo {
     pub model: Option<String>,
     /// A coding agent rather than a shell (or an editor/browser pane).
     pub is_agent: bool,
-    /// `None` for editors and browsers.
+    /// The sidebar's lifecycle badge; `None` for editors and browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentState>,
+    /// Live facts used for control decisions when `status` holds a sidebar badge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AgentStatusSource>,
+    /// Bounded, single-line activity supplied by the current provider binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<AgentBlockedOn>,
+    /// Why a terminal is not running. `dormant` means it starts when opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_running_reason: Option<String>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -474,6 +533,13 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// What the agent's own screen says is still running beside its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// The turn is over and only `background` keeps the pane Working. `wait --turn`
+    /// stops here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_over: bool,
     /// A startup task that failed before provider acceptance. The terminal itself
     /// may still be running, for example at a folder-trust menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,8 +555,28 @@ pub struct AgentInfo {
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Current Git branch from the launch folder's background cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Runs on a remote host over SSH.
     pub remote: bool,
+}
+
+impl AgentInfo {
+    /// State used by control decisions, independent of a retained sidebar badge.
+    pub fn live_state(&self) -> Option<AgentState> {
+        self.live_status.or(self.status)
+    }
+}
+
+/// Functional state from a status/show entry, including replies from older hosts.
+/// A present but malformed live state must not fall back to a finished badge.
+pub fn reported_live_state(info: &serde_json::Value) -> Option<AgentState> {
+    let state = info
+        .get("live_status")
+        .filter(|state| !state.is_null())
+        .or_else(|| info.get("status"))?;
+    serde_json::from_value(state.clone()).ok()
 }
 
 /// An instance's short id, as tmux session names and `muxel ctl` show it.
@@ -500,14 +586,7 @@ pub fn short_id(id: Uuid) -> String {
 
 /// The latest lifecycle transition an agent has recorded (unix ms).
 pub fn status_since(activity: &AgentActivity) -> Option<i64> {
-    [
-        activity.work_started_at,
-        activity.completed_at,
-        activity.blocked_at,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    activity.last_work_at()
 }
 
 /// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has
@@ -547,6 +626,7 @@ pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
 pub struct AgentEntry<'a> {
     pub id: Uuid,
     pub name: &'a str,
+    pub label: Option<&'a str>,
     pub project: &'a str,
 }
 
@@ -577,7 +657,8 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits), a name, or `project/name` when names repeat.
+/// four or more hex digits), a display name or retained label, or `project/name`
+/// when names repeat. Each pane contributes at most one candidate.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -606,7 +687,11 @@ pub fn resolve_agent(
     };
     let hits: Vec<&AgentEntry> = agents
         .iter()
-        .filter(|a| normalize(a.name) == name)
+        .filter(|a| {
+            normalize(a.name) == name
+                || a.label
+                    .is_some_and(|label| !label.trim().is_empty() && normalize(label) == name)
+        })
         .filter(|a| project.as_ref().is_none_or(|p| normalize(a.project) == *p))
         .collect();
     match hits.as_slice() {
@@ -1251,6 +1336,8 @@ pub enum CliCommand {
         agent: String,
         timeout_secs: u64,
         full: bool,
+        /// Stop when the turn ends, even with background work still running.
+        turn: bool,
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
@@ -1266,20 +1353,23 @@ usage: muxel ctl <command> [args]
 
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
-  new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+  new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
               [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
                                  --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
+  focus AGENT                    open a pane; start it if dormant
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal
-  wait AGENT [--timeout SECS] [--full]
-                                 wait for the turn to end, then show it
+  wait AGENT [--timeout SECS] [--full] [--turn]
+                                 wait for the agent to finish, then show it;
+                                 --turn stops at the turn's end, even with
+                                 background work still running
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
@@ -1332,7 +1422,8 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
+Open a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1340,6 +1431,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "status" => {
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
         }
+        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, starting it if dormant.",
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
         }
@@ -1350,7 +1442,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
@@ -1376,6 +1468,7 @@ fn unknown_command_error(command: &str) -> String {
             "new",
             "new-status",
             "status",
+            "focus",
             "show",
             "screen",
             "send",
@@ -1454,6 +1547,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
+    let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
     let mut lines: Option<usize> = None;
@@ -1466,6 +1560,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 break;
             }
             "--full" => full = true,
+            "--turn" => turn = true,
             "--force" => force = true,
             "--launch-id" => {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
@@ -1510,6 +1605,12 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             at_most(1)?;
             Command::Status {
                 agent: words.first().cloned(),
+            }
+        }
+        "focus" => {
+            at_most(1)?;
+            Command::Focus {
+                agent: agent(&words)?,
             }
         }
         "show" => {
@@ -1569,6 +1670,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 agent: agent(&words)?,
                 timeout_secs: timeout.unwrap_or(WAIT_TIMEOUT_SECS),
                 full,
+                turn,
             });
         }
         "skill" => return Ok(CliCommand::Skill),
@@ -1707,9 +1809,17 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
-- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
-  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+- `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
+  starting it through normal restore if dormant. This changes keyboard focus.
+- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
+  `--name` supplies a starting label. A useful agent title received after launch
+  replaces it on screen. The label remains a resolver alias and a `label` field
+  in `panes`/`status`; the row tooltip keeps it visible. `--name-fixed` instead
+  keeps a sticky name, like an inline rename. The two options are exclusive.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
@@ -1799,7 +1909,17 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   Remote projects are currently refused.
   `new` opens terminal panes; browser presets, including a browser default, are
   not supported yet and receive a refusal.
-- `muxel ctl status [AGENT]` - one agent's status, or every agent's.
+- `muxel ctl status [AGENT]` - one agent's status, or every agent's. Terminal
+  entries in `status`, `panes` and `show.agent` include `source`, optional
+  current `activity`, and `blocked_on` (`permission`, `question`, or `auth`)
+  when a program report identifies why it is blocked. `source` describes the
+  current status evidence: `program`, `hook`, `title`, `screen`, `bell`,
+  `output`, `quiet`, or `process`. `settling` means the evidence cannot yet be
+  attributed to this conversation; its status stays `working`.
+  `status` matches the sidebar, including a completed turn held over Idle.
+  When that badge differs from live facts, `live_status` carries the state used
+  by `wait` and send admission. Attending a completed pane marks its notification
+  read without erasing Done. `activity` is absent when no current source supplies it.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
   blocked, the `question` it's asking with its numbered `options`. `controller`
@@ -1850,8 +1970,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   and an added blank cursor line proving that the first Enter was consumed;
   a pending Enter never authorizes another.
   An unconfirmed receipt requires inspecting `screen` before more input.
-- `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints.
+- `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
+  turn and any background work it left have finished (or it blocks on a question,
+  or exits), then print what `show` prints. A turn that ends beside a running shell
+  or subagent usually wakes when that work ends, so plain `wait` returns the reply
+  after it. `--turn` stops at the turn's end instead. Either way `wait.background`
+  lists anything still running.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
   our Enter. Codex may receive one extra Enter only while its exact task remains
   on one exact ASCII row in its live idle editor, with no new user row. Wrapped
@@ -1916,6 +2040,12 @@ hosts ignore this caller ID, so check the target when driving one.
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
   start. `not_running` - the pane hasn't been started this session; the user has
   to open it in muxel.
+
+Old local sessions may be dormant: `status` and `panes` report
+`status: "not_running", not_running_reason: "dormant"`. `show` includes this
+reason; `screen`, `send`, `keys`, and `answer` refuse with `not_running` and
+`reason: "dormant"`, even with `--force`. `focus` opens and resumes the session.
+An approved `new --focus` also leaves other dormant sessions asleep.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to
@@ -2322,11 +2452,33 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_shows_its_launch_id_only_while_it_runs() {
+    fn cached_branch_is_additive_and_separate_from_worktree_creation_branch() {
+        let mut old_response = serde_json::json!({
+            "id": "11111111", "uuid": id(7), "name": "shell",
+            "project": "repo", "project_id": "22222222", "kind": "terminal",
+            "preset": "Shell", "is_agent": false, "awaiting_reply": false,
+            "focused": false, "remote": false, "cwd": "/repo/env",
+            "worktree_branch": "original-at-creation"
+        });
+        let old: AgentInfo = serde_json::from_value(old_response.clone()).unwrap();
+        assert_eq!(old.branch, None);
+        assert!(serde_json::to_value(old).unwrap().get("branch").is_none());
+        old_response["branch"] = serde_json::json!("checked-out-now");
+        let current: AgentInfo = serde_json::from_value(old_response).unwrap();
+        assert_eq!(current.branch.as_deref(), Some("checked-out-now"));
+        assert_eq!(
+            current.worktree_branch.as_deref(),
+            Some("original-at-creation")
+        );
+    }
+
+    #[test]
+    fn agent_info_optional_launch_id_and_label_round_trip() {
         let mut info = AgentInfo {
             id: short_id(id(7)),
             uuid: id(7),
             name: "Claude".into(),
+            label: None,
             project: "p".into(),
             project_id: "11111111".into(),
             kind: "terminal".into(),
@@ -2335,22 +2487,50 @@ mod tests {
             model: None,
             is_agent: true,
             status: Some(AgentState::NotRunning),
+            live_status: None,
+            source: None,
+            activity: None,
+            blocked_on: None,
+            not_running_reason: None,
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            background: None,
+            turn_over: false,
             startup_error: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,
             cwd: None,
+            branch: None,
             remote: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("launch_id").is_none(), "{json}");
+        for key in ["source", "activity", "blocked_on", "live_status"] {
+            assert!(json.get(key).is_none(), "{json}");
+        }
+        assert!(
+            json.get("label").is_none(),
+            "unnamed replies keep their old shape"
+        );
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+        info.label = Some("starting label".into());
         info.status = Some(AgentState::Idle);
         info.launch_id = Some(id(42));
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["launch_id"], id(42).to_string());
+        assert_eq!(json["label"], "starting label");
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+        info.status = Some(AgentState::Blocked);
+        info.live_status = None;
+        info.source = Some(super::AgentStatusSource::Program);
+        info.activity = Some("Reading files · 42%".into());
+        info.blocked_on = Some(super::AgentBlockedOn::Question);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["source"], "program");
+        assert_eq!(json["blocked_on"], "question");
+        assert_eq!(json["activity"], "Reading files · 42%");
         assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
     }
 
@@ -2421,16 +2601,19 @@ mod tests {
             AgentEntry {
                 id: a,
                 name: "✳ Claude",
+                label: None,
                 project: "muxel",
             },
             AgentEntry {
                 id: b,
                 name: "Codex",
+                label: None,
                 project: "muxel",
             },
             AgentEntry {
                 id: c,
                 name: "Codex",
+                label: None,
                 project: "Other Repo",
             },
         ];
@@ -2747,6 +2930,14 @@ Steps:
     fn cli_parses_commands_flags_and_literal_text() {
         assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
         assert_eq!(
+            parse_cli(&words(&["focus", "old-session"])),
+            Ok(CliCommand::Request(Command::Focus {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["focus"])).is_err());
+        assert!(parse_cli(&words(&["focus", "a", "b"])).is_err());
+        assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
         );
@@ -2780,7 +2971,17 @@ Steps:
             Ok(CliCommand::Wait {
                 agent: "a1b2".into(),
                 timeout_secs: 30,
-                full: false
+                full: false,
+                turn: false
+            })
+        );
+        assert_eq!(
+            parse_cli(&words(&["wait", "a1b2", "--turn"])),
+            Ok(CliCommand::Wait {
+                agent: "a1b2".into(),
+                timeout_secs: crate::control::WAIT_TIMEOUT_SECS,
+                full: false,
+                turn: true
             })
         );
         assert_eq!(
