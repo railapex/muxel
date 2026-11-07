@@ -1080,6 +1080,7 @@ mod imp {
                 )
                 .child(
                     Button::new("browser-back")
+                        .accessibility_id("muxel.browser-back")
                         .ghost()
                         .xsmall()
                         .icon(IconName::ArrowLeft)
@@ -1088,6 +1089,7 @@ mod imp {
                 )
                 .child(
                     Button::new("browser-forward")
+                        .accessibility_id("muxel.browser-forward")
                         .ghost()
                         .xsmall()
                         .icon(IconName::ArrowRight)
@@ -1096,6 +1098,7 @@ mod imp {
                 )
                 .child(
                     Button::new("browser-reload")
+                        .accessibility_id("muxel.browser-reload")
                         .ghost()
                         .xsmall()
                         .icon(Icon::empty().path("icons/refresh.svg"))
@@ -1104,6 +1107,7 @@ mod imp {
                 )
                 .child(
                     Button::new("browser-open-external")
+                        .accessibility_id("muxel.browser-open-external")
                         .ghost()
                         .xsmall()
                         .icon(IconName::ExternalLink)
@@ -1117,7 +1121,11 @@ mod imp {
                     div()
                         .flex_1()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(Input::new(&self.address)),
+                        .child(
+                            Input::new(&self.address)
+                                .accessibility_id("muxel.input.browser-address")
+                                .aria_label(t("Address")),
+                        ),
                 );
 
             let content: AnyElement = match &self.webview {
@@ -1247,6 +1255,7 @@ mod imp {
                 .child(t("On Linux the built-in browser opens as its own window."))
                 .child(
                     Button::new("browser-open-window")
+                        .accessibility_id("muxel.browser-open-window")
                         .primary()
                         .label(t("Open in browser window"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {

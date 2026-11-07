@@ -26,6 +26,7 @@ type MouseDownHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 #[derive(IntoElement)]
 pub(super) struct StripIconButton {
     id: ElementId,
+    accessibility_id: Option<SharedString>,
     icon: Icon,
     tooltip: SharedString,
     on_click: Option<ClickHandler>,
@@ -40,11 +41,18 @@ impl StripIconButton {
     ) -> Self {
         Self {
             id: id.into(),
+            accessibility_id: None,
             icon: icon.into(),
             tooltip: tooltip.into(),
             on_click: None,
             on_right_mouse_down: None,
         }
+    }
+
+    /// The stable identifier exposed to accessibility clients, as on `Button`.
+    pub(super) fn accessibility_id(mut self, id: impl Into<SharedString>) -> Self {
+        self.accessibility_id = Some(id.into());
+        self
     }
 
     pub(super) fn on_click(
@@ -110,6 +118,9 @@ impl RenderOnce for StripIconButton {
         // Plain `if`s rather than FluentBuilder's `when`, so this file needn't
         // import a trait that `super::*` brings in on some GPUI pins and not
         // on others (a redundant import fails clippy).
+        if let Some(id) = self.accessibility_id {
+            button = button.accessibility_id(id);
+        }
         if let Some(on_click) = self.on_click {
             button = button.on_click(move |event, window, cx| on_click(event, window, cx));
         }

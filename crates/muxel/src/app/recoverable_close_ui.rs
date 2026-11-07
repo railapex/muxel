@@ -127,6 +127,9 @@ impl MuxelApp {
     fn render_close_check(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("recoverable-close-checking")
+            .role(Role::Status)
+            .accessibility_id("muxel.close-check")
+            .aria_label(t("Checking before close…"))
             .flex()
             .items_center()
             .gap_1()
@@ -139,6 +142,7 @@ impl MuxelApp {
             .child(div().text_xs().child(t("Checking before close…")))
             .child(
                 Button::new("close-check-cancel")
+                    .accessibility_id("muxel.close-check-cancel")
                     .ghost()
                     .xsmall()
                     .label(t("Cancel"))
@@ -185,6 +189,9 @@ impl MuxelApp {
             .any(|group| group.needs_decision && !group.undoing);
         div()
             .id("recoverable-close-chip")
+            .role(Role::Group)
+            .accessibility_id("muxel.pending-terminal-close-control")
+            .aria_label(label.clone())
             .flex()
             .items_center()
             .gap_1()
@@ -219,6 +226,7 @@ impl MuxelApp {
             )
             .children(decision.then(|| {
                 Button::new("close-chip-finalize")
+                    .accessibility_id("muxel.finish-terminal-close")
                     .xsmall()
                     .danger()
                     .label(t("Close"))
@@ -226,6 +234,7 @@ impl MuxelApp {
             }))
             .child(
                 Button::new("close-chip-undo")
+                    .accessibility_id("muxel.undo-terminal-close")
                     .ghost()
                     .xsmall()
                     .label(button)
@@ -241,6 +250,7 @@ impl MuxelApp {
             )
             .children(multiple.then(|| {
                 Button::new("close-chip-list")
+                    .accessibility_id("muxel.close-list-toggle")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronDown)
@@ -388,6 +398,7 @@ impl MuxelApp {
                     .child(
                         div().flex().justify_end().child(
                             Button::new("close-list-dismiss")
+                                .accessibility_id("muxel.close-list-dismiss")
                                 .ghost()
                                 .label(t("Done"))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -502,6 +513,7 @@ impl PopoutView {
                                 .pt_2()
                                 .child(
                                     Button::new("popout-close-cancel")
+                                        .accessibility_id("muxel.popout-close-cancel")
                                         .ghost()
                                         .label(t("Cancel"))
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -510,6 +522,7 @@ impl PopoutView {
                                 )
                                 .children(alternate.map(|label| {
                                     Button::new("popout-close-alternative")
+                                        .accessibility_id("muxel.popout-close-alternate")
                                         .ghost()
                                         .label(label)
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -527,6 +540,7 @@ impl PopoutView {
                                 }))
                                 .child(
                                     Button::new("popout-close-ok")
+                                        .accessibility_id("muxel.popout-close-ok")
                                         .danger()
                                         .label(pending.confirm_label)
                                         .on_click(cx.listener(|this, _, window, cx| {

@@ -719,7 +719,13 @@ impl Render for EditorView {
             } else {
                 self.config.font_family.clone().into()
             };
-            Input::new(&self.input)
+            // Screen readers name the editor after its file.
+            let input = Input::new(&self.input);
+            let input = match self.path.as_deref().and_then(Path::file_name) {
+                Some(name) => input.aria_label(name.to_string_lossy().into_owned()),
+                None => input,
+            };
+            input
                 .h_full()
                 .bordered(false)
                 .focus_bordered(false)
