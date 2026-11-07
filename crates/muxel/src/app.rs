@@ -115,6 +115,7 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
 use restart_guard::{PendingRestarts, RemoteRestartCompletion, RestartLease};
+use status_badge::status_tag;
 use strip_button::StripIconButton;
 
 /// Capture tmux eligibility before removing a pane's metadata. An absent
@@ -791,6 +792,160 @@ fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     }
 }
 
+/// Opacity of a Done icon once its pane has been focused: still green, but faint
+/// enough that unread finishes stand out.
+const READ_DONE_OPACITY: f32 = 0.45;
+
+/// Whether a shown Done is one the user has already seen. It mirrors attention
+/// navigation: a Done that `attention_rank` would still visit is unread.
+fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
+    status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
+}
+
+/// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
+fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &App) -> Hsla {
+    let color = status_hsla(status, cx);
+    if done_is_read(status, activity) {
+        color.opacity(READ_DONE_OPACITY)
+    } else {
+        color
+    }
+}
+
+#[cfg(test)]
+mod status_pill_contrast_tests {
+    use super::READ_DONE_OPACITY;
+    use super::status_badge::{outline_colors, pill_colors};
+    use crate::theme;
+    use gpui::{Hsla, Rgba, TestAppContext};
+    use gpui_component::{Theme, ThemeRegistry};
+    use muxel_terminal::AgentStatus;
+
+    fn luminance(c: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// `fg` composited over an opaque `bg`.
+    fn over(fg: Hsla, bg: Hsla) -> Rgba {
+        let (f, b) = (fg.to_rgb(), bg.to_rgb());
+        let a = f.a;
+        Rgba {
+            r: f.r * a + b.r * (1.0 - a),
+            g: f.g * a + b.g * (1.0 - a),
+            b: f.b * a + b.b * (1.0 - a),
+            a: 1.0,
+        }
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    fn hex(c: Rgba) -> String {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+    }
+
+    /// Every bundled theme keeps status pills legible. Each filled pill's label
+    /// reaches WCAG's 4.5:1 against its fill. A read finish stays visible: the
+    /// outline pill's label stays at least as legible as the theme's weakest
+    /// green text, and the dimmed icon stays visible yet fainter than an unread
+    /// one. Set `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors
+    /// for review.
+    #[test]
+    fn status_pills_stay_legible_in_every_bundled_theme() {
+        let cx = TestAppContext::single();
+        let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::register_bundled_themes(cx);
+            let configs: Vec<_> = ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .cloned()
+                .collect();
+            assert!(!configs.is_empty());
+            let mut rows = Vec::new();
+            let mut unreadable = Vec::new();
+            for config in configs {
+                Theme::global_mut(cx).apply_config(&config);
+                let t = Theme::global(cx);
+                let bg = over(t.sidebar, t.background);
+                let on_bg = |c: Hsla| over(c, bg.into());
+                let name = &config.name;
+                // A filled pill's fill and label as they land on the sidebar.
+                let pill = |status| {
+                    let (fill, label, _) = pill_colors(status, t);
+                    let fill = on_bg(fill);
+                    (fill, over(label, fill.into()))
+                };
+                for status in [
+                    AgentStatus::Working,
+                    AgentStatus::Idle,
+                    AgentStatus::Blocked,
+                    AgentStatus::Done,
+                ] {
+                    let (fill, label) = pill(status);
+                    let ratio = contrast(label, fill);
+                    if ratio < 4.5 {
+                        unreadable.push(format!("{name}: {status:?} pill label {ratio:.2}:1"));
+                    }
+                }
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let (filled, filled_text) = pill(AgentStatus::Done);
+                // The read pill has no fill: its label sits on the sidebar.
+                let read_label = on_bg(outline_colors(AgentStatus::Done, t).1);
+                let (label, read) = (contrast(read_label, bg), contrast(read_icon, bg));
+                assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
+                assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
+                assert!(label > read, "{name}: read icon is not fainter than unread");
+                rows.push(format!(
+                    concat!(
+                        r#"{{"name":"{}","bg":"{}","fg":"{}","muted":"{}","success":"{}","#,
+                        r#""successFg":"{}","readIcon":"{}","secondary":"{}","secondaryFg":"{}","#,
+                        r#""border":"{}","outline":{:.2},"filled":{:.2},"readIconC":{:.2}}}"#
+                    ),
+                    name,
+                    hex(bg),
+                    hex(on_bg(t.sidebar_foreground)),
+                    hex(on_bg(t.muted_foreground)),
+                    hex(filled),
+                    hex(filled_text),
+                    hex(read_icon),
+                    hex(on_bg(t.secondary)),
+                    hex(over(t.secondary_foreground, on_bg(t.secondary).into())),
+                    hex(on_bg(t.border)),
+                    label,
+                    contrast(filled_text, filled),
+                    read,
+                ));
+            }
+            if let Some(path) = &swatches {
+                std::fs::write(
+                    path,
+                    format!(
+                        "[{}]",
+                        rows.join(
+                            ",
+"
+                        )
+                    ),
+                )
+                .unwrap();
+            }
+            assert!(unreadable.is_empty(), "{}", unreadable.join("\n"));
+        });
+    }
+}
+
 fn activity_state(status: AgentStatus) -> AgentActivityState {
     match status {
         AgentStatus::Working => AgentActivityState::Working,
@@ -916,8 +1071,9 @@ fn attend_agent_activity(
 mod restored_activity_tests {
     use super::{
         AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
+        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample,
+        unprompted_report_working,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1224,6 +1380,26 @@ mod restored_activity_tests {
             blocked.activity.current_state(),
             Some(AgentActivityState::Idle)
         );
+    }
+
+    #[test]
+    fn only_an_attended_done_reads_as_read() {
+        let read = attended_completion();
+        assert!(done_is_read(AgentStatus::Done, Some(&read.activity)));
+
+        // A finish after the last focus is unread again.
+        let mut unread = attended_completion();
+        unread.activity.last_attended_at = Some(100);
+        assert!(!done_is_read(AgentStatus::Done, Some(&unread.activity)));
+
+        // Runtime Done ahead of the durable record, or no record, is unread.
+        let fresh = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        assert!(!done_is_read(AgentStatus::Done, Some(&fresh.activity)));
+        assert!(!done_is_read(AgentStatus::Done, None));
+
+        // Other states are never dimmed.
+        assert!(!done_is_read(AgentStatus::Idle, Some(&read.activity)));
+        assert!(!done_is_read(AgentStatus::Working, Some(&read.activity)));
     }
 
     #[test]
@@ -5788,7 +5964,6 @@ struct TerminalSpawnMeta {
 type SessionResume = (Vec<String>, Option<PathBuf>);
 
 pub struct MuxelApp {
-    badge_clock: status_badge::BadgeClock,
     closing: HashMap<Uuid, HeldClose>,
     close_groups: Vec<CloseGroup>,
     /// Every pane closed while a held close's snapshot still holds it, held or
@@ -6033,15 +6208,10 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
-    /// Sampled lifecycle presentation. Done tracks completion identity; only
-    /// visible badges schedule its age redraws.
-    last_activity_keys: HashMap<
-        Uuid,
-        (
-            muxel_core::status_badge::SampledActivityKey,
-            Option<muxel_core::control::BackgroundWork>,
-        ),
-    >,
+    /// Last rendered lifecycle copy per instance, with the background work shown
+    /// beside it. Age labels change at coarse minute/hour/day boundaries without
+    /// changing the underlying status.
+    last_activity_labels: HashMap<Uuid, (String, Option<muxel_core::control::BackgroundWork>)>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
     /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
@@ -6577,7 +6747,6 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
 /// plus the pane content. The title-bar X and native close hook route through
 /// the main app's recoverable-close rule. The Dock button re-docks it directly.
 struct PopoutView {
-    badge_clock: status_badge::BadgeClock,
     view: PaneView,
     iid: Uuid,
     close_confirm: Option<PendingConfirm>,
@@ -6597,10 +6766,6 @@ struct PopoutAppState {
     present: bool,
     held: bool,
     confirm: Option<PopoutConfirmState>,
-    /// The lifecycle badge's inputs. Render must not read the app: a popout
-    /// first renders while the app that opens it is still being updated.
-    activity: Option<AgentActivity>,
-    restoring: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -6627,8 +6792,6 @@ impl PopoutAppState {
             present: app.popouts.contains_key(&iid),
             held: app.closing.contains_key(&iid),
             confirm,
-            activity: app.workspace.instance(iid).map(|i| i.activity.clone()),
-            restoring: app.restoring_activity.contains(&iid),
         }
     }
 }
@@ -6725,7 +6888,6 @@ impl PopoutView {
         Self {
             view,
             iid,
-            badge_clock: status_badge::BadgeClock::default(),
             close_confirm: None,
             app_state: None,
             profile_status,
@@ -6773,7 +6935,6 @@ struct SecondaryWindow {
 /// area for one project. All state lives in [`MuxelApp`]; render delegates into
 /// it so every existing `cx.listener` handler works unchanged in this window.
 struct WorkspaceWindow {
-    badge_clock: status_badge::BadgeClock,
     app: WeakEntity<MuxelApp>,
     pid: Uuid,
     display_uuid: Uuid,
@@ -6860,7 +7021,6 @@ impl WorkspaceWindow {
             app,
             pid,
             display_uuid,
-            badge_clock: status_badge::BadgeClock::default(),
             focus_handle: cx.focus_handle(),
             bounds_save_task: None,
             shown: DisplayEpoch::default(),
@@ -6877,21 +7037,12 @@ impl Render for WorkspaceWindow {
             let focus = self.focus_handle.clone();
             let shown = self.shown.clone();
             app.update(cx, |app, cx| {
-                // Rendering helpers share MuxelApp, while wake ownership follows
-                // the actual window. Elements capture the scoped clock clone.
-                let main_clock = std::mem::replace(&mut app.badge_clock, self.badge_clock.clone());
-                let content = app.render_secondary_content(pid, &focus, &shown, window, cx);
-                app.badge_clock = main_clock;
-                content
+                app.render_secondary_content(pid, &focus, &shown, window, cx)
             })
         } else {
             div().into_any_element()
         };
-        ui_profile::finish_render(
-            ui_profile::RenderView::Workspace,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Workspace, _render, root)
     }
 }
 
@@ -7288,30 +7439,6 @@ impl Render for PopoutView {
         self.shown.advance();
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
-        let badge = if let PaneView::Terminal(terminal) = &self.view {
-            let activity = self.app_state.as_ref().and_then(|s| s.activity.as_ref());
-            let restoring = self.app_state.as_ref().is_some_and(|s| s.restoring);
-            let status = shown_terminal_activity_status(terminal.read(cx), activity, restoring);
-            Some(
-                self.badge_clock.tag(
-                    status,
-                    activity
-                        .map(|activity| {
-                            localized_activity_label(
-                                status,
-                                activity,
-                                terminal.read(cx).runtime_snapshot().background,
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                        })
-                        .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                    activity.and_then(|activity| activity.completed_at),
-                    cx,
-                ),
-            )
-        } else {
-            None
-        };
         let has_close_confirm = self.central_close_confirm(cx).is_some();
         // A native webview child draws above all gpui content, so it has to go
         // away while the close confirmation sits on top of it.
@@ -7397,7 +7524,6 @@ impl Render for PopoutView {
                                     .font_semibold()
                                     .child(title),
                             )
-                            .children(badge)
                             .child(
                                 div()
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -7427,11 +7553,7 @@ impl Render for PopoutView {
             )
             .child(div().flex_1().min_h_0().child(self.content(cx)))
             .children(self.render_central_close_confirm(cx));
-        ui_profile::finish_render(
-            ui_profile::RenderView::Popout,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Popout, _render, root)
     }
 }
 
@@ -8605,7 +8727,7 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
-            last_activity_keys: HashMap::new(),
+            last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
             auto: HashMap::new(),
@@ -8639,7 +8761,6 @@ impl MuxelApp {
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
-            badge_clock: status_badge::BadgeClock::default(),
             _status_timer: status_timer,
             _loop_timer: loop_timer,
             _diff_timer: diff_timer,
@@ -14631,14 +14752,10 @@ impl MuxelApp {
             if let Some(instance) = self.workspace.instance(iid) {
                 // What runs beside the turn is part of the row too.
                 let key = (
-                    muxel_core::status_badge::sampled_activity_key(
-                        activity_state(status),
-                        &instance.activity,
-                        now_epoch,
-                    ),
+                    agent_activity_label(activity_state(status), &instance.activity, now_epoch),
                     runtime.background,
                 );
-                let previous = self.last_activity_keys.insert(iid, key.clone());
+                let previous = self.last_activity_labels.insert(iid, key.clone());
                 dirty |= previous.as_ref() != Some(&key);
             }
             // Attendance can clear unread without changing the displayed status.
@@ -14984,7 +15101,7 @@ impl MuxelApp {
         self.last_status.retain(|iid, _| {
             terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
         });
-        self.last_activity_keys.retain(|iid, _| {
+        self.last_activity_labels.retain(|iid, _| {
             terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
         });
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
@@ -23459,14 +23576,10 @@ impl MuxelApp {
             if let Some(instance) = self.workspace.instance(iid) {
                 // What runs beside the turn is part of the row too.
                 let key = (
-                    muxel_core::status_badge::sampled_activity_key(
-                        activity_state(sample.status),
-                        &instance.activity,
-                        now,
-                    ),
+                    agent_activity_label(activity_state(sample.status), &instance.activity, now),
                     sample.runtime.background,
                 );
-                let previous = self.last_activity_keys.insert(iid, key.clone());
+                let previous = self.last_activity_labels.insert(iid, key.clone());
                 updates.redraw |= previous.as_ref() != Some(&key);
             }
             updates.redraw |= effect.changed;
@@ -26223,19 +26336,6 @@ impl MuxelApp {
                                 px(12.0),
                                 cx.theme().muted_foreground,
                             ))
-                            .children(self.terminals.get(&tab).map(|terminal| {
-                                let instance = self.workspace.instance(tab);
-                                let status = shown_terminal_status(
-                                    terminal.read(cx),
-                                    instance,
-                                    self.restoring_activity.contains(&tab),
-                                );
-                                self.badge_clock.dot(
-                                    status,
-                                    instance.and_then(|i| i.activity.completed_at),
-                                    cx,
-                                )
-                            }))
                             // A tab in a worktree always shows its color dot.
                             .children(
                                 tab_wt_colors[i]
@@ -26274,14 +26374,9 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_default();
-                                let completed_at =
-                                    activity.and_then(|activity| activity.completed_at);
-                                div().flex_none().child(self.badge_clock.tag(
-                                    status,
-                                    format!("{age} · {}", t("dormant")),
-                                    completed_at,
-                                    cx,
-                                ))
+                                div()
+                                    .flex_none()
+                                    .child(status_tag(status, format!("{age} · {}", t("dormant"))))
                             }))
                             // A tab being read aloud says so — even when another tab
                             // of its pane is showing — and pauses or resumes on click.
@@ -26965,6 +27060,9 @@ impl MuxelApp {
                 let status = self.terminals.get(&iid).map(|v| {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
+                let color = status
+                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
+                    .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
                         .flex()
@@ -26981,13 +27079,7 @@ impl MuxelApp {
                                 this.focus_instance(iid, window, cx);
                             }),
                         )
-                        .child(self.badge_clock.icon(
-                            program.as_deref(),
-                            px(15.0),
-                            status.unwrap_or(AgentStatus::Idle),
-                            inst.and_then(|i| i.activity.completed_at),
-                            cx,
-                        ))
+                        .child(agent_icon(program.as_deref(), px(15.0), color))
                         .child(
                             div()
                                 .text_xs()
@@ -26995,24 +27087,24 @@ impl MuxelApp {
                                 .child(title),
                         )
                         .child(
-                            self.badge_clock.tag(
-                                status.unwrap_or(AgentStatus::Idle),
-                                status
-                                    .zip(inst)
-                                    .map(|(status, instance)| {
-                                        localized_activity_label(
-                                            status,
-                                            &instance.activity,
-                                            self.terminal_view(iid).and_then(|view| {
-                                                view.read(cx).runtime_snapshot().background
-                                            }),
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| status_label(status).to_string()),
-                                inst.and_then(|i| i.activity.completed_at),
-                                cx,
-                            ),
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    status
+                                        .zip(inst)
+                                        .map(|(status, instance)| {
+                                            localized_activity_label(
+                                                status,
+                                                &instance.activity,
+                                                self.terminal_view(iid).and_then(|view| {
+                                                    view.read(cx).runtime_snapshot().background
+                                                }),
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|| status_label(status).to_string()),
+                                ),
                         ),
                 );
             }
@@ -27288,25 +27380,7 @@ impl MuxelApp {
         // Newest first.
         for n in visible() {
             let nid = n.id;
-            let dot = if matches!(n.kind, NotifKind::Done | NotifKind::Blocked) {
-                self.badge_clock.dot(
-                    if n.kind == NotifKind::Done {
-                        AgentStatus::Done
-                    } else {
-                        AgentStatus::Blocked
-                    },
-                    n.instance
-                        .and_then(|iid| self.workspace.instance(iid))
-                        .and_then(|i| i.activity.completed_at),
-                    cx,
-                )
-            } else {
-                div()
-                    .size(px(8.0))
-                    .rounded_full()
-                    .bg(n.kind.dot(cx))
-                    .into_any_element()
-            };
+            let dot = n.kind.dot(cx);
             let title: SharedString = n.title.clone().into();
             let sub: SharedString = n.subtitle.clone().into();
             section = section.child(
@@ -27328,7 +27402,7 @@ impl MuxelApp {
                             this.open_notification(nid, window, cx)
                         }),
                     )
-                    .child(div().flex_none().child(dot))
+                    .child(div().size(px(8.0)).rounded_full().flex_none().bg(dot))
                     .child(
                         div()
                             .flex_1()
@@ -28653,6 +28727,7 @@ impl MuxelApp {
                     let app_title = agent_title.unwrap_or(meta);
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -28727,18 +28802,18 @@ impl MuxelApp {
                         } else {
                             cx.theme().sidebar
                         })
-                        .child(self.badge_clock.icon(
+                        .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            if loading {
-                                AgentStatus::Working
-                            } else if stopped {
-                                AgentStatus::Idle
-                            } else {
-                                status
-                            },
-                            inst.and_then(|i| i.activity.completed_at),
-                            cx,
+                            pane_status_hsla(
+                                if loading {
+                                    AgentStatus::Working
+                                } else {
+                                    status
+                                },
+                                inst.map(|i| &i.activity),
+                                cx,
+                            ),
                         ))
                         .children(
                             (sort == SidebarSort::RecentWork && inst.is_some_and(|i| i.pinned))
@@ -28803,21 +28878,11 @@ impl MuxelApp {
                     } else {
                         let dormant = self.is_dormant(iid);
                         let badge = if loading {
-                            self.badge_clock.tag(
-                                AgentStatus::Working,
-                                t("loading").to_string(),
-                                None,
-                                cx,
-                            )
+                            status_tag(AgentStatus::Working, t("loading").to_string())
                         } else if stopped {
-                            self.badge_clock.tag(
-                                AgentStatus::Idle,
-                                t("stopped").to_string(),
-                                None,
-                                cx,
-                            )
+                            status_tag(AgentStatus::Idle, t("stopped").to_string())
                         } else {
-                            self.badge_clock.tag(
+                            let tag = status_tag(
                                 status,
                                 inst.map(|instance| {
                                     let label = localized_activity_label(
@@ -28835,9 +28900,10 @@ impl MuxelApp {
                                     }
                                 })
                                 .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                inst.and_then(|instance| instance.activity.completed_at),
-                                cx,
-                            )
+                            );
+                            // A read finish keeps its green as an outline, so
+                            // the label stays legible on the sidebar.
+                            if read_done { tag.outline() } else { tag }
                         };
                         let details = div()
                             .flex_1()
@@ -36274,11 +36340,7 @@ impl Render for MuxelApp {
                         .child(self.render_terms_screen(cx)),
                 )
                 .into_any_element();
-            return ui_profile::finish_render(
-                ui_profile::RenderView::Main,
-                _render,
-                self.badge_clock.frame(root),
-            );
+            return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
         }
         if self.show_workspace_selector {
             let root = div()
@@ -36300,11 +36362,7 @@ impl Render for MuxelApp {
                         ),
                 )
                 .into_any_element();
-            return ui_profile::finish_render(
-                ui_profile::RenderView::Main,
-                _render,
-                self.badge_clock.frame(root),
-            );
+            return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
         }
         // Rebuild any editors/browsers awaiting re-dock (needs the main window).
         let prep = ui_profile::region_scope(ui_profile::Region::Prep);
@@ -36756,11 +36814,7 @@ impl Render for MuxelApp {
             }))
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element();
-        ui_profile::finish_render(
-            ui_profile::RenderView::Main,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Main, _render, root)
     }
 }
 

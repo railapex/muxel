@@ -60,7 +60,7 @@ pub struct SwitchTheme(pub SharedString);
 /// The bundled theme JSON files (vendored from gpui-component's `themes/`).
 #[derive(RustEmbed)]
 #[folder = "assets/themes"]
-pub(crate) struct ThemeAssets;
+struct ThemeAssets;
 
 /// Load all bundled theme sets into the global registry.
 pub fn register_bundled_themes(cx: &mut App) {

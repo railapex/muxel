@@ -1,27 +1,5 @@
 # Agent lifecycle, attention, and recency
 
-Lifecycle badges use opaque status-coloured backgrounds and choose a readable
-foreground against the resulting colour (at least WCAG 4.5:1). A bundled-theme
-population test covers all four statuses and completion fade bands. The label
-stays fully opaque; only the completion colour settles toward the theme's muted
-background. Working, idle, and blocked retain their colour strength.
-
-Completion recency uses the persisted `completed_at` timestamp, also used by
-`done · 2h`: under ten minutes, under one hour, under one day, and older. Unknown
-completion times use the oldest style; future times use the newest style until
-their first boundary. Sidebar and dashboard labels, tab dots, and terminal
-popout labels share this policy. Attendance does not restart the fade.
-
-Each window collects the next band edge only from indicators intersecting the
-current paint clip. One cancellable wake targets the soonest visible boundary;
-painting re-arms it after that boundary. Hidden or clipped indicators contribute
-no deadline, and a window with no eligible visible completion has no fade wake.
-This adds no periodic age redraw and does not change lifecycle sampling.
-The sampler compares Done completion identity rather than its changing coarse
-age label, so an offscreen completion cannot force minute-by-minute redraws.
-Actual completion changes still invalidate the view; other statuses retain
-their existing coarse-label refresh behavior.
-
 ## Reader
 
 Muxel maintainers implementing or reviewing agent-status detection and its sidebar UI.
@@ -294,6 +272,17 @@ out of the sidebar.
 Under narrow width the title truncates first. V1 keeps the full status label. If
 future labels become materially longer, a later responsive rule may drop age text
 while preserving the state word.
+
+The status pill is drawn like a small gpui-component `Tag`, but its colours are
+resolved first. The fill is the theme's status colour (primary, secondary,
+warning or success) made opaque over the sidebar background. The label keeps the
+theme's matching foreground when that reaches WCAG's 4.5:1 against the fill, and
+otherwise uses black or white, whichever contrasts more; one of them always
+reaches 4.5:1. Unlike `Tag`, the pill doesn't fade on hover. A Done the user has
+already read is drawn as an outline instead, the way `Tag::outline` draws it: no
+fill, with the theme's green as label and border. The bundled-theme contrast test
+holds every filled status's label to 4.5:1 and the read outline's label to a
+1.8:1 floor.
 
 ## Research probe
 
