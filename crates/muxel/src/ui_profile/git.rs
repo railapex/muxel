@@ -1,11 +1,14 @@
-//! One record per `git` process muxel starts and waits for, so a poll that keeps
-//! asking the same question shows up in the log. Paths and arguments are logged
-//! only as hashes; the subcommand and a fixed caller label are the only text.
+//! One record per `git` process the integrations helpers start and wait for, so
+//! a poll that keeps asking the same question shows up in the log. Team-library
+//! jobs run git through their own deadline runner and aren't recorded. Paths
+//! and arguments are logged only as hashes; the subcommand and a fixed caller
+//! label are the only text.
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Distinct commands remembered for the `same=` column.
@@ -35,7 +38,15 @@ impl Drop for GitCaller {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Output bytes copied for the writer thread to hash and not yet dropped,
+/// across every queued record.
+static PENDING_OUTPUT: AtomicUsize = AtomicUsize::new(0);
+
+/// Past this much pending output a caller hashes its own, so a burst of large
+/// diffs can't pile copies up in the record queue.
+const MAX_PENDING_OUTPUT: usize = 16 << 20;
+
+#[derive(Debug)]
 pub(super) struct GitLaunch {
     caller: &'static str,
     subcommand: String,
@@ -44,29 +55,89 @@ pub(super) struct GitLaunch {
     elapsed_us: u64,
     /// `None` when git couldn't be started or ended without an exit code.
     status: Option<i32>,
-    output: u64,
+    output: Printed,
+}
+
+/// What a launch printed. A caller copies its stdout and the writer thread
+/// hashes it, so a git read on the UI thread (the diff viewer's) costs a copy
+/// there rather than a byte-at-a-time hash.
+#[derive(Debug)]
+enum Printed {
+    Queued(QueuedOutput),
+    Hashed(u64),
+}
+
+impl Printed {
+    fn new(pending: &'static AtomicUsize, status: Option<i32>, stdout: &[u8]) -> Self {
+        let len = stdout.len();
+        if pending.fetch_add(len, Ordering::Relaxed) + len <= MAX_PENDING_OUTPUT {
+            Printed::Queued(QueuedOutput {
+                bytes: stdout.to_vec(),
+                pending,
+            })
+        } else {
+            pending.fetch_sub(len, Ordering::Relaxed);
+            Printed::Hashed(output_hash(status, stdout))
+        }
+    }
+
+    fn hash(&self, status: Option<i32>) -> u64 {
+        match self {
+            Printed::Queued(output) => output_hash(status, &output.bytes),
+            Printed::Hashed(hash) => *hash,
+        }
+    }
+}
+
+/// Copied stdout, counted in `pending` until dropped: after the writer hashes
+/// it, or with its record when the queue is full.
+#[derive(Debug)]
+struct QueuedOutput {
+    bytes: Vec<u8>,
+    pending: &'static AtomicUsize,
+}
+
+impl Drop for QueuedOutput {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+    }
 }
 
 /// Record a finished `git` run. Called only while profiling is on; anything
-/// that isn't git (a remote read goes through `ssh`) is ignored.
+/// that isn't git (a remote read goes through `ssh`) is ignored. The caller's
+/// thread builds the record (see [`launch_record`]); hashing and formatting
+/// happen on the writer thread.
 pub fn git_launched(cmd: &Command, elapsed: Duration, out: &std::io::Result<Output>) {
-    let Some(mut launch) = describe(cmd) else {
+    let Some(launch) = launch_record(cmd, elapsed, out, &PENDING_OUTPUT) else {
         return;
     };
-    launch.caller = CALLER.with(Cell::get);
-    launch.elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
-    match out {
-        Ok(out) => {
-            launch.status = out.status.code();
-            launch.output = output_hash(launch.status, &out.stdout);
-        }
-        Err(_) => launch.output = output_hash(None, &[]),
-    }
     super::ensure_flusher();
     super::defer_record(super::DeferredRecord::GitLaunch {
         at: SystemTime::now(),
         launch: Box::new(launch),
     });
+}
+
+/// The record of a finished `git` run, as its caller's thread builds it. stdout
+/// is copied for the writer to hash; only output that would take `pending` past
+/// [`MAX_PENDING_OUTPUT`] is hashed here, on the caller.
+fn launch_record(
+    cmd: &Command,
+    elapsed: Duration,
+    out: &std::io::Result<Output>,
+    pending: &'static AtomicUsize,
+) -> Option<GitLaunch> {
+    let mut launch = describe(cmd)?;
+    launch.caller = CALLER.with(Cell::get);
+    launch.elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    match out {
+        Ok(out) => {
+            launch.status = out.status.code();
+            launch.output = Printed::new(pending, launch.status, &out.stdout);
+        }
+        Err(_) => launch.output = Printed::Hashed(output_hash(None, &[])),
+    }
+    Some(launch)
 }
 
 /// The subcommand, directory and argument hash of a git `Command`; the
@@ -103,7 +174,7 @@ fn describe(cmd: &Command) -> Option<GitLaunch> {
         command: command.finish(),
         elapsed_us: 0,
         status: None,
-        output: 0,
+        output: Printed::Hashed(0),
     })
 }
 
@@ -170,23 +241,24 @@ pub(super) struct Repeats {
 }
 
 impl Repeats {
-    /// `Some(true)` when `launch` printed what the same command printed last
-    /// time, `Some(false)` when that changed, `None` the first time.
-    fn observe(&mut self, launch: &GitLaunch) -> Option<bool> {
-        let previous = self.last.insert(launch.command, launch.output);
+    /// `Some(true)` when `command` printed `output` last time too,
+    /// `Some(false)` when that changed, `None` the first time.
+    fn observe(&mut self, command: u64, output: u64) -> Option<bool> {
+        let previous = self.last.insert(command, output);
         if previous.is_none() {
             if self.order.len() == MAX_COMMANDS
                 && let Some(oldest) = self.order.pop_front()
             {
                 self.last.remove(&oldest);
             }
-            self.order.push_back(launch.command);
+            self.order.push_back(command);
         }
-        previous.map(|output| output == launch.output)
+        previous.map(|previous| previous == output)
     }
 
     pub fn line(&mut self, launch: &GitLaunch) -> String {
-        let same = match self.observe(launch) {
+        let output = launch.output.hash(launch.status);
+        let same = match self.observe(launch.command, output) {
             Some(true) => "yes",
             Some(false) => "no",
             None => "first",
@@ -198,17 +270,22 @@ impl Repeats {
             .status
             .map_or_else(|| "none".to_string(), |code| code.to_string());
         format!(
-            "ui-prof[git v1] caller={} sub={} dir={dir} cmd={:016x} status={status} elapsed={}µs out={:016x} same={same}",
-            launch.caller, launch.subcommand, launch.command, launch.elapsed_us, launch.output,
+            "ui-prof[git v1] caller={} sub={} dir={dir} cmd={:016x} status={status} elapsed={}µs out={output:016x} same={same}",
+            launch.caller, launch.subcommand, launch.command, launch.elapsed_us,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Fnv, GitLaunch, Repeats, describe, subcommand_label};
+    use super::{
+        Fnv, GitLaunch, MAX_PENDING_OUTPUT, Printed, Repeats, describe, launch_record, output_hash,
+        subcommand_label,
+    };
     use std::ffi::OsStr;
-    use std::process::Command;
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn fnv_matches_the_published_test_vectors() {
@@ -254,6 +331,52 @@ mod tests {
         assert_eq!(subcommand_label(OsStr::new("Secret")), "other");
     }
 
+    /// What `git_launched` hands the record queue: the caller copies stdout and
+    /// leaves the hash to the writer's `Repeats::line`, up to the bound on
+    /// queued bytes, past which the caller hashes it.
+    #[test]
+    fn a_launch_record_leaves_hashing_to_the_writer_up_to_a_bound() {
+        static PENDING: AtomicUsize = AtomicUsize::new(0);
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", "/repo", "rev-parse", "--abbrev-ref", "HEAD"]);
+        let status = Command::new("git")
+            .arg("--version")
+            .output()
+            .unwrap()
+            .status;
+        let ran = |stdout: &[u8]| {
+            let out = Ok(Output {
+                status,
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            });
+            launch_record(&cmd, Duration::from_millis(3), &out, &PENDING).expect("git")
+        };
+        let code = status.code();
+
+        let record = ran(b"main\n");
+        match &record.output {
+            Printed::Queued(output) => assert_eq!(output.bytes, b"main\n", "copied, not hashed"),
+            Printed::Hashed(_) => panic!("hashed by the caller"),
+        }
+        assert_eq!(PENDING.load(Ordering::Relaxed), 5);
+        let line = Repeats::default().line(&record);
+        let hash = output_hash(code, b"main\n");
+        assert!(line.contains(&format!("out={hash:016x}")), "{line}");
+        drop(record);
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0, "released when dropped");
+
+        let held = ran(&vec![b'x'; MAX_PENDING_OUTPUT]);
+        assert!(matches!(held.output, Printed::Queued(_)), "up to the bound");
+        let over = ran(b"main\n");
+        assert!(
+            matches!(over.output, Printed::Hashed(h) if h == hash),
+            "past it, hashed by the caller"
+        );
+        drop(held);
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn same_column_compares_against_the_previous_run_of_that_command() {
         let launch = |command, output| GitLaunch {
@@ -263,7 +386,7 @@ mod tests {
             command,
             elapsed_us: 7,
             status: Some(0),
-            output,
+            output: Printed::Hashed(output),
         };
         let mut repeats = Repeats::default();
         assert!(repeats.line(&launch(1, 10)).ends_with("same=first"));
