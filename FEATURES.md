@@ -309,7 +309,13 @@ feature is added or changed, update the matching entry here in the same change**
   sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  indexes take one stat. A Claude pane reads its hook record when a watcher on
+  the hook directory reports it written, so `/clear` or `/resume` rebinds at
+  once, and otherwise every thirty seconds, for events a watcher loses. A
+  record that can't be adopted or read yet is retried every two seconds. Where
+  the watcher can't start, reports an error, stops, or loses its directory (it,
+  or the directory above it, was removed or renamed), Claude retries
+  unresolved results with backoff, as Grok does, for the rest of the run.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
@@ -1033,9 +1039,13 @@ feature is added or changed, update the matching entry here in the same change**
   Activity and attendance follow the same conversation attribution as docked
   terminals; redocking uncertain state preserves existing attention cards.
   On Windows, Grok conversation discovery follows the live terminal in either
-  window. It reads Grok's registry on every discovery poll, reusing process
-  ancestry for up to 30 seconds while registrations and pane PID/launches are
-  unchanged. Registry or pane-process changes refresh ancestry immediately;
+  window. A watcher on Grok's folder reports each write of its registry, and
+  every Grok pane reads it then, and otherwise every thirty seconds for events
+  a watcher loses. Process ancestry is reused for up to five minutes while
+  registrations and pane PID/launches are unchanged. Where the folder can't be
+  watched (not created yet, removed, or the watcher fails), Grok panes read the
+  registry on every discovery poll instead, reusing ancestry for up to 30
+  seconds. Registry or pane-process changes refresh ancestry immediately;
   steady polling avoids repeatedly enumerating every process on the machine.
   Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
