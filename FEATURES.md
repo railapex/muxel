@@ -1761,6 +1761,20 @@ feature is added or changed, update the matching entry here in the same change**
   fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
   waits on a slow host.
 
+## Accessibility & automation
+
+- **Screen-reader roles and names** — panes, their tab strips and tabs, the
+  project tree, workspace rows, the new-tab agent menu, terminals, and the
+  close countdown reach the platform accessibility tree with the role they play
+  and a readable name. Tabs and projects report whether they are selected,
+  projects whether they are expanded, and rows that open on mouse-down
+  (workspaces, projects) also respond to a screen reader's activate request.
+- **Stable control IDs** — buttons, text fields, and those rows carry stable
+  `muxel.*` accessibility IDs (UI Automation's AutomationId on Windows), so UI
+  test drivers and automation tools find a control without screen coordinates.
+  IDs for per-item controls include the item's saved UUID, so they stay the
+  same across restarts.
+
 ## Localization
 
 - **Many languages** — the UI auto-detects your OS locale on startup and can be

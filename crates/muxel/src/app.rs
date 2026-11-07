@@ -3255,6 +3255,9 @@ fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &Ap
     let mouse_mode = view.read(cx).mouse_mode();
     let view = view.clone();
     div()
+        .id(("terminal", view.entity_id()))
+        .role(Role::Terminal)
+        .aria_label(t("Terminal"))
         .size_full()
         .child(terminal)
         .context_menu(move |mut menu, window, cx| {
@@ -7204,6 +7207,7 @@ impl Render for PopoutView {
                                     })
                                     .child(
                                         Button::new("dock-back")
+                                            .accessibility_id("muxel.dock-back")
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::PanelBottom)
@@ -7343,6 +7347,7 @@ impl Render for DevConsoleView {
                                 )
                                 .child(
                                     Button::new("dev-console-clear")
+                                        .accessibility_id("muxel.dev-console-clear")
                                         .ghost()
                                         .xsmall()
                                         .label(t("Clear"))
@@ -7583,6 +7588,7 @@ impl Render for FileDiffView {
                                 )
                                 .child(
                                     Button::new("diff-view-toggle")
+                                        .accessibility_id("muxel.diff-view-toggle")
                                         .ghost()
                                         .xsmall()
                                         .label(toggle_label)
@@ -11102,6 +11108,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("remote-reconnect")
+                            .accessibility_id("muxel.remote-reconnect")
                             .primary()
                             .icon(IconName::Redo)
                             .label(t("Reconnect"))
@@ -11111,6 +11118,7 @@ impl MuxelApp {
                     )
                     .children(host_id.map(|hid| {
                         Button::new("remote-scan")
+                            .accessibility_id("muxel.remote-scan")
                             .ghost()
                             .icon(IconName::Search)
                             .label(t("Scan for projects"))
@@ -19560,6 +19568,7 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("nr-cancel")
+                            .accessibility_id("muxel.nr-cancel")
                             .ghost()
                             .label(t("Cancel"))
                             .on_click(
@@ -19568,6 +19577,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("nr-add-host")
+                            .accessibility_id("muxel.nr-add-host")
                             .primary()
                             .icon(IconName::Plus)
                             .label(t("Add host"))
@@ -19599,6 +19609,7 @@ impl MuxelApp {
             }
             hosts = hosts.child(
                 Button::new("nr-add-host")
+                    .accessibility_id("muxel.nr-add-host")
                     .ghost()
                     .icon(IconName::Plus)
                     .label(t("Add host"))
@@ -19611,6 +19622,7 @@ impl MuxelApp {
                 .child(
                     div().pt_1().child(
                         Button::new("nr-scan")
+                            .accessibility_id("muxel.nr-scan")
                             .ghost()
                             .icon(IconName::Search)
                             .label(t("Scan for projects"))
@@ -19672,9 +19684,9 @@ impl MuxelApp {
                     }
                 })
                 .child(self.settings_label(&t("Remote directory"), cx))
-                .child(Input::new(&self.nr_dir))
+                .child(Input::new(&self.nr_dir).accessibility_id("muxel.input.nr_dir"))
                 .child(self.settings_label(&t("Project name (optional)"), cx))
-                .child(Input::new(&self.nr_name))
+                .child(Input::new(&self.nr_name).accessibility_id("muxel.input.nr_name"))
                 // Inline Verify result, above the buttons.
                 .children(match &self.nr_verify {
                     RemoteTestState::Idle => None,
@@ -19712,6 +19724,7 @@ impl MuxelApp {
                         .pt_2()
                         .child(
                             Button::new("nr-verify")
+                                .accessibility_id("muxel.nr-verify")
                                 .ghost()
                                 .label(t("Verify"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -19721,6 +19734,7 @@ impl MuxelApp {
                         .child(div().flex_1())
                         .child(
                             Button::new("nr-cancel")
+                                .accessibility_id("muxel.nr-cancel")
                                 .ghost()
                                 .label(t("Cancel"))
                                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -19729,6 +19743,7 @@ impl MuxelApp {
                         )
                         .child(
                             Button::new("nr-create")
+                                .accessibility_id("muxel.nr-create")
                                 .primary()
                                 .label(t("Create"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -19919,11 +19934,24 @@ impl MuxelApp {
             .p_2()
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(Input::new(&self.memory_title_input).w_full())
-            .child(Input::new(&self.memory_note_input).w_full())
-            .child(Input::new(&self.memory_tags_input).w_full())
+            .child(
+                Input::new(&self.memory_title_input)
+                    .accessibility_id("muxel.input.memory_title_input")
+                    .w_full(),
+            )
+            .child(
+                Input::new(&self.memory_note_input)
+                    .accessibility_id("muxel.input.memory_note_input")
+                    .w_full(),
+            )
+            .child(
+                Input::new(&self.memory_tags_input)
+                    .accessibility_id("muxel.input.memory_tags_input")
+                    .w_full(),
+            )
             .child(
                 Button::new("mem-add")
+                    .accessibility_id("muxel.mem-add")
                     .primary()
                     .xsmall()
                     .icon(IconName::Plus)
@@ -19965,6 +19993,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("mem-open-file")
+                            .accessibility_id("muxel.mem-open-file")
                             .ghost()
                             .xsmall()
                             .icon(IconName::File)
@@ -19975,6 +20004,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("mem-close")
+                            .accessibility_id("muxel.mem-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -19990,10 +20020,11 @@ impl MuxelApp {
                     ),
             )
             .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .child(Input::new(&self.memory_search).w_full()),
+                div().px_2().py_1().child(
+                    Input::new(&self.memory_search)
+                        .accessibility_id("muxel.input.memory_search")
+                        .w_full(),
+                ),
             )
             .child(list)
             .child(add_form)
@@ -20046,7 +20077,10 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(hint),
                     )
-                    .child(Input::new(&self.password_prompt_input))
+                    .child(
+                        Input::new(&self.password_prompt_input)
+                            .accessibility_id("muxel.input.password_prompt_input"),
+                    )
                     .child(
                         div()
                             .flex()
@@ -20055,17 +20089,22 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("pw-cancel")
+                                    .accessibility_id("muxel.pw-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, window, cx| {
                                         this.close_password_prompt(window, cx)
                                     })),
                             )
-                            .child(Button::new("pw-confirm").primary().label(confirm).on_click(
-                                cx.listener(|this, _e, window, cx| {
-                                    this.confirm_password_prompt(window, cx)
-                                }),
-                            )),
+                            .child(
+                                Button::new("pw-confirm")
+                                    .accessibility_id("muxel.pw-confirm")
+                                    .primary()
+                                    .label(confirm)
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.confirm_password_prompt(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -20151,9 +20190,14 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(label),
+                            .child(label.clone()),
                     )
-                    .child(Input::new(&self.git_action_input).w_full())
+                    .child(
+                        Input::new(&self.git_action_input)
+                            .accessibility_id("muxel.input.git_action_input")
+                            .aria_label(label)
+                            .w_full(),
+                    )
                     .children(file_list)
                     .child(
                         div()
@@ -20163,6 +20207,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("git-cancel")
+                                    .accessibility_id("muxel.git-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -20171,6 +20216,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("git-confirm")
+                                    .accessibility_id("muxel.git-confirm")
                                     .primary()
                                     .label(confirm)
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -20907,6 +20953,7 @@ impl MuxelApp {
                             .shadow_md()
                             .child(
                                 Button::new("fullscreen-reveal-sidebar-secondary")
+                                    .accessibility_id("muxel.fullscreen-reveal-sidebar-secondary")
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
@@ -24153,10 +24200,12 @@ impl MuxelApp {
                                 },
                             ))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&rename_input).w_full().min_w_0()),
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&rename_input)
+                                        .accessibility_id("muxel.input.file-rename")
+                                        .w_full()
+                                        .min_w_0(),
+                                ),
                             )
                             .into_any_element();
                     }
@@ -24353,6 +24402,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("fb-close")
+                            .accessibility_id("muxel.fb-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -24368,10 +24418,11 @@ impl MuxelApp {
                     ),
             )
             .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .child(Input::new(&self.file_browser_input).w_full()),
+                div().px_2().py_1().child(
+                    Input::new(&self.file_browser_input)
+                        .accessibility_id("muxel.input.file_browser_input")
+                        .w_full(),
+                ),
             )
             .child(div().flex_1().min_h_0().px_1().child(list.size_full()))
             .into_any_element()
@@ -24824,6 +24875,9 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("split-h-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.split-right.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelRight)
@@ -24851,6 +24905,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("split-v-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.split-down.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelBottom)
@@ -24895,6 +24952,9 @@ impl MuxelApp {
                             t("Auto")
                         };
                         Button::new(SharedString::from(format!("auto-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.autopilot.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .selected(on)
@@ -24923,6 +24983,9 @@ impl MuxelApp {
                     }))
                     .children((kind == InstanceKind::Terminal).then(|| {
                         Button::new(SharedString::from(format!("diff-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.diff.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(Icon::empty().path("icons/diff.svg"))
@@ -24941,6 +25004,9 @@ impl MuxelApp {
                     )
                     .children((kind == InstanceKind::Diff).then(|| {
                         Button::new(SharedString::from(format!("refresh-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.refresh.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .label("↻")
@@ -24957,6 +25023,9 @@ impl MuxelApp {
                             .map(|e| {
                                 let rendered = e.read(cx).show_rendered();
                                 Button::new(SharedString::from(format!("md-{sid}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.pane-control.markdown.{sid}"
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .label(if rendered { t("Raw") } else { t("Rendered") })
@@ -24978,6 +25047,9 @@ impl MuxelApp {
                             .filter(|editor| editor.read(cx).is_html())
                             .map(|_| {
                                 Button::new(SharedString::from(format!("preview-html-{sid}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.pane-control.preview-html.{sid}"
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .label(t("Preview"))
@@ -24999,6 +25071,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("max-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.maximize.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(max_icon)
@@ -25009,6 +25084,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("popout-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.popout.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::ExternalLink)
@@ -25019,6 +25097,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("close-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.close.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -25089,10 +25170,13 @@ impl MuxelApp {
                                     cx.theme().muted_foreground,
                                 ))
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                                    div().flex_1().min_w_0().child(
+                                        Input::new(&self.rename_input)
+                                            .accessibility_id("muxel.input.rename_input")
+                                            .aria_label(t("Rename"))
+                                            .w_full()
+                                            .min_w_0(),
+                                    ),
                                 )
                                 .into_any_element();
                         }
@@ -25100,6 +25184,13 @@ impl MuxelApp {
                         let pill_ghost = tab_title.clone();
                         let pill = div()
                             .id(SharedString::from(format!("tab-{}", tab.simple())))
+                            .role(Role::Tab)
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-tab.{}",
+                                tab.simple()
+                            )))
+                            .aria_label(tab_title.clone())
+                            .aria_selected(tab_active)
                             .flex()
                             .items_center()
                             .gap_1()
@@ -25398,6 +25489,10 @@ impl MuxelApp {
                                             "tabx-{}",
                                             tab.simple()
                                         )))
+                                        .accessibility_id(SharedString::from(format!(
+                                            "muxel.pane-tab-close.{}",
+                                            tab.simple()
+                                        )))
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Close)
@@ -25443,6 +25538,9 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("newtab-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.new-tab.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
@@ -25490,6 +25588,11 @@ impl MuxelApp {
                     .child(
                         div()
                             .id(SharedString::from(format!("tabrow-{}", anchor.simple())))
+                            .role(Role::TabList)
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-tabs.{}",
+                                anchor.simple()
+                            )))
                             .flex_1()
                             .min_w_0()
                             .flex()
@@ -25532,10 +25635,13 @@ impl MuxelApp {
                                     }
                                 }))
                                 .child(
-                                    div()
-                                        .w(px(110.0))
-                                        .min_w_0()
-                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                                    div().w(px(110.0)).min_w_0().child(
+                                        Input::new(&self.rename_input)
+                                            .accessibility_id("muxel.input.rename_input")
+                                            .aria_label(t("Rename"))
+                                            .w_full()
+                                            .min_w_0(),
+                                    ),
                                 )
                                 .into_any_element()
                         } else {
@@ -25572,6 +25678,12 @@ impl MuxelApp {
 
                 let mut card = div()
                     .id(SharedString::from(format!("pane-{}", anchor.simple())))
+                    .role(Role::Group)
+                    .accessibility_id(SharedString::from(format!(
+                        "muxel.pane.{}",
+                        anchor.simple()
+                    )))
+                    .aria_label(self.instance_title(iid, cx))
                     .size_full()
                     .flex()
                     .flex_col()
@@ -25798,6 +25910,7 @@ impl MuxelApp {
                     .items_center()
                     .child(
                         Button::new("terms-full")
+                            .accessibility_id("muxel.terms-full")
                             .ghost()
                             .label(t("View full terms"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
@@ -25806,6 +25919,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("terms-license")
+                            .accessibility_id("muxel.terms-license")
                             .ghost()
                             .label(t("License (GPL-3.0)"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
@@ -25823,14 +25937,19 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
-                        cx.listener(|this, _e, _w, cx| {
-                            this.confirm_quit = true;
-                            this.quit_after_closes(cx);
-                        }),
-                    ))
+                    .child(
+                        Button::new("terms-quit")
+                            .accessibility_id("muxel.terms-quit")
+                            .ghost()
+                            .label(t("Quit"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.confirm_quit = true;
+                                this.quit_after_closes(cx);
+                            })),
+                    )
                     .child(
                         Button::new("terms-accept")
+                            .accessibility_id("muxel.terms-accept")
                             .primary()
                             .label(t("I Agree & Continue"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.accept_terms(cx))),
@@ -25856,10 +25975,22 @@ impl MuxelApp {
             let id = meta.id;
             let name = meta.name.clone();
             let selected = current == Some(id);
+            let entity = cx.entity();
             list =
                 list.child(
                     div()
                         .id(SharedString::from(format!("workspace-{}", id.simple())))
+                        .role(Role::Button)
+                        .accessibility_id(SharedString::from(format!(
+                            "muxel.workspace.{}",
+                            id.simple()
+                        )))
+                        .aria_label(name.clone())
+                        // The row opens on mouse-down, which assistive technology
+                        // can't send; give it the same action as a click.
+                        .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.enter_workspace(id, window, cx));
+                        })
                         .px_3()
                         .py_2()
                         .rounded(cx.theme().radius)
@@ -25900,6 +26031,10 @@ impl MuxelApp {
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "del-workspace-{}",
+                                        id.simple()
+                                    )))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.workspace-delete.{}",
                                         id.simple()
                                     )))
                                     .ghost()
@@ -25975,9 +26110,15 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_1().child(Input::new(&self.workspace_name_input)))
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.workspace_name_input)
+                                .accessibility_id("muxel.input.workspace_name_input"),
+                        ),
+                    )
                     .child(
                         Button::new("create-workspace")
+                            .accessibility_id("muxel.create-workspace")
                             .primary()
                             .label(t("Create"))
                             .on_click(cx.listener(|this, _e, window, cx| {
@@ -25995,6 +26136,7 @@ impl MuxelApp {
                 .justify_between()
                 .child(
                     Button::new("quit-selector")
+                        .accessibility_id("muxel.quit-selector")
                         .ghost()
                         .label(t("Quit"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
@@ -26004,6 +26146,7 @@ impl MuxelApp {
                 )
                 .children(self.current_workspace.is_some().then(|| {
                     Button::new("cancel-selector")
+                        .accessibility_id("muxel.cancel-selector")
                         .ghost()
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
@@ -26156,10 +26299,13 @@ impl MuxelApp {
                     }
                 }))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.rename_input)
+                            .accessibility_id("muxel.input.rename_input")
+                            .aria_label(t("Rename"))
+                            .w_full()
+                            .min_w_0(),
+                    ),
                 )
                 .into_any_element();
         }
@@ -26347,6 +26493,7 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new("notif-clear-all")
+                            .accessibility_id("muxel.notif-clear-all")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -26498,6 +26645,7 @@ impl MuxelApp {
             }))
             .child(
                 Button::new("gitdiff-refresh")
+                    .accessibility_id("muxel.gitdiff-refresh")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Redo)
@@ -26520,6 +26668,7 @@ impl MuxelApp {
                 .border_color(cx.theme().border)
                 .child(
                     Button::new("gd-tab-files")
+                        .accessibility_id("muxel.gd-tab-files")
                         .ghost()
                         .xsmall()
                         .selected(self.git_diff_tab == GitDiffTab::Files)
@@ -26530,6 +26679,7 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("gd-tab-worktrees")
+                        .accessibility_id("muxel.gd-tab-worktrees")
                         .ghost()
                         .xsmall()
                         .selected(self.git_diff_tab == GitDiffTab::Worktrees)
@@ -26582,9 +26732,14 @@ impl MuxelApp {
                 .p_2()
                 .border_t_1()
                 .border_color(cx.theme().border)
-                .child(Input::new(&self.git_diff_commit_input).w_full())
+                .child(
+                    Input::new(&self.git_diff_commit_input)
+                        .accessibility_id("muxel.input.git_diff_commit_input")
+                        .w_full(),
+                )
                 .child(
                     Button::new("gitdiff-commit-all")
+                        .accessibility_id("muxel.gitdiff-commit-all")
                         .primary()
                         .w_full()
                         .label(t("Commit all"))
@@ -26957,6 +27112,34 @@ impl MuxelApp {
             };
             let base = div()
                 .id(SharedString::from(format!("proj-row-{ix}")))
+                .role(Role::TreeItem)
+                .accessibility_id(SharedString::from(format!(
+                    "muxel.project.{}",
+                    pid.simple()
+                )))
+                .aria_label(name.clone())
+                .aria_selected(active)
+                .aria_expanded(!collapsed)
+                .on_a11y_action(AccessibleAction::Expand, {
+                    let entity = cx.entity();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if this.collapsed.contains(&pid) {
+                                this.toggle_collapse(pid, cx);
+                            }
+                        })
+                    }
+                })
+                .on_a11y_action(AccessibleAction::Collapse, {
+                    let entity = cx.entity();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if !this.collapsed.contains(&pid) {
+                                this.toggle_collapse(pid, cx);
+                            }
+                        })
+                    }
+                })
                 .mx_1()
                 .px_1()
                 .py_1()
@@ -26995,10 +27178,13 @@ impl MuxelApp {
                     }
                 }))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.rename_input)
+                            .accessibility_id("muxel.input.rename_input")
+                            .aria_label(t("Rename"))
+                            .w_full()
+                            .min_w_0(),
+                    ),
                 )
                 .into_any_element()
             } else {
@@ -27013,6 +27199,12 @@ impl MuxelApp {
                             }
                         }),
                     )
+                    .on_a11y_action(AccessibleAction::Click, {
+                        let entity = cx.entity();
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.select_project(pid, window, cx))
+                        }
+                    })
                     .child(
                         // Name + the repo's current branch (cached) with a branch icon.
                         div()
@@ -27070,6 +27262,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("memory-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-memory.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Star)
@@ -27086,6 +27282,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("accomplishments-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-accomplishments.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::CircleCheck)
@@ -27105,6 +27305,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("files-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-files.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::empty().path("icons/files.svg"))
@@ -27676,10 +27880,13 @@ impl MuxelApp {
                             }
                         }))
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.rename_input)
+                                    .accessibility_id("muxel.input.rename_input")
+                                    .aria_label(t("Rename"))
+                                    .w_full()
+                                    .min_w_0(),
+                            ),
                         )
                         .into_any_element()
                     } else {
@@ -27816,6 +28023,7 @@ impl MuxelApp {
                 .child(
                     div().flex_1().min_w_0().overflow_hidden().child(
                         Button::new("new-project")
+                            .accessibility_id("muxel.new-project")
                             .ghost()
                             .icon(IconName::Plus)
                             .label(t("New Project"))
@@ -27827,6 +28035,7 @@ impl MuxelApp {
                 .child(
                     div().flex_none().child(
                         Button::new("new-remote-project")
+                            .accessibility_id("muxel.new-remote-project")
                             .ghost()
                             .icon(IconName::Network)
                             .tooltip(t("New remote project (SSH)"))
@@ -27878,6 +28087,7 @@ impl MuxelApp {
             DropdownButton::new("preset-run")
                 .button(
                     Button::new("preset-run-btn")
+                        .accessibility_id("muxel.preset-run-btn")
                         .ghost()
                         .small()
                         .icon(current_icon)
@@ -27911,6 +28121,7 @@ impl MuxelApp {
         bar.child(div().w(px(6.0)))
             .child(
                 Button::new("run-task")
+                    .accessibility_id("muxel.run-task")
                     .ghost()
                     .small()
                     .icon(IconName::Play)
@@ -27927,6 +28138,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("loops-btn")
+                    .accessibility_id("muxel.loops-btn")
                     .ghost()
                     .small()
                     .icon(IconName::Redo)
@@ -27943,6 +28155,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("snippets-btn")
+                    .accessibility_id("muxel.snippets-btn")
                     .ghost()
                     .small()
                     .icon(IconName::SquareTerminal)
@@ -27960,6 +28173,7 @@ impl MuxelApp {
             .child(div().w(px(6.0)))
             .child(
                 Button::new("toggle-tmux")
+                    .accessibility_id("muxel.toggle-tmux")
                     .ghost()
                     .icon(IconName::SquareTerminal)
                     .selected(self.use_tmux)
@@ -27968,6 +28182,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("toggle-worktree")
+                    .accessibility_id("muxel.toggle-worktree")
                     .ghost()
                     .icon(Icon::empty().path("icons/git-branch.svg"))
                     .selected(self.use_worktree)
@@ -27976,6 +28191,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("restart")
+                    .accessibility_id("muxel.restart")
                     .ghost()
                     .icon(IconName::Play)
                     .disabled(!self.active_is_terminal())
@@ -27984,6 +28200,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("close")
+                    .accessibility_id("muxel.close")
                     .ghost()
                     .icon(IconName::Close)
                     .tooltip(t("Close pane"))
@@ -27991,6 +28208,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("speech-to-text")
+                    .accessibility_id("muxel.speech-to-text")
                     .ghost()
                     .icon(Icon::empty().path("icons/mic.svg"))
                     .selected(self.stt_state == SttState::Recording)
@@ -28009,6 +28227,7 @@ impl MuxelApp {
             .child(div().flex_1())
             .child(
                 Button::new("toggle-git-diff")
+                    .accessibility_id("muxel.toggle-git-diff")
                     .ghost()
                     .icon(Icon::empty().path("icons/diff.svg"))
                     .selected(self.show_git_diff)
@@ -28172,7 +28391,10 @@ impl MuxelApp {
                             .p_2()
                             .border_b_1()
                             .border_color(cx.theme().border)
-                            .child(Input::new(&self.search_input)),
+                            .child(
+                                Input::new(&self.search_input)
+                                    .accessibility_id("muxel.input.search_input"),
+                            ),
                     )
                     .child(
                         div()
@@ -28290,7 +28512,12 @@ impl MuxelApp {
                                     .flex_none()
                                     .child(t("Find in project")),
                             )
-                            .child(div().flex_1().child(Input::new(&self.find_input))),
+                            .child(
+                                div().flex_1().child(
+                                    Input::new(&self.find_input)
+                                        .accessibility_id("muxel.input.find_input"),
+                                ),
+                            ),
                     )
                     .child(
                         div()
@@ -28364,6 +28591,7 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new("toggle-sidebar")
+                                    .accessibility_id("muxel.toggle-sidebar")
                                     .ghost()
                                     .icon(IconName::PanelLeft)
                                     .tooltip(if sidebar_hidden {
@@ -28412,6 +28640,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(nodrag(
                         Button::new("toggle-sidebar")
+                            .accessibility_id("muxel.toggle-sidebar")
                             .ghost()
                             .icon(IconName::PanelLeft)
                             .tooltip(t("Toggle sidebar"))
@@ -28432,6 +28661,7 @@ impl MuxelApp {
                     .child(nodrag(self.render_close_chip(cx)))
                     .child(nodrag(
                         Button::new("global-search")
+                            .accessibility_id("muxel.global-search")
                             .ghost()
                             .small()
                             .icon(IconName::Search)
@@ -28444,6 +28674,7 @@ impl MuxelApp {
                     .child(div().flex_1())
                     .child(nodrag(
                         Button::new("update")
+                            .accessibility_id("muxel.update")
                             .ghost()
                             .icon(IconName::ArrowUp)
                             .selected(self.update_pending())
@@ -28460,6 +28691,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("workspaces")
+                            .accessibility_id("muxel.workspaces")
                             .ghost()
                             .icon(IconName::CircleUser)
                             .tooltip(t("Switch workspace"))
@@ -28469,6 +28701,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("dashboard")
+                            .accessibility_id("muxel.dashboard")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
                             .selected(self.main_view == hotbar::MainView::Dashboard)
@@ -28499,6 +28732,7 @@ impl MuxelApp {
                     )
                     .child(nodrag(
                         Button::new("settings")
+                            .accessibility_id("muxel.settings")
                             .ghost()
                             .icon(IconName::Settings)
                             .selected(self.show_settings)
@@ -28509,6 +28743,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("notifications")
+                            .accessibility_id("muxel.notifications")
                             .ghost()
                             .icon(IconName::Bell)
                             .selected(self.notifications_enabled)
@@ -28519,6 +28754,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("donate")
+                            .accessibility_id("muxel.donate")
                             .ghost()
                             .icon(IconName::Heart)
                             .tooltip(t("Support muxel"))
@@ -28895,12 +29131,14 @@ impl MuxelApp {
                         .items_center()
                         .gap_2()
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_provider_url)),
+                            v_flex().flex_1().child(
+                                Input::new(&self.settings_ui.stt_provider_url)
+                                    .accessibility_id("muxel.input.stt_provider_url"),
+                            ),
                         )
                         .child(
                             Button::new("stt-apply-provider")
+                                .accessibility_id("muxel.stt-apply-provider")
                                 .primary()
                                 .label(t("Apply"))
                                 .on_click(
@@ -28926,12 +29164,14 @@ impl MuxelApp {
                         .items_center()
                         .gap_2()
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_api_key)),
+                            v_flex().flex_1().child(
+                                Input::new(&self.settings_ui.stt_api_key)
+                                    .accessibility_id("muxel.input.stt_api_key"),
+                            ),
                         )
                         .child(
                             Button::new("stt-save-key")
+                                .accessibility_id("muxel.stt-save-key")
                                 .primary()
                                 .label(t("Save"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -28940,6 +29180,7 @@ impl MuxelApp {
                         )
                         .children(self.settings_ui.stt_has_key.then(|| {
                             Button::new("stt-clear-key")
+                                .accessibility_id("muxel.stt-clear-key")
                                 .ghost()
                                 .label(t("Remove"))
                                 .on_click(
@@ -28958,9 +29199,15 @@ impl MuxelApp {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(v_flex().flex_1().child(Input::new(&self.settings_ui.stt_language)))
+                .child(
+                    v_flex().flex_1().child(
+                        Input::new(&self.settings_ui.stt_language)
+                            .accessibility_id("muxel.input.stt_language"),
+                    ),
+                )
                 .child(
                     Button::new("stt-apply-lang")
+                        .accessibility_id("muxel.stt-apply-lang")
                         .primary()
                         .label(t("Apply"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx))),
@@ -29002,10 +29249,14 @@ impl MuxelApp {
                         .child(
                             v_flex()
                                 .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_wake_phrase)),
+                                .child(
+                                    Input::new(&self.settings_ui.stt_wake_phrase)
+                                        .accessibility_id("muxel.input.stt_wake_phrase"),
+                                ),
                         )
                         .child(
                             Button::new("stt-apply-wake-phrase")
+                                .accessibility_id("muxel.stt-apply-wake-phrase")
                                 .primary()
                                 .label(t("Apply"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -29587,18 +29838,30 @@ impl MuxelApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Button::new("ed-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(-1.0, w, cx)),
-                    ))
+                    .child(
+                        Button::new("ed-font-dec")
+                            .accessibility_id("muxel.ed-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_font(-1.0, w, cx)),
+                            ),
+                    )
                     .child(
                         div()
                             .w(rems(4.0))
                             .text_center()
                             .child(format!("{}", self.settings.editor_font_size.round() as i32)),
                     )
-                    .child(Button::new("ed-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
-                    )),
+                    .child(
+                        Button::new("ed-font-inc")
+                            .accessibility_id("muxel.ed-font-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
+                            ),
+                    ),
             )
             .child(self.settings_label(&t("Editor font family (blank = theme monospace)"), cx))
             .child(
@@ -29607,12 +29870,14 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.editor_font_family)),
+                        v_flex().flex_1().child(
+                            Input::new(&self.settings_ui.editor_font_family)
+                                .accessibility_id("muxel.input.editor_font_family"),
+                        ),
                     )
                     .child(
                         Button::new("apply-ed-font")
+                            .accessibility_id("muxel.apply-ed-font")
                             .primary()
                             .label(t("Apply"))
                             .on_click(
@@ -29629,9 +29894,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("ed-tab-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(-1, w, cx)),
-                        ),
+                        Button::new("ed-tab-dec")
+                            .accessibility_id("muxel.ed-tab-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_tab(-1, w, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -29640,9 +29909,13 @@ impl MuxelApp {
                             .child(format!("{}", self.settings.editor_tab_size)),
                     )
                     .child(
-                        Button::new("ed-tab-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(1, w, cx)),
-                        ),
+                        Button::new("ed-tab-inc")
+                            .accessibility_id("muxel.ed-tab-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_tab(1, w, cx)),
+                            ),
                     ),
             )
             .child(
@@ -30918,6 +31191,9 @@ impl MuxelApp {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("place-preset-{idx}")))
+                    .role(Role::MenuItem)
+                    .accessibility_id(SharedString::from(format!("muxel.place-preset.{idx}")))
+                    .aria_label(name.clone())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -31442,7 +31718,9 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(preview),
                     )
-                    .child(Input::new(&self.runner_input))
+                    .child(
+                        Input::new(&self.runner_input).accessibility_id("muxel.input.runner_input"),
+                    )
                     .child(
                         div()
                             .flex()
@@ -31451,6 +31729,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("run-cancel")
+                                    .accessibility_id("muxel.run-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31459,9 +31738,15 @@ impl MuxelApp {
                                         cx.notify();
                                     })),
                             )
-                            .child(Button::new("run-go").primary().label(t("Run")).on_click(
-                                cx.listener(|this, _e, window, cx| this.execute_runner(window, cx)),
-                            )),
+                            .child(
+                                Button::new("run-go")
+                                    .accessibility_id("muxel.run-go")
+                                    .primary()
+                                    .label(t("Run"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.execute_runner(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -31770,6 +32055,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("confirm-cancel")
+                                    .accessibility_id("muxel.confirm-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -31778,6 +32064,7 @@ impl MuxelApp {
                             )
                             .children(alternative.map(|label| {
                                 Button::new("confirm-alternative")
+                                    .accessibility_id("muxel.confirm-alternate")
                                     .ghost()
                                     .label(label)
                                     .on_click(
@@ -31788,6 +32075,7 @@ impl MuxelApp {
                             }))
                             .child(
                                 Button::new("confirm-ok")
+                                    .accessibility_id("muxel.confirm-ok")
                                     .danger()
                                     .label(confirm_label)
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -31875,7 +32163,10 @@ impl MuxelApp {
                             .child(body),
                     )
                     // The commit message applies to uncommitted changes only.
-                    .children(show_commit.then(|| Input::new(&self.dispose_commit_input)))
+                    .children(show_commit.then(|| {
+                        Input::new(&self.dispose_commit_input)
+                            .accessibility_id("muxel.input.dispose_commit_input")
+                    }))
                     .child(
                         div()
                             .flex()
@@ -31885,6 +32176,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("wt-keep")
+                                    .accessibility_id("muxel.wt-keep")
                                     .ghost()
                                     .label(t("Keep"))
                                     .tooltip(t("Leave the worktree on disk to resume later"))
@@ -31894,6 +32186,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("wt-discard")
+                                    .accessibility_id("muxel.wt-discard")
                                     .danger()
                                     .label(t("Discard"))
                                     .tooltip(t("Delete the worktree and its branch (lose the work)"))
@@ -31903,6 +32196,7 @@ impl MuxelApp {
                             )
                             .children(show_commit.then(|| {
                                 Button::new("wt-commit")
+                                    .accessibility_id("muxel.wt-commit")
                                     .label(t("Commit & close"))
                                     .tooltip(t("Commit changes to its branch, then remove the worktree (branch kept, unmerged)"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31911,6 +32205,7 @@ impl MuxelApp {
                             }))
                             .children(show_merge.then(|| {
                                 Button::new("wt-merge")
+                                    .accessibility_id("muxel.wt-merge")
                                     .primary()
                                     .label(t("Merge & close"))
                                     .tooltip(merge_tip.clone())
@@ -32005,6 +32300,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("quit-cancel")
+                                    .accessibility_id("muxel.quit-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -32014,6 +32310,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("quit-confirm")
+                                    .accessibility_id("muxel.quit-confirm")
                                     .danger()
                                     .label(t("Quit"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -32054,9 +32351,10 @@ impl MuxelApp {
                 }
             }))
             .child(
-                div()
-                    .w(px(180.0))
-                    .child(Input::new(&self.term_search_input)),
+                div().w(px(180.0)).child(
+                    Input::new(&self.term_search_input)
+                        .accessibility_id("muxel.input.term_search_input"),
+                ),
             )
             .child(
                 div()
@@ -32067,6 +32365,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-prev")
+                    .accessibility_id("muxel.ts-prev")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronUp)
@@ -32075,6 +32374,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-next")
+                    .accessibility_id("muxel.ts-next")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronDown)
@@ -32083,6 +32383,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-close")
+                    .accessibility_id("muxel.ts-close")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Close)
@@ -32132,7 +32433,12 @@ impl MuxelApp {
                             .text_color(cx.theme().warning)
                             .child(t("BROADCAST")),
                     )
-                    .child(div().flex_1().child(Input::new(&self.broadcast_input)))
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.broadcast_input)
+                                .accessibility_id("muxel.input.broadcast_input"),
+                        ),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -32146,6 +32452,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("bc-send")
+                            .accessibility_id("muxel.bc-send")
                             .primary()
                             .xsmall()
                             .label(t("Send"))
@@ -32155,6 +32462,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("bc-close")
+                            .accessibility_id("muxel.bc-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -32217,6 +32525,7 @@ impl MuxelApp {
                     .child(div().text_sm().child(label))
                     .children(recording.then(|| {
                         Button::new("stt-stop")
+                            .accessibility_id("muxel.stt-stop")
                             .primary()
                             .xsmall()
                             .label(t("Stop"))
@@ -32226,6 +32535,7 @@ impl MuxelApp {
                     }))
                     .children(mic_settings.then(|| {
                         Button::new("stt-mic-settings")
+                            .accessibility_id("muxel.stt-mic-settings")
                             .primary()
                             .xsmall()
                             .label(t("Open Settings"))
@@ -32238,6 +32548,7 @@ impl MuxelApp {
                     }))
                     .children(error.then(|| {
                         Button::new("stt-dismiss")
+                            .accessibility_id("muxel.stt-dismiss")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -32302,6 +32613,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("onboard-add-project")
+                                    .accessibility_id("muxel.onboard-add-project")
                                     .primary()
                                     .icon(IconName::Plus)
                                     .label(t("Add a project"))
@@ -32311,6 +32623,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("onboard-add-remote")
+                                    .accessibility_id("muxel.onboard-add-remote")
                                     .ghost()
                                     .label(t("New remote project (SSH)"))
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -32514,6 +32827,7 @@ impl MuxelApp {
         // Footer: Close + a state-specific primary action.
         let mut footer = div().flex().gap_2().justify_end().pt_2().child(
             Button::new("update-close")
+                .accessibility_id("muxel.update-close")
                 .ghost()
                 .label(t("Close"))
                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -32525,6 +32839,7 @@ impl MuxelApp {
             UpdateState::Available(_) if self_updatable => {
                 footer = footer.child(
                     Button::new("update-install")
+                        .accessibility_id("muxel.update-install")
                         .primary()
                         .label(t("Download & Install"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.start_update_download(cx))),
@@ -32533,6 +32848,7 @@ impl MuxelApp {
             UpdateState::Available(_) => {
                 footer = footer.child(
                     Button::new("update-releases")
+                        .accessibility_id("muxel.update-releases")
                         .primary()
                         .label(t("Open releases page"))
                         .on_click(
@@ -32543,6 +32859,7 @@ impl MuxelApp {
             UpdateState::Ready(_) => {
                 footer = footer.child(
                     Button::new("update-restart")
+                        .accessibility_id("muxel.update-restart")
                         .primary()
                         .label(t("Restart now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_update_restart(cx))),
@@ -32551,6 +32868,7 @@ impl MuxelApp {
             UpdateState::Error(_) => {
                 footer = footer.child(
                     Button::new("update-retry")
+                        .accessibility_id("muxel.update-retry")
                         .label(t("Check again"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
@@ -32558,6 +32876,7 @@ impl MuxelApp {
             UpdateState::Idle | UpdateState::UpToDate => {
                 footer = footer.child(
                     Button::new("update-check")
+                        .accessibility_id("muxel.update-check")
                         .label(t("Check now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
@@ -32708,6 +33027,7 @@ impl MuxelApp {
                                     })
                                     .child(
                                         Button::new("close-settings")
+                                            .accessibility_id("muxel.close-settings")
                                             .ghost()
                                             .icon(IconName::Close)
                                             .tooltip(t("Close"))
@@ -32736,6 +33056,7 @@ impl MuxelApp {
                             .border_color(cx.theme().border)
                             .child(
                                 Button::new("settings-cancel")
+                                    .accessibility_id("muxel.settings-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -32744,6 +33065,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("settings-save")
+                                    .accessibility_id("muxel.settings-save")
                                     .primary()
                                     .label(t("Save"))
                                     .on_click(
@@ -32906,6 +33228,7 @@ impl MuxelApp {
                 DropdownButton::new("settings-theme")
                     .button(
                         Button::new("settings-theme-btn")
+                            .accessibility_id("muxel.settings-theme-btn")
                             .ghost()
                             .icon(IconName::Palette)
                             .label(current_theme),
@@ -32923,6 +33246,7 @@ impl MuxelApp {
                 DropdownButton::new("settings-language")
                     .button(
                         Button::new("settings-language-btn")
+                            .accessibility_id("muxel.settings-language-btn")
                             .ghost()
                             .label(crate::i18n::display_name(&crate::i18n::current_language())),
                     )
@@ -32946,9 +33270,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("ui-font-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_ui_font(-1.0, cx)),
-                        ),
+                        Button::new("ui-font-dec")
+                            .accessibility_id("muxel.ui-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_ui_font(-1.0, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -32958,6 +33286,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("ui-font-inc")
+                            .accessibility_id("muxel.ui-font-inc")
                             .ghost()
                             .label("+")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_ui_font(1.0, cx))),
@@ -32971,6 +33300,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("ui-zoom-dec")
+                            .accessibility_id("muxel.ui-zoom-dec")
                             .ghost()
                             .label("−")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(-0.1, cx))),
@@ -32983,6 +33313,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("ui-zoom-inc")
+                            .accessibility_id("muxel.ui-zoom-inc")
                             .ghost()
                             .label("+")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(0.1, cx))),
@@ -32994,18 +33325,30 @@ impl MuxelApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Button::new("term-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(-1.0, cx)),
-                    ))
+                    .child(
+                        Button::new("term-font-dec")
+                            .accessibility_id("muxel.term-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(-1.0, cx)),
+                            ),
+                    )
                     .child(
                         div()
                             .w(rems(4.0))
                             .text_center()
                             .child(format!("{}", self.settings.font_size.round() as i32)),
                     )
-                    .child(Button::new("term-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
-                    )),
+                    .child(
+                        Button::new("term-font-inc")
+                            .accessibility_id("muxel.term-font-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
+                            ),
+                    ),
             )
             .child(self.settings_label(&t("Terminal font family (blank = built-in default)"), cx))
             .child(
@@ -33014,12 +33357,14 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.font_family)),
+                        v_flex().flex_1().child(
+                            Input::new(&self.settings_ui.font_family)
+                                .accessibility_id("muxel.input.font_family"),
+                        ),
                     )
                     .child(
                         Button::new("apply-font-family")
+                            .accessibility_id("muxel.apply-font-family")
                             .primary()
                             .label(t("Apply"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.apply_font_family(cx))),
@@ -33140,6 +33485,7 @@ impl MuxelApp {
             .child(
                 div().pl(rems(1.75)).child(
                     Button::new("test-notif")
+                        .accessibility_id("muxel.test-notif")
                         .ghost()
                         .small()
                         .icon(IconName::Bell)
@@ -33317,6 +33663,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-preset")
+                .accessibility_id("muxel.add-preset")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add preset"))
@@ -33382,6 +33729,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-snippet")
+                .accessibility_id("muxel.add-snippet")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add snippet"))
@@ -33412,9 +33760,15 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.sn_name).accessibility_id("muxel.input.sn_name"),
+            ))
             .child(self.settings_label(&t("Text — typed into the focused pane"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_text).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.sn_text)
+                    .accessibility_id("muxel.input.sn_text")
+                    .h(px(120.0)),
+            ))
             .child(self.check_row(
                 Checkbox::new("sn-submit").checked(ui.sn_submit).on_click(
                     cx.listener(|this, _c: &bool, _w, cx| this.toggle_snippet_submit(cx)),
@@ -33428,12 +33782,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-snippet")
+                            .accessibility_id("muxel.save-snippet")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_snippet(cx))),
                     )
                     .child(
                         Button::new("del-snippet")
+                            .accessibility_id("muxel.del-snippet")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -33494,6 +33850,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-runner")
+                .accessibility_id("muxel.add-runner")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add runner"))
@@ -33525,6 +33882,7 @@ impl MuxelApp {
         let mut agent_row = div().flex().flex_wrap().gap_1();
         agent_row = agent_row.child(
             Button::new("runner-agent-default")
+                .accessibility_id("muxel.runner-agent-default")
                 .ghost()
                 .selected(selected_preset.is_none())
                 .label(t("Current/default"))
@@ -33548,7 +33906,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.r_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.r_name).accessibility_id("muxel.input.r_name"),
+            ))
             .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
             .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
@@ -33559,6 +33919,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("runner-presses-dec")
+                            .accessibility_id("muxel.runner-presses-dec")
                             .ghost()
                             .label("−")
                             .on_click(
@@ -33573,6 +33934,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("runner-presses-inc")
+                            .accessibility_id("muxel.runner-presses-inc")
                             .ghost()
                             .label("+")
                             .on_click(
@@ -33584,7 +33946,11 @@ impl MuxelApp {
                 &t("Prompt — {{input}} is replaced with run-time details"),
                 cx,
             ))
-            .child(Self::wide_input(Input::new(&ui.r_prompt).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.r_prompt)
+                    .accessibility_id("muxel.input.r_prompt")
+                    .h(px(120.0)),
+            ))
             .child(
                 div()
                     .flex()
@@ -33592,12 +33958,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-runner")
+                            .accessibility_id("muxel.save-runner")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_runner(cx))),
                     )
                     .child(
                         Button::new("del-runner")
+                            .accessibility_id("muxel.del-runner")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -33673,6 +34041,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-loop")
+                .accessibility_id("muxel.add-loop")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add loop"))
@@ -33744,35 +34113,48 @@ impl MuxelApp {
                     .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_sched_kind(k, cx))),
             );
         }
-        let value_row = if kind == 2 {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_hour)))
-                .child(div().child(":"))
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_minute)))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t("local 24h time")),
-                )
-        } else {
-            let unit = if kind == 0 { "minutes" } else { "hours" };
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(80.0)).child(Input::new(&ui.l_interval)))
-                .child(div().text_sm().child(unit))
-        };
+        let value_row =
+            if kind == 2 {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(56.0))
+                            .child(Input::new(&ui.l_hour).accessibility_id("muxel.input.l_hour")),
+                    )
+                    .child(div().child(":"))
+                    .child(
+                        div().w(px(56.0)).child(
+                            Input::new(&ui.l_minute).accessibility_id("muxel.input.l_minute"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("local 24h time")),
+                    )
+            } else {
+                let unit = if kind == 0 { "minutes" } else { "hours" };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(80.0)).child(
+                        Input::new(&ui.l_interval).accessibility_id("muxel.input.l_interval"),
+                    ))
+                    .child(div().text_sm().child(unit))
+            };
 
         v_flex()
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.l_name).accessibility_id("muxel.input.l_name"),
+            ))
             .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
             .child(self.settings_label(&t("Project"), cx))
@@ -33787,9 +34169,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("loop-presses-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(-1, cx)),
-                        ),
+                        Button::new("loop-presses-dec")
+                            .accessibility_id("muxel.loop-presses-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(-1, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -33798,13 +34184,21 @@ impl MuxelApp {
                             .child(format!("{}", ui.l_presses)),
                     )
                     .child(
-                        Button::new("loop-presses-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(1, cx)),
-                        ),
+                        Button::new("loop-presses-inc")
+                            .accessibility_id("muxel.loop-presses-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(1, cx)),
+                            ),
                     ),
             )
             .child(self.settings_label(&t("Prompt"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_prompt).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.l_prompt)
+                    .accessibility_id("muxel.input.l_prompt")
+                    .h(px(120.0)),
+            ))
             .child(
                 self.check_row(
                     Checkbox::new("loop-exit")
@@ -33834,6 +34228,7 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("loop-run-now")
+                            .accessibility_id("muxel.loop-run-now")
                             .label(t("Run now"))
                             .icon(IconName::Play)
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -33842,26 +34237,31 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("save-loop")
+                            .accessibility_id("muxel.save-loop")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_loop(cx))),
                     )
-                    .child(Button::new("del-loop").ghost().label(t("Delete")).on_click(
-                        cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .loops
-                                .get(idx)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete loop?"),
-                                tf("The “{name}” loop will be deleted.", &[("name", &name)]),
-                                t("Delete"),
-                                ConfirmAction::DeleteLoop(idx),
-                                cx,
-                            )
-                        }),
-                    )),
+                    .child(
+                        Button::new("del-loop")
+                            .accessibility_id("muxel.del-loop")
+                            .ghost()
+                            .label(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let name = this
+                                    .loops
+                                    .get(idx)
+                                    .map(|l| l.name.clone())
+                                    .unwrap_or_default();
+                                this.request_confirm(
+                                    t("Delete loop?"),
+                                    tf("The “{name}” loop will be deleted.", &[("name", &name)]),
+                                    t("Delete"),
+                                    ConfirmAction::DeleteLoop(idx),
+                                    cx,
+                                )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -33906,6 +34306,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-remote")
+                .accessibility_id("muxel.add-remote")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add host"))
@@ -33945,6 +34346,7 @@ impl MuxelApp {
         let cred_picker = {
             let mut row = div().flex().flex_wrap().gap_1().child(
                 Button::new("cred-inline")
+                    .accessibility_id("muxel.cred-inline")
                     .ghost()
                     .selected(ui.s_identity_id.is_none())
                     .label(t("Inline"))
@@ -33975,19 +34377,25 @@ impl MuxelApp {
             .w_full()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_name).accessibility_id("muxel.input.s_name"),
+            ))
             .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_host)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_host).accessibility_id("muxel.input.s_host"),
+            ))
             .child(self.settings_label(&t("Credentials"), cx))
             .child(cred_picker)
             .child(self.settings_label(&t("Port"), cx))
-            .child(Input::new(&ui.s_port));
+            .child(Input::new(&ui.s_port).accessibility_id("muxel.input.s_port"));
 
         if ui.s_identity_id.is_none() {
             // Inline credentials: user + auth + key/password on the host itself.
             form = form
                 .child(self.settings_label(&t("User"), cx))
-                .child(Self::wide_input(Input::new(&ui.s_user)))
+                .child(Self::wide_input(
+                    Input::new(&ui.s_user).accessibility_id("muxel.input.s_user"),
+                ))
                 .child(self.settings_label(&t("Authentication"), cx))
                 .child(
                     div()
@@ -34005,9 +34413,15 @@ impl MuxelApp {
                             .flex()
                             .gap_2()
                             .items_center()
-                            .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
+                            .child(
+                                v_flex().flex_1().child(
+                                    Input::new(&ui.s_identity)
+                                        .accessibility_id("muxel.input.s_identity"),
+                                ),
+                            )
                             .child(
                                 Button::new("remote-browse-key")
+                                    .accessibility_id("muxel.remote-browse-key")
                                     .ghost()
                                     .icon(IconName::Folder)
                                     .label(t("Browse"))
@@ -34024,7 +34438,9 @@ impl MuxelApp {
                 };
                 form = form
                     .child(self.settings_label(&t("Password"), cx))
-                    .child(Self::wide_input(Input::new(&ui.s_password)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.s_password).accessibility_id("muxel.input.s_password"),
+                    ))
                     .child(
                         div()
                             .text_xs()
@@ -34108,7 +34524,9 @@ impl MuxelApp {
                     .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
             )
             .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_jump)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_jump).accessibility_id("muxel.input.s_jump"),
+            ))
             .child(
                 self.check_row(
                     Checkbox::new("remote-forward-agent")
@@ -34175,14 +34593,22 @@ impl MuxelApp {
 
         form = form
             .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_strict)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_strict).accessibility_id("muxel.input.s_strict"),
+            ))
             .child(self.settings_label(
                 &t("Keepalive — ServerAliveInterval secs (blank = 20s default; 0 disables)"),
                 cx,
             ))
-            .child(Self::wide_input(Input::new(&ui.s_keepalive)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_keepalive).accessibility_id("muxel.input.s_keepalive"),
+            ))
             .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));
+            .child(Self::wide_input(
+                Input::new(&ui.s_extra)
+                    .accessibility_id("muxel.input.s_extra")
+                    .h(px(60.0)),
+            ));
 
         // Inline Test-connection result, above the buttons.
         form.children(match &self.settings_ui.s_test {
@@ -34220,6 +34646,7 @@ impl MuxelApp {
                 .pt_2()
                 .child(
                     Button::new("test-remote")
+                        .accessibility_id("muxel.test-remote")
                         .ghost()
                         .icon(IconName::Network)
                         .label(t("Test connection"))
@@ -34230,12 +34657,14 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("save-remote")
+                        .accessibility_id("muxel.save-remote")
                         .primary()
                         .label(t("Save"))
                         .on_click(cx.listener(|this, _e, window, cx| this.save_remote(window, cx))),
                 )
                 .child(
                     Button::new("del-remote")
+                        .accessibility_id("muxel.del-remote")
                         .ghost()
                         .label(t("Delete"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -34299,6 +34728,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-identity")
+                .accessibility_id("muxel.add-identity")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add identity"))
@@ -34342,9 +34772,13 @@ impl MuxelApp {
             .w_full()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.id_name).accessibility_id("muxel.input.id_name"),
+            ))
             .child(self.settings_label(&t("User"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_user)))
+            .child(Self::wide_input(
+                Input::new(&ui.id_user).accessibility_id("muxel.input.id_user"),
+            ))
             .child(self.settings_label(&t("Authentication"), cx))
             .child(
                 div()
@@ -34363,9 +34797,12 @@ impl MuxelApp {
                         .flex()
                         .gap_2()
                         .items_center()
-                        .child(v_flex().flex_1().child(Input::new(&ui.id_identity)))
+                        .child(v_flex().flex_1().child(
+                            Input::new(&ui.id_identity).accessibility_id("muxel.input.id_identity"),
+                        ))
                         .child(
                             Button::new("id-browse-key")
+                                .accessibility_id("muxel.id-browse-key")
                                 .ghost()
                                 .icon(IconName::Folder)
                                 .label(t("Browse"))
@@ -34382,7 +34819,9 @@ impl MuxelApp {
             };
             form = form
                 .child(self.settings_label(&t("Password"), cx))
-                .child(Self::wide_input(Input::new(&ui.id_password)))
+                .child(Self::wide_input(
+                    Input::new(&ui.id_password).accessibility_id("muxel.input.id_password"),
+                ))
                 .child(
                     div()
                         .text_xs()
@@ -34398,6 +34837,7 @@ impl MuxelApp {
                 .pt_2()
                 .child(
                     Button::new("save-identity")
+                        .accessibility_id("muxel.save-identity")
                         .primary()
                         .label(t("Save"))
                         .on_click(
@@ -34406,6 +34846,7 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("del-identity")
+                        .accessibility_id("muxel.del-identity")
                         .ghost()
                         .label(t("Delete"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -34440,7 +34881,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.p_name).accessibility_id("muxel.input.p_name"),
+            ))
             .child(self.settings_label(&t("Type"), cx))
             .child(
                 div()
@@ -34448,6 +34891,7 @@ impl MuxelApp {
                     .gap_1()
                     .child(
                         Button::new("pk-terminal")
+                            .accessibility_id("muxel.pk-terminal")
                             .ghost()
                             .selected(ui.p_kind == muxel_core::PresetKind::Terminal)
                             .label(t("Agent"))
@@ -34458,6 +34902,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("pk-browser")
+                            .accessibility_id("muxel.pk-browser")
                             .ghost()
                             .selected(ui.p_kind == muxel_core::PresetKind::Browser)
                             .label(t("Browser"))
@@ -34471,13 +34916,17 @@ impl MuxelApp {
                 v_flex()
                     .gap_2()
                     .child(self.settings_label(&t("Homepage URL"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_url)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_url).accessibility_id("muxel.input.p_url"),
+                    ))
             }))
             .children((ui.p_kind == muxel_core::PresetKind::Terminal).then(|| {
                 v_flex()
                     .gap_2()
                     .child(self.settings_label(&t("Program (blank = default shell)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_program)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_program).accessibility_id("muxel.input.p_program"),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -34487,14 +34936,20 @@ impl MuxelApp {
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Model"), cx))
-                                    .child(Input::new(&ui.p_model)),
+                                    .child(
+                                        Input::new(&ui.p_model)
+                                            .accessibility_id("muxel.input.p_model"),
+                                    ),
                             )
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Model flag"), cx))
-                                    .child(Input::new(&ui.p_model_flag)),
+                                    .child(
+                                        Input::new(&ui.p_model_flag)
+                                            .accessibility_id("muxel.input.p_model_flag"),
+                                    ),
                             ),
                     )
                     .child(
@@ -34506,20 +34961,32 @@ impl MuxelApp {
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Effort"), cx))
-                                    .child(Input::new(&ui.p_effort)),
+                                    .child(
+                                        Input::new(&ui.p_effort)
+                                            .accessibility_id("muxel.input.p_effort"),
+                                    ),
                             )
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Effort flag"), cx))
-                                    .child(Input::new(&ui.p_effort_flag)),
+                                    .child(
+                                        Input::new(&ui.p_effort_flag)
+                                            .accessibility_id("muxel.input.p_effort_flag"),
+                                    ),
                             ),
                     )
                     .child(self.settings_label(&t("Extra arguments"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_args)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_args).accessibility_id("muxel.input.p_args"),
+                    ))
                     .child(self.settings_label(&t("System prompt"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_prompt)
+                            .accessibility_id("muxel.input.p_prompt")
+                            .h(px(72.0)),
+                    ))
                     .child(self.settings_label(&t("System-prompt injection"), cx))
                     .child(
                         div()
@@ -34527,6 +34994,7 @@ impl MuxelApp {
                             .gap_1()
                             .child(
                                 Button::new("inj-none")
+                                    .accessibility_id("muxel.inj-none")
                                     .ghost()
                                     .selected(matches!(inj, InjectionMode::None))
                                     .label(t("None"))
@@ -34536,6 +35004,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("inj-flag")
+                                    .accessibility_id("muxel.inj-flag")
                                     .ghost()
                                     .selected(is_flag)
                                     .label(t("CLI flag"))
@@ -34550,6 +35019,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("inj-typein")
+                                    .accessibility_id("muxel.inj-typein")
                                     .ghost()
                                     .selected(matches!(inj, InjectionMode::TypeIn))
                                     .label(t("Type-in"))
@@ -34576,18 +35046,34 @@ impl MuxelApp {
                         v_flex()
                             .gap_1()
                             .child(self.settings_label(&t("Injection flag"), cx))
-                            .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
+                            .child(Self::wide_input(
+                                Input::new(&ui.p_inj_flag)
+                                    .accessibility_id("muxel.input.p_inj_flag"),
+                            ))
                     }))
                     .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_env)
+                            .accessibility_id("muxel.input.p_env")
+                            .h(px(60.0)),
+                    ))
                     .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_working_markers)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_working_markers)
+                            .accessibility_id("muxel.input.p_working_markers"),
+                    ))
                     .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_blocked_markers)
+                            .accessibility_id("muxel.input.p_blocked_markers"),
+                    ))
                     .child(
                         self.settings_label(&t("Runner startup delay (ms after first output)"), cx),
                     )
-                    .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_startup_delay)
+                            .accessibility_id("muxel.input.p_startup_delay"),
+                    ))
             }))
             .child(
                 div()
@@ -34596,12 +35082,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-preset")
+                            .accessibility_id("muxel.save-preset")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_preset(cx))),
                     )
                     .child(
                         Button::new("dup-preset")
+                            .accessibility_id("muxel.dup-preset")
                             .ghost()
                             .label(t("Duplicate"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -34610,6 +35098,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("del-preset")
+                            .accessibility_id("muxel.del-preset")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -34785,7 +35274,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&self.settings_ui.proj_name)))
+            .child(Self::wide_input(
+                Input::new(&self.settings_ui.proj_name).accessibility_id("muxel.input.proj_name"),
+            ))
             .child(self.settings_label(&t("Folder"), cx))
             .child(
                 div()
@@ -34795,6 +35286,7 @@ impl MuxelApp {
                     .child(div().flex_1().min_w_0().text_sm().child(root))
                     .child(
                         Button::new("change-folder")
+                            .accessibility_id("muxel.change-folder")
                             .ghost()
                             .label(t("Change…"))
                             .on_click(cx.listener(|this, _e, window, cx| {
@@ -34835,12 +35327,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-project")
+                            .accessibility_id("muxel.save-project")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_project(cx))),
                     )
                     .child(
                         Button::new("del-project")
+                            .accessibility_id("muxel.del-project")
                             .ghost()
                             .label(t("Delete project"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -34890,7 +35384,12 @@ impl MuxelApp {
                     .child(
                         self.settings_label(&t("Pass these keys through to the focused terminal"), cx),
                     )
-                    .child(div().w(form_w).child(Input::new(&self.settings_ui.passthrough_keys))),
+                    .child(
+                        div().w(form_w).child(
+                            Input::new(&self.settings_ui.passthrough_keys)
+                                .accessibility_id("muxel.input.passthrough_keys"),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -34905,6 +35404,7 @@ impl MuxelApp {
             .child(
                 div().pt_2().flex().items_center().gap_3().child(
                     Button::new("apply-keys")
+                        .accessibility_id("muxel.apply-keys")
                         .primary()
                         .label(t("Apply keybindings"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_keybindings(cx))),
@@ -35432,6 +35932,7 @@ impl Render for MuxelApp {
                             .shadow_md()
                             .child(
                                 Button::new("fullscreen-reveal-sidebar")
+                                    .accessibility_id("muxel.fullscreen-reveal-sidebar")
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
