@@ -1434,12 +1434,15 @@ impl MuxelApp {
     }
 }
 
-/// What a lookup batch's Grok panes carry from the UI.
+/// What a lookup batch's Grok panes carry from the UI. Grok is looked up only
+/// on Windows; elsewhere this is empty.
 #[derive(Default)]
 struct GrokInputs {
     /// Each pane's previous registry read, as `(started, finished)`.
+    #[cfg(windows)]
     previous_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
     /// A watcher reports every registry write, so ancestry is reused longer.
+    #[cfg(windows)]
     watched: bool,
 }
 
