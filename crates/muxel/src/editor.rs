@@ -6,7 +6,7 @@
 use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
+use gpui_component::input::{Input, InputEvent, InputState, Position, RopeExt as _, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
 use std::path::{Path, PathBuf};
@@ -478,10 +478,10 @@ impl EditorView {
     }
 
     /// Swap in the file's contents from disk, keeping the cursor and scroll
-    /// position, and without moving focus. Putting the cursor back focuses the
-    /// input (gpui-component's `set_cursor_position` does), so the window's
-    /// focus is noted first and given back if that moved it. Otherwise a file
-    /// an agent rewrites while it's open in a clean editor takes the keys from
+    /// position, and without moving focus. The cursor goes back with
+    /// `set_selected_range`, which only moves it. gpui-component's
+    /// `set_cursor_position` also focuses the input, and then a file an agent
+    /// rewrites while it's open in a clean editor would take the keys from
     /// whatever had them, the agent's own terminal included.
     fn replace_disk_content(
         &mut self,
@@ -492,20 +492,14 @@ impl EditorView {
         if &*self.input.read(cx).value() == content.as_str() {
             return;
         }
-        let focused = window.focused(cx);
         self.input.update(cx, |s, cx| {
             let offset = s.scroll_offset();
             let cursor = s.cursor_position();
             s.set_value(content, window, cx);
             s.set_scroll_offset(offset, cx);
-            s.set_cursor_position(cursor, window, cx);
+            let at = s.text().position_to_offset(&cursor);
+            s.set_selected_range(at..at, cx);
         });
-        if window.focused(cx) != focused {
-            match &focused {
-                Some(handle) => window.focus(handle, cx),
-                None => window.blur(cx),
-            }
-        }
         self.dirty = false;
         cx.notify();
     }
@@ -777,7 +771,8 @@ pub fn language_for_path(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskChange, EditorConfig, EditorView, disk_stamp, language_for_path, read_disk_change,
+        DiskChange, EditorConfig, EditorView, Position, disk_stamp, language_for_path,
+        read_disk_change,
     };
     use gpui::{
         AppContext, Context, Entity, FocusHandle, IntoElement, Render, TestAppContext, Window,
@@ -907,6 +902,22 @@ mod tests {
                 .unwrap();
         }
 
+        fn cursor(&self) -> Position {
+            self.editor
+                .read_with(&self.cx, |editor, cx| editor.cursor(cx))
+        }
+
+        fn goto(&mut self, line: u32, character: u32) {
+            let editor = self.editor.clone();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.goto_position(line, character, window, cx)
+                    })
+                })
+                .unwrap();
+        }
+
         /// The disk poll finding the file rewritten as `text`, by an agent say.
         /// The poll compares modified time and length, and a quick rewrite can
         /// keep the time, so `text` is a different length from what's there.
@@ -976,5 +987,18 @@ mod tests {
         assert_eq!(reload.focused(), None);
         reload.poll("two lines\n");
         assert_eq!(reload.focused(), None, "the poll's reload took focus");
+    }
+
+    #[test]
+    fn a_reload_from_disk_keeps_the_cursor_on_its_line() {
+        let mut reload = Reload::new("cursor");
+        reload.poll("one\nsecond line\n");
+        reload.goto(1, 5);
+        // The line above the cursor grows.
+        reload.poll("one more\nsecond line\n");
+        assert_eq!(reload.cursor(), Position::new(1, 5));
+        // The cursor's own line shrinks past it, leaving it at the line's end.
+        reload.poll("one more\nsec\n");
+        assert_eq!(reload.cursor(), Position::new(1, 3));
     }
 }
