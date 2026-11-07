@@ -2,10 +2,61 @@ use muxel_core::{LeafData, PaneNode, SplitDirection, remove};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+/// What one close group's hide did to one project's live layout: the layout
+/// just before it took its panes out, and just after.
+pub(super) struct LiveHide {
+    pub before: Option<PaneNode>,
+    pub after: Option<PaneNode>,
+}
+
+/// Undo one close group in one project. While the live layout is still what
+/// the hide left, the layout from just before it goes back exactly, less any of
+/// its panes whose close went final. Otherwise the layout changed since, and
+/// [`restore_layout`] replays the closes over the durable snapshot.
+pub(super) fn restore_hidden(
+    current: &mut Option<PaneNode>,
+    hide: Option<&LiveHide>,
+    original: &Option<PaneNode>,
+    restoring: &HashSet<Uuid>,
+    closed: &[Uuid],
+) {
+    let present: HashSet<_> = current
+        .as_ref()
+        .map(PaneNode::collect_instances)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !restoring.iter().any(|id| !present.contains(id)) {
+        return;
+    }
+    if let Some(hide) = hide
+        && same(current, &hide.after)
+    {
+        let mut restored = hide.before.clone();
+        remove_in_close_order(
+            &mut restored,
+            |id| !present.contains(id) && !restoring.contains(id),
+            closed,
+        );
+        *current = restored;
+        return;
+    }
+    restore_layout(current, original, restoring, closed);
+}
+
+/// The same layout, up to float rounding in the sizes.
+fn same(a: &Option<PaneNode>, b: &Option<PaneNode>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_layout(b),
+        (a, b) => a.is_none() && b.is_none(),
+    }
+}
+
 /// Restore held instances without replaying layout edits made during the hold.
 /// Capture `original` from the durable layout (including earlier held groups),
 /// so independent groups retain the topology needed for either restoration order.
-/// `closed` lists every held pane, across groups, in the order it was closed.
+/// `closed` lists the panes closed since the snapshots were taken, held or
+/// final, in the order they closed.
 pub(super) fn restore_layout(
     current: &mut Option<PaneNode>,
     original: &Option<PaneNode>,
@@ -31,11 +82,7 @@ pub(super) fn restore_layout(
     remove_in_close_order(&mut expected, |id| !present.contains(id), closed);
     // Sizes added in another order can still round differently. Compare up to
     // that rounding.
-    let unchanged = match (current.as_ref(), expected.as_ref()) {
-        (Some(current), Some(expected)) => current.same_layout(expected),
-        (current, expected) => current.is_none() && expected.is_none(),
-    };
-    if unchanged {
+    if same(current, &expected) {
         let mut restored = original.clone();
         remove_in_close_order(
             &mut restored,
@@ -62,20 +109,21 @@ pub(super) fn restore_layout(
     }
 }
 
-/// Remove the panes `leaving` picks from `layout`: those that left without a
-/// held close first, in reading order, then held ones in the order they closed.
+/// Remove the panes `leaving` picks from `layout`: those that left without
+/// closing (a popout, say) first, in reading order, then closed ones in the
+/// order they closed.
 fn remove_in_close_order(
     layout: &mut Option<PaneNode>,
     leaving: impl Fn(&Uuid) -> bool,
     closed: &[Uuid],
 ) {
-    let held: HashSet<_> = closed.iter().copied().collect();
+    let recorded: HashSet<_> = closed.iter().copied().collect();
     let others: Vec<_> = layout
         .as_ref()
         .map(PaneNode::collect_instances)
         .unwrap_or_default()
         .into_iter()
-        .filter(|id| !held.contains(id))
+        .filter(|id| !recorded.contains(id))
         .collect();
     for id in others.iter().chain(closed) {
         if leaving(id) {
@@ -203,6 +251,8 @@ fn matching_leaf<'a>(node: &'a mut PaneNode, original: &LeafData) -> Option<&'a 
     }
 }
 
+/// Put `restored` beside `target`, taking `restored_size` against
+/// `survivor_size` of the place `target` fills. That place keeps its size.
 fn insert_beside(
     target: &mut PaneNode,
     restored: PaneNode,
@@ -218,9 +268,21 @@ fn insert_beside(
     } = target
         && *existing == direction
     {
+        // Already a row: its panes give up the restored pane's share and keep
+        // their proportions among themselves.
+        let pair = restored_size + survivor_size;
+        let share = if pair > 0.0 {
+            restored_size / pair
+        } else {
+            0.5
+        };
+        let width: f32 = sizes.iter().sum();
+        for size in sizes.iter_mut() {
+            *size *= 1.0 - share;
+        }
         let index = if before { 0 } else { children.len() };
         children.insert(index, restored);
-        sizes.insert(index, restored_size);
+        sizes.insert(index, width * share);
         return;
     }
     let survivor = std::mem::replace(
@@ -628,9 +690,13 @@ mod tests {
             current.as_ref().unwrap().collect_instances(),
             [id(4), id(5), id(3)]
         );
+        let restored = sizes(&current);
+        let [four, five, three] = restored[..] else {
+            panic!("expected three columns: {restored:?}");
+        };
         // 2 is still held, so 3's width belongs where 2's went: to 4, not to
         // the new pane beside it.
         assert!(remove(&mut current, id(3)));
-        assert_eq!(sizes(&current), [1.5, 1.0]);
+        assert_eq!(sizes(&current), [four + three, five]);
     }
 }
