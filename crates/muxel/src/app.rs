@@ -35,8 +35,8 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, SidebarEntry, SidebarSort, instances_by_id, is_unread, notification_in_feed,
-    sidebar_order, unread_count,
+    ActivityBand, FocusHold, SidebarEntry, SidebarSort, instances_by_id, is_unread,
+    notification_in_feed, sidebar_order, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -6216,6 +6216,9 @@ pub struct MuxelApp {
     restoring_activity: HashSet<Uuid>,
     /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
     dormant_instances: HashSet<Uuid>,
+    /// The focused session's place in Recent work, taken before focus first
+    /// attends it and kept until focus leaves ([`FocusHold`]).
+    sidebar_hold: Option<FocusHold>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8730,6 +8733,7 @@ impl MuxelApp {
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
+            sidebar_hold: None,
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -13045,17 +13049,21 @@ impl MuxelApp {
                 .terminals
                 .get(&iid)
                 .is_some_and(|view| view.read(cx).has_visible_content());
-        if attend
-            && can_attend
-            && let Some(instance) = self.workspace.instance_mut(iid)
-        {
+        // Focus has left the held session, so its row takes its own place.
+        if self.sidebar_hold.is_some_and(|hold| hold.id != iid) {
+            self.sidebar_hold = None;
+        }
+        if attend && can_attend {
             let now = chrono::Utc::now().timestamp_millis();
-            if attend_agent_activity(
-                &mut instance.activity,
-                self.last_status.get(&iid).map(|seen| seen.status),
-                runtime_completion,
-                now,
-            ) {
+            self.hold_sidebar_place(iid, now, cx);
+            if let Some(instance) = self.workspace.instance_mut(iid)
+                && attend_agent_activity(
+                    &mut instance.activity,
+                    self.last_status.get(&iid).map(|seen| seen.status),
+                    runtime_completion,
+                    now,
+                )
+            {
                 self.persist();
             }
         }
@@ -14664,6 +14672,15 @@ impl MuxelApp {
         // (rather than a respawn that's about to fail again on a still-down host).
         const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
+        // Focus has left the held session, so its row takes its own place. A
+        // pop-out's hold ends with its window's focus (`sync_popout_activity`).
+        if self
+            .sidebar_hold
+            .is_some_and(|hold| Some(hold.id) != focused && !self.popouts.contains_key(&hold.id))
+        {
+            self.sidebar_hold = None;
+            dirty = true;
+        }
         let mut status_notify_generation = None;
         let mut status_transition_count = 0;
         let mut activity_changed = false;
@@ -14697,6 +14714,9 @@ impl MuxelApp {
             let pane_active = Some(iid) == focused;
             let owning_window_active = self.instance_window_active(iid);
             let attended = owning_window_active && pane_active;
+            if attended {
+                self.hold_sidebar_place(iid, now_epoch, cx);
+            }
             let (preserve_restored, keep_restore_guard) =
                 restored_activity_sample(restoring, submitted_turn, raw_status);
             if !keep_restore_guard {
@@ -23486,6 +23506,34 @@ impl MuxelApp {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
+    /// The status a sidebar row shows. A dormant PTY shows the state it was
+    /// saved in; any other pane without a live terminal shows Idle, or Done once
+    /// it has finished a turn.
+    fn sidebar_status(&self, iid: Uuid, instance: Option<&Instance>, cx: &App) -> AgentStatus {
+        let restoring = self.restoring_activity.contains(&iid);
+        let status = match self.terminal_view(iid) {
+            Some(view) => shown_terminal_status(view.read(cx), instance, restoring),
+            None if self.is_dormant(iid) => {
+                instance.map_or(AgentStatus::Idle, |i| saved_activity_status(&i.activity))
+            }
+            None => AgentStatus::Idle,
+        };
+        persisted_status(status, instance, restoring)
+    }
+
+    /// Take the Recent work hold for `iid` as focus first attends it, so
+    /// reading it can't move its row. A session already held keeps its hold.
+    fn hold_sidebar_place(&mut self, iid: Uuid, now: i64, cx: &App) {
+        if self.sidebar_hold.is_some_and(|hold| hold.id == iid) {
+            return;
+        }
+        let Some(instance) = self.workspace.instance(iid) else {
+            return;
+        };
+        let shown = activity_state(self.sidebar_status(iid, Some(instance), cx));
+        self.sidebar_hold = Some(FocusHold::take(iid, &instance.activity, Some(shown), now));
+    }
+
     fn terminal_activity_sample(
         &self,
         iid: Uuid,
@@ -23546,6 +23594,13 @@ impl MuxelApp {
             let attended = window
                 .update(cx, |_, window, _| window.is_window_active())
                 .unwrap_or(false);
+            if attended {
+                self.hold_sidebar_place(iid, now, cx);
+            } else if self.sidebar_hold.is_some_and(|hold| hold.id == iid) {
+                // Focus has left the pop-out.
+                self.sidebar_hold = None;
+                updates.redraw = true;
+            }
             let mut record = self.last_status.get(&iid).copied();
             let (preserve, keep_guard) = restored_activity_sample(
                 sample.restoring,
@@ -28620,7 +28675,7 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
-                let shown: Vec<Uuid> = pane_ids
+                let visible: Vec<Uuid> = pane_ids
                     .iter()
                     .copied()
                     .filter(|iid| {
@@ -28629,7 +28684,22 @@ impl MuxelApp {
                             .is_none_or(|instance| self.session_matches_filter(project, instance))
                     })
                     .collect();
-                let entries = sidebar_order(&shown, &instances, now, sort);
+                let entries = {
+                    let app: &App = cx;
+                    // Rows place by the status they show, like their badges.
+                    let shown = |iid: Uuid| {
+                        let instance = instances.get(&iid).copied();
+                        Some(activity_state(self.sidebar_status(iid, instance, app)))
+                    };
+                    sidebar_order(
+                        &visible,
+                        &instances,
+                        &shown,
+                        self.sidebar_hold.as_ref(),
+                        now,
+                        sort,
+                    )
+                };
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
@@ -28681,52 +28751,34 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (agent_title, status) = if let Some(view) = self.terminal_view(iid) {
+                    let agent_title = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
-                        (
-                            inst.and_then(|instance| {
-                                let remote = self
-                                    .workspace
-                                    .project(instance.project_id)
-                                    .is_some_and(Project::is_remote);
-                                let live_title = view.title();
-                                let program_name = view.program_auto_title();
-                                authoritative_terminal_auto_title(
-                                    instance,
-                                    &self.codex_session_names,
-                                    remote,
-                                    live_title.as_deref(),
-                                    program_name.as_deref(),
-                                )
-                            }),
-                            shown_terminal_status(
-                                view,
-                                inst,
-                                self.restoring_activity.contains(&iid),
-                            ),
-                        )
+                        inst.and_then(|instance| {
+                            let remote = self
+                                .workspace
+                                .project(instance.project_id)
+                                .is_some_and(Project::is_remote);
+                            let live_title = view.title();
+                            let program_name = view.program_auto_title();
+                            authoritative_terminal_auto_title(
+                                instance,
+                                &self.codex_session_names,
+                                remote,
+                                live_title.as_deref(),
+                                program_name.as_deref(),
+                            )
+                        })
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (Some(ed.read(cx).title()), AgentStatus::Idle)
-                    } else if let Some(bv) = self.browsers.get(&iid) {
-                        (Some(bv.read(cx).tab_title()), AgentStatus::Idle)
+                        Some(ed.read(cx).title())
                     } else {
-                        (
-                            None,
-                            if self.is_dormant(iid) {
-                                inst.map(|i| saved_activity_status(&i.activity))
-                                    .unwrap_or(AgentStatus::Idle)
-                            } else {
-                                AgentStatus::Idle
-                            },
-                        )
+                        self.browsers.get(&iid).map(|bv| bv.read(cx).tab_title())
                     };
                     let tooltip =
                         inst.and_then(|instance| instance.name_tooltip(agent_title.as_deref()));
                     let app_title = agent_title.unwrap_or(meta);
-                    let status =
-                        persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let status = self.sidebar_status(iid, inst, cx);
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
