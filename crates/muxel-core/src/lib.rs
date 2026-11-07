@@ -148,13 +148,11 @@ impl AgentActivity {
         })
     }
 
-    /// Whether a completed turn is newer than the last time the pane was
-    /// attended. A missing attendance timestamp means the completion is unseen.
+    /// Whether the pane is Done and unread. Unread is [`sidebar::is_unread`], the
+    /// one read rule shared by the read pill, the unread mark and Recent work's
+    /// tiers. A missing attendance timestamp means the completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
-        self.current_state() == Some(AgentActivityState::Done)
-            && self
-                .completed_at
-                .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
+        self.current_state() == Some(AgentActivityState::Done) && sidebar::is_unread(self)
     }
 
     /// Apply one displayed-status transition. Returns whether durable state

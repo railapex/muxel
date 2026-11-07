@@ -515,7 +515,9 @@ feature is added or changed, update the matching entry here in the same change**
   supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  icon, dashboard, and notification dots. A **done** you haven't looked at stays
+  bright green; once you focus its pane, its sidebar and dashboard icons dim and
+  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
@@ -1380,9 +1382,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then whichever most recently finished or needed attention, in
-  Today (under 24 hours), This week (under seven days), and Older bands. Starting
-  a turn doesn't move a session, and neither does looking at it.
+  each project, then the rest in Today (under 24 hours), This week (under seven
+  days), and Older bands. Within a band, sessions that need you (unread, or
+  asking for something) come first, newest first; then working sessions in the
+  order each started, so one that starts a turn joins the bottom of them; then
+  the rest, newest finish first. A working session counts as Today however long
+  ago it last finished. The focused session keeps its place until focus moves
+  on, so reading it doesn't move it, unless it starts working.
   Sessions without work follow in layout order; project order and keyboard
   navigation stay the same. Live popped-out sessions remain in Recent work;
   their external-window icon marks rows that raise an existing window on click.
@@ -1405,8 +1411,10 @@ feature is added or changed, update the matching entry here in the same change**
   files.
 - **Unread sessions** — in Recent work, a dot and bold name mark a completion or
   blocked event since the session was last attended. Only attendance clears the
-  mark, even if another turn starts; Done persists. Project rows show the unread
-  count even when collapsed. Agent notifications appear on these session rows
+  mark, even if another turn starts; Done persists. The mark and a read done's
+  outline pill follow the same rule, so a done row's pill and mark always agree;
+  the mark also keeps an unseen finish or question visible after the agent moves
+  on. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
   instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
   and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a

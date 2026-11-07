@@ -35,8 +35,8 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, SidebarEntry, SidebarSort, instances_by_id, is_unread, notification_in_feed,
-    sidebar_order, unread_count,
+    ActivityBand, FocusHold, SidebarEntry, SidebarSort, instances_by_id, is_unread,
+    notification_in_feed, sidebar_order, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -781,6 +781,137 @@ fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     }
 }
 
+/// Opacity of a Done icon once its pane has been focused: still green, but faint
+/// enough that unread finishes stand out.
+const READ_DONE_OPACITY: f32 = 0.45;
+
+/// Whether a shown Done is one the user has already seen. It mirrors attention
+/// navigation: a Done that `attention_rank` would still visit is unread.
+fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
+    status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
+}
+
+/// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
+fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &App) -> Hsla {
+    let color = status_hsla(status, cx);
+    if done_is_read(status, activity) {
+        color.opacity(READ_DONE_OPACITY)
+    } else {
+        color
+    }
+}
+
+#[cfg(test)]
+mod read_done_contrast_tests {
+    use super::READ_DONE_OPACITY;
+    use crate::theme;
+    use gpui::{Hsla, Rgba, TestAppContext};
+    use gpui_component::{Theme, ThemeRegistry};
+
+    fn luminance(c: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// `fg` composited over an opaque `bg`.
+    fn over(fg: Hsla, bg: Hsla) -> Rgba {
+        let (f, b) = (fg.to_rgb(), bg.to_rgb());
+        let a = f.a;
+        Rgba {
+            r: f.r * a + b.r * (1.0 - a),
+            g: f.g * a + b.g * (1.0 - a),
+            b: f.b * a + b.b * (1.0 - a),
+            a: 1.0,
+        }
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    fn hex(c: Rgba) -> String {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+    }
+
+    /// Every bundled theme keeps a read finish visible: the outline pill's label
+    /// stays at least as legible as the theme's weakest green text, and the
+    /// dimmed icon stays visible yet fainter than an unread one. Set
+    /// `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors for review.
+    #[test]
+    fn read_done_stays_legible_in_every_bundled_theme() {
+        let cx = TestAppContext::single();
+        let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::register_bundled_themes(cx);
+            let configs: Vec<_> = ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .cloned()
+                .collect();
+            assert!(!configs.is_empty());
+            let mut rows = Vec::new();
+            for config in configs {
+                Theme::global_mut(cx).apply_config(&config);
+                let t = Theme::global(cx);
+                let bg = over(t.sidebar, t.background);
+                let on_bg = |c: Hsla| over(c, bg.into());
+                let unread_icon = on_bg(t.success);
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let filled = on_bg(t.success);
+                let filled_text = over(t.success_foreground, filled.into());
+                // The read pill's label is the unread icon's green on the sidebar.
+                let (label, read) = (contrast(unread_icon, bg), contrast(read_icon, bg));
+                let name = &config.name;
+                assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
+                assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
+                assert!(label > read, "{name}: read icon is not fainter than unread");
+                rows.push(format!(
+                    concat!(
+                        r#"{{"name":"{}","bg":"{}","fg":"{}","muted":"{}","success":"{}","#,
+                        r#""successFg":"{}","readIcon":"{}","secondary":"{}","secondaryFg":"{}","#,
+                        r#""border":"{}","outline":{:.2},"filled":{:.2},"readIconC":{:.2}}}"#
+                    ),
+                    name,
+                    hex(bg),
+                    hex(on_bg(t.sidebar_foreground)),
+                    hex(on_bg(t.muted_foreground)),
+                    hex(filled),
+                    hex(filled_text),
+                    hex(read_icon),
+                    hex(on_bg(t.secondary)),
+                    hex(over(t.secondary_foreground, on_bg(t.secondary).into())),
+                    hex(on_bg(t.border)),
+                    label,
+                    contrast(filled_text, filled),
+                    read,
+                ));
+            }
+            if let Some(path) = &swatches {
+                std::fs::write(
+                    path,
+                    format!(
+                        "[{}]",
+                        rows.join(
+                            ",
+"
+                        )
+                    ),
+                )
+                .unwrap();
+            }
+        });
+    }
+}
+
 fn activity_state(status: AgentStatus) -> AgentActivityState {
     match status {
         AgentStatus::Working => AgentActivityState::Working,
@@ -906,8 +1037,9 @@ fn attend_agent_activity(
 mod restored_activity_tests {
     use super::{
         AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
+        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample,
+        unprompted_report_working,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1213,6 +1345,26 @@ mod restored_activity_tests {
             blocked.activity.current_state(),
             Some(AgentActivityState::Idle)
         );
+    }
+
+    #[test]
+    fn only_an_attended_done_reads_as_read() {
+        let read = attended_completion();
+        assert!(done_is_read(AgentStatus::Done, Some(&read.activity)));
+
+        // A finish after the last focus is unread again.
+        let mut unread = attended_completion();
+        unread.activity.last_attended_at = Some(100);
+        assert!(!done_is_read(AgentStatus::Done, Some(&unread.activity)));
+
+        // Runtime Done ahead of the durable record, or no record, is unread.
+        let fresh = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        assert!(!done_is_read(AgentStatus::Done, Some(&fresh.activity)));
+        assert!(!done_is_read(AgentStatus::Done, None));
+
+        // Other states are never dimmed.
+        assert!(!done_is_read(AgentStatus::Idle, Some(&read.activity)));
+        assert!(!done_is_read(AgentStatus::Working, Some(&read.activity)));
     }
 
     #[test]
@@ -5859,6 +6011,9 @@ pub struct MuxelApp {
     last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
+    /// The focused session's place in Recent work, taken before focus first
+    /// attends it and kept until focus leaves ([`FocusHold`]).
+    sidebar_hold: Option<FocusHold>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8318,6 +8473,7 @@ impl MuxelApp {
             last_status: HashMap::new(),
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
+            sidebar_hold: None,
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -12500,17 +12656,21 @@ impl MuxelApp {
                 .terminals
                 .get(&iid)
                 .is_some_and(|view| view.read(cx).has_visible_content());
-        if attend
-            && can_attend
-            && let Some(instance) = self.workspace.instance_mut(iid)
-        {
+        // Focus has left the held session, so its row takes its own place.
+        if self.sidebar_hold.is_some_and(|hold| hold.id != iid) {
+            self.sidebar_hold = None;
+        }
+        if attend && can_attend {
             let now = chrono::Utc::now().timestamp_millis();
-            if attend_agent_activity(
-                &mut instance.activity,
-                self.last_status.get(&iid).map(|seen| seen.status),
-                runtime_completion,
-                now,
-            ) {
+            self.hold_sidebar_place(iid, now, cx);
+            if let Some(instance) = self.workspace.instance_mut(iid)
+                && attend_agent_activity(
+                    &mut instance.activity,
+                    self.last_status.get(&iid).map(|seen| seen.status),
+                    runtime_completion,
+                    now,
+                )
+            {
                 self.persist();
             }
         }
@@ -14156,6 +14316,15 @@ impl MuxelApp {
         // (rather than a respawn that's about to fail again on a still-down host).
         const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
+        // Focus has left the held session, so its row takes its own place. A
+        // pop-out's hold ends with its window's focus (`sync_popout_activity`).
+        if self
+            .sidebar_hold
+            .is_some_and(|hold| Some(hold.id) != focused && !self.popouts.contains_key(&hold.id))
+        {
+            self.sidebar_hold = None;
+            dirty = true;
+        }
         let mut status_notify_generation = None;
         let mut status_transition_count = 0;
         let mut activity_changed = false;
@@ -14189,6 +14358,9 @@ impl MuxelApp {
             let pane_active = Some(iid) == focused;
             let owning_window_active = self.instance_window_active(iid);
             let attended = owning_window_active && pane_active;
+            if attended {
+                self.hold_sidebar_place(iid, now_epoch, cx);
+            }
             let (preserve_restored, keep_restore_guard) =
                 restored_activity_sample(restoring, submitted_turn, raw_status);
             if !keep_restore_guard {
@@ -22690,6 +22862,29 @@ impl MuxelApp {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
+    /// The status a sidebar row shows. A pane without a live terminal shows
+    /// Idle, or Done once it has finished a turn, whatever state it was saved in.
+    fn sidebar_status(&self, iid: Uuid, instance: Option<&Instance>, cx: &App) -> AgentStatus {
+        let restoring = self.restoring_activity.contains(&iid);
+        let status = self.terminal_view(iid).map_or(AgentStatus::Idle, |view| {
+            shown_terminal_status(view.read(cx), instance, restoring)
+        });
+        persisted_status(status, instance, restoring)
+    }
+
+    /// Take the Recent work hold for `iid` as focus first attends it, so
+    /// reading it can't move its row. A session already held keeps its hold.
+    fn hold_sidebar_place(&mut self, iid: Uuid, now: i64, cx: &App) {
+        if self.sidebar_hold.is_some_and(|hold| hold.id == iid) {
+            return;
+        }
+        let Some(instance) = self.workspace.instance(iid) else {
+            return;
+        };
+        let shown = activity_state(self.sidebar_status(iid, Some(instance), cx));
+        self.sidebar_hold = Some(FocusHold::take(iid, &instance.activity, Some(shown), now));
+    }
+
     fn terminal_activity_sample(
         &self,
         iid: Uuid,
@@ -22750,6 +22945,13 @@ impl MuxelApp {
             let attended = window
                 .update(cx, |_, window, _| window.is_window_active())
                 .unwrap_or(false);
+            if attended {
+                self.hold_sidebar_place(iid, now, cx);
+            } else if self.sidebar_hold.is_some_and(|hold| hold.id == iid) {
+                // Focus has left the pop-out.
+                self.sidebar_hold = None;
+                updates.redraw = true;
+            }
             let mut record = self.last_status.get(&iid).copied();
             let (preserve, keep_guard) = restored_activity_sample(
                 sample.restoring,
@@ -26140,7 +26342,7 @@ impl MuxelApp {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
                 let color = status
-                    .map(|s| status_hsla(s, cx))
+                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
                     .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
@@ -27654,7 +27856,22 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
-                let entries = sidebar_order(&pane_ids, &instances, now, sort);
+                let entries = {
+                    let app: &App = cx;
+                    // Rows place by the status they show, like their badges.
+                    let shown = |iid: Uuid| {
+                        let instance = instances.get(&iid).copied();
+                        Some(activity_state(self.sidebar_status(iid, instance, app)))
+                    };
+                    sidebar_order(
+                        &pane_ids,
+                        &instances,
+                        &shown,
+                        self.sidebar_hold.as_ref(),
+                        now,
+                        sort,
+                    )
+                };
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
@@ -27706,42 +27923,35 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminal_view(iid) {
+                    let app_title = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
-                        (
-                            inst.and_then(|instance| {
-                                let remote = self
-                                    .workspace
-                                    .project(instance.project_id)
-                                    .is_some_and(Project::is_remote);
-                                let live_title = view.title();
-                                let program_name = view.program_auto_title();
-                                authoritative_terminal_auto_title(
-                                    instance,
-                                    &self.codex_session_names,
-                                    remote,
-                                    live_title.as_deref(),
-                                    program_name.as_deref(),
-                                )
-                            })
-                            .unwrap_or(meta),
-                            shown_terminal_status(
-                                view,
-                                inst,
-                                self.restoring_activity.contains(&iid),
-                            ),
-                        )
+                        inst.and_then(|instance| {
+                            let remote = self
+                                .workspace
+                                .project(instance.project_id)
+                                .is_some_and(Project::is_remote);
+                            let live_title = view.title();
+                            let program_name = view.program_auto_title();
+                            authoritative_terminal_auto_title(
+                                instance,
+                                &self.codex_session_names,
+                                remote,
+                                live_title.as_deref(),
+                                program_name.as_deref(),
+                            )
+                        })
+                        .unwrap_or(meta)
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (ed.read(cx).title(), AgentStatus::Idle)
+                        ed.read(cx).title()
                     } else if let Some(bv) = self.browsers.get(&iid) {
-                        (bv.read(cx).tab_title(), AgentStatus::Idle)
+                        bv.read(cx).tab_title()
                     } else {
-                        (meta, AgentStatus::Idle)
+                        meta
                     };
-                    let status =
-                        persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let status = self.sidebar_status(iid, inst, cx);
+                    let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -27772,12 +27982,13 @@ impl MuxelApp {
                         .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            status_hsla(
+                            pane_status_hsla(
                                 if loading {
                                     AgentStatus::Working
                                 } else {
                                     status
                                 },
+                                inst.map(|i| &i.activity),
                                 cx,
                             ),
                         ))
@@ -27866,7 +28077,7 @@ impl MuxelApp {
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
-                                status_tag(
+                                let tag = status_tag(
                                     status,
                                     inst.map(|instance| {
                                         localized_activity_label(
@@ -27876,7 +28087,10 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                )
+                                );
+                                // A read finish keeps its green as an outline, so
+                                // the label stays legible on the sidebar.
+                                if read_done { tag.outline() } else { tag }
                             }))
                             .when(!popped_out, |row| {
                                 row.on_drag(DragInstance { iid }, move |_, offset, _, cx| {
