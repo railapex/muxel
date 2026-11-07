@@ -502,7 +502,9 @@ feature is added or changed, update the matching entry here in the same change**
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays
   bright green; once you focus its pane, its sidebar and dashboard icons dim and
-  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
+  its sidebar pill turns to a green outline, so unread finishes stand out. Filled
+  sidebar pills are opaque, with labels at 4.5:1 contrast or better in every
+  bundled theme. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
@@ -511,9 +513,7 @@ feature is added or changed, update the matching entry here in the same change**
   status bar. A marker-based agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
-  notification read without rewriting lifecycle state or age. Filled sidebar
-  status pills are opaque, with labels at 4.5:1 contrast or better in every
-  bundled theme. Sidebar badges include
+  notification read without rewriting lifecycle state or age. Sidebar badges include
   coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of

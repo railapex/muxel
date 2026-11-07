@@ -277,8 +277,11 @@ resolved first. The fill is the theme's status colour (primary, secondary,
 warning or success) made opaque over the sidebar background. The label keeps the
 theme's matching foreground when that reaches WCAG's 4.5:1 against the fill, and
 otherwise uses black or white, whichever contrasts more; one of them always
-reaches 4.5:1. Unlike `Tag`, the pill doesn't fade on hover. A bundled-theme test
-checks every status in every theme.
+reaches 4.5:1. Unlike `Tag`, the pill doesn't fade on hover. A Done the user has
+already read is drawn as an outline instead, the way `Tag::outline` draws it: no
+fill, with the theme's green as label and border. The bundled-theme contrast test
+holds every filled status's label to 4.5:1 and the read outline's label to a
+1.8:1 floor.
 
 ## Research probe
 

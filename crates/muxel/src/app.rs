@@ -794,11 +794,13 @@ fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &
 }
 
 #[cfg(test)]
-mod read_done_contrast_tests {
+mod status_pill_contrast_tests {
     use super::READ_DONE_OPACITY;
+    use super::status_badge::{outline_colors, pill_colors};
     use crate::theme;
     use gpui::{Hsla, Rgba, TestAppContext};
     use gpui_component::{Theme, ThemeRegistry};
+    use muxel_terminal::AgentStatus;
 
     fn luminance(c: Rgba) -> f32 {
         let lin = |v: f32| {
@@ -833,12 +835,14 @@ mod read_done_contrast_tests {
         format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
     }
 
-    /// Every bundled theme keeps a read finish visible: the outline pill's label
-    /// stays at least as legible as the theme's weakest green text, and the
-    /// dimmed icon stays visible yet fainter than an unread one. Set
-    /// `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors for review.
+    /// Every bundled theme keeps status pills legible. Each filled pill's label
+    /// reaches WCAG's 4.5:1 against its fill. A read finish stays visible: the
+    /// outline pill's label stays at least as legible as the theme's weakest
+    /// green text, and the dimmed icon stays visible yet fainter than an unread
+    /// one. Set `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors
+    /// for review.
     #[test]
-    fn read_done_stays_legible_in_every_bundled_theme() {
+    fn status_pills_stay_legible_in_every_bundled_theme() {
         let cx = TestAppContext::single();
         let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
         cx.update(|cx| {
@@ -851,18 +855,36 @@ mod read_done_contrast_tests {
                 .collect();
             assert!(!configs.is_empty());
             let mut rows = Vec::new();
+            let mut unreadable = Vec::new();
             for config in configs {
                 Theme::global_mut(cx).apply_config(&config);
                 let t = Theme::global(cx);
                 let bg = over(t.sidebar, t.background);
                 let on_bg = |c: Hsla| over(c, bg.into());
-                let unread_icon = on_bg(t.success);
-                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
-                let filled = on_bg(t.success);
-                let filled_text = over(t.success_foreground, filled.into());
-                // The read pill's label is the unread icon's green on the sidebar.
-                let (label, read) = (contrast(unread_icon, bg), contrast(read_icon, bg));
                 let name = &config.name;
+                // A filled pill's fill and label as they land on the sidebar.
+                let pill = |status| {
+                    let (fill, label, _) = pill_colors(status, t);
+                    let fill = on_bg(fill);
+                    (fill, over(label, fill.into()))
+                };
+                for status in [
+                    AgentStatus::Working,
+                    AgentStatus::Idle,
+                    AgentStatus::Blocked,
+                    AgentStatus::Done,
+                ] {
+                    let (fill, label) = pill(status);
+                    let ratio = contrast(label, fill);
+                    if ratio < 4.5 {
+                        unreadable.push(format!("{name}: {status:?} pill label {ratio:.2}:1"));
+                    }
+                }
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let (filled, filled_text) = pill(AgentStatus::Done);
+                // The read pill has no fill: its label sits on the sidebar.
+                let read_label = on_bg(outline_colors(AgentStatus::Done, t).1);
+                let (label, read) = (contrast(read_label, bg), contrast(read_icon, bg));
                 assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
                 assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
                 assert!(label > read, "{name}: read icon is not fainter than unread");
@@ -900,6 +922,7 @@ mod read_done_contrast_tests {
                 )
                 .unwrap();
             }
+            assert!(unreadable.is_empty(), "{}", unreadable.join("\n"));
         });
     }
 }
