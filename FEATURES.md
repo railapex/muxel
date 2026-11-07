@@ -476,13 +476,9 @@ feature is added or changed, update the matching entry here in the same change**
   status bar. A marker-based agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
-  notification read without rewriting lifecycle state or age. Badges use
-  readable, opaque labels over status-coloured backgrounds; label contrast is at
-  least 4.5:1 in every bundled theme. Done green fades at 10 minutes, one hour,
-  and one day after completion, keeping the label readable. Dashboard badges,
-  popout badges, and tab status dots use the same completion bands. Only visible
-  indicators schedule a wake at their next band edge; there is no periodic fade
-  redraw. Working and blocked never fade. Sidebar badges include
+  notification read without rewriting lifecycle state or age. Filled sidebar
+  status pills are opaque, with labels at 4.5:1 contrast or better in every
+  bundled theme. Sidebar badges include
   coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of

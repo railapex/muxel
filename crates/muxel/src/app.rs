@@ -92,6 +92,7 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
 use restart_guard::{PendingRestarts, RemoteRestartCompletion, RestartLease};
+use status_badge::status_tag;
 
 /// Capture tmux eligibility before removing a pane's metadata. An absent
 /// recorded name still permits the legacy remote-name fallback; a literal pane
@@ -5431,7 +5432,6 @@ struct TerminalSpawnMeta {
 type SessionResume = (Vec<String>, Option<PathBuf>);
 
 pub struct MuxelApp {
-    badge_clock: status_badge::BadgeClock,
     closing: HashMap<Uuid, HeldClose>,
     close_groups: Vec<CloseGroup>,
     close_requests: HashMap<Uuid, Uuid>,
@@ -5644,9 +5644,9 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
-    /// Sampled lifecycle presentation. Done tracks completion identity; only
-    /// visible badges schedule its age redraws.
-    last_activity_keys: HashMap<Uuid, muxel_core::status_badge::SampledActivityKey>,
+    /// Last rendered lifecycle copy per instance. Age labels change at coarse
+    /// minute/hour/day boundaries without changing the underlying status.
+    last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
@@ -6176,7 +6176,6 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
 /// plus the pane content. The title-bar X and native close hook route through
 /// the main app's recoverable-close rule. The Dock button re-docks it directly.
 struct PopoutView {
-    badge_clock: status_badge::BadgeClock,
     view: PaneView,
     iid: Uuid,
     /// Profiler-only correlation state. Keeping it on the root that owns the
@@ -6257,7 +6256,6 @@ impl PopoutView {
         Self {
             view,
             iid,
-            badge_clock: status_badge::BadgeClock::default(),
             profile_status,
             profile_window_active,
         }
@@ -6302,7 +6300,6 @@ struct SecondaryWindow {
 /// area for one project. All state lives in [`MuxelApp`]; render delegates into
 /// it so every existing `cx.listener` handler works unchanged in this window.
 struct WorkspaceWindow {
-    badge_clock: status_badge::BadgeClock,
     app: WeakEntity<MuxelApp>,
     pid: Uuid,
     display_uuid: Uuid,
@@ -6388,7 +6385,6 @@ impl WorkspaceWindow {
             app,
             pid,
             display_uuid,
-            badge_clock: status_badge::BadgeClock::default(),
             focus_handle: cx.focus_handle(),
             bounds_save_task: None,
         }
@@ -6402,21 +6398,12 @@ impl Render for WorkspaceWindow {
             let pid = self.pid;
             let focus = self.focus_handle.clone();
             app.update(cx, |app, cx| {
-                // Rendering helpers share MuxelApp, while wake ownership follows
-                // the actual window. Elements capture the scoped clock clone.
-                let main_clock = std::mem::replace(&mut app.badge_clock, self.badge_clock.clone());
-                let content = app.render_secondary_content(pid, &focus, window, cx);
-                app.badge_clock = main_clock;
-                content
+                app.render_secondary_content(pid, &focus, window, cx)
             })
         } else {
             div().into_any_element()
         };
-        ui_profile::finish_render(
-            ui_profile::RenderView::Workspace,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Workspace, _render, root)
     }
 }
 
@@ -6788,35 +6775,6 @@ impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
-        let badge = if let PaneView::Terminal(terminal) = &self.view {
-            let app = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade());
-            let (instance, restoring) = app.as_ref().map_or((None, false), |app| {
-                let app = app.read(cx);
-                (
-                    app.workspace.instance(self.iid),
-                    app.restoring_activity.contains(&self.iid),
-                )
-            });
-            let status = shown_terminal_status(terminal.read(cx), instance, restoring);
-            Some(
-                self.badge_clock.tag(
-                    status,
-                    instance
-                        .map(|i| {
-                            localized_activity_label(
-                                status,
-                                &i.activity,
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                        })
-                        .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                    instance.and_then(|i| i.activity.completed_at),
-                    cx,
-                ),
-            )
-        } else {
-            None
-        };
         let has_close_confirm = self.central_close_confirm(cx).is_some();
         // A native webview child draws above all gpui content, so it has to go
         // away while the close confirmation sits on top of it.
@@ -6894,7 +6852,6 @@ impl Render for PopoutView {
                                     .font_semibold()
                                     .child(title),
                             )
-                            .children(badge)
                             .child(
                                 div()
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -6924,11 +6881,7 @@ impl Render for PopoutView {
             )
             .child(div().flex_1().min_h_0().child(self.content(cx)))
             .children(self.render_central_close_confirm(cx));
-        ui_profile::finish_render(
-            ui_profile::RenderView::Popout,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Popout, _render, root)
     }
 }
 
@@ -8059,7 +8012,7 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
-            last_activity_keys: HashMap::new(),
+            last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
@@ -8092,7 +8045,6 @@ impl MuxelApp {
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
-            badge_clock: status_badge::BadgeClock::default(),
             _status_timer: status_timer,
             _loop_timer: loop_timer,
             _diff_timer: diff_timer,
@@ -13920,13 +13872,10 @@ impl MuxelApp {
                 }
             }
             if let Some(instance) = self.workspace.instance(iid) {
-                let key = muxel_core::status_badge::sampled_activity_key(
-                    activity_state(status),
-                    &instance.activity,
-                    now_epoch,
-                );
-                let previous = self.last_activity_keys.insert(iid, key.clone());
-                dirty |= previous.as_ref() != Some(&key);
+                let label =
+                    agent_activity_label(activity_state(status), &instance.activity, now_epoch);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                dirty |= previous_label.as_ref() != Some(&label);
             }
             dirty |= changed;
             if changed {
@@ -14242,7 +14191,7 @@ impl MuxelApp {
         self.last_status.retain(|iid, _| {
             terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
         });
-        self.last_activity_keys.retain(|iid, _| {
+        self.last_activity_labels.retain(|iid, _| {
             terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
         });
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
@@ -21724,13 +21673,10 @@ impl MuxelApp {
             }
             updates.persist |= effect.activity_changed;
             if let Some(instance) = self.workspace.instance(iid) {
-                let key = muxel_core::status_badge::sampled_activity_key(
-                    activity_state(sample.status),
-                    &instance.activity,
-                    now,
-                );
-                let previous = self.last_activity_keys.insert(iid, key.clone());
-                updates.redraw |= previous.as_ref() != Some(&key);
+                let label =
+                    agent_activity_label(activity_state(sample.status), &instance.activity, now);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                updates.redraw |= previous_label.as_ref() != Some(&label);
             }
             updates.redraw |= effect.changed;
         }
@@ -24342,19 +24288,6 @@ impl MuxelApp {
                                 px(12.0),
                                 cx.theme().muted_foreground,
                             ))
-                            .children(self.terminals.get(&tab).map(|terminal| {
-                                let instance = self.workspace.instance(tab);
-                                let status = shown_terminal_status(
-                                    terminal.read(cx),
-                                    instance,
-                                    self.restoring_activity.contains(&tab),
-                                );
-                                self.badge_clock.dot(
-                                    status,
-                                    instance.and_then(|i| i.activity.completed_at),
-                                    cx,
-                                )
-                            }))
                             // A tab in a worktree always shows its color dot.
                             .children(
                                 tab_wt_colors[i]
@@ -25087,6 +25020,9 @@ impl MuxelApp {
                 let status = self.terminals.get(&iid).map(|v| {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
+                let color = status
+                    .map(|s| status_hsla(s, cx))
+                    .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
                         .flex()
@@ -25103,13 +25039,7 @@ impl MuxelApp {
                                 this.focus_instance(iid, window, cx);
                             }),
                         )
-                        .child(self.badge_clock.icon(
-                            program.as_deref(),
-                            px(15.0),
-                            status.unwrap_or(AgentStatus::Idle),
-                            inst.and_then(|i| i.activity.completed_at),
-                            cx,
-                        ))
+                        .child(agent_icon(program.as_deref(), px(15.0), color))
                         .child(
                             div()
                                 .text_xs()
@@ -25117,21 +25047,21 @@ impl MuxelApp {
                                 .child(title),
                         )
                         .child(
-                            self.badge_clock.tag(
-                                status.unwrap_or(AgentStatus::Idle),
-                                status
-                                    .zip(inst)
-                                    .map(|(status, instance)| {
-                                        localized_activity_label(
-                                            status,
-                                            &instance.activity,
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| status_label(status).to_string()),
-                                inst.and_then(|i| i.activity.completed_at),
-                                cx,
-                            ),
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    status
+                                        .zip(inst)
+                                        .map(|(status, instance)| {
+                                            localized_activity_label(
+                                                status,
+                                                &instance.activity,
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|| status_label(status).to_string()),
+                                ),
                         ),
                 );
             }
@@ -25400,25 +25330,7 @@ impl MuxelApp {
         // Newest first.
         for n in self.notifications.iter().rev() {
             let nid = n.id;
-            let dot = if matches!(n.kind, NotifKind::Done | NotifKind::Blocked) {
-                self.badge_clock.dot(
-                    if n.kind == NotifKind::Done {
-                        AgentStatus::Done
-                    } else {
-                        AgentStatus::Blocked
-                    },
-                    n.instance
-                        .and_then(|iid| self.workspace.instance(iid))
-                        .and_then(|i| i.activity.completed_at),
-                    cx,
-                )
-            } else {
-                div()
-                    .size(px(8.0))
-                    .rounded_full()
-                    .bg(n.kind.dot(cx))
-                    .into_any_element()
-            };
+            let dot = n.kind.dot(cx);
             let title: SharedString = n.title.clone().into();
             let sub: SharedString = n.subtitle.clone().into();
             section = section.child(
@@ -25440,7 +25352,7 @@ impl MuxelApp {
                             this.open_notification(nid, window, cx)
                         }),
                     )
-                    .child(div().flex_none().child(dot))
+                    .child(div().size(px(8.0)).rounded_full().flex_none().bg(dot))
                     .child(
                         div()
                             .flex_1()
@@ -26692,18 +26604,17 @@ impl MuxelApp {
                         } else {
                             cx.theme().sidebar
                         })
-                        .child(self.badge_clock.icon(
+                        .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            if loading {
-                                AgentStatus::Working
-                            } else if stopped {
-                                AgentStatus::Idle
-                            } else {
-                                status
-                            },
-                            inst.and_then(|i| i.activity.completed_at),
-                            cx,
+                            status_hsla(
+                                if loading {
+                                    AgentStatus::Working
+                                } else {
+                                    status
+                                },
+                                cx,
+                            ),
                         ))
                         // Worktree dot (matches the pane outline color).
                         .children(
@@ -26757,21 +26668,11 @@ impl MuxelApp {
                                     .child(display),
                             )
                             .child(div().flex_none().child(if loading {
-                                self.badge_clock.tag(
-                                    AgentStatus::Working,
-                                    t("loading").to_string(),
-                                    None,
-                                    cx,
-                                )
+                                status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
-                                self.badge_clock.tag(
-                                    AgentStatus::Idle,
-                                    t("stopped").to_string(),
-                                    None,
-                                    cx,
-                                )
+                                status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
-                                self.badge_clock.tag(
+                                status_tag(
                                     status,
                                     inst.map(|instance| {
                                         localized_activity_label(
@@ -26781,8 +26682,6 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                    inst.and_then(|instance| instance.activity.completed_at),
-                                    cx,
                                 )
                             }))
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
@@ -34039,11 +33938,7 @@ impl Render for MuxelApp {
                         .child(self.render_terms_screen(cx)),
                 )
                 .into_any_element();
-            return ui_profile::finish_render(
-                ui_profile::RenderView::Main,
-                _render,
-                self.badge_clock.frame(root),
-            );
+            return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
         }
         if self.show_workspace_selector {
             let root = div()
@@ -34065,11 +33960,7 @@ impl Render for MuxelApp {
                         ),
                 )
                 .into_any_element();
-            return ui_profile::finish_render(
-                ui_profile::RenderView::Main,
-                _render,
-                self.badge_clock.frame(root),
-            );
+            return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
         }
         // Rebuild any editors/browsers awaiting re-dock (needs the main window).
         self.drain_editor_redocks(window, cx);
@@ -34467,11 +34358,7 @@ impl Render for MuxelApp {
             }))
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element();
-        ui_profile::finish_render(
-            ui_profile::RenderView::Main,
-            _render,
-            self.badge_clock.frame(root),
-        )
+        ui_profile::finish_render(ui_profile::RenderView::Main, _render, root)
     }
 }
 
