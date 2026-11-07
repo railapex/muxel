@@ -9,10 +9,12 @@
 
 mod accomplishments_view;
 mod app;
+mod binding_watch;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
 mod browser_storage;
+mod build_info;
 mod control;
 mod editor;
 mod filetree;
@@ -34,6 +36,7 @@ mod test_support;
 mod theme;
 mod tmux_install;
 mod tts;
+mod uat_root;
 mod ui_profile;
 mod update;
 mod user_data_dir;
@@ -229,20 +232,46 @@ pub(crate) fn window_options() -> WindowOptions {
 fn main() {
     // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
     // this process and all it starts. First, before any path is read or thread runs.
-    let args = match user_data_dir::configure(std::env::args_os().skip(1).collect()) {
+    // The private UAT alias is normalized before the public root policy runs.
+    let args = match uat_root::configure(std::env::args_os().skip(1).collect())
+        .and_then(user_data_dir::configure)
+    {
         Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(2);
         }
     };
-    // Answer version/help before GUI startup, after consuming isolation flags.
+    let identity = match muxel_core::build_identity::parse_identity_args(&args) {
+        Ok(command) => command,
+        Err(error) => {
+            #[cfg(windows)]
+            control::attach_parent_console();
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    // Validate identity arguments before version/help returns, after consuming
+    // isolation flags and before any endpoint or GUI initialization.
     if let Some(text) = cli_info(args.first().and_then(|arg| arg.to_str())) {
         #[cfg(windows)]
         control::attach_parent_console();
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+        return;
+    }
+    if let Some(command) = identity {
+        #[cfg(windows)]
+        control::attach_parent_console();
+        match command {
+            muxel_core::build_identity::IdentityCommand::Json => {
+                println!("{}", build_info::json_value());
+            }
+            muxel_core::build_identity::IdentityCommand::Version => {
+                println!("muxel {}", build_info::compact_label());
+            }
+        }
         return;
     }
     // `muxel ctl …` talks to the running app and exits; it never opens a window.
@@ -441,7 +470,7 @@ fn main() {
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
                     // shows "Unknown" in the title bar / window switcher.
-                    window.set_window_title("muxel");
+                    window.set_window_title(&build_info::native_window_title());
                     let view = cx.new(|cx| MuxelApp::new(window, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
