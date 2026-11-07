@@ -1374,7 +1374,8 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
+  position and leaves keyboard focus where it was, so an agent rewriting an open file
+  doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resources open beside their pane** — a file, diff or web page opened from a
