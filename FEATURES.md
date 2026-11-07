@@ -65,7 +65,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane maximized, as does closing or popping out the tab being shown while others
   remain. While a pane is maximized, selecting another agent (sidebar,
   notification, tray) moves the maximize to it, so that agent comes up full-size
-  instead of hiding behind.
+  instead of hiding behind. A file, diff or page that opens in another pane ends
+  the maximize, so it shows beside the pane that opened it.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 
@@ -73,6 +74,12 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
+  add the new agent as a tab in the focused pane, so starting an agent never adds
+  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
+  split buttons and dragging a tab to an edge still make a new pane. In a
+  per-monitor project window, the toolbar and shortcuts act on that window's
+  project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -730,7 +737,7 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  tab beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
@@ -743,7 +750,7 @@ feature is added or changed, update the matching entry here in the same change**
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
 - **Browser as a preset** — the built-in **Browser** preset opens a web-browser
-  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  pane; pick it anywhere you pick an agent (the toolbar's agent dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
@@ -803,8 +810,10 @@ feature is added or changed, update the matching entry here in the same change**
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
-  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
-  plain and prompt launches, retained on restart. The preset needs Model flag /
+  that project's toolbar preset. Run from one of that project's panes, the tab
+  joins the caller's own group; otherwise it joins the focused group.
+  `--model M` and `--effort E` select per-pane values for plain and prompt
+  launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
@@ -1190,13 +1199,20 @@ feature is added or changed, update the matching entry here in the same change**
   `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink` or agent markdown
   links), a literal Markdown inline link, a `file://` URI, or a **file path**
   (Windows/Unix absolute, `~/`, or relative to the pane's working directory).
-  Local files open in a muxel editor pane; only paths that exist are
+  It shows beside the terminal and the keys stay in the terminal; click into
+  the file or page to type there. Local files open in a muxel editor pane; only paths that exist are
   clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs. Right-clicking a
+  focus in any window. In a browser page, a middle-click or `Ctrl`/`Cmd`+click
+  on a link opens it in a background tab beside the page, and the page keeps the
+  keys; on Windows the link menu's **Open link in new tab**, in place of "Open
+  link in new window", does the same. A target=_blank link and window.open open
+  a tab in front. Page links open as Muxel tabs in the page's project, in the
+  window showing it, and a popped-out terminal's in its project's window. A page
+  opens only web links this way, never a local file or another app's link, and
+  no more than ten at once and about three a second after. Right-clicking a
   terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
@@ -1270,6 +1286,13 @@ feature is added or changed, update the matching entry here in the same change**
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text). Paragraphs combining inline
   images and line breaks render without crashing, including linked HTML images.
+  Links in rendered Markdown resolve against the file's folder (`other.md`,
+  `../src/main.rs#L10`, `my%20notes.md`) and open beside the file as a terminal
+  link does: a click shows it and keeps the keys where they are, and a
+  middle-click or `Ctrl`/`Cmd`+click opens it in the background. Web links
+  follow the built-in browser setting and `mailto:` links go to the mail app.
+  Other schemes, network paths and broken links do nothing, and a `#heading`
+  link doesn't scroll the file.
 - **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
   text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
   from a focused terminal.
@@ -1282,10 +1305,32 @@ feature is added or changed, update the matching entry here in the same change**
   position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
-- **Resource tab grouping** — files, diffs, and browser pages opened by default join
-  the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement. Opening another resource as a tab
-  preserves the surrounding split geometry, including narrow resource columns.
+- **Resources open beside their pane** — a file, diff or web page opened from a
+  pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
+  new-window link) opens as a tab in the pane next to it, whatever that pane
+  holds: the one on its right, or on its left when it sits at the right edge. A
+  link goes beside the pane it was clicked in, even one that didn't have focus.
+  A pane with no neighbour in its row splits once, and its later opens join that
+  new column. Opens with no pane behind them (the file browser, palette, find
+  panel, sidebar or git panel) join the nearest pane of the same type instead,
+  and so do links from a popped-out terminal, which has left the layout; those
+  open in the window showing the terminal's project. A terminal link's
+  Ctrl+click or **Open link**, and a click on a rendered Markdown link, show the
+  resource without taking the keys: it comes to the front of its group and every
+  window keeps its focus, even when the file jumps to a line or reloads. A
+  middle-click or **Open in new tab** opens it the same way in the background. A
+  tab holding a window's focus stays in front of its group either way. A file
+  already open anywhere, or a page already open in the same project, is
+  refreshed where it is. A foreground open, such as the file browser's or a
+  page's own new-window link, focuses it there: the window showing its project
+  comes to the front, or the main window switches to that project. When that's
+  another window, the one the link was clicked in keeps its own focus. A link
+  that shows a resource whose project no window shows opens it that way too,
+  since the main window has to switch to see it. A resource focused or shown in
+  the main window comes out from behind the Dashboard or another hotbar view. Explicit New
+  Tab and New Pane commands still use the requested placement. Opening a
+  resource as a tab preserves the surrounding split geometry, including narrow
+  resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
@@ -1309,8 +1354,9 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
-  changes", the project menu, or a worktree) rather than splitting off a new pane.
+  directory. From a pane's diff button it opens as a tab beside that pane; from
+  the project menu or a worktree's **View changes** it joins the nearest diff
+  tab, if there is one.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
@@ -1649,10 +1695,10 @@ feature is added or changed, update the matching entry here in the same change**
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
-  `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
-  to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
+  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+  switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
+  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits

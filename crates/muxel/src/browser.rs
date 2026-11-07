@@ -320,6 +320,163 @@ mod imp {
         })();
     "#;
 
+    /// Injected into each page's top frame before its own scripts run, with
+    /// `__ASK__` replaced by the view's background-open prefix, which carries
+    /// its random token, and `__MODIFIER__` by the key that makes a click a
+    /// background open (`ctrlKey`, or `metaKey` on macOS).
+    ///
+    /// A middle-click or Ctrl+click on a link asks the host for a background
+    /// tab and cancels the click, so the webview raises no new-window request
+    /// of its own. The page's code can post to the same channel, so:
+    /// - Only a trusted event counts. Page code can't make one.
+    /// - The token and the native post function are kept in this closure,
+    ///   taken before the page's own scripts run. A message the page posts
+    ///   lacks the token, and the host drops it ([`muxel_core::page_opens`]).
+    /// - Listeners sit on `window` in the bubble phase, so a page that
+    ///   handled the click itself (`defaultPrevented`) keeps it. One that stops
+    ///   the event's propagation gets today's foreground open.
+    /// - The link comes from `composedPath`, so one in an open shadow root
+    ///   counts. A download link, a link that isn't a web page, Shift (a new
+    ///   window) and Alt (a download) are left to the webview.
+    ///
+    /// Frames are left alone: WebView2 delivers only the top frame's messages.
+    const BACKGROUND_OPEN_SCRIPT: &str = r#"
+        (function () {
+          if (window !== window.top) return;
+          var native = (window.chrome && window.chrome.webview) ||
+            (window.webkit && window.webkit.messageHandlers &&
+             window.webkit.messageHandlers.ipc);
+          if (!native || typeof native.postMessage !== 'function') return;
+          var post = native.postMessage.bind(native);
+          var apply = Reflect.apply;
+          var path = Event.prototype.composedPath;
+          var Anchor = HTMLAnchorElement;
+          var Area = HTMLAreaElement;
+          var web = /^https?:/i;
+          var ask = '__ASK__';
+          function open(event) {
+            if (!event.isTrusted || event.defaultPrevented) return;
+            var nodes = apply(path, event, []);
+            for (var i = 0; i < nodes.length; i++) {
+              var node = nodes[i];
+              if (node instanceof Anchor || node instanceof Area) {
+                var href = node.href;
+                if (node.hasAttribute('download') || !web.test(href)) return;
+                try { post(ask + href); } catch (e) { return; }
+                event.preventDefault();
+                return;
+              }
+            }
+          }
+          window.addEventListener('auxclick', function (event) {
+            if (event.button === 1 && !event.shiftKey && !event.altKey) open(event);
+          });
+          window.addEventListener('click', function (event) {
+            if (event.button === 0 && event.__MODIFIER__ &&
+                !event.shiftKey && !event.altKey) open(event);
+          });
+        })();
+    "#;
+
+    /// [`BACKGROUND_OPEN_SCRIPT`] for the view with `token`.
+    fn background_open_script(token: &str) -> String {
+        let modifier = if cfg!(target_os = "macos") {
+            "metaKey"
+        } else {
+            "ctrlKey"
+        };
+        BACKGROUND_OPEN_SCRIPT
+            .replace(
+                "__ASK__",
+                &muxel_core::page_opens::background_open_message(token, ""),
+            )
+            .replace("__MODIFIER__", modifier)
+    }
+
+    /// Swap WebView2's "Open link in new window" on a web link for muxel's
+    /// "Open link in new tab", which opens it in the background. The built-in
+    /// item raises a new-window request with nothing to tell it from a
+    /// `target=_blank` click, so it would open in front. The item asks through
+    /// `background`, as the page script does, with the view's `token`.
+    #[cfg(target_os = "windows")]
+    fn offer_background_tab(
+        webview: &wry::WebView,
+        token: String,
+        background: std::sync::mpsc::Sender<(std::time::Instant, String)>,
+    ) -> windows_webview::core::Result<()> {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, ICoreWebView2_11,
+            ICoreWebView2Environment9,
+        };
+        use webview2_com::{ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler};
+        use windows_webview::Win32::System::Com::IStream;
+        use windows_webview::core::{BOOL, HSTRING, Interface as _, PWSTR};
+
+        let core = webview.webview().cast::<ICoreWebView2_11>()?;
+        let environment = webview.environment().cast::<ICoreWebView2Environment9>()?;
+        let label = HSTRING::from(t("Open link in new tab").as_ref());
+        let requested = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let target = unsafe { args.ContextMenuTarget()? };
+            let mut has_link = BOOL::default();
+            unsafe { target.HasLinkUri(&mut has_link)? };
+            if !has_link.as_bool() {
+                return Ok(());
+            }
+            let mut link = PWSTR::null();
+            unsafe { target.LinkUri(&mut link)? };
+            let link = webview2_com::take_pwstr(link);
+            if !muxel_core::page_opens::is_web_url(&link) {
+                return Ok(());
+            }
+            let items = unsafe { args.MenuItems()? };
+            let mut count = 0;
+            unsafe { items.Count(&mut count)? };
+            let mut built_in = None;
+            let mut names = Vec::new();
+            for index in 0..count {
+                let mut name = PWSTR::null();
+                unsafe { items.GetValueAtIndex(index)?.Name(&mut name)? };
+                let name = webview2_com::take_pwstr(name);
+                if name == "openLinkInNewWindow" {
+                    built_in = Some(index);
+                    break;
+                }
+                names.push(name);
+            }
+            let item = unsafe {
+                environment.CreateContextMenuItem(
+                    &label,
+                    None::<&IStream>,
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+                )?
+            };
+            let message = muxel_core::page_opens::background_open_message(&token, &link);
+            let background = background.clone();
+            let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                let _ = background.send((std::time::Instant::now(), message.clone()));
+                Ok(())
+            }));
+            let mut selected_token = 0;
+            unsafe { item.add_CustomItemSelected(&selected, &mut selected_token)? };
+            let at = match built_in {
+                Some(index) => {
+                    unsafe { items.RemoveValueAtIndex(index)? };
+                    index
+                }
+                None => {
+                    log::debug!("WebView2's link menu had no openLinkInNewWindow: {names:?}");
+                    0
+                }
+            };
+            unsafe { items.InsertValueAtIndex(at, &item) }
+        }));
+        let mut requested_token = 0;
+        unsafe { core.add_ContextMenuRequested(&requested, &mut requested_token) }
+    }
+
     const COPY_SCRIPT: &str = r#"
         (function () {
           // WebView2 hosted as a child window does not always run its built-in
@@ -370,9 +527,15 @@ mod imp {
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
         focus_events: std::sync::mpsc::Receiver<bool>,
-        /// URLs requested through target=_blank, window.open, Ctrl+click, or
-        /// middle-click. The app turns these into normal Muxel browser tabs.
+        /// URLs requested through target=_blank, window.open, or a middle-click
+        /// or Ctrl+click the page script left to the webview. The app turns
+        /// these into normal Muxel browser tabs.
         new_window_events: std::sync::mpsc::Receiver<String>,
+        /// Background-tab requests from the page script and the link menu,
+        /// each with when it arrived, for [`Self::take_background_opens`].
+        background_events: std::sync::mpsc::Receiver<(std::time::Instant, String)>,
+        /// This view's token, and the background opens it has allowed.
+        page_opens: muxel_core::page_opens::PageOpens,
     }
 
     impl BrowserView {
@@ -444,6 +607,13 @@ mod imp {
             let requested = url.clone();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
             let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
+            let (background_tx, background_events) = std::sync::mpsc::channel();
+            // Random per view, so a page's own messages can't ask for a tab.
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            let script = background_open_script(&token);
+            #[cfg(target_os = "windows")]
+            let menu = (token.clone(), background_tx.clone());
+            let page_opens = muxel_core::page_opens::PageOpens::new(token);
 
             cx.spawn_in(window, async move |this, cx| {
                 #[cfg(target_os = "windows")]
@@ -483,14 +653,32 @@ mod imp {
                                 wry::NewWindowResponse::Deny
                             });
                         #[cfg(target_os = "macos")]
-                        let builder = builder
-                            .with_initialization_script(PAGE_CLICK_SCRIPT)
-                            .with_ipc_handler(move |req| {
-                                if req.body().as_str() == CLICK_MSG {
-                                    let _ = focus_tx.send(true);
+                        let builder = builder.with_initialization_script(PAGE_CLICK_SCRIPT);
+                        #[cfg(target_os = "macos")]
+                        let page_focus = focus_tx.clone();
+                        let builder = builder.with_initialization_script(script).with_ipc_handler(
+                            move |req| {
+                                let body = req.body();
+                                #[cfg(target_os = "macos")]
+                                if body.as_str() == CLICK_MSG {
+                                    let _ = page_focus.send(true);
+                                    return;
                                 }
-                            });
+                                // Judged later, by `take_background_opens`.
+                                if body.starts_with(muxel_core::page_opens::BACKGROUND_OPEN) {
+                                    let _ = background_tx
+                                        .send((std::time::Instant::now(), body.clone()));
+                                }
+                            },
+                        );
                         let built = builder.build_as_child_async(parent).await.ok();
+
+                        #[cfg(target_os = "windows")]
+                        if let Some(webview) = built.as_ref()
+                            && let Err(error) = offer_background_tab(webview, menu.0, menu.1)
+                        {
+                            log::warn!("failed to change WebView2's link menu: {error}");
+                        }
 
                         #[cfg(target_os = "windows")]
                         if let Some(webview) = built.as_ref() {
@@ -604,16 +792,38 @@ mod imp {
                 last_profile_bounds: None,
                 focus_events,
                 new_window_events,
+                background_events,
+                page_opens,
             }
         }
 
         /// Drain page requests for a separate browsing context. Keeping this at
         /// the app boundary gives all browser entry points the same dedupe and
-        /// tab-placement policy.
+        /// tab-placement policy. A request for a link that just opened in the
+        /// background is dropped as that open's twin, in case the webview
+        /// raised one despite the page script cancelling the click, so call
+        /// [`Self::take_background_opens`] first.
         pub fn take_new_window_requests(&mut self) -> Vec<String> {
+            let now = std::time::Instant::now();
             let mut urls = Vec::new();
             while let Ok(url) = self.new_window_events.try_recv() {
-                urls.push(url);
+                if !self.page_opens.opened_lately(&url, now) {
+                    urls.push(url);
+                }
+            }
+            urls
+        }
+
+        /// Drain the web links the page asked to open in a background tab,
+        /// by a middle-click or Ctrl+click, or from the link menu. Each must
+        /// carry this view's token and keep within its rate
+        /// ([`muxel_core::page_opens::PageOpens::accept`]); the rest drop.
+        pub fn take_background_opens(&mut self) -> Vec<String> {
+            let mut urls = Vec::new();
+            while let Ok((at, message)) = self.background_events.try_recv() {
+                if let Some(url) = self.page_opens.accept(&message, at) {
+                    urls.push(url.to_string());
+                }
             }
             urls
         }
@@ -982,6 +1192,11 @@ mod imp {
 
         /// Linux has no embedded webview, so it cannot emit native popup requests.
         pub fn take_new_window_requests(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Nor background-tab requests.
+        pub fn take_background_opens(&mut self) -> Vec<String> {
             Vec::new()
         }
 
