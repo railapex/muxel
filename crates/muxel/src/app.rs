@@ -5526,6 +5526,10 @@ type SessionResume = (Vec<String>, Option<PathBuf>);
 pub struct MuxelApp {
     closing: HashMap<Uuid, HeldClose>,
     close_groups: Vec<CloseGroup>,
+    /// Every pane closed while a held close's snapshot still holds it, held or
+    /// final, oldest first. Undo replays closes in this order, because which
+    /// pane inherits a closed one's size can depend on it.
+    close_history: Vec<Uuid>,
     close_requests: HashMap<Uuid, Uuid>,
     close_client_counts: HashMap<Uuid, ClientCount>,
     show_close_list: bool,
@@ -8005,6 +8009,7 @@ impl MuxelApp {
         let mut this = Self {
             closing: HashMap::new(),
             close_groups: Vec::new(),
+            close_history: Vec::new(),
             close_requests: HashMap::new(),
             close_client_counts: HashMap::new(),
             show_close_list: false,
@@ -36040,6 +36045,7 @@ mod split_resize_tests {
                 pane_id: Uuid::new_v4(),
                 tabs: vec![terminal_a, editor],
                 active: 0,
+                split_from: None,
             }),
             PaneNode::Split {
                 direction: SplitDirection::Vertical,
