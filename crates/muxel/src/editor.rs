@@ -55,6 +55,12 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// "Copy as rich text" just succeeded: the header shows a check briefly.
+    rich_copied: bool,
+    /// Counts copies, so an earlier copy's timer can't clear a later one's check.
+    rich_copy_count: u64,
+    /// A rich-text copy is converting in the background.
+    rich_copy_converting: bool,
     /// Latest external change that could not be applied without discarding edits.
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
@@ -237,6 +243,9 @@ impl EditorView {
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: stamp,
         }
@@ -269,6 +278,9 @@ impl EditorView {
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: None,
         }
@@ -306,6 +318,56 @@ impl EditorView {
             self.show_rendered = !self.show_rendered;
             cx.notify();
         }
+    }
+
+    /// Whether "Copy as rich text" is offered: rendered Markdown only.
+    pub fn can_copy_rich_text(&self) -> bool {
+        self.is_markdown && self.show_rendered
+    }
+
+    /// Whether a rich-text copy just succeeded (the header shows a check).
+    pub fn rich_text_copied(&self) -> bool {
+        self.rich_copied
+    }
+
+    /// Start a rich-text copy: the document to convert, or `None` while an
+    /// earlier copy is still converting, so a repeated click is ignored. An
+    /// earlier copy's check goes, so it can't sit beside this one's error.
+    pub fn begin_rich_copy(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if self.rich_copy_converting {
+            return None;
+        }
+        self.rich_copy_converting = true;
+        if self.rich_copied {
+            self.rich_copied = false;
+            cx.notify();
+        }
+        Some(self.text(cx))
+    }
+
+    /// The conversion `begin_rich_copy` started has finished.
+    pub fn end_rich_copy(&mut self) {
+        self.rich_copy_converting = false;
+    }
+
+    /// Show the copied check for a moment.
+    pub fn flash_rich_text_copied(&mut self, cx: &mut Context<Self>) {
+        self.rich_copy_count += 1;
+        let count = self.rich_copy_count;
+        self.rich_copied = true;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rich_copy_count == count {
+                    this.rich_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The directory a diff pane is showing (for dedup), if any.
@@ -431,6 +493,12 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Swap in the file's contents from disk, keeping the cursor and scroll
+    /// position, and without moving focus. Putting the cursor back focuses the
+    /// input (gpui-component's `set_cursor_position` does), so the window's
+    /// focus is noted first and given back if that moved it. Otherwise a file
+    /// an agent rewrites while it's open in a clean editor takes the keys from
+    /// whatever had them, the agent's own terminal included.
     fn replace_disk_content(
         &mut self,
         content: String,
@@ -440,6 +508,7 @@ impl EditorView {
         if &*self.input.read(cx).value() == content.as_str() {
             return;
         }
+        let focused = window.focused(cx);
         self.input.update(cx, |s, cx| {
             let offset = s.scroll_offset();
             let cursor = s.cursor_position();
@@ -447,6 +516,12 @@ impl EditorView {
             s.set_scroll_offset(offset, cx);
             s.set_cursor_position(cursor, window, cx);
         });
+        if window.focused(cx) != focused {
+            match &focused {
+                Some(handle) => window.focus(handle, cx),
+                None => window.blur(cx),
+            }
+        }
         self.dirty = false;
         cx.notify();
     }
@@ -738,8 +813,14 @@ pub fn language_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskChange, disk_stamp, language_for_path, read_disk_change};
-    use std::path::Path;
+    use super::{
+        DiskChange, EditorConfig, EditorView, disk_stamp, language_for_path, read_disk_change,
+    };
+    use gpui::{
+        AppContext, Context, Entity, FocusHandle, IntoElement, Render, TestAppContext, Window,
+        WindowHandle,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn detects_languages_by_extension() {
@@ -800,5 +881,137 @@ mod tests {
             Some(DiskChange::Unavailable { .. })
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A test window's root. The editor under test isn't drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// A clean editor on `notes.txt`, in a test window with nothing focused.
+    /// Fields drop in order, and `cx` checks for leaked entities when it
+    /// drops, so it comes last.
+    struct Reload {
+        editor: Entity<EditorView>,
+        window: WindowHandle<Blank>,
+        root: PathBuf,
+        path: PathBuf,
+        cx: TestAppContext,
+    }
+
+    impl Reload {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "muxel-editor-reload-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, "one\n").unwrap();
+            let mut cx = TestAppContext::single();
+            cx.skip_drawing();
+            cx.update(gpui_component::init);
+            let window = cx.add_window(|_, _| Blank);
+            let open = Some(path.clone());
+            let editor = window
+                .update(&mut cx, |_, window, cx| {
+                    cx.new(|cx| EditorView::open(open, EditorConfig::default(), window, cx))
+                })
+                .unwrap();
+            Self {
+                editor,
+                window,
+                root,
+                path,
+                cx,
+            }
+        }
+
+        fn focused(&mut self) -> Option<FocusHandle> {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focused(cx))
+                .unwrap()
+        }
+
+        fn focus(&mut self, handle: &FocusHandle) {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focus(handle, cx))
+                .unwrap();
+        }
+
+        /// The disk poll finding the file rewritten as `text`, by an agent say.
+        /// The poll compares modified time and length, and a quick rewrite can
+        /// keep the time, so `text` is a different length from what's there.
+        fn poll(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            let stamp = editor.read_with(&self.cx, |editor, _| editor.disk_stamp());
+            std::fs::write(&self.path, text).unwrap();
+            let change = read_disk_change(&self.path, stamp).expect("the poll saw no change");
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.apply_disk_change(change, window, cx)
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+
+        /// Reopening the file after it was rewritten as `text`.
+        fn reopen(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            std::fs::write(&self.path, text).unwrap();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx))
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+    }
+
+    impl Drop for Reload {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_reload_from_disk_leaves_focus_with_the_pane_that_has_it() {
+        let mut reload = Reload::new("elsewhere");
+        // Another pane has focus: the terminal of the agent rewriting the file, say.
+        let elsewhere = reload.cx.update(|cx| cx.focus_handle());
+        reload.focus(&elsewhere);
+        reload.poll("two lines\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere.clone()),
+            "the poll's reload took focus"
+        );
+        reload.reopen("three lines now\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere),
+            "reopening the file took focus"
+        );
+    }
+
+    #[test]
+    fn a_reload_from_disk_with_nothing_focused_focuses_nothing() {
+        let mut reload = Reload::new("unfocused");
+        assert_eq!(reload.focused(), None);
+        reload.poll("two lines\n");
+        assert_eq!(reload.focused(), None, "the poll's reload took focus");
     }
 }
