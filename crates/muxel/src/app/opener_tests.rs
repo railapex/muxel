@@ -104,3 +104,64 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
             .unwrap();
     });
 }
+
+/// A link clicked in rendered Markdown opens from the Markdown file's pane, so
+/// the file it opens belongs to the session that opened the Markdown.
+#[test]
+fn a_rendered_markdown_links_file_belongs_to_the_markdowns_session() {
+    with_app(|cx, window| {
+        let (view, session) = window
+            .update(cx, |app, window, cx| {
+                let root = muxel_store::data_dir()
+                    .unwrap()
+                    .join(Uuid::new_v4().to_string());
+                std::fs::create_dir_all(&root).unwrap();
+                let readme_path = root.join("README.md");
+                std::fs::write(&readme_path, "[guide](guide.md)\n").unwrap();
+                std::fs::write(root.join("guide.md"), "# guide\n").unwrap();
+                let pid = app.workspace.add_project(Project::new("opener", root));
+                app.workspace.active_project = Some(pid);
+                app.current_workspace = Some(Uuid::new_v4());
+                app.main_window = Some(window.window_handle());
+                let session = Instance::shell(pid);
+                let session_id = session.id;
+                app.workspace.add_instance(session);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(session_id));
+
+                let readme = app
+                    .open_editor_at(
+                        pid,
+                        Some(readme_path),
+                        ResourceOrigin::Pane(session_id),
+                        OpenFocus::Focus,
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                assert_eq!(opened_by(app, readme), Some(session_id));
+                (app.editors[&readme].entity_id(), session_id)
+            })
+            .unwrap();
+
+        cx.update(|cx| MuxelApp::open_rendered_link(view, "guide.md", false, cx));
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, cx| {
+                let guide = app
+                    .editors
+                    .iter()
+                    .find(|(_, editor)| {
+                        editor
+                            .read(cx)
+                            .path()
+                            .and_then(|path| path.file_name())
+                            .is_some_and(|name| name == "guide.md")
+                    })
+                    .map(|(iid, _)| *iid)
+                    .expect("the link opened nothing");
+                assert_eq!(opened_by(app, guide), Some(session));
+            })
+            .unwrap();
+    });
+}
