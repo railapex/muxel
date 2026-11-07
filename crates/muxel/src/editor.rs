@@ -105,6 +105,22 @@ pub(crate) fn read_disk_change(path: &Path, known: Option<DiskStamp>) -> Option<
     }
 }
 
+/// Whether a click on a rendered Markdown link opens it in the background: a
+/// middle-click or Ctrl+click (Cmd+click on macOS) does, and a plain click
+/// shows it without taking focus. `None` for a click that opens nothing, such
+/// as a right-click or a long press.
+fn link_in_background(event: &ClickEvent) -> Option<bool> {
+    match event {
+        ClickEvent::Mouse(click) => match click.up.button {
+            MouseButton::Left => Some(click.up.modifiers.secondary()),
+            MouseButton::Middle => Some(true),
+            _ => None,
+        },
+        ClickEvent::Keyboard(_) => Some(false),
+        ClickEvent::Touch(touch) => (!touch.long_press).then_some(false),
+    }
+}
+
 /// Whether `path` is a markdown file by extension.
 fn is_markdown_path(p: &Path) -> bool {
     p.extension()
@@ -614,11 +630,32 @@ impl Render for EditorView {
         // edits made in raw mode show here when toggled back).
         } else if self.is_markdown && self.show_rendered {
             let src = self.input.read(cx).value().to_string();
+            let editor = cx.entity_id();
             div()
                 .id("md-view")
                 .size_full()
                 .bg(cx.theme().background)
-                .child(markdown(src).selectable(true).scrollable(true).p_4())
+                .child(
+                    markdown(src)
+                        .selectable(true)
+                        .scrollable(true)
+                        // Without a handler, gpui-component hands the raw href
+                        // to the OS, which can't place `other.md` and bypasses
+                        // muxel's browser.
+                        .on_link_click(move |href, event, _, cx| {
+                            if let Some(background) = link_in_background(event) {
+                                let href = href.to_string();
+                                // The click lands mid-render of this window,
+                                // which the open may need to update.
+                                cx.defer(move |cx| {
+                                    crate::app::MuxelApp::open_rendered_link(
+                                        editor, &href, background, cx,
+                                    );
+                                });
+                            }
+                        })
+                        .p_4(),
+                )
                 .into_any_element()
         } else {
             let family: SharedString = if self.config.font_family.trim().is_empty() {

@@ -17,6 +17,7 @@ pub mod import;
 pub mod isolated_root;
 pub mod library;
 pub mod locale;
+pub mod markdown_link;
 pub mod memory;
 pub mod muse;
 pub mod outage;

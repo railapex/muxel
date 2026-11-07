@@ -6972,7 +6972,7 @@ impl Render for PopoutView {
                 }
             }))
             .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
-                MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Focus, cx);
+                MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Show, cx);
             }))
             .on_action(
                 cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
@@ -7496,6 +7496,12 @@ enum OpenFocus {
     /// showing the project in the main window when no window does. The main
     /// window shows its panes again if a hotbar view replaced them.
     Focus,
+    /// A terminal link's Ctrl+click or "Open link": the resource opens and
+    /// comes to the front as with [`Self::Background`], so the keys stay where
+    /// they were. When no window shows its project, seeing it means switching
+    /// the main window to that project, so it opens as with [`Self::Focus`]
+    /// once every window has its focus back.
+    Show,
     /// A middle-click or "Open in new tab": every window ends with the focus
     /// it had, put back after the open if anything moved it. The resource
     /// only comes to the front of its group, unless one of that group's tabs
@@ -15646,14 +15652,16 @@ impl MuxelApp {
         }
     }
 
-    /// A ctrl+clicked terminal link, routed from the terminal it was clicked in.
+    /// A ctrl+clicked terminal link, or the right-click menu's "Open link",
+    /// routed from the terminal it was clicked in. The resource shows without
+    /// taking the keys from the terminal; see [`OpenFocus::Show`].
     fn on_open_link(
         &mut self,
         a: &muxel_terminal::OpenLink,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Focus, window, cx);
+        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Show, window, cx);
     }
 
     /// A middle-clicked terminal link, or the right-click menu's "Open in new
@@ -15668,10 +15676,11 @@ impl MuxelApp {
         self.open_link_from(&a.url, Some(a.pane), OpenFocus::Background, window, cx);
     }
 
-    /// A link clicked in a popped-out terminal. It opens in the window showing
-    /// the terminal's project, else the main window, and never in the popout's
-    /// own: an editor or page belongs to the window it's made in. A foreground
-    /// open raises that window.
+    /// A link clicked in pane `pane` outside the app's own update: in a
+    /// popped-out terminal, or in rendered Markdown. It opens in the window
+    /// showing the pane's project, else the main window, and never in a
+    /// popout's own: an editor or page belongs to the window it's made in. A
+    /// foreground open raises that window.
     fn open_popout_link(url: &str, pane: Uuid, focus: OpenFocus, cx: &mut App) {
         let Some(app) = cx
             .try_global::<MuxelHandle>()
@@ -15694,6 +15703,67 @@ impl MuxelApp {
         });
     }
 
+    /// A link clicked in the rendered Markdown of `editor`'s view, docked or
+    /// popped out. It resolves against the file's folder
+    /// ([`muxel_core::markdown_link`]) and opens from the editor's pane as a
+    /// terminal link does: a plain click as with [`OpenFocus::Show`], and a
+    /// middle-click or Ctrl+click in the background. A `mailto:` link goes to
+    /// the system's mail handler. An anchor within the file does nothing:
+    /// gpui-component's text view can't scroll to a heading.
+    pub(crate) fn open_rendered_link(editor: EntityId, href: &str, background: bool, cx: &mut App) {
+        use muxel_core::markdown_link::{MarkdownLink, resolve};
+        let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .map(|handle| handle.0.clone())
+        else {
+            return;
+        };
+        let link = app.read_with(cx, |app, cx| {
+            let (&pane, view) = app.editors.iter().find(|(_, v)| v.entity_id() == editor)?;
+            let folder = view.read(cx).path()?.parent()?.to_path_buf();
+            Some((pane, resolve(&folder, href)?))
+        });
+        let Ok(Some((pane, link))) = link else {
+            return;
+        };
+        let url = match link {
+            MarkdownLink::Anchor(_) => return,
+            MarkdownLink::Mail(url) => {
+                cx.open_url(&url);
+                return;
+            }
+            MarkdownLink::Web(url) => url,
+            MarkdownLink::FileUrl(url) => url,
+            MarkdownLink::File { path, fragment } => {
+                let mut url = muxel_terminal::file_uri(&path);
+                if let Some(fragment) = fragment {
+                    url.push('#');
+                    url.push_str(&fragment);
+                }
+                url
+            }
+        };
+        // Only a local file that's there. A URL muxel doesn't read as a local
+        // file, such as a network share's, would otherwise go to the OS, and
+        // so would a broken link, which only shows an error. A folder does go
+        // there, to open it.
+        let local = url
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
+        if local
+            && !muxel_terminal::file_target_from_uri(&url)
+                .is_some_and(|target| target.path.exists())
+        {
+            return;
+        }
+        let focus = if background {
+            OpenFocus::Background
+        } else {
+            OpenFocus::Show
+        };
+        Self::open_popout_link(&url, pane, focus, cx);
+    }
+
     /// Route a link relative to `source`, the pane it came from (a terminal, or
     /// a browser page whose new-window event arrives a tick later, when another
     /// pane may be active): local `file://` paths open in a muxel editor pane;
@@ -15704,10 +15774,10 @@ impl MuxelApp {
     /// Opening can move focus on its own: going to a link's line, or reloading
     /// a reused file that changed on disk, focuses the editor in this window,
     /// whichever window shows it. So every window's focus is noted first. A
-    /// background open puts each one back afterwards. A foreground open puts
-    /// back only this window's, and only when it was left holding a pane that
-    /// [`Self::project_window`] gives to another window. That window focuses
-    /// the pane itself.
+    /// background or show open puts each one back afterwards. A foreground
+    /// open puts back only this window's, and only when it was left holding a
+    /// pane that [`Self::project_window`] gives to another window. That window
+    /// focuses the pane itself.
     fn open_link_from(
         &mut self,
         url: &str,
@@ -15719,7 +15789,7 @@ impl MuxelApp {
         let kept = window_focus(window, cx);
         self.route_link(url, source, focus, window, cx);
         match focus {
-            OpenFocus::Background => self.give_back_focus(&kept, window, cx),
+            OpenFocus::Background | OpenFocus::Show => self.give_back_focus(&kept, window, cx),
             OpenFocus::Focus => {
                 let here = window.window_handle().window_id();
                 let elsewhere = window
@@ -16343,6 +16413,11 @@ impl MuxelApp {
     /// that shows the resource's project, which can be another window than this
     /// one (a reopened file lives in its own project). When no window shows the
     /// project, it's the main window, which switches to it.
+    ///
+    /// [`OpenFocus::Show`] brings the resource forward where a window shows its
+    /// project, and out from behind the main window's hotbar view. Otherwise it
+    /// focuses it as above, after the link's open has put every window's focus
+    /// back.
     fn focus_resource(
         &mut self,
         iid: Uuid,
@@ -16364,28 +16439,39 @@ impl MuxelApp {
         if hidden {
             self.maximized = None;
         }
-        if focus == OpenFocus::Background {
-            // The link's open then gives every window its focus back and keeps
-            // the tab holding it in front.
-            if let Some(project) = self.workspace.project_mut(pid) {
-                set_active_tab(&mut project.layout, iid);
-                cx.notify();
+        let shown_in = self.window_showing(pid);
+        match focus {
+            OpenFocus::Focus => {}
+            OpenFocus::Show if shown_in.is_none() => {
+                if let Some(target) = self.project_window(pid) {
+                    self.focus_resource_later(iid, target, cx);
+                }
+                return;
             }
-            return;
+            OpenFocus::Show | OpenFocus::Background => {
+                // The link's open then gives every window its focus back and
+                // keeps the tab holding it in front.
+                if focus == OpenFocus::Show
+                    && shown_in
+                        .zip(self.main_window)
+                        .is_some_and(|(shown, main)| shown.window_id() == main.window_id())
+                {
+                    self.main_view = hotbar::MainView::Panes;
+                }
+                if let Some(project) = self.workspace.project_mut(pid) {
+                    set_active_tab(&mut project.layout, iid);
+                    cx.notify();
+                }
+                return;
+            }
         }
         match self.project_window(pid) {
             Some(target) if target.window_id() != window.window_handle().window_id() => {
                 // Focusing there needs the app, which this update holds.
-                let app = cx.weak_entity();
-                cx.defer(move |cx| {
-                    Self::update_in_window(&app, target, cx, |app, window, cx| {
-                        app.focus_resource(iid, OpenFocus::Focus, window, cx);
-                        window.activate_window();
-                    });
-                });
+                self.focus_resource_later(iid, target, cx);
             }
             _ => {
-                if self.window_showing(pid).is_none() {
+                if shown_in.is_none() {
                     self.select_project_with_attendance(pid, false, window, cx);
                 }
                 // A hotbar view filling the main window would hide it.
@@ -16395,6 +16481,18 @@ impl MuxelApp {
                 self.focus_instance(iid, window, cx);
             }
         }
+    }
+
+    /// Focus resource `iid` in `target`, raising it, once this update has let
+    /// go of the app.
+    fn focus_resource_later(&self, iid: Uuid, target: AnyWindowHandle, cx: &mut Context<Self>) {
+        let app = cx.weak_entity();
+        cx.defer(move |cx| {
+            Self::update_in_window(&app, target, cx, |app, window, cx| {
+                app.focus_resource(iid, OpenFocus::Focus, window, cx);
+                window.activate_window();
+            });
+        });
     }
 
     /// Put each window's focus back as `kept` noted it, and bring the tab that
