@@ -78,6 +78,8 @@ mod recoverable_close;
 mod recoverable_close_tests;
 mod recoverable_close_ui;
 mod recoverable_layout;
+#[cfg(test)]
+mod recoverable_layout_tests;
 #[cfg(all(test, windows))]
 mod remote_reconnect_tests;
 #[cfg(all(test, windows))]
@@ -769,6 +771,137 @@ fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     }
 }
 
+/// Opacity of a Done icon once its pane has been focused: still green, but faint
+/// enough that unread finishes stand out.
+const READ_DONE_OPACITY: f32 = 0.45;
+
+/// Whether a shown Done is one the user has already seen. It mirrors attention
+/// navigation: a Done that `attention_rank` would still visit is unread.
+fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
+    status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
+}
+
+/// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
+fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &App) -> Hsla {
+    let color = status_hsla(status, cx);
+    if done_is_read(status, activity) {
+        color.opacity(READ_DONE_OPACITY)
+    } else {
+        color
+    }
+}
+
+#[cfg(test)]
+mod read_done_contrast_tests {
+    use super::READ_DONE_OPACITY;
+    use crate::theme;
+    use gpui::{Hsla, Rgba, TestAppContext};
+    use gpui_component::{Theme, ThemeRegistry};
+
+    fn luminance(c: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// `fg` composited over an opaque `bg`.
+    fn over(fg: Hsla, bg: Hsla) -> Rgba {
+        let (f, b) = (fg.to_rgb(), bg.to_rgb());
+        let a = f.a;
+        Rgba {
+            r: f.r * a + b.r * (1.0 - a),
+            g: f.g * a + b.g * (1.0 - a),
+            b: f.b * a + b.b * (1.0 - a),
+            a: 1.0,
+        }
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    fn hex(c: Rgba) -> String {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+    }
+
+    /// Every bundled theme keeps a read finish visible: the outline pill's label
+    /// stays at least as legible as the theme's weakest green text, and the
+    /// dimmed icon stays visible yet fainter than an unread one. Set
+    /// `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors for review.
+    #[test]
+    fn read_done_stays_legible_in_every_bundled_theme() {
+        let cx = TestAppContext::single();
+        let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::register_bundled_themes(cx);
+            let configs: Vec<_> = ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .cloned()
+                .collect();
+            assert!(!configs.is_empty());
+            let mut rows = Vec::new();
+            for config in configs {
+                Theme::global_mut(cx).apply_config(&config);
+                let t = Theme::global(cx);
+                let bg = over(t.sidebar, t.background);
+                let on_bg = |c: Hsla| over(c, bg.into());
+                let unread_icon = on_bg(t.success);
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let filled = on_bg(t.success);
+                let filled_text = over(t.success_foreground, filled.into());
+                // The read pill's label is the unread icon's green on the sidebar.
+                let (label, read) = (contrast(unread_icon, bg), contrast(read_icon, bg));
+                let name = &config.name;
+                assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
+                assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
+                assert!(label > read, "{name}: read icon is not fainter than unread");
+                rows.push(format!(
+                    concat!(
+                        r#"{{"name":"{}","bg":"{}","fg":"{}","muted":"{}","success":"{}","#,
+                        r#""successFg":"{}","readIcon":"{}","secondary":"{}","secondaryFg":"{}","#,
+                        r#""border":"{}","outline":{:.2},"filled":{:.2},"readIconC":{:.2}}}"#
+                    ),
+                    name,
+                    hex(bg),
+                    hex(on_bg(t.sidebar_foreground)),
+                    hex(on_bg(t.muted_foreground)),
+                    hex(filled),
+                    hex(filled_text),
+                    hex(read_icon),
+                    hex(on_bg(t.secondary)),
+                    hex(over(t.secondary_foreground, on_bg(t.secondary).into())),
+                    hex(on_bg(t.border)),
+                    label,
+                    contrast(filled_text, filled),
+                    read,
+                ));
+            }
+            if let Some(path) = &swatches {
+                std::fs::write(
+                    path,
+                    format!(
+                        "[{}]",
+                        rows.join(
+                            ",
+"
+                        )
+                    ),
+                )
+                .unwrap();
+            }
+        });
+    }
+}
+
 fn activity_state(status: AgentStatus) -> AgentActivityState {
     match status {
         AgentStatus::Working => AgentActivityState::Working,
@@ -894,8 +1027,9 @@ fn attend_agent_activity(
 mod restored_activity_tests {
     use super::{
         AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
+        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample,
+        unprompted_report_working,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1201,6 +1335,26 @@ mod restored_activity_tests {
             blocked.activity.current_state(),
             Some(AgentActivityState::Idle)
         );
+    }
+
+    #[test]
+    fn only_an_attended_done_reads_as_read() {
+        let read = attended_completion();
+        assert!(done_is_read(AgentStatus::Done, Some(&read.activity)));
+
+        // A finish after the last focus is unread again.
+        let mut unread = attended_completion();
+        unread.activity.last_attended_at = Some(100);
+        assert!(!done_is_read(AgentStatus::Done, Some(&unread.activity)));
+
+        // Runtime Done ahead of the durable record, or no record, is unread.
+        let fresh = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        assert!(!done_is_read(AgentStatus::Done, Some(&fresh.activity)));
+        assert!(!done_is_read(AgentStatus::Done, None));
+
+        // Other states are never dimmed.
+        assert!(!done_is_read(AgentStatus::Idle, Some(&read.activity)));
+        assert!(!done_is_read(AgentStatus::Working, Some(&read.activity)));
     }
 
     #[test]
@@ -2757,6 +2911,7 @@ fn scan_importable(
     root: &str,
     presets: &[AgentPreset],
     owned: &[SessionTarget],
+    closed: &[muxel_core::tmux::ClosedSession],
     live: &[String],
     own_pid: u32,
     home: Option<&std::path::Path>,
@@ -2779,7 +2934,7 @@ fn scan_importable(
     let Some(sessions) = sessions else {
         return Err(t("Couldn't list tmux sessions there.").to_string());
     };
-    let mut tmux_rows = import::tmux_candidates(&sessions, owned, root, presets);
+    let mut tmux_rows = import::tmux_candidates(&sessions, owned, closed, root, presets);
     for row in &mut tmux_rows {
         // A pane's title is the agent's own statement of what it is doing
         // (`✳ Review changes`). `clean_agent_title` drops the lifecycle
@@ -3100,6 +3255,9 @@ fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &Ap
     let mouse_mode = view.read(cx).mouse_mode();
     let view = view.clone();
     div()
+        .id(("terminal", view.entity_id()))
+        .role(Role::Terminal)
+        .aria_label(t("Terminal"))
         .size_full()
         .child(terminal)
         .context_menu(move |mut menu, window, cx| {
@@ -5535,6 +5693,7 @@ pub struct MuxelApp {
     /// A workspace switch already stopped once for that unsaved removal.
     close_flush_warned: bool,
     close_tmux_kills: Vec<Task<()>>,
+    local_closes_inflight: HashMap<Uuid, Uuid>,
     close_departure: Option<CloseDeparture>,
     close_departure_task: Option<Task<()>>,
     workspace: Workspace,
@@ -5975,6 +6134,7 @@ pub struct MuxelApp {
     confirm: Option<PendingConfirm>,
     /// Dirty worktrees awaiting a Commit/Discard/Keep decision (modal shows front).
     pending_worktree_dispose: std::collections::VecDeque<WorktreeDispose>,
+    deferred_worktree_dispose: HashMap<Uuid, HashMap<Uuid, WorktreeAnswer>>,
     /// Reused commit-message input for the worktree dispose modal.
     dispose_commit_input: Entity<InputState>,
     /// Project git modal (commit / new branch) + its reused input.
@@ -6790,10 +6950,21 @@ enum PasswordAction {
     Verify(usize),
 }
 
+/// A file answer waiting on its worktree's panes. It runs only once the close it
+/// was given for is accepted and takes every pane it counted. Any other ending
+/// (Cancel, a replaced prompt, a newer close, a pane left open or exiting first)
+/// drops it, and the worktree asks again.
+struct WorktreeAnswer {
+    choice: WorktreeDispose,
+    action: WorktreeDisposeAction,
+    accepted: bool,
+}
+
 /// A worktree whose last instance just closed with work that isn't fully landed
 /// (uncommitted changes and/or unmerged commits), awaiting a Commit / Merge /
 /// Discard / Keep decision (shown in the dispose modal).
 struct WorktreeDispose {
+    project_id: Uuid,
     close_after: Vec<Uuid>,
     close_rest: Vec<Uuid>,
     wid: Uuid,
@@ -6809,6 +6980,13 @@ struct WorktreeDispose {
     unmerged: usize,
     /// Base branch name for display (e.g. `main`), or "base" when detached.
     base_label: String,
+}
+
+enum WorktreeDisposeAction {
+    Keep,
+    Discard,
+    Commit(String),
+    Merge(String),
 }
 
 /// What an in-app notification is about (drives its color/label). `Blocked`/`Done`
@@ -7029,6 +7207,7 @@ impl Render for PopoutView {
                                     })
                                     .child(
                                         Button::new("dock-back")
+                                            .accessibility_id("muxel.dock-back")
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::PanelBottom)
@@ -7168,6 +7347,7 @@ impl Render for DevConsoleView {
                                 )
                                 .child(
                                     Button::new("dev-console-clear")
+                                        .accessibility_id("muxel.dev-console-clear")
                                         .ghost()
                                         .xsmall()
                                         .label(t("Clear"))
@@ -7408,6 +7588,7 @@ impl Render for FileDiffView {
                                 )
                                 .child(
                                     Button::new("diff-view-toggle")
+                                        .accessibility_id("muxel.diff-view-toggle")
                                         .ghost()
                                         .xsmall()
                                         .label(toggle_label)
@@ -8012,6 +8193,7 @@ impl MuxelApp {
             close_persist_pending: false,
             close_flush_warned: false,
             close_tmux_kills: Vec::new(),
+            local_closes_inflight: HashMap::new(),
             close_departure: None,
             close_departure_task: None,
             workspace: Workspace::default(),
@@ -8143,6 +8325,7 @@ impl MuxelApp {
             pane_drop: None,
             confirm: None,
             pending_worktree_dispose: std::collections::VecDeque::new(),
+            deferred_worktree_dispose: HashMap::new(),
             dispose_commit_input,
             git_modal: None,
             git_action_input,
@@ -8355,7 +8538,21 @@ impl MuxelApp {
         // mirror each other, and closing one would kill the session under the other.
         // Normally a no-op.
         muxel_core::dedupe_instances(&mut workspace);
+        // An earlier version could save a worktree attached with no pane, which
+        // the sidebar hides. Remote projects are left alone: a peer's panes may
+        // use theirs.
+        let local: HashSet<Uuid> = workspace
+            .projects
+            .iter()
+            .filter(|project| !project.is_remote())
+            .map(|project| project.id)
+            .collect();
+        let repaired =
+            workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
+        if repaired {
+            self.persist();
+        }
         let active = self
             .workspace
             .active_project
@@ -10290,6 +10487,9 @@ impl MuxelApp {
                     && !self.browsers.contains_key(&iid)
             });
         if !needs && !first_sync {
+            if !is_remote {
+                self.retry_local_closes(pid, cx);
+            }
             return;
         }
 
@@ -10465,6 +10665,9 @@ impl MuxelApp {
             let has_memory = loc.as_ref().is_some_and(integrations::memory_file_exists);
             self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
         }
+        if !is_remote {
+            self.retry_local_closes(pid, cx);
+        }
         if defer_spawns {
             self.spawn_project_terminals_deferred(pid, cx);
         } else {
@@ -10552,7 +10755,7 @@ impl MuxelApp {
         // A pane the user closed must not come back as a pane: neither one whose kill
         // is still unconfirmed (`reap_closed_sessions` is working on it) nor one whose
         // kill was confirmed after `sessions` was listed.
-        let closed = self.closed_sessions_of(pid);
+        let closed = self.closed_sessions_on(project.remote.as_ref().map(|remote| remote.host_id));
 
         let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
         if orphans.is_empty() {
@@ -10656,6 +10859,7 @@ impl MuxelApp {
             .collect();
         let home = home_dir();
         let own_pid = std::process::id();
+        let closed = self.closed_sessions_on(project.remote.as_ref().map(|remote| remote.host_id));
 
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
@@ -10666,6 +10870,7 @@ impl MuxelApp {
                         &root,
                         &presets,
                         &owned,
+                        &closed,
                         &live,
                         own_pid,
                         home.as_deref(),
@@ -10903,6 +11108,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("remote-reconnect")
+                            .accessibility_id("muxel.remote-reconnect")
                             .primary()
                             .icon(IconName::Redo)
                             .label(t("Reconnect"))
@@ -10912,6 +11118,7 @@ impl MuxelApp {
                     )
                     .children(host_id.map(|hid| {
                         Button::new("remote-scan")
+                            .accessibility_id("muxel.remote-scan")
                             .ghost()
                             .icon(IconName::Search)
                             .label(t("Scan for projects"))
@@ -11677,6 +11884,7 @@ impl MuxelApp {
         self.close_flush_warned = false;
         self.close_requests.clear();
         self.close_client_counts.clear();
+        self.deferred_worktree_dispose.clear();
         self.show_close_list = false;
 
         self.failed_launches.clear();
@@ -13342,11 +13550,8 @@ impl MuxelApp {
                 .spawn(async move {
                     jobs.into_iter()
                         .map(|(pid, epoch, read, loc)| {
-                            // A local file is never out of reach: none there
-                            // means no peer has written one.
-                            let reached = matches!(loc, integrations::RepoLoc::Local(_));
-                            let json = integrations::fetch_remote_layout(&loc);
-                            (pid, epoch, read, reached || json.is_some(), json)
+                            let (reached, json) = integrations::fetch_layout_for_poll(&loc);
+                            (pid, epoch, read, reached, json)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -13364,10 +13569,10 @@ impl MuxelApp {
                     {
                         continue;
                     }
-                    if let Some(json) = json {
-                        this.poll_peer_layout(pid, &json, window, cx);
-                    }
-                    if reached {
+                    let compared = json
+                        .as_deref()
+                        .is_none_or(|json| this.poll_peer_layout(pid, json, window, cx));
+                    if reached && compared {
                         this.layout_reads.entry(pid).or_default().applied(read);
                     }
                 }
@@ -13384,21 +13589,21 @@ impl MuxelApp {
         json: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(proj) = self.workspace.project(pid) else {
-            return;
+            return false;
         };
         let layout_root = match &proj.remote {
             Some(r) => r.remote_root.clone(),
             None => proj.root_path.display().to_string(),
         };
         let Some(remote) = RemoteLayout::parse(json, &layout_root) else {
-            return;
+            return false;
         };
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
         let local_rev = proj.layout_updated_at.unwrap_or(0);
         let Some(local) = self.sync_capture(pid, now_epoch) else {
-            return;
+            return false;
         };
         let local_key = local.content_key();
         let remote_key = remote.content_key();
@@ -13415,6 +13620,7 @@ impl MuxelApp {
             }
             muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
         }
+        true
     }
 
     /// Apply a peer's layout live, in place: panes it added appear (attached to their
@@ -17070,8 +17276,26 @@ impl MuxelApp {
         project_id: Uuid,
         tmux: Option<InstanceTmux>,
         worktree_cleanup: muxel_core::WorktreeCleanup,
+        closed_worktree: muxel_core::tmux::ClosedWorktree,
         cx: &mut Context<Self>,
     ) {
+        if let muxel_core::WorktreeCleanup::Registered(wid) = &worktree_cleanup {
+            let ends_answer = self
+                .deferred_worktree_dispose
+                .get(&project_id)
+                .and_then(|choices| choices.get(wid))
+                .is_some_and(|answer| {
+                    !answer.accepted || !answer.choice.close_after.contains(&iid)
+                });
+            if ends_answer {
+                // An uncaptured member's files were never covered by the answer.
+                // A captured one leaving before its close was accepted (exiting,
+                // say) ends that close. A sibling still open would otherwise let
+                // a later close run the answer over what this pane wrote since.
+                // An accepted close marks its answer before closing anything.
+                self.take_deferred_worktree_dispose(project_id, *wid);
+            }
+        }
         if let Some(data_dir) = muxel_store::data_dir() {
             crate::session_binding::clear_muse_binding(&data_dir, iid);
         }
@@ -17109,7 +17333,14 @@ impl MuxelApp {
                 let session = tmux.on_host(&host.name);
                 if !self.session_kept_for_another_pane(Some(host.id), &session) {
                     self.reap_remote_session(project_id, iid, host, session, cx);
+                    if let Some(project) = self.workspace.project_mut(project_id) {
+                        project.set_closed_worktree(iid, closed_worktree);
+                    }
                 }
+                // SSH teardown is asynchronous. Never remove files under the
+                // agent until its death is confirmed; keep this worktree.
+                self.log_kept_close_worktree(iid, &worktree_cleanup);
+                return;
             }
             // A remote instance's session lives on the host, not here; killing the
             // recorded name locally would be a no-op at best.
@@ -17117,23 +17348,54 @@ impl MuxelApp {
                 if let Some(session) = tmux.recorded_session {
                     let session = SessionTarget::new(session, tmux.socket);
                     if !self.session_kept_for_another_pane(None, &session) {
-                        self.close_tmux_kills.retain(|task| !task.is_ready());
-                        self.close_tmux_kills
-                            .push(cx.background_executor().spawn(async move {
-                            if let Err(error) = integrations::close_local_tmux(
-                                &session,
-                                Instant::now() + Duration::from_secs(10),
-                            ) {
-                                log::warn!(
-                                    "could not confirm local tmux close for {session}: {error:#}"
-                                );
-                            }
-                        }));
+                        self.reap_local_session(
+                            project_id,
+                            iid,
+                            session,
+                            worktree_cleanup,
+                            closed_worktree,
+                            cx,
+                        );
+                    } else {
+                        self.keep_closed_worktree(iid, &worktree_cleanup);
                     }
+                    return;
                 }
+            }
+            (Some(_), None) if is_remote => {
+                self.log_kept_close_worktree(iid, &worktree_cleanup);
+                return;
             }
             _ => {}
         }
+        self.cleanup_closed_worktree(project_id, worktree_cleanup, cx);
+    }
+
+    fn log_kept_close_worktree(&self, iid: Uuid, cleanup: &muxel_core::WorktreeCleanup) {
+        if !matches!(cleanup, muxel_core::WorktreeCleanup::None) {
+            muxel_store::append_event_log(&format!(
+                "close: kept worktree for [{iid}]; the agent's tmux session is not confirmed gone"
+            ));
+        }
+    }
+
+    /// The sidebar lists a worktree with no panes only when detached, so a local
+    /// one kept here has to be, or nothing could reach it again.
+    fn keep_closed_worktree(&mut self, iid: Uuid, cleanup: &muxel_core::WorktreeCleanup) {
+        self.log_kept_close_worktree(iid, cleanup);
+        if let muxel_core::WorktreeCleanup::Registered(wid) = cleanup
+            && self.workspace.detach_unused_worktrees(|w| w.id == *wid)
+        {
+            self.persist();
+        }
+    }
+
+    fn cleanup_closed_worktree(
+        &mut self,
+        project_id: Uuid,
+        worktree_cleanup: muxel_core::WorktreeCleanup,
+        cx: &mut Context<Self>,
+    ) {
         // Worktree disposed only when its last instance is gone.
         let root = self
             .workspace
@@ -17145,10 +17407,307 @@ impl MuxelApp {
             }
             muxel_core::WorktreeCleanup::Legacy(path) => {
                 if let Some(root) = root {
-                    integrations::remove_worktree(&root, &path);
+                    let registered: HashSet<_> = self
+                        .workspace
+                        .worktrees
+                        .iter()
+                        .filter(|w| w.path == path)
+                        .map(|w| w.id)
+                        .collect();
+                    let shared = self.workspace.instances.iter().any(|inst| {
+                        inst.worktree_path.as_ref() == Some(&path)
+                            || inst
+                                .worktree_id
+                                .is_some_and(|wid| registered.contains(&wid))
+                    });
+                    let pending = self
+                        .workspace
+                        .project(project_id)
+                        .is_some_and(|p| p.close_pending_in(&path));
+                    let base = integrations::repo_head(&root);
+                    let changed = integrations::worktree_change_count(&path);
+                    let unmerged = base
+                        .as_deref()
+                        .map(|base| integrations::worktree_unmerged_count(&path, base));
+                    if shared || pending || changed > 0 || unmerged.is_none_or(|count| count > 0) {
+                        muxel_store::append_event_log(&format!(
+                            "close: kept legacy worktree {} (shared, pending teardown, or work not confirmed landed)",
+                            path.display()
+                        ));
+                    } else {
+                        integrations::remove_worktree(&root, &path);
+                    }
                 }
             }
             muxel_core::WorktreeCleanup::None => {}
+        }
+    }
+
+    /// Save the pending kill before doing any I/O. A crash before that save
+    /// leaves the old pane available to attach; afterwards activation retries
+    /// this ledger, including an owner resolved from legacy metadata.
+    fn reap_local_session(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        session: SessionTarget,
+        cleanup: muxel_core::WorktreeCleanup,
+        worktree: muxel_core::tmux::ClosedWorktree,
+        cx: &mut Context<Self>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let Some(project) = self.workspace.project_mut(project_id) else {
+            return;
+        };
+        let session = integrations::profile_tmux_target(&session);
+        project.remember_closed_session(session.clone(), iid);
+        let closed = project
+            .closed_sessions
+            .iter_mut()
+            .find(|closed| closed.instance == iid)
+            .unwrap();
+        closed.local_close_token = Some(Uuid::new_v4());
+        closed.worktree = worktree;
+        let closed = closed.clone();
+        if !self.try_persist() {
+            // The worktree now looks kept, as after a failed kill. A retry that
+            // later finds the session gone must not run the answer over it.
+            self.drop_answers_behind_kill(project_id, iid);
+            self.keep_closed_worktree(iid, &cleanup);
+            muxel_store::append_event_log(
+                "close: local tmux kill deferred; couldn't save its ledger",
+            );
+            return;
+        }
+        self.start_local_close(project_id, closed, cleanup, true, deadline, cx);
+    }
+
+    fn local_close_is_owned(&self, iid: Uuid, target: &SessionTarget) -> bool {
+        self.workspace.instance(iid).is_some()
+            || muxel_core::tmux::session_still_shown(target, &self.pane_sessions_on(None))
+    }
+
+    fn cancel_local_close(&mut self, pid: Uuid, iid: Uuid) {
+        self.drop_answers_behind_kill(pid, iid);
+        if let Some(project) = self.workspace.project_mut(pid) {
+            project.forget_closed_session(iid);
+        }
+        if let Some(reaped) = self.reaped_sessions.get_mut(&pid) {
+            reaped.retain(|closed| closed.instance != iid);
+        }
+        self.persist();
+    }
+
+    /// A kept, replaced or failed kill also cancels the file actions that may
+    /// have been waiting for it. They must never run as successful teardown, even
+    /// if a later retry confirms the kill. Returns whether a worktree was detached.
+    fn drop_answers_behind_kill(&mut self, pid: Uuid, iid: Uuid) -> bool {
+        let closed_worktree = self.workspace.project(pid).and_then(|project| {
+            project
+                .closed_sessions
+                .iter()
+                .find(|closed| closed.instance == iid)
+                .map(|closed| closed.worktree.clone())
+        });
+        let Some(answers) = self.deferred_worktree_dispose.get_mut(&pid) else {
+            return false;
+        };
+        let cancelled: HashSet<Uuid> = answers
+            .iter()
+            .filter(|(_, answer)| {
+                closed_worktree
+                    .as_ref()
+                    .is_none_or(|worktree| worktree.may_be(&answer.choice.path))
+            })
+            .map(|(&wid, _)| wid)
+            .collect();
+        answers.retain(|wid, _| !cancelled.contains(wid));
+        if answers.is_empty() {
+            self.deferred_worktree_dispose.remove(&pid);
+        }
+        self.workspace
+            .detach_unused_worktrees(|worktree| cancelled.contains(&worktree.id))
+    }
+
+    fn retry_local_closes(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let pending = self
+            .workspace
+            .project(pid)
+            .map(|p| p.closed_sessions.clone())
+            .unwrap_or_default();
+        for closed in pending {
+            if self.local_close_is_owned(closed.instance, &closed.target())
+                || closed.local_close_token.is_none()
+            {
+                muxel_store::append_event_log(&format!(
+                    "close: cancelled local retry for [{}] {}; a pane owns it or its generation is unverified; session kept",
+                    closed.instance,
+                    closed.target()
+                ));
+                self.cancel_local_close(pid, closed.instance);
+                continue;
+            }
+            // Settle the worktree its pane ran in, as the first attempt would
+            // have. A sibling's kill that confirmed meanwhile left that to this one.
+            // A legacy pane still on that path counts only by path, which the
+            // registered cleanup can't see, so that worktree is left alone.
+            let cleanup = match &closed.worktree {
+                muxel_core::tmux::ClosedWorktree::In(path)
+                    if !self.workspace.instances.iter().any(|instance| {
+                        instance.worktree_id.is_none()
+                            && instance.worktree_path.as_ref() == Some(path)
+                    }) =>
+                {
+                    self.workspace
+                        .worktrees
+                        .iter()
+                        .find(|w| w.project_id == pid && w.path == *path)
+                        .map_or(muxel_core::WorktreeCleanup::None, |w| {
+                            muxel_core::WorktreeCleanup::Registered(w.id)
+                        })
+                }
+                _ => muxel_core::WorktreeCleanup::None,
+            };
+            self.start_local_close(
+                pid,
+                closed,
+                cleanup,
+                false,
+                Instant::now() + Duration::from_secs(10),
+                cx,
+            );
+        }
+    }
+
+    fn start_local_close(
+        &mut self,
+        project_id: Uuid,
+        closed: muxel_core::tmux::ClosedSession,
+        cleanup: muxel_core::WorktreeCleanup,
+        initialize: bool,
+        deadline: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let iid = closed.instance;
+        let Some(token) = closed.local_close_token else {
+            return;
+        };
+        if self.local_closes_inflight.get(&iid) == Some(&token) {
+            return;
+        }
+        self.local_closes_inflight.insert(iid, token);
+        let session = integrations::profile_tmux_target(&closed.target());
+        let owner_was_saved = session.socket.is_some();
+        let workspace = self.current_workspace;
+        self.close_tmux_kills.retain(|task| !task.is_ready());
+        let task = cx.spawn(async move |this, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move { integrations::resolve_local_tmux_close(&session, deadline) })
+                .await;
+            let result = match resolved {
+                Ok(owner) => {
+                    let permission = this
+                        .update(cx, |app, _| -> anyhow::Result<bool> {
+                            if app.current_workspace != workspace {
+                                return Ok(false);
+                            }
+                            if app.local_close_is_owned(iid, &owner) {
+                                app.cancel_local_close(project_id, iid);
+                                return Ok(false);
+                            }
+                            // A later close or cancellation supersedes this job. A
+                            // removed project has neither, and its kill still runs.
+                            if app.workspace.project(project_id).is_some_and(|project| {
+                                !project.closed_sessions.iter().any(|entry| {
+                                    entry.instance == iid && entry.local_close_token == Some(token)
+                                })
+                            }) {
+                                return Ok(false);
+                            }
+                            if owner_was_saved {
+                                return Ok(true);
+                            }
+                            let Some(project) = app.workspace.project_mut(project_id) else {
+                                return Ok(true);
+                            };
+                            project.remember_closed_session(owner.clone(), iid);
+                            anyhow::ensure!(
+                                app.try_persist(),
+                                "couldn't save local tmux owner before teardown"
+                            );
+                            Ok(true)
+                        })
+                        // GPUI drops windows before awaiting quit jobs. The
+                        // known owner and token are already durably saved.
+                        .unwrap_or(Ok(owner_was_saved));
+                    match permission {
+                        Ok(true) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    integrations::close_local_tmux(
+                                        &owner, token, initialize, deadline,
+                                    )
+                                    .map(|outcome| Some((owner, outcome)))
+                                })
+                                .await
+                        }
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |app, cx| {
+                if app.local_closes_inflight.get(&iid) != Some(&token) {
+                    return;
+                }
+                app.local_closes_inflight.remove(&iid);
+                if app.current_workspace != workspace {
+                    return;
+                }
+                app.finish_local_close(project_id, iid, cleanup, result, cx);
+                cx.notify();
+            });
+        });
+        self.close_tmux_kills.push(task);
+    }
+
+    fn finish_local_close(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        cleanup: muxel_core::WorktreeCleanup,
+        result: anyhow::Result<Option<(SessionTarget, integrations::LocalTmuxClose)>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Some((owner, integrations::LocalTmuxClose::Gone))) => {
+                self.finish_closed_session(project_id, iid, &owner, cx);
+                self.cleanup_closed_worktree(project_id, cleanup, cx);
+            }
+            Ok(Some((owner, integrations::LocalTmuxClose::Preserved))) => {
+                self.cancel_local_close(project_id, iid);
+                self.keep_closed_worktree(iid, &cleanup);
+                muxel_store::append_event_log(&format!(
+                    "close: generation changed for [{iid}] {owner}; session and files kept"
+                ));
+            }
+            // Cancelled or superseded. The session may be running in another pane
+            // now, so this worktree can't be removed, and a sibling's kill may have
+            // left it to this one to decide.
+            Ok(None) => self.keep_closed_worktree(iid, &cleanup),
+            Err(error) => {
+                muxel_store::append_event_log(&format!(
+                    "close: local tmux teardown for [{iid}] failed: {error:#}; activation retries only a stamped session and otherwise keeps it"
+                ));
+                // The ledger entry stays for that retry. The worktree now looks
+                // kept, so the answer must not run when the retry confirms.
+                if self.drop_answers_behind_kill(project_id, iid) {
+                    self.persist();
+                }
+                self.keep_closed_worktree(iid, &cleanup);
+            }
         }
     }
 
@@ -17201,6 +17760,8 @@ impl MuxelApp {
             name: session.name,
             socket: session.socket,
             instance: iid,
+            local_close_token: None,
+            worktree: Default::default(),
         };
         let control_path = Self::commands_control_path(host.id);
         let password = (host.auth == SshAuth::Password)
@@ -17297,7 +17858,7 @@ impl MuxelApp {
                     return;
                 }
                 match err {
-                    None => this.finish_closed_session(project_id, iid, &session),
+                    None => this.finish_closed_session(project_id, iid, &session, cx),
                     Some(msg) => {
                         // Not an error dialog: the session is remembered, the pane stays
                         // closed, and the next connect to the host finishes the job.
@@ -17328,7 +17889,13 @@ impl MuxelApp {
     /// the close also covers a session that comes back on its own after the kill —
     /// a pane closed while its ssh was still connecting can start it on the host
     /// after the kill has run.
-    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid, session: &SessionTarget) {
+    fn finish_closed_session(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        session: &SessionTarget,
+        cx: &mut Context<Self>,
+    ) {
         debug_assert!(
             session.socket.is_some(),
             "completed closes retain their owner"
@@ -17339,12 +17906,23 @@ impl MuxelApp {
                 name: session.name.clone(),
                 socket: session.socket.clone(),
                 instance: iid,
+                local_close_token: None,
+                worktree: Default::default(),
             });
         }
         if let Some(p) = self.workspace.project_mut(project_id)
             && p.forget_closed_session(iid)
         {
             self.persist();
+            // Each answer still waiting checks its own worktree's kills.
+            let worktrees: Vec<_> = self
+                .deferred_worktree_dispose
+                .get(&project_id)
+                .map(|answers| answers.keys().copied().collect())
+                .unwrap_or_default();
+            for wid in worktrees {
+                self.dispose_worktree_if_orphaned(wid, cx);
+            }
         }
     }
 
@@ -17366,6 +17944,23 @@ impl MuxelApp {
             );
         }
         closed
+    }
+
+    fn closed_sessions_on(&self, host_id: Option<Uuid>) -> Vec<muxel_core::tmux::ClosedSession> {
+        let mut seen = HashSet::new();
+        self.workspace
+            .projects
+            .iter()
+            .filter(|project| project.remote.as_ref().map(|remote| remote.host_id) == host_id)
+            .flat_map(|project| {
+                project
+                    .closed_sessions
+                    .iter()
+                    .chain(self.reaped_sessions.get(&project.id).into_iter().flatten())
+            })
+            .filter(|closed| seen.insert(closed.instance))
+            .cloned()
+            .collect()
     }
 
     /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
@@ -17408,7 +18003,7 @@ impl MuxelApp {
         for (iid, name, live) in pending {
             match live {
                 Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
-                None => self.finish_closed_session(pid, iid, &name),
+                None => self.finish_closed_session(pid, iid, &name, cx),
             }
         }
     }
@@ -17485,12 +18080,20 @@ impl MuxelApp {
                 } else {
                     i.worktree_cleanup()
                 },
+                self.workspace.closed_worktree_of(i),
                 i.project_id,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((tmux, worktree_cleanup, project_id)) = info {
-            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
+        if let Some((tmux, worktree_cleanup, closed_worktree, project_id)) = info {
+            self.teardown_closed_instance(
+                iid,
+                project_id,
+                tmux,
+                worktree_cleanup,
+                closed_worktree,
+                cx,
+            );
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
@@ -17509,24 +18112,45 @@ impl MuxelApp {
     /// worktree (clean tree + nothing unmerged); otherwise queue the dispose modal
     /// so uncommitted changes / unmerged commits aren't lost silently.
     fn dispose_worktree_if_orphaned(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        if self.finish_deferred_worktree_dispose(wid, cx) {
+            return;
+        }
         // A question already showing for it decides; never queue a second one.
         if !self.workspace.instances_using(wid).is_empty()
             || self.pending_worktree_dispose.iter().any(|d| d.wid == wid)
         {
             return;
         }
+        // Each of its panes' kills reports back here, so the last one decides.
+        if self.worktree_kill_in_flight(wid) {
+            return;
+        }
+        if self.keep_worktree_for_pending_close(wid, cx) {
+            return;
+        }
         let Some(w) = self.workspace.worktree(wid) else {
+            return;
+        };
+        if w.detached {
+            return;
+        }
+        // A kill can outlast its project. With no repository to act from, the
+        // files stay on disk.
+        let Some(root) = self
+            .workspace
+            .project(w.project_id)
+            .map(|p| p.root_path.clone())
+        else {
+            muxel_store::append_event_log(&format!(
+                "close: kept worktree {}; its project was removed",
+                w.path.display()
+            ));
             return;
         };
         let path = w.path.clone();
         let name = w.name.clone();
         let color = w.color;
         let branch = w.branch.clone();
-        let root = self
-            .workspace
-            .project(w.project_id)
-            .map(|p| p.root_path.clone())
-            .unwrap_or_default();
         let changed = integrations::worktree_change_count(&path);
         let unmerged = integrations::repo_head(&root).map_or(0, |base| {
             integrations::worktree_unmerged_count(&path, &base)
@@ -17543,6 +18167,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            project_id: w.project_id,
             close_after: Vec::new(),
             close_rest: Vec::new(),
             wid,
@@ -17565,18 +18190,23 @@ impl MuxelApp {
         if self.pending_worktree_dispose.iter().any(|d| d.wid == wid) {
             return; // already queued
         }
+        if self.keep_worktree_for_pending_close(wid, cx) {
+            return;
+        }
         let Some(w) = self.workspace.worktree(wid) else {
+            return;
+        };
+        let Some(root) = self
+            .workspace
+            .project(w.project_id)
+            .map(|p| p.root_path.clone())
+        else {
             return;
         };
         let path = w.path.clone();
         let name = w.name.clone();
         let color = w.color;
         let branch = w.branch.clone();
-        let root = self
-            .workspace
-            .project(w.project_id)
-            .map(|p| p.root_path.clone())
-            .unwrap_or_default();
         let changed = integrations::worktree_change_count(&path);
         let unmerged = integrations::repo_head(&root).map_or(0, |base| {
             integrations::worktree_unmerged_count(&path, &base)
@@ -17593,6 +18223,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            project_id: w.project_id,
             close_after: Vec::new(),
             close_rest: Vec::new(),
             wid,
@@ -17608,14 +18239,223 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Whether an unconfirmed kill could be for a pane that ran in this worktree.
+    fn worktree_close_pending(&self, wid: Uuid) -> bool {
+        self.workspace.worktree(wid).is_some_and(|w| {
+            self.workspace
+                .project(w.project_id)
+                .is_some_and(|p| p.close_pending_in(&w.path))
+        })
+    }
+
+    /// Whether one of this worktree's own panes has a kill running right now.
+    fn worktree_kill_in_flight(&self, wid: Uuid) -> bool {
+        self.workspace.worktree(wid).is_some_and(|w| {
+            self.workspace.project(w.project_id).is_some_and(|p| {
+                p.closed_sessions.iter().any(|closed| {
+                    closed.worktree == muxel_core::tmux::ClosedWorktree::In(w.path.clone())
+                        && self.local_closes_inflight.contains_key(&closed.instance)
+                })
+            })
+        })
+    }
+
+    /// Ledger entries survive crashes, so worktree review after a restart
+    /// cannot remove files beneath a teardown that still needs retrying.
+    fn keep_worktree_for_pending_close(&mut self, wid: Uuid, cx: &mut Context<Self>) -> bool {
+        let pending = self.worktree_close_pending(wid);
+        if pending {
+            self.workspace.detach_unused_worktrees(|w| w.id == wid);
+            self.add_event(NotifKind::Error, t("Worktree kept"),
+                t("A tmux close in this worktree is not confirmed. Reopen the project to retry it before removing the worktree."));
+            self.persist();
+            cx.notify();
+        }
+        pending
+    }
+
+    /// A file choice authorizes a later git action, never an immediate terminal
+    /// kill. Busy confirmation and the Undo hold still own the close.
+    fn choose_worktree_dispose(
+        &mut self,
+        mut d: WorktreeDispose,
+        action: WorktreeDisposeAction,
+        cx: &mut Context<Self>,
+    ) {
+        // A pane gone before the answer was given isn't waiting on it. Keeping
+        // only those still here lets acceptance treat any that go missing later
+        // as having left first.
+        d.close_after
+            .retain(|iid| self.workspace.instance(*iid).is_some());
+        let live = d
+            .close_after
+            .iter()
+            .any(|iid| self.workspace.instance(*iid).is_some());
+        let pending = self.worktree_close_pending(d.wid);
+        if !live && !pending {
+            let rest = d.close_rest.clone();
+            self.execute_worktree_dispose(d, action, cx);
+            self.continue_close_request(rest, cx);
+            return;
+        }
+        let ids = d.close_after.iter().chain(&d.close_rest).copied().collect();
+        // With nothing left for this close to take, there's nothing to accept.
+        let accepted = d
+            .close_after
+            .iter()
+            .all(|iid| self.workspace.instance(*iid).is_none() || self.is_closing(*iid));
+        self.deferred_worktree_dispose
+            .entry(d.project_id)
+            .or_default()
+            .insert(
+                d.wid,
+                WorktreeAnswer {
+                    choice: d,
+                    action,
+                    accepted,
+                },
+            );
+        self.continue_close_request(ids, cx);
+    }
+
+    /// The answers these panes were counted in, if no close has taken them yet.
+    pub(super) fn drop_unaccepted_worktree_answers(&mut self, ids: &[Uuid]) {
+        for answers in self.deferred_worktree_dispose.values_mut() {
+            answers.retain(|_, answer| {
+                answer.accepted
+                    || !answer
+                        .choice
+                        .close_after
+                        .iter()
+                        .any(|iid| ids.contains(iid))
+            });
+        }
+        self.deferred_worktree_dispose
+            .retain(|_, answers| !answers.is_empty());
+    }
+
+    fn cancel_deferred_worktree_closes(&mut self, ids: &[Uuid]) {
+        let worktrees: HashSet<_> = ids
+            .iter()
+            .filter_map(|iid| {
+                let inst = self.workspace.instance(*iid)?;
+                Some((inst.project_id, inst.worktree_id?))
+            })
+            .collect();
+        for (pid, wid) in worktrees {
+            if let Some(choices) = self.deferred_worktree_dispose.get_mut(&pid) {
+                choices.remove(&wid);
+            }
+        }
+        self.deferred_worktree_dispose
+            .retain(|_, choices| !choices.is_empty());
+    }
+
+    fn take_deferred_worktree_dispose(&mut self, pid: Uuid, wid: Uuid) -> Option<WorktreeAnswer> {
+        let choices = self.deferred_worktree_dispose.get_mut(&pid)?;
+        let choice = choices.remove(&wid);
+        if choices.is_empty() {
+            self.deferred_worktree_dispose.remove(&pid);
+        }
+        choice
+    }
+
+    /// True while a prior answer owns disposal, including while a tmux close
+    /// is unconfirmed. A new pane invalidates that captured answer.
+    fn finish_deferred_worktree_dispose(&mut self, wid: Uuid, cx: &mut Context<Self>) -> bool {
+        let Some(pid) = self.workspace.worktree(wid).map(|w| w.project_id) else {
+            return false;
+        };
+        let Some(answer) = self
+            .deferred_worktree_dispose
+            .get(&pid)
+            .and_then(|answers| answers.get(&wid))
+        else {
+            return false;
+        };
+        let accepted = answer.accepted;
+        let captured: HashSet<_> = answer.choice.close_after.iter().copied().collect();
+        let members = self.workspace.instances_using(wid);
+        if members.iter().any(|iid| !captured.contains(iid)) {
+            self.take_deferred_worktree_dispose(pid, wid);
+            return false;
+        }
+        if !members.is_empty() {
+            return true;
+        }
+        // Its panes all left, but not through the close this answer was given for.
+        if !accepted {
+            self.take_deferred_worktree_dispose(pid, wid);
+            return false;
+        }
+        if self.worktree_close_pending(wid) {
+            return true;
+        }
+        let answer = self.take_deferred_worktree_dispose(pid, wid).unwrap();
+        self.execute_worktree_dispose(answer.choice, answer.action, cx);
+        true
+    }
+
+    fn execute_worktree_dispose(
+        &mut self,
+        d: WorktreeDispose,
+        action: WorktreeDisposeAction,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace.instances_using(d.wid).is_empty()
+            || self.keep_worktree_for_pending_close(d.wid, cx)
+        {
+            return;
+        }
+        let result = match &action {
+            WorktreeDisposeAction::Keep => Ok(()),
+            WorktreeDisposeAction::Discard => Ok(()),
+            WorktreeDisposeAction::Commit(message) => {
+                integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), message)
+                    .map(|_| ())
+            }
+            WorktreeDisposeAction::Merge(message) => {
+                // Recheck at execution: the agent could edit during its hold.
+                let commit = if integrations::worktree_change_count(&d.path) > 0 {
+                    integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), message)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                commit.and_then(|()| {
+                    integrations::merge_worktree_branch(&d.root, &d.branch).map(|_| ())
+                })
+            }
+        };
+        let keep = matches!(action, WorktreeDisposeAction::Keep) || result.is_err();
+        if let Err(error) = result {
+            log::warn!("worktree disposal failed, keeping it: {error}");
+            self.add_event(NotifKind::Error, t("Worktree kept"), error.to_string());
+        }
+        if keep {
+            if let Some(w) = self.workspace.worktree_mut(d.wid) {
+                w.detached = true;
+            }
+        } else {
+            integrations::remove_worktree(&d.root, &d.path);
+            if matches!(
+                action,
+                WorktreeDisposeAction::Discard | WorktreeDisposeAction::Merge(_)
+            ) {
+                integrations::delete_branch(&d.root, &d.branch);
+            }
+            self.workspace.remove_worktree_meta(d.wid);
+        }
+        self.persist();
+        cx.notify();
+    }
+
     /// Commit the front pending worktree (message = the input, or its name), then
     /// remove it. On commit failure, keep it on disk so no work is lost.
     fn dispose_worktree_commit(&mut self, cx: &mut Context<Self>) {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
         let typed = self
             .dispose_commit_input
             .read(cx)
@@ -17627,20 +18467,7 @@ impl MuxelApp {
         } else {
             typed
         };
-        match integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg) {
-            Ok(_) => {
-                integrations::remove_worktree(&d.root, &d.path);
-                self.workspace.remove_worktree_meta(d.wid);
-            }
-            Err(e) => {
-                log::warn!("worktree commit failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-            }
-        }
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Commit(msg), cx);
     }
 
     /// Discard the front pending worktree: force-remove it AND delete its branch,
@@ -17649,13 +18476,7 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
-        integrations::remove_worktree(&d.root, &d.path);
-        integrations::delete_branch(&d.root, &d.branch);
-        self.workspace.remove_worktree_meta(d.wid);
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Discard, cx);
     }
 
     /// Merge the front pending worktree's branch into the base, then remove the
@@ -17665,54 +18486,18 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
-        // Land any uncommitted changes onto the branch first, so the merge
-        // includes them. On failure, keep the worktree (no work lost).
-        if d.changed > 0 {
-            let typed = self
-                .dispose_commit_input
-                .read(cx)
-                .value()
-                .trim()
-                .to_string();
-            let msg = if typed.is_empty() {
-                d.name.clone()
-            } else {
-                typed
-            };
-            if let Err(e) =
-                integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg)
-            {
-                log::warn!("worktree commit failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-                self.persist();
-                cx.notify();
-                return;
-            }
-        }
-        match integrations::merge_worktree_branch(&d.root, &d.branch) {
-            Ok(()) => {
-                integrations::remove_worktree(&d.root, &d.path);
-                integrations::delete_branch(&d.root, &d.branch);
-                self.workspace.remove_worktree_meta(d.wid);
-            }
-            Err(e) => {
-                log::warn!("worktree merge failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-                self.add_event(
-                    NotifKind::Error,
-                    tf("Couldn't merge {name}", &[("name", &d.name.to_string())]),
-                    tf("{e} — the worktree was kept.", &[("e", &e.to_string())]),
-                );
-            }
-        }
-        self.persist();
-        cx.notify();
+        let typed = self
+            .dispose_commit_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let msg = if typed.is_empty() {
+            d.name.clone()
+        } else {
+            typed
+        };
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Merge(msg), cx);
     }
 
     /// Keep the front pending worktree on disk (detached, resumable later).
@@ -17720,13 +18505,7 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
-        if let Some(w) = self.workspace.worktree_mut(d.wid) {
-            w.detached = true;
-        }
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Keep, cx);
     }
 
     /// Run a (possibly slow) git/gh operation off the main thread, toasting the
@@ -18789,6 +19568,7 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("nr-cancel")
+                            .accessibility_id("muxel.nr-cancel")
                             .ghost()
                             .label(t("Cancel"))
                             .on_click(
@@ -18797,6 +19577,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("nr-add-host")
+                            .accessibility_id("muxel.nr-add-host")
                             .primary()
                             .icon(IconName::Plus)
                             .label(t("Add host"))
@@ -18828,6 +19609,7 @@ impl MuxelApp {
             }
             hosts = hosts.child(
                 Button::new("nr-add-host")
+                    .accessibility_id("muxel.nr-add-host")
                     .ghost()
                     .icon(IconName::Plus)
                     .label(t("Add host"))
@@ -18840,6 +19622,7 @@ impl MuxelApp {
                 .child(
                     div().pt_1().child(
                         Button::new("nr-scan")
+                            .accessibility_id("muxel.nr-scan")
                             .ghost()
                             .icon(IconName::Search)
                             .label(t("Scan for projects"))
@@ -18901,9 +19684,9 @@ impl MuxelApp {
                     }
                 })
                 .child(self.settings_label(&t("Remote directory"), cx))
-                .child(Input::new(&self.nr_dir))
+                .child(Input::new(&self.nr_dir).accessibility_id("muxel.input.nr_dir"))
                 .child(self.settings_label(&t("Project name (optional)"), cx))
-                .child(Input::new(&self.nr_name))
+                .child(Input::new(&self.nr_name).accessibility_id("muxel.input.nr_name"))
                 // Inline Verify result, above the buttons.
                 .children(match &self.nr_verify {
                     RemoteTestState::Idle => None,
@@ -18941,6 +19724,7 @@ impl MuxelApp {
                         .pt_2()
                         .child(
                             Button::new("nr-verify")
+                                .accessibility_id("muxel.nr-verify")
                                 .ghost()
                                 .label(t("Verify"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -18950,6 +19734,7 @@ impl MuxelApp {
                         .child(div().flex_1())
                         .child(
                             Button::new("nr-cancel")
+                                .accessibility_id("muxel.nr-cancel")
                                 .ghost()
                                 .label(t("Cancel"))
                                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -18958,6 +19743,7 @@ impl MuxelApp {
                         )
                         .child(
                             Button::new("nr-create")
+                                .accessibility_id("muxel.nr-create")
                                 .primary()
                                 .label(t("Create"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -19148,11 +19934,24 @@ impl MuxelApp {
             .p_2()
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(Input::new(&self.memory_title_input).w_full())
-            .child(Input::new(&self.memory_note_input).w_full())
-            .child(Input::new(&self.memory_tags_input).w_full())
+            .child(
+                Input::new(&self.memory_title_input)
+                    .accessibility_id("muxel.input.memory_title_input")
+                    .w_full(),
+            )
+            .child(
+                Input::new(&self.memory_note_input)
+                    .accessibility_id("muxel.input.memory_note_input")
+                    .w_full(),
+            )
+            .child(
+                Input::new(&self.memory_tags_input)
+                    .accessibility_id("muxel.input.memory_tags_input")
+                    .w_full(),
+            )
             .child(
                 Button::new("mem-add")
+                    .accessibility_id("muxel.mem-add")
                     .primary()
                     .xsmall()
                     .icon(IconName::Plus)
@@ -19194,6 +19993,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("mem-open-file")
+                            .accessibility_id("muxel.mem-open-file")
                             .ghost()
                             .xsmall()
                             .icon(IconName::File)
@@ -19204,6 +20004,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("mem-close")
+                            .accessibility_id("muxel.mem-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -19219,10 +20020,11 @@ impl MuxelApp {
                     ),
             )
             .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .child(Input::new(&self.memory_search).w_full()),
+                div().px_2().py_1().child(
+                    Input::new(&self.memory_search)
+                        .accessibility_id("muxel.input.memory_search")
+                        .w_full(),
+                ),
             )
             .child(list)
             .child(add_form)
@@ -19275,7 +20077,10 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(hint),
                     )
-                    .child(Input::new(&self.password_prompt_input))
+                    .child(
+                        Input::new(&self.password_prompt_input)
+                            .accessibility_id("muxel.input.password_prompt_input"),
+                    )
                     .child(
                         div()
                             .flex()
@@ -19284,17 +20089,22 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("pw-cancel")
+                                    .accessibility_id("muxel.pw-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, window, cx| {
                                         this.close_password_prompt(window, cx)
                                     })),
                             )
-                            .child(Button::new("pw-confirm").primary().label(confirm).on_click(
-                                cx.listener(|this, _e, window, cx| {
-                                    this.confirm_password_prompt(window, cx)
-                                }),
-                            )),
+                            .child(
+                                Button::new("pw-confirm")
+                                    .accessibility_id("muxel.pw-confirm")
+                                    .primary()
+                                    .label(confirm)
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.confirm_password_prompt(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -19380,9 +20190,14 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(label),
+                            .child(label.clone()),
                     )
-                    .child(Input::new(&self.git_action_input).w_full())
+                    .child(
+                        Input::new(&self.git_action_input)
+                            .accessibility_id("muxel.input.git_action_input")
+                            .aria_label(label)
+                            .w_full(),
+                    )
                     .children(file_list)
                     .child(
                         div()
@@ -19392,6 +20207,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("git-cancel")
+                                    .accessibility_id("muxel.git-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -19400,6 +20216,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("git-confirm")
+                                    .accessibility_id("muxel.git-confirm")
                                     .primary()
                                     .label(confirm)
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -19440,35 +20257,29 @@ impl MuxelApp {
     /// Remove worktree `wid` entirely: close its panes, delete the worktree + its
     /// branch, drop the registry entry.
     fn discard_worktree(&mut self, wid: Uuid, cx: &mut Context<Self>) {
-        let held: Vec<_> = self
-            .workspace
-            .instances_using(wid)
-            .into_iter()
-            .filter(|iid| self.is_closing(*iid))
-            .collect();
+        // Close every pane, held or not, while the registry entry still exists,
+        // so each kill's ledger entry records this worktree; one saved after it
+        // went would count as any worktree. Preserving skips the dispose prompt.
         let preserving = self.preserve_close_worktrees;
         self.preserve_close_worktrees = true;
-        for iid in held {
+        for iid in self.workspace.instances_using(wid) {
             self.close_instance_inner(iid, "worktree discard", cx);
         }
         self.preserve_close_worktrees = preserving;
         let Some(w) = self.workspace.worktree(wid) else {
             return;
         };
+        let pid = w.project_id;
         let path = w.path.clone();
         let branch = w.branch.clone();
         let root = self
             .workspace
-            .project(w.project_id)
+            .project(pid)
             .map(|p| p.root_path.clone())
             .unwrap_or_default();
-        let instances = self.workspace.instances_using(wid);
-        // Drop the registry entry first so each close skips the dispose prompt
-        // (dispose_worktree_if_orphaned no-ops when the worktree is gone).
+        // An answer waiting on these panes has nothing left to act on.
+        self.take_deferred_worktree_dispose(pid, wid);
         self.workspace.remove_worktree_meta(wid);
-        for iid in instances {
-            self.close_instance(iid, cx);
-        }
         integrations::remove_worktree(&root, &path);
         integrations::delete_branch(&root, &branch);
         self.worktree_changes.remove(&wid);
@@ -20142,6 +20953,7 @@ impl MuxelApp {
                             .shadow_md()
                             .child(
                                 Button::new("fullscreen-reveal-sidebar-secondary")
+                                    .accessibility_id("muxel.fullscreen-reveal-sidebar-secondary")
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
@@ -20402,14 +21214,25 @@ impl MuxelApp {
             view.read(cx).session().kill();
         }
         // Tear down tmux (local or remote) + worktree, then drop the orphan meta.
-        let info = self
-            .workspace
-            .instance(iid)
-            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
+        let info = self.workspace.instance(iid).map(|i| {
+            (
+                InstanceTmux::capture(i),
+                i.worktree_cleanup(),
+                self.workspace.closed_worktree_of(i),
+                i.project_id,
+            )
+        });
         self.workspace.remove_instance_meta(iid);
-        if let Some((tmux, worktree_cleanup, project_id)) = info {
+        if let Some((tmux, worktree_cleanup, closed_worktree, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
-            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
+            self.teardown_closed_instance(
+                iid,
+                project_id,
+                tmux,
+                worktree_cleanup,
+                closed_worktree,
+                cx,
+            );
         }
         self.last_status.remove(&iid);
         self.persist();
@@ -20541,6 +21364,8 @@ impl MuxelApp {
         action: ConfirmAction,
         cx: &mut Context<Self>,
     ) {
+        // Nothing can accept a close prompt once another replaces it.
+        self.cancel_close_prompt_answers();
         self.confirm = Some(PendingConfirm {
             title: title.into(),
             message: message.into(),
@@ -20568,7 +21393,19 @@ impl MuxelApp {
         cx.notify();
     }
 
+    fn cancel_close_prompt_answers(&mut self) {
+        if let Some(pending) = &self.confirm {
+            let ids = match &pending.action {
+                ConfirmAction::CloseBatch(ids) => ids.clone(),
+                ConfirmAction::SaveEditorBeforeClose { rest, .. } => rest.clone(),
+                _ => Vec::new(),
+            };
+            self.cancel_deferred_worktree_closes(&ids);
+        }
+    }
+
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        self.cancel_close_prompt_answers();
         self.confirm = None;
         cx.notify();
     }
@@ -20913,6 +21750,8 @@ impl MuxelApp {
                                 name: owner.name.clone(),
                                 socket: owner.socket.clone(),
                                 instance: iid,
+                                local_close_token: None,
+                                worktree: Default::default(),
                             };
                             if self.terminal_restarts.record_owner(
                                 &mut self.workspace,
@@ -20963,6 +21802,8 @@ impl MuxelApp {
                 name: session.name,
                 socket: session.socket,
                 instance: iid,
+                local_close_token: None,
+                worktree: Default::default(),
             };
             let resolved = cx
                 .background_executor()
@@ -23359,10 +24200,12 @@ impl MuxelApp {
                                 },
                             ))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&rename_input).w_full().min_w_0()),
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&rename_input)
+                                        .accessibility_id("muxel.input.file-rename")
+                                        .w_full()
+                                        .min_w_0(),
+                                ),
                             )
                             .into_any_element();
                     }
@@ -23559,6 +24402,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("fb-close")
+                            .accessibility_id("muxel.fb-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -23574,10 +24418,11 @@ impl MuxelApp {
                     ),
             )
             .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .child(Input::new(&self.file_browser_input).w_full()),
+                div().px_2().py_1().child(
+                    Input::new(&self.file_browser_input)
+                        .accessibility_id("muxel.input.file_browser_input")
+                        .w_full(),
+                ),
             )
             .child(div().flex_1().min_h_0().px_1().child(list.size_full()))
             .into_any_element()
@@ -24030,6 +24875,9 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("split-h-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.split-right.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelRight)
@@ -24057,6 +24905,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("split-v-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.split-down.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelBottom)
@@ -24101,6 +24952,9 @@ impl MuxelApp {
                             t("Auto")
                         };
                         Button::new(SharedString::from(format!("auto-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.autopilot.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .selected(on)
@@ -24129,6 +24983,9 @@ impl MuxelApp {
                     }))
                     .children((kind == InstanceKind::Terminal).then(|| {
                         Button::new(SharedString::from(format!("diff-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.diff.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(Icon::empty().path("icons/diff.svg"))
@@ -24147,6 +25004,9 @@ impl MuxelApp {
                     )
                     .children((kind == InstanceKind::Diff).then(|| {
                         Button::new(SharedString::from(format!("refresh-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.refresh.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .label("↻")
@@ -24163,6 +25023,9 @@ impl MuxelApp {
                             .map(|e| {
                                 let rendered = e.read(cx).show_rendered();
                                 Button::new(SharedString::from(format!("md-{sid}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.pane-control.markdown.{sid}"
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .label(if rendered { t("Raw") } else { t("Rendered") })
@@ -24184,6 +25047,9 @@ impl MuxelApp {
                             .filter(|editor| editor.read(cx).is_html())
                             .map(|_| {
                                 Button::new(SharedString::from(format!("preview-html-{sid}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.pane-control.preview-html.{sid}"
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .label(t("Preview"))
@@ -24205,6 +25071,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("max-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.maximize.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(max_icon)
@@ -24215,6 +25084,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("popout-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.popout.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::ExternalLink)
@@ -24225,6 +25097,9 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("close-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.close.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -24295,10 +25170,13 @@ impl MuxelApp {
                                     cx.theme().muted_foreground,
                                 ))
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                                    div().flex_1().min_w_0().child(
+                                        Input::new(&self.rename_input)
+                                            .accessibility_id("muxel.input.rename_input")
+                                            .aria_label(t("Rename"))
+                                            .w_full()
+                                            .min_w_0(),
+                                    ),
                                 )
                                 .into_any_element();
                         }
@@ -24306,6 +25184,13 @@ impl MuxelApp {
                         let pill_ghost = tab_title.clone();
                         let pill = div()
                             .id(SharedString::from(format!("tab-{}", tab.simple())))
+                            .role(Role::Tab)
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-tab.{}",
+                                tab.simple()
+                            )))
+                            .aria_label(tab_title.clone())
+                            .aria_selected(tab_active)
                             .flex()
                             .items_center()
                             .gap_1()
@@ -24604,6 +25489,10 @@ impl MuxelApp {
                                             "tabx-{}",
                                             tab.simple()
                                         )))
+                                        .accessibility_id(SharedString::from(format!(
+                                            "muxel.pane-tab-close.{}",
+                                            tab.simple()
+                                        )))
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Close)
@@ -24649,6 +25538,9 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("newtab-{sid}")))
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-control.new-tab.{sid}"
+                            )))
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
@@ -24696,6 +25588,11 @@ impl MuxelApp {
                     .child(
                         div()
                             .id(SharedString::from(format!("tabrow-{}", anchor.simple())))
+                            .role(Role::TabList)
+                            .accessibility_id(SharedString::from(format!(
+                                "muxel.pane-tabs.{}",
+                                anchor.simple()
+                            )))
                             .flex_1()
                             .min_w_0()
                             .flex()
@@ -24738,10 +25635,13 @@ impl MuxelApp {
                                     }
                                 }))
                                 .child(
-                                    div()
-                                        .w(px(110.0))
-                                        .min_w_0()
-                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                                    div().w(px(110.0)).min_w_0().child(
+                                        Input::new(&self.rename_input)
+                                            .accessibility_id("muxel.input.rename_input")
+                                            .aria_label(t("Rename"))
+                                            .w_full()
+                                            .min_w_0(),
+                                    ),
                                 )
                                 .into_any_element()
                         } else {
@@ -24778,6 +25678,12 @@ impl MuxelApp {
 
                 let mut card = div()
                     .id(SharedString::from(format!("pane-{}", anchor.simple())))
+                    .role(Role::Group)
+                    .accessibility_id(SharedString::from(format!(
+                        "muxel.pane.{}",
+                        anchor.simple()
+                    )))
+                    .aria_label(self.instance_title(iid, cx))
                     .size_full()
                     .flex()
                     .flex_col()
@@ -25004,6 +25910,7 @@ impl MuxelApp {
                     .items_center()
                     .child(
                         Button::new("terms-full")
+                            .accessibility_id("muxel.terms-full")
                             .ghost()
                             .label(t("View full terms"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
@@ -25012,6 +25919,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("terms-license")
+                            .accessibility_id("muxel.terms-license")
                             .ghost()
                             .label(t("License (GPL-3.0)"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
@@ -25029,14 +25937,19 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
-                        cx.listener(|this, _e, _w, cx| {
-                            this.confirm_quit = true;
-                            this.quit_after_closes(cx);
-                        }),
-                    ))
+                    .child(
+                        Button::new("terms-quit")
+                            .accessibility_id("muxel.terms-quit")
+                            .ghost()
+                            .label(t("Quit"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.confirm_quit = true;
+                                this.quit_after_closes(cx);
+                            })),
+                    )
                     .child(
                         Button::new("terms-accept")
+                            .accessibility_id("muxel.terms-accept")
                             .primary()
                             .label(t("I Agree & Continue"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.accept_terms(cx))),
@@ -25062,10 +25975,22 @@ impl MuxelApp {
             let id = meta.id;
             let name = meta.name.clone();
             let selected = current == Some(id);
+            let entity = cx.entity();
             list =
                 list.child(
                     div()
                         .id(SharedString::from(format!("workspace-{}", id.simple())))
+                        .role(Role::Button)
+                        .accessibility_id(SharedString::from(format!(
+                            "muxel.workspace.{}",
+                            id.simple()
+                        )))
+                        .aria_label(name.clone())
+                        // The row opens on mouse-down, which assistive technology
+                        // can't send; give it the same action as a click.
+                        .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.enter_workspace(id, window, cx));
+                        })
                         .px_3()
                         .py_2()
                         .rounded(cx.theme().radius)
@@ -25106,6 +26031,10 @@ impl MuxelApp {
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "del-workspace-{}",
+                                        id.simple()
+                                    )))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.workspace-delete.{}",
                                         id.simple()
                                     )))
                                     .ghost()
@@ -25181,9 +26110,15 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_1().child(Input::new(&self.workspace_name_input)))
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.workspace_name_input)
+                                .accessibility_id("muxel.input.workspace_name_input"),
+                        ),
+                    )
                     .child(
                         Button::new("create-workspace")
+                            .accessibility_id("muxel.create-workspace")
                             .primary()
                             .label(t("Create"))
                             .on_click(cx.listener(|this, _e, window, cx| {
@@ -25201,6 +26136,7 @@ impl MuxelApp {
                 .justify_between()
                 .child(
                     Button::new("quit-selector")
+                        .accessibility_id("muxel.quit-selector")
                         .ghost()
                         .label(t("Quit"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
@@ -25210,6 +26146,7 @@ impl MuxelApp {
                 )
                 .children(self.current_workspace.is_some().then(|| {
                     Button::new("cancel-selector")
+                        .accessibility_id("muxel.cancel-selector")
                         .ghost()
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
@@ -25270,7 +26207,7 @@ impl MuxelApp {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
                 let color = status
-                    .map(|s| status_hsla(s, cx))
+                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
                     .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
@@ -25362,10 +26299,13 @@ impl MuxelApp {
                     }
                 }))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.rename_input)
+                            .accessibility_id("muxel.input.rename_input")
+                            .aria_label(t("Rename"))
+                            .w_full()
+                            .min_w_0(),
+                    ),
                 )
                 .into_any_element();
         }
@@ -25553,6 +26493,7 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new("notif-clear-all")
+                            .accessibility_id("muxel.notif-clear-all")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -25704,6 +26645,7 @@ impl MuxelApp {
             }))
             .child(
                 Button::new("gitdiff-refresh")
+                    .accessibility_id("muxel.gitdiff-refresh")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Redo)
@@ -25726,6 +26668,7 @@ impl MuxelApp {
                 .border_color(cx.theme().border)
                 .child(
                     Button::new("gd-tab-files")
+                        .accessibility_id("muxel.gd-tab-files")
                         .ghost()
                         .xsmall()
                         .selected(self.git_diff_tab == GitDiffTab::Files)
@@ -25736,6 +26679,7 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("gd-tab-worktrees")
+                        .accessibility_id("muxel.gd-tab-worktrees")
                         .ghost()
                         .xsmall()
                         .selected(self.git_diff_tab == GitDiffTab::Worktrees)
@@ -25788,9 +26732,14 @@ impl MuxelApp {
                 .p_2()
                 .border_t_1()
                 .border_color(cx.theme().border)
-                .child(Input::new(&self.git_diff_commit_input).w_full())
+                .child(
+                    Input::new(&self.git_diff_commit_input)
+                        .accessibility_id("muxel.input.git_diff_commit_input")
+                        .w_full(),
+                )
                 .child(
                     Button::new("gitdiff-commit-all")
+                        .accessibility_id("muxel.gitdiff-commit-all")
                         .primary()
                         .w_full()
                         .label(t("Commit all"))
@@ -26163,6 +27112,34 @@ impl MuxelApp {
             };
             let base = div()
                 .id(SharedString::from(format!("proj-row-{ix}")))
+                .role(Role::TreeItem)
+                .accessibility_id(SharedString::from(format!(
+                    "muxel.project.{}",
+                    pid.simple()
+                )))
+                .aria_label(name.clone())
+                .aria_selected(active)
+                .aria_expanded(!collapsed)
+                .on_a11y_action(AccessibleAction::Expand, {
+                    let entity = cx.entity();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if this.collapsed.contains(&pid) {
+                                this.toggle_collapse(pid, cx);
+                            }
+                        })
+                    }
+                })
+                .on_a11y_action(AccessibleAction::Collapse, {
+                    let entity = cx.entity();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if !this.collapsed.contains(&pid) {
+                                this.toggle_collapse(pid, cx);
+                            }
+                        })
+                    }
+                })
                 .mx_1()
                 .px_1()
                 .py_1()
@@ -26201,10 +27178,13 @@ impl MuxelApp {
                     }
                 }))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.rename_input)
+                            .accessibility_id("muxel.input.rename_input")
+                            .aria_label(t("Rename"))
+                            .w_full()
+                            .min_w_0(),
+                    ),
                 )
                 .into_any_element()
             } else {
@@ -26219,6 +27199,12 @@ impl MuxelApp {
                             }
                         }),
                     )
+                    .on_a11y_action(AccessibleAction::Click, {
+                        let entity = cx.entity();
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.select_project(pid, window, cx))
+                        }
+                    })
                     .child(
                         // Name + the repo's current branch (cached) with a branch icon.
                         div()
@@ -26276,6 +27262,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("memory-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-memory.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Star)
@@ -26292,6 +27282,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("accomplishments-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-accomplishments.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::CircleCheck)
@@ -26311,6 +27305,10 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new(SharedString::from(format!("files-{ix}")))
+                                    .accessibility_id(SharedString::from(format!(
+                                        "muxel.project-files.{}",
+                                        pid.simple()
+                                    )))
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::empty().path("icons/files.svg"))
@@ -26826,6 +27824,7 @@ impl MuxelApp {
                     };
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -26856,12 +27855,13 @@ impl MuxelApp {
                         .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            status_hsla(
+                            pane_status_hsla(
                                 if loading {
                                     AgentStatus::Working
                                 } else {
                                     status
                                 },
+                                inst.map(|i| &i.activity),
                                 cx,
                             ),
                         ))
@@ -26880,10 +27880,13 @@ impl MuxelApp {
                             }
                         }))
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.rename_input)
+                                    .accessibility_id("muxel.input.rename_input")
+                                    .aria_label(t("Rename"))
+                                    .w_full()
+                                    .min_w_0(),
+                            ),
                         )
                         .into_any_element()
                     } else {
@@ -26921,7 +27924,7 @@ impl MuxelApp {
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
-                                status_tag(
+                                let tag = status_tag(
                                     status,
                                     inst.map(|instance| {
                                         localized_activity_label(
@@ -26931,7 +27934,10 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                )
+                                );
+                                // A read finish keeps its green as an outline, so
+                                // the label stays legible on the sidebar.
+                                if read_done { tag.outline() } else { tag }
                             }))
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
                                 let label = ghost_label.clone();
@@ -27017,6 +28023,7 @@ impl MuxelApp {
                 .child(
                     div().flex_1().min_w_0().overflow_hidden().child(
                         Button::new("new-project")
+                            .accessibility_id("muxel.new-project")
                             .ghost()
                             .icon(IconName::Plus)
                             .label(t("New Project"))
@@ -27028,6 +28035,7 @@ impl MuxelApp {
                 .child(
                     div().flex_none().child(
                         Button::new("new-remote-project")
+                            .accessibility_id("muxel.new-remote-project")
                             .ghost()
                             .icon(IconName::Network)
                             .tooltip(t("New remote project (SSH)"))
@@ -27079,6 +28087,7 @@ impl MuxelApp {
             DropdownButton::new("preset-run")
                 .button(
                     Button::new("preset-run-btn")
+                        .accessibility_id("muxel.preset-run-btn")
                         .ghost()
                         .small()
                         .icon(current_icon)
@@ -27112,6 +28121,7 @@ impl MuxelApp {
         bar.child(div().w(px(6.0)))
             .child(
                 Button::new("run-task")
+                    .accessibility_id("muxel.run-task")
                     .ghost()
                     .small()
                     .icon(IconName::Play)
@@ -27128,6 +28138,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("loops-btn")
+                    .accessibility_id("muxel.loops-btn")
                     .ghost()
                     .small()
                     .icon(IconName::Redo)
@@ -27144,6 +28155,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("snippets-btn")
+                    .accessibility_id("muxel.snippets-btn")
                     .ghost()
                     .small()
                     .icon(IconName::SquareTerminal)
@@ -27161,6 +28173,7 @@ impl MuxelApp {
             .child(div().w(px(6.0)))
             .child(
                 Button::new("toggle-tmux")
+                    .accessibility_id("muxel.toggle-tmux")
                     .ghost()
                     .icon(IconName::SquareTerminal)
                     .selected(self.use_tmux)
@@ -27169,6 +28182,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("toggle-worktree")
+                    .accessibility_id("muxel.toggle-worktree")
                     .ghost()
                     .icon(Icon::empty().path("icons/git-branch.svg"))
                     .selected(self.use_worktree)
@@ -27177,6 +28191,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("restart")
+                    .accessibility_id("muxel.restart")
                     .ghost()
                     .icon(IconName::Play)
                     .disabled(!self.active_is_terminal())
@@ -27185,6 +28200,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("close")
+                    .accessibility_id("muxel.close")
                     .ghost()
                     .icon(IconName::Close)
                     .tooltip(t("Close pane"))
@@ -27192,6 +28208,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("speech-to-text")
+                    .accessibility_id("muxel.speech-to-text")
                     .ghost()
                     .icon(Icon::empty().path("icons/mic.svg"))
                     .selected(self.stt_state == SttState::Recording)
@@ -27210,6 +28227,7 @@ impl MuxelApp {
             .child(div().flex_1())
             .child(
                 Button::new("toggle-git-diff")
+                    .accessibility_id("muxel.toggle-git-diff")
                     .ghost()
                     .icon(Icon::empty().path("icons/diff.svg"))
                     .selected(self.show_git_diff)
@@ -27373,7 +28391,10 @@ impl MuxelApp {
                             .p_2()
                             .border_b_1()
                             .border_color(cx.theme().border)
-                            .child(Input::new(&self.search_input)),
+                            .child(
+                                Input::new(&self.search_input)
+                                    .accessibility_id("muxel.input.search_input"),
+                            ),
                     )
                     .child(
                         div()
@@ -27491,7 +28512,12 @@ impl MuxelApp {
                                     .flex_none()
                                     .child(t("Find in project")),
                             )
-                            .child(div().flex_1().child(Input::new(&self.find_input))),
+                            .child(
+                                div().flex_1().child(
+                                    Input::new(&self.find_input)
+                                        .accessibility_id("muxel.input.find_input"),
+                                ),
+                            ),
                     )
                     .child(
                         div()
@@ -27565,6 +28591,7 @@ impl MuxelApp {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 Button::new("toggle-sidebar")
+                                    .accessibility_id("muxel.toggle-sidebar")
                                     .ghost()
                                     .icon(IconName::PanelLeft)
                                     .tooltip(if sidebar_hidden {
@@ -27613,6 +28640,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(nodrag(
                         Button::new("toggle-sidebar")
+                            .accessibility_id("muxel.toggle-sidebar")
                             .ghost()
                             .icon(IconName::PanelLeft)
                             .tooltip(t("Toggle sidebar"))
@@ -27633,6 +28661,7 @@ impl MuxelApp {
                     .child(nodrag(self.render_close_chip(cx)))
                     .child(nodrag(
                         Button::new("global-search")
+                            .accessibility_id("muxel.global-search")
                             .ghost()
                             .small()
                             .icon(IconName::Search)
@@ -27645,6 +28674,7 @@ impl MuxelApp {
                     .child(div().flex_1())
                     .child(nodrag(
                         Button::new("update")
+                            .accessibility_id("muxel.update")
                             .ghost()
                             .icon(IconName::ArrowUp)
                             .selected(self.update_pending())
@@ -27661,6 +28691,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("workspaces")
+                            .accessibility_id("muxel.workspaces")
                             .ghost()
                             .icon(IconName::CircleUser)
                             .tooltip(t("Switch workspace"))
@@ -27670,6 +28701,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("dashboard")
+                            .accessibility_id("muxel.dashboard")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
                             .selected(self.main_view == hotbar::MainView::Dashboard)
@@ -27700,6 +28732,7 @@ impl MuxelApp {
                     )
                     .child(nodrag(
                         Button::new("settings")
+                            .accessibility_id("muxel.settings")
                             .ghost()
                             .icon(IconName::Settings)
                             .selected(self.show_settings)
@@ -27710,6 +28743,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("notifications")
+                            .accessibility_id("muxel.notifications")
                             .ghost()
                             .icon(IconName::Bell)
                             .selected(self.notifications_enabled)
@@ -27720,6 +28754,7 @@ impl MuxelApp {
                     ))
                     .child(nodrag(
                         Button::new("donate")
+                            .accessibility_id("muxel.donate")
                             .ghost()
                             .icon(IconName::Heart)
                             .tooltip(t("Support muxel"))
@@ -28096,12 +29131,14 @@ impl MuxelApp {
                         .items_center()
                         .gap_2()
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_provider_url)),
+                            v_flex().flex_1().child(
+                                Input::new(&self.settings_ui.stt_provider_url)
+                                    .accessibility_id("muxel.input.stt_provider_url"),
+                            ),
                         )
                         .child(
                             Button::new("stt-apply-provider")
+                                .accessibility_id("muxel.stt-apply-provider")
                                 .primary()
                                 .label(t("Apply"))
                                 .on_click(
@@ -28127,12 +29164,14 @@ impl MuxelApp {
                         .items_center()
                         .gap_2()
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_api_key)),
+                            v_flex().flex_1().child(
+                                Input::new(&self.settings_ui.stt_api_key)
+                                    .accessibility_id("muxel.input.stt_api_key"),
+                            ),
                         )
                         .child(
                             Button::new("stt-save-key")
+                                .accessibility_id("muxel.stt-save-key")
                                 .primary()
                                 .label(t("Save"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -28141,6 +29180,7 @@ impl MuxelApp {
                         )
                         .children(self.settings_ui.stt_has_key.then(|| {
                             Button::new("stt-clear-key")
+                                .accessibility_id("muxel.stt-clear-key")
                                 .ghost()
                                 .label(t("Remove"))
                                 .on_click(
@@ -28159,9 +29199,15 @@ impl MuxelApp {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(v_flex().flex_1().child(Input::new(&self.settings_ui.stt_language)))
+                .child(
+                    v_flex().flex_1().child(
+                        Input::new(&self.settings_ui.stt_language)
+                            .accessibility_id("muxel.input.stt_language"),
+                    ),
+                )
                 .child(
                     Button::new("stt-apply-lang")
+                        .accessibility_id("muxel.stt-apply-lang")
                         .primary()
                         .label(t("Apply"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx))),
@@ -28203,10 +29249,14 @@ impl MuxelApp {
                         .child(
                             v_flex()
                                 .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_wake_phrase)),
+                                .child(
+                                    Input::new(&self.settings_ui.stt_wake_phrase)
+                                        .accessibility_id("muxel.input.stt_wake_phrase"),
+                                ),
                         )
                         .child(
                             Button::new("stt-apply-wake-phrase")
+                                .accessibility_id("muxel.stt-apply-wake-phrase")
                                 .primary()
                                 .label(t("Apply"))
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -28788,18 +29838,30 @@ impl MuxelApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Button::new("ed-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(-1.0, w, cx)),
-                    ))
+                    .child(
+                        Button::new("ed-font-dec")
+                            .accessibility_id("muxel.ed-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_font(-1.0, w, cx)),
+                            ),
+                    )
                     .child(
                         div()
                             .w(rems(4.0))
                             .text_center()
                             .child(format!("{}", self.settings.editor_font_size.round() as i32)),
                     )
-                    .child(Button::new("ed-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
-                    )),
+                    .child(
+                        Button::new("ed-font-inc")
+                            .accessibility_id("muxel.ed-font-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
+                            ),
+                    ),
             )
             .child(self.settings_label(&t("Editor font family (blank = theme monospace)"), cx))
             .child(
@@ -28808,12 +29870,14 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.editor_font_family)),
+                        v_flex().flex_1().child(
+                            Input::new(&self.settings_ui.editor_font_family)
+                                .accessibility_id("muxel.input.editor_font_family"),
+                        ),
                     )
                     .child(
                         Button::new("apply-ed-font")
+                            .accessibility_id("muxel.apply-ed-font")
                             .primary()
                             .label(t("Apply"))
                             .on_click(
@@ -28830,9 +29894,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("ed-tab-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(-1, w, cx)),
-                        ),
+                        Button::new("ed-tab-dec")
+                            .accessibility_id("muxel.ed-tab-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_tab(-1, w, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -28841,9 +29909,13 @@ impl MuxelApp {
                             .child(format!("{}", self.settings.editor_tab_size)),
                     )
                     .child(
-                        Button::new("ed-tab-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(1, w, cx)),
-                        ),
+                        Button::new("ed-tab-inc")
+                            .accessibility_id("muxel.ed-tab-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, w, cx| this.adjust_editor_tab(1, w, cx)),
+                            ),
                     ),
             )
             .child(
@@ -29946,7 +31018,17 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        let unconfirmed = self
+            .workspace
+            .project(pid)
+            .map(|p| p.closed_sessions.clone())
+            .unwrap_or_default();
+        // A file answer runs only through its own close, never on the way out, so
+        // held panes leave their files as a workspace departure does.
+        self.deferred_worktree_dispose.remove(&pid);
+        let preserving = std::mem::replace(&mut self.preserve_close_worktrees, true);
         self.finalize_project_closes(pid, cx);
+        self.preserve_close_worktrees = preserving;
         let iids: Vec<_> = self
             .workspace
             .instances
@@ -29956,6 +31038,32 @@ impl MuxelApp {
             .collect();
         for iid in iids {
             self.close_instance(iid, cx);
+        }
+        // The retry ledger goes with the project, so anything older gets one last
+        // try now. Kills already running carry on without it. A host that never
+        // answers can't keep the project here; its session stays running there.
+        if self.workspace.project(pid).is_some_and(|p| p.is_remote()) {
+            if let Some(host) = self.remote_host_for_project(pid) {
+                for closed in &unconfirmed {
+                    self.reap_remote_session(
+                        pid,
+                        closed.instance,
+                        host.clone(),
+                        closed.target(),
+                        cx,
+                    );
+                }
+            }
+        } else {
+            self.retry_local_closes(pid, cx);
+        }
+        if !unconfirmed.is_empty() {
+            muxel_store::append_event_log(&format!(
+                "close: removed project [{pid}] with {} unconfirmed tmux close(s); nothing retries them now",
+                unconfirmed.len()
+            ));
+            self.add_event(NotifKind::Error, t("tmux sessions may still be running"),
+                t("This project had tmux closes that never confirmed. Muxel tried once more and won't retry. Import lists any still running."));
         }
         self.workspace.projects.retain(|p| p.id != pid);
         if self.workspace.active_project == Some(pid) {
@@ -30083,6 +31191,9 @@ impl MuxelApp {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("place-preset-{idx}")))
+                    .role(Role::MenuItem)
+                    .accessibility_id(SharedString::from(format!("muxel.place-preset.{idx}")))
+                    .aria_label(name.clone())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -30607,7 +31718,9 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(preview),
                     )
-                    .child(Input::new(&self.runner_input))
+                    .child(
+                        Input::new(&self.runner_input).accessibility_id("muxel.input.runner_input"),
+                    )
                     .child(
                         div()
                             .flex()
@@ -30616,6 +31729,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("run-cancel")
+                                    .accessibility_id("muxel.run-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -30624,9 +31738,15 @@ impl MuxelApp {
                                         cx.notify();
                                     })),
                             )
-                            .child(Button::new("run-go").primary().label(t("Run")).on_click(
-                                cx.listener(|this, _e, window, cx| this.execute_runner(window, cx)),
-                            )),
+                            .child(
+                                Button::new("run-go")
+                                    .accessibility_id("muxel.run-go")
+                                    .primary()
+                                    .label(t("Run"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.execute_runner(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -30935,6 +32055,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("confirm-cancel")
+                                    .accessibility_id("muxel.confirm-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -30943,6 +32064,7 @@ impl MuxelApp {
                             )
                             .children(alternative.map(|label| {
                                 Button::new("confirm-alternative")
+                                    .accessibility_id("muxel.confirm-alternate")
                                     .ghost()
                                     .label(label)
                                     .on_click(
@@ -30953,6 +32075,7 @@ impl MuxelApp {
                             }))
                             .child(
                                 Button::new("confirm-ok")
+                                    .accessibility_id("muxel.confirm-ok")
                                     .danger()
                                     .label(confirm_label)
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -31040,7 +32163,10 @@ impl MuxelApp {
                             .child(body),
                     )
                     // The commit message applies to uncommitted changes only.
-                    .children(show_commit.then(|| Input::new(&self.dispose_commit_input)))
+                    .children(show_commit.then(|| {
+                        Input::new(&self.dispose_commit_input)
+                            .accessibility_id("muxel.input.dispose_commit_input")
+                    }))
                     .child(
                         div()
                             .flex()
@@ -31050,6 +32176,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("wt-keep")
+                                    .accessibility_id("muxel.wt-keep")
                                     .ghost()
                                     .label(t("Keep"))
                                     .tooltip(t("Leave the worktree on disk to resume later"))
@@ -31059,6 +32186,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("wt-discard")
+                                    .accessibility_id("muxel.wt-discard")
                                     .danger()
                                     .label(t("Discard"))
                                     .tooltip(t("Delete the worktree and its branch (lose the work)"))
@@ -31068,6 +32196,7 @@ impl MuxelApp {
                             )
                             .children(show_commit.then(|| {
                                 Button::new("wt-commit")
+                                    .accessibility_id("muxel.wt-commit")
                                     .label(t("Commit & close"))
                                     .tooltip(t("Commit changes to its branch, then remove the worktree (branch kept, unmerged)"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31076,6 +32205,7 @@ impl MuxelApp {
                             }))
                             .children(show_merge.then(|| {
                                 Button::new("wt-merge")
+                                    .accessibility_id("muxel.wt-merge")
                                     .primary()
                                     .label(t("Merge & close"))
                                     .tooltip(merge_tip.clone())
@@ -31170,6 +32300,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("quit-cancel")
+                                    .accessibility_id("muxel.quit-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31179,6 +32310,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("quit-confirm")
+                                    .accessibility_id("muxel.quit-confirm")
                                     .danger()
                                     .label(t("Quit"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31219,9 +32351,10 @@ impl MuxelApp {
                 }
             }))
             .child(
-                div()
-                    .w(px(180.0))
-                    .child(Input::new(&self.term_search_input)),
+                div().w(px(180.0)).child(
+                    Input::new(&self.term_search_input)
+                        .accessibility_id("muxel.input.term_search_input"),
+                ),
             )
             .child(
                 div()
@@ -31232,6 +32365,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-prev")
+                    .accessibility_id("muxel.ts-prev")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronUp)
@@ -31240,6 +32374,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-next")
+                    .accessibility_id("muxel.ts-next")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronDown)
@@ -31248,6 +32383,7 @@ impl MuxelApp {
             )
             .child(
                 Button::new("ts-close")
+                    .accessibility_id("muxel.ts-close")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Close)
@@ -31297,7 +32433,12 @@ impl MuxelApp {
                             .text_color(cx.theme().warning)
                             .child(t("BROADCAST")),
                     )
-                    .child(div().flex_1().child(Input::new(&self.broadcast_input)))
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.broadcast_input)
+                                .accessibility_id("muxel.input.broadcast_input"),
+                        ),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -31311,6 +32452,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("bc-send")
+                            .accessibility_id("muxel.bc-send")
                             .primary()
                             .xsmall()
                             .label(t("Send"))
@@ -31320,6 +32462,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("bc-close")
+                            .accessibility_id("muxel.bc-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -31382,6 +32525,7 @@ impl MuxelApp {
                     .child(div().text_sm().child(label))
                     .children(recording.then(|| {
                         Button::new("stt-stop")
+                            .accessibility_id("muxel.stt-stop")
                             .primary()
                             .xsmall()
                             .label(t("Stop"))
@@ -31391,6 +32535,7 @@ impl MuxelApp {
                     }))
                     .children(mic_settings.then(|| {
                         Button::new("stt-mic-settings")
+                            .accessibility_id("muxel.stt-mic-settings")
                             .primary()
                             .xsmall()
                             .label(t("Open Settings"))
@@ -31403,6 +32548,7 @@ impl MuxelApp {
                     }))
                     .children(error.then(|| {
                         Button::new("stt-dismiss")
+                            .accessibility_id("muxel.stt-dismiss")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
@@ -31467,6 +32613,7 @@ impl MuxelApp {
                             .pt_2()
                             .child(
                                 Button::new("onboard-add-project")
+                                    .accessibility_id("muxel.onboard-add-project")
                                     .primary()
                                     .icon(IconName::Plus)
                                     .label(t("Add a project"))
@@ -31476,6 +32623,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("onboard-add-remote")
+                                    .accessibility_id("muxel.onboard-add-remote")
                                     .ghost()
                                     .label(t("New remote project (SSH)"))
                                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -31679,6 +32827,7 @@ impl MuxelApp {
         // Footer: Close + a state-specific primary action.
         let mut footer = div().flex().gap_2().justify_end().pt_2().child(
             Button::new("update-close")
+                .accessibility_id("muxel.update-close")
                 .ghost()
                 .label(t("Close"))
                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -31690,6 +32839,7 @@ impl MuxelApp {
             UpdateState::Available(_) if self_updatable => {
                 footer = footer.child(
                     Button::new("update-install")
+                        .accessibility_id("muxel.update-install")
                         .primary()
                         .label(t("Download & Install"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.start_update_download(cx))),
@@ -31698,6 +32848,7 @@ impl MuxelApp {
             UpdateState::Available(_) => {
                 footer = footer.child(
                     Button::new("update-releases")
+                        .accessibility_id("muxel.update-releases")
                         .primary()
                         .label(t("Open releases page"))
                         .on_click(
@@ -31708,6 +32859,7 @@ impl MuxelApp {
             UpdateState::Ready(_) => {
                 footer = footer.child(
                     Button::new("update-restart")
+                        .accessibility_id("muxel.update-restart")
                         .primary()
                         .label(t("Restart now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_update_restart(cx))),
@@ -31716,6 +32868,7 @@ impl MuxelApp {
             UpdateState::Error(_) => {
                 footer = footer.child(
                     Button::new("update-retry")
+                        .accessibility_id("muxel.update-retry")
                         .label(t("Check again"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
@@ -31723,6 +32876,7 @@ impl MuxelApp {
             UpdateState::Idle | UpdateState::UpToDate => {
                 footer = footer.child(
                     Button::new("update-check")
+                        .accessibility_id("muxel.update-check")
                         .label(t("Check now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
@@ -31873,6 +33027,7 @@ impl MuxelApp {
                                     })
                                     .child(
                                         Button::new("close-settings")
+                                            .accessibility_id("muxel.close-settings")
                                             .ghost()
                                             .icon(IconName::Close)
                                             .tooltip(t("Close"))
@@ -31901,6 +33056,7 @@ impl MuxelApp {
                             .border_color(cx.theme().border)
                             .child(
                                 Button::new("settings-cancel")
+                                    .accessibility_id("muxel.settings-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(
@@ -31909,6 +33065,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("settings-save")
+                                    .accessibility_id("muxel.settings-save")
                                     .primary()
                                     .label(t("Save"))
                                     .on_click(
@@ -32071,6 +33228,7 @@ impl MuxelApp {
                 DropdownButton::new("settings-theme")
                     .button(
                         Button::new("settings-theme-btn")
+                            .accessibility_id("muxel.settings-theme-btn")
                             .ghost()
                             .icon(IconName::Palette)
                             .label(current_theme),
@@ -32088,6 +33246,7 @@ impl MuxelApp {
                 DropdownButton::new("settings-language")
                     .button(
                         Button::new("settings-language-btn")
+                            .accessibility_id("muxel.settings-language-btn")
                             .ghost()
                             .label(crate::i18n::display_name(&crate::i18n::current_language())),
                     )
@@ -32111,9 +33270,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("ui-font-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_ui_font(-1.0, cx)),
-                        ),
+                        Button::new("ui-font-dec")
+                            .accessibility_id("muxel.ui-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_ui_font(-1.0, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -32123,6 +33286,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("ui-font-inc")
+                            .accessibility_id("muxel.ui-font-inc")
                             .ghost()
                             .label("+")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_ui_font(1.0, cx))),
@@ -32136,6 +33300,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("ui-zoom-dec")
+                            .accessibility_id("muxel.ui-zoom-dec")
                             .ghost()
                             .label("−")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(-0.1, cx))),
@@ -32148,6 +33313,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("ui-zoom-inc")
+                            .accessibility_id("muxel.ui-zoom-inc")
                             .ghost()
                             .label("+")
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(0.1, cx))),
@@ -32159,18 +33325,30 @@ impl MuxelApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Button::new("term-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(-1.0, cx)),
-                    ))
+                    .child(
+                        Button::new("term-font-dec")
+                            .accessibility_id("muxel.term-font-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(-1.0, cx)),
+                            ),
+                    )
                     .child(
                         div()
                             .w(rems(4.0))
                             .text_center()
                             .child(format!("{}", self.settings.font_size.round() as i32)),
                     )
-                    .child(Button::new("term-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
-                    )),
+                    .child(
+                        Button::new("term-font-inc")
+                            .accessibility_id("muxel.term-font-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
+                            ),
+                    ),
             )
             .child(self.settings_label(&t("Terminal font family (blank = built-in default)"), cx))
             .child(
@@ -32179,12 +33357,14 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.font_family)),
+                        v_flex().flex_1().child(
+                            Input::new(&self.settings_ui.font_family)
+                                .accessibility_id("muxel.input.font_family"),
+                        ),
                     )
                     .child(
                         Button::new("apply-font-family")
+                            .accessibility_id("muxel.apply-font-family")
                             .primary()
                             .label(t("Apply"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.apply_font_family(cx))),
@@ -32305,6 +33485,7 @@ impl MuxelApp {
             .child(
                 div().pl(rems(1.75)).child(
                     Button::new("test-notif")
+                        .accessibility_id("muxel.test-notif")
                         .ghost()
                         .small()
                         .icon(IconName::Bell)
@@ -32482,6 +33663,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-preset")
+                .accessibility_id("muxel.add-preset")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add preset"))
@@ -32547,6 +33729,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-snippet")
+                .accessibility_id("muxel.add-snippet")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add snippet"))
@@ -32577,9 +33760,15 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.sn_name).accessibility_id("muxel.input.sn_name"),
+            ))
             .child(self.settings_label(&t("Text — typed into the focused pane"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_text).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.sn_text)
+                    .accessibility_id("muxel.input.sn_text")
+                    .h(px(120.0)),
+            ))
             .child(self.check_row(
                 Checkbox::new("sn-submit").checked(ui.sn_submit).on_click(
                     cx.listener(|this, _c: &bool, _w, cx| this.toggle_snippet_submit(cx)),
@@ -32593,12 +33782,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-snippet")
+                            .accessibility_id("muxel.save-snippet")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_snippet(cx))),
                     )
                     .child(
                         Button::new("del-snippet")
+                            .accessibility_id("muxel.del-snippet")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -32659,6 +33850,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-runner")
+                .accessibility_id("muxel.add-runner")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add runner"))
@@ -32690,6 +33882,7 @@ impl MuxelApp {
         let mut agent_row = div().flex().flex_wrap().gap_1();
         agent_row = agent_row.child(
             Button::new("runner-agent-default")
+                .accessibility_id("muxel.runner-agent-default")
                 .ghost()
                 .selected(selected_preset.is_none())
                 .label(t("Current/default"))
@@ -32713,7 +33906,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.r_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.r_name).accessibility_id("muxel.input.r_name"),
+            ))
             .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
             .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
@@ -32724,6 +33919,7 @@ impl MuxelApp {
                     .gap_2()
                     .child(
                         Button::new("runner-presses-dec")
+                            .accessibility_id("muxel.runner-presses-dec")
                             .ghost()
                             .label("−")
                             .on_click(
@@ -32738,6 +33934,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("runner-presses-inc")
+                            .accessibility_id("muxel.runner-presses-inc")
                             .ghost()
                             .label("+")
                             .on_click(
@@ -32749,7 +33946,11 @@ impl MuxelApp {
                 &t("Prompt — {{input}} is replaced with run-time details"),
                 cx,
             ))
-            .child(Self::wide_input(Input::new(&ui.r_prompt).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.r_prompt)
+                    .accessibility_id("muxel.input.r_prompt")
+                    .h(px(120.0)),
+            ))
             .child(
                 div()
                     .flex()
@@ -32757,12 +33958,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-runner")
+                            .accessibility_id("muxel.save-runner")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_runner(cx))),
                     )
                     .child(
                         Button::new("del-runner")
+                            .accessibility_id("muxel.del-runner")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -32838,6 +34041,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-loop")
+                .accessibility_id("muxel.add-loop")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add loop"))
@@ -32909,35 +34113,48 @@ impl MuxelApp {
                     .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_sched_kind(k, cx))),
             );
         }
-        let value_row = if kind == 2 {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_hour)))
-                .child(div().child(":"))
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_minute)))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t("local 24h time")),
-                )
-        } else {
-            let unit = if kind == 0 { "minutes" } else { "hours" };
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(80.0)).child(Input::new(&ui.l_interval)))
-                .child(div().text_sm().child(unit))
-        };
+        let value_row =
+            if kind == 2 {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(56.0))
+                            .child(Input::new(&ui.l_hour).accessibility_id("muxel.input.l_hour")),
+                    )
+                    .child(div().child(":"))
+                    .child(
+                        div().w(px(56.0)).child(
+                            Input::new(&ui.l_minute).accessibility_id("muxel.input.l_minute"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("local 24h time")),
+                    )
+            } else {
+                let unit = if kind == 0 { "minutes" } else { "hours" };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(80.0)).child(
+                        Input::new(&ui.l_interval).accessibility_id("muxel.input.l_interval"),
+                    ))
+                    .child(div().text_sm().child(unit))
+            };
 
         v_flex()
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.l_name).accessibility_id("muxel.input.l_name"),
+            ))
             .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
             .child(self.settings_label(&t("Project"), cx))
@@ -32952,9 +34169,13 @@ impl MuxelApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("loop-presses-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(-1, cx)),
-                        ),
+                        Button::new("loop-presses-dec")
+                            .accessibility_id("muxel.loop-presses-dec")
+                            .ghost()
+                            .label("−")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(-1, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -32963,13 +34184,21 @@ impl MuxelApp {
                             .child(format!("{}", ui.l_presses)),
                     )
                     .child(
-                        Button::new("loop-presses-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(1, cx)),
-                        ),
+                        Button::new("loop-presses-inc")
+                            .accessibility_id("muxel.loop-presses-inc")
+                            .ghost()
+                            .label("+")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(1, cx)),
+                            ),
                     ),
             )
             .child(self.settings_label(&t("Prompt"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_prompt).h(px(120.0))))
+            .child(Self::wide_input(
+                Input::new(&ui.l_prompt)
+                    .accessibility_id("muxel.input.l_prompt")
+                    .h(px(120.0)),
+            ))
             .child(
                 self.check_row(
                     Checkbox::new("loop-exit")
@@ -32999,6 +34228,7 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("loop-run-now")
+                            .accessibility_id("muxel.loop-run-now")
                             .label(t("Run now"))
                             .icon(IconName::Play)
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -33007,26 +34237,31 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("save-loop")
+                            .accessibility_id("muxel.save-loop")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_loop(cx))),
                     )
-                    .child(Button::new("del-loop").ghost().label(t("Delete")).on_click(
-                        cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .loops
-                                .get(idx)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete loop?"),
-                                tf("The “{name}” loop will be deleted.", &[("name", &name)]),
-                                t("Delete"),
-                                ConfirmAction::DeleteLoop(idx),
-                                cx,
-                            )
-                        }),
-                    )),
+                    .child(
+                        Button::new("del-loop")
+                            .accessibility_id("muxel.del-loop")
+                            .ghost()
+                            .label(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let name = this
+                                    .loops
+                                    .get(idx)
+                                    .map(|l| l.name.clone())
+                                    .unwrap_or_default();
+                                this.request_confirm(
+                                    t("Delete loop?"),
+                                    tf("The “{name}” loop will be deleted.", &[("name", &name)]),
+                                    t("Delete"),
+                                    ConfirmAction::DeleteLoop(idx),
+                                    cx,
+                                )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -33071,6 +34306,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-remote")
+                .accessibility_id("muxel.add-remote")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add host"))
@@ -33110,6 +34346,7 @@ impl MuxelApp {
         let cred_picker = {
             let mut row = div().flex().flex_wrap().gap_1().child(
                 Button::new("cred-inline")
+                    .accessibility_id("muxel.cred-inline")
                     .ghost()
                     .selected(ui.s_identity_id.is_none())
                     .label(t("Inline"))
@@ -33140,19 +34377,25 @@ impl MuxelApp {
             .w_full()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_name).accessibility_id("muxel.input.s_name"),
+            ))
             .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_host)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_host).accessibility_id("muxel.input.s_host"),
+            ))
             .child(self.settings_label(&t("Credentials"), cx))
             .child(cred_picker)
             .child(self.settings_label(&t("Port"), cx))
-            .child(Input::new(&ui.s_port));
+            .child(Input::new(&ui.s_port).accessibility_id("muxel.input.s_port"));
 
         if ui.s_identity_id.is_none() {
             // Inline credentials: user + auth + key/password on the host itself.
             form = form
                 .child(self.settings_label(&t("User"), cx))
-                .child(Self::wide_input(Input::new(&ui.s_user)))
+                .child(Self::wide_input(
+                    Input::new(&ui.s_user).accessibility_id("muxel.input.s_user"),
+                ))
                 .child(self.settings_label(&t("Authentication"), cx))
                 .child(
                     div()
@@ -33170,9 +34413,15 @@ impl MuxelApp {
                             .flex()
                             .gap_2()
                             .items_center()
-                            .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
+                            .child(
+                                v_flex().flex_1().child(
+                                    Input::new(&ui.s_identity)
+                                        .accessibility_id("muxel.input.s_identity"),
+                                ),
+                            )
                             .child(
                                 Button::new("remote-browse-key")
+                                    .accessibility_id("muxel.remote-browse-key")
                                     .ghost()
                                     .icon(IconName::Folder)
                                     .label(t("Browse"))
@@ -33189,7 +34438,9 @@ impl MuxelApp {
                 };
                 form = form
                     .child(self.settings_label(&t("Password"), cx))
-                    .child(Self::wide_input(Input::new(&ui.s_password)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.s_password).accessibility_id("muxel.input.s_password"),
+                    ))
                     .child(
                         div()
                             .text_xs()
@@ -33273,7 +34524,9 @@ impl MuxelApp {
                     .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
             )
             .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_jump)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_jump).accessibility_id("muxel.input.s_jump"),
+            ))
             .child(
                 self.check_row(
                     Checkbox::new("remote-forward-agent")
@@ -33340,14 +34593,22 @@ impl MuxelApp {
 
         form = form
             .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_strict)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_strict).accessibility_id("muxel.input.s_strict"),
+            ))
             .child(self.settings_label(
                 &t("Keepalive — ServerAliveInterval secs (blank = 20s default; 0 disables)"),
                 cx,
             ))
-            .child(Self::wide_input(Input::new(&ui.s_keepalive)))
+            .child(Self::wide_input(
+                Input::new(&ui.s_keepalive).accessibility_id("muxel.input.s_keepalive"),
+            ))
             .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));
+            .child(Self::wide_input(
+                Input::new(&ui.s_extra)
+                    .accessibility_id("muxel.input.s_extra")
+                    .h(px(60.0)),
+            ));
 
         // Inline Test-connection result, above the buttons.
         form.children(match &self.settings_ui.s_test {
@@ -33385,6 +34646,7 @@ impl MuxelApp {
                 .pt_2()
                 .child(
                     Button::new("test-remote")
+                        .accessibility_id("muxel.test-remote")
                         .ghost()
                         .icon(IconName::Network)
                         .label(t("Test connection"))
@@ -33395,12 +34657,14 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("save-remote")
+                        .accessibility_id("muxel.save-remote")
                         .primary()
                         .label(t("Save"))
                         .on_click(cx.listener(|this, _e, window, cx| this.save_remote(window, cx))),
                 )
                 .child(
                     Button::new("del-remote")
+                        .accessibility_id("muxel.del-remote")
                         .ghost()
                         .label(t("Delete"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -33464,6 +34728,7 @@ impl MuxelApp {
         }
         list = list.child(
             Button::new("add-identity")
+                .accessibility_id("muxel.add-identity")
                 .ghost()
                 .icon(IconName::Plus)
                 .label(t("Add identity"))
@@ -33507,9 +34772,13 @@ impl MuxelApp {
             .w_full()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.id_name).accessibility_id("muxel.input.id_name"),
+            ))
             .child(self.settings_label(&t("User"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_user)))
+            .child(Self::wide_input(
+                Input::new(&ui.id_user).accessibility_id("muxel.input.id_user"),
+            ))
             .child(self.settings_label(&t("Authentication"), cx))
             .child(
                 div()
@@ -33528,9 +34797,12 @@ impl MuxelApp {
                         .flex()
                         .gap_2()
                         .items_center()
-                        .child(v_flex().flex_1().child(Input::new(&ui.id_identity)))
+                        .child(v_flex().flex_1().child(
+                            Input::new(&ui.id_identity).accessibility_id("muxel.input.id_identity"),
+                        ))
                         .child(
                             Button::new("id-browse-key")
+                                .accessibility_id("muxel.id-browse-key")
                                 .ghost()
                                 .icon(IconName::Folder)
                                 .label(t("Browse"))
@@ -33547,7 +34819,9 @@ impl MuxelApp {
             };
             form = form
                 .child(self.settings_label(&t("Password"), cx))
-                .child(Self::wide_input(Input::new(&ui.id_password)))
+                .child(Self::wide_input(
+                    Input::new(&ui.id_password).accessibility_id("muxel.input.id_password"),
+                ))
                 .child(
                     div()
                         .text_xs()
@@ -33563,6 +34837,7 @@ impl MuxelApp {
                 .pt_2()
                 .child(
                     Button::new("save-identity")
+                        .accessibility_id("muxel.save-identity")
                         .primary()
                         .label(t("Save"))
                         .on_click(
@@ -33571,6 +34846,7 @@ impl MuxelApp {
                 )
                 .child(
                     Button::new("del-identity")
+                        .accessibility_id("muxel.del-identity")
                         .ghost()
                         .label(t("Delete"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -33605,7 +34881,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_name)))
+            .child(Self::wide_input(
+                Input::new(&ui.p_name).accessibility_id("muxel.input.p_name"),
+            ))
             .child(self.settings_label(&t("Type"), cx))
             .child(
                 div()
@@ -33613,6 +34891,7 @@ impl MuxelApp {
                     .gap_1()
                     .child(
                         Button::new("pk-terminal")
+                            .accessibility_id("muxel.pk-terminal")
                             .ghost()
                             .selected(ui.p_kind == muxel_core::PresetKind::Terminal)
                             .label(t("Agent"))
@@ -33623,6 +34902,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("pk-browser")
+                            .accessibility_id("muxel.pk-browser")
                             .ghost()
                             .selected(ui.p_kind == muxel_core::PresetKind::Browser)
                             .label(t("Browser"))
@@ -33636,13 +34916,17 @@ impl MuxelApp {
                 v_flex()
                     .gap_2()
                     .child(self.settings_label(&t("Homepage URL"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_url)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_url).accessibility_id("muxel.input.p_url"),
+                    ))
             }))
             .children((ui.p_kind == muxel_core::PresetKind::Terminal).then(|| {
                 v_flex()
                     .gap_2()
                     .child(self.settings_label(&t("Program (blank = default shell)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_program)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_program).accessibility_id("muxel.input.p_program"),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -33652,14 +34936,20 @@ impl MuxelApp {
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Model"), cx))
-                                    .child(Input::new(&ui.p_model)),
+                                    .child(
+                                        Input::new(&ui.p_model)
+                                            .accessibility_id("muxel.input.p_model"),
+                                    ),
                             )
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Model flag"), cx))
-                                    .child(Input::new(&ui.p_model_flag)),
+                                    .child(
+                                        Input::new(&ui.p_model_flag)
+                                            .accessibility_id("muxel.input.p_model_flag"),
+                                    ),
                             ),
                     )
                     .child(
@@ -33671,20 +34961,32 @@ impl MuxelApp {
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Effort"), cx))
-                                    .child(Input::new(&ui.p_effort)),
+                                    .child(
+                                        Input::new(&ui.p_effort)
+                                            .accessibility_id("muxel.input.p_effort"),
+                                    ),
                             )
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .gap_1()
                                     .child(self.settings_label(&t("Effort flag"), cx))
-                                    .child(Input::new(&ui.p_effort_flag)),
+                                    .child(
+                                        Input::new(&ui.p_effort_flag)
+                                            .accessibility_id("muxel.input.p_effort_flag"),
+                                    ),
                             ),
                     )
                     .child(self.settings_label(&t("Extra arguments"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_args)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_args).accessibility_id("muxel.input.p_args"),
+                    ))
                     .child(self.settings_label(&t("System prompt"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_prompt)
+                            .accessibility_id("muxel.input.p_prompt")
+                            .h(px(72.0)),
+                    ))
                     .child(self.settings_label(&t("System-prompt injection"), cx))
                     .child(
                         div()
@@ -33692,6 +34994,7 @@ impl MuxelApp {
                             .gap_1()
                             .child(
                                 Button::new("inj-none")
+                                    .accessibility_id("muxel.inj-none")
                                     .ghost()
                                     .selected(matches!(inj, InjectionMode::None))
                                     .label(t("None"))
@@ -33701,6 +35004,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("inj-flag")
+                                    .accessibility_id("muxel.inj-flag")
                                     .ghost()
                                     .selected(is_flag)
                                     .label(t("CLI flag"))
@@ -33715,6 +35019,7 @@ impl MuxelApp {
                             )
                             .child(
                                 Button::new("inj-typein")
+                                    .accessibility_id("muxel.inj-typein")
                                     .ghost()
                                     .selected(matches!(inj, InjectionMode::TypeIn))
                                     .label(t("Type-in"))
@@ -33741,18 +35046,34 @@ impl MuxelApp {
                         v_flex()
                             .gap_1()
                             .child(self.settings_label(&t("Injection flag"), cx))
-                            .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
+                            .child(Self::wide_input(
+                                Input::new(&ui.p_inj_flag)
+                                    .accessibility_id("muxel.input.p_inj_flag"),
+                            ))
                     }))
                     .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_env)
+                            .accessibility_id("muxel.input.p_env")
+                            .h(px(60.0)),
+                    ))
                     .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_working_markers)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_working_markers)
+                            .accessibility_id("muxel.input.p_working_markers"),
+                    ))
                     .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_blocked_markers)
+                            .accessibility_id("muxel.input.p_blocked_markers"),
+                    ))
                     .child(
                         self.settings_label(&t("Runner startup delay (ms after first output)"), cx),
                     )
-                    .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
+                    .child(Self::wide_input(
+                        Input::new(&ui.p_startup_delay)
+                            .accessibility_id("muxel.input.p_startup_delay"),
+                    ))
             }))
             .child(
                 div()
@@ -33761,12 +35082,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-preset")
+                            .accessibility_id("muxel.save-preset")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_preset(cx))),
                     )
                     .child(
                         Button::new("dup-preset")
+                            .accessibility_id("muxel.dup-preset")
                             .ghost()
                             .label(t("Duplicate"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -33775,6 +35098,7 @@ impl MuxelApp {
                     )
                     .child(
                         Button::new("del-preset")
+                            .accessibility_id("muxel.del-preset")
                             .ghost()
                             .label(t("Delete"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -33950,7 +35274,9 @@ impl MuxelApp {
             .gap_2()
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&self.settings_ui.proj_name)))
+            .child(Self::wide_input(
+                Input::new(&self.settings_ui.proj_name).accessibility_id("muxel.input.proj_name"),
+            ))
             .child(self.settings_label(&t("Folder"), cx))
             .child(
                 div()
@@ -33960,6 +35286,7 @@ impl MuxelApp {
                     .child(div().flex_1().min_w_0().text_sm().child(root))
                     .child(
                         Button::new("change-folder")
+                            .accessibility_id("muxel.change-folder")
                             .ghost()
                             .label(t("Change…"))
                             .on_click(cx.listener(|this, _e, window, cx| {
@@ -34000,12 +35327,14 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("save-project")
+                            .accessibility_id("muxel.save-project")
                             .primary()
                             .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_project(cx))),
                     )
                     .child(
                         Button::new("del-project")
+                            .accessibility_id("muxel.del-project")
                             .ghost()
                             .label(t("Delete project"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -34055,7 +35384,12 @@ impl MuxelApp {
                     .child(
                         self.settings_label(&t("Pass these keys through to the focused terminal"), cx),
                     )
-                    .child(div().w(form_w).child(Input::new(&self.settings_ui.passthrough_keys))),
+                    .child(
+                        div().w(form_w).child(
+                            Input::new(&self.settings_ui.passthrough_keys)
+                                .accessibility_id("muxel.input.passthrough_keys"),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -34070,6 +35404,7 @@ impl MuxelApp {
             .child(
                 div().pt_2().flex().items_center().gap_3().child(
                     Button::new("apply-keys")
+                        .accessibility_id("muxel.apply-keys")
                         .primary()
                         .label(t("Apply keybindings"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_keybindings(cx))),
@@ -34597,6 +35932,7 @@ impl Render for MuxelApp {
                             .shadow_md()
                             .child(
                                 Button::new("fullscreen-reveal-sidebar")
+                                    .accessibility_id("muxel.fullscreen-reveal-sidebar")
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
