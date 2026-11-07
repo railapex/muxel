@@ -21,6 +21,7 @@ pub mod markdown_link;
 pub mod memory;
 pub mod muse;
 pub mod outage;
+pub mod page_opens;
 mod pane;
 pub mod path_paste;
 pub mod placement;

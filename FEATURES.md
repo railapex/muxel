@@ -1205,10 +1205,15 @@ feature is added or changed, update the matching entry here in the same change**
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  focus in any window; browser target=_blank, window.open, Ctrl+click, and
-  middle-click requests stay in the source project and open as Muxel tabs, a
-  popped-out terminal's in its project's window. Right-clicking a terminal link
-  opens link actions instead of copying or pasting through the PTY.
+  focus in any window. In a browser page, a middle-click or `Ctrl`/`Cmd`+click
+  on a link opens it in a background tab beside the page, and the page keeps the
+  keys; on Windows the link menu's **Open link in new tab**, in place of "Open
+  link in new window", does the same. A target=_blank link and window.open open
+  a tab in front. Page links open as Muxel tabs in the page's project, in the
+  window showing it, and a popped-out terminal's in its project's window. A page
+  opens only web links this way, never a local file or another app's link, and
+  no more than ten at once and about three a second after. Right-clicking a
+  terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can

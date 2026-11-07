@@ -6972,11 +6972,11 @@ impl Render for PopoutView {
                 }
             }))
             .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
-                MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Show, cx);
+                MuxelApp::open_pane_link(&a.url, a.pane, OpenFocus::Show, cx);
             }))
             .on_action(
                 cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
-                    MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Background, cx);
+                    MuxelApp::open_pane_link(&a.url, a.pane, OpenFocus::Background, cx);
                 }),
             )
             .child(
@@ -7516,17 +7516,9 @@ fn link_source_project(workspace: &Workspace, source: Option<Uuid>) -> Option<Uu
         .or(workspace.active_project)
 }
 
-/// Web content may request a new browsing context, but it must not gain the
-/// broader file and OS-protocol powers intentionally available to terminal links.
-fn browser_popup_url_allowed(url: &str) -> bool {
-    url.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-    })
-}
-
 #[cfg(test)]
 mod link_source_tests {
-    use super::{Instance, Project, Workspace, browser_popup_url_allowed, link_source_project};
+    use super::{Instance, Project, Workspace, link_source_project};
 
     #[test]
     fn emitting_pane_beats_the_later_active_project() {
@@ -7543,18 +7535,6 @@ mod link_source_tests {
             Some(source_project)
         );
         assert_eq!(link_source_project(&workspace, None), Some(later_project));
-    }
-
-    #[test]
-    fn browser_popups_only_enter_the_router_for_web_urls() {
-        assert!(browser_popup_url_allowed("https://example.com/new"));
-        assert!(browser_popup_url_allowed("HTTP://example.com/new"));
-        assert!(!browser_popup_url_allowed(
-            "file:///C:/Users/test/secret.txt"
-        ));
-        assert!(!browser_popup_url_allowed("mailto:test@example.com"));
-        assert!(!browser_popup_url_allowed("custom-protocol:payload"));
-        assert!(!browser_popup_url_allowed("//example.com/scheme-relative"));
     }
 }
 
@@ -13882,7 +13862,7 @@ impl MuxelApp {
             let views: Vec<(Uuid, Entity<crate::browser::BrowserView>)> =
                 self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
             let mut changed = false;
-            let mut new_windows: Vec<(Uuid, String)> = Vec::new();
+            let mut page_opens: Vec<(Uuid, String, OpenFocus)> = Vec::new();
             for (iid, view) in views {
                 if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
                     && let Some(inst) = self.workspace.instance_mut(iid)
@@ -13907,16 +13887,33 @@ impl MuxelApp {
                         view.read(cx).focus_native(cx);
                     }
                 }
-                new_windows.extend(
-                    view.update(cx, |v, _| v.take_new_window_requests())
+                // Background opens first, so a new-window request the webview
+                // raised for the same click drops as its twin.
+                let background = view.update(cx, |v, _| v.take_background_opens());
+                let new_windows = view.update(cx, |v, _| v.take_new_window_requests());
+                page_opens.extend(
+                    background
                         .into_iter()
-                        .map(|url| (iid, url)),
+                        .map(|url| (iid, url, OpenFocus::Background)),
+                );
+                // Web content may request a new browsing context, but it must
+                // not gain the broader file and OS-protocol powers terminal
+                // links have.
+                page_opens.extend(
+                    new_windows
+                        .into_iter()
+                        .filter(|url| muxel_core::page_opens::is_web_url(url))
+                        .map(|url| (iid, url, OpenFocus::Focus)),
                 );
             }
-            for (source, url) in new_windows {
-                if browser_popup_url_allowed(&url) {
-                    self.open_link_from(&url, Some(source), OpenFocus::Focus, window, cx);
-                }
+            if !page_opens.is_empty() {
+                // In the window showing the page, which this tick's, the main
+                // window's, may not be: a page made here would be drawn here.
+                cx.defer(move |cx| {
+                    for (source, url, focus) in page_opens {
+                        Self::open_pane_link(&url, source, focus, cx);
+                    }
+                });
             }
             if changed {
                 self.persist();
@@ -15676,12 +15673,15 @@ impl MuxelApp {
         self.open_link_from(&a.url, Some(a.pane), OpenFocus::Background, window, cx);
     }
 
-    /// A link clicked in pane `pane` outside the app's own update: in a
-    /// popped-out terminal, or in rendered Markdown. It opens in the window
-    /// showing the pane's project, else the main window, and never in a
-    /// popout's own: an editor or page belongs to the window it's made in. A
-    /// foreground open raises that window.
-    fn open_popout_link(url: &str, pane: Uuid, focus: OpenFocus, cx: &mut App) {
+    /// A link from pane `pane`, opened outside the app's own update: clicked
+    /// in a popped-out terminal or in rendered Markdown, or asked for by a
+    /// browser page. It opens in the window showing the pane's project, else
+    /// the main window, and never in a popout's own: an editor or page
+    /// belongs to the window it's made in. Nothing here raises that window.
+    /// A page's own `target=_blank` open shouldn't pull muxel in front of
+    /// another app, and a [`OpenFocus::Show`] that switches the main window
+    /// raises it in [`Self::focus_resource`].
+    fn open_pane_link(url: &str, pane: Uuid, focus: OpenFocus, cx: &mut App) {
         let Some(app) = cx
             .try_global::<MuxelHandle>()
             .map(|handle| handle.0.clone())
@@ -15697,9 +15697,6 @@ impl MuxelApp {
         };
         Self::update_in_window(&app, target, cx, |app, window, cx| {
             app.open_link_from(url, Some(pane), focus, window, cx);
-            if focus == OpenFocus::Focus {
-                window.activate_window();
-            }
         });
     }
 
@@ -15761,7 +15758,7 @@ impl MuxelApp {
         } else {
             OpenFocus::Show
         };
-        Self::open_popout_link(&url, pane, focus, cx);
+        Self::open_pane_link(&url, pane, focus, cx);
     }
 
     /// Route a link relative to `source`, the pane it came from (a terminal, or
