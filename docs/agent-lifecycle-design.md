@@ -272,6 +272,17 @@ Under narrow width the title truncates first. V1 keeps the full status label. If
 future labels become materially longer, a later responsive rule may drop age text
 while preserving the state word.
 
+The status pill is drawn like a small gpui-component `Tag`, but its colours are
+resolved first. The fill is the theme's status colour (primary, secondary,
+warning or success) made opaque over the sidebar background. The label keeps the
+theme's matching foreground when that reaches WCAG's 4.5:1 against the fill, and
+otherwise uses black or white, whichever contrasts more; one of them always
+reaches 4.5:1. Unlike `Tag`, the pill doesn't fade on hover. A Done the user has
+already read is drawn as an outline instead, the way `Tag::outline` draws it: no
+fill, with the theme's green as label and border. The bundled-theme contrast test
+holds every filled status's label to 4.5:1 and the read outline's label to a
+1.8:1 floor.
+
 ## Research probe
 
 The probe is a developer binary in `muxel-terminal`, not product UI. It uses the
