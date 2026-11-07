@@ -33,10 +33,13 @@ struct MuseBinding {
     metadata: muxel_core::muse::MuseMetadata,
 }
 
+/// Where each Muse pane's hook records live, one directory per pane.
+pub(crate) fn muse_binding_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(MUSE_BINDING_DIR)
+}
+
 fn muse_pane_dir(data_dir: &Path, instance_id: Uuid) -> PathBuf {
-    data_dir
-        .join(MUSE_BINDING_DIR)
-        .join(instance_id.to_string())
+    muse_binding_dir(data_dir).join(instance_id.to_string())
 }
 
 fn write_muse_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {

@@ -233,7 +233,11 @@ feature is added or changed, update the matching entry here in the same change**
   with permission notifications marking a blocked turn. Where the title can't
   be read (under tmux, or on a remote host) the dot follows output activity,
   and local hooks still mark blocked and finished turns. Hook records are read
-  in the background. SessionStart context
+  in the background, when a watcher on the hook folder reports one written, so
+  a state change shows at once. A pane whose record has been found otherwise
+  rereads it every thirty seconds, for events a watcher loses; before that,
+  and wherever the watcher can't start or fails, every one to two seconds.
+  SessionStart context
   delivers file-link, memory and custom instructions without submitting a turn.
   Hooks are configured per launch outside the project; existing user, project
   and managed hooks are preserved. Only permission notifications invoke the
@@ -1087,9 +1091,13 @@ feature is added or changed, update the matching entry here in the same change**
   Activity and attendance follow the same conversation attribution as docked
   terminals; redocking uncertain state preserves existing attention cards.
   On Windows, Grok conversation discovery follows the live terminal in either
-  window. It reads Grok's registry on every discovery poll, reusing process
-  ancestry for up to 30 seconds while registrations and pane PID/launches are
-  unchanged. Registry or pane-process changes refresh ancestry immediately;
+  window. A watcher on Grok's folder reports each write of its registry, and
+  every Grok pane reads it then, and otherwise every thirty seconds for events
+  a watcher loses. Process ancestry is reused for up to five minutes while
+  registrations and pane PID/launches are unchanged. Where the folder can't be
+  watched (not created yet, removed, or the watcher fails), Grok panes read the
+  registry on every discovery poll instead, reusing ancestry for up to 30
+  seconds. Registry or pane-process changes refresh ancestry immediately;
   steady polling avoids repeatedly enumerating every process on the machine.
   Scheduled loops stay tracked across popout and redock.
   Restart docks a popped-out terminal before replacing its process.
@@ -1443,10 +1451,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
-  tab, if there is one. While it's on screen, docked or popped out, it refreshes
-  every 1.5 s and keeps your scroll position. A pane hidden behind another tab,
-  another view or a maximized pane runs no git, and refreshes as soon as it's
-  shown. The ↻ button, reopening and popping out never wait on git.
+  tab, if there is one. While it's on screen, docked or popped out, it refreshes when a tracked file
+  under its folder changes or HEAD's branch moves, once the writes have been
+  quiet for 0.3 s (at most 2 s into a steady stream, and at most once a second),
+  and keeps your scroll position. New untracked files and build output don't
+  wake it, and it re-checks every 30 s anyway. Where the folder can't be watched
+  (a checkout with more than 4096 tracked folders on Linux, or git pointed
+  elsewhere by `GIT_DIR`), it refreshes every 1.5 s instead. A pane hidden
+  behind another tab, another view or a maximized pane runs no git, and
+  refreshes as soon as it's shown if it may be stale. The ↻ button, reopening
+  and popping out never wait on git. On Windows, while the pane is open the
+  folders above its folder can't be renamed.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
