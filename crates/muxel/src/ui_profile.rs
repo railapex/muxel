@@ -868,14 +868,6 @@ fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
 fn deferred_writer(rx: Receiver<DeferredRecord>) {
     let mut lookups = lookups::Lookups::default();
     let mut git_repeats = git::Repeats::default();
-    let cycles_per_us = frame::calibrate_cycles_per_us();
-    emit_at(
-        SystemTime::now(),
-        &cycles_per_us.map_or_else(
-            || "ui-frame[v1 start] cycles_per_us=unavailable".to_string(),
-            |rate| format!("ui-frame[v1 start] cycles_per_us={rate:.1}"),
-        ),
-    );
     let mut last_summary = Instant::now();
     loop {
         // Check even during a sustained queue flood. All summary formatting and
@@ -972,11 +964,9 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
                     "ui-prof[root notify v1] reason={reason} generation={generation} transitions={transitions}"
                 ),
             ),
-            DeferredRecord::Frame { at, frame } => {
-                emit_at(at, &frame::frame_line(&frame, cycles_per_us))
-            }
+            DeferredRecord::Frame { at, frame } => emit_at(at, &frame::frame_line(&frame)),
             DeferredRecord::FrameSummary { at, summary } => {
-                emit_at(at, &frame::summary_line(&summary, cycles_per_us))
+                emit_at(at, &frame::summary_line(&summary))
             }
         }
     }
@@ -1488,8 +1478,10 @@ fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
 }
 
 /// Mark root-view element construction as the current UI-thread render stage
-/// and open this draw's frame attribution (`frame.rs`). Normal frames touch
-/// atomics and thread-local counters only and produce no log record.
+/// and open this draw's frame attribution (`frame.rs`). With profiling on,
+/// each frame allocates its record and reads the thread's cycle counter and
+/// the process's page-fault count when it opens and closes. Only a slow frame
+/// writes a record of its own; the rest feed the ten-second summary.
 pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
     let mut watch = watch_render(view, RenderStage::Build)?;
     frame::begin(view, watch.token);
