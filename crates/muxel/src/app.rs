@@ -90,6 +90,7 @@ mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
 mod tmux_install_modal;
 mod upkeep;
+mod watching;
 
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
@@ -5609,9 +5610,19 @@ pub struct MuxelApp {
     close_layout_poll: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
-    /// The Claude hook directory's watcher, started for the first Claude pane
-    /// discovery looks up. `Some(None)`: it failed, and Claude panes poll.
-    claude_binding_watch: Option<Option<crate::binding_watch::ClaudeBindingWatch>>,
+    /// The app's one file watcher, started by the first registration.
+    /// `Some(None)`: it couldn't start or it failed, and every watched target
+    /// polls for the rest of the run.
+    file_watch: Option<Option<crate::file_watch::FileWatch>>,
+    /// What each live registration with `file_watch` wakes.
+    watch_targets: HashMap<muxel_core::file_watch::WatchId, watching::WatchTarget>,
+    /// Providers whose watch was tried: its registration, or `None` when the
+    /// provider polls for the rest of the run. Claude's is tried for the first
+    /// Claude pane discovery looks up.
+    provider_watches: HashMap<
+        muxel_core::session_discovery::SessionProvider,
+        Option<muxel_core::file_watch::WatchId>,
+    >,
     /// Accepted Grok identity and observation time belong to one pane launch.
     /// Keep live identity even when a workspace write is rolled back.
     #[cfg(windows)]
@@ -8050,7 +8061,9 @@ impl MuxelApp {
             layout_reads: HashMap::new(),
             close_layout_poll: false,
             session_discoveries: Default::default(),
-            claude_binding_watch: None,
+            file_watch: None,
+            watch_targets: HashMap::new(),
+            provider_watches: HashMap::new(),
             #[cfg(windows)]
             grok_observations: HashMap::new(),
             claude_hook_seen: HashMap::new(),
