@@ -441,14 +441,7 @@ impl EditorView {
         if window.focused(cx) != focused {
             match &focused {
                 Some(handle) => window.focus(handle, cx),
-                // Nothing had focus. Focusing a handle that's dropped at once
-                // gives that back: GPUI blurs a window whose focused handle is
-                // released, and `Window::blur` takes different arguments on
-                // the GPUI revisions muxel builds against.
-                None => {
-                    let nothing = cx.focus_handle();
-                    window.focus(&nothing, cx);
-                }
+                None => window.blur(),
             }
         }
         self.dirty = false;
