@@ -251,14 +251,10 @@ impl MuxelApp {
 
     /// Point `pane`'s watch at `spec`, or stop watching where there's none.
     fn watch_diff(&mut self, pane: Uuid, spec: Option<WatchSpec>, cx: &mut Context<Self>) {
-        let Some(old) = self
-            .diff_panes
-            .sources
-            .get_mut(&pane)
-            .map(|s| s.watch.take())
-        else {
+        let Some(source) = self.diff_panes.sources.get_mut(&pane) else {
             return;
         };
+        let (old, dir) = (source.watch.take(), source.dir.clone());
         let watch = match (old, spec) {
             (Some(id), Some(spec)) => {
                 let respec = match self.file_watch.as_mut() {
@@ -268,28 +264,48 @@ impl MuxelApp {
                 match respec {
                     Ok(()) => Some(id),
                     Err(error) => {
-                        log::warn!("diff pane stopped watching: {error}");
+                        log::warn!("diff pane for {} stopped watching: {error}", dir.display());
+                        ui_profile::diff_watch("lost");
                         self.watch_targets.remove(&id);
                         None
                     }
                 }
             }
+            // The watcher failed earlier in this run, and said so then.
+            (None, Some(_)) if matches!(self.file_watch, Some(None)) => None,
             (None, Some(spec)) => match self.watch(spec, WatchTarget::Diff(pane), cx) {
                 Ok(id) => {
+                    ui_profile::diff_watch("watching");
                     // Writes between running git and this watch went unseen.
                     self.diff_panes.schedule.changed(pane, None);
                     Some(id)
                 }
                 Err(error) => {
-                    log::debug!("diff pane polls: {error}");
+                    let spent = error.downcast_ref::<notify::Error>().is_some_and(|error| {
+                        matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
+                    });
+                    log::warn!(
+                        "diff pane for {} polls while visible: {error}{}",
+                        dir.display(),
+                        if spent {
+                            " (fs.inotify.max_user_watches is spent)"
+                        } else {
+                            ""
+                        }
+                    );
+                    ui_profile::diff_watch("polling");
                     None
                 }
             },
             (Some(id), None) => {
                 self.drop_watch(id);
+                ui_profile::diff_watch("polling");
                 None
             }
-            (None, None) => None,
+            (None, None) => {
+                ui_profile::diff_watch("polling");
+                None
+            }
         };
         if let Some(source) = self.diff_panes.sources.get_mut(&pane) {
             source.watch = watch;
@@ -302,6 +318,7 @@ impl MuxelApp {
         if let Some(source) = self.diff_panes.sources.get_mut(&pane) {
             source.watch = None;
         }
+        ui_profile::diff_watch("lost");
         self.diff_panes.schedule.set_watched(pane, false);
     }
 }
