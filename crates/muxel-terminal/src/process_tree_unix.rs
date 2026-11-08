@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ProcessIdentity {
     executable: PathBuf,
     #[cfg(target_os = "linux")]
@@ -12,9 +12,19 @@ pub(crate) struct ProcessIdentity {
 
 impl ProcessIdentity {
     pub(crate) fn capture(pid: u32, expected: &Path) -> Option<Self> {
-        let identity = Self::read(pid)?;
-        // A profile can already have exec'd another program by the first read.
-        (identity.executable == expected).then_some(identity)
+        let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
+        // The PTY's pre-exec cleanup can release the spawn handshake before
+        // the target image is ready. Record the known launch path, not the
+        // image observed during that transition; still_matches reads it live.
+        #[cfg(target_os = "linux")]
+        let started_at = linux::birth_time(Path::new("/proc"), pid).ok()?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+        Some(Self {
+            executable: expected.to_owned(),
+            #[cfg(target_os = "linux")]
+            started_at,
+        })
     }
 
     pub(crate) fn still_matches(&self, pid: u32) -> bool {
@@ -113,17 +123,21 @@ mod linux {
 
     pub(super) fn identity(proc: &Path, pid: libc::pid_t) -> io::Result<ProcessIdentity> {
         let process = proc.join(pid.to_string());
-        let started_at = start_time(&fs::read(process.join("stat"))?)?;
+        let started_at = birth_time(proc, pid)?;
         let executable = fs::canonicalize(fs::read_link(process.join("exe"))?)?;
         // A reused pid must not combine the previous process's start time
         // with the new process's executable.
-        if start_time(&fs::read(process.join("stat"))?)? != started_at {
+        if birth_time(proc, pid)? != started_at {
             return Err(invalid_process());
         }
         Ok(ProcessIdentity {
             executable,
             started_at,
         })
+    }
+
+    pub(super) fn birth_time(proc: &Path, pid: libc::pid_t) -> io::Result<u64> {
+        start_time(&fs::read(proc.join(pid.to_string()).join("stat"))?)
     }
 
     fn children_interface_missing(proc: &Path) -> io::Result<bool> {

@@ -218,7 +218,13 @@ impl Drop for Shell {
 fn an_idle_prompt_is_idle() {
     for marked in [false, true] {
         let shell = Shell::start(marked);
-        assert!(shell.session.is_idle_foreground());
+        assert!(
+            shell.session.is_idle_foreground(),
+            "idle shell pid={:?}, launch={:?}, current={:?}",
+            shell.session.child_pid,
+            shell.session.child_identity,
+            shell.session.child_pid.and_then(executable)
+        );
         assert_eq!(
             shell.close_decision(),
             CloseDecision::Hold { forced: false }
