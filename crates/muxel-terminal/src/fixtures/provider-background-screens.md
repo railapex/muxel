@@ -17,9 +17,12 @@ Codex's terminal count sits immediately above its composer, with both `/ps` and
 prints a historical list: it remains after a child completes, alongside a new
 `Completed` message. Neither that history nor `Started` proves live child work.
 
-Muse's live terminal tree sits below the lower composer rule. Its task spinner
-alternates `◇` and `◆`; the explicit `running` column identifies live work. A
+Muse's live terminal tree sits below the lower composer rule. Captured task spinner
+frames include `◇`, `◆` and `◈`; the explicit `running` column identifies live work. A
 past `Backgrounded` message above the composer remains after the tree vanishes.
+An additional run ended with the composer free and the last OSC spinner title
+unchanged after completion. A Done hook and five seconds of quiet distinguish
+that cached title from the live title updates during work.
 
 The child JSONL fixture retains Codex's first metadata record, copied parent
 history, the child-history boundary, its own turn start, assistant text, and turn

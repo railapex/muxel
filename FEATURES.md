@@ -530,7 +530,9 @@ feature is added or changed, update the matching entry here in the same change**
   finished turn. Subagents hold until they end. Local Codex panes also read child-turn
   lifecycle records for subagents created during the current pane launch; their normal
   composer has no live child count. Copied parent history and children left by an
-  earlier launch do not count. Closing a pane asks while anything is
+  earlier launch do not count. Muse's completion hook can retire a leftover spinner
+  title after five seconds without output or a title update; live work stays listed.
+  Closing a pane asks while anything is
   listed as running, and `ctl status` reports it as `background`. `ctl send` still
   delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
   keeps waiting through a hold, so it returns the agent's reply after the work, and

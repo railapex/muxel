@@ -60,6 +60,8 @@ const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
 /// must not allocate a full grid string for every PTY read under stream load.
 const STATUS_SCREEN_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 const SILENT_SWITCH_SETTLE: Duration = Duration::from_secs(5);
+/// Muse can finish a turn without clearing its last spinner title.
+const MUSE_DONE_TITLE_SETTLE: Duration = Duration::from_secs(5);
 
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
@@ -553,6 +555,25 @@ impl RuntimeStatusState {
         }
         let bell = session.has_bell();
         let idle = session.idle_for();
+        if title_provider == TitleProvider::Muse
+            && !exited
+            && program_root.is_none()
+            && !settling
+            && self.silent_switch_until.is_none()
+            && self.muse_hook_state == Some(muxel_core::muse::MuseState::Done)
+            && title == Some(AgentStatus::Working)
+        {
+            let quiet = idle.min(session.title_age().unwrap_or_default());
+            let remaining = MUSE_DONE_TITLE_SETTLE.saturating_sub(quiet);
+            if remaining.is_zero() {
+                title = Some(AgentStatus::Idle);
+                self.semantic_title_status = title;
+                self.provider_settled = true;
+            } else {
+                let deadline = now + remaining;
+                next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
         // Until Muse's own title is read (never, on a remote or tmux pane), it
         // is judged by output activity like an unknown terminal. Its hooks
         // still report blocked and finished turns.
@@ -1333,9 +1354,6 @@ fn muse_background(screen: &str) -> Option<BackgroundWork> {
         .take_while(|row| row.starts_with(['├', '└', '│']))
         .filter(|row| {
             let row = row.trim_start_matches(['├', '└', '│', '─', ' ']);
-            if !row.starts_with("◇ ") && !row.starts_with("◆ ") {
-                return false;
-            }
             let mut columns = row
                 .rsplit("  ")
                 .map(str::trim)
@@ -9234,14 +9252,16 @@ mod provider_switch_tests {
                 );
             }
             let running = background_fixture("muse", "running");
-            let other_spinner = running.replace("└ ◇", "└ ◆");
-            assert_eq!(
-                crate::view::provider_screen_read(TitleProvider::Muse, &other_spinner)
-                    .1
-                    .unwrap()
-                    .shells,
-                1
-            );
+            for spinner in ["◆", "◈"] {
+                let other_spinner = running.replace("└ ◇", &format!("└ {spinner}"));
+                assert_eq!(
+                    crate::view::provider_screen_read(TitleProvider::Muse, &other_spinner)
+                        .1
+                        .unwrap()
+                        .shells,
+                    1
+                );
+            }
             for screen in [
                 running.replace("  running ", "  completed "),
                 background_fixture("muse", "ended").replace(
@@ -9361,6 +9381,83 @@ mod provider_switch_tests {
             );
             assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
             assert_eq!(runtime.snapshot(&session).background, None);
+            session.kill();
+        }
+
+        #[test]
+        fn muse_background_ends_after_its_final_spinner_title_stops() {
+            use crate::view::BACKGROUND_WAKE_GRACE;
+            use muxel_core::muse::MuseState;
+            let (session, _receiver) = super::fixture_with_size(160, 40);
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.muse_cwd_label = Some("project".into());
+            runtime.muse_hook_state = Some(MuseState::Done);
+            let start = Instant::now();
+            draw(
+                &session,
+                Some("⠧ project"),
+                &background_fixture("muse", "running"),
+            );
+            runtime.reconcile(&session, TitleProvider::Muse, &[], &[], false, start);
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            assert_eq!(runtime.snapshot(&session).background.unwrap().shells, 1);
+
+            session.set_title_age_for_test(BACKGROUND_WAKE_GRACE);
+            session.set_idle_for_test(BACKGROUND_WAKE_GRACE);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                start + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            assert_eq!(runtime.snapshot(&session).background.unwrap().shells, 1);
+
+            draw(&session, None, &background_fixture("muse", "ended"));
+            session.set_title_age_for_test(BACKGROUND_WAKE_GRACE);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                start + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            session.set_idle_for_test(BACKGROUND_WAKE_GRACE);
+            let cleared = start + BACKGROUND_WAKE_GRACE * 2;
+            runtime.reconcile(&session, TitleProvider::Muse, &[], &[], false, cleared);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            assert_eq!(runtime.snapshot(&session).background, None);
+            assert!(runtime.snapshot(&session).completion_ready);
+
+            runtime.muse_hook_state = Some(MuseState::Working);
+            draw(
+                &session,
+                Some("⠋ project"),
+                &background_fixture("muse", "ended"),
+            );
+            session.set_title_age_for_test(BACKGROUND_WAKE_GRACE);
+            session.set_idle_for_test(BACKGROUND_WAKE_GRACE);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
             session.kill();
         }
 
