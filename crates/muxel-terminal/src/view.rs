@@ -1070,22 +1070,11 @@ impl TitleProvider {
     }
 
     fn from_program(program: &str) -> Self {
-        let leaf = program
-            .trim()
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let stem = leaf
-            .strip_suffix(".exe")
-            .or_else(|| leaf.strip_suffix(".cmd"))
-            .or_else(|| leaf.strip_suffix(".bat"))
-            .unwrap_or(&leaf);
-        match stem {
-            "claude" => Self::Claude,
-            "codex" => Self::Codex,
-            "grok" => Self::Grok,
-            "muse" => Self::Muse,
+        match muxel_core::program_stem(program).as_deref() {
+            Some("claude") => Self::Claude,
+            Some("codex") => Self::Codex,
+            Some("grok") => Self::Grok,
+            Some("muse") => Self::Muse,
             _ => Self::Other,
         }
     }
