@@ -34,11 +34,26 @@ pub(super) struct BranchResult {
 
 pub(super) fn probe_branches(jobs: Vec<BranchJob>) -> Vec<BranchResult> {
     jobs.into_iter()
-        .map(|job| BranchResult {
-            branch: integrations::repo_current_branch(&job.loc),
-            list: job.is_root.then(|| integrations::list_branches(&job.loc)),
-            key: job.key,
-            host_snapshot: job.host_snapshot,
+        .map(|job| {
+            let remote_root = job.is_root && matches!(job.loc, integrations::RepoLoc::Remote(_));
+            let (branch, list) = if remote_root {
+                // One ssh for both: the branch and the list.
+                let (branch, list) = integrations::read_branches(&job.loc).unwrap_or_default();
+                (branch, Some(list))
+            } else {
+                // A local folder's branch usually comes from its git files,
+                // with no git at all; only the list costs one.
+                (
+                    integrations::repo_current_branch(&job.loc),
+                    job.is_root.then(|| integrations::list_branches(&job.loc)),
+                )
+            };
+            BranchResult {
+                key: job.key,
+                branch,
+                list,
+                host_snapshot: job.host_snapshot,
+            }
         })
         .collect()
 }

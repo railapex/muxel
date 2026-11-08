@@ -50,41 +50,74 @@ pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
 }
 
 fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
-    let policy = if read_only {
-        " -c diff.autoRefreshIndex=false"
-    } else {
-        ""
-    };
     match os {
-        RemoteOs::Unix => {
-            let env = if read_only {
-                "GIT_OPTIONAL_LOCKS=0 "
-            } else {
-                ""
-            };
-            let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
-            for a in args {
-                c.push(' ');
-                c.push_str(&sh_quote(a));
-            }
-            c
-        }
-        RemoteOs::Windows => {
-            let env = if read_only {
-                "$env:GIT_OPTIONAL_LOCKS='0'; "
-            } else {
-                ""
-            };
-            let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
-            for a in args {
-                body.push(' ');
-                body.push_str(&ps_quote(a));
-            }
-            // git signals failure by exit code, not a PowerShell error, so the
-            // strict prelude alone would not surface it.
-            body.push_str("; exit $LASTEXITCODE");
-            ps(&body)
-        }
+        RemoteOs::Unix => sh_git(repo, args, read_only),
+        // git signals failure by exit code, not a PowerShell error, so the
+        // strict prelude alone would not surface it.
+        RemoteOs::Windows => ps(&format!(
+            "{}; exit $LASTEXITCODE",
+            ps_git(repo, args, read_only)
+        )),
+    }
+}
+
+const READ_ONLY_POLICY: &str = " -c diff.autoRefreshIndex=false";
+
+/// `git -C <repo> <args…>` for `sh`.
+fn sh_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("GIT_OPTIONAL_LOCKS=0 ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
+    for a in args {
+        c.push(' ');
+        c.push_str(&sh_quote(a));
+    }
+    c
+}
+
+/// `git -C <repo> <args…>` as PowerShell statements, git's exit code left in
+/// `$LASTEXITCODE`.
+fn ps_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("$env:GIT_OPTIONAL_LOCKS='0'; ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
+    for a in args {
+        body.push(' ');
+        body.push_str(&ps_quote(a));
+    }
+    body
+}
+
+/// The local branches, one a line, `*` before HEAD's and a space before the
+/// others; then the branch HEAD names on a line of its own, since git's list
+/// has none for it before the first commit. One command, so one ssh for both.
+/// The second part runs only once the first succeeded, so a failure other
+/// than exit 1 (HEAD names no branch: detached) is the listing's: a git older
+/// than 1.9 doesn't know `%(HEAD)`.
+pub fn branches(os: RemoteOs, repo: &str) -> String {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    const HEAD: &[&str] = &["symbolic-ref", "--quiet", "--short", "HEAD"];
+    match os {
+        RemoteOs::Unix => format!(
+            "{} && {}",
+            sh_git(repo, LIST, true),
+            sh_git(repo, HEAD, true)
+        ),
+        RemoteOs::Windows => ps(&format!(
+            "{}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; {}; exit $LASTEXITCODE",
+            ps_git(repo, LIST, true),
+            ps_git(repo, HEAD, true),
+        )),
     }
 }
 
@@ -426,8 +459,8 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep, read_file,
-        scan_projects, test_dir, test_file, upload_paste, write_file,
+        branches, ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep,
+        read_file, scan_projects, test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -481,7 +514,27 @@ mod tests {
     }
 
     #[test]
+    fn branches_are_listed_and_head_named_in_one_command() {
+        assert_eq!(
+            branches(UNIX, "/srv/a b"),
+            "GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false -C '/srv/a b' for-each-ref \
+             '--format=%(HEAD)%(refname:short)' refs/heads/ && GIT_OPTIONAL_LOCKS=0 git -c \
+             diff.autoRefreshIndex=false -C '/srv/a b' symbolic-ref --quiet --short HEAD"
+        );
+        // The listing's failure is the exit code; HEAD is asked only after it.
+        let s = script_of(&branches(WIN, "C:/p"));
+        let list = s.find("'for-each-ref'").expect("lists");
+        let bail = s
+            .find("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+            .expect("stops on the listing's failure");
+        let head = s.find("'symbolic-ref'").expect("names HEAD");
+        assert!(list < bail && bail < head, "{s}");
+        assert!(s[head..].contains("; exit $LASTEXITCODE"), "{s}");
+    }
+
+    #[test]
     fn windows_commands_are_all_opaque_base64() {
+        assert_opaque(&branches(WIN, "C:/p"));
         assert_opaque(&git(WIN, "C:/p", &["status"]));
         assert_opaque(&list_files(WIN, "C:/p", 10));
         assert_opaque(&read_file(WIN, "C:/p/a.txt", 10));
