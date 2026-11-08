@@ -194,6 +194,10 @@ pub(crate) struct FileWatch {
     router: Arc<Mutex<WatchRouter>>,
     /// Upgradable while the backend still holds its handler.
     backend: Weak<()>,
+    /// The handler's signal, for the news the router makes itself (see
+    /// [`Self::signal_news`]). Weak, so the receiver still closes when the
+    /// backend drops its handler.
+    signal: async_channel::WeakSender<()>,
 }
 
 impl FileWatch {
@@ -209,8 +213,26 @@ impl FileWatch {
     pub fn start_with<W: Watcher + 'static>(
         backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
     ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
-        let router = Arc::new(Mutex::new(WatchRouter::new(cfg!(target_os = "macos"))));
+        Self::start_with_router(cfg!(target_os = "macos"), backend)
+    }
+
+    /// As [`Self::start_with`], for a backend that restarts its event stream
+    /// whenever the watched set changes, as macOS's does, whatever this
+    /// machine is.
+    #[cfg(test)]
+    pub fn start_restarting_with<W: Watcher + 'static>(
+        backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
+        Self::start_with_router(true, backend)
+    }
+
+    fn start_with_router<W: Watcher + 'static>(
+        restarts_stream: bool,
+        backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
+        let router = Arc::new(Mutex::new(WatchRouter::new(restarts_stream)));
         let (signal, receiver) = async_channel::bounded(1);
+        let weak_signal = signal.downgrade();
         let alive = Arc::new(());
         let backend_alive = Arc::downgrade(&alive);
         let watcher = backend(RouteEvents {
@@ -223,6 +245,7 @@ impl FileWatch {
                 watcher: Some(Box::new(watcher)),
                 router,
                 backend: backend_alive,
+                signal: weak_signal,
             },
             receiver,
         ))
@@ -236,6 +259,7 @@ impl FileWatch {
             self.unregister(id);
             return Err(error);
         }
+        self.signal_news();
         Ok(id)
     }
 
@@ -248,6 +272,7 @@ impl FileWatch {
             self.unregister(id);
             return Err(error);
         }
+        self.signal_news();
         Ok(())
     }
 
@@ -256,6 +281,21 @@ impl FileWatch {
         let ops = lock(&self.router).unregister(id);
         if let Err(error) = self.apply(&ops) {
             log::warn!("file watcher could not narrow its watches: {error}");
+        }
+        self.signal_news();
+    }
+
+    /// Signal the news the router made itself, as the handler does after an
+    /// event. Where the stream restarts when the watched set changes (macOS),
+    /// the router marks every other registration for a rescan; unsignalled,
+    /// that waits for the next event, however late, and events lost in the
+    /// restart go unseen until then.
+    fn signal_news(&self) {
+        if lock(&self.router).has_news()
+            && let Some(signal) = self.signal.upgrade()
+        {
+            // Full means a signal is already waiting for this news.
+            let _ = signal.try_send(());
         }
     }
 
@@ -419,6 +459,37 @@ mod tests {
         let (watch, _signal) = FileWatch::start_with(|handler| live.build(handler)).unwrap();
         drop(watch);
         assert!(live.dropped());
+    }
+
+    /// Where the stream restarts as the watched set changes (macOS), adding,
+    /// re-speccing or dropping a watch has every other one rescanned. That is
+    /// signalled as it happens, not left for whatever event comes next.
+    #[test]
+    fn a_restarted_streams_rescans_are_signalled_without_an_event() {
+        let backend = TestBackend::default();
+        let (mut watch, signal) =
+            FileWatch::start_restarting_with(|handler| backend.build(handler)).unwrap();
+        let root = short_temp_path();
+        let first = watch.register(claude_records(&root.join("a"))).unwrap();
+        let _ = watch.take();
+        let _ = signal.try_recv();
+        let rescanned = |watch: &FileWatch| -> Vec<WatchId> {
+            let news = watch.take().changes.into_iter();
+            news.filter(|(_, change)| change.rescan)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let second = watch.register(claude_records(&root.join("b"))).unwrap();
+        assert!(signal.try_recv().is_ok(), "adding one");
+        assert_eq!(rescanned(&watch), [first]);
+        watch
+            .respec(second, claude_records(&root.join("c")))
+            .unwrap();
+        assert!(signal.try_recv().is_ok(), "re-speccing one");
+        assert_eq!(rescanned(&watch), [first]);
+        watch.unregister(second);
+        assert!(signal.try_recv().is_ok(), "dropping one");
+        assert_eq!(rescanned(&watch), [first]);
     }
 
     /// Watch Claude's hook directory under `data` through the platform's
