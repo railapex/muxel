@@ -279,6 +279,9 @@ struct RuntimeStatusState {
     /// Working title has had enough quiet time to retire.
     silent_switch_until: Option<Instant>,
     timer_generation: u64,
+    /// When `status` last changed: the time of the event it reports, however
+    /// late the app samples it.
+    status_since: Instant,
 }
 
 impl RuntimeStatusState {
@@ -318,6 +321,7 @@ impl RuntimeStatusState {
             deadline: None,
             silent_switch_until: None,
             timer_generation: 0,
+            status_since: Instant::now(),
         }
     }
 
@@ -818,6 +822,9 @@ impl RuntimeStatusState {
             || self.completion_revision != previous_completion_revision;
         if public_changed {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
+        }
+        if status != self.status {
+            self.status_since = now;
         }
         self.status = status;
         self.reason = reason;
@@ -3704,6 +3711,11 @@ impl TerminalView {
     /// Pure immutable projection used by render/sidebar callers.
     pub fn status(&self) -> AgentStatus {
         self.runtime.status
+    }
+
+    /// When [`Self::status`] took its current value, on the wall clock.
+    pub fn status_since(&self) -> SystemTime {
+        wall_time_at(self.runtime.status_since)
     }
 
     /// Whether [`Self::status`] can be attributed to the current provider
@@ -7298,6 +7310,32 @@ mod provider_switch_tests {
             session.program_status_snapshot().root.unwrap().state,
             crate::program_status::ProgramState::Done
         );
+        session.kill();
+    }
+
+    #[test]
+    fn status_since_is_when_the_status_changed_not_when_it_was_read() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        let mut sample = |wire: &[u8], offset_ms| {
+            session.test_program_status(wire);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(offset_ms),
+            );
+            runtime.status_since
+        };
+        let started = now + Duration::from_millis(10);
+        assert_eq!(sample(b"\x1b]7501;state=working\x07", 10), started);
+        // The same state reported again later is the same event.
+        assert_eq!(sample(b"\x1b]7501;state=working\x07", 500), started);
+        let finished = now + Duration::from_millis(900);
+        assert_eq!(sample(b"\x1b]7501;state=done\x07", 900), finished);
         session.kill();
     }
 

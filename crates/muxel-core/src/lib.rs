@@ -148,8 +148,9 @@ impl AgentActivity {
     }
 
     /// Whether the pane is Done and unread. Unread is [`sidebar::is_unread`], the
-    /// one read rule shared by the read pill, the unread mark and Recent work's
-    /// tiers. A missing attendance timestamp means the completion is unseen.
+    /// one read rule shared by the read pill and the unread mark. Recent work's
+    /// order never reads it. A missing attendance timestamp means the
+    /// completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
         self.current_state() == Some(AgentActivityState::Done) && sidebar::is_unread(self)
     }
@@ -615,6 +616,11 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// When this pane was opened, in Unix milliseconds. Recent work places a
+    /// pane that has never worked by it. `None` for panes saved before muxel
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -728,6 +734,8 @@ impl Instance {
         self.session_started = false;
         self.auto_name = None;
         self.activity = AgentActivity::default();
+        // The copy is opened when it is added, not when its source was.
+        self.created_at = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -792,6 +800,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            created_at: None,
         }
     }
 
@@ -861,6 +870,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            created_at: None,
         }
     }
 }
@@ -1657,6 +1667,8 @@ impl RemoteLayout {
                 instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                // Set once, and dropped by older peers: never a layout change.
+                instance.created_at = None;
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
@@ -1867,6 +1879,8 @@ pub fn merge_peer_instances(
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                // An older peer doesn't write the open time.
+                instance.created_at = mine.created_at.or(instance.created_at);
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()
