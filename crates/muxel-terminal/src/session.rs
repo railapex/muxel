@@ -3220,15 +3220,14 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child is sitting idle at its prompt with no foreground command
-    /// running — i.e. the terminal's foreground process group *is* the child
-    /// itself. A shell that's running `vim`/`make`/etc. puts that command in a new
-    /// foreground group, so this returns `false`. Used to skip the close
-    /// confirmation for an untouched shell pane.
+    /// Whether the child owns the foreground process group and has no child
+    /// process of its own. Foreground commands take the group; background jobs
+    /// keep the shell busy even while its prompt is showing. Used to skip the
+    /// close confirmation for an untouched shell pane.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown child
-    /// pid, or a platform without `tcgetpgrp` (Windows) — so callers stay safe and
-    /// confirm as usual.
+    /// pid, a failed child lookup, or a platform without `tcgetpgrp` (Windows)
+    /// — so callers stay safe and confirm as usual.
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
         {
@@ -3240,7 +3239,9 @@ impl TerminalSession {
                     .and_then(|master| master.process_group_leader()),
                 self.child_pid,
             ) {
-                (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
+                (Some(fg), Some(pid)) => {
+                    fg == pid as libc::pid_t && crate::process_tree_unix::shell_has_no_children(pid)
+                }
                 _ => false,
             }
         }
@@ -3250,18 +3251,20 @@ impl TerminalSession {
         }
     }
 
-    /// Close evidence for a Unix shell, including prompts marked with OSC 133.
+    /// Close evidence for a Unix shell. An OSC 133 prompt cannot override a
+    /// running job or an unreadable process tree.
     #[cfg(unix)]
     pub fn shell_close_evidence(
         &self,
         program: Option<&str>,
         via_client: bool,
     ) -> muxel_core::recoverable_close::CloseEvidence {
+        let idle = self.is_idle_foreground();
         muxel_core::recoverable_close::shell_close_evidence(
             program,
             via_client,
-            self.is_idle_foreground(),
-            self.shell_at_prompt(),
+            idle,
+            idle && self.shell_at_prompt(),
         )
     }
 
