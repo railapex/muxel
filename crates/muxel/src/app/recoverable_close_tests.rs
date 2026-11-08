@@ -1006,7 +1006,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             let path = app.workspace.project(pid).unwrap().root_path.clone();
             let instance = Instance::editor(pid, Some(path.clone()));
             let iid = instance.id;
-            let snapshot = EditorSnapshot { text: "unsaved draft".into(), path: Some(path), language: "text".into(), cursor: None, dirty: true, external_change: None, disk_stamp: None, show_rendered: false, diff_dir: None };
+            let snapshot = EditorSnapshot { text: "unsaved draft".into(), path: Some(path), language: "text".into(), cursor: None, dirty: true, external_change: None, disk_stamp: None, show_rendered: false, diff_dir: None, backup_target: None, backup_offered: false };
             let editor = snapshot.build(app.editor_config(), window, cx);
             app.workspace.add_instance(instance);
             app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));

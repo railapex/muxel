@@ -30,18 +30,7 @@ pub(super) struct Rescue {
     pub(super) closed_hidden: bool,
 }
 
-/// `HH:MM` for today, else the date as well: when rescued text was kept.
-pub(super) fn rescue_time(ms: i64) -> String {
-    use chrono::TimeZone as _;
-    let Some(at) = chrono::Local.timestamp_millis_opt(ms).single() else {
-        return String::new();
-    };
-    if at.date_naive() == chrono::Local::now().date_naive() {
-        at.format("%H:%M").to_string()
-    } else {
-        at.format("%b %-d %H:%M").to_string()
-    }
-}
+pub(super) use crate::editor::rescue_time;
 
 /// Two drafts that differ only in how whitespace was wrapped are the same.
 pub(super) fn same_draft(a: &str, b: &str) -> bool {
@@ -123,6 +112,10 @@ impl MuxelApp {
             let sink = dir.clone().map(|dir| Self::draft_sink(dir, iid));
             view.update(cx, |view, cx| view.set_draft_sink(sink, cx));
         }
+        for (iid, editor) in self.rescue_editors() {
+            let target = dir.clone().map(|dir| (dir, iid));
+            editor.update(cx, |editor, cx| editor.adopt_backup(target, false, cx));
+        }
         if !on {
             if let Some(dir) = self.rescue_dir_any() {
                 dir.purge();
@@ -161,7 +154,8 @@ impl MuxelApp {
         }
     }
 
-    /// Save every pane's draft now (quit, workspace switch).
+    /// Save every pane's draft and every editor's unsaved changes now (quit,
+    /// workspace switch).
     pub(super) fn flush_rescue(&self, cx: &mut App) {
         let ids: Vec<Uuid> = self
             .terminals
@@ -171,6 +165,55 @@ impl MuxelApp {
             .collect();
         for iid in ids {
             self.flush_draft(iid, cx);
+        }
+        for (_, editor) in self.rescue_editors() {
+            editor.update(cx, |editor, cx| editor.flush_backup(cx));
+        }
+    }
+
+    /// Every editor pane, docked or popped out.
+    fn rescue_editors(&self) -> Vec<(Uuid, Entity<EditorView>)> {
+        self.editors
+            .iter()
+            .map(|(iid, editor)| (*iid, editor.clone()))
+            .chain(
+                self.popouts
+                    .iter()
+                    .filter_map(|(iid, popout)| match &popout.view {
+                        PaneView::Editor(editor) => Some((*iid, editor.clone())),
+                        _ => None,
+                    }),
+            )
+            .collect()
+    }
+
+    /// An editor pane was just created: keep its unsaved changes backed up,
+    /// first offering (`offer`) the backup it left when muxel last ran.
+    pub(super) fn attach_editor_rescue(
+        &self,
+        iid: Uuid,
+        editor: &Entity<EditorView>,
+        offer: bool,
+        cx: &mut App,
+    ) {
+        let target = self.rescue_dir().map(|dir| (dir, iid));
+        editor.update(cx, |editor, cx| editor.adopt_backup(target, offer, cx));
+    }
+
+    /// An editor pane closed for good: its unsaved changes were saved or
+    /// given up when it closed, so its backup goes.
+    pub(super) fn drop_editor_backup(&self, iid: Uuid, cx: &mut App) {
+        let Some(editor) = self.editors.get(&iid).cloned().or_else(|| {
+            match self.popouts.get(&iid).map(|popout| &popout.view) {
+                Some(PaneView::Editor(editor)) => Some(editor.clone()),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        editor.update(cx, |editor, _| editor.set_backup_target(None));
+        if let Some(dir) = self.rescue_dir_any() {
+            dir.delete_editor_backup(iid);
         }
     }
 

@@ -1649,9 +1649,15 @@ feature is added or changed, update the matching entry here in the same change**
   puts the text back into the box and never sends it. A pane closed for good keeps
   its draft in a strip under the title bar with **Copy** and **Discard**. Grok,
   Muse, opencode and Amp input boxes are not read yet.
-- **Rescue storage** — drafts are small private files beside the workspace,
-  written atomically, size-capped, and never logged. Settings → **Keep unsent
-  prompts** (on by default) turns it off and deletes everything kept.
+- **Unsaved editor changes survive** — an editor with unsaved changes backs them
+  up about a second after edits stop. When it opens again it offers **Restore
+  unsaved changes from HH:MM**; if the file changed on disk since, it says so, and
+  restoring keeps both (the disk version waits behind **Reload / Keep mine**).
+  Saving, reloading or closing without saving deletes the backup.
+- **Rescue storage** — drafts and backups are small private files beside the
+  workspace, written atomically, size-capped, and never logged. Settings →
+  **Keep unsent prompts and unsaved editor changes** (on by default) turns it off
+  and deletes everything kept.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
   `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
   a separate keychain service on Windows, macOS and Linux. This separates Muxel

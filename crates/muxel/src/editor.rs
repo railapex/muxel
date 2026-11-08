@@ -9,8 +9,11 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
+use muxel_core::rescue::{BackupOffer, EditorBackup, FileStamp};
+use muxel_store::rescue::RescueDir;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+use uuid::Uuid;
 
 /// Don't try to open files larger than this (treated as non-text).
 pub const MAX_EDITOR_BYTES: u64 = 8 * 1024 * 1024;
@@ -59,6 +62,21 @@ pub struct EditorView {
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
     disk_stamp: Option<DiskStamp>,
+    /// Backups of unsaved changes, so a crash doesn't lose them.
+    rescue: EditorRescue,
+}
+
+/// An editor's backup of its unsaved changes: where it goes, the debounce,
+/// and a backup found when the editor opened.
+#[derive(Default)]
+struct EditorRescue {
+    target: Option<(RescueDir, Uuid)>,
+    last_edit: Option<Instant>,
+    pending: Option<Task<()>>,
+    /// The on-disk version the unsaved edits started from.
+    base: Option<FileStamp>,
+    /// A backup left by the last run, until it is restored or discarded.
+    offer: Option<(EditorBackup, BackupOffer)>,
 }
 
 #[derive(Clone)]
@@ -201,7 +219,11 @@ impl EditorView {
             |this: &mut Self, _input, ev: &InputEvent, _window, cx| {
                 if matches!(ev, InputEvent::Change) && !this.dirty {
                     this.dirty = true;
+                    this.rescue.base = this.disk_stamp.map(file_stamp);
                     cx.notify();
+                }
+                if matches!(ev, InputEvent::Change | InputEvent::Blur) {
+                    this.note_edit(cx);
                 }
             },
         )
@@ -223,6 +245,7 @@ impl EditorView {
             show_rendered: is_markdown || is_image,
             external_change: None,
             disk_stamp: stamp,
+            rescue: EditorRescue::default(),
         }
     }
 
@@ -255,6 +278,7 @@ impl EditorView {
             show_rendered: false,
             external_change: None,
             disk_stamp: None,
+            rescue: EditorRescue::default(),
         }
     }
 
@@ -496,6 +520,7 @@ impl EditorView {
         if was_dirty || changed {
             cx.notify();
         }
+        self.backup_clean(cx);
     }
 
     /// Replace the buffer contents (used after an async remote read), keeping the
@@ -506,6 +531,7 @@ impl EditorView {
         self.external_change = None;
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         cx.notify();
+        self.backup_clean(cx);
     }
 
     /// Point the editor at a new on-disk path (after Save As), re-detecting the
@@ -519,6 +545,7 @@ impl EditorView {
         self.external_change = None;
         self.disk_stamp = stamp;
         cx.notify();
+        self.backup_clean(cx);
     }
 
     fn render_external_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -545,6 +572,7 @@ impl EditorView {
                         this.replace_disk_content(content, window, cx);
                         this.dirty = false;
                         cx.notify();
+                        this.backup_clean(cx);
                     })),
             );
         }
@@ -582,6 +610,288 @@ impl EditorView {
     }
 }
 
+/// A disk stamp as a backup records it.
+fn file_stamp(stamp: DiskStamp) -> FileStamp {
+    FileStamp {
+        modified_ms: stamp
+            .modified
+            .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_millis()).ok()),
+        len: stamp.len,
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// `HH:MM` for today, else the date as well: when rescued text was kept.
+pub(crate) fn rescue_time(ms: i64) -> String {
+    use chrono::TimeZone as _;
+    let Some(at) = chrono::Local.timestamp_millis_opt(ms).single() else {
+        return String::new();
+    };
+    if at.date_naive() == chrono::Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
+    }
+}
+
+/// Backing up unsaved changes. A dirty buffer is written about a second after
+/// edits stop, off the UI thread; saving, reloading from disk, or closing
+/// without saving deletes the backup.
+impl EditorView {
+    /// Back up this editor's unsaved changes to `target` (its workspace's
+    /// rescue directory and its pane); `None` stops.
+    pub(crate) fn set_backup_target(&mut self, target: Option<(RescueDir, Uuid)>) {
+        if target.is_none() {
+            self.rescue.pending = None;
+            self.rescue.offer = None;
+        }
+        self.rescue.target = target;
+    }
+
+    pub(crate) fn backup_target(&self) -> Option<(RescueDir, Uuid)> {
+        self.rescue.target.clone()
+    }
+
+    /// Keep this editor's unsaved changes backed up under `target`; with
+    /// `offer`, first offer the backup a previous run left.
+    pub(crate) fn adopt_backup(
+        &mut self,
+        target: Option<(RescueDir, Uuid)>,
+        offer: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_backup_target(target);
+        if offer {
+            self.offer_backup(cx);
+        }
+        self.note_edit(cx);
+    }
+
+    /// Whether the buffer holds changes a backup must keep. Backups ask this
+    /// and nothing else about dirtiness.
+    fn needs_backup(&self, _cx: &App) -> bool {
+        self.diff_dir.is_none() && !self.is_image && self.is_dirty()
+    }
+
+    /// An edit (or the editor losing focus): restart the debounce.
+    fn note_edit(&mut self, cx: &mut Context<Self>) {
+        // A backup still on offer keeps its file until it is decided.
+        if self.rescue.target.is_none() || self.rescue.offer.is_some() || !self.needs_backup(cx) {
+            return;
+        }
+        self.rescue.last_edit = Some(Instant::now());
+        if self.rescue.pending.is_some() {
+            return;
+        }
+        self.rescue.pending = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let wait = this.update(cx, |this, _| {
+                    this.rescue
+                        .last_edit
+                        .and_then(|at| muxel_core::rescue::debounce_remaining(at.elapsed()))
+                });
+                match wait {
+                    Ok(Some(wait)) => cx.background_executor().timer(wait).await,
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.rescue.pending = None;
+                this.write_backup(false, cx);
+            });
+        }));
+    }
+
+    /// Write the backup, or delete it once the buffer is clean. `now` does the
+    /// file work on this thread, for an editor about to be dropped.
+    fn write_backup(&mut self, now: bool, cx: &mut Context<Self>) {
+        let Some((dir, iid)) = self.rescue.target.clone() else {
+            return;
+        };
+        if self.rescue.offer.is_some() {
+            return;
+        }
+        let job: Box<dyn FnOnce() + Send> = if self.needs_backup(cx) {
+            let text = self.text(cx);
+            if text.len() > muxel_core::rescue::MAX_EDITOR_BACKUP_BYTES {
+                log::warn!(
+                    "editor {iid} is too large to back up ({} bytes)",
+                    text.len()
+                );
+                return;
+            }
+            if self.rescue.base.is_none() {
+                self.rescue.base = self.disk_stamp.map(file_stamp);
+            }
+            let backup = EditorBackup {
+                path: self.path.clone(),
+                text,
+                base: self.rescue.base,
+                saved_at_ms: now_ms(),
+            };
+            Box::new(move || {
+                let started = Instant::now();
+                match dir.save_editor_backup(iid, &backup) {
+                    Ok(()) => log::debug!(
+                        "editor backup saved: {} bytes in {:?}",
+                        backup.text.len(),
+                        started.elapsed()
+                    ),
+                    Err(e) => log::warn!("couldn't back up editor {iid}: {e:#}"),
+                }
+            })
+        } else {
+            self.rescue.base = None;
+            Box::new(move || dir.delete_editor_backup(iid))
+        };
+        if now {
+            job();
+        } else {
+            cx.background_executor()
+                .spawn(async move { job() })
+                .detach();
+        }
+    }
+
+    /// Back up unsaved changes now (quit, workspace switch).
+    pub(crate) fn flush_backup(&mut self, cx: &mut Context<Self>) {
+        self.rescue.pending = None;
+        if self.needs_backup(cx) {
+            self.write_backup(true, cx);
+        }
+    }
+
+    /// The buffer now matches the disk (saved, reloaded, replaced): its
+    /// backup has nothing left to keep.
+    fn backup_clean(&mut self, cx: &mut Context<Self>) {
+        if self.rescue.offer.is_some() {
+            return;
+        }
+        self.rescue.pending = None;
+        self.write_backup(false, cx);
+    }
+
+    /// Offer the backup this pane left when muxel last ran, unless the file
+    /// already holds that text. Call once, after the buffer was loaded.
+    pub(crate) fn offer_backup(&mut self, cx: &mut Context<Self>) {
+        let Some((dir, iid)) = self.rescue.target.clone() else {
+            return;
+        };
+        let Some(backup) = dir.editor_backup(iid) else {
+            return;
+        };
+        let current = self.path.as_deref().and_then(disk_stamp).map(file_stamp);
+        let loaded = self.text(cx);
+        let disk_text = current.is_some().then_some(loaded.as_str());
+        match muxel_core::rescue::backup_offer(&backup, current, disk_text) {
+            BackupOffer::Stale => dir.delete_editor_backup(iid),
+            offer => {
+                log::info!("editor {iid} offers unsaved changes ({offer:?})");
+                self.rescue.offer = Some((backup, offer));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Whether this editor is offering a backup.
+    pub(crate) fn backup_offered(&self) -> bool {
+        self.rescue.offer.is_some()
+    }
+
+    /// Type `text` at the cursor, as a keystroke would.
+    #[cfg(test)]
+    pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.input.update(cx, |s, cx| s.insert(text, window, cx));
+    }
+
+    /// Restore the offered backup into the buffer, unsaved. When the file
+    /// changed on disk since, the next poll shows the disk version beside it.
+    pub(crate) fn restore_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((backup, offer)) = self.rescue.offer.take() else {
+            return;
+        };
+        self.input
+            .update(cx, |s, cx| s.set_value(backup.text, window, cx));
+        self.dirty = true;
+        self.rescue.base = backup.base;
+        if offer == BackupOffer::ChangedOnDisk {
+            // Forget the stamp so the poller reads the disk version and offers
+            // it beside these changes, neither replacing the other.
+            self.disk_stamp = None;
+        }
+        cx.notify();
+        self.note_edit(cx);
+    }
+
+    /// Discard the offered backup and its file.
+    pub(crate) fn discard_backup(&mut self, cx: &mut Context<Self>) {
+        if self.rescue.offer.take().is_some()
+            && let Some((dir, iid)) = self.rescue.target.clone()
+        {
+            dir.delete_editor_backup(iid);
+        }
+        cx.notify();
+    }
+
+    fn render_backup_offer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (backup, offer) = self.rescue.offer.as_ref()?;
+        let time = rescue_time(backup.saved_at_ms);
+        let label = match offer {
+            BackupOffer::ChangedOnDisk => tf(
+                "Restore unsaved changes from {time}? The file changed on disk since; restoring keeps both.",
+                &[("time", &time)],
+            ),
+            _ => tf("Restore unsaved changes from {time}?", &[("time", &time)]),
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().primary.opacity(0.12))
+                .text_color(cx.theme().foreground)
+                .text_xs()
+                .child(label)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Button::new("editor-backup-restore")
+                                .xsmall()
+                                .label(t("Restore"))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.restore_backup(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("editor-backup-discard")
+                                .ghost()
+                                .xsmall()
+                                .label(t("Discard"))
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.discard_backup(cx)
+                                    }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Focusable for EditorView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.read(cx).focus_handle(cx)
@@ -590,6 +900,7 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let backup = self.render_backup_offer(cx);
         let notice = self
             .external_change
             .as_ref()
@@ -638,6 +949,7 @@ impl Render for EditorView {
             .size_full()
             .flex()
             .flex_col()
+            .children(backup)
             .children(notice)
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()

@@ -6321,6 +6321,10 @@ struct EditorSnapshot {
     show_rendered: bool,
     /// Set when the snapshot is of a diff pane (rebuilds via `EditorView::diff`).
     diff_dir: Option<PathBuf>,
+    /// Where the editor backs up its unsaved changes, and whether it was
+    /// still offering the backup a previous run left.
+    backup_target: Option<(muxel_store::rescue::RescueDir, Uuid)>,
+    backup_offered: bool,
 }
 
 impl EditorSnapshot {
@@ -6336,6 +6340,8 @@ impl EditorSnapshot {
             disk_stamp: e.disk_stamp(),
             show_rendered: e.show_rendered(),
             diff_dir: e.diff_dir().map(|p| p.to_path_buf()),
+            backup_target: e.backup_target(),
+            backup_offered: e.backup_offered(),
         }
     }
     fn build(self, config: EditorConfig, window: &mut Window, cx: &mut App) -> Entity<EditorView> {
@@ -6343,7 +6349,7 @@ impl EditorSnapshot {
             return cx.new(|cx| EditorView::diff(dir, config, window, cx));
         }
         cx.new(|cx| {
-            EditorView::from_state(
+            let mut editor = EditorView::from_state(
                 self.text,
                 self.path,
                 self.language,
@@ -6355,7 +6361,9 @@ impl EditorSnapshot {
                 config,
                 window,
                 cx,
-            )
+            );
+            editor.adopt_backup(self.backup_target, self.backup_offered, cx);
+            editor
         })
     }
 }
@@ -11740,6 +11748,7 @@ impl MuxelApp {
                         .and_then(|i| i.editor_path.clone());
                     let config = self.editor_config();
                     let ed = cx.new(|cx| EditorView::open(path, config, window, cx));
+                    self.attach_editor_rescue(iid, &ed, true, cx);
                     self.editors.insert(iid, ed);
                 }
             }
@@ -13677,6 +13686,7 @@ impl MuxelApp {
         self.release_maximize(&closed);
         for &iid in &closed {
             self.keep_closed_draft(iid, cx);
+            self.drop_editor_backup(iid, cx);
             ui_profile::unregister_focus_pane(iid);
             self.terminal_launching.remove(&iid);
             self.clear_notifications_for(iid);
@@ -16343,6 +16353,7 @@ impl MuxelApp {
         }
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::open(path.clone(), config, window, cx));
+        self.attach_editor_rescue(iid, &ed, false, cx);
         self.editors.insert(iid, ed.clone());
         // Remote project: the local read in `EditorView::open` finds nothing, so
         // fetch the file's contents over SSH (background) and fill the editor.
@@ -18027,8 +18038,11 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
-        // Keep an unsent prompt before its view goes; it outlives the pane.
+        // Settle rescued text before the view goes. An unsent prompt outlives
+        // its pane; an editor's backup goes, since its changes were saved or
+        // given up when it closed.
         self.keep_closed_draft(iid, cx);
+        self.drop_editor_backup(iid, cx);
         self.forget_close(iid);
         self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
@@ -33217,7 +33231,7 @@ impl MuxelApp {
                         .on_click(
                             cx.listener(|this, c: &bool, _w, cx| this.set_rescue_enabled(*c, cx)),
                         ),
-                    &t("Keep unsent prompts through a crash, a restart or an accidental close"),
+                    &t("Keep unsent prompts and unsaved editor changes through a crash, a restart or an accidental close"),
                 ),
             )
             .child(
