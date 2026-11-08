@@ -7,7 +7,7 @@ use crate::file_watch::test_backend::TestBackend;
 use crate::test_support::TestRepo;
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
-use muxel_core::diff_schedule::{MIN_GAP, POLL};
+use muxel_core::diff_schedule::{BACKSTOP, MIN_GAP, POLL};
 use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -251,6 +251,90 @@ fn a_lost_diff_watch_puts_the_pane_back_on_its_poll() {
         add_line(&fx.a);
         tick(cx);
         assert!(diff_text(cx, window, iid).contains("+second"));
+    });
+}
+
+/// `git add` of a new file whose index event the watcher lost: the file is
+/// now tracked, but the pane's plan still lists the old files.
+fn add_unreported(repo: &TestRepo) -> PathBuf {
+    let added = repo.path().join("added.txt");
+    std::fs::write(&added, "one\n").unwrap();
+    repo.git(&["add", "added.txt"]);
+    added
+}
+
+/// After the plan caught up, an edit to the newly tracked file wakes the
+/// pane by itself.
+fn edit_wakes(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    backend: &TestBackend,
+    iid: Uuid,
+    added: PathBuf,
+) {
+    std::fs::write(&added, "one\nmore\n").unwrap();
+    modified(backend, added);
+    wait(cx, SOON);
+    assert!(
+        diff_text(cx, window, iid).contains("+more"),
+        "the newly tracked file's edit refreshed the pane"
+    );
+}
+
+#[test]
+fn a_watcher_overflow_re_plans_the_diff() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        let added = add_unreported(&fx.a);
+        backend.send(Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, window, iid).contains("+one"),
+            "the rescan refreshed"
+        );
+        edit_wakes(cx, window, &backend, iid, added);
+    });
+}
+
+#[test]
+fn the_backstop_re_plans_after_a_lost_index_event() {
+    with_app(|cx, window, fx| {
+        let (backend, iid) = watched_diff(cx, window, fx);
+        let added = add_unreported(&fx.a);
+        wait(cx, BACKSTOP);
+        assert!(
+            diff_text(cx, window, iid).contains("+one"),
+            "the backstop refreshed"
+        );
+        edit_wakes(cx, window, &backend, iid, added);
+    });
+}
+
+/// An edit inside a submodule changes the diff (`-dirty`) without touching a
+/// file the plan tracks, so a repository with one polls instead of watching.
+#[test]
+fn a_repository_with_a_submodule_polls() {
+    with_app(|cx, window, fx| {
+        fx.a.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &fx.b.path().to_string_lossy(),
+            "sub",
+        ]);
+        fx.a.commit(&[], "add sub");
+        let backend = watch_with(cx, window);
+        let iid = open_diff(cx, window, fx, &fx.a);
+        assert!(!watched(cx, window, iid), "the pane polls");
+        let inside = fx.a.path().join("sub").join("notes.txt");
+        std::fs::write(&inside, "first\nsecond\n").unwrap();
+        modified(&backend, inside);
+        tick(cx);
+        assert!(diff_text(cx, window, iid).contains("-dirty"));
     });
 }
 
