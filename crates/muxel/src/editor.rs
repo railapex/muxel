@@ -941,6 +941,9 @@ mod tests {
         assert_eq!(reload.cursor(), Position::new(1, 3));
     }
 
+    // On macOS, gpui-component's Root installs native accessibility hooks;
+    // GPUI test windows have no native window handle for that constructor.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_drawn_editor_keeps_its_scroll_and_cursor_after_disk_reload() {
         let mut cx = TestAppContext::single();
