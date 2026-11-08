@@ -21,7 +21,12 @@ impl Shell {
     fn start(marked: bool) -> Self {
         let mut spec = CommandSpec::program(
             "/bin/bash",
-            vec!["--noprofile".into(), "--norc".into(), "-i".into()],
+            vec![
+                "--noprofile".into(),
+                "--norc".into(),
+                "-i".into(),
+                "+H".into(),
+            ],
         );
         spec.env_remove = vec!["PROMPT_COMMAND".into(), "BASH_ENV".into(), "ENV".into()];
         let prompt = if marked {
@@ -100,8 +105,7 @@ impl Shell {
         // to finish: the test kills it and the shell explicitly reaps it.
         self.session
             .write_input(b"sleep 30 & muxel_job=$!; printf '\\nCHILD:%s\\n' \"$muxel_job\"\n");
-        // Readline can redraw a prompt while accepting input. Synchronize on
-        // the command's output before looking for the prompt after it.
+        // Wait for the command's PID output before accepting its next prompt.
         self.read_until("\nCHILD:");
         let pid_line = self.read_until("\n");
         self.job = Some(
