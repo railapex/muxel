@@ -49,7 +49,7 @@ pub use agent::{
     codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
     find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    memory_instruction, memory_reference, muxel_file_reference, program_stem, resolve_launch,
     resolve_launch_for_session, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
@@ -2999,19 +2999,11 @@ fn is_useful_auto_name_for_program(name: &str, program: Option<&str>) -> bool {
     if !absolute {
         return true;
     }
-    let stem = |value: &str| {
-        let leaf = value.rsplit(['/', '\\']).next().unwrap_or(value);
-        leaf.strip_suffix(".exe")
-            .or_else(|| leaf.strip_suffix(".cmd"))
-            .or_else(|| leaf.strip_suffix(".bat"))
-            .unwrap_or(leaf)
-            .to_ascii_lowercase()
-    };
-    let program_stem = stem(program);
-    let title_stem = stem(name);
-    title_stem != program_stem
-        && !title_stem.starts_with(&format!("{program_stem}-"))
-        && !title_stem.starts_with(&format!("{program_stem}_"))
+    let stem = |value: &str| program_stem(value).unwrap_or_default();
+    let (program, title) = (stem(program), stem(name));
+    title != program
+        && !title.starts_with(&format!("{program}-"))
+        && !title.starts_with(&format!("{program}_"))
 }
 
 #[cfg(test)]

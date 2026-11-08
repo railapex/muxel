@@ -570,28 +570,37 @@ impl AgentPreset {
     }
 }
 
+/// The name `program` runs under, for matching it against a provider: its
+/// basename without the directory, lowercased, with one trailing `.exe`, `.cmd`
+/// or `.bat` removed. Windows launches all three by bare name, so `codex`,
+/// `codex.exe` and npm's `codex.cmd` shim are the same program. `None` when
+/// nothing is left (`""`, `/opt/codex/`, `.exe`).
+pub fn program_stem(program: &str) -> Option<String> {
+    let program = program.trim();
+    let leaf = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let stem = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|suffix| leaf.strip_suffix(suffix))
+        .unwrap_or(&leaf);
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
 /// Whether `program` runs one of muxel's built-in agent providers — the program
-/// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
-/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
-/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
-/// user preset runs it.
+/// of a [`AgentPreset::builtin_agents`] preset — matched by [`program_stem`],
+/// so its directory, case and a `.exe`, `.cmd` or `.bat` suffix don't matter.
+/// Anything else (`ssh`, `wsl.exe`, `python`, a wrapper with its own name, a
+/// shell) is not, even if a user preset runs it.
 pub fn is_known_agent_program(program: Option<&str>) -> bool {
-    fn stem(program: &str) -> Option<String> {
-        let program = program.trim();
-        let leaf = program
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(program)
-            .to_ascii_lowercase();
-        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
-        (!stem.is_empty()).then(|| stem.to_string())
-    }
-    let Some(name) = program.and_then(stem) else {
+    let Some(name) = program.and_then(program_stem) else {
         return false;
     };
     AgentPreset::builtin_agents()
         .iter()
-        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .filter_map(|preset| preset.program.as_deref().and_then(program_stem))
         .any(|known| known == name)
 }
 
@@ -1392,6 +1401,44 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// Windows launches a program by bare name through `.exe`, `.cmd` or
+    /// `.bat`, and npm installs agents as `.cmd` shims, so a pane's program can
+    /// name an agent in any of those forms, in any case, from any directory.
+    #[test]
+    fn known_agents_match_under_every_windows_launch_suffix_and_path_form() {
+        let names = [
+            "claude", "codex", "grok", "opencode", "amp", "muse", "hermes", "ollama", "pi",
+        ];
+        let suffixes = ["", ".exe", ".EXE", ".cmd", ".Cmd", ".bat", ".BAT"];
+        let forms = [
+            "{}",
+            "  {}  ",
+            r"C:\Users\me\AppData\Roaming\npm\{}",
+            r"\\host\share\tools\{}",
+            r".\bin\{}",
+            "/usr/local/bin/{}",
+        ];
+        for name in names {
+            for suffix in suffixes {
+                let file = format!("{name}{suffix}");
+                for form in forms {
+                    let program = form.replace("{}", &file);
+                    assert!(is_known_agent_program(Some(&program)), "{program}");
+                }
+                let upper = file.to_ascii_uppercase();
+                assert!(is_known_agent_program(Some(&upper)), "{upper}");
+                // Another program whose name only starts with the agent's.
+                let wrapper = format!("{name}-wrapper{suffix}");
+                assert!(!is_known_agent_program(Some(&wrapper)), "{wrapper}");
+            }
+            // Not a suffix muxel launches, or not the last one.
+            for other in [".ps1", ".sh", ".exe.bak", ".cmd.txt"] {
+                let program = format!("{name}{other}");
+                assert!(!is_known_agent_program(Some(&program)), "{program}");
+            }
+        }
+    }
+
     #[test]
     fn known_agents_are_the_builtin_agent_programs_by_basename() {
         for program in [
@@ -1421,7 +1468,6 @@ mod tests {
             Some("cmd.exe"),
             Some("pwsh"),
             Some("claude-wrapper"),
-            Some("codex.cmd"),
             Some("/opt/codex/"),
         ] {
             assert!(!is_known_agent_program(program), "{program:?}");
