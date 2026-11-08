@@ -10,6 +10,7 @@
 
 mod colors;
 mod control_input;
+mod control_paste;
 mod element;
 mod keymap;
 mod links;

@@ -712,6 +712,15 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     if instance.program.as_deref().is_some_and(is_codex_program) {
         args.push("--config".to_string());
         args.push(codex_terminal_title_override().to_string());
+        if instance.control_prompt && startup_input.is_some() {
+            args.push("--config".to_string());
+            args.push("check_for_update_on_startup=false".to_string());
+        }
+        #[cfg(windows)]
+        {
+            args.push("--config".to_string());
+            args.push("disable_paste_burst=true".to_string());
+        }
     }
 
     let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
@@ -1504,6 +1513,40 @@ mod tests {
             session_resume_args(&preset, &pane),
             Some(vec!["resume".to_string(), session_id])
         );
+    }
+
+    #[test]
+    fn codex_control_launches_configure_input_without_changing_literal_argv() {
+        let mut pane = instance(&AgentPreset::codex(), Some("startup task"));
+        pane.control_prompt = true;
+        pane.auto_submit = true;
+        let launch = resolve_launch(&pane);
+        assert_eq!(launch.startup_input.as_deref(), Some("startup task"));
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "check_for_update_on_startup=false"] })
+        );
+        assert_eq!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "disable_paste_burst=true"] }),
+            cfg!(windows)
+        );
+        let resumed = resolve_launch_for_session(&pane, true);
+        assert!(resumed.startup_input.is_none());
+        assert!(
+            !resumed
+                .args
+                .iter()
+                .any(|arg| arg == "check_for_update_on_startup=false")
+        );
+
+        pane.literal_argv = true;
+        pane.args = vec!["--config".into(), "disable_paste_burst=false".into()];
+        assert_eq!(resolve_launch(&pane).args, pane.args);
     }
 
     #[test]

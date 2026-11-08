@@ -2068,6 +2068,7 @@ struct PromptOriginProof {
     frame: crate::startup::CodexCtlOrigin,
     title_generation: u64,
     resize_revision: u64,
+    first_binding_title: std::cell::Cell<Option<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2305,7 +2306,8 @@ fn prompt_submission_state(
         && attempt.provider == TitleProvider::Codex
         && !startup_has_fresh_user_row(attempt, prompt)
         && origin.is_some_and(|proof| {
-            proof.title_generation == title_generation
+            (proof.title_generation == title_generation
+                || proof.first_binding_title.get() == Some(title_generation))
                 && screen.codex_ctl_retry_draft(attempt.input, &proof.frame)
         })
         && codex_ctl_ready(screen, title, marker_sets, false)
@@ -2643,7 +2645,7 @@ async fn wait_startup_composer(
         let ready = with_startup_view(view, session, cx, |view| {
             let screen = session.startup_screen();
             let title = startup_title(session, probe).1;
-            guard.ready(
+            let ready = guard.ready(
                 armed_at.elapsed(),
                 session.input_rev(),
                 startup_ready(
@@ -2653,7 +2655,16 @@ async fn wait_startup_composer(
                     &view.blocked_markers,
                     empty,
                 ),
-            )
+            );
+            // After paste, a quoted menu in the task is not a startup blocker.
+            if empty
+                && matches!(ready, Ok(false))
+                && let Some(blocker) = screen.startup_blocker()
+            {
+                guard.blocked(blocker);
+                return Err(crate::startup::Stop::NotReady);
+            }
+            ready
         })??;
         if ready {
             return Ok(());
@@ -2677,10 +2688,11 @@ async fn write_startup_input(
     input: crate::ControlInput,
 ) -> Result<(), crate::startup::Stop> {
     let submit = input == crate::ControlInput::Submit;
+    let paste = matches!(input, crate::ControlInput::Paste(_));
     let (write, admitted_at) = with_startup_view(view, session, cx, |_| {
         let admitted_at = startup_now_ms();
         let mut write = None;
-        guard.write(armed_at.elapsed(), session.input_rev(), || {
+        let written = guard.write(armed_at.elapsed(), session.input_rev(), || {
             let pending = session.control_write(input);
             let written = match pending.ready() {
                 Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
@@ -2688,13 +2700,26 @@ async fn write_startup_input(
             };
             write = Some(pending);
             written
-        })?;
+        });
+        if paste && let Some(pending) = &write {
+            guard.record_paste(
+                !matches!(pending.ready(), Some(Err(error)) if !error.may_have_typed()),
+            );
+            if let Some(Err(error)) = pending.ready() {
+                guard.write_error(error.to_string());
+            }
+        }
+        written?;
         Ok::<_, crate::startup::Stop>((write, admitted_at))
     })??;
     let mut admitted_at = admitted_at;
     if let Some(write) = write.filter(crate::ControlWrite::is_queued) {
         if let Err(error) = write.finish().await {
             log::warn!("terminal startup automation: tmux input failed: {error}");
+            if paste {
+                guard.record_paste(error.may_have_typed());
+            }
+            guard.write_error(error.to_string());
             guard.fail(crate::startup::Stop::WriteFailed);
             return Err(crate::startup::Stop::WriteFailed);
         }
@@ -3016,7 +3041,8 @@ impl TerminalView {
             let armed_at = Instant::now();
             let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
             let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
-                .with_control_turn(Some(owner));
+                .with_control_turn(Some(owner))
+                .with_launch(session.id);
             // Only a task that is still waiting pays for reading the title
             // through tmux, and only until its startup settles either way.
             let probe = title_source.map(|source| {
@@ -3498,6 +3524,7 @@ impl TerminalView {
                     frame,
                     title_generation: before_title,
                     resize_revision,
+                    first_binding_title: std::cell::Cell::new(None),
                 })
         } else {
             None
@@ -3536,13 +3563,22 @@ impl TerminalView {
                 && snapshot.instance_id == self.instance_id
                 && snapshot.provider == self.title_provider
                 && snapshot.session.ptr_eq(&Arc::downgrade(&self.session))
-                && snapshot.binding_revision == self.session.binding_revision()
+                && self
+                    .session
+                    .prompt_binding_is_current(snapshot.binding_revision)
         };
         if !current() {
             return PromptSubmissionState::Interrupted;
         }
         let resize_revision = self.session.resize_revision();
         let (generation, title) = self.session.title_snapshot();
+        if snapshot.binding_revision == 0
+            && self.session.binding_revision() == 1
+            && let Some(proof) = &snapshot.origin
+            && proof.first_binding_title.get().is_none()
+        {
+            proof.first_binding_title.set(Some(generation));
+        }
         let screen = self.session.startup_screen();
         let prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
             self.session.recent_text(500)
@@ -3583,6 +3619,20 @@ impl TerminalView {
 
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// A complete live draft, never a clipped prefix or collapsed paste marker.
+    pub fn prompt_in_composer(&self, text: &str) -> bool {
+        let screen = self.session.startup_screen();
+        let title = self.session.title();
+        startup_draft_matches(self.title_provider, &screen, text)
+            && startup_ready(
+                self.title_provider,
+                &screen,
+                title.as_deref(),
+                &self.blocked_markers,
+                false,
+            )
     }
 
     /// Whether the child has drawn anything a person can see. Agent TUIs often
@@ -5035,7 +5085,45 @@ mod startup_readiness_tests {
             frame: empty.codex_ctl_origin().unwrap(),
             title_generation: 8,
             resize_revision: 0,
+            first_binding_title: std::cell::Cell::new(None),
         }
+    }
+
+    #[test]
+    fn first_attachment_can_adopt_only_one_title_generation_for_retry() {
+        let proof = ctl_origin_proof();
+        let screen = ctl_grid(&["task"], true);
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        let observe = |generation| {
+            prompt_submission_state(
+                &attempt,
+                &screen,
+                Some("scratch | Ready"),
+                generation,
+                None,
+                [&[], &[]],
+                Some(&proof),
+            )
+        };
+        assert_eq!(observe(9), PromptSubmissionState::Unconfirmed);
+        proof.first_binding_title.set(Some(9));
+        assert_eq!(
+            observe(9),
+            if cfg!(windows) {
+                PromptSubmissionState::Retryable
+            } else {
+                PromptSubmissionState::Unconfirmed
+            }
+        );
+        assert_eq!(observe(10), PromptSubmissionState::Unconfirmed);
     }
 
     #[test]

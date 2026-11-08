@@ -1055,7 +1055,7 @@ feature is added or changed, update the matching entry here in the same change**
   literal text keeps those words as prompt text. Unknown verbs suggest a nearby
   command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
-  ten seconds (three more after a retry) and report `submission_confirmed` and
+  sixty seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
   `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
   `retry_unanswered` when tmux didn't answer for the retry Enter); once
@@ -1068,10 +1068,29 @@ feature is added or changed, update the matching entry here in the same change**
   and input guards and an exact fully visible ASCII prose draft in its idle
   composer. A compact composer frame captured before paste and an added blank
   cursor line must prove that its first Enter was consumed, with no resize or
-  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  later title change. Learning the first provider thread does not cancel the
+  confirmation. Wrapped prose is supported; clipped, multiline, Unicode,
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
+- **Delivery outcomes and next commands** — `send` and `new --prompt` report
+  `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
+  `next` command when more action is needed. Existing receipt fields remain.
+  A complete pending draft calls for `keys enter`, never another paste; clipped
+  or otherwise uncertain input calls for screen inspection. Agent IDs also
+  accept the `pane<ID>` spelling.
+- **Startup input waits for the provider** — `new --prompt` waits for a real
+  editable composer and provider acceptance. Known folder trust, update and
+  login menus stop delivery with `blocked_by` and a short `screen_excerpt`;
+  trust prompts are never answered automatically. `--no-wait` returns
+  `prompt_pending` and a polling command. Status exposes the same delivery facts.
+  Codex launches carrying a startup task suppress its startup update menu.
+- **Windows Codex multiline control** — configured Codex launches disable
+  heuristic paste bursts so controller Enter submits the task. With
+  Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
+  blank lines and Unicode; CRLF becomes one newline. Other control characters in
+  controller text are refused before typing; an unverified multiline protocol
+  reports `unsupported_input`.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

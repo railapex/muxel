@@ -1288,6 +1288,7 @@ pub struct TerminalSession {
     local_paste: Mutex<Option<crate::LocalPasteHandler>>,
     path_paste_error: Mutex<Option<crate::PathPasteErrorHandler>>,
     paste_shell: PasteShell,
+    control_paste: crate::control_paste::ControlPaste,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -1549,6 +1550,17 @@ impl TerminalSession {
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
         let program = spec.program_for_spawn()?;
+        let control_paste = crate::control_paste::ControlPaste::for_launch(
+            &spec.program,
+            &spec.args,
+            cfg!(windows),
+        );
+        let control_paste =
+            if control_paste == crate::control_paste::ControlPaste::WindowsCodexUnverified {
+                control_paste.with_version(&codex_control_version(&program).unwrap_or_default())
+            } else {
+                control_paste
+            };
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1824,6 +1836,7 @@ impl TerminalSession {
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
             paste_shell: spec.paste_shell,
+            control_paste,
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
@@ -2298,7 +2311,13 @@ impl TerminalSession {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
             let written = match &input {
-                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Paste(text) => match self.control_paste.encode(text) {
+                    Ok(Some(encoded)) => self.try_write_input(encoded.as_bytes()),
+                    Ok(None) => self.try_paste(text),
+                    Err(why) => {
+                        return ControlWrite::done(Err(ControlWriteError::InvalidInput(why)));
+                    }
+                },
                 ControlInput::Keys { keys, app_cursor } => self.try_write_input(
                     &keys
                         .iter()
@@ -2524,6 +2543,9 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        if let Some(encoded) = self.control_paste.clipboard(text) {
+            return self.try_write_input(encoded.as_bytes());
+        }
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
@@ -3098,6 +3120,11 @@ impl TerminalSession {
         self.evidence.lock().binding_rev()
     }
 
+    /// Whether confirmation still observes the conversation that received its paste.
+    pub fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        self.evidence.lock().prompt_binding_is_current(captured)
+    }
+
     /// The embedder owns vte's synchronized-update timeout. The view uses this
     /// deadline to revisit a title/report held by a BSU without more PTY bytes.
     pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
@@ -3395,6 +3422,48 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+#[cfg(windows)]
+fn codex_control_version(program: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let program = literal_program_for_spawn(program).ok()?;
+    let mut child = Command::new(program)
+        .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut output = String::new();
+    child
+        .stdout
+        .take()?
+        .take(4096)
+        .read_to_string(&mut output)
+        .ok()?;
+    Some(output)
+}
+
+#[cfg(not(windows))]
+fn codex_control_version(_program: &str) -> Option<String> {
+    None
 }
 
 /// Resolve a literal launch without permitting a batch interpreter to reparse
