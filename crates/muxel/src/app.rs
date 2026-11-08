@@ -63,6 +63,7 @@ mod accomplishments_ui;
 mod claude_capture_tests;
 mod claude_launch;
 mod close_probes;
+mod codex_background;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
 #[cfg(all(test, windows))]
@@ -5825,6 +5826,8 @@ pub struct MuxelApp {
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
     codex_name_index: muxel_core::CodexSessionNames,
+    codex_subagents: HashMap<PathBuf, muxel_core::CodexSubagents>,
+    codex_subagents_in_flight: bool,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -8300,6 +8303,8 @@ impl MuxelApp {
             worktree_changes_stale: false,
             codex_session_names: HashMap::new(),
             codex_name_index: Default::default(),
+            codex_subagents: Default::default(),
+            codex_subagents_in_flight: false,
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -13379,6 +13384,7 @@ impl MuxelApp {
     /// and an antivirus scan). Remote project branches are handled separately by
     /// `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.refresh_codex_background(cx);
         // Keep the git-diff panel current while it's open, docked or as the
         // Changes view (covers edits and active-project switches; the calls
         // self-guard re-entrancy).

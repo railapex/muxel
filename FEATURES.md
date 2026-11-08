@@ -519,14 +519,18 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, and background work listed by Claude's footer
-  or Grok's panel holds a finished turn at **working**, labelled with what's running
-  (`working · 1 shell`). That covers tmux and SSH panes too, and it beats Claude's own
+  permission forms report **blocked**, and background work listed by Claude's footer,
+  Grok's panel, Codex's terminal badge or Muse's terminal tree holds a finished turn
+  at **working**, labelled with what's running
+  (`working · 1 shell`). The screen readers cover tmux and SSH panes too, and beat Claude's own
   finished report. A held turn doesn't alert or move in Recent, and it reads **done**
   once when the work ends and the agent has had a moment to wake for it. Shells and
   monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
   the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
-  finished turn. Subagents hold until they end. Closing a pane asks while anything is
+  finished turn. Subagents hold until they end. Local Codex panes also read child-turn
+  lifecycle records for subagents created during the current pane launch; their normal
+  composer has no live child count. Copied parent history and children left by an
+  earlier launch do not count. Closing a pane asks while anything is
   listed as running, and `ctl status` reports it as `background`. `ctl send` still
   delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
   keeps waiting through a hold, so it returns the agent's reply after the work, and

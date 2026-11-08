@@ -263,6 +263,7 @@ struct RuntimeStatusState {
     blocked_marker: bool,
     provider_screen: Option<AgentStatus>,
     provider_background: Option<BackgroundWork>,
+    codex_subagents: Option<(u64, bool)>,
     background_hold: BackgroundHold,
     background: Option<BackgroundWork>,
     prev_raw: Option<AgentStatus>,
@@ -313,6 +314,7 @@ impl RuntimeStatusState {
             blocked_marker: false,
             provider_screen: None,
             provider_background: None,
+            codex_subagents: None,
             background_hold: BackgroundHold::default(),
             background: None,
             prev_raw: None,
@@ -508,8 +510,13 @@ impl RuntimeStatusState {
         }
         let mut title = sticky_title_status(self.semantic_title_status, observed_title);
 
-        let needs_provider_screen_scan =
-            matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
+        let needs_provider_screen_scan = matches!(
+            title_provider,
+            TitleProvider::Claude
+                | TitleProvider::Grok
+                | TitleProvider::Codex
+                | TitleProvider::Muse
+        );
         let content_generation = session.content_generation();
         let has_visible_sources = !working_markers.is_empty()
             || !blocked_markers.is_empty()
@@ -576,10 +583,16 @@ impl RuntimeStatusState {
         // once it has reported, so waiting on that would pin it busy for the shell's whole
         // life. The screen hold still keeps it from alerting, and work that ends under it
         // gets no wake grace: this conversation has run no turn.
+        let mut background = self.provider_background;
+        if title_provider == TitleProvider::Codex
+            && self.codex_subagents == Some((binding_rev, true))
+        {
+            background.get_or_insert_default().subagents = true;
+        }
         let ended_before_a_turn =
-            self.provider_background.is_none() && self.screen_held && program_root.is_none();
+            background.is_none() && self.screen_held && program_root.is_none();
         let (background_holds, background_deadline) = self.background_hold.observe(
-            self.provider_background,
+            background,
             exited || !turn_over || ended_before_a_turn,
             now,
         );
@@ -587,8 +600,7 @@ impl RuntimeStatusState {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
         // Only an expired hold stops listed work reading as Working.
-        let background_reads_working =
-            background_holds || (self.provider_background.is_some() && !turn_over);
+        let background_reads_working = background_holds || (background.is_some() && !turn_over);
         let provider_screen = self
             .provider_screen
             .or(background_reads_working.then_some(AgentStatus::Working));
@@ -883,7 +895,7 @@ impl RuntimeStatusState {
         } else {
             self.fallback_coverage
         };
-        let background = self.provider_background.filter(|_| !exited);
+        let background = background.filter(|_| !exited);
         let public_changed = status != self.status
             || background != self.background
             || reason != self.reason
@@ -1251,6 +1263,8 @@ fn provider_screen_read(
             is_grok_question(screen).then_some(AgentStatus::Blocked),
             grok_background(screen),
         ),
+        TitleProvider::Codex => (None, codex_background(screen)),
+        TitleProvider::Muse => (None, muse_background(screen)),
         _ => (None, None),
     }
 }
@@ -1265,6 +1279,79 @@ const BACKGROUND_HOLD: Duration = Duration::from_secs(30 * 60);
 /// When background work ends the agent wakes for it, moments later. Done in that
 /// gap would alert and float the pane just before it starts working again.
 const BACKGROUND_WAKE_GRACE: Duration = Duration::from_secs(5);
+
+/// Codex's live badge is directly above the composer. `/ps` output and
+/// transcript prose are history, including its "No background terminals" row.
+fn codex_background(screen: &str) -> Option<BackgroundWork> {
+    let rows: Vec<_> = screen.lines().collect();
+    let composer = rows
+        .iter()
+        .rposition(|row| row.trim_start().starts_with('›'))?;
+    let badge = rows[..composer]
+        .iter()
+        .rev()
+        .take(4)
+        .map(|row| row.trim())
+        .find(|row| !row.is_empty())?;
+    let summary = badge.strip_suffix(" · /ps to view · /stop to close")?;
+    let count = if let Some((working, count)) = summary.rsplit_once(" · ") {
+        if !working.starts_with("• Working (") {
+            return None;
+        }
+        count
+    } else {
+        summary
+    };
+    let words: Vec<_> = count.split_whitespace().collect();
+    let [number, "background", kind, "running"] = words.as_slice() else {
+        return None;
+    };
+    let shells = number.parse::<u32>().ok()?;
+    if (shells == 1 && *kind == "terminal") || (shells > 1 && *kind == "terminals") {
+        Some(BackgroundWork {
+            shells,
+            ..Default::default()
+        })
+    } else {
+        None
+    }
+}
+
+/// Muse's live terminal tree is below the lower composer rule. The historical
+/// Backgrounded/Finished messages above it do not describe current work.
+fn muse_background(screen: &str) -> Option<BackgroundWork> {
+    let rows: Vec<_> = screen.lines().map(str::trim).collect();
+    let rule = rows
+        .iter()
+        .rposition(|row| !row.is_empty() && row.chars().all(|ch| ch == '─'))?;
+    let mut footer = rows[rule + 1..].iter().filter(|row| !row.is_empty());
+    let header = footer.next()?;
+    if !header.ends_with(" · ↓ to select") {
+        return None;
+    }
+    let shells = footer
+        .take_while(|row| row.starts_with(['├', '└', '│']))
+        .filter(|row| {
+            let row = row.trim_start_matches(['├', '└', '│', '─', ' ']);
+            if !row.starts_with("◇ ") && !row.starts_with("◆ ") {
+                return false;
+            }
+            let mut columns = row
+                .rsplit("  ")
+                .map(str::trim)
+                .filter(|column| !column.is_empty());
+            match columns.next() {
+                Some("running") => true,
+                Some(_) => columns.next() == Some("running"),
+                None => false,
+            }
+        })
+        .count() as u32;
+    (shells > 0).then_some(BackgroundWork {
+        shells,
+        ..Default::default()
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BackgroundHold {
@@ -3978,6 +4065,32 @@ impl TerminalView {
 
     pub fn runtime_snapshot(&self) -> TerminalRuntimeSnapshot {
         self.runtime.snapshot(&self.session)
+    }
+
+    pub fn launched_at(&self) -> SystemTime {
+        self.session.launched_at()
+    }
+
+    /// Install a worker's child-turn observation only in the launch and binding
+    /// it read. A delayed result cannot make a replacement conversation busy.
+    pub fn set_codex_subagents(
+        &mut self,
+        launch: Uuid,
+        binding: u64,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title_provider != TitleProvider::Codex
+            || self.session.id != launch
+            || self.session.binding_revision() != binding
+        {
+            return;
+        }
+        let observed = Some((binding, running));
+        if self.runtime.codex_subagents != observed {
+            self.runtime.codex_subagents = observed;
+            self.refresh_runtime(cx);
+        }
     }
 
     /// Fresh completion edges observed in this PTY launch. Cached reads do
@@ -7122,6 +7235,13 @@ mod provider_switch_tests {
     use std::time::{Duration, Instant, SystemTime};
 
     fn fixture() -> (Arc<TerminalSession>, crate::session::PtyReceiver) {
+        fixture_with_size(80, 24)
+    }
+
+    fn fixture_with_size(
+        cols: u16,
+        rows: u16,
+    ) -> (Arc<TerminalSession>, crate::session::PtyReceiver) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -7129,7 +7249,7 @@ mod provider_switch_tests {
         );
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+        TerminalSession::spawn(spec, cols, rows).expect("spawn fixture")
     }
 
     mod program_name_tests {
@@ -9025,6 +9145,274 @@ mod provider_switch_tests {
             let past = sample(ended + BACKGROUND_HOLD, "✳ Left it running");
             assert_eq!(past.status, AgentStatus::Done);
             assert!(past.background.is_some());
+            session.kill();
+        }
+
+        fn background_fixture(provider: &str, state: &str) -> String {
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-background-screens.json"))
+                    .unwrap();
+            data[provider][state].as_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn codex_background_screen_fixtures() {
+            use muxel_core::control::BackgroundWork;
+            for (state, shells) in [
+                ("one", 1),
+                ("two", 2),
+                ("stopped", 0),
+                ("subagent", 0),
+                ("none", 0),
+            ] {
+                assert_eq!(
+                    crate::view::provider_screen_read(
+                        TitleProvider::Codex,
+                        &background_fixture("codex", state)
+                    ),
+                    (
+                        None,
+                        (shells > 0).then_some(BackgroundWork {
+                            shells,
+                            ..Default::default()
+                        })
+                    ),
+                    "{state}"
+                );
+            }
+            for screen in ["", "• No background terminals running."] {
+                assert_eq!(
+                    crate::view::provider_screen_read(TitleProvider::Codex, screen),
+                    (None, None)
+                );
+            }
+            let one = background_fixture("codex", "one");
+            let badge = "1 background terminal running · /ps to view · /stop to close";
+            let working = one.replace(
+                badge,
+                &format!("• Working (8s • esc to interrupt) · {badge}"),
+            );
+            assert_eq!(
+                crate::view::provider_screen_read(TitleProvider::Codex, &working)
+                    .1
+                    .unwrap()
+                    .shells,
+                1
+            );
+            for screen in [
+                one.replace(badge, "No background terminals running."),
+                one.replace(badge, &format!("• The footer read: {badge}")),
+                one.replace(badge, &format!("{badge}\n\n• Finished earlier.")),
+            ] {
+                assert_eq!(
+                    crate::view::provider_screen_read(TitleProvider::Codex, &screen).1,
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn muse_background_screen_fixtures() {
+            use muxel_core::control::BackgroundWork;
+            assert_eq!(
+                crate::view::provider_screen_read(
+                    TitleProvider::Muse,
+                    &background_fixture("muse", "running")
+                ),
+                (
+                    None,
+                    Some(BackgroundWork {
+                        shells: 1,
+                        ..Default::default()
+                    })
+                )
+            );
+            for screen in ["".to_string(), background_fixture("muse", "ended")] {
+                assert_eq!(
+                    crate::view::provider_screen_read(TitleProvider::Muse, &screen),
+                    (None, None)
+                );
+            }
+            let running = background_fixture("muse", "running");
+            let other_spinner = running.replace("└ ◇", "└ ◆");
+            assert_eq!(
+                crate::view::provider_screen_read(TitleProvider::Muse, &other_spinner)
+                    .1
+                    .unwrap()
+                    .shells,
+                1
+            );
+            for screen in [
+                running.replace("  running ", "  completed "),
+                background_fixture("muse", "ended").replace(
+                    "◆ STARTED",
+                    "◆ STARTED\n\nmain · ↓ to select\n└ ◇ Earlier task  running  13s",
+                ),
+            ] {
+                assert_eq!(
+                    crate::view::provider_screen_read(TitleProvider::Muse, &screen).1,
+                    None
+                );
+            }
+        }
+
+        fn background_fixture_holds_a_finished_turn(provider: TitleProvider, fixture_name: &str) {
+            use crate::view::{BACKGROUND_WAKE_GRACE, TerminalStatusReason};
+            use std::time::Duration;
+            let (session, _receiver) = super::fixture_with_size(160, 40);
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.muse_cwd_label = Some("project".into());
+            let start = Instant::now();
+            let title = match provider {
+                TitleProvider::Codex => "Capture | Ready",
+                TitleProvider::Muse => "project",
+                _ => unreachable!(),
+            };
+            let running = background_fixture(
+                fixture_name,
+                if fixture_name == "codex" {
+                    "one"
+                } else {
+                    "running"
+                },
+            );
+            let ended = background_fixture(
+                fixture_name,
+                if fixture_name == "codex" {
+                    "stopped"
+                } else {
+                    "ended"
+                },
+            );
+            draw(&session, Some(title), &running);
+            session.test_program_status(b"\x1b]7501;state=working\x07");
+            runtime.reconcile(&session, provider, &[], &[], false, start);
+            session.test_program_status(b"\x1b]7501;state=done\x07");
+            let ended_at = start + Duration::from_secs(1);
+            runtime.reconcile(&session, provider, &[], &[], false, ended_at);
+            let held = runtime.snapshot(&session);
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            assert_eq!(held.background.unwrap().shells, 1);
+            assert_eq!(held.completion_revision, 0);
+
+            draw(&session, Some(title), &ended);
+            let cleared_at = start + Duration::from_secs(2);
+            runtime.reconcile(&session, provider, &[], &[], false, cleared_at);
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            assert_eq!(runtime.snapshot(&session).background, None);
+            runtime.reconcile(
+                &session,
+                provider,
+                &[],
+                &[],
+                false,
+                cleared_at + BACKGROUND_WAKE_GRACE,
+            );
+            let finished = runtime.snapshot(&session);
+            assert_eq!(finished.status, AgentStatus::Done);
+            assert_eq!(finished.background, None);
+            session.kill();
+        }
+
+        #[test]
+        fn codex_background_fixture_holds_a_finished_turn() {
+            background_fixture_holds_a_finished_turn(TitleProvider::Codex, "codex");
+        }
+
+        #[test]
+        fn muse_background_fixture_holds_a_finished_turn() {
+            background_fixture_holds_a_finished_turn(TitleProvider::Muse, "muse");
+        }
+
+        #[test]
+        fn muse_background_fixture_outlasts_its_done_hook() {
+            use crate::view::BACKGROUND_WAKE_GRACE;
+            use muxel_core::muse::MuseState;
+            use std::time::Duration;
+            let (session, _receiver) = super::fixture_with_size(160, 40);
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.muse_cwd_label = Some("project".into());
+            runtime.muse_hook_state = Some(MuseState::Done);
+            let start = Instant::now();
+            draw(
+                &session,
+                Some("project"),
+                &background_fixture("muse", "running"),
+            );
+            runtime.reconcile(&session, TitleProvider::Muse, &[], &[], false, start);
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            assert_eq!(runtime.snapshot(&session).background.unwrap().shells, 1);
+            draw(
+                &session,
+                Some("project"),
+                &background_fixture("muse", "ended"),
+            );
+            let cleared = start + Duration::from_secs(1);
+            runtime.reconcile(&session, TitleProvider::Muse, &[], &[], false, cleared);
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            assert_eq!(runtime.snapshot(&session).background, None);
+            session.kill();
+        }
+
+        #[test]
+        fn codex_child_background_holds_past_the_shell_limit_and_stays_in_its_binding() {
+            use crate::view::{BACKGROUND_HOLD, BACKGROUND_WAKE_GRACE};
+            use std::time::Duration;
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let binding = session.binding_revision();
+            runtime.codex_subagents = Some((binding, true));
+            draw(
+                &session,
+                Some("Capture | Ready"),
+                "› Ask Codex to do anything",
+            );
+            session.test_program_status(b"\x1b]7501;state=done\x07");
+            let start = Instant::now();
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, start);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                start + BACKGROUND_HOLD,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            assert!(runtime.snapshot(&session).background.unwrap().subagents);
+            let ended = start + BACKGROUND_HOLD + Duration::from_secs(1);
+            runtime.codex_subagents = Some((binding, false));
+            runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, ended);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                ended + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            assert_eq!(runtime.snapshot(&session).background, None);
+            runtime.codex_subagents = Some((binding.wrapping_add(1), true));
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                ended + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).background, None);
             session.kill();
         }
 

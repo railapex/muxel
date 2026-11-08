@@ -459,9 +459,24 @@ clears by itself. Its `← 4 agents` is on every footer and is not a running cou
 a finished turn's `1 shell still running` row stays on screen after the shell ends, so
 an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
 the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
-is a scheduled wake, not running work. Codex's report already stays Working while a
-background terminal runs. Its parent reads finished while a spawned agent runs, and
-nothing on its terminal says so.
+is a scheduled wake, not running work. Codex 0.167.0's terminal badge sits directly
+above the composer and includes `/ps` and `/stop` hints. Its report already stays
+Working while a background terminal runs; the screen adds the listed shell count.
+Muse 1.4.14 lists running terminals in the tree below the lower composer rule.
+Its earlier `Backgrounded` message remains after a task ends and is not live work.
+
+Codex's parent can finish while a spawned agent runs. Its `Started`, `/subagents`
+and `Completed` output is history, so local panes use child rollout records instead.
+A shared worker discovers new dated files through filesystem notifications,
+uses directory stamps as a backstop, caches their `parent_thread_id`, and
+reads matching children forward in bounded chunks. `subagent_history_start_ordinal`
+excludes copied parent events; a matching `task_complete` or `turn_aborted` ends
+the child's own `task_started` turn. Incomplete records wait for their newline.
+Results are guarded by parent session, launch and binding. Only children created
+and turns started during that pane launch count, so a restarted pane does not
+inherit abandoned work. A historical child thread resumed after a restart may
+be unobserved; remote child files are not read. File and record format changes can disable
+this source; terminal footer layout changes can disable the screen sources.
 
 A held turn takes no completion: the report that started the hold would otherwise stamp
 the pane as finished. The release is its own status change. A switch reads the same way:
