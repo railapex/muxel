@@ -193,7 +193,11 @@ impl MuxelApp {
 
     /// [`Self::close_facts`] for the last check before a close kills the pane:
     /// a Windows shell's children come from a process table walked now, not
-    /// the snapshot another pane's close may have just taken.
+    /// the snapshot another pane's close may have just taken. Its prompt
+    /// evidence is only the last mark the shell printed, read again: nothing
+    /// asks PowerShell to check itself a second time, so work inside
+    /// PowerShell shows here only through a mark printed since (a command
+    /// start, a busy prompt).
     fn close_facts_at_expiry(&self, iid: Uuid, cx: &App) -> CloseFacts {
         self.close_facts_walking(iid, true, cx)
     }

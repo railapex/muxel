@@ -5427,6 +5427,21 @@ mod windows_shell_idle_tests {
             self.until("idle prompt", Self::proves_idle);
         }
 
+        /// Never idle at any millisecond until `marker` shows.
+        fn busy_until(&self, marker: &str) {
+            let deadline = Instant::now() + PATIENCE;
+            while !self.session.visible_text().contains(marker) {
+                self.pump();
+                assert!(
+                    !self.proves_idle(),
+                    "idle before {marker}: {:?}",
+                    self.session.visible_text()
+                );
+                assert!(Instant::now() < deadline, "no {marker}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         /// Never idle at any check for a second.
         fn stays_busy(&self, why: &str) {
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -5712,15 +5727,92 @@ mod windows_shell_idle_tests {
         shell.type_text(&format!("{}; 'FIRST' + 'DONE'\r", first.wait()));
         std::thread::sleep(Duration::from_millis(500));
         // Sent with Enter while the first runs. PowerShell reads it straight
-        // after the first's prompt, which must not read idle; nor may the
-        // pane while it runs.
-        shell.type_text(&format!("{}; 'SECOND' + 'DONE'\r", second.wait()));
+        // after the first's prompt, which must not read idle, even for the
+        // moment before the line editor returns it; nor may the pane while it
+        // runs.
+        shell.type_text(&format!(
+            "'SECOND' + 'STARTED'; {}; 'SECOND' + 'DONE'\r",
+            second.wait()
+        ));
         first.release();
-        shell.shows("FIRSTDONE");
+        shell.busy_until("SECONDSTARTED");
         shell.stays_busy("the command typed ahead");
         second.release();
         shell.shows("SECONDDONE");
         shell.becomes_idle();
+    }
+
+    #[test]
+    fn each_command_of_a_multiline_paste_is_not_idle_while_it_runs() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            // PSReadLine reads a paste ahead into its own buffer, so the
+            // console's input is empty at the prompt the first command ends
+            // with, and the second runs from what PSReadLine holds.
+            let hold = Hold::new("pasted");
+            shell.session.paste(&format!(
+                "'FIRST' + 'PASTED'\n'SECOND' + 'STARTED'; {}; 'SECOND' + 'DONE'\n",
+                hold.wait()
+            ));
+            shell.shows("SECONDSTARTED");
+            shell.stays_busy("the paste's second command");
+            hold.release();
+            shell.shows("SECONDDONE");
+            shell.becomes_idle();
+        }
+    }
+
+    /// Enter as Starship's and oh-my-posh's transient prompts bind it: draw
+    /// the prompt again, which prints a fresh idle mark, then accept the line.
+    const TRANSIENT_ENTER: &str = "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt(); [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }";
+
+    /// A command sent with [`TRANSIENT_ENTER`] stays busy until it ends.
+    fn runs_busy_after_a_redraw(shell: &Shell, tag: &str) {
+        let hold = Hold::new(&tag.to_ascii_lowercase());
+        shell.type_text(&format!(
+            "'{tag}' + 'STARTED'; {}; '{tag}' + 'DONE'\r",
+            hold.wait()
+        ));
+        shell.shows(&format!("{tag}STARTED"));
+        shell.stays_busy(&format!("{tag}: a command accepted after the redraw"));
+        hold.release();
+        shell.shows(&format!("{tag}DONE"));
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_command_is_not_idle_after_a_transient_prompt_redraw() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.run(TRANSIENT_ENTER, "BOUND");
+            shell.becomes_idle();
+            runs_busy_after_a_redraw(&shell, "TRANSIENT");
+        }
+    }
+
+    #[test]
+    fn a_line_editor_replaced_or_hooked_after_launch_still_marks_each_line() {
+        let shell = Shell::start(powershell());
+        shell.run(TRANSIENT_ENTER, "BOUND");
+        // A line editor of its own, as a module loaded later might define.
+        shell.run(
+            "function global:PSConsoleHostReadLine { $global:reads++; [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($host.Runspace, $ExecutionContext) }",
+            "REPLACED",
+        );
+        shell.becomes_idle();
+        runs_busy_after_a_redraw(&shell, "REPLACEMENT");
+        // A hook that chains whatever is current, which is muxel's wrap.
+        shell.run(
+            "$global:prev = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:hooks++; & $global:prev }",
+            "HOOKED",
+        );
+        shell.becomes_idle();
+        runs_busy_after_a_redraw(&shell, "CHAINED");
+        // Each line went through the hook and the line editor once.
+        shell.run("$global:hooks = 0; $global:reads = 0", "RESET");
+        shell.type_text("'COUNTS=' + \"$global:hooks,$global:reads.\"\r");
+        shell.shows("COUNTS=1,1.");
     }
 
     #[test]

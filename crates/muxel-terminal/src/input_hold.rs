@@ -275,11 +275,15 @@ mod tests {
             marks.advance(plain, &prompt);
             assert!(prompt.idle_prompt(), "{plain:?}");
         }
-        let prompt = ShellPrompt::default();
-        let mut marks = ShellMarks::default();
-        marks.advance(IDLE, &prompt);
-        marks.advance(b"\x1b]133;C\x07", &prompt);
-        assert!(!prompt.idle_prompt(), "a command started");
+        // A command start, as a prompt module prints it and as muxel's line
+        // editor wrap does, ends the prompt.
+        for start in [b"\x1b]133;C\x07".as_slice(), b"\x1b]133;C\x1b\\"] {
+            let prompt = ShellPrompt::default();
+            let mut marks = ShellMarks::default();
+            marks.advance(IDLE, &prompt);
+            marks.advance(start, &prompt);
+            assert!(!prompt.idle_prompt(), "a command started: {start:?}");
+        }
     }
 
     #[test]
