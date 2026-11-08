@@ -1,12 +1,12 @@
 //! Sidebar ordering and unread decisions over persisted activity, without UI or I/O.
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Days, NaiveDate, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentActivity, AgentActivityState, Instance, Workspace};
+use crate::{AgentActivity, AgentActivityState, Instance, Project, Workspace};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarSort {
@@ -201,9 +201,37 @@ pub fn notification_in_feed(sort: SidebarSort, agent_event: bool) -> bool {
     sort == SidebarSort::Layout || !agent_event
 }
 
-/// The caller supplies this project's visible pane ids, including live popouts
-/// in recent mode. Layout preserves existing worktree groups. Recent work is flat,
-/// so worktree membership cannot hold older sessions above newer work.
+/// The rows `project` lists in the sidebar, in the order [`sidebar_order`]
+/// breaks ties by. Layout lists the layout's panes in layout order. Recent
+/// work adds the project's live popped-out panes (`popped`), which have left
+/// the layout, and lists every row in the order its pane was opened (the
+/// workspace's order), so popping a row out or docking it back never changes
+/// how it ties with its neighbours.
+pub fn sidebar_rows(
+    project: &Project,
+    workspace: &Workspace,
+    popped: &dyn Fn(Uuid) -> bool,
+    sort: SidebarSort,
+) -> Vec<Uuid> {
+    let docked = project.instances();
+    if sort == SidebarSort::Layout {
+        return docked;
+    }
+    let mut unlisted: HashSet<Uuid> = docked.iter().copied().collect();
+    let mut rows: Vec<Uuid> = workspace
+        .instances
+        .iter()
+        .filter(|i| unlisted.remove(&i.id) || (i.project_id == project.id && popped(i.id)))
+        .map(|i| i.id)
+        .collect();
+    // A pane the layout holds without an instance still gets its row.
+    rows.extend(docked.into_iter().filter(|id| unlisted.contains(id)));
+    rows
+}
+
+/// The caller supplies this project's rows ([`sidebar_rows`]). Layout
+/// preserves existing worktree groups. Recent work is flat, so worktree
+/// membership cannot hold older sessions above newer work.
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
 /// state each row shows (`shown`). Nothing about reading or focus is an input.
@@ -332,22 +360,28 @@ mod tests {
         workspace.instance_mut(id).unwrap().activity.attend(at);
     }
 
-    /// Recent work as each row's `shown` state and `clock` give it.
+    /// Recent work as each row's `shown` state and `clock` give it, over the
+    /// rows the sidebar lists for `project`.
     fn order_at(
         project: &Project,
         workspace: &Workspace,
         shown: &dyn Fn(&Instance) -> Option<AgentActivityState>,
         clock: BandClock,
     ) -> Vec<SidebarEntry> {
+        let rows = sidebar_rows(project, workspace, &|_| false, SidebarSort::RecentWork);
+        order_rows(&rows, workspace, shown, clock)
+    }
+
+    /// Recent work over `rows`.
+    fn order_rows(
+        rows: &[Uuid],
+        workspace: &Workspace,
+        shown: &dyn Fn(&Instance) -> Option<AgentActivityState>,
+        clock: BandClock,
+    ) -> Vec<SidebarEntry> {
         let index = instances_by_id(workspace);
         let shown = |id: Uuid| index.get(&id).and_then(|i| shown(i));
-        sidebar_order(
-            &project.instances(),
-            &index,
-            &shown,
-            clock,
-            SidebarSort::RecentWork,
-        )
+        sidebar_order(rows, &index, &shown, clock, SidebarSort::RecentWork)
     }
 
     /// Every row shows the state it was saved in, as when each has a live terminal.
@@ -1062,9 +1096,44 @@ mod tests {
     }
 
     #[test]
-    fn future_work_clamps_to_now_and_ties_keep_layout_order() {
+    fn future_work_clamps_to_now_and_ties_keep_opening_order() {
         let (project, workspace, ids) =
             fixture(vec![worked(NOW), worked(NOW + DAY), worked(NOW - 1)]);
         assert_eq!(pane_order(&project, &workspace), ids);
+    }
+
+    #[test]
+    fn popping_a_tied_row_out_or_docking_it_back_never_moves_it() {
+        // Panes saved before muxel recorded open times all tie.
+        let (mut project, workspace, ids) = fixture(vec![AgentActivity::default(); 3]);
+        let first = ids[0];
+        let recent_with = |project: &Project, popped: Option<Uuid>| {
+            let rows = sidebar_rows(
+                project,
+                &workspace,
+                &|id| Some(id) == popped,
+                SidebarSort::RecentWork,
+            );
+            panes(order_rows(&rows, &workspace, &live, clock()))
+        };
+        assert_eq!(recent_with(&project, None), ids);
+        // Popped out, the first pane leaves the layout but keeps its place.
+        let Some(PaneNode::Leaf(leaf)) = &mut project.layout else {
+            unreachable!()
+        };
+        leaf.tabs.retain(|&id| id != first);
+        leaf.active = 0;
+        assert_eq!(recent_with(&project, Some(first)), ids);
+        // Docked back at the end of its group, still.
+        let Some(PaneNode::Leaf(leaf)) = &mut project.layout else {
+            unreachable!()
+        };
+        leaf.tabs.push(first);
+        assert_eq!(recent_with(&project, None), ids);
+        // Layout follows the layout.
+        assert_eq!(
+            sidebar_rows(&project, &workspace, &|_| false, SidebarSort::Layout),
+            [ids[1], ids[2], first]
+        );
     }
 }

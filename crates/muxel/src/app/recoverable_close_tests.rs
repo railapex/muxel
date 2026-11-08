@@ -3278,3 +3278,134 @@ fn removing_a_project_leaves_the_files_of_an_answered_close() {
             .unwrap();
     });
 }
+
+/// A plain shell pane whose command prints a line and rings the bell, then
+/// waits: a finish its terminal shows (Done, from the bell) with no provider.
+fn bell_terminal(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+) -> (Uuid, Entity<TerminalView>, OwnedChild) {
+    window
+        .update(cx, |app, window, cx| {
+            let root = app.workspace.project(pid).unwrap().root_path.clone();
+            let filename = format!("bell-{}.cmd", Uuid::new_v4());
+            std::fs::write(root.join(&filename), "@echo finished\x07\r\n@more\r\n").unwrap();
+            // As `title_terminal`: a plain cwd and a `.\` local filename.
+            let directory = root.to_string_lossy();
+            let directory = directory
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&directory)
+                .to_string();
+            let args = vec![
+                "/d".into(),
+                "/q".into(),
+                "/c".into(),
+                format!(r".\{filename}"),
+            ];
+            let mut instance = Instance::shell(pid);
+            instance.program = Some("cmd.exe".into());
+            let iid = instance.id;
+            let launch = TerminalLaunch::spawn(
+                CommandSpec::program("cmd.exe", args).with_cwd(directory),
+                (80, 24),
+            )
+            .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            let child = OwnedChild::new(view.read(cx).session().clone());
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view, child)
+        })
+        .unwrap()
+}
+
+#[test]
+fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarEntry, SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (a, _, _a_child) = terminal(cx, window, pid);
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // A finished a minute ago, and it has been read.
+                let mut finished = AgentActivity::default();
+                finished.observe(None, AgentActivityState::Working, now - 90_000);
+                finished.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    now - 60_000,
+                );
+                finished.attend(now - 60_000);
+                app.workspace.instance_mut(a).unwrap().activity = finished;
+                // B started a turn two minutes ago, which the tick recorded.
+                // Its bell has rung since; no tick has read it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: 0,
+                        sampled_at: now - 120_000,
+                    },
+                );
+                let panes = |entries: &[SidebarEntry]| -> Vec<Uuid> {
+                    entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            SidebarEntry::Pane(iid) => Some(*iid),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // B's row already sits by its finish, newer than A's.
+                let before = app.sidebar_entries_now(pid, cx);
+                assert_eq!(panes(&before), [b, a]);
+
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.sidebar_entries_now(pid, cx),
+                    before,
+                    "the click moved a row"
+                );
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(activity), "the click read the finish");
+                let recorded = activity.completed_at;
+                assert!(recorded.is_some_and(|at| at > now - 120_000 && at <= now));
+
+                // Focusing it again records nothing new and moves nothing.
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.workspace.instance(b).unwrap().activity.completed_at,
+                    recorded
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), before);
+            })
+            .unwrap();
+    });
+}

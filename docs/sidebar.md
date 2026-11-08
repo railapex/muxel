@@ -13,15 +13,16 @@ The saved `config.toml` setting is `sidebar_sort = "Layout"` or
 Recent work follows two rules. Looking at a session never moves its row:
 reading, focusing and clicking change no position, and read state drives only
 the unread mark and the Done pill. A row moves only when its work changes (a
-turn starts or finishes, a question is asked or answered) or when the clock
-crosses into another band.
+turn starts, finishes or stops, including when its process exits; a question is
+asked or answered) or when the clock crosses into another band.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A row's band comes from its
 latest event of any kind, a start, a finish or a question
 (`AgentActivity::last_work_at`), so a row that stops working stays in the band
-its turn started in. A working row is Today however long its turn has run. A
-row that has never worked goes by when it was opened (`created_at` on its
+its turn started in. One exception: a working row is Today however long its
+turn has run, so a turn started yesterday and still running sits with today's
+work, not in the band of its start. A row that has never worked goes by when it was opened (`created_at` on its
 instance); a pane saved before muxel recorded that sits with Older. The sidebar
 redraws at midnight, when rows change band. A block spanning only one band
 needs no band label. Within each band, `sidebar::RecentPlace` puts rows in four
@@ -42,20 +43,33 @@ rule, without band labels.
 Groups go by the status the row shows. A session with no live terminal (in a
 project not opened since a restart, say) shows idle, or Done if its last turn
 finished, and sorts with the recent rows by its latest event. Timestamps are
-Unix milliseconds; future ones count as now. Ties keep layout order.
+Unix milliseconds; future ones count as now. Ties keep the order the panes were
+opened in, so popping a row out into its own window or docking it back never
+moves it.
 
 An event is stamped when it happened, not when muxel noticed it. The terminal
-records when its status changed, and the app records that time even when it
-reads the status late: a pane held for Undo, or a finish the status tick hadn't
-recorded when you clicked the row. Three things are not work and never move a
-row: a process exiting (the row keeps the state it had, so a turn cut short
-reads as idle and nothing is marked unread), a relaunched agent reporting
-Working before any turn is submitted, and startup output while a restored
-terminal settles. Row ages and `muxel ctl` use `last_work_at` too.
+reads the wall clock as each event happens (its status changing, its provider
+reporting a completion, its provider switching conversations) and keeps that
+time, so a later clock correction moves nothing, and a second turn that ends at
+the same Done badge gets its own time. The app records those times however late
+it reads them, as for a pane held for Undo. A row sits where the work its
+terminal shows puts it before the status tick has recorded that work, and
+focusing the pane records exactly that, so clicking a row that has just
+finished moves nothing.
+
+Some states are not work. A process exiting records no finish, marks nothing
+unread and doesn't notify: a working row stops and joins the recent rows by
+when its turn started, so a turn cut short reads as idle. A provider that
+reported its own finish before exiting is finished all the same, and notifies.
+A relaunched agent reporting Working before any turn is submitted, and startup
+output while a restored terminal settles, record nothing. Row ages and
+`muxel ctl` use `last_work_at` too.
 
 Read state stays on each machine, as the rest of a pane's activity does. Since
-reading never moves a row, two machines that saw the same work order it the
-same way; only their unread marks differ.
+reading never moves a row, two machines that saw the same work and keep the
+same calendar order it the same way; only their unread marks differ. Machines
+in different time zones can put one event in different bands, and so order
+rows differently.
 
 Recent work is flat within the project so a worktree cannot hold an older
 session above newer work. Worktree color dots remain; detached worktrees retain
