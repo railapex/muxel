@@ -1,31 +1,66 @@
-//! The OSC 133 prompt marks muxel adds to the local Windows shells it starts.
+//! The OSC 133 prompt marks muxel adds to the local PowerShell it starts.
 //!
-//! Windows has no foreground process group, and cmd and PowerShell run batch
-//! files, cmdlets and scripts in their own process, so a pane can only tell its
-//! shell sits at a prompt if the shell says so. muxel asks cmd and PowerShell to
-//! print `ESC ] 133 ; A` before their prompt and `ESC ] 133 ; B` after it, the
-//! marks VS Code and Windows Terminal use for shell integration. Each wraps the
-//! user's own prompt, so what they see is unchanged. When a launch can't be
-//! marked this way, nothing is added and the pane's close asks, as before.
+//! Windows has no foreground process group, and PowerShell runs cmdlets,
+//! scripts, thread jobs and event actions in its own process, so a pane can only
+//! tell its shell sits idle at a prompt if the shell says so. muxel wraps
+//! PowerShell's prompt function so it prints `ESC ] 133 ; A` before the user's
+//! own prompt and `ESC ] 133 ; B` after it, the marks Windows Terminal uses for
+//! shell integration. That `B` is [`BUSY_MARK`] unless the shell found nothing
+//! running inside itself. What the user sees is unchanged. cmd isn't marked: an
+//! echoing batch file prints cmd's `PROMPT` while it runs, so a mark there
+//! can't tell a prompt from a running batch. An unmarked cmd or PowerShell
+//! prints no marks, so its pane's close asks.
 
-/// What to add to a launch so its shell marks every prompt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PromptMarks {
-    /// cmd reads its prompt from `PROMPT`: set it to this.
-    CmdPrompt(String),
-    /// Append these to PowerShell's arguments.
-    PowerShellArgs(Vec<String>),
+macro_rules! busy_option {
+    () => {
+        "muxel=busy"
+    };
 }
+
+/// The OSC payload of the wrapper's closing mark when the shell found work
+/// running inside itself, or couldn't check. The wrapper's mark is the
+/// prompt's last, so it decides over any marks the user's own prompt prints.
+pub const BUSY_MARK: &str = concat!("133;B;", busy_option!());
 
 /// The prompt wrapper PowerShell runs after its profiles. It reads `$?` first
 /// and hands the original prompt the same value, so a prompt that shows the
-/// last command's status (oh-my-posh, starship) still sees it.
+/// last command's status (oh-my-posh, starship) still sees it. After the
+/// original prompt has run, it checks for work that outlives the prompt inside
+/// PowerShell's own process, where no child process shows it, and for input
+/// the shell hasn't read:
+///
+/// - `$NestedPromptLevel`: a debugger stop or `$host.EnterNestedPrompt()`;
+/// - an unfinished job (`Get-Job`) of any type, including a module's own job
+///   types, which can run without a runspace;
+/// - any event subscriber (`Get-EventSubscriber -Force`);
+/// - a runspace beyond the shell's own (`Get-Runspace`);
+/// - a key waiting in the console's input buffer (`[Console]::KeyAvailable`).
+///
+/// The prompt runs before the line editor reads anything, so keys typed while
+/// the last command ran, a whole command sent with Enter included, are still
+/// waiting there. .NET's `KeyAvailable` skips key-up and lone modifier
+/// records; the host's `$Host.UI.RawUI.KeyAvailable` stays true at every
+/// prompt after a Ctrl+C, though the line editor has read every key. It's
+/// read last, as late as the prompt can.
+///
+/// Unless all are clear, the closing mark is [`BUSY_MARK`]; a check that
+/// throws leaves it busy. The wrapper costs about 0.15 ms per prompt on
+/// PowerShell 7 and 0.6 ms on Windows PowerShell 5.1.
 const POWERSHELL_WRAP: &str = concat!(
     "$global:__muxel_prompt = $function:prompt; ",
     "function global:prompt { ",
     "$ok = $global:?; $e = [char]27; ",
     "if (-not $ok) { Write-Error muxel -ErrorAction Ignore }; ",
-    "\"$e]133;A$e\\\" + (& $global:__muxel_prompt) + \"$e]133;B$e\\\" }",
+    "$text = & $global:__muxel_prompt; ",
+    "$busy = $true; ",
+    "try { $busy = -not ($NestedPromptLevel -eq 0 -and ",
+    "-not (Get-Job -ErrorAction Ignore | Where-Object { $_.State -notin 'Completed', 'Failed', 'Stopped' }) -and ",
+    "-not (Get-EventSubscriber -Force -ErrorAction Ignore) -and ",
+    "@(Get-Runspace -ErrorAction Ignore).Count -eq 1 -and ",
+    "-not [Console]::KeyAvailable) } catch { }; ",
+    "\"$e]133;A$e\\\" + $text + \"$e]133;B$(if ($busy) { ';",
+    busy_option!(),
+    "' })$e\\\" }",
 );
 
 /// PowerShell options that leave it an interactive session reading the
@@ -47,68 +82,48 @@ const POWERSHELL_SWITCHES: &[&str] = &[
 ];
 const POWERSHELL_EXECUTION_POLICY: &[&str] = &["-executionpolicy", "-ep", "-ex", "-exec"];
 
-/// The marks for launching `program` with `args`, or `None` when it isn't a
-/// shell muxel marks, or its arguments already run something else. `prompt` is
-/// the `PROMPT` the shell would otherwise get (its preset's, else muxel's own
-/// environment's); cmd's default is `$P$G`.
-pub fn for_launch(program: &str, args: &[String], prompt: Option<&str>) -> Option<PromptMarks> {
+/// The arguments to append so launching `program` with `args` marks every
+/// prompt, or `None` when it isn't PowerShell, or its arguments already run
+/// something else.
+pub fn for_launch(program: &str, args: &[String]) -> Option<Vec<String>> {
     let leaf = program
         .trim()
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match leaf.strip_suffix(".exe").unwrap_or(&leaf) {
-        "cmd" => {
-            let inner = prompt.filter(|prompt| !prompt.is_empty()).unwrap_or("$P$G");
-            Some(PromptMarks::CmdPrompt(format!(
-                "$e]133;A$e\\{inner}$e]133;B$e\\"
-            )))
-        }
-        "powershell" | "pwsh" => {
-            let mut rest = args.iter().map(|arg| arg.to_ascii_lowercase());
-            let mut no_exit = false;
-            while let Some(arg) = rest.next() {
-                if POWERSHELL_EXECUTION_POLICY.contains(&arg.as_str()) {
-                    rest.next()?;
-                } else if POWERSHELL_SWITCHES.contains(&arg.as_str()) {
-                    no_exit |= matches!(arg.as_str(), "-noexit" | "-noe");
-                } else {
-                    return None;
-                }
-            }
-            let mut add = Vec::new();
-            if !no_exit {
-                add.push("-NoExit".to_string());
-            }
-            add.push("-EncodedCommand".to_string());
-            add.push(crate::winshell::encoded_command(POWERSHELL_WRAP));
-            Some(PromptMarks::PowerShellArgs(add))
-        }
-        _ => None,
+    if !matches!(
+        leaf.strip_suffix(".exe").unwrap_or(&leaf),
+        "powershell" | "pwsh"
+    ) {
+        return None;
     }
+    let mut rest = args.iter().map(|arg| arg.to_ascii_lowercase());
+    let mut no_exit = false;
+    while let Some(arg) = rest.next() {
+        if POWERSHELL_EXECUTION_POLICY.contains(&arg.as_str()) {
+            rest.next()?;
+        } else if POWERSHELL_SWITCHES.contains(&arg.as_str()) {
+            no_exit |= matches!(arg.as_str(), "-noexit" | "-noe");
+        } else {
+            return None;
+        }
+    }
+    let mut add = Vec::new();
+    if !no_exit {
+        add.push("-NoExit".to_string());
+    }
+    add.push("-EncodedCommand".to_string());
+    add.push(crate::winshell::encoded_command(POWERSHELL_WRAP));
+    Some(add)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptMarks, for_launch};
+    use super::for_launch;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
-    }
-
-    #[test]
-    fn cmd_wraps_the_prompt_it_would_have_had() {
-        let marked = |prompt| match for_launch(r"C:\Windows\System32\CMD.EXE", &[], prompt) {
-            Some(PromptMarks::CmdPrompt(value)) => value,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(marked(None), "$e]133;A$e\\$P$G$e]133;B$e\\");
-        assert_eq!(marked(Some("")), "$e]133;A$e\\$P$G$e]133;B$e\\");
-        assert_eq!(
-            marked(Some("$T $P$_$G")),
-            "$e]133;A$e\\$T $P$_$G$e]133;B$e\\"
-        );
     }
 
     #[test]
@@ -124,17 +139,14 @@ mod tests {
                 args(&["-ExecutionPolicy", "Bypass", "-nop"]),
                 args(&["-Login"]),
             ] {
-                let Some(PromptMarks::PowerShellArgs(added)) = for_launch(program, &plain, None)
-                else {
+                let Some(added) = for_launch(program, &plain) else {
                     panic!("{program} {plain:?}");
                 };
                 assert_eq!(added[0], "-NoExit", "{program} {plain:?}");
                 assert_eq!(added[1], "-EncodedCommand");
             }
             // An -NoExit of its own isn't repeated.
-            let Some(PromptMarks::PowerShellArgs(added)) =
-                for_launch(program, &args(&["-NoExit"]), None)
-            else {
+            let Some(added) = for_launch(program, &args(&["-NoExit"])) else {
                 panic!("{program} -NoExit");
             };
             assert_eq!(added[0], "-EncodedCommand");
@@ -148,7 +160,7 @@ mod tests {
                 args(&["-ExecutionPolicy"]),
             ] {
                 assert_eq!(
-                    for_launch(program, &runs_something, None),
+                    for_launch(program, &runs_something),
                     None,
                     "{runs_something:?}"
                 );
@@ -159,6 +171,8 @@ mod tests {
     #[test]
     fn other_programs_are_not_marked() {
         for program in [
+            "cmd.exe",
+            r"C:\Windows\System32\CMD.EXE",
             "bash.exe",
             "ssh",
             "wsl.exe",
@@ -167,7 +181,7 @@ mod tests {
             "cmd-wrapper.exe",
             "",
         ] {
-            assert_eq!(for_launch(program, &[], None), None, "{program}");
+            assert_eq!(for_launch(program, &[]), None, "{program}");
         }
     }
 }

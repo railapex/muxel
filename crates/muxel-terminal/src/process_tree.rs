@@ -13,10 +13,11 @@ pub(crate) const RECENT: Duration = Duration::from_millis(250);
 /// Every process's parent pid, shared between the callers of one snapshot.
 pub type ParentMap = Arc<HashMap<u32, u32>>;
 
-/// [`process_parent_map`], reusing a snapshot taken in the last 250 ms. A
-/// process started after it isn't seen, so callers must tolerate a quarter-
-/// second-old answer: a pane close does, since its Undo countdown checks again
-/// at expiry with a fresh walk.
+/// [`process_parent_map`], reusing a snapshot any caller took in the last
+/// 250 ms. A process started after it isn't seen, so callers must tolerate a
+/// quarter-second-old answer: a pane close does when it starts, since its Undo
+/// countdown checks again at expiry with its own walk
+/// (`TerminalSession::is_idle_foreground_now`).
 pub fn recent_process_parent_map() -> ParentMap {
     static CACHE: Mutex<Option<(Instant, ParentMap)>> = Mutex::new(None);
     let mut cache = CACHE

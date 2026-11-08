@@ -36,19 +36,27 @@ pub fn shell_close_evidence(
     }
 }
 
-/// Windows prompt evidence. Windows has no foreground process group, and cmd
-/// and PowerShell run batch files, cmdlets and scripts in their own process, so
-/// neither a prompt nor an empty process tree proves idleness alone.
-/// ShellPrompt needs an OSC 133 prompt showing with nothing typed after it
-/// (muxel marks the local cmd and PowerShell it starts, [`crate::prompt_marks`])
-/// and no live child ([`shell_is_idle`]: `start /b` work behind the prompt).
+/// Windows prompt evidence. Windows has no foreground process group, and
+/// PowerShell runs cmdlets, scripts, thread jobs and event actions in its own
+/// process, so neither a prompt nor an empty process tree proves idleness
+/// alone. ShellPrompt needs both:
+///
+/// - `idle_prompt`: an OSC 133 prompt showing, not marked busy
+///   ([`crate::prompt_marks::BUSY_MARK`], which muxel's PowerShell wrapper
+///   prints when it finds work running inside the shell), with nothing typed
+///   since;
+/// - `no_child`: no live child of the shell ([`shell_is_idle`]), such as a
+///   process started in the background.
+///
 /// The child check walks the process table, so it runs only once the prompt
-/// holds. A shell that prints no marks never shows a prompt, so it asks.
+/// holds. A shell that prints no marks (cmd, PowerShell muxel didn't wrap)
+/// never shows a prompt, so it asks. One that prints its own marks keeps the
+/// trust OSC 133 alone had before, with both checks added.
 pub fn windows_shell_close_evidence(
-    at_empty_prompt: bool,
+    idle_prompt: bool,
     no_child: impl FnOnce() -> bool,
 ) -> CloseEvidence {
-    if at_empty_prompt && no_child() {
+    if idle_prompt && no_child() {
         CloseEvidence::ShellPrompt
     } else {
         CloseEvidence::Quiet

@@ -1561,34 +1561,17 @@ impl TerminalSession {
                 0,
             );
         }
-        // A local cmd or PowerShell prints OSC 133 marks around its prompt,
-        // which is how a Windows pane knows its shell is at the prompt. An exact
-        // argv the caller gave isn't touched.
+        // A local PowerShell prints OSC 133 marks around its prompt, saying
+        // whether it found work running inside itself, which is how a Windows
+        // pane knows its shell sits idle at the prompt. An exact argv the
+        // caller gave isn't touched.
         #[cfg(windows)]
-        let marks = if spec.literal_argv {
-            None
-        } else {
-            // The PROMPT cmd would get: the preset's (which a removal beats,
-            // as `apply_spec_env` applies them), else muxel's own.
-            let is_prompt = |key: &str| key.eq_ignore_ascii_case("PROMPT");
-            let prompt = if spec.env_remove.iter().any(|key| is_prompt(key)) {
-                None
-            } else {
-                spec.env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| is_prompt(key))
-                    .map(|(_, value)| value.clone())
-                    .or_else(|| std::env::var("PROMPT").ok())
-            };
-            muxel_core::prompt_marks::for_launch(&program, &spec.args, prompt.as_deref())
-        };
-        #[cfg(windows)]
-        let args: std::borrow::Cow<'_, [String]> = match &marks {
-            Some(muxel_core::prompt_marks::PromptMarks::PowerShellArgs(added)) => {
-                [spec.args.as_slice(), added.as_slice()].concat().into()
-            }
-            _ => spec.args.as_slice().into(),
+        let args: std::borrow::Cow<'_, [String]> = match (!spec.literal_argv)
+            .then(|| muxel_core::prompt_marks::for_launch(&program, &spec.args))
+            .flatten()
+        {
+            Some(added) => [spec.args.as_slice(), added.as_slice()].concat().into(),
+            None => spec.args.as_slice().into(),
         };
         #[cfg(not(windows))]
         let args = std::borrow::Cow::Borrowed(spec.args.as_slice());
@@ -1610,11 +1593,6 @@ impl TerminalSession {
         builder.env("COLORTERM", "truecolor");
         // Apply preset overrides, then filter settings owned by the parent.
         apply_spec_env(&mut builder, &spec);
-        // After the preset's env, whose PROMPT this wraps.
-        #[cfg(windows)]
-        if let Some(muxel_core::prompt_marks::PromptMarks::CmdPrompt(prompt)) = &marks {
-            builder.env("PROMPT", prompt);
-        }
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
         // program or argv that Muxel resolved.
@@ -2436,9 +2414,11 @@ impl TerminalSession {
         self.shell_prompt.at_prompt()
     }
 
-    /// [`Self::shell_at_prompt`] with nothing typed on that prompt since.
-    pub fn shell_at_empty_prompt(&self) -> bool {
-        self.shell_prompt.at_empty_prompt()
+    /// [`Self::shell_at_prompt`], not marked busy by muxel's PowerShell wrapper
+    /// ([`muxel_core::prompt_marks::BUSY_MARK`]), with nothing typed since that
+    /// could still run.
+    pub fn shell_at_idle_prompt(&self) -> bool {
+        self.shell_prompt.idle_prompt()
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -3274,15 +3254,26 @@ impl TerminalSession {
     /// no live process of its own ([`muxel_core::recoverable_close::shell_is_idle`]);
     /// a command it starts, `start /b` included, is its child. That alone isn't
     /// idle on Windows, where cmd and PowerShell run batch files and cmdlets in
-    /// their own process: callers pair it with [`Self::shell_at_empty_prompt`].
-    /// The process snapshot may be up to 250 ms old
-    /// ([`crate::process_tree::recent_process_parent_map`]), so one close
-    /// walks the process table once.
+    /// their own process: callers pair it with [`Self::shell_at_idle_prompt`].
+    /// The process snapshot may be up to 250 ms old and shared with other
+    /// panes ([`crate::process_tree::recent_process_parent_map`]), so one close
+    /// walks the process table once; [`Self::is_idle_foreground_now`] walks it
+    /// afresh.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown
     /// child pid or start time, a failed snapshot, or another platform — so
     /// callers stay safe and confirm as usual.
     pub fn is_idle_foreground(&self) -> bool {
+        self.idle_foreground(false)
+    }
+
+    /// [`Self::is_idle_foreground`] from a process table walked now, for the
+    /// last check before a close kills the shell.
+    pub fn is_idle_foreground_now(&self) -> bool {
+        self.idle_foreground(true)
+    }
+
+    fn idle_foreground(&self, #[cfg_attr(not(windows), allow(unused))] fresh: bool) -> bool {
         #[cfg(unix)]
         {
             match (
@@ -3302,7 +3293,11 @@ impl TerminalSession {
             let (Some(pid), Some(started)) = (self.child_pid, self.child_started) else {
                 return false;
             };
-            let parents = crate::process_tree::recent_process_parent_map();
+            let parents = if fresh {
+                Arc::new(crate::process_tree::process_parent_map())
+            } else {
+                crate::process_tree::recent_process_parent_map()
+            };
             muxel_core::recoverable_close::shell_is_idle(
                 parents.iter().map(|(&process, &parent)| (process, parent)),
                 pid,
@@ -5284,8 +5279,9 @@ mod profiler_transport_tests {
 #[cfg(all(test, windows))]
 mod windows_shell_idle_tests {
     use super::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
-    use crate::process_tree::{RECENT, process_parent_map, process_start_time};
+    use crate::process_tree::RECENT;
     use muxel_core::recoverable_close::{CloseEvidence, windows_shell_close_evidence};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -5304,11 +5300,67 @@ mod windows_shell_idle_tests {
         (system32("cmd.exe"), vec!["/D".into()])
     }
 
+    /// Windows PowerShell 5.1, on every Windows host.
     fn powershell() -> (String, Vec<String>) {
         (
             system32(r"WindowsPowerShell\v1.0\powershell.exe"),
             vec!["-NoLogo".into(), "-NoProfile".into()],
         )
+    }
+
+    /// PowerShell 7, where it's installed; it ships `Start-ThreadJob`.
+    fn pwsh() -> Option<(String, Vec<String>)> {
+        let path = PathBuf::from(std::env::var_os("ProgramFiles")?).join(r"PowerShell\7\pwsh.exe");
+        path.is_file().then(|| {
+            (
+                path.to_string_lossy().into_owned(),
+                vec!["-NoLogo".into(), "-NoProfile".into()],
+            )
+        })
+    }
+
+    fn powershells() -> Vec<(String, Vec<String>)> {
+        let mut all = vec![powershell()];
+        match pwsh() {
+            Some(pwsh) => all.push(pwsh),
+            None => eprintln!("PowerShell 7 is not installed; testing 5.1 only"),
+        }
+        all
+    }
+
+    /// Work the test holds open: it runs while this file exists and ends by
+    /// itself once the file is gone. Dropping the hold releases it, so a
+    /// failed assertion leaves nothing running, and no test kills a process by
+    /// pid.
+    struct Hold(PathBuf);
+
+    impl Hold {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "muxel-shell-idle-{name}-{}.hold",
+                std::process::id()
+            ));
+            std::fs::write(&path, b"").expect("hold file");
+            Self(path)
+        }
+
+        /// PowerShell that waits while the hold lasts.
+        fn wait(&self) -> String {
+            format!(
+                "while (Test-Path -LiteralPath '{}') {{ Start-Sleep -Milliseconds 50 }}",
+                self.0.display()
+            )
+        }
+
+        fn release(&self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
     struct Shell {
@@ -5323,13 +5375,13 @@ mod windows_shell_idle_tests {
         }
 
         fn spawn(spec: CommandSpec) -> Self {
-            let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn shell");
+            let (session, rx) = TerminalSession::spawn(spec, 100, 30).expect("spawn shell");
             Self { session, rx }
         }
 
         /// What a pane close reads on Windows (`close_facts`).
         fn proves_idle(&self) -> bool {
-            windows_shell_close_evidence(self.session.shell_at_empty_prompt(), || {
+            windows_shell_close_evidence(self.session.shell_at_idle_prompt(), || {
                 self.session.is_idle_foreground()
             }) == CloseEvidence::ShellPrompt
         }
@@ -5367,13 +5419,17 @@ mod windows_shell_idle_tests {
             });
         }
 
+        fn at_prompt(&self) {
+            self.until("a prompt", |shell| shell.session.shell_at_prompt());
+        }
+
         fn becomes_idle(&self) {
             self.until("idle prompt", Self::proves_idle);
         }
 
-        /// Never idle at any check for `window`.
-        fn stays_busy(&self, window: Duration, why: &str) {
-            let deadline = Instant::now() + window;
+        /// Never idle at any check for a second.
+        fn stays_busy(&self, why: &str) {
+            let deadline = Instant::now() + Duration::from_secs(1);
             while Instant::now() < deadline {
                 self.pump();
                 assert!(
@@ -5387,6 +5443,19 @@ mod windows_shell_idle_tests {
 
         fn type_text(&self, text: &str) {
             self.session.write_input(text.as_bytes());
+        }
+
+        /// Run `command` and wait for the prompt after it. `marker` is the
+        /// output to wait for, split in the command so its echo can't match.
+        fn run(&self, command: &str, marker: &str) {
+            let half = marker.len() / 2;
+            self.type_text(&format!(
+                "{command}; '{}' + '{}'\r",
+                &marker[..half],
+                &marker[half..]
+            ));
+            self.shows(marker);
+            self.at_prompt();
         }
 
         /// The last non-blank line on screen once output has settled.
@@ -5403,19 +5472,6 @@ mod windows_shell_idle_tests {
             });
             last
         }
-
-        /// The shell's own live children, by exact pid, for cleanup.
-        fn children(&self) -> Vec<u32> {
-            let shell = self.session.child_pid.expect("shell pid");
-            let started = self.session.child_started.expect("shell start");
-            process_parent_map()
-                .into_iter()
-                .filter(|&(pid, parent)| {
-                    parent == shell && process_start_time(pid).is_some_and(|at| at >= started)
-                })
-                .map(|(pid, _)| pid)
-                .collect()
-        }
     }
 
     impl Drop for Shell {
@@ -5424,30 +5480,16 @@ mod windows_shell_idle_tests {
         }
     }
 
-    fn terminate(pid: u32) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-        // SAFETY: `pid` is a child this test's shell started and still runs; the
-        // handle is closed once.
-        unsafe {
-            if let Ok(process) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                let _ = TerminateProcess(process, 1);
-                let _ = CloseHandle(process);
-            }
-        }
-    }
-
     #[test]
     fn an_idle_prompt_is_idle() {
-        let shells = [Shell::start(cmd()), Shell::start(powershell())];
-        for shell in &shells {
-            shell.becomes_idle();
+        for shell in powershells() {
+            Shell::start(shell).becomes_idle();
         }
     }
 
     #[test]
     fn the_marks_leave_the_prompt_looking_the_same() {
-        for (program, args) in [cmd(), powershell()] {
+        for (program, args) in powershells() {
             let plain = Shell::spawn(CommandSpec::literal(&program, args.clone()));
             let marked = Shell::start((program.clone(), args));
             marked.becomes_idle();
@@ -5473,77 +5515,227 @@ mod windows_shell_idle_tests {
     }
 
     #[test]
-    fn a_cmdlet_running_in_powershell_is_not_idle() {
+    fn a_profile_prompt_that_prints_its_own_marks_is_still_idle() {
         let shell = Shell::start(powershell());
         shell.becomes_idle();
-        // Three seconds inside PowerShell's own process, so no child to see.
-        shell.type_text("Start-Sleep 3; 'SLEPT' + 'DONE'\r");
-        shell.stays_busy(Duration::from_millis(1500), "Start-Sleep");
-        shell.shows("SLEPTDONE");
-        shell.becomes_idle();
-    }
-
-    #[test]
-    fn a_batch_file_pausing_in_cmd_is_not_idle() {
-        let script = std::env::temp_dir().join(format!("muxel-pause-{}.bat", std::process::id()));
-        std::fs::write(&script, "@echo PAUSED\r\n@pause\r\n@echo RESUMED\r\n").expect("script");
-        let shell = Shell::start(cmd());
-        shell.becomes_idle();
-        // cmd runs a batch file and its `pause` itself, so no child to see.
-        shell.type_text(&format!("\"{}\"\r", script.display()));
-        shell.shows("PAUSED");
-        shell.stays_busy(Duration::from_millis(1000), "pause in a batch file");
-        shell.type_text("\r");
-        shell.shows("RESUMED");
-        shell.becomes_idle();
-        let _ = std::fs::remove_file(&script);
-    }
-
-    #[test]
-    fn typing_on_a_prompt_is_not_idle() {
-        let shell = Shell::start(cmd());
-        shell.becomes_idle();
-        shell.type_text("echo TYP");
-        shell.stays_busy(Duration::from_millis(600), "typed but not sent");
-        // The caret keeps the command line itself from showing the marker.
-        shell.type_text("^ED\r");
-        shell.shows("TYPED");
-        shell.becomes_idle();
-    }
-
-    #[test]
-    fn a_start_b_job_behind_the_prompt_is_not_idle() {
-        let shell = Shell::start(cmd());
-        shell.becomes_idle();
-        shell.type_text("start /b ping -n 30 127.0.0.1 >nul & echo START^ED\r");
-        shell.shows("STARTED");
-        shell.until("the prompt back", |shell| {
-            shell.session.shell_at_empty_prompt()
-        });
-        // A close may read a process table up to RECENT old; past that, any
-        // table read was taken after ping started.
-        std::thread::sleep(RECENT);
-        shell.stays_busy(Duration::from_millis(600), "start /b leaves ping running");
-        let background = shell.children();
-        assert!(!background.is_empty(), "the background ping");
-        for pid in background {
-            terminate(pid);
-        }
+        // As oh-my-posh's shell integration does, inside the wrapper's marks.
+        shell.type_text(
+            "$global:__muxel_prompt = { \"$([char]27)]133;A$([char]7)PRO\" + \"FILE> $([char]27)]133;B$([char]7)\" }\r",
+        );
+        shell.shows("PROFILE>");
         shell.becomes_idle();
     }
 
     #[test]
     fn a_prompt_set_after_launch_drops_the_marks_and_asks() {
-        // As a cmd AutoRun that sets its own prompt would.
-        let shell = Shell::spawn(CommandSpec::program(
-            system32("cmd.exe"),
-            vec!["/D".into(), "/K".into(), "prompt $P$G & echo READY".into()],
-        ));
-        shell.shows("READY");
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        shell.type_text("function global:prompt { 'MI' + 'NE> ' }\r");
+        shell.shows("MINE>");
+        shell.stays_busy("an unmarked prompt");
+    }
+
+    #[test]
+    fn cmd_asks_even_at_an_echoing_batch_pause() {
+        let shell = Shell::start(cmd());
         shell.until("its prompt", |shell| {
             shell.session.visible_text().trim_end().ends_with('>')
         });
-        shell.stays_busy(Duration::from_millis(1000), "an unmarked prompt");
+        shell.stays_busy("cmd at its prompt");
+        // With echo on, cmd prints its prompt before each line of the batch,
+        // so a prompt can't tell a batch waiting at `pause` from cmd waiting
+        // for a command.
+        let script = std::env::temp_dir().join(format!("muxel-echo-{}.bat", std::process::id()));
+        std::fs::write(
+            &script,
+            "@echo on\r\necho BATCH_STARTED\r\npause\r\necho BATCH_FINISHED\r\n",
+        )
+        .expect("script");
+        shell.type_text(&format!("\"{}\"\r", script.display()));
+        shell.shows("BATCH_STARTED");
+        shell.stays_busy("an echoing batch at pause");
+        shell.type_text("\r");
+        shell.shows("BATCH_FINISHED");
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[test]
+    fn a_cmdlet_running_in_powershell_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // Inside PowerShell's own process, so no child to see.
+        let hold = Hold::new("cmdlet");
+        shell.type_text(&format!("{}; 'RELEASED' + 'CMDLET'\r", hold.wait()));
+        shell.stays_busy("a cmdlet running");
+        hold.release();
+        shell.shows("RELEASEDCMDLET");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_child_left_running_behind_the_prompt_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let hold = Hold::new("child");
+        let child = muxel_core::winshell::encoded_command(&hold.wait());
+        shell.run(
+            &format!(
+                "Start-Process -NoNewWindow -FilePath '{}' -ArgumentList '-NoProfile', '-EncodedCommand', '{child}'",
+                powershell().0
+            ),
+            "STARTED",
+        );
+        // A close may read a process table up to RECENT old; past that, any
+        // table read was taken after the child started.
+        std::thread::sleep(RECENT);
+        shell.stays_busy("a child behind the prompt");
+        // The prompt itself was idle; once the child ends, so is the shell.
+        hold.release();
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn work_inside_powershell_behind_the_prompt_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // An event action on a timer, which keeps printing.
+        shell.run(
+            "$t = New-Object Timers.Timer; $t.Interval = 200; $null = Register-ObjectEvent $t Elapsed -SourceIdentifier tick -Action { [Console]::Write('') }; $t.Start()",
+            "TIMED",
+        );
+        shell.stays_busy("an event action");
+        shell.run(
+            "$t.Stop(); Unregister-Event tick; Remove-Job -Name tick",
+            "UNTIMED",
+        );
+        shell.becomes_idle();
+        // A subscriber with no action, which runs no job.
+        shell.run(
+            "$quiet = New-Object Timers.Timer; Register-ObjectEvent $quiet Elapsed -SourceIdentifier muxel.test",
+            "SUBSCRIBED",
+        );
+        shell.stays_busy("an event subscriber");
+        shell.run("Unregister-Event muxel.test", "UNSUBSCRIBED");
+        shell.becomes_idle();
+        // Another runspace, as a thread job or a background pipeline makes.
+        let hold = Hold::new("runspace");
+        shell.run(
+            &format!(
+                "$ps = [powershell]::Create().AddScript(\"{}\"); $h = $ps.BeginInvoke()",
+                hold.wait().replace('"', "`\"")
+            ),
+            "BEGUN",
+        );
+        shell.stays_busy("a pipeline in another runspace");
+        hold.release();
+        shell.run("$null = $ps.EndInvoke($h); $ps.Dispose()", "ENDED");
+        shell.becomes_idle();
+        // A nested prompt, as a debugger stop opens.
+        shell.type_text("$host.EnterNestedPrompt()\r");
+        shell.at_prompt();
+        shell.stays_busy("a nested prompt");
+        shell.type_text("exit\r");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_thread_job_behind_the_prompt_is_not_idle() {
+        let Some(pwsh) = pwsh() else {
+            eprintln!("PowerShell 7 is not installed; skipping");
+            return;
+        };
+        let shell = Shell::start(pwsh);
+        shell.becomes_idle();
+        let hold = Hold::new("thread-job");
+        shell.run(
+            &format!("$j = Start-ThreadJob {{ {} }}", hold.wait()),
+            "JOBBED",
+        );
+        shell.stays_busy("a running thread job");
+        hold.release();
+        shell.run("$null = Wait-Job $j", "WAITED");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_draft_kept_through_a_redraw_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.run("Import-Module PSReadLine", "LOADED");
+        shell.becomes_idle();
+        shell.type_text("Write-Output UNSENT");
+        shell.stays_busy("a draft");
+        // Ctrl+L clears the screen and draws the prompt again, with the draft.
+        shell.type_text("\x0c");
+        shell.until("the redraw", |shell| {
+            !shell.session.visible_text().contains("LOADED")
+        });
+        shell.stays_busy("a draft after a redraw");
+        // Ctrl+C drops the draft; the prompt PowerShell draws next is idle.
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn the_unsent_last_line_of_a_paste_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        shell.session.paste("'FIRST' + 'LINE'\nUNSENT");
+        shell.shows("FIRSTLINE");
+        shell.at_prompt();
+        shell.stays_busy("the paste's unsent last line");
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn keys_typed_ahead_while_a_command_runs_are_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let hold = Hold::new("typeahead");
+        shell.type_text(&format!("{}; 'RELEASED' + 'TYPEAHEAD'\r", hold.wait()));
+        // Typed once the command is running, not while the prompt reads it.
+        std::thread::sleep(Duration::from_millis(500));
+        shell.type_text("Write-Output UNSENT");
+        hold.release();
+        shell.shows("RELEASEDTYPEAHEAD");
+        shell.at_prompt();
+        shell.stays_busy("a draft typed ahead");
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_command_typed_ahead_is_not_idle_while_it_runs() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let (first, second) = (Hold::new("first"), Hold::new("second"));
+        shell.type_text(&format!("{}; 'FIRST' + 'DONE'\r", first.wait()));
+        std::thread::sleep(Duration::from_millis(500));
+        // Sent with Enter while the first runs. PowerShell reads it straight
+        // after the first's prompt, which must not read idle; nor may the
+        // pane while it runs.
+        shell.type_text(&format!("{}; 'SECOND' + 'DONE'\r", second.wait()));
+        first.release();
+        shell.shows("FIRSTDONE");
+        shell.stays_busy("the command typed ahead");
+        second.release();
+        shell.shows("SECONDDONE");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_job_that_starts_no_runspace_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // A job type of a module's own can run without a runspace, a
+        // subscriber or a child process; only `Get-Job` shows it.
+        shell.run(
+            r#"Add-Type -TypeDefinition 'using System.Management.Automation; public class MuxelHeldJob : Job { public MuxelHeldJob() : base("held") { SetJobState(JobState.Running); } public override bool HasMoreData { get { return false; } } public override string Location { get { return ""; } } public override string StatusMessage { get { return ""; } } public override void StopJob() { SetJobState(JobState.Stopped); } }'; function Add-HeldJob { [CmdletBinding()] param() $job = [MuxelHeldJob]::new(); $PSCmdlet.JobRepository.Add($job); $job }; $held = Add-HeldJob"#,
+            "HELDJOB",
+        );
+        shell.stays_busy("a running job of a module's own type");
+        shell.run("$held.StopJob()", "STOPPED");
+        shell.becomes_idle();
     }
 }
 

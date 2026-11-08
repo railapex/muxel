@@ -188,6 +188,17 @@ impl MuxelApp {
     }
 
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
+        self.close_facts_walking(iid, false, cx)
+    }
+
+    /// [`Self::close_facts`] for the last check before a close kills the pane:
+    /// a Windows shell's children come from a process table walked now, not
+    /// the snapshot another pane's close may have just taken.
+    fn close_facts_at_expiry(&self, iid: Uuid, cx: &App) -> CloseFacts {
+        self.close_facts_walking(iid, true, cx)
+    }
+
+    fn close_facts_walking(&self, iid: Uuid, fresh_walk: bool, cx: &App) -> CloseFacts {
         let inst = self.workspace.instance(iid);
         let mut state = inst
             .and_then(|inst| self.control_state(inst, cx))
@@ -201,8 +212,12 @@ impl MuxelApp {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
                 if cfg!(windows) {
                     let session = view.session();
-                    windows_shell_close_evidence(session.shell_at_empty_prompt(), || {
-                        session.is_idle_foreground()
+                    windows_shell_close_evidence(session.shell_at_idle_prompt(), || {
+                        if fresh_walk {
+                            session.is_idle_foreground_now()
+                        } else {
+                            session.is_idle_foreground()
+                        }
                     })
                 } else {
                     shell_close_evidence(
@@ -1056,7 +1071,7 @@ impl MuxelApp {
             .filter(|&iid| {
                 self.workspace.instance(iid).is_none()
                     || self.closing.get(&iid).is_none_or(|held| {
-                        let now = self.close_facts(iid, cx);
+                        let now = self.close_facts_at_expiry(iid, cx);
                         exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
                     })
             })
