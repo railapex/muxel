@@ -100,14 +100,17 @@ impl Shell {
         // to finish: the test kills it and the shell explicitly reaps it.
         self.session
             .write_input(b"sleep 30 & muxel_job=$!; printf '\\nCHILD:%s\\n' \"$muxel_job\"\n");
-        let output = self.read_prompt();
+        // Readline can redraw a prompt while accepting input. Synchronize on
+        // the command's output before looking for the prompt after it.
+        self.read_until("\nCHILD:");
+        let pid_line = self.read_until("\n");
         self.job = Some(
-            output
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("CHILD:"))
-                .find_map(|pid| pid.parse().ok())
+            pid_line
+                .trim()
+                .parse()
                 .expect("the shell reported its child's pid"),
         );
+        self.read_prompt();
         if foreground {
             self.session.write_input(b"fg\n");
             let deadline = Instant::now() + Duration::from_secs(10);
