@@ -11,6 +11,7 @@ use directories::ProjectDirs;
 use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
+pub mod rescue;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
@@ -172,7 +173,7 @@ const RENAME_RETRIES: u32 = 3;
 /// Pause between those retries.
 const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut retries = 0;
     loop {
         match std::fs::rename(from, to) {

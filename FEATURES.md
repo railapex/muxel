@@ -1639,6 +1639,19 @@ feature is added or changed, update the matching entry here in the same change**
   (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
+- **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box,
+  or after a shell prompt that marks itself with OSC 133, is saved about a second
+  after typing stops, off the UI thread, and forgotten once it is sent. Pasted
+  blocks shown as `[Pasted text …]` markers are saved as the pasted text; a draft
+  taller than the pane, or a marker muxel can't match, is saved as far as it can be
+  read and flagged partial. When the pane starts again after a crash, a restart or
+  a relaunch, it offers **Unsent prompt from HH:MM · Restore · Discard**; Restore
+  puts the text back into the box and never sends it. A pane closed for good keeps
+  its draft in a strip under the title bar with **Copy** and **Discard**. Grok,
+  Muse, opencode and Amp input boxes are not read yet.
+- **Rescue storage** — drafts are small private files beside the workspace,
+  written atomically, size-capped, and never logged. Settings → **Keep unsent
+  prompts** (on by default) turns it off and deletes everything kept.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
   `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
   a separate keychain service on Windows, macOS and Linux. This separates Muxel

@@ -1323,6 +1323,22 @@ pub struct TerminalSession {
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
     runtime_events: async_channel::Receiver<()>,
+    /// Recent pastes, so a provider's paste markers can be put back into a
+    /// saved draft. Bounded; see [`muxel_core::rescue::PasteLog`].
+    paste_log: Mutex<muxel_core::rescue::PasteLog>,
+    /// Wakes the draft watcher after user input or a submission. Capacity one,
+    /// so a burst of keys costs one failed `try_send` per key and nothing when
+    /// no watcher runs.
+    draft_trigger: async_channel::Sender<()>,
+    draft_events: async_channel::Receiver<()>,
+    draft_epoch: Instant,
+    /// Milliseconds after `draft_epoch` of the last user input or submission.
+    draft_touch: AtomicU64,
+    /// A submission was admitted since the draft watcher last looked.
+    draft_submitted: AtomicBool,
+    /// Where the shell's last OSC 133 B mark left the cursor: its input starts
+    /// there.
+    shell_input: Mutex<Option<crate::draft::ShellInputMark>>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -1780,6 +1796,7 @@ impl TerminalSession {
         );
 
         let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+        let (draft_trigger, draft_events) = async_channel::bounded(1);
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
@@ -1836,6 +1853,13 @@ impl TerminalSession {
             input_state: AtomicU64::new(0),
             runtime_trigger,
             runtime_events,
+            paste_log: Mutex::new(muxel_core::rescue::PasteLog::default()),
+            draft_trigger,
+            draft_events,
+            draft_epoch: Instant::now(),
+            draft_touch: AtomicU64::new(0),
+            draft_submitted: AtomicBool::new(false),
+            shell_input: Mutex::new(None),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -1904,22 +1928,35 @@ impl TerminalSession {
         } else {
             self.evidence.lock().begin_read(effective_at)
         };
-        self.observe_program_status(bytes, fresh);
-        processor.advance(term, bytes);
+        match self.observe_program_status(bytes, fresh) {
+            // Parse up to the shell's last B mark, note where it left the
+            // cursor, then parse the rest. Output held by a synchronized
+            // update hasn't moved the cursor yet, so its mark is unknown.
+            Some(end) => {
+                processor.advance(term, &bytes[..end]);
+                let mark = (processor.sync_timeout().sync_timeout().is_none())
+                    .then(|| crate::draft::ShellInputMark::at_cursor(term));
+                *self.shell_input.lock() = mark;
+                processor.advance(term, &bytes[end..]);
+            }
+            None => processor.advance(term, bytes),
+        }
     }
 
     /// Observe each timed segment before VTE can defer its title callbacks.
     /// Capacity replay has already separated the old frame from these bytes,
     /// so the observer and the listener receive the same attribution time.
-    fn observe_program_status(&self, bytes: &[u8], fresh: bool) {
+    /// Returns the offset just past the segment's last OSC 133 B mark.
+    fn observe_program_status(&self, bytes: &[u8], fresh: bool) -> Option<usize> {
         #[cfg(test)]
         if !self
             .observe_program_status_for_bench
             .load(Ordering::Relaxed)
         {
-            return;
+            return None;
         }
         let mut observer = self.program_status_observer.lock();
+        let mut shell_input = None;
         let mut rest = bytes;
         loop {
             // Plain output, and escapes that can't start an OSC or a reset,
@@ -1975,9 +2012,15 @@ impl TerminalSession {
                         status.shell_prompt();
                     }
                 }
+                ProgramStatusEvent::ShellInput => {
+                    if fresh {
+                        shell_input = Some(bytes.len() - rest.len());
+                    }
+                }
                 ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => {}
             }
         }
+        shell_input
     }
 
     /// Collects alacritty damage for the next paint (partial row rebuild) and
@@ -2285,6 +2328,7 @@ impl TerminalSession {
         self.advance_input(Some(true));
         self.mark_interactive();
         self.trigger_runtime();
+        self.draft_submission();
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
@@ -2328,6 +2372,7 @@ impl TerminalSession {
                 Some((self.clone(), SystemTime::now(), prompt))
             }
             ControlInput::Paste(text) => {
+                self.paste_log.lock().record(text);
                 self.admit_input(!text.is_empty());
                 None
             }
@@ -2404,6 +2449,82 @@ impl TerminalSession {
     /// auto-continue and outside control type on their own and never mark it.
     pub fn mark_user_input(&self) {
         *self.last_user_input.lock() = Some(Instant::now());
+        self.touch_draft();
+    }
+
+    /// Restart the draft watcher's debounce and wake it. One atomic store and
+    /// one non-blocking send: typing never waits on a draft save.
+    fn touch_draft(&self) {
+        let ms = u64::try_from(self.draft_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.draft_touch.store(ms, Ordering::Relaxed);
+        let _ = self.draft_trigger.try_send(());
+    }
+
+    /// A submission was admitted: the watcher drops the saved draft at once
+    /// and reads the box again once input stops.
+    fn draft_submission(&self) {
+        self.draft_submitted.store(true, Ordering::Release);
+        self.touch_draft();
+    }
+
+    /// Wakeups for [`crate::draft::watch`]. Receivers share one queue.
+    pub(crate) fn draft_events(&self) -> async_channel::Receiver<()> {
+        self.draft_events.clone()
+    }
+
+    /// Time since the last user input or submission.
+    pub(crate) fn draft_idle_for(&self) -> Duration {
+        let touched = Duration::from_millis(self.draft_touch.load(Ordering::Relaxed));
+        self.draft_epoch.elapsed().saturating_sub(touched)
+    }
+
+    pub(crate) fn take_draft_submitted(&self) -> bool {
+        self.draft_submitted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Read the draft in this pane's input box: `provider`'s box for an agent,
+    /// the text after the shell's OSC 133 B mark otherwise. Copies the visible
+    /// screen under the terminal lock and parses it after the lock is released.
+    pub(crate) fn read_draft(
+        &self,
+        provider: crate::view::TitleProvider,
+    ) -> muxel_core::rescue::DraftRead {
+        use crate::view::TitleProvider;
+        use muxel_core::rescue::DraftRead;
+        let read = match provider {
+            TitleProvider::Claude | TitleProvider::Codex => {
+                let capture = self.with_term(crate::draft::DraftCapture::from_term);
+                if provider == TitleProvider::Claude {
+                    crate::draft::claude(&capture)
+                } else {
+                    crate::draft::codex(&capture)
+                }
+            }
+            TitleProvider::Other if self.shell_at_prompt() => {
+                let mark = self.shell_input.lock().clone();
+                match mark {
+                    Some(mark) => self.with_term(|term| crate::draft::shell(term, &mark)),
+                    None => DraftRead::Unknown,
+                }
+            }
+            _ => DraftRead::Unknown,
+        };
+        match read {
+            DraftRead::Text {
+                text,
+                partial,
+                clipped,
+            } => {
+                let substituted =
+                    muxel_core::rescue::substitute_pastes(&text, &self.paste_log.lock());
+                DraftRead::Text {
+                    text: substituted.text,
+                    partial: partial || substituted.partial,
+                    clipped,
+                }
+            }
+            other => other,
+        }
     }
 
     /// Send pastes that name this machine's files — a clipboard image, copied or
@@ -2450,6 +2571,7 @@ impl TerminalSession {
         self.evidence.lock().record_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
+        self.draft_submission();
     }
 
     /// Explicit prompt submission from a path that supplied the prompt text.
@@ -2461,8 +2583,10 @@ impl TerminalSession {
         let submitted_at = SystemTime::now();
         let mut evidence = self.evidence.lock();
         evidence.record_prompt_submission(submitted_at);
+        drop(evidence);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
+        self.draft_submission();
     }
 
     /// Whether any turn was submitted in this launch, in any conversation.
@@ -2524,6 +2648,7 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        self.paste_log.lock().record(text);
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {

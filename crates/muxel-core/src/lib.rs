@@ -26,6 +26,7 @@ pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
+pub mod rescue;
 pub mod session_discovery;
 mod shell;
 pub mod sound_alert;
@@ -2667,6 +2668,11 @@ pub struct Settings {
     pub confirm_close_editor: bool,
     #[serde(default)]
     pub confirm_close_diff: bool,
+    /// Keep unsent prompt drafts and unsaved editor text on disk so a crash or
+    /// an accidental close doesn't lose them (default on). Turning it off
+    /// deletes what is kept.
+    #[serde(default = "default_true")]
+    pub rescue_unsent_text: bool,
     /// Highest Terms/Privacy version the user has accepted (0 = never). When this
     /// is below [`CURRENT_TERMS_VERSION`] the app shows the first-run acceptance
     /// screen.
@@ -3164,6 +3170,7 @@ impl Default for Settings {
             confirm_close_terminal: true,
             confirm_close_editor: false,
             confirm_close_diff: false,
+            rescue_unsent_text: true,
             accepted_terms_version: 0,
             tmux_install_offered: false,
             preset_seed_version: PRESET_SEED_VERSION,
@@ -3630,6 +3637,8 @@ mod settings_tests {
         // URLs and paths are shortened, and the voice keeps its normal pace.
         let s: Settings = serde_json::from_str("{}").expect("parse");
         assert!(s.read_aloud_button);
+        assert!(s.rescue_unsent_text, "rescue defaults on for old configs");
+        assert!(Settings::default().rescue_unsent_text);
         assert_eq!(s.read_aloud_scope, ReadAloudScope::FinalMessage);
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::Off);
         assert!(!s.read_aloud_announce);

@@ -859,7 +859,7 @@ fn program_status_reason(root: &RootStatus) -> TerminalStatusReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TitleProvider {
+pub(crate) enum TitleProvider {
     Claude,
     Codex,
     Grok,
@@ -2032,6 +2032,8 @@ pub struct TerminalView {
     paint_hold_until: std::cell::Cell<Option<std::time::Instant>>,
     _drain: Task<()>,
     _runtime_events: Task<()>,
+    /// Keeps the pane's unsent draft saved while set; see [`Self::set_draft_sink`].
+    draft_watch: Option<Task<()>>,
 }
 
 /// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
@@ -3444,6 +3446,7 @@ impl TerminalView {
             paint_hold_until: std::cell::Cell::new(None),
             _drain: drain,
             _runtime_events: runtime_event_task,
+            draft_watch: None,
         };
         view.refresh_runtime(cx);
         view
@@ -3451,6 +3454,52 @@ impl TerminalView {
 
     pub fn session(&self) -> &Arc<TerminalSession> {
         &self.session
+    }
+
+    /// Keep this pane's unsent draft saved through `sink`, about a second
+    /// after the user stops typing and only when it changed; `None` stops.
+    /// Reads and writes happen on a background thread. A provider whose input
+    /// box muxel can't read (Grok, Muse) gets no watcher.
+    pub fn set_draft_sink(&mut self, sink: Option<crate::DraftSink>, cx: &mut Context<Self>) {
+        self.draft_watch = sink
+            .filter(|_| crate::draft::readable(self.title_provider))
+            .map(|sink| {
+                let executor = cx.background_executor().clone();
+                cx.background_executor().spawn(crate::draft::watch(
+                    self.session.clone(),
+                    self.title_provider,
+                    executor,
+                    sink,
+                ))
+            });
+    }
+
+    /// Whether this pane's draft is being kept.
+    pub fn draft_watched(&self) -> bool {
+        self.draft_watch.is_some()
+    }
+
+    /// The draft in this pane's input box right now, if muxel can read it
+    /// whole. A box taller than the pane reads as `None`: only the watcher,
+    /// which saw its earlier lines, can save it.
+    pub fn current_draft(&self) -> Option<muxel_core::rescue::PromptDraft> {
+        if !crate::draft::readable(self.title_provider) {
+            return None;
+        }
+        match self.session.read_draft(self.title_provider) {
+            muxel_core::rescue::DraftRead::Text {
+                text,
+                partial,
+                clipped: false,
+            } => Some(muxel_core::rescue::PromptDraft {
+                text,
+                partial,
+                saved_at_ms: crate::draft::now_ms(),
+                source: crate::draft::source(self.title_provider),
+                pane: None,
+            }),
+            _ => None,
+        }
     }
 
     /// Snapshot evidence before the caller pastes. This never marks a turn as

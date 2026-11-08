@@ -82,6 +82,9 @@ mod recoverable_layout;
 mod recoverable_layout_tests;
 #[cfg(all(test, windows))]
 mod remote_reconnect_tests;
+mod rescue;
+#[cfg(all(test, windows))]
+mod rescue_tests;
 #[cfg(all(test, windows))]
 mod restart_completion_tests;
 mod restart_guard;
@@ -6046,6 +6049,8 @@ pub struct MuxelApp {
     /// Keeps two muxel processes from opening the same workspace and clobbering
     /// its `workspace.json`; different workspaces lock independently.
     workspace_lock: Option<std::fs::File>,
+    /// Unsent drafts offered on restarted panes and kept from closed ones.
+    rescue: rescue::Rescue,
     /// A workspace the user tried to enter that another muxel process already
     /// holds open — surfaced as an inline note in the selector. Cleared on a
     /// successful entry or when the selector is dismissed.
@@ -8283,6 +8288,7 @@ impl MuxelApp {
             workspaces,
             show_workspace_selector: true,
             workspace_lock: None,
+            rescue: rescue::Rescue::default(),
             workspace_busy: None,
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
@@ -8431,6 +8437,7 @@ impl MuxelApp {
         // hands tmux's exit policy back so it exits with its last session.
         cx.on_app_quit(|this, cx| {
             this.finalize_all_closes(cx);
+            this.flush_rescue(cx);
             this.persist();
             this.close_departure = None;
             this.close_departure_task = None;
@@ -10250,7 +10257,9 @@ impl MuxelApp {
                 .session()
                 .set_path_paste_error_handler(Some(handler));
         }
+        let rescue_view = view.clone();
         self.terminals.insert(instance_id, view);
+        self.attach_draft_rescue(instance_id, &rescue_view, cx);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
@@ -11868,6 +11877,8 @@ impl MuxelApp {
             self.begin_close_departure(CloseDeparture::Workspace(id), cx);
             return;
         }
+        // The old workspace's panes go away below; save what they hold first.
+        self.flush_rescue(cx);
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
@@ -11963,9 +11974,11 @@ impl MuxelApp {
                 .and_then(|p| muxel_store::load_workspace_from(&p))
                 .filter(|w| !w.projects.is_empty())
         };
+        self.rescue = rescue::Rescue::default();
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
         }
+        self.load_workspace_rescue();
         // Reopen per-monitor project windows for saved assignments whose display
         // is currently connected (a missing monitor keeps the pin for later).
         let assignments: Vec<(Uuid, Uuid)> = self
@@ -13663,6 +13676,7 @@ impl MuxelApp {
         // already tore down its tmux session and worktree.
         self.release_maximize(&closed);
         for &iid in &closed {
+            self.keep_closed_draft(iid, cx);
             ui_profile::unregister_focus_pane(iid);
             self.terminal_launching.remove(&iid);
             self.clear_notifications_for(iid);
@@ -18013,6 +18027,8 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        // Keep an unsent prompt before its view goes; it outlives the pane.
+        self.keep_closed_draft(iid, cx);
         self.forget_close(iid);
         self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
@@ -24619,6 +24635,11 @@ impl MuxelApp {
                     tabs[leaf_active]
                 };
                 let is_active = pane_has_focus;
+                let draft_offer = self
+                    .terminals
+                    .contains_key(&iid)
+                    .then(|| self.render_draft_offer(iid, cx))
+                    .flatten();
                 let content: AnyElement = if let Some(view) = self.terminals.get(&iid) {
                     let v = view.read(cx);
                     if v.exited() {
@@ -24708,6 +24729,19 @@ impl MuxelApp {
                             .into_any_element()
                     } else if !v.has_visible_content() {
                         self.terminal_starting(iid, cx)
+                    } else if let Some(offer) = draft_offer {
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(terminal_pane_element(view, !is_active, cx)),
+                            )
+                            .child(offer)
+                            .into_any_element()
                     } else {
                         terminal_pane_element(view, !is_active, cx)
                     }
@@ -33178,6 +33212,16 @@ impl MuxelApp {
             )
             .child(
                 self.check_row(
+                    Checkbox::new("b-rescue-unsent")
+                        .checked(self.settings.rescue_unsent_text)
+                        .on_click(
+                            cx.listener(|this, c: &bool, _w, cx| this.set_rescue_enabled(*c, cx)),
+                        ),
+                    &t("Keep unsent prompts through a crash, a restart or an accidental close"),
+                ),
+            )
+            .child(
+                self.check_row(
                     Checkbox::new("b-dev-console")
                         .checked(self.settings.dev_console_enabled)
                         .on_click(cx.listener(|this, c: &bool, _w, cx| {
@@ -35331,6 +35375,7 @@ impl Render for MuxelApp {
         let root = self.attach_workspace_actions(root, cx);
         let root = root
             .child(self.render_titlebar(active_name, cx))
+            .children(self.render_rescue_strip(cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
             .child(self.render_hotbar(cx))
             .children(
