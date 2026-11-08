@@ -298,11 +298,16 @@ pub enum ErrorCode {
     Blocked,
     /// The agent is still starting: try again in a moment.
     Starting,
-    /// The pane is held for closing; the user can undo before `undo_until`.
+    /// Input is refused while the pane is held for closing. Reads still work.
+    /// `undo_until` is present only during its countdown; otherwise `reason`
+    /// describes `counting_down`, `checking`, `awaiting_decision` or `restoring`
+    /// with no deadline. A countdown whose wall-clock deadline elapsed (for
+    /// example across suspend) omits that expired deadline too.
     Closing,
     /// The pane isn't running this session, or its program failed to start.
     NotRunning,
-    /// The agent's program has exited.
+    /// The agent's program has exited, or the addressed UUID is no longer in
+    /// this workspace. A missing pane does not prove a remote process is dead.
     Exited,
     /// Another request holds the shared tmux claim, or another `send` from this
     /// muxel hasn't pressed its Enter yet.
@@ -314,6 +319,8 @@ pub enum ErrorCode {
     /// A pane behind tmux takes ctl input only through tmux, at the agent's own
     /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
     TmuxPaneUnresolved,
+    /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
+    TmuxPaneInMode,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -498,7 +505,8 @@ pub struct AgentInfo {
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
-    /// `None` when it is popped out into its own window.
+    /// `None` when popped out into its own window or held outside the layout
+    /// for a recoverable close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1910,6 +1918,19 @@ after a failed lookup the next waits a little longer each time, up to two
 minutes. A remote agent's input needs muxel's background SSH commands to that
 host to work.
 
+Newly created agents record their pane id before the program starts. That
+record survives pane moves and splits; reattaches preserve it. Older or adopted
+sessions use the lowest-pane lookup. Copy mode refuses input with
+`tmux_pane_in_mode`, leaving the user's scroll position intact. Leave copy mode
+before retrying. If the prompt was already pasted before Enter was refused,
+the failure has `pasted: true`: inspect `screen` before resending. An unanswered
+Enter also guards the turn as just submitted, because it may have landed.
+Servers reporting version 2.4+ check mode and write in one tmux command queue.
+Older or unreported server versions check separately before each write, adding
+a round trip. That legacy path has a small race if the user enters copy mode
+between the check and Enter; stock 2.2/2.3 use it too (server version reporting
+arrived in 2.4). There is no new tmux version requirement.
+
 AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
 at. PROJECT is a project's id or name. muxels on different computers that share
@@ -1949,7 +1970,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim, or another
   `send` to the agent hasn't pressed Enter yet.
-- `closing` - the pane is closing; `undo_until` is its undo deadline (unix ms). Undo in muxel before sending more input.
+- `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
@@ -1958,6 +1979,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   need to restart the agent.
 - `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
   `screen` before pressing any again.
+- `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
+  copy mode before retrying. A failure after a paste instead has `pasted: true`.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2243,6 +2266,7 @@ mod tests {
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
