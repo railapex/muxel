@@ -14,7 +14,7 @@ use muxel_core::{
     ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
     accomplishments_header, memory_header, remote_ops, ssh,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -2026,21 +2026,50 @@ pub struct StatusPlan {
     /// The work tree's top level. `git status` reports the whole tree from
     /// any folder in it, so every path here is relative to this.
     pub root: PathBuf,
-    /// The whole tree's [`DiffPlan`], with git's exclude file among the
-    /// state that re-plans.
+    /// The whole tree's [`DiffPlan`], with the files deciding what's ignored
+    /// beyond the `.gitignore`s among the state that re-plans: `info/exclude`,
+    /// the repository's config, and the excludes file git reads
+    /// (`core.excludesFile`, else git's XDG default).
     pub diff: DiffPlan,
     /// Ignored paths, directories collapsed.
     pub ignored: Vec<PathBuf>,
     /// The git directory, when it's inside `root`.
     pub git_dir: Option<PathBuf>,
+    /// The files deciding what's ignored as they stood before it was listed,
+    /// the tracked `.gitignore`s and the global git config (not watched)
+    /// among them: see [`Self::current`].
+    pub inputs: PlanInputs,
 }
 
-/// Resolve [`StatusPlan`] for `dir` with three git commands: `rev-parse`,
-/// `ls-files` for the tracked files and again for the ignored ones. `None`
-/// where `dir` isn't in a work tree git will read.
+impl StatusPlan {
+    /// Whether HEAD, the index and every file deciding what's ignored still
+    /// stand as when the plan was read. A lost event leaves a plan that
+    /// isn't, which then has to be read again.
+    pub fn current(&self) -> bool {
+        self.diff.inputs.current() && self.inputs.current()
+    }
+}
+
+/// Resolve [`StatusPlan`] for `dir` with four git commands: `rev-parse`,
+/// `ls-files` for the tracked files, `config` for the excludes file, and
+/// `ls-files` again for the ignored ones. `None` where `dir` isn't in a work
+/// tree git will read.
 pub fn status_plan(dir: &Path) -> Option<StatusPlan> {
     let (mut diff, git_dir, common) = plan_with(dir, true)?;
     let root = PathBuf::from(&diff.toplevel);
+    let excludes = excludes_file(&root);
+    let mut rules = vec![common.join("info").join("exclude"), common.join("config")];
+    rules.extend(excludes);
+    let mut stamped = rules.clone();
+    stamped.extend(global_git_configs());
+    stamped.extend(
+        diff.tracked
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| name == ".gitignore"))
+            .map(|path| root.join(path)),
+    );
+    // Before listing, as for HEAD and the index.
+    let inputs = PlanInputs::read(&stamped);
     let ignored = git_read_command()
         .arg("-C")
         .arg(&root)
@@ -2062,7 +2091,7 @@ pub fn status_plan(dir: &Path) -> Option<StatusPlan> {
         // `target/` as `target`.
         .map(|path| path.components().collect())
         .collect();
-    diff.state.push(common.join("info").join("exclude"));
+    diff.state.extend(rules);
     let git_dir = git_dir
         .strip_prefix(lexical(&root))
         .ok()
@@ -2072,7 +2101,141 @@ pub fn status_plan(dir: &Path) -> Option<StatusPlan> {
         diff,
         ignored,
         git_dir,
+        inputs,
     })
+}
+
+/// The excludes file git reads in the work tree at `root`:
+/// `core.excludesFile`, else git's default under its XDG folder. `None`
+/// where git turned it off (an empty value) or can't say.
+fn excludes_file(root: &Path) -> Option<PathBuf> {
+    let out = git_read_command()
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--path", "--get", "core.excludesFile"])
+        .profiled_output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => {
+            let path = String::from_utf8(out.stdout).ok()?;
+            let path = path.trim_end_matches(['\r', '\n']);
+            // Relative to the work tree, as git reads it from there.
+            (!path.is_empty()).then(|| root.join(path))
+        }
+        // Unset.
+        Some(1) => git_xdg_dir().map(|dir| dir.join("ignore")),
+        _ => None,
+    }
+}
+
+/// The folder git reads its XDG files from: `$XDG_CONFIG_HOME/git`, else
+/// `~/.config/git`.
+fn git_xdg_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| git_home().map(|home| home.join(".config")))
+        .map(|dir| dir.join("git"))
+}
+
+/// The home folder git reads `~/.gitconfig` from.
+fn git_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The user's git config files, where `core.excludesFile` is usually set.
+fn global_git_configs() -> Vec<PathBuf> {
+    [
+        git_xdg_dir().map(|dir| dir.join("config")),
+        git_home().map(|home| home.join(".gitconfig")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Which of `paths` (relative to `root`, a work tree's top level) git
+/// ignores, and so everything under them, asked with one `git check-ignore
+/// --stdin`. `None` where git couldn't say: it failed, or was handed a name
+/// it reads as pathspec magic (`:!x`). A name that can't be passed to git is
+/// taken as not ignored.
+pub fn check_ignored(root: &Path, paths: &[PathBuf]) -> Option<HashSet<PathBuf>> {
+    use std::io::Write;
+    let names: Vec<(Vec<u8>, &PathBuf)> = paths
+        .iter()
+        .filter_map(|path| Some((git_rel_name(path)?, path)))
+        .collect();
+    if names.is_empty() {
+        return Some(HashSet::new());
+    }
+    let mut input = Vec::new();
+    for (name, _) in &names {
+        input.extend_from_slice(name);
+        input.push(0);
+    }
+    let mut cmd = git_read_command();
+    cmd.arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let out = cmd.spawn().and_then(|mut child| {
+        let mut stdin = child.stdin.take().ok_or(std::io::ErrorKind::BrokenPipe)?;
+        // From its own thread, as git may fill stdout before reading it all.
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output();
+        // git stopping early (a fatal error) breaks the pipe; its exit says why.
+        let _ = writer.join();
+        out
+    });
+    if crate::ui_profile::is_enabled() {
+        crate::ui_profile::git_launched(&cmd, started.elapsed(), &out);
+    }
+    let out = out.ok()?;
+    // 1: none of them is ignored.
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return None;
+    }
+    // git prints each ignored name as it was given.
+    let ignored: HashSet<&[u8]> = out
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .collect();
+    Some(
+        names
+            .into_iter()
+            .filter(|(name, _)| ignored.contains(name.as_slice()))
+            .map(|(_, path)| path.clone())
+            .collect(),
+    )
+}
+
+/// `path`, relative to the top level, as git names it: `/`-separated.
+/// Elsewhere than Unix, `None` for a name that isn't UTF-8.
+fn git_rel_name(path: &Path) -> Option<Vec<u8>> {
+    let mut name = Vec::new();
+    for part in path.components() {
+        let std::path::Component::Normal(part) = part else {
+            return None;
+        };
+        if !name.is_empty() {
+            name.push(b'/');
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            name.extend_from_slice(part.as_bytes());
+        }
+        #[cfg(not(unix))]
+        name.extend_from_slice(part.to_str()?.as_bytes());
+    }
+    (!name.is_empty()).then_some(name)
 }
 
 /// [`diff_plan`], listing the tracked files of the whole work tree (relative

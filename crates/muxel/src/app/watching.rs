@@ -144,16 +144,14 @@ impl MuxelApp {
                         lost.push(id);
                         continue;
                     }
-                    if change.touched {
+                    let Some(source) = self.status_targets.sources.get_mut(&key) else {
+                        continue;
+                    };
+                    if source.note(&change) {
                         self.status_targets.schedule.changed(key, Some(now));
                     }
                     if change.rescan {
                         self.status_targets.schedule.changed(key, None);
-                    }
-                    if change.relist
-                        && let Some(source) = self.status_targets.sources.get_mut(&key)
-                    {
-                        source.replan = true;
                     }
                 }
             }
