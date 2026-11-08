@@ -1039,12 +1039,30 @@ struct ResizeState {
     since: Instant,
 }
 
-fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
-    if !has_bytes {
-        previous
-    } else {
-        !submission_pending
-    }
+/// What an input write submits. The write commits it together with its bytes
+/// (see [`TerminalSession::try_write_submission`]), so a refused write records
+/// no submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submission {
+    /// Text, keys or a paste that submit nothing. They latch the draft.
+    None,
+    /// A bare Enter, or a snippet's lone Enter. It can select a resume item,
+    /// so it carries no prompt intent.
+    Turn,
+    /// Enter, or text ending in one, whose caller supplied the prompt.
+    Prompt,
+}
+
+/// What a gated write tells the session besides its bytes.
+#[derive(Clone, Copy)]
+enum InputFacts {
+    Typed(Submission),
+    /// A mouse or wheel report: input, but not text.
+    Pointer,
+}
+
+fn draft_after_input(previous: bool, submitted: bool, has_bytes: bool) -> bool {
+    if !has_bytes { previous } else { !submitted }
 }
 
 /// The input word (see `TerminalSession::input_state`) after one non-empty
@@ -1313,7 +1331,6 @@ pub struct TerminalSession {
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
-    submission_pending: AtomicBool,
     /// The input revision and a conservative draft bit in one atomic word, so
     /// a reader never sees one write's revision paired with another write's
     /// draft bit. The low bit is the draft flag; the remaining bits are the
@@ -1832,7 +1849,6 @@ impl TerminalSession {
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
             last_user_input: Mutex::new(None),
-            submission_pending: AtomicBool::new(false),
             input_state: AtomicU64::new(0),
             runtime_trigger,
             runtime_events,
@@ -2201,13 +2217,80 @@ impl TerminalSession {
     }
 
     /// [`Self::write_input`], saying whether the bytes could be handed to the
-    /// PTY. An error means the terminal's writer is gone (its program exited and
-    /// a write has already failed); `Ok` only means the bytes were queued.
+    /// PTY. An error means the terminal is held for closing or its writer is
+    /// gone (its program exited and a write has already failed); `Ok` only means
+    /// the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.admit_input(!data.is_empty());
-        self.try_write_raw(data)?;
-        self.shell_prompt.submitted(data);
+        self.try_write_submission(data, Submission::None)
+    }
+
+    /// [`Self::write_input`] for input that may submit something: a key the
+    /// user pressed, a snippet, a broadcast line. Its facts are committed with
+    /// the write; see [`Self::try_write_submission`].
+    pub fn write_submission(&self, data: &[u8], submission: Submission) {
+        let _ = self.try_write_submission(data, submission);
+    }
+
+    /// Write input and commit what it says, together: the input revision, the
+    /// draft bit, the shell prompt and, for a [`Submission::Turn`] or
+    /// [`Submission::Prompt`], the submission evidence. A refused write changes
+    /// none of them. Success means queued bytes, not confirmation that the child
+    /// consumed them.
+    pub fn try_write_submission(&self, data: &[u8], submission: Submission) -> std::io::Result<()> {
+        self.try_write_with_facts(data, InputFacts::Typed(submission))
+    }
+
+    /// Admit a complete submission after a known prompt (Enter, or text ending
+    /// in Enter). This is the API `paste_prompt` uses once it has checked the
+    /// pane and input revision. Keyboard Enter alone is a [`Submission::Turn`]:
+    /// it can't prove prompt intent.
+    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.try_write_submission(data, Submission::Prompt)
+    }
+
+    /// The one gated write. Under the writer lock it checks the input gate,
+    /// enqueues `data`, and only if that succeeded commits the facts the write
+    /// justifies. Whatever holds the writer lock (a hold, a fence) therefore
+    /// sees each write either with its facts or refused, never one without the
+    /// other. View effects (scroll, output priority, the runtime trigger) follow
+    /// after the lock is released.
+    fn try_write_with_facts(&self, data: &[u8], facts: InputFacts) -> std::io::Result<()> {
+        // The child can react as soon as the bytes are queued. Take the input
+        // time first, so a resume hook the Enter causes can't make that Enter
+        // belong to the replacement conversation.
+        let submitted_at = SystemTime::now();
+        {
+            let mut writer = self.writer.lock();
+            self.check_input_gate()?;
+            writer.write_all(data)?;
+            writer.flush()?;
+            if !data.is_empty() {
+                match facts {
+                    InputFacts::Pointer => self.advance_input(None),
+                    InputFacts::Typed(Submission::None) => self.advance_input(Some(false)),
+                    InputFacts::Typed(Submission::Turn) => {
+                        self.record_submission(submitted_at, false)
+                    }
+                    InputFacts::Typed(Submission::Prompt) => {
+                        self.record_submission(submitted_at, true)
+                    }
+                }
+            }
+            if let InputFacts::Typed(_) = facts {
+                self.shell_prompt.submitted(data);
+            }
+        }
+        if let InputFacts::Typed(submission) = facts {
+            self.scroll_input_to_bottom();
+            if !data.is_empty() {
+                // A TUI reaction will follow; prioritize output during this
+                // short interaction window even if stream output is queued.
+                self.mark_interactive();
+                if submission != Submission::None {
+                    self.trigger_runtime();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2223,56 +2306,9 @@ impl TerminalSession {
         }
     }
 
-    /// The bookkeeping every input write does before its bytes go anywhere.
-    fn admit_input(&self, nonempty: bool) {
-        self.scroll_input_to_bottom();
-        if nonempty {
-            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
-            if submitted_enter {
-                self.trigger_runtime();
-            }
-            // A TUI reaction will follow; prioritize output during this short
-            // interaction window even if stream output is already queued.
-            self.mark_interactive();
-        }
-    }
-
-    /// Admit a complete submission (Enter, or text ending in Enter) and commit
-    /// its lifecycle facts together. Failed admission leaves the draft and
-    /// submission evidence unchanged, with no marker for a later key to consume.
-    /// Success means queued bytes, not confirmation that the child consumed them.
-    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
-        // This API admits a known prompt after `paste_prompt` has checked
-        // the pane and input revision. Generic keyboard Enter uses
-        // `mark_turn_submitted` and cannot prove prompt intent.
-        self.try_submit(data, true)
-    }
-
-    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
-    /// and a plain one otherwise.
-    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.scroll_input_to_bottom();
-        let mut writer = self.writer.lock();
-        // The child can react as soon as write_all publishes bytes. Keep the
-        // input time before any resume hook it causes, but commit no facts
-        // until writer admission succeeds.
-        let submitted_at = SystemTime::now();
-        self.submission_pending.store(false, Ordering::Release);
-        writer.write_all(data)?;
-        writer.flush()?;
-        self.shell_prompt.submitted(data);
-        if !data.is_empty() {
-            self.commit_submission(submitted_at, prompt);
-        }
-        Ok(())
-    }
-
-    /// The facts an admitted submission commits together. A `prompt` one
-    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
-    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+    /// The facts an admitted submission records. A `prompt` one follows a
+    /// known prompt; any other is a bare Enter.
+    fn record_submission(&self, submitted_at: SystemTime, prompt: bool) {
         {
             let mut evidence = self.evidence.lock();
             if prompt {
@@ -2283,8 +2319,25 @@ impl TerminalSession {
         }
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.advance_input(Some(true));
+    }
+
+    /// The facts of a submission tmux has delivered, committed by
+    /// [`crate::ControlWrite::finish`], with the view effects a PTY submission
+    /// has.
+    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        self.record_submission(submitted_at, prompt);
         self.mark_interactive();
         self.trigger_runtime();
+    }
+
+    /// The bookkeeping a ctl paste or key press through tmux does when it is
+    /// queued: tmux reports delivery later, and these facts don't wait for it.
+    fn note_control_input(&self, nonempty: bool) {
+        self.scroll_input_to_bottom();
+        if nonempty {
+            self.advance_input(Some(false));
+            self.mark_interactive();
+        }
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
@@ -2306,7 +2359,7 @@ impl TerminalSession {
                         .collect::<Vec<u8>>(),
                 ),
                 ControlInput::Submit => self.try_submit_input(b"\r"),
-                ControlInput::SubmitKey => self.try_submit(b"\r", false),
+                ControlInput::SubmitKey => self.try_write_submission(b"\r", Submission::Turn),
             };
             return ControlWrite::done(
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
@@ -2323,16 +2376,15 @@ impl TerminalSession {
         let submit = match &input {
             ControlInput::Submit | ControlInput::SubmitKey => {
                 self.scroll_input_to_bottom();
-                self.submission_pending.store(false, Ordering::Release);
                 let prompt = input == ControlInput::Submit;
                 Some((self.clone(), SystemTime::now(), prompt))
             }
             ControlInput::Paste(text) => {
-                self.admit_input(!text.is_empty());
+                self.note_control_input(!text.is_empty());
                 None
             }
             ControlInput::Keys { keys, .. } => {
-                self.admit_input(!keys.is_empty());
+                self.note_control_input(!keys.is_empty());
                 None
             }
         };
@@ -2371,7 +2423,6 @@ impl TerminalSession {
     /// Hide-time cancellation: old queued input stays invalid after Undo.
     pub fn hold_input(&self) {
         self.input_gate.hold();
-        self.submission_pending.store(false, Ordering::Release);
     }
 
     pub fn resume_input(&self) {
@@ -2395,8 +2446,14 @@ impl TerminalSession {
     /// [`Self::write_input`] for input the user produced themselves — a key typed
     /// into the pane — so it counts as someone being at this machine.
     pub fn write_user_input(&self, data: &[u8]) {
+        self.write_user_submission(data, Submission::None);
+    }
+
+    /// [`Self::write_submission`] for a key the user pressed themselves, as
+    /// [`Self::write_user_input`] counts it.
+    pub fn write_user_submission(&self, data: &[u8], submission: Submission) {
         self.mark_user_input();
-        self.write_input(data);
+        self.write_submission(data, submission);
     }
 
     /// Note that the user just sent this terminal input themselves: a key, a
@@ -2440,31 +2497,6 @@ impl TerminalSession {
             });
     }
 
-    /// Announce that the next input write submits a turn. Call it just before
-    /// writing the Enter (or the text ending in one).
-    pub fn mark_turn_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        self.evidence.lock().record_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
-    }
-
-    /// Explicit prompt submission from a path that supplied the prompt text.
-    /// Keyboard Enter alone can select a resume item, even after arrow input.
-    pub fn mark_prompt_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        let mut evidence = self.evidence.lock();
-        evidence.record_prompt_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
-    }
-
     /// Whether any turn was submitted in this launch, in any conversation.
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
@@ -2481,12 +2513,12 @@ impl TerminalSession {
         self.evidence.lock().initial_unbound_submission()
     }
 
-    /// The input revision and draft bit. Ordinary non-empty input writes (keys,
-    /// pastes, mouse and wheel reports) advance the revision before writer
-    /// admission; fallible submissions commit it after successful admission.
-    /// Focus reports and the terminal's own replies to the program don't count.
-    /// The draft bit is set
-    /// by typed input and cleared by a submission.
+    /// The input revision and draft bit. A non-empty input write (keys, pastes,
+    /// submissions, mouse and wheel reports) advances the revision only once
+    /// the writer has admitted it; a ctl write through tmux advances it when
+    /// queued. Focus reports and the terminal's own replies to the program
+    /// don't count. The draft bit is set by typed input and cleared by a
+    /// submission.
     pub fn input_snapshot(&self) -> (u64, bool) {
         let state = self.input_state.load(Ordering::Relaxed);
         (state >> 1, state & 1 != 0)
@@ -2557,13 +2589,7 @@ impl TerminalSession {
     /// advances the input revision, but it isn't text: the draft bit and the
     /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        if !data.is_empty() {
-            self.advance_input(None);
-        }
-        self.write_raw(data);
+        let _ = self.try_write_with_facts(data, InputFacts::Pointer);
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
@@ -6286,7 +6312,6 @@ mod runtime_fact_tests {
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
@@ -6335,8 +6360,7 @@ mod runtime_fact_tests {
         session.write_input(b"\x1b\r");
         assert_eq!(session.input_snapshot(), (2, true));
 
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         assert_eq!(session.input_snapshot(), (3, false));
         assert_eq!(events.try_recv(), Ok(()));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
@@ -6606,7 +6630,7 @@ mod runtime_fact_tests {
     }
 
     #[test]
-    fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
+    fn failed_submission_admission_leaves_no_facts() {
         struct RefuseSubmission {
             on_flush: bool,
         }
@@ -6634,7 +6658,6 @@ mod runtime_fact_tests {
             assert!(!session.has_submitted_turn());
             assert_eq!(session.first_submission_at(), None);
             assert!(!session.runtime_evidence(None).submitted);
-            assert!(!session.submission_pending.load(Ordering::Acquire));
             assert!(events.is_empty());
 
             // A recovered writer must treat the next key as ordinary draft
@@ -6651,6 +6674,45 @@ mod runtime_fact_tests {
             assert_eq!(events.try_recv(), Ok(()));
             session.kill();
         }
+    }
+
+    /// The writer's own refusal is the one that decides: a hold that landed
+    /// after the caller looked, or a writer whose child is gone. A write it
+    /// refuses leaves every input fact as it was: no revision, no draft bit,
+    /// no submission evidence and no runtime event.
+    #[test]
+    fn a_write_the_writer_refuses_changes_no_input_facts() {
+        struct Refuse;
+        impl std::io::Write for Refuse {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "terminal is closing",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session = fixture();
+        session.paste("draft");
+        let before = session.input_snapshot();
+        let events = session.runtime_events();
+        *session.writer.lock() = Box::new(Refuse);
+
+        assert!(session.try_write_input(b"x").is_err());
+        session.write_pointer(b"\x1b[<0;1;1M");
+        for submission in [crate::Submission::Turn, crate::Submission::Prompt] {
+            assert!(session.try_write_submission(b"go\r", submission).is_err());
+        }
+
+        assert_eq!(session.input_snapshot(), before);
+        assert!(!session.has_submitted_turn());
+        assert_eq!(session.first_submission_at(), None);
+        assert!(!session.runtime_evidence(None).submitted);
+        assert!(events.is_empty());
+        session.kill();
     }
 
     #[test]

@@ -4717,7 +4717,7 @@ mod loop_cleanup_tests {
     fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
         let (session, _receiver, _) = claude_loop_pane();
         // The startup prompt, typed before Claude has shown any identity.
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         assert_eq!(
             session.first_submission_binding(),
             Some(session.binding_revision())
@@ -4736,7 +4736,7 @@ mod loop_cleanup_tests {
         session.kill();
 
         let (session, _receiver, _) = claude_loop_pane();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let mut left = run(session.id);
         left.post_run = PostRunAction::Leave;
         let mut runs = HashMap::from([(pane, left)]);
@@ -4749,7 +4749,7 @@ mod loop_cleanup_tests {
     #[test]
     fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
         let (session, _receiver, _) = claude_loop_pane();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
         assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
@@ -4770,7 +4770,7 @@ mod loop_cleanup_tests {
     fn a_fresh_claude_loops_first_same_id_resume_abandons_exit_cleanup() {
         let (session, _receiver, bound) = claude_loop_pane();
         assert!(!session.launch_resumed());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
         assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
@@ -4810,7 +4810,7 @@ mod loop_cleanup_tests {
         // Observe A before submitting, so this exercises verified ownership.
         let first = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let a = session.binding_revision();
         let mut run = run(session.id);
         let working = snapshot(session.id, a, AgentStatus::Working);
@@ -4877,7 +4877,7 @@ mod loop_cleanup_tests {
     fn loop_cleanup_releases_an_ambiguous_initial_turn_at_the_cap() {
         let (session, _receiver) = session();
         let hook = SystemTime::now() - Duration::from_secs(1);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         // An unknown launch's first identity is reported after submission. The
         // task finishes inside its ambiguity window, then emits no more output;
         // the status stays uncertain until the window's settle deadline.
@@ -4918,7 +4918,7 @@ mod loop_cleanup_tests {
         // A fresh Codex launch: its conversation is unknown until it names it.
         let (session, _receiver) = session();
         let mut run = run(session.id);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         assert_eq!(session.first_submission_binding(), None);
         let first = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
@@ -4953,7 +4953,7 @@ mod loop_cleanup_tests {
         // Later identities and submissions cannot repair unknown ownership.
         let replacement = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{replacement} | Ready\x07").as_bytes());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let replaced = session.binding_revision();
         assert_eq!(session.first_submission_binding(), None);
         assert_eq!(
@@ -14706,8 +14706,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(self.continue_message_for(iid).as_bytes());
-            session.mark_prompt_submitted();
-            session.write_input(b"\r");
+            session.write_submission(b"\r", muxel_terminal::Submission::Prompt);
         }
     }
 
@@ -22249,8 +22248,7 @@ impl MuxelApp {
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
                 let session = view.read(cx).session();
-                session.mark_prompt_submitted();
-                session.write_input(payload.as_bytes());
+                session.write_submission(payload.as_bytes(), muxel_terminal::Submission::Prompt);
             }
         }
         self.broadcast_input
@@ -22300,14 +22298,14 @@ impl MuxelApp {
                     session.paste(text);
                 }
                 SnippetStep::Write(bytes) => {
-                    if bytes.ends_with(b"\r") {
-                        if supplied_prompt || bytes.len() > 1 {
-                            session.mark_prompt_submitted();
-                        } else {
-                            session.mark_turn_submitted();
-                        }
-                    }
-                    session.write_input(bytes);
+                    let submission = if !bytes.ends_with(b"\r") {
+                        muxel_terminal::Submission::None
+                    } else if supplied_prompt || bytes.len() > 1 {
+                        muxel_terminal::Submission::Prompt
+                    } else {
+                        muxel_terminal::Submission::Turn
+                    };
+                    session.write_submission(bytes, submission);
                 }
             }
         }
@@ -23084,8 +23082,7 @@ impl MuxelApp {
         };
         session.paste(text);
         if submit {
-            session.mark_prompt_submitted();
-            session.write_input(b"\r");
+            session.write_submission(b"\r", muxel_terminal::Submission::Prompt);
         }
         self.focus_instance(target.iid, window, cx);
     }
