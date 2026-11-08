@@ -1,6 +1,54 @@
 //! A Unix shell is quiet only when it has no child process, including jobs
 //! running behind its prompt. Failure to inspect children never proves idle.
 
+use std::path::{Path, PathBuf};
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    executable: PathBuf,
+    #[cfg(target_os = "linux")]
+    started_at: u64,
+}
+
+impl ProcessIdentity {
+    pub(crate) fn capture(pid: u32, expected: &Path) -> Option<Self> {
+        let identity = Self::read(pid)?;
+        // A profile can already have exec'd another program by the first read.
+        (identity.executable == expected).then_some(identity)
+    }
+
+    pub(crate) fn still_matches(&self, pid: u32) -> bool {
+        Self::read(pid).as_ref() == Some(self)
+    }
+
+    fn read(pid: u32) -> Option<Self> {
+        let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::identity(Path::new("/proc"), pid).ok()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: path is a writable buffer of exactly the supplied size.
+            if unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) } <= 0
+            {
+                return None;
+            }
+            let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
+            let executable =
+                std::fs::canonicalize(std::ffi::OsStr::from_bytes(path.to_bytes())).ok()?;
+            Some(Self { executable })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+}
+
 pub(crate) fn shell_has_no_children(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -44,17 +92,88 @@ pub(crate) fn shell_has_no_children(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::ProcessIdentity;
     use std::fs;
     use std::io::{self, ErrorKind};
     use std::path::Path;
 
     pub(super) fn has_no_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
         match task_children(proc, pid) {
-            // Kernels without CONFIG_PROC_CHILDREN have no children files.
-            // Scan parent pids instead; other read errors remain uncertain.
-            Err(error) if error.kind() == ErrorKind::NotFound => no_children_by_parent(proc, pid),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // A vanished shell task does not establish that the kernel
+                // lacks CONFIG_PROC_CHILDREN. Probe our own surviving task.
+                if !children_interface_missing(proc)? || !complete_visibility(proc)? {
+                    return Err(error);
+                }
+                no_children_by_parent(proc, pid)
+            }
             result => result,
         }
+    }
+
+    pub(super) fn identity(proc: &Path, pid: libc::pid_t) -> io::Result<ProcessIdentity> {
+        let process = proc.join(pid.to_string());
+        let started_at = start_time(&fs::read(process.join("stat"))?)?;
+        let executable = fs::canonicalize(fs::read_link(process.join("exe"))?)?;
+        // A reused pid must not combine the previous process's start time
+        // with the new process's executable.
+        if start_time(&fs::read(process.join("stat"))?)? != started_at {
+            return Err(invalid_process());
+        }
+        Ok(ProcessIdentity {
+            executable,
+            started_at,
+        })
+    }
+
+    fn children_interface_missing(proc: &Path) -> io::Result<bool> {
+        let task = proc.join(format!("self/task/{}", std::process::id()));
+        match fs::read(task.join("children")) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(fs::metadata(task)?.is_dir()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn complete_visibility(proc: &Path) -> io::Result<bool> {
+        let mounts = fs::read(proc.join("self/mountinfo"))?;
+        let mut found = false;
+        for line in mounts
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let separator = line
+                .windows(3)
+                .position(|part| part == b" - ")
+                .ok_or_else(invalid_process)?;
+            let mut mount = fields(&line[..separator]);
+            let root = mount.nth(3).ok_or_else(invalid_process)?;
+            if mount.next().ok_or_else(invalid_process)? != b"/proc" {
+                continue;
+            }
+            let options = mount.next().ok_or_else(invalid_process)?;
+            let mut filesystem = fields(&line[separator + 3..]);
+            let kind = filesystem.next().ok_or_else(invalid_process)?;
+            filesystem.next().ok_or_else(invalid_process)?;
+            let super_options = filesystem.next().ok_or_else(invalid_process)?;
+            if root != b"/"
+                || kind != b"proc"
+                || !unrestricted(options)
+                || !unrestricted(super_options)
+            {
+                return Ok(false);
+            }
+            found = true;
+        }
+        Ok(found)
+    }
+
+    fn unrestricted(options: &[u8]) -> bool {
+        options.split(|byte| *byte == b',').all(|option| {
+            !option.starts_with(b"pidns=")
+                && (!option.starts_with(b"hidepid")
+                    || matches!(option, b"hidepid=0" | b"hidepid=off"))
+        })
     }
 
     fn task_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
@@ -81,12 +200,7 @@ mod linux {
             else {
                 continue;
             };
-            let stat = match fs::read(process.path().join("stat")) {
-                Ok(stat) => stat,
-                // A process that exited during the walk has no work to lose.
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            let stat = fs::read(process.path().join("stat"))?;
             if parent_pid(&stat)? == pid {
                 return Ok(false);
             }
@@ -98,25 +212,43 @@ mod linux {
     fn parent_pid(stat: &[u8]) -> io::Result<libc::pid_t> {
         // comm is parenthesized and can contain spaces, ')' and non-UTF8.
         // The fields after its final ')' start with state, then parent pid.
-        let invalid = || io::Error::new(ErrorKind::InvalidData, "invalid process stat");
+        std::str::from_utf8(stat_field(stat, 1)?)
+            .ok()
+            .and_then(|parent| parent.parse().ok())
+            .ok_or_else(invalid_process)
+    }
+
+    fn start_time(stat: &[u8]) -> io::Result<u64> {
+        // Field 22; state is the first field after comm (field 3).
+        std::str::from_utf8(stat_field(stat, 19)?)
+            .ok()
+            .and_then(|started| started.parse().ok())
+            .ok_or_else(invalid_process)
+    }
+
+    fn stat_field(stat: &[u8], index: usize) -> io::Result<&[u8]> {
         let end = stat
             .iter()
             .rposition(|&byte| byte == b')')
-            .ok_or_else(invalid)?;
-        let parent = stat[end + 1..]
+            .ok_or_else(invalid_process)?;
+        fields(&stat[end + 1..])
+            .nth(index)
+            .ok_or_else(invalid_process)
+    }
+
+    fn fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+        bytes
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
-            .nth(1)
-            .ok_or_else(invalid)?;
-        std::str::from_utf8(parent)
-            .ok()
-            .and_then(|parent| parent.parse().ok())
-            .ok_or_else(invalid)
+    }
+
+    fn invalid_process() -> io::Error {
+        io::Error::new(ErrorKind::InvalidData, "incomplete process information")
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{has_no_children, parent_pid};
+        use super::{has_no_children, parent_pid, start_time};
         use std::fs;
         use std::path::PathBuf;
 
@@ -164,13 +296,16 @@ mod linux {
 
         #[test]
         fn missing_children_files_fall_back_to_parent_pids() {
-            let proc = Proc::new();
-            proc.write("7/stat", b"7 (unrelated) S 1 7 7");
-            assert!(has_no_children(&proc.0, 40).unwrap());
-            proc.write("51/stat", b"51 (sleep) S 40 51 40");
-            assert!(!has_no_children(&proc.0, 40).unwrap());
-            fs::remove_dir_all(proc.0.join("51")).unwrap();
-            assert!(has_no_children(&proc.0, 40).unwrap());
+            for options in ["rw", "rw,hidepid=0", "rw,hidepid=off"] {
+                let proc = Proc::new();
+                proc.mount_options(options);
+                proc.write("7/stat", b"7 (unrelated) S 1 7 7");
+                assert!(has_no_children(&proc.0, 40).unwrap());
+                proc.write("51/stat", b"51 (sleep) S 40 51 40");
+                assert!(!has_no_children(&proc.0, 40).unwrap());
+                fs::remove_dir_all(proc.0.join("51")).unwrap();
+                assert!(has_no_children(&proc.0, 40).unwrap());
+            }
         }
 
         #[test]
@@ -190,6 +325,14 @@ mod linux {
         fn stat_names_do_not_shift_parent_fields() {
             assert_eq!(parent_pid(b"51 (a name ) with \xff) S 40 51").unwrap(), 40);
             assert!(parent_pid(b"51 (no parent) S").is_err());
+            assert_eq!(
+                start_time(
+                    b"40 (a name) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 987654321 23"
+                )
+                .unwrap(),
+                987654321
+            );
+            assert!(start_time(b"40 (no start time) S 1").is_err());
         }
 
         #[test]
@@ -199,6 +342,7 @@ mod linux {
                 "rw,hidepid=2",
                 "rw,hidepid=4",
                 "rw,hidepid=invisible",
+                "rw,pidns=123",
             ] {
                 let proc = Proc::new();
                 // Only the shell is visible. A restricted proc mount can omit
@@ -211,7 +355,12 @@ mod linux {
         #[test]
         fn fallback_needs_readable_mount_information() {
             let proc = Proc::new();
-            for mountinfo in [b"".as_slice(), b"unreadable mount fields"] {
+            for mountinfo in [
+                b"".as_slice(),
+                b"unreadable mount fields",
+                b"1 0 0:1 /40 /proc rw - proc proc rw\n",
+                b"1 0 0:1 / /somewhere-else rw - proc proc rw\n",
+            ] {
                 proc.write("self/mountinfo", mountinfo);
                 assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
             }

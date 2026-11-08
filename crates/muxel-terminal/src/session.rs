@@ -1255,6 +1255,9 @@ pub struct TerminalSession {
     /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
+    /// `exec` can replace the shell without changing its pid or foreground group.
+    #[cfg(unix)]
+    child_identity: Option<crate::process_tree_unix::ProcessIdentity>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
     /// Current root OSC 7501 report from this PTY launch. Child-id records do
@@ -1585,6 +1588,13 @@ impl TerminalSession {
         // program or argv that Muxel resolved.
         apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
+        // Use the PTY's PATH/cwd resolution before a startup command can exec
+        // something else; that replacement must not become the trusted image.
+        #[cfg(unix)]
+        let expected_executable = builder
+            .as_command()
+            .ok()
+            .and_then(|command| std::fs::canonicalize(command.get_program()).ok());
         let phase = std::time::Instant::now();
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
         if let Some(instance_id) = instance_id {
@@ -1598,6 +1608,13 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
+        #[cfg(unix)]
+        let child_identity =
+            child_pid
+                .zip(expected_executable.as_deref())
+                .and_then(|(pid, expected)| {
+                    crate::process_tree_unix::ProcessIdentity::capture(pid, expected)
+                });
         let killer = Arc::new(Mutex::new(child.clone_killer()));
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let reader_wake = ReaderWake::new(&*pair.master, &tx.queue_state())?;
@@ -1805,6 +1822,8 @@ impl TerminalSession {
             shell_prompt,
             input_stop: write_tx,
             child_pid,
+            #[cfg(unix)]
+            child_identity,
             title,
             evidence,
             program_status,
@@ -3220,13 +3239,13 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child owns the foreground process group and has no child
-    /// process of its own. Foreground commands take the group; background jobs
-    /// keep the shell busy even while its prompt is showing. Used to skip the
+    /// Whether the child owns the foreground group, has no children and still
+    /// runs its original executable. Background jobs and executable changes
+    /// keep the pane busy even if its prompt marks remain. Used to skip the
     /// close confirmation for an untouched shell pane.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown child
-    /// pid, a failed child lookup, or a platform without `tcgetpgrp` (Windows)
+    /// pid, an unverified executable, a failed child lookup, or no `tcgetpgrp`
     /// — so callers stay safe and confirm as usual.
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
@@ -3240,7 +3259,12 @@ impl TerminalSession {
                 self.child_pid,
             ) {
                 (Some(fg), Some(pid)) => {
-                    fg == pid as libc::pid_t && crate::process_tree_unix::shell_has_no_children(pid)
+                    fg == pid as libc::pid_t
+                        && crate::process_tree_unix::shell_has_no_children(pid)
+                        && self
+                            .child_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.still_matches(pid))
                 }
                 _ => false,
             }
