@@ -483,6 +483,13 @@ inherit abandoned work. A historical child thread resumed after a restart may
 be unobserved; remote child files are not read. File and record format changes can disable
 this source; terminal footer layout changes can disable the screen sources.
 
+Plain `ctl wait` now follows the background hold rather than returning at the
+foreground turn's end. `ctl wait --turn` stops at an observable turn end with
+background work still listed. It cannot override a provider's continuing Working
+report. Both send admission and the background turn-end decision require a hold
+attributable to the current conversation binding; cached holds from before a
+switch cannot authorize input or finish a wait.
+
 A held turn takes no completion: the report that started the hold would otherwise stamp
 the pane as finished. The release is its own status change. A switch reads the same way:
 `/clear` beside a running shell leaves no report until the next turn, and only a title
