@@ -803,8 +803,9 @@ impl EditorView {
         self.rescue.offer.is_some()
     }
 
-    /// Type `text` at the cursor, as a keystroke would.
-    #[cfg(test)]
+    /// Type `text` at the cursor, as a keystroke would. Only the Windows app
+    /// tests use it.
+    #[cfg(all(test, windows))]
     pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let text = text.to_string();
         self.input.update(cx, |s, cx| s.insert(text, window, cx));
