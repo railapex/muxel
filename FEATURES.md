@@ -497,9 +497,10 @@ feature is added or changed, update the matching entry here in the same change**
   finished turn. Subagents hold until they end. Closing a pane asks while anything is
   listed as running, and `ctl status` reports it as `background`. `ctl send` still
   delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
-  keeps waiting through a hold, so it returns the agent's reply after the work, and
-  lists what's still running if it times out first; `ctl wait --turn` stops as soon
-  as the turn is over instead. Claude's
+  keeps waiting through a hold, changing its previous behavior of returning when
+  the foreground turn finished. It lists what's still running if it times out
+  first; `ctl wait --turn` stops at an observable turn end even if background work
+  remains. It cannot override a provider still reporting **working**. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity
