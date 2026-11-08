@@ -118,6 +118,7 @@ impl StatusSource {
     /// Take a watch's news. Whether it may change what `git status` lists,
     /// so the target is due once the writes settle.
     pub(super) fn note(&mut self, change: &Change) -> bool {
+        eprintln!("PROBE note kind={:?} touched={} relist={} rescan={} unknown={:?} learned={:?}", self.kind, change.touched, change.relist, change.rescan, change.unknown, self.learned);
         self.dirty |= change.touched || change.rescan;
         // Lost events may include HEAD's, the index's or an ignore file's.
         self.replan |= change.relist || change.rescan;
@@ -213,6 +214,7 @@ impl StatusResult {
 
 impl StatusJob {
     fn run(mut self) -> StatusResult {
+        eprintln!("PROBE run key={} loc={:?} must={} replan={} watched={} pending={:?}", self.key, match &self.loc { RepoLoc::Local(d) => d.display().to_string(), _ => "remote".into() }, self.must, self.replan, self.watched, self.pending);
         let RepoLoc::Local(dir) = &self.loc else {
             // Remote: read over ssh, never watched.
             return StatusResult {
@@ -235,17 +237,20 @@ impl StatusJob {
         // An event the watcher lost may have left the plan behind HEAD, the
         // index or an ignore rule.
         self.replan |= self.watched && self.plan.as_ref().is_some_and(|plan| !plan.current());
+        eprintln!("PROBE after-stamp replan={} current={:?}", self.replan, self.plan.as_ref().map(|p| p.current()));
         let plan = if self.replan {
             integrations::status_plan(dir).map(Arc::new)
         } else {
             self.plan.clone()
         };
         let mut ignored = Vec::new();
+        if let Some(p) = &plan { eprintln!("PROBE plan root={} ignored={:?} git_dir={:?} settled={} state={:?}", p.root.display(), p.ignored, p.git_dir, p.diff.settled, p.diff.state); }
         if !(self.must || self.replan || self.pending.is_empty())
             && let Some(plan) = &plan
             && let Some(found) =
                 integrations::check_ignored(&plan.root, &with_ancestors(&self.pending))
         {
+            eprintln!("PROBE check_ignored asked={:?} found={:?}", with_ancestors(&self.pending), found);
             let all = self.pending.iter().all(|path| hidden(&found, path));
             ignored = found.into_iter().collect();
             if all {
@@ -255,6 +260,7 @@ impl StatusJob {
                 };
             }
         }
+        eprintln!("PROBE status runs key={}", self.key);
         let files = integrations::git_status_files(&self.loc);
         let dirs = untracked_dirs(&files);
         // Where each directory is its own watch, a directory may have come

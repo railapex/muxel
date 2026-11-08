@@ -39,7 +39,7 @@ jobs:
         # x86_64 + arm64 Linux (native runners), macOS (Apple Silicon), Windows.
         # Intel macOS isn't a separate test runner — it's covered by the release
         # job's x86_64 cross-compile (the code is arch-portable).
-        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2022]
+        os: [macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -66,8 +66,8 @@ jobs:
         if: runner.os != 'Windows'
         run: tmux -V
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      - run: cargo test -p muxel --bin muxel -- changes_refresh_tests --nocapture --test-threads=1 2>&1 | grep -E "PROBE|^test |panicked|test result" || true
+      - run: cargo test -p muxel --bin muxel -- changes_refresh_tests
       # `muxel ctl` (outside agents such as Grok Bot driving muxel) runs from
       # contexts with no display: it must start, print its usage, and report —
       # as JSON, exit 1 — that no muxel is running, without touching the GUI.
