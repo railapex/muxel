@@ -383,6 +383,19 @@ fn runtime_control_state(
     }
 }
 
+/// A turn held at Working for its background work is over, and its prompt is free.
+fn send_admission_state(
+    state: Option<AgentState>,
+    reason: Option<muxel_terminal::TerminalStatusReason>,
+) -> Option<AgentState> {
+    if state == Some(AgentState::Working)
+        && reason == Some(muxel_terminal::TerminalStatusReason::BackgroundWork)
+    {
+        return Some(AgentState::Done);
+    }
+    state
+}
+
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
     if !admission.force {
         if admission.just_submitted {
@@ -1182,6 +1195,10 @@ impl MuxelApp {
                 .control_turns
                 .get(&inst.id)
                 .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+            background: self
+                .terminal_view(inst.id)
+                .and_then(|view| view.read(cx).runtime_snapshot().background),
+            turn_over: self.control_turn_over(inst, now, cx),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
@@ -1451,7 +1468,7 @@ impl MuxelApp {
             input,
             turn,
             site: self.control_claim_site(inst),
-            state: self.control_state(inst, cx),
+            state: self.control_admission_state(inst, cx),
             activity: inst.activity.clone(),
             force,
             launch_id: None,
@@ -1460,9 +1477,30 @@ impl MuxelApp {
         })
     }
 
+    /// A turn held for its background work is over, unless a prompt sent since then
+    /// hasn't started yet, whose reply this would pass off as the previous one.
+    fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
+        self.terminal_view(inst.id).is_some_and(|view| {
+            view.read(cx).runtime_snapshot().reason
+                == muxel_terminal::TerminalStatusReason::BackgroundWork
+        }) && !self
+            .control_turns
+            .get(&inst.id)
+            .is_some_and(|turn| turn.awaiting_reply(Some(AgentState::Done), &inst.activity, now))
+    }
+
+    /// The state a prompt is admitted against, here and by a peer sharing the pane.
+    fn control_admission_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        send_admission_state(
+            self.control_state(inst, cx),
+            self.terminal_view(inst.id)
+                .map(|view| view.read(cx).runtime_snapshot().reason),
+        )
+    }
+
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
-        let state = inst.and_then(|inst| self.control_state(inst, cx));
+        let state = inst.and_then(|inst| self.control_admission_state(inst, cx));
         let coverage = self
             .terminal_view(iid)
             .map(|view| view.read(cx).runtime_snapshot().coverage);
@@ -2640,6 +2678,24 @@ mod prompt_submission_tests {
                     .any(|at| tmux_matches(tail, &rest[at..]))
             }),
         }
+    }
+
+    /// A turn held for its background work is over, so a prompt goes in. A turn
+    /// actually running still refuses.
+    #[test]
+    fn send_goes_to_a_turn_held_only_for_its_background_work() {
+        use muxel_terminal::TerminalStatusReason as Reason;
+        let state =
+            |reason| super::send_admission_state(Some(super::AgentState::Working), Some(reason));
+        assert_eq!(state(Reason::BackgroundWork), Some(super::AgentState::Done));
+        assert_eq!(
+            state(Reason::ProgramStatus(None)),
+            Some(super::AgentState::Working)
+        );
+        assert_eq!(
+            state(Reason::ProviderScreen),
+            Some(super::AgentState::Working)
+        );
     }
 
     #[test]
@@ -4117,6 +4173,7 @@ mod runtime_control_tests {
         let revision = session.binding_revision();
         let activity = AgentActivity::default();
         let cached = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Done,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -4133,6 +4190,7 @@ mod runtime_control_tests {
         session.provider_switched(now, now);
         for old_status in [AgentStatus::Idle, AgentStatus::Done] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status: old_status,
                 ..cached
             };
@@ -4167,6 +4225,7 @@ mod runtime_control_tests {
             AgentStatus::Idle,
         ] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status,
                 attributable: false,
                 binding_rev: session.binding_revision(),

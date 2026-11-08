@@ -1,0 +1,8 @@
+{"timestamp":"2026-11-08T14:57:27.591Z","type":"session_meta","payload":{"id":"01a1bbaa-121c-7000-8000-000000000002","parent_thread_id":"01a1bba7-6f16-7000-8000-000000000001","timestamp":"2026-11-08T14:57:27.589Z","subagent_history_start_ordinal":4}}
+{"timestamp":"2026-11-08T14:57:27.591Z","type":"session_meta","payload":{"id":"01a1bba7-6f16-7000-8000-000000000001"}}
+{"timestamp":"2026-11-08T14:57:27.593Z","type":"event_msg","payload":{"type":"task_started","turn_id":"parent-turn"}}
+{"timestamp":"2026-11-08T14:57:27.593Z","type":"response_item","payload":{"type":"message","role":"developer","content":[]}}
+{"timestamp":"2026-11-08T14:57:27.595Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}
+{"timestamp":"2026-11-08T14:57:27.700Z","type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}
+{"timestamp":"2026-11-08T14:59:08.080Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}}
+{"timestamp":"2026-11-08T14:59:08.094Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"child-turn"}}

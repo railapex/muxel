@@ -16,6 +16,23 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Work an agent's screen says is still running beside its turn. Read from the
+/// screen every time, so it is never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundWork {
+    pub shells: u32,
+    pub monitors: u32,
+    /// Running subagents, which the agent's screen may name without a count.
+    pub subagents: bool,
+}
+
+impl BackgroundWork {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 mod new;
 pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
@@ -474,6 +491,13 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// What the agent's own screen says is still running beside its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// The turn is over and only `background` keeps the pane Working. `wait --turn`
+    /// stops here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_over: bool,
     /// A startup task that failed before provider acceptance. The terminal itself
     /// may still be running, for example at a folder-trust menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1251,6 +1275,8 @@ pub enum CliCommand {
         agent: String,
         timeout_secs: u64,
         full: bool,
+        /// Stop when the turn ends, even with background work still running.
+        turn: bool,
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
@@ -1278,8 +1304,10 @@ usage: muxel ctl <command> [args]
   send AGENT TEXT [--force] [--launch-id ID]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal
-  wait AGENT [--timeout SECS] [--full]
-                                 wait for the turn to end, then show it
+  wait AGENT [--timeout SECS] [--full] [--turn]
+                                 wait for the agent to finish, then show it;
+                                 --turn stops at the turn's end, even with
+                                 background work still running
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
@@ -1350,7 +1378,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
@@ -1454,6 +1482,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
+    let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
     let mut lines: Option<usize> = None;
@@ -1466,6 +1495,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 break;
             }
             "--full" => full = true,
+            "--turn" => turn = true,
             "--force" => force = true,
             "--launch-id" => {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
@@ -1569,6 +1599,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 agent: agent(&words)?,
                 timeout_secs: timeout.unwrap_or(WAIT_TIMEOUT_SECS),
                 full,
+                turn,
             });
         }
         "skill" => return Ok(CliCommand::Skill),
@@ -1850,8 +1881,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   and an added blank cursor line proving that the first Enter was consumed;
   a pending Enter never authorizes another.
   An unconfirmed receipt requires inspecting `screen` before more input.
-- `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints.
+- `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
+  turn and any background work it left have finished (or it blocks on a question,
+  or exits), then print what `show` prints. A turn that ends beside a running shell
+  or subagent usually wakes when that work ends, so plain `wait` returns the reply
+  after it. `--turn` stops at the turn's end instead. Either way `wait.background`
+  lists anything still running.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
   our Enter. Codex may receive one extra Enter only while its exact task remains
   on one exact ASCII row in its live idle editor, with no new user row. Wrapped
@@ -2338,6 +2373,8 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            background: None,
+            turn_over: false,
             startup_error: None,
             focused: false,
             pane: Some(1),
@@ -2780,7 +2817,17 @@ Steps:
             Ok(CliCommand::Wait {
                 agent: "a1b2".into(),
                 timeout_secs: 30,
-                full: false
+                full: false,
+                turn: false
+            })
+        );
+        assert_eq!(
+            parse_cli(&words(&["wait", "a1b2", "--turn"])),
+            Ok(CliCommand::Wait {
+                agent: "a1b2".into(),
+                timeout_secs: crate::control::WAIT_TIMEOUT_SECS,
+                full: false,
+                turn: true
             })
         );
         assert_eq!(

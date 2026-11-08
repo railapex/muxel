@@ -60,7 +60,7 @@ impl CodexHintMiss {
     }
 }
 
-fn creation_time(hint: &str) -> Option<DateTime<Utc>> {
+pub(super) fn creation_time(hint: &str) -> Option<DateTime<Utc>> {
     if !is_codex_thread_id_hint(hint) {
         return None;
     }

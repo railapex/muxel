@@ -3046,6 +3046,11 @@ impl TerminalSession {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_title_age_for_test(&self, age: Duration) {
+        *self.title_changed_at.lock() = Some(Instant::now() - age);
+    }
+
     /// The running TUI switched provider conversations at some instant in
     /// `[from, to]` (one instant when the report carries its own time), as
     /// reported out of band: a session hook's record or a registry row, read on

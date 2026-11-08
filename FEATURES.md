@@ -519,8 +519,28 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Claude's
+  permission forms report **blocked**, and background work listed by Claude's footer,
+  Grok's panel, Codex's terminal badge or Muse's terminal tree holds a finished turn
+  at **working**, labelled with what's running
+  (`working · 1 shell`). The screen readers cover tmux and SSH panes too, and beat Claude's own
+  finished report. A held turn doesn't alert or move in Recent, and it reads **done**
+  once when the work ends and the agent has had a moment to wake for it. Shells and
+  monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
+  the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
+  finished turn. Subagents hold until they end. Local Codex panes also read child-turn
+  lifecycle records for subagents created during the current pane launch; their normal
+  composer has no live child count. Panes identified later also pick up children
+  already running beside them. Copied parent history and children left by an
+  earlier launch do not count. Muse's completion hook can retire a leftover spinner
+  title after five seconds without output or a title update; live work stays listed.
+  A redraw alone cannot make that retired title read as new work. New titles and
+  Working hooks remain valid work signals.
+  Closing a pane asks while anything is
+  listed as running, and `ctl status` reports it as `background`. `ctl send` still
+  delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
+  keeps waiting through a hold, so it returns the agent's reply after the work, and
+  lists what's still running if it times out first; `ctl wait --turn` stops as soon
+  as the turn is over instead. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity

@@ -16,6 +16,9 @@ uuid.workspace = true
 base64 = "0.22"
 # Already resolved for the app/store; decode UUIDv7 rollout dates in local time.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Already used by GPUI; receive new rollout paths without rescanning a growing
+# day directory for every child.
+notify = "7"
 # Team libraries (`library`): parse `muxel-library.toml` and strip Unicode format
 # characters. Both already in the tree (via muxel-store and rustybuzz), so these
 # add dependency edges, not new crates.
