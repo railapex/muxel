@@ -1173,6 +1173,18 @@ feature is added or changed, update the matching entry here in the same change**
   that had already closed its terminal is not force-killed, as before. The
   operating system's own hangup when the pane's terminal closes is separate and
   outside muxel's control, so a program is not guaranteed those five seconds.
+- **Per-process memory limit (Windows)** — each local pane's process tree runs in
+  its own job object, and every process in it can commit at most 16 GB by default
+  (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
+  after it). A process that asks for more is refused, which usually stops it, so
+  one runaway can't exhaust the machine's memory and crash muxel and other
+  programs; the pane and its other processes keep running, and the
+  notifications feed names the process and its PID. The limit is per process, so
+  a pane running many large processes at once (parallel compilers) is unaffected.
+  Processes started in the pane's first instant are covered; programs started
+  from a pane still outlive it. A child that asks to break away from the job, and
+  processes a remote host or tmux server runs, aren't covered. If Windows can't
+  apply the limit, the pane starts without one and the reason is logged.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
