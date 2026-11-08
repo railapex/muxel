@@ -23243,8 +23243,9 @@ impl MuxelApp {
         sidebar_order(pane_ids, placing, &shown, bands, self.settings.sidebar_sort)
     }
 
-    /// `pid`'s sidebar entries as the sidebar draws them now.
-    #[cfg(test)]
+    /// `pid`'s sidebar entries as the sidebar draws them now, for the Windows
+    /// app tests that click rows.
+    #[cfg(all(test, windows))]
     fn sidebar_entries_now(&self, pid: Uuid, cx: &App) -> Vec<SidebarEntry> {
         let project = self.workspace.project(pid).expect("project");
         let instances = instances_by_id(&self.workspace);
