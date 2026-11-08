@@ -38,17 +38,21 @@ impl Shell {
             ("PS1".into(), prompt),
             ("HISTFILE".into(), "/dev/null".into()),
         ];
+        let shell = Self::spawn(spec, marked);
+        shell.read_prompt();
+        assert_eq!(shell.session.shell_at_prompt(), marked);
+        shell
+    }
+
+    fn spawn(spec: CommandSpec, marked: bool) -> Self {
         let (session, rx) = TerminalSession::spawn(spec, 120, 24).expect("spawn bash");
-        let shell = Self {
+        Self {
             session,
             rx,
             job: None,
             marked,
             pending: RefCell::new(String::new()),
-        };
-        shell.read_prompt();
-        assert_eq!(shell.session.shell_at_prompt(), marked);
-        shell
+        }
     }
 
     fn read_until(&self, marker: &str) -> String {
@@ -146,6 +150,58 @@ impl Shell {
         self.read_until("JOB_REAPED");
         self.read_prompt();
     }
+
+    fn wait_for_exec(&self) {
+        let pid = self.session.child_pid.expect("shell pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while executable(pid).is_none_or(|path| path.file_name() != Some("cat".as_ref())) {
+            assert!(Instant::now() < deadline, "the shell never exec'd cat");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            self.session
+                .master
+                .inner
+                .lock()
+                .as_ref()
+                .and_then(|master| master.process_group_leader()),
+            Some(pid as libc::pid_t),
+            "exec keeps the shell's foreground group"
+        );
+        assert!(crate::process_tree_unix::shell_has_no_children(pid));
+    }
+}
+
+/// Read the OS image independently of the idle predicate under test. `cat`
+/// waits for input until this test closes its session, without a timed exit.
+fn executable(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: path is a writable buffer whose exact size is passed.
+        if unsafe {
+            libc::proc_pidpath(
+                pid as libc::pid_t,
+                path.as_mut_ptr().cast(),
+                path.len() as u32,
+            )
+        } <= 0
+        {
+            return None;
+        }
+        let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
+        Some(std::ffi::OsStr::from_bytes(path.to_bytes()).into())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 impl Drop for Shell {
@@ -199,4 +255,36 @@ fn a_foreground_command_is_not_idle() {
     assert_eq!(shell.close_decision(), CloseDecision::Ask);
     shell.end_job();
     assert!(shell.session.is_idle_foreground());
+}
+
+#[test]
+fn an_exec_replacement_asks_before_close() {
+    for marked in [false, true] {
+        let shell = Shell::start(marked);
+        shell.session.write_input(b"exec /bin/cat\n");
+        shell.wait_for_exec();
+        assert_eq!(
+            shell.close_decision(),
+            CloseDecision::Ask,
+            "a replacement with the shell's PID and no children must ask"
+        );
+    }
+}
+
+#[test]
+fn an_immediate_exec_does_not_establish_an_idle_shell() {
+    let shell = Shell::spawn(
+        CommandSpec::program(
+            "/bin/bash",
+            vec![
+                "--noprofile".into(),
+                "--norc".into(),
+                "-c".into(),
+                "exec /bin/cat".into(),
+            ],
+        ),
+        false,
+    );
+    shell.wait_for_exec();
+    assert_eq!(shell.close_decision(), CloseDecision::Ask);
 }

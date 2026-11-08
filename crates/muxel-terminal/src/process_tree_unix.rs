@@ -127,14 +127,24 @@ mod linux {
                 let root =
                     std::env::temp_dir().join(format!("muxel-proc-{}", uuid::Uuid::new_v4()));
                 fs::create_dir_all(root.join("40/task/40")).unwrap();
+                fs::create_dir_all(root.join(format!("self/task/{}", std::process::id()))).unwrap();
                 fs::write(root.join("40/stat"), b"40 (bash) S 1 40 40").unwrap();
-                Self(root)
+                let proc = Self(root);
+                proc.mount_options("rw");
+                proc
             }
 
             fn write(&self, path: &str, content: &[u8]) {
                 let path = self.0.join(path);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, content).unwrap();
+            }
+
+            fn mount_options(&self, options: &str) {
+                self.write(
+                    "self/mountinfo",
+                    format!("1 0 0:1 / /proc rw - proc proc {options}\n").as_bytes(),
+                );
             }
         }
 
@@ -180,6 +190,49 @@ mod linux {
         fn stat_names_do_not_shift_parent_fields() {
             assert_eq!(parent_pid(b"51 (a name ) with \xff) S 40 51").unwrap(), 40);
             assert!(parent_pid(b"51 (no parent) S").is_err());
+        }
+
+        #[test]
+        fn hidden_processes_cannot_be_treated_as_absent_children() {
+            for options in [
+                "rw,hidepid=1",
+                "rw,hidepid=2",
+                "rw,hidepid=4",
+                "rw,hidepid=invisible",
+            ] {
+                let proc = Proc::new();
+                // Only the shell is visible. A restricted proc mount can omit
+                // a live child without producing a read error for that child.
+                proc.mount_options(options);
+                assert!(!has_no_children(&proc.0, 40).unwrap_or(false), "{options}");
+            }
+        }
+
+        #[test]
+        fn fallback_needs_readable_mount_information() {
+            let proc = Proc::new();
+            for mountinfo in [b"".as_slice(), b"unreadable mount fields"] {
+                proc.write("self/mountinfo", mountinfo);
+                assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+            }
+            fs::remove_file(proc.0.join("self/mountinfo")).unwrap();
+            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+        }
+
+        #[test]
+        fn a_disappearing_task_does_not_select_the_fallback() {
+            let proc = Proc::new();
+            proc.write("40/task/40/children", b"");
+            fs::create_dir_all(proc.0.join("40/task/41")).unwrap();
+            proc.write(&format!("self/task/{}/children", std::process::id()), b"");
+            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+        }
+
+        #[test]
+        fn a_disappearing_proc_entry_cannot_prove_idle() {
+            let proc = Proc::new();
+            fs::create_dir_all(proc.0.join("51")).unwrap();
+            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
         }
     }
 }
