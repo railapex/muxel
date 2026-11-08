@@ -13491,8 +13491,9 @@ impl MuxelApp {
                 .spawn(async move {
                     jobs.into_iter()
                         .map(|(pid, loc)| {
-                            let branch = integrations::repo_current_branch(&loc);
-                            let branches = integrations::list_branches(&loc);
+                            // One ssh for both: the branch and the list.
+                            let (branch, branches) =
+                                integrations::read_branches(&loc).unwrap_or_default();
                             (pid, branch, branches)
                         })
                         .collect::<Vec<_>>()
