@@ -129,7 +129,8 @@ impl MuxelApp {
                     if change.rescan {
                         self.diff_panes.schedule.changed(pane, None);
                     }
-                    if change.relist
+                    // Lost events may include HEAD's or the index's.
+                    if (change.relist || change.rescan)
                         && let Some(source) = self.diff_panes.sources.get_mut(&pane)
                     {
                         source.replan = true;
