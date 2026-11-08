@@ -495,6 +495,40 @@ fn control_new_trusts_a_declared_caller_only_when_it_is_a_live_terminal() {
         let opened = open_from(&mut app, Some(declared));
         assert_eq!(group(&app, focused), [focused, opened]);
         assert_eq!(group(&app, declared), [declared]);
+        // Nor may it claim the new session in Recent work.
+        assert_eq!(app.workspace.instance(opened).unwrap().opened_by, None);
+    }
+}
+
+#[test]
+fn control_new_records_the_calling_session_as_spawner_unless_top_level() {
+    let opened_by = |app: &MuxelApp, iid: Uuid| app.workspace.instance(iid).unwrap().opened_by;
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (_, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+
+    let child = open_from(&mut app, Some(caller));
+    assert_eq!(opened_by(&app, child), Some(caller));
+
+    let independent = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane: Some(caller),
+                top_level: true,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let independent: Uuid = serde_json::from_value(independent["uuid"].clone()).unwrap();
+    assert_eq!(opened_by(&app, independent), None);
+
+    // No caller, a closed one, or one in another project spawns nothing.
+    let (_, other_project_pane) = target_project(&mut app, false);
+    for declared in [None, Some(Uuid::new_v4()), other_project_pane] {
+        let opened = open_from(&mut app, declared);
+        assert_eq!(opened_by(&app, opened), None, "{declared:?}");
     }
 }
 

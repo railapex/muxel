@@ -28052,22 +28052,30 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
-                let entries = {
+                let (entries, asking_below) = {
                     let app: &App = cx;
                     // Rows place by the status they show, like their badges.
                     let shown = |iid: Uuid| {
                         let instance = instances.get(&iid).copied();
                         Some(activity_state(self.sidebar_status(iid, instance, app)))
                     };
-                    sidebar_order(&pane_ids, &instances, &shown, bands, sort)
+                    let entries = sidebar_order(&pane_ids, &instances, &shown, bands, sort);
+                    // A family's top row says when a session nested under it asks.
+                    let asking: Vec<usize> = (0..entries.len())
+                        .map(|at| match entries[at] {
+                            SidebarEntry::Pane(_) => nested_asking(&entries, at, &instances, &shown),
+                            _ => 0,
+                        })
+                        .collect();
+                    (entries, asking)
                 };
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                for entry in entries {
-                    let (iid, nested) = match entry {
+                for (entry, asking_below) in entries.into_iter().zip(asking_below) {
+                    let (iid, depth) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
@@ -28090,9 +28098,11 @@ impl MuxelApp {
                             );
                             continue;
                         }
-                        SidebarEntry::Pane(iid) => (iid, false),
-                        // Under the session that opened it, one step further in.
-                        SidebarEntry::Nested(iid) => (iid, true),
+                        SidebarEntry::Pane(iid) => (iid, 0.0),
+                        // Under the session that opened or spawned it, one step
+                        // further in; a child session's files, two.
+                        SidebarEntry::Nested(iid) => (iid, 1.0),
+                        SidebarEntry::NestedTwice(iid) => (iid, 2.0),
                     };
                     let inst = instances.get(&iid).copied();
                     let popped_out = self.popouts.contains_key(&iid);
@@ -28155,7 +28165,7 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
-                        .ml(rems(if nested { 2.0 } else { 1.0 }))
+                        .ml(rems(1.0 + depth))
                         .mr_1()
                         .px_2()
                         .py_1()

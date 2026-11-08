@@ -486,6 +486,37 @@ fn new_preserves_focus_by_default_and_focus_wins_over_legacy_background() {
 }
 
 #[test]
+fn new_top_level_opts_out_of_nesting_and_stays_off_the_wire_unless_set() {
+    let parsed = |flags: &[&str]| {
+        let mut args = words(&["new", "repo"]);
+        args.extend(words(flags));
+        let CliCommand::Request(muxel_core::control::Command::New { options, .. }) =
+            parse_cli(&args).unwrap()
+        else {
+            panic!("expected new");
+        };
+        options
+    };
+    let nested = parsed(&[]);
+    assert!(!nested.top_level);
+    // Older hosts see the same request they always did.
+    assert!(!serde_json::to_string(&nested).unwrap().contains("top_level"));
+    let top = parsed(&["--top-level"]);
+    assert!(top.top_level);
+    let restored: NewOptions =
+        serde_json::from_value(serde_json::to_value(&top).unwrap()).unwrap();
+    assert!(restored.top_level);
+    let skill = muxel_core::control::skill("muxel");
+    for help in [
+        muxel_core::control::USAGE,
+        skill.as_str(),
+        &muxel_core::control::command_help("new").unwrap(),
+    ] {
+        assert!(help.contains("--top-level"), "{help}");
+    }
+}
+
+#[test]
 fn new_uses_the_selected_preset_and_allows_a_plain_external_cwd() {
     let project = Project::new("repo", std::env::current_dir().unwrap());
     let presets = vec![AgentPreset::shell(), AgentPreset::codex()];

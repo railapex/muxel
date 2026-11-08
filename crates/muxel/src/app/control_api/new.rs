@@ -145,11 +145,18 @@ impl MuxelApp {
                 .as_ref()
                 .is_some_and(|l| l.leaf_containing(*iid).is_some())
         };
-        let target = options
+        let caller = options
             .requesting_pane
-            .filter(|iid| self.terminals.contains_key(iid) && in_project(iid))
+            .filter(|iid| self.terminals.contains_key(iid) && in_project(iid));
+        let target = caller
             .or_else(|| self.active_instance.filter(in_project))
             .or_else(|| project.preferred_instance());
+        // The same caller is the new session's spawner: Recent work nests it
+        // under the caller's session unless it asked for a top-level pane.
+        instance.record_opener(
+            caller.filter(|_| !options.top_level),
+            chrono::Utc::now().timestamp_millis(),
+        );
         let iid = instance.id;
         // Taking focus moves the user's keystrokes (a password, say) into the
         // new pane, so only a request the user just clicked to approve may.

@@ -619,9 +619,11 @@ pub struct Instance {
     pub session_started: bool,
     /// For a file, diff or page: the session that last opened it (a link
     /// clicked in it, its diff button, or a file or page that session opened).
-    /// Recent work nests the resource under that session. `None` when only
-    /// muxel's own chrome opened it. Kept on this machine: the shared layout
-    /// leaves it out, as it does a pane's activity.
+    /// For a session: the session whose pane spawned it (`muxel ctl new`), or
+    /// that the user dragged it onto in Recent work. Recent work nests the row
+    /// under that session ([`sidebar::nests_under`]). `None` when only muxel's
+    /// own chrome opened it. Kept on this machine: the shared layout leaves it
+    /// out, as it does a pane's activity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_by: Option<Uuid>,
     /// When `opened_by` last opened it, in Unix milliseconds. A session's
