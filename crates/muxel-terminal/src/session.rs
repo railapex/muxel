@@ -3240,6 +3240,7 @@ impl TerminalSession {
 
     /// Processes in this pane that reached its memory limit since the last
     /// call, once each is ready to report (see [`crate::MemoryLimitHit`]).
+    /// Windows reports these on a best-effort basis, so one can be missing.
     #[cfg(windows)]
     pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
         self.pane_job

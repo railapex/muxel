@@ -2908,17 +2908,20 @@ pub struct Settings {
     pub new_project_accomplishments: bool,
     /// Most memory, in GB, each process a local pane starts may commit
     /// (Windows only; 0 = no limit). A process that asks for more is refused,
-    /// which usually stops it; muxel and the pane's other processes carry on.
+    /// which usually stops it.
     #[serde(default = "default_pane_memory_limit_gb")]
     pub pane_memory_limit_gb: u32,
 }
 
-/// Default per-process memory limit for local panes, in GB. On a 64 GB
-/// development machine the largest legitimate process peaked near 6 GB
-/// committed (a local Node service); rustc building and testing this
-/// workspace peaked under 5 GB and the linker near 2 GB. 16 GB is more than
-/// twice the largest of those and still stops a runaway long before it drains
-/// the commit pool of a typical 16–64 GB machine.
+/// Default per-process memory limit for local panes, in GB, fitted to a
+/// measured developer workload: on a 64 GB machine the largest legitimate
+/// process peaked near 6 GB committed (a local Node service); rustc building
+/// and testing this workspace peaked under 5 GB and the linker near 2 GB.
+/// 16 GB is more than twice the largest of those. Workloads outside that
+/// (large JVM heaps, LTO links, local model runners) can legitimately need
+/// more, which is what the setting is for. The limit only bounds one process;
+/// it reserves nothing, so it can't stop a machine with less free commit than
+/// the limit from running out.
 pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
 
 fn default_pane_memory_limit_gb() -> u32 {

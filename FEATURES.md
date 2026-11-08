@@ -1177,14 +1177,18 @@ feature is added or changed, update the matching entry here in the same change**
   its own job object, and every process in it can commit at most 16 GB by default
   (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
   after it). A process that asks for more is refused, which usually stops it, so
-  one runaway can't exhaust the machine's memory and crash muxel and other
-  programs; the pane and its other processes keep running, and the
-  notifications feed names the process and its PID. The limit is per process, so
-  a pane running many large processes at once (parallel compilers) is unaffected.
-  Processes started in the pane's first instant are covered; programs started
-  from a pane still outlive it. A child that asks to break away from the job, and
-  processes a remote host or tmux server runs, aren't covered. If Windows can't
-  apply the limit, the pane starts without one and the reason is logged.
+  a single runaway doesn't take the machine down in the common case. It's no
+  guarantee: when less memory is free than the limit, or several large
+  processes share what is free, memory can still run out. The default fits
+  typical developer tools; large Java heaps, optimized links and local model
+  runners can need more. When Windows reports a hit (best effort), the
+  notifications feed names the process when it can, its PID, and whether it
+  stopped. The limit is per process, so a pane running many large processes at
+  once (parallel compilers) is unaffected. Processes started in the pane's first
+  instant are covered; programs started from a pane still outlive it and stay
+  under its limit. A child that asks to break away from the job, and processes a
+  remote host or tmux server runs, aren't covered. If Windows can't apply the
+  limit, the pane starts without one and the reason is logged.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —

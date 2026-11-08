@@ -5,8 +5,11 @@
 //! plus page file) runs dry; then whichever program allocates next fails,
 //! muxel included, while the runaway lives on. A pane's local process tree
 //! therefore runs in its own job object with `JOB_OBJECT_LIMIT_PROCESS_MEMORY`:
-//! a process that asks for more than the limit is refused, which usually stops
-//! it, and muxel and the pane's other processes carry on.
+//! a process that asks to commit more than the limit is refused, which usually
+//! stops it. That keeps a single runaway from taking the machine down in the
+//! common case. It is not a guarantee: the limit reserves nothing, so a machine
+//! with less free commit than the limit still runs out first, and several
+//! processes under the limit share one pool.
 //!
 //! - One job per pane, owned by its [`crate::TerminalSession`]. The child is
 //!   created inside it (`PROC_THREAD_ATTRIBUTE_JOB_LIST`, in the vendored
@@ -14,17 +17,21 @@
 //! - The limit is per process, not per job: a pane legitimately runs many
 //!   large processes at once, like cargo's parallel rustc.
 //! - No `KILL_ON_JOB_CLOSE`, and muxel never calls `TerminateJobObject`. A GUI
-//!   program started from a pane (`start notepad`) outlives the pane as before;
-//!   closing a pane still kills its shell by exact PID.
+//!   program started from a pane (`start notepad`) outlives the pane as before,
+//!   still under the limit; closing a pane still kills its shell by exact PID.
+//!   A job muxel itself runs in keeps its own rules, including killing on
+//!   close.
 //! - `BREAKAWAY_OK`, not `SILENT_BREAKAWAY_OK`: a child created with
 //!   `CREATE_BREAKAWAY_FROM_JOB` leaves the job and runs without the limit.
 //!   Without the flag such launches would fail outright.
 //! - If the job can't be created, or Windows refuses it at launch (a parent
 //!   job's limits can conflict), the pane starts without a limit and the
 //!   reason is logged. A pane never fails to start because of this.
-//! - Every job reports to one shared completion port and thread. It turns
-//!   `JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT` into [`MemoryLimitHit`]s the pane
-//!   reports, and notes when that process exits.
+//! - Every job reports to one shared completion port and thread, which turns
+//!   `JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT` into [`MemoryLimitHit`]s. Windows
+//!   delivers job messages on a best-effort basis, so a hit can go unreported.
+//!   Whether the process stopped is checked through a handle opened when the
+//!   message arrives, never inferred from the absence of an exit message.
 //!
 //! Only processes in the pane's local tree are covered: what a tmux server or
 //! a remote host runs, WSL's Linux processes, and processes Windows starts on a
@@ -37,7 +44,6 @@
 //! example through `systemd-run --user --scope`) limits the whole group, and
 //! the kernel's OOM killer then picks the victim inside it.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// A process in a pane that asked for more memory than the pane's limit.
@@ -47,9 +53,21 @@ pub struct MemoryLimitHit {
     /// The executable's file name, when Windows could still name the process.
     pub program: Option<String>,
     pub limit_bytes: u64,
-    /// The process had exited when the hit was reported. Windows only refuses
-    /// the allocation; most programs stop on that, and some carry on.
-    pub exited: bool,
+    /// What muxel could check about the process when the hit was reported.
+    /// Windows only refuses the allocation; most programs stop on that, and
+    /// some carry on.
+    pub status: HitStatus,
+}
+
+/// Whether the process behind a [`MemoryLimitHit`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitStatus {
+    /// It had exited.
+    Stopped,
+    /// It was still running [`SETTLE`] after the refusal.
+    Running,
+    /// muxel couldn't open the process to check.
+    Unknown,
 }
 
 /// How long a hit waits for its process to exit before it is reported as
@@ -58,65 +76,118 @@ pub struct MemoryLimitHit {
 #[cfg_attr(not(windows), allow(dead_code))]
 const SETTLE: Duration = Duration::from_secs(2);
 
-/// Hits held per pane between reports. A pane that keeps starting runaways
-/// reports the first few; the rest are logged only.
+/// Hits held per pane between reports, and reported-running processes kept
+/// per pane. A pane that keeps starting runaways reports the first few; the
+/// rest are logged only.
 #[cfg_attr(not(windows), allow(dead_code))]
 const MAX_PENDING: usize = 16;
 
-/// The hits of one pane's job, in the order Windows posted them.
-#[derive(Default)]
+/// A way to check on the process behind a hit.
 #[cfg_attr(not(windows), allow(dead_code))]
-struct HitLog {
-    pending: Vec<(MemoryLimitHit, Instant)>,
-    /// Processes recorded and not yet exited, so one that keeps asking is
-    /// reported once.
-    live: HashSet<u32>,
+trait Watch {
+    /// `Some(true)` once it has exited, `Some(false)` while it verifiably
+    /// runs, `None` when muxel can't tell.
+    fn exited(&self) -> Option<bool>;
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-impl HitLog {
-    fn hit(&mut self, pid: u32, program: Option<String>, limit_bytes: u64, now: Instant) -> bool {
-        if !self.live.insert(pid) || self.pending.len() >= MAX_PENDING {
+struct Pending<W> {
+    hit: MemoryLimitHit,
+    watch: W,
+    at: Instant,
+}
+
+/// The hits of one pane's job, in the order Windows posted them.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct HitLog<W> {
+    pending: Vec<Pending<W>>,
+    /// Processes reported as still running, kept while they verifiably run
+    /// so one that asks again is reported once. On Windows the watch holds a
+    /// handle to the process, so its id can't be reused meanwhile.
+    running: Vec<(u32, W)>,
+}
+
+impl<W> Default for HitLog<W> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            running: Vec::new(),
+        }
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<W: Watch> HitLog<W> {
+    /// Record a hit; `false` when it is the same running process asking
+    /// again, or the pane already holds [`MAX_PENDING`] hits.
+    fn hit(
+        &mut self,
+        pid: u32,
+        program: Option<String>,
+        limit_bytes: u64,
+        watch: W,
+        now: Instant,
+    ) -> bool {
+        // Only a process verifiably still running can be the same one: an id
+        // whose process exited, or that muxel can't check, may have been
+        // reused, and a duplicate report beats a missed one.
+        let same = self
+            .pending
+            .iter()
+            .map(|pending| (pending.hit.pid, &pending.watch))
+            .chain(self.running.iter().map(|(id, watch)| (*id, watch)))
+            .any(|(id, watch)| id == pid && watch.exited() == Some(false));
+        if same || self.pending.len() >= MAX_PENDING {
             return false;
         }
-        self.pending.push((
-            MemoryLimitHit {
+        self.pending.push(Pending {
+            hit: MemoryLimitHit {
                 pid,
                 program,
                 limit_bytes,
-                exited: false,
+                status: HitStatus::Unknown,
             },
-            now,
-        ));
+            watch,
+            at: now,
+        });
         true
     }
 
-    fn exited(&mut self, pid: u32) {
-        if self.live.remove(&pid) {
-            for (hit, _) in &mut self.pending {
-                if hit.pid == pid {
-                    hit.exited = true;
-                }
-            }
-        }
-    }
-
-    /// Whether exits still matter: a hit waits to be reported, or a reported
-    /// process hasn't exited yet.
+    /// Whether there is anything to check: a hit waits to be reported, or a
+    /// reported process still runs.
     fn busy(&self) -> bool {
-        !self.pending.is_empty() || !self.live.is_empty()
+        !self.pending.is_empty() || !self.running.is_empty()
     }
 
-    /// Hits whose process has exited, or that have waited [`SETTLE`].
+    /// Hits whose process has exited or can't be checked, and those still
+    /// running after [`SETTLE`].
     fn take(&mut self, now: Instant) -> Vec<MemoryLimitHit> {
+        self.running
+            .retain(|(_, watch)| watch.exited() == Some(false));
         let mut ready = Vec::new();
-        self.pending.retain(|(hit, at)| {
-            let due = hit.exited || now.saturating_duration_since(*at) >= SETTLE;
-            if due {
-                ready.push(hit.clone());
+        let mut waiting = Vec::new();
+        for pending in self.pending.drain(..) {
+            let status = match pending.watch.exited() {
+                Some(true) => HitStatus::Stopped,
+                None => HitStatus::Unknown,
+                Some(false) if now.saturating_duration_since(pending.at) >= SETTLE => {
+                    HitStatus::Running
+                }
+                Some(false) => {
+                    waiting.push(pending);
+                    continue;
+                }
+            };
+            let Pending { hit, watch, .. } = pending;
+            if status == HitStatus::Running {
+                self.running.push((hit.pid, watch));
             }
-            !due
-        });
+            ready.push(MemoryLimitHit { status, ..hit });
+        }
+        self.pending = waiting;
+        // Forgetting the oldest only risks reporting it again.
+        let excess = self.running.len().saturating_sub(MAX_PENDING);
+        self.running.drain(..excess);
         ready
     }
 }
@@ -126,14 +197,17 @@ pub(crate) use imp::PaneJob;
 
 #[cfg(windows)]
 mod imp {
-    use super::{HitLog, MemoryLimitHit};
+    use super::{HitLog, MemoryLimitHit, Watch};
     use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::os::windows::io::RawHandle;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, Weak};
     use std::time::Instant;
-    use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{
+        BOOL, CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
     use windows::Win32::System::IO::{
         CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
     };
@@ -145,24 +219,99 @@ mod imp {
     };
     use windows::Win32::System::Threading::{
         INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
     };
-    use windows::core::{PCWSTR, PWSTR};
+    use windows::core::{HRESULT, PCWSTR, PWSTR};
 
-    // `JOB_OBJECT_MSG_*` (winnt.h). For these, the completion packet's
+    // `JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT` (winnt.h). The completion packet's
     // overlapped pointer carries the process id.
-    const MSG_EXIT_PROCESS: u32 = 7;
-    const MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
     const MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
 
-    /// Where one job's messages land.
+    /// The process behind a hit, as far as muxel could open it.
+    enum Process {
+        /// A handle to the process itself. While it is open Windows can't
+        /// give the process's id to another one.
+        Open(HANDLE),
+        /// No process has the id any more, or the one that has it now runs
+        /// outside the job: the process that reached the limit has exited.
+        Gone,
+        /// Windows wouldn't let muxel check.
+        Unknown,
+    }
+
+    impl Process {
+        /// Open the process `pid` that reached the limit of `job`, with its
+        /// executable's name when Windows still has it.
+        fn open(pid: u32, job: HANDLE) -> (Self, Option<String>) {
+            let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+            let handle = match unsafe { OpenProcess(access, BOOL(0), pid) } {
+                Ok(handle) => handle,
+                // OpenProcess's answer for an id no process has.
+                Err(err) if err.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+                    return (Self::Gone, None);
+                }
+                Err(_) => return (Self::Unknown, None),
+            };
+            let process = Self::Open(handle);
+            let mut inside = BOOL(0);
+            let asked = unsafe { IsProcessInJob(handle, job, &mut inside) };
+            match asked {
+                Ok(()) if inside.as_bool() => {
+                    let name = image_name(handle);
+                    (process, name)
+                }
+                Ok(()) => (Self::Gone, None),
+                Err(_) => (Self::Unknown, None),
+            }
+        }
+    }
+
+    impl Watch for Process {
+        fn exited(&self) -> Option<bool> {
+            match self {
+                Self::Open(handle) => {
+                    let waited = unsafe { WaitForSingleObject(*handle, 0) };
+                    if waited == WAIT_OBJECT_0 {
+                        Some(true)
+                    } else if waited == WAIT_TIMEOUT {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                Self::Gone => Some(true),
+                Self::Unknown => None,
+            }
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            if let Self::Open(handle) = self {
+                unsafe {
+                    let _ = CloseHandle(*handle);
+                }
+            }
+        }
+    }
+
+    /// One job and where its messages land. The job handle lives here so it
+    /// stays open while the watcher holds the sink, even if the pane closes.
     struct Sink {
+        job: HANDLE,
         limit_bytes: u64,
-        log: Mutex<HitLog>,
+        log: Mutex<HitLog<Process>>,
         /// [`HitLog::busy`], written under the lock and read without it, so
-        /// the per-tick poll and the stream of exit messages from a busy pane
-        /// (cargo's rustc processes) skip the lock while there are no hits.
+        /// the per-tick poll skips the lock while there are no hits.
         busy: AtomicBool,
+    }
+
+    impl Drop for Sink {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.job);
+            }
+        }
     }
 
     /// Completion key → sink. Keys are never reused, so a message from a job
@@ -229,37 +378,26 @@ mod imp {
                 }
                 continue;
             }
-            let pid = overlapped as usize as u32;
-            match message {
-                MSG_PROCESS_MEMORY_LIMIT => {
-                    let Some(sink) = sink(key) else { continue };
-                    let program = image_name(pid);
-                    log::warn!(
-                        "pane memory limit: {} (pid {pid}) reached the {} byte limit",
-                        program.as_deref().unwrap_or("a process"),
-                        sink.limit_bytes
-                    );
-                    let mut log = sink.log.lock();
-                    log.hit(pid, program, sink.limit_bytes, Instant::now());
-                    sink.busy.store(log.busy(), Ordering::Release);
-                }
-                MSG_EXIT_PROCESS | MSG_ABNORMAL_EXIT_PROCESS => {
-                    if let Some(sink) = sink(key)
-                        && sink.busy.load(Ordering::Acquire)
-                    {
-                        let mut log = sink.log.lock();
-                        log.exited(pid);
-                        sink.busy.store(log.busy(), Ordering::Release);
-                    }
-                }
-                _ => {}
+            // Other messages (process starts and exits) aren't needed: a hit's
+            // outcome is checked on its process handle.
+            if message != MSG_PROCESS_MEMORY_LIMIT {
+                continue;
             }
+            let Some(sink) = sink(key) else { continue };
+            let pid = overlapped as usize as u32;
+            let (process, program) = Process::open(pid, sink.job);
+            log::warn!(
+                "pane memory limit: {} (pid {pid}) reached the {} byte limit",
+                program.as_deref().unwrap_or("a process"),
+                sink.limit_bytes
+            );
+            let mut log = sink.log.lock();
+            log.hit(pid, program, sink.limit_bytes, process, Instant::now());
+            sink.busy.store(log.busy(), Ordering::Release);
         }
     }
 
-    fn image_name(pid: u32) -> Option<String> {
-        let process =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), pid) }.ok()?;
+    fn image_name(process: HANDLE) -> Option<String> {
         let mut buffer = [0u16; 1024];
         let mut len = buffer.len() as u32;
         let named = unsafe {
@@ -270,9 +408,6 @@ mod imp {
                 &mut len,
             )
         };
-        unsafe {
-            let _ = CloseHandle(process);
-        }
         named.ok()?;
         let path = String::from_utf16_lossy(&buffer[..len as usize]);
         std::path::Path::new(&path)
@@ -283,11 +418,11 @@ mod imp {
     /// One pane's job object. Dropping it closes muxel's handle; processes
     /// still in the job keep running, with the limit still applied.
     pub(crate) struct PaneJob {
-        handle: HANDLE,
         /// What the spawn hands to Windows. The job itself, except in tests
         /// that make Windows refuse it.
         spawn_handle: HANDLE,
         key: Option<usize>,
+        /// Owns the job handle.
         sink: Arc<Sink>,
     }
 
@@ -301,10 +436,10 @@ mod imp {
             let handle =
                 unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(std::io::Error::from)?;
             let mut job = Self {
-                handle,
                 spawn_handle: handle,
                 key: None,
                 sink: Arc::new(Sink {
+                    job: handle,
                     limit_bytes,
                     log: Mutex::new(HitLog::default()),
                     busy: AtomicBool::new(false),
@@ -346,7 +481,7 @@ mod imp {
             };
             let associated = unsafe {
                 SetInformationJobObject(
-                    self.handle,
+                    self.sink.job,
                     JobObjectAssociateCompletionPortInformation,
                     &association as *const _ as *const core::ffi::c_void,
                     std::mem::size_of_val(&association) as u32,
@@ -373,7 +508,7 @@ mod imp {
         pub(crate) fn contains(&self, process: RawHandle) -> bool {
             let mut inside = BOOL(0);
             let asked =
-                unsafe { IsProcessInJob(HANDLE(process as isize), self.handle, &mut inside) };
+                unsafe { IsProcessInJob(HANDLE(process as isize), self.sink.job, &mut inside) };
             asked.is_ok() && inside.as_bool()
         }
 
@@ -381,8 +516,8 @@ mod imp {
             self.sink.limit_bytes
         }
 
-        /// Hits ready to report: their process exited, or it outlived the
-        /// settle time. Cheap when there are none.
+        /// Hits ready to report: their process exited or can't be checked, or
+        /// it outlived the settle time. Cheap when there are none.
         pub(crate) fn take_hits(&self, now: Instant) -> Vec<MemoryLimitHit> {
             if !self.sink.busy.load(Ordering::Acquire) {
                 return Vec::new();
@@ -402,11 +537,11 @@ mod imp {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&key);
             }
-            unsafe {
-                if self.spawn_handle != self.handle {
+            // The sink closes the job handle once the watcher lets go of it too.
+            if self.spawn_handle != self.sink.job {
+                unsafe {
                     let _ = CloseHandle(self.spawn_handle);
                 }
-                let _ = CloseHandle(self.handle);
             }
         }
     }
@@ -473,6 +608,7 @@ mod imp {
 /// commits past the limit, a well-behaved sibling, and a detached lingerer.
 #[cfg(all(test, windows))]
 mod pty_tests {
+    use super::HitStatus;
     use super::imp::PaneJob;
     use super::imp::tests::{Refusal, refuse};
     use crate::session::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
@@ -512,8 +648,16 @@ mod pty_tests {
     /// allocation-error handler prints and aborts, so "done" is never written.
     fn hog(mb: usize, file: &Path) {
         std::fs::write(file, format!("start {}\n", std::process::id())).unwrap();
-        // Time for the test to open a handle before the outcome.
-        std::thread::sleep(Duration::from_millis(500));
+        // Allocate only once the test holds a handle, or the test can lose
+        // the process before it opens it. Without the go-ahead, don't.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ack_path(file).exists() {
+            if Instant::now() >= deadline {
+                std::fs::write(file, "never acknowledged\n").unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut block: Vec<u8> = Vec::with_capacity(mb << 20);
         block.resize(mb << 20, 1);
         let report = format!("start {}\ndone {}\n", std::process::id(), block.len());
@@ -535,6 +679,11 @@ mod pty_tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         std::hint::black_box(&block);
+    }
+
+    /// Where the test tells the hog writing `file` that it holds its handle.
+    fn ack_path(file: &Path) -> PathBuf {
+        file.with_extension("ack")
     }
 
     /// The cmd line that runs the probe in `args` mode.
@@ -714,6 +863,17 @@ mod pty_tests {
         fn in_job(&self, job: &PaneJob) -> bool {
             job.contains(self.0.0 as RawHandle)
         }
+
+        /// Open the hog that wrote its pid to `file`. It waits for [`go`].
+        fn hog(screen: &mut Screen, file: &Path) -> (Self, u32) {
+            let pid = screen.probe_pid(file, "start");
+            (Self::open(pid), pid)
+        }
+    }
+
+    /// Let the hog writing `file` allocate.
+    fn go(file: &Path) {
+        std::fs::write(ack_path(file), "").unwrap();
     }
 
     impl Drop for Process {
@@ -744,8 +904,8 @@ mod pty_tests {
             "512",
             &hog_file.display().to_string(),
         ]));
-        let hog_pid = screen.probe_pid(&hog_file, "start");
-        let hog = Process::open(hog_pid);
+        let (hog, hog_pid) = Process::hog(&mut screen, &hog_file);
+        go(&hog_file);
         let code = hog.exit_code(&mut screen, Duration::from_secs(30));
         let report = std::fs::read_to_string(&hog_file).unwrap();
         assert!(
@@ -785,7 +945,7 @@ mod pty_tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].pid, hog_pid);
         assert_eq!(hits[0].limit_bytes, TEST_LIMIT);
-        assert!(hits[0].exited);
+        assert_eq!(hits[0].status, HitStatus::Stopped);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -813,8 +973,9 @@ mod pty_tests {
         )
         .with_memory_limit(Some(TEST_LIMIT));
         let mut screen = Screen::new(spec);
-        let hog = Process::open(screen.probe_pid(&hog_file, "start"));
+        let (hog, _) = Process::hog(&mut screen, &hog_file);
         let in_job = screen.session.pane_job().map(|job| hog.in_job(job));
+        go(&hog_file);
         hog.exit_code(&mut screen, Duration::from_secs(30))
             .expect("the hog exits");
         let report = std::fs::read_to_string(&hog_file).unwrap();
@@ -914,56 +1075,92 @@ mod pty_tests {
 
 #[cfg(test)]
 mod hit_log_tests {
-    use super::{HitLog, MemoryLimitHit, SETTLE};
+    use super::{HitLog, HitStatus, MemoryLimitHit, SETTLE, Watch};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    fn hit(pid: u32, exited: bool) -> MemoryLimitHit {
+    /// A process whose state the test sets: exited, running, or uncheckable.
+    #[derive(Clone)]
+    struct Fake(Rc<Cell<Option<bool>>>);
+
+    impl Fake {
+        fn new(exited: Option<bool>) -> Self {
+            Self(Rc::new(Cell::new(exited)))
+        }
+    }
+
+    impl Watch for Fake {
+        fn exited(&self) -> Option<bool> {
+            self.0.get()
+        }
+    }
+
+    fn hit(pid: u32, status: HitStatus) -> MemoryLimitHit {
         MemoryLimitHit {
             pid,
             program: Some("awk.exe".into()),
             limit_bytes: 1 << 30,
-            exited,
+            status,
         }
     }
 
-    #[test]
-    fn a_hit_waits_for_its_process_to_exit_then_reports_once() {
-        let start = Instant::now();
-        let mut log = HitLog::default();
-        assert!(log.hit(7, Some("awk.exe".into()), 1 << 30, start));
-        assert!(!log.hit(7, Some("awk.exe".into()), 1 << 30, start));
-        assert!(log.take(start).is_empty());
-        log.exited(7);
-        assert_eq!(log.take(start), [hit(7, true)]);
-        assert!(log.take(start + SETTLE).is_empty());
+    fn record(log: &mut HitLog<Fake>, pid: u32, process: &Fake, at: Instant) -> bool {
+        log.hit(pid, Some("awk.exe".into()), 1 << 30, process.clone(), at)
     }
 
     #[test]
-    fn a_process_that_survives_the_refusal_is_reported_still_running() {
+    fn a_process_that_exited_is_reported_stopped_without_an_exit_message() {
         let start = Instant::now();
         let mut log = HitLog::default();
-        log.hit(7, Some("awk.exe".into()), 1 << 30, start);
+        let process = Fake::new(Some(false));
+        assert!(record(&mut log, 7, &process, start));
+        assert!(log.take(start).is_empty());
+        // Windows may never post the exit message; the handle says it exited.
+        process.0.set(Some(true));
+        assert_eq!(log.take(start), [hit(7, HitStatus::Stopped)]);
+        assert!(!log.busy());
+    }
+
+    #[test]
+    fn a_process_that_survives_the_refusal_is_reported_running_once() {
+        let start = Instant::now();
+        let mut log = HitLog::default();
+        let process = Fake::new(Some(false));
+        record(&mut log, 7, &process, start);
+        // The same process asking again before or after the report is one hit.
+        assert!(!record(&mut log, 7, &process, start));
         assert!(
             log.take(start + SETTLE - Duration::from_millis(1))
                 .is_empty()
         );
-        assert_eq!(log.take(start + SETTLE), [hit(7, false)]);
-        // Reported, but its exit still has to be seen.
+        assert_eq!(log.take(start + SETTLE), [hit(7, HitStatus::Running)]);
+        assert!(!record(&mut log, 7, &process, start + SETTLE));
         assert!(log.busy());
-        // Still the same live process: asking again isn't a new hit.
-        assert!(!log.hit(7, Some("awk.exe".into()), 1 << 30, start + SETTLE));
-        log.exited(7);
+        process.0.set(Some(true));
+        assert!(log.take(start + SETTLE).is_empty());
         assert!(!log.busy());
-        // A later process that reuses the id is.
-        assert!(log.hit(7, Some("awk.exe".into()), 1 << 30, start + SETTLE));
     }
 
     #[test]
-    fn exits_of_other_processes_change_nothing() {
+    fn a_process_muxel_cannot_check_is_reported_unknown() {
         let start = Instant::now();
         let mut log = HitLog::default();
-        log.hit(7, None, 1 << 30, start);
-        log.exited(8);
-        assert!(log.take(start).is_empty());
+        record(&mut log, 7, &Fake::new(None), start);
+        assert_eq!(log.take(start), [hit(7, HitStatus::Unknown)]);
+        assert!(!log.busy());
+    }
+
+    #[test]
+    fn only_a_process_still_running_hides_a_later_hit_for_its_id() {
+        let start = Instant::now();
+        let mut log = HitLog::default();
+        // Exited before the report: a new process may have the id.
+        record(&mut log, 7, &Fake::new(Some(true)), start);
+        assert!(record(&mut log, 7, &Fake::new(Some(false)), start));
+        // Uncheckable: it can't vouch that the id is still its own.
+        record(&mut log, 8, &Fake::new(None), start);
+        assert!(record(&mut log, 8, &Fake::new(None), start));
+        assert_eq!(log.take(start).len(), 3);
     }
 }

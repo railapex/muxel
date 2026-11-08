@@ -15136,20 +15136,32 @@ impl MuxelApp {
             ("pid", pid.as_str()),
             ("limit", limit.as_str()),
         ];
-        let body = if hit.exited {
-            tf(
-                "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. The pane and its other processes keep running. Settings → Behavior sets the limit.",
-                &args,
-            )
-        } else {
-            tf(
-                "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → Behavior sets the limit.",
-                &args,
-            )
+        let (body, status) = match hit.status {
+            muxel_terminal::HitStatus::Stopped => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "stopped",
+            ),
+            muxel_terminal::HitStatus::Running => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "running",
+            ),
+            muxel_terminal::HitStatus::Unknown => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; muxel couldn't check whether it stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "unknown",
+            ),
         };
         muxel_store::append_event_log(&format!(
-            "memory-limit: \"{title}\" [{project}] pid={pid} program=\"{program}\" limit_bytes={} exited={}",
-            hit.limit_bytes, hit.exited
+            "memory-limit: \"{title}\" [{project}] pid={pid} program=\"{program}\" limit_bytes={} status={status}",
+            hit.limit_bytes
         ));
         self.add_event(
             NotifKind::Error,
@@ -29784,7 +29796,7 @@ impl MuxelApp {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t("A process a local pane starts can commit at most this much memory. One that asks for more is refused, which usually stops it, so a runaway can't exhaust the computer's memory; muxel and the pane's other processes keep running. Applies to panes started after a change. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
+                    .child(t("Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
             )
             .into_any_element()
     }
