@@ -40,6 +40,10 @@ mod input_hold;
 pub(crate) use input_hold::InputGate;
 use input_hold::{ShellMarks, ShellPrompt};
 
+#[cfg(all(test, unix))]
+#[path = "unix_shell_idle_tests.rs"]
+mod unix_shell_idle_tests;
+
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
 /// Identity and timestamp attached to one PTY read while profiling is enabled.
@@ -3244,6 +3248,21 @@ impl TerminalSession {
         {
             false
         }
+    }
+
+    /// Close evidence for a Unix shell, including prompts marked with OSC 133.
+    #[cfg(unix)]
+    pub fn shell_close_evidence(
+        &self,
+        program: Option<&str>,
+        via_client: bool,
+    ) -> muxel_core::recoverable_close::CloseEvidence {
+        muxel_core::recoverable_close::shell_close_evidence(
+            program,
+            via_client,
+            self.is_idle_foreground(),
+            self.shell_at_prompt(),
+        )
     }
 
     /// Kill the child process. On Unix this sends SIGHUP, at most once per
