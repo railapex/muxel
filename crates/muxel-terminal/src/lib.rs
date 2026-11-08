@@ -14,6 +14,7 @@ mod element;
 mod keymap;
 mod links;
 mod listener;
+mod pending_ops;
 mod present_flag;
 mod profile;
 mod profile_idle;

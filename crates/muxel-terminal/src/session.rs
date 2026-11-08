@@ -1078,6 +1078,67 @@ fn next_input_state(state: u64, submitted: Option<bool>) -> u64 {
     (revision << 1) | u64::from(draft)
 }
 
+fn advance_input_state(state: &AtomicU64, submitted: Option<bool>) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+        Some(next_input_state(state, submitted))
+    });
+}
+
+/// How long after input its terminal's output paints at the interactive
+/// cadence.
+const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
+
+fn mark_interactive_until(until: &Mutex<Option<Instant>>) {
+    *until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+}
+
+/// What committing a submission changes. It's shared, apart from the
+/// terminal, so the tmux input worker can commit a submission it delivered on
+/// its own thread; the terminal itself stays on the UI thread.
+pub(crate) struct SubmissionFacts {
+    evidence: Arc<Mutex<LifecycleEvidence>>,
+    turn_submitted: Arc<AtomicBool>,
+    input_state: Arc<AtomicU64>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    runtime_trigger: async_channel::Sender<()>,
+}
+
+impl SubmissionFacts {
+    /// The facts an admitted submission records. A `prompt` one follows a
+    /// known prompt; any other is a bare Enter.
+    fn record(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        advance_input_state(&self.input_state, Some(true));
+    }
+
+    /// The facts of a submission tmux has delivered, with the view effects a
+    /// PTY submission has. The tmux input worker commits them once tmux has
+    /// taken the Enter, whether or not anyone still waits for the answer.
+    pub(crate) fn commit(&self, submitted_at: SystemTime, prompt: bool) {
+        self.record(submitted_at, prompt);
+        mark_interactive_until(&self.interactive_until);
+        let _ = self.runtime_trigger.try_send(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_submitted(&self) -> bool {
+        self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
+}
+
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
 /// buffer line (negative = history, so the underline scrolls with the content)
 /// plus the URI a click would open.
@@ -1327,7 +1388,7 @@ pub struct TerminalSession {
     /// launch. Startup title activity alone is not evidence that a turn
     /// completed. The runtime reducer uses the submission recorded in
     /// `evidence` instead, which counts only within its provider binding.
-    turn_submitted: AtomicBool,
+    turn_submitted: Arc<AtomicBool>,
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
@@ -1335,7 +1396,7 @@ pub struct TerminalSession {
     /// a reader never sees one write's revision paired with another write's
     /// draft bit. The low bit is the draft flag; the remaining bits are the
     /// revision, advanced for each input write (see [`Self::input_snapshot`]).
-    input_state: AtomicU64,
+    input_state: Arc<AtomicU64>,
     /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
@@ -1353,10 +1414,15 @@ pub struct TerminalSession {
     /// to recent input. A TUI usually redraws rather than literally echoing the
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
-    interactive_until: Mutex<Option<Instant>>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    /// The submission facts above, shared with the tmux input worker.
+    submission: Arc<SubmissionFacts>,
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    /// Input admitted that can still be written later (see
+    /// [`crate::pending_ops`]).
+    pending_ops: Arc<crate::pending_ops::PendingOps>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1797,6 +1863,13 @@ impl TerminalSession {
         );
 
         let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+        let submission = Arc::new(SubmissionFacts {
+            evidence: evidence.clone(),
+            turn_submitted: Arc::default(),
+            input_state: Arc::default(),
+            interactive_until: Arc::default(),
+            runtime_trigger: runtime_trigger.clone(),
+        });
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
@@ -1847,20 +1920,22 @@ impl TerminalSession {
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
-            turn_submitted: AtomicBool::new(false),
+            turn_submitted: submission.turn_submitted.clone(),
             last_user_input: Mutex::new(None),
-            input_state: AtomicU64::new(0),
+            input_state: submission.input_state.clone(),
             runtime_trigger,
             runtime_events,
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
-            interactive_until: Mutex::new(None),
+            interactive_until: submission.interactive_until.clone(),
+            submission,
             // ctl input through tmux honours the same close hold.
             tmux_input: spec
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            pending_ops: Arc::default(),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2144,8 +2219,7 @@ impl TerminalSession {
     /// interaction window, not echo detection: full-screen TUIs redraw in
     /// response to keys and streaming output may already be queued.
     fn mark_interactive(&self) {
-        const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
-        *self.interactive_until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+        mark_interactive_until(&self.interactive_until);
     }
 
     /// Whether output should use the interactive paint cadence.
@@ -2306,28 +2380,10 @@ impl TerminalSession {
         }
     }
 
-    /// The facts an admitted submission records. A `prompt` one follows a
-    /// known prompt; any other is a bare Enter.
+    /// The facts an admitted submission records (see
+    /// [`SubmissionFacts::record`]).
     fn record_submission(&self, submitted_at: SystemTime, prompt: bool) {
-        {
-            let mut evidence = self.evidence.lock();
-            if prompt {
-                evidence.record_prompt_submission(submitted_at);
-            } else {
-                evidence.record_submission(submitted_at);
-            }
-        }
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.advance_input(Some(true));
-    }
-
-    /// The facts of a submission tmux has delivered, committed by
-    /// [`crate::ControlWrite::finish`], with the view effects a PTY submission
-    /// has.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
-        self.record_submission(submitted_at, prompt);
-        self.mark_interactive();
-        self.trigger_runtime();
+        self.submission.record(submitted_at, prompt);
     }
 
     /// The bookkeeping a ctl paste or key press through tmux does when it is
@@ -2346,7 +2402,9 @@ impl TerminalSession {
     /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
     /// [`Self::try_submit_input`]. Either way the input revision and draft bit
     /// move as for a PTY write, and a submit's facts are committed only once it
-    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    /// is admitted. Through tmux, that's when tmux has taken it: the input
+    /// worker commits them then, before it answers, and the write counts in
+    /// [`Self::pending_input_ops`] until it has.
     pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
@@ -2377,7 +2435,11 @@ impl TerminalSession {
             ControlInput::Submit | ControlInput::SubmitKey => {
                 self.scroll_input_to_bottom();
                 let prompt = input == ControlInput::Submit;
-                Some((self.clone(), SystemTime::now(), prompt))
+                Some(crate::control_input::Submit {
+                    facts: self.submission.clone(),
+                    at: SystemTime::now(),
+                    prompt,
+                })
             }
             ControlInput::Paste(text) => {
                 self.note_control_input(!text.is_empty());
@@ -2388,7 +2450,30 @@ impl TerminalSession {
                 None
             }
         };
-        ControlWrite::queued(tmux.deliver(input, epoch), submit)
+        ControlWrite::queued(tmux.deliver(input, epoch, submit, self.begin_pending_op()))
+    }
+
+    /// How many pieces of admitted input can still reach this terminal's
+    /// program: ctl writes queued for tmux that it hasn't answered, and a
+    /// startup automation that hasn't made its last write. Each is counted until
+    /// its write and the facts that go with it are done.
+    pub fn pending_input_ops(&self) -> usize {
+        self.pending_ops.count()
+    }
+
+    pub(crate) fn begin_pending_op(&self) -> crate::pending_ops::PendingOp {
+        self.pending_ops.begin()
+    }
+
+    /// Run `probe` with this terminal's submission facts each time its pending
+    /// input drops to none.
+    #[cfg(test)]
+    pub(crate) fn on_pending_input_drained(
+        &self,
+        probe: impl Fn(&SubmissionFacts) + Send + Sync + 'static,
+    ) {
+        let facts = self.submission.clone();
+        self.pending_ops.on_drained(move || probe(&facts));
     }
 
     /// Whether outside-control input reaches this terminal through tmux.
@@ -2490,11 +2575,7 @@ impl TerminalSession {
     }
 
     fn advance_input(&self, submitted: Option<bool>) {
-        let _ = self
-            .input_state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
-                Some(next_input_state(state, submitted))
-            });
+        advance_input_state(&self.input_state, submitted);
     }
 
     /// Whether any turn was submitted in this launch, in any conversation.

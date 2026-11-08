@@ -70,6 +70,7 @@ mod conpty_test_support;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
+mod pending_input;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
@@ -6103,10 +6104,15 @@ pub struct MuxelApp {
     broadcasting: bool,
     /// Reused input for the broadcast bar.
     broadcast_input: Entity<InputState>,
+    /// Input operations admitted that can still type into a pane later (see
+    /// [`pending_input`]).
+    pending_inputs: pending_input::PendingInputs,
     /// Speech-to-text dictation state (idle / recording / transcribing / error).
     stt_state: SttState,
-    /// The in-flight microphone capture, held while `stt_state == Recording`.
-    stt_recording: Option<crate::stt::Recording>,
+    /// The in-flight microphone capture, held while `stt_state == Recording`,
+    /// with the dictation's pending-input guard, which the transcription then
+    /// carries until its transcript is delivered.
+    stt_recording: Option<(crate::stt::Recording, pending_input::PendingInput)>,
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
@@ -8307,6 +8313,7 @@ impl MuxelApp {
             term_search_input,
             broadcasting: false,
             broadcast_input,
+            pending_inputs: Default::default(),
             stt_state: SttState::Idle,
             stt_recording: None,
             stt_hold: false,
@@ -10197,6 +10204,7 @@ impl MuxelApp {
         if self.remote_host_for_instance(instance_id).is_some() {
             let origin = Arc::downgrade(view.read(cx).session());
             let app = cx.weak_entity();
+            let inputs = self.pending_inputs.clone();
             let handler: muxel_terminal::LocalPasteHandler = Arc::new(move |paste, cx: &App| {
                 let Some(session) = origin.upgrade() else {
                     return;
@@ -10207,6 +10215,8 @@ impl MuxelApp {
                 if !session.accepts_input_epoch(input_epoch) {
                     return;
                 }
+                // Pending from here until the upload's paste lands or fails.
+                let pending = inputs.begin(pending_input::PendingKind::Upload, Some(instance_id));
                 let app = app.clone();
                 let origin = origin.clone();
                 cx.spawn(async move |cx| {
@@ -10218,10 +10228,18 @@ impl MuxelApp {
                             .paste_session(instance_id, cx)
                             .is_some_and(|current| Arc::ptr_eq(&current, &origin))
                             || !origin.accepts_input_epoch(input_epoch)
+                            || pending.interrupted()
                         {
                             return;
                         }
-                        this.paste_into_remote(instance_id, paste, &origin, input_epoch, cx);
+                        this.paste_into_remote(
+                            instance_id,
+                            paste,
+                            &origin,
+                            input_epoch,
+                            pending,
+                            cx,
+                        );
                     });
                 })
                 .detach();
@@ -10293,6 +10311,7 @@ impl MuxelApp {
         paste: muxel_terminal::LocalPaste,
         origin: &Arc<TerminalSession>,
         input_epoch: u64,
+        pending: pending_input::PendingInput,
         cx: &mut Context<Self>,
     ) {
         if !self
@@ -10337,10 +10356,13 @@ impl MuxelApp {
                 let Some(session) = session.upgrade() else {
                     return;
                 };
+                // Quitting or restarting interrupted the upload: the files
+                // are copied, but their paths aren't pasted.
                 if !this
                     .paste_session(iid, cx)
                     .is_some_and(|current| Arc::ptr_eq(&current, &session))
                     || !session.accepts_input_epoch(input_epoch)
+                    || pending.interrupted()
                 {
                     return;
                 }
@@ -10357,6 +10379,7 @@ impl MuxelApp {
                     cx.notify();
                 }
             });
+            drop(pending);
         })
         .detach();
     }
@@ -22375,9 +22398,14 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        // Pending from the start of the recording until its transcript is
+        // delivered, or the recording is dropped.
+        let pending = self
+            .pending_inputs
+            .begin(pending_input::PendingKind::Dictation, None);
         match crate::stt::start_capture() {
             Ok(rec) => {
-                self.stt_recording = Some(rec);
+                self.stt_recording = Some((rec, pending));
                 self.stt_state = SttState::Recording;
             }
             Err(e) => self.stt_state = SttState::error(&e),
@@ -22388,7 +22416,7 @@ impl MuxelApp {
     /// Stop capture, transcribe off the UI thread (local whisper.cpp or the
     /// provider), then paste the transcript into the focused pane.
     fn stop_and_transcribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rec) = self.stt_recording.take() else {
+        let Some((rec, pending)) = self.stt_recording.take() else {
             self.stt_state = SttState::Idle;
             cx.notify();
             return;
@@ -22456,6 +22484,9 @@ impl MuxelApp {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
+                    // Quitting or restarting interrupted the dictation: its
+                    // transcript is neither typed nor run as the wake command.
+                    Ok(_) if pending.interrupted() => this.stt_state = SttState::Idle,
                     Ok(text) if !text.is_empty() => {
                         this.stt_state = SttState::Idle;
                         // The wake phrase is a command, not dictation — it wakes the
@@ -22472,6 +22503,8 @@ impl MuxelApp {
                 }
                 cx.notify();
             });
+            // The transcript is delivered, or dropped.
+            drop(pending);
         })
         .detach();
     }
@@ -22983,11 +23016,23 @@ impl MuxelApp {
         let home_pid = self.workspace.active_project;
         let home_iid = self.active_instance;
         self.waking = true;
+        // Pending until the sweep's last update.
+        let pending = self
+            .pending_inputs
+            .begin(pending_input::PendingKind::WakeSweep, None);
         cx.notify();
 
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             let mut relaunched = 0usize;
             for (pid, iid, admission) in targets {
+                // Quitting or restarting stops the sweep before its next pane.
+                if pending.interrupted() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.waking = false;
+                        cx.notify();
+                    });
+                    return;
+                }
                 let Ok(was_dead) = this.update_in(cx, |this, window, cx| {
                     if this.current_workspace != workspace
                         || !this.launch_permitted(iid, muxel_core::TerminalLaunchReason::Wake)
@@ -23039,6 +23084,7 @@ impl MuxelApp {
                 this.persist();
                 cx.notify();
             });
+            drop(pending);
         })
         .detach();
     }

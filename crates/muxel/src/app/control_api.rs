@@ -9,6 +9,7 @@
 //! check, before typing into an agent, that muxel on another computer sharing its
 //! tmux session isn't mid-turn with it (see [`claim_agent`]).
 
+use super::pending_input::{PendingInput, PendingKind};
 use super::*;
 use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
@@ -27,6 +28,8 @@ pub(super) use approval::PreparedCreation;
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
+#[cfg(all(test, windows))]
+mod pending_input_tests;
 #[cfg(all(test, windows))]
 mod startup_reservation_tests;
 
@@ -266,6 +269,10 @@ pub(super) struct Typing {
     /// or through tmux, taken by tmux.
     in_flight: Option<SendInFlight>,
     reply: Value,
+    /// Pending from admission, through any claim, until the last press and
+    /// its bookkeeping (a send's confirmation and retries included). Its
+    /// interrupt stops the typing at its next write.
+    pending: PendingInput,
 }
 
 /// A `send` from this process between its admission and its Enter. While one
@@ -1444,10 +1451,15 @@ impl MuxelApp {
             .instance(iid)
             .ok_or("that agent has just closed")?;
         let admitted = self.control_writable(iid, cx)?;
+        let kind = match input {
+            Input::Prompt(_) => PendingKind::CtlSend,
+            Input::Keys { .. } => PendingKind::CtlKeys,
+        };
         Ok(Typing {
             iid,
             input_epoch: admitted.input_epoch(),
             admitted_launch: admitted.id,
+            pending: self.pending_inputs.begin(kind, Some(iid)),
             input,
             turn,
             site: self.control_claim_site(inst),
@@ -1634,6 +1646,7 @@ impl MuxelApp {
             launch_id,
             force,
             in_flight,
+            pending,
             ..
         } = typing;
         if session.id != admitted_launch {
@@ -1647,6 +1660,9 @@ impl MuxelApp {
                 ErrorCode::InputChanged,
                 "closing cancelled this queued input",
             )));
+        }
+        if pending.interrupted() {
+            return Task::ready(Err(departure_cancelled("this queued input")));
         }
         match typing.input {
             Input::Prompt(text) => {
@@ -1662,7 +1678,10 @@ impl MuxelApp {
                         Err(error) => return Task::ready(Err(error)),
                     };
                 let pasted = session.input_rev();
-                cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                let typing = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    // Held until this task ends, after its last write and its
+                    // bookkeeping.
+                    let pending = pending;
                     // A paste through tmux is in only once tmux has run it.
                     // Until then there is no receipt and nothing to press
                     // Enter on. A direct paste is already in.
@@ -1679,6 +1698,9 @@ impl MuxelApp {
                         .await;
                     let enter = this.update(cx, |app, cx| -> CtlResult<ControlWrite> {
                         if !session.accepts_input_epoch(input_epoch) { return Err(ctl::Error::new(ErrorCode::InputChanged, "closing cancelled this queued Enter").after_paste()); }
+                        if pending.interrupted() {
+                            return Err(departure_cancelled("this queued Enter").after_paste());
+                        }
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
                         if attempt.as_ref().is_some_and(|attempt| {
@@ -1717,6 +1739,11 @@ impl MuxelApp {
                         let action = this
                             .update(cx, |app, cx| -> Result<_, Unconfirmed> {
                                 if !session.accepts_input_epoch(input_epoch) { return Err(Unconfirmed::Interrupted); }
+                                // Quitting or restarting stops the checking, and
+                                // with it any retry Enter.
+                                if pending.interrupted() {
+                                    return Err(Unconfirmed::Interrupted);
+                                }
                                 confirmation_verdict(
                                     app.control_writable(iid, cx),
                                     &session,
@@ -1773,7 +1800,8 @@ impl MuxelApp {
                         submission_receipt(&mut reply, Some(outcome), retries);
                         return Ok(reply);
                     }
-                })
+                });
+                detach_typing(typing, cx)
             }
             Input::Keys {
                 presses,
@@ -1784,6 +1812,8 @@ impl MuxelApp {
                 let total = presses.len();
                 let receipt = reply.clone();
                 let pressed = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    // Held until the last press and its answer.
+                    let pending = pending;
                     for (i, (keys, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
@@ -1803,6 +1833,9 @@ impl MuxelApp {
                                         ErrorCode::InputChanged,
                                         "closing cancelled these queued keys",
                                     ));
+                                }
+                                if pending.interrupted() {
+                                    return Err(departure_cancelled("these queued keys"));
                                 }
                                 // A press that submits is an Enter (`key_submits`).
                                 // It goes as the submit, so the turn counts as
@@ -1833,7 +1866,7 @@ impl MuxelApp {
                 self.note_control_turn(iid, turn, at.unwrap_or_else(|| now_ms() + lead_ms));
                 if through_tmux {
                     // The reply says whether tmux took every key.
-                    return pressed;
+                    return detach_typing(pressed, cx);
                 }
                 // A PTY write is in once queued, so the reply never waited for
                 // the keys' gaps.
@@ -2076,6 +2109,37 @@ async fn finish_prompt_enter(
     }
     drop(in_flight);
     entered.map_err(enter_failed)
+}
+
+/// Let `typing` run to its end whatever becomes of whoever asked for it. The
+/// app owns the task, and with it the typing's pending-input guard; the task
+/// returned only waits for the answer. Dropping it (the request going away)
+/// leaves the typing to finish its writes, its facts and its control turn, and
+/// only then to stop counting as pending.
+fn detach_typing(
+    typing: Task<CtlResult<Value>>,
+    cx: &mut Context<MuxelApp>,
+) -> Task<CtlResult<Value>> {
+    let (done, answer) = async_channel::bounded(1);
+    cx.spawn(async move |_: WeakEntity<MuxelApp>, _| {
+        let _ = done.try_send(typing.await);
+    })
+    .detach();
+    cx.spawn(async move |_: WeakEntity<MuxelApp>, _| {
+        answer
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err("muxel is shutting down".into()))
+    })
+}
+
+/// The error for typing that quitting or restarting muxel interrupted:
+/// `what` was cancelled at its next write.
+fn departure_cancelled(what: &str) -> ctl::Error {
+    ctl::Error::new(
+        ErrorCode::InputChanged,
+        format!("quitting or restarting muxel cancelled {what}"),
+    )
 }
 
 /// Why a prompt wasn't pasted. A paste that may have typed

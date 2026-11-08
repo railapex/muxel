@@ -3026,7 +3026,10 @@ impl TerminalView {
                     deadline + crate::startup::ACCEPTANCE_WINDOW + Duration::from_secs(5),
                 )
             });
+            // Counted from before the task is queued until it has stopped.
+            let pending = session.begin_pending_op();
             cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                let _pending = pending;
                 let probe = probe.as_ref();
                 let result: Result<(), crate::startup::Stop> = async {
                     if !known_provider {
@@ -3231,7 +3234,9 @@ impl TerminalView {
                 startup_delay_ms,
                 submit,
             };
+            let pending = session.begin_pending_op();
             cx.spawn(async move |_view: WeakEntity<Self>, cx| {
+                let _pending = pending;
                 let executor = cx.background_executor().clone();
                 quiet_startup(
                     &*session,
