@@ -87,8 +87,9 @@ pub struct Untracked {
     /// Ignored paths, directories collapsed, as `git ls-files --others
     /// --ignored --exclude-standard --directory` lists them.
     pub ignored: HashSet<PathBuf>,
-    /// Untracked directories `git status` shows collapsed (`?? notes/`):
-    /// entries coming or going inside one leave its output as it was.
+    /// Untracked directories `git status` shows collapsed (`?? notes/`): an
+    /// entry appearing inside one leaves its output as it was, but one going
+    /// may have been its last.
     pub dirs: HashSet<PathBuf>,
     /// The repository's git directory, when it's under the root.
     pub git_dir: Option<PathBuf>,
@@ -104,28 +105,29 @@ impl Untracked {
             || rel.ancestors().any(|path| self.ignored.contains(path))
     }
 
-    /// Route a path under the root that isn't tracked. Something that wasn't
-    /// there coming, or something going, can change what `git status`
-    /// lists; an untracked file's contents can't. A `.gitignore` changes
-    /// what's ignored, so the plan is listed again; so is a path appearing
-    /// in a directory the plan doesn't know, which may be a new ignored one
-    /// (a fresh `target/`) whose writes would otherwise keep waking it.
-    fn route(&self, rel: &Path, moved: bool, tracked_dirs: &HashSet<PathBuf>, change: &mut Change) {
-        if rel.as_os_str().is_empty()
-            || self.hides(rel)
-            || rel.ancestors().skip(1).any(|dir| self.dirs.contains(dir))
-        {
+    /// Route a path under the root that isn't tracked. An untracked file's
+    /// contents can't change what `git status` lists; something coming or
+    /// going can, unless git ignores it, which only git can say of a path
+    /// the plan didn't list as ignored (a fresh `target/`, a new object
+    /// file): it's [`Change::unknown`], for the owner to ask git about.
+    /// Inside a directory status shows collapsed, only something going
+    /// counts. A `.gitignore` anywhere changes what's ignored, so the plan
+    /// is listed again.
+    fn route(&self, rel: &Path, kind: EventKind, change: &mut Change) {
+        if rel.as_os_str().is_empty() || self.hides(rel) {
             return;
         }
+        let collapsed = rel.ancestors().skip(1).any(|dir| self.dirs.contains(dir));
+        let counts = match kind {
+            EventKind::Create => !collapsed,
+            EventKind::Remove | EventKind::Rename => true,
+            _ => false,
+        };
         if is_gitignore(rel) {
             change.touched = true;
             change.relist = true;
-        } else if moved {
-            change.touched = true;
-            let parent = rel.parent().unwrap_or(Path::new(""));
-            if !parent.as_os_str().is_empty() && !tracked_dirs.contains(parent) {
-                change.relist = true;
-            }
+        } else if counts {
+            change.unknown.push(rel.to_path_buf());
         }
     }
 }
@@ -192,7 +194,7 @@ impl TrackedFiles {
                     change.touched = true;
                     change.relist = true;
                 } else if let Some(untracked) = &self.untracked {
-                    untracked.route(rel, moved, &self.dirs, change);
+                    untracked.route(rel, event.kind, change);
                 }
             }
         }
@@ -257,6 +259,10 @@ pub struct Change {
     pub touched: bool,
     /// What it depends on may have changed too (see [`TrackedFiles::relist`]).
     pub relist: bool,
+    /// Paths git neither tracks nor was known to ignore that came or went,
+    /// relative to the root: they change what `git status` lists unless git
+    /// ignores them (see [`Untracked::route`]).
+    pub unknown: Vec<PathBuf>,
     /// Events may have been lost: every pane of the target is due.
     pub rescan: bool,
     /// Blind from now on. It routes nothing more; its owner goes back to
@@ -266,13 +272,18 @@ pub struct Change {
 
 impl Change {
     fn is_empty(&self) -> bool {
-        self.hits.is_empty() && !self.touched && !self.rescan && !self.lost
+        self.hits.is_empty()
+            && !self.touched
+            && self.unknown.is_empty()
+            && !self.rescan
+            && !self.lost
     }
 
     fn merge(&mut self, other: Change) {
         self.hits.extend(other.hits);
         self.touched |= other.touched;
         self.relist |= other.relist;
+        self.unknown.extend(other.unknown);
         self.rescan |= other.rescan;
         self.lost |= other.lost;
     }
@@ -648,7 +659,8 @@ mod tests {
         });
         // None of these changes what `git status` lists: a build under an
         // ignored directory, an ignored file, git's own writes, an untracked
-        // file's contents, an entry inside a directory status shows collapsed.
+        // file's contents, an entry appearing in or written inside a
+        // directory status shows collapsed.
         for (kind, path) in [
             (EventKind::Create, root.join("target/debug/muxel.exe")),
             (EventKind::Remove, root.join("target")),
@@ -656,6 +668,7 @@ mod tests {
             (EventKind::Create, git.join("objects/ab/cdef")),
             (EventKind::Modify, root.join("notes.txt")),
             (EventKind::Create, root.join("notes/today.md")),
+            (EventKind::Modify, root.join("notes/today.md")),
             (EventKind::Modify, root.join("src")),
         ] {
             router.event(&event(kind, &[path]));
@@ -669,21 +682,33 @@ mod tests {
             relist: true,
             ..touched.clone()
         };
-        // An untracked file coming or going, beside tracked ones or at the top.
+        // Something coming or going that the plan doesn't list as ignored,
+        // beside tracked files, at the top, in a directory the plan doesn't
+        // know (a fresh `build/`, maybe ignored), or going from a collapsed
+        // one (maybe its last entry): whether git ignores it is the owner's
+        // to ask.
         for (kind, path) in [
             (EventKind::Create, root.join("src/scratch.rs")),
             (EventKind::Remove, root.join("notes.txt")),
             (EventKind::Rename, root.join("notes")),
+            (EventKind::Create, root.join("build/out.o")),
+            (EventKind::Remove, root.join("notes/today.md")),
+            (EventKind::Rename, root.join("notes/sub/old.md")),
         ] {
             router.event(&event(kind, std::slice::from_ref(&path)));
-            assert_eq!(change(&mut router), touched, "{kind:?} {path:?}");
+            let unknown = Change {
+                unknown: vec![path.strip_prefix(&root).unwrap().to_path_buf()],
+                ..Change::default()
+            };
+            assert_eq!(change(&mut router), unknown, "{kind:?} {path:?}");
         }
-        // A path in a directory the plan doesn't know: maybe a new ignored
-        // one, so the plan is listed again.
-        router.event(&event(EventKind::Create, &[root.join("build/out.o")]));
-        assert_eq!(change(&mut router), relist);
-        // A .gitignore, tracked or not, changes what's ignored.
-        for path in [root.join(".gitignore"), root.join("src/.gitignore")] {
+        // A .gitignore, tracked or not, changes what's ignored, inside a
+        // collapsed directory too.
+        for path in [
+            root.join(".gitignore"),
+            root.join("src/.gitignore"),
+            root.join("notes/.gitignore"),
+        ] {
             router.event(&event(EventKind::Modify, std::slice::from_ref(&path)));
             assert_eq!(change(&mut router), relist, "{path:?}");
         }

@@ -75,23 +75,29 @@ pub(crate) fn diff_sources(dir: &Path, plan: &DiffPlan) -> Option<WatchSpec> {
 pub(crate) const PER_DIR: bool = !cfg!(any(windows, target_os = "macos"));
 
 /// What `git status` over `plan`'s work tree watches: a diff's sources for
-/// the whole tree, and any path coming or going there that git neither
-/// tracks nor ignores (see [`Untracked`]). `untracked_dirs` are those the
-/// last status showed collapsed. Where each directory is its own watch, that
-/// means every directory git may list a file in, found by walking the tree,
-/// so a refresh there rebuilds the watch. `None` where it polls instead, as
-/// a diff pane would. It reads the disk, so it runs off the UI thread.
-pub(crate) fn status_sources(plan: &StatusPlan, untracked_dirs: &[PathBuf]) -> Option<WatchSpec> {
-    status_sources_with(plan, untracked_dirs, PER_DIR)
+/// the whole tree, and any path coming or going there that git doesn't track
+/// and isn't known to ignore (see [`Untracked`]). `untracked_dirs` are those
+/// the last status showed collapsed; `learned`, paths git has said since the
+/// plan that it ignores. Where each directory is its own watch, that means
+/// every directory git may list a file in, found by walking the tree, so a
+/// refresh there rebuilds the watch. `None` where it polls instead, as a diff
+/// pane would. It reads the disk, so it runs off the UI thread.
+pub(crate) fn status_sources(
+    plan: &StatusPlan,
+    untracked_dirs: &[PathBuf],
+    learned: &HashSet<PathBuf>,
+) -> Option<WatchSpec> {
+    status_sources_with(plan, untracked_dirs, learned, PER_DIR)
 }
 
 fn status_sources_with(
     plan: &StatusPlan,
     untracked_dirs: &[PathBuf],
+    learned: &HashSet<PathBuf>,
     per_dir: bool,
 ) -> Option<WatchSpec> {
     let untracked = Untracked {
-        ignored: plan.ignored.iter().cloned().collect(),
+        ignored: plan.ignored.iter().chain(learned).cloned().collect(),
         dirs: untracked_dirs.iter().cloned().collect(),
         git_dir: plan.git_dir.clone(),
     };
@@ -235,10 +241,10 @@ pub(crate) fn grok_registry(dir: &Path) -> WatchSpec {
 
 /// Watch each directory under `root` that `git status` may list a file in,
 /// where each directory is its own watch: the untracked ones too, so a file
-/// appearing in a new directory is seen. Ignored ones and git's aren't; a
-/// collapsed untracked directory (`?? notes/`) is, since its first entry or
-/// its last going changes the status, but nothing below it. Symlinks aren't
-/// followed. False past `budget` directories.
+/// appearing in a new directory is seen, and those inside a collapsed one
+/// (`?? notes/`), whose last file going anywhere below changes the status.
+/// Ignored ones and git's aren't. Symlinks aren't followed. False past
+/// `budget` directories.
 fn watch_listed_dirs(
     root: &Path,
     untracked: &Untracked,
@@ -264,9 +270,7 @@ fn watch_listed_dirs(
                 return false;
             }
             watch(root.join(&child), Recursion::Dir);
-            if !untracked.dirs.contains(&child) {
-                below.push(child);
-            }
+            below.push(child);
         }
     }
     true
@@ -593,6 +597,7 @@ mod tests {
                 seen.hits.extend(change.hits);
                 seen.touched |= change.touched;
                 seen.relist |= change.relist;
+                seen.unknown.extend(change.unknown);
                 seen.rescan |= change.rescan;
                 seen.lost |= change.lost;
             }
@@ -642,33 +647,49 @@ mod tests {
 
     /// Where each directory is its own watch, `git status` watches every
     /// directory it may list a file in: an empty untracked one too (its first
-    /// file shows), and a collapsed one, but nothing below that, nothing
-    /// ignored and nothing of git's beyond the folders of the files it reads
-    /// (HEAD and the index, the branch, `info/exclude`).
+    /// file shows), and a collapsed one and those below it (its last file
+    /// going clears its row), but nothing ignored, whether the plan listed it
+    /// or git said so since, and nothing of git's beyond the folders of the
+    /// files it reads (HEAD and the index, the branch, `info/exclude`).
     #[test]
     fn a_per_directory_status_watches_every_directory_git_may_list() {
         let repo = TestRepo::init();
         repo.commit(&[("src/lib.rs", ""), (".gitignore", "target/\n")], "seed");
         let root = repo.path();
         // `git init`'s templates usually make `info/`; not every install's do.
-        for dir in ["scratch", "notes/sub", "target/debug", ".git/info"] {
+        for dir in [
+            "scratch",
+            "notes/sub",
+            "target/debug",
+            "build/obj",
+            ".git/info",
+        ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         std::fs::write(root.join("notes/sub/idea.md"), "").unwrap();
         let plan = status_plan(root).expect("a work tree");
         let collapsed = [PathBuf::from("notes")];
-        let spec = status_sources_with(&plan, &collapsed, true).expect("within budget");
+        // `build/` came after the plan, and git has said it ignores it.
+        let learned = HashSet::from([PathBuf::from("build")]);
+        let spec = status_sources_with(&plan, &collapsed, &learned, true).expect("within budget");
         let git = root.join(".git");
         let each: Vec<_> = [
             root.to_path_buf(),
             root.join("src"),
             root.join("scratch"),
             root.join("notes"),
+            root.join("notes").join("sub"),
             git.clone(),
             git.join("refs").join("heads"),
             git.join("info"),
         ]
         .into_iter()
+        // And the folder of git's global excludes file, where this machine
+        // has one: the only state file outside the repository.
+        .chain(plan.diff.state.iter().filter_map(|file| {
+            let dir = file.parent()?.canonicalize().ok()?;
+            (!dir.starts_with(root.canonicalize().unwrap())).then_some(dir)
+        }))
         .map(|dir| (dir, Recursion::Dir))
         .collect();
         assert_eq!(resolved(&spec.paths), resolved(&each));
@@ -732,8 +753,11 @@ mod tests {
     }
 
     /// `git status`'s sources through the platform's backend, in a main
-    /// checkout and a linked worktree: a new untracked file counts, a build's
-    /// output under an ignored directory doesn't, and a `.gitignore` re-plans.
+    /// checkout and a linked worktree: a new untracked file is unknown (for
+    /// the target to ask git about), a build's output under an ignored
+    /// directory and an untracked file's contents are nothing, and a
+    /// `.gitignore` re-plans. Each negative is written before a positive, so
+    /// an event for it would arrive with the positive's.
     #[test]
     fn a_status_wakes_for_real_untracked_files_but_not_ignored_ones() {
         let repo = TestRepo::init();
@@ -759,23 +783,33 @@ mod tests {
                 "{at}: {:?}",
                 plan.ignored
             );
-            let spec = status_sources(&plan, &[]).expect("watchable");
+            let spec = status_sources(&plan, &[], &HashSet::new()).expect("watchable");
             let (mut watch, signal) = FileWatch::start().unwrap();
             let id = watch.register(spec).unwrap();
             let settle = || gather_for(&watch, &signal, id, Duration::from_millis(500), |_| false);
+            // Gather until something unknown comes, and check it's only `name`.
+            let only = |name: &str, what: &str| {
+                let seen = gather(&watch, &signal, id, |seen| !seen.unknown.is_empty());
+                assert!(
+                    !seen.unknown.is_empty()
+                        && seen.unknown.iter().all(|path| path == Path::new(name)),
+                    "{at}: {what}: {:?}",
+                    seen.unknown
+                );
+                assert!(!seen.touched && !seen.relist && !seen.lost, "{at}: {what}");
+            };
 
             std::fs::write(dir.join("target").join("out.o"), "built\n").unwrap();
-            assert!(!settle().touched, "{at}: a build's output");
-
             std::fs::write(dir.join("scratch.txt"), "new\n").unwrap();
-            let seen = gather(&watch, &signal, id, |seen| seen.touched);
-            assert!(seen.touched && !seen.relist, "{at}: a new untracked file");
+            only("scratch.txt", "a new untracked file, not a build's output");
             settle();
 
             // FSEvents may still flag a rewritten file as created.
             if !cfg!(target_os = "macos") {
                 std::fs::write(dir.join("scratch.txt"), "more\n").unwrap();
-                assert!(!settle().touched, "{at}: an untracked file's contents");
+                std::fs::write(dir.join("other.txt"), "new\n").unwrap();
+                only("other.txt", "a new file, not an untracked file's contents");
+                settle();
             }
 
             std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
@@ -785,20 +819,20 @@ mod tests {
             );
             assert!(!settle().lost, "{at}");
 
-            // A new directory wakes the status, whose refresh rebuilds the
-            // watch; then a file in it shows, where each directory is its
-            // own watch too.
+            // A new directory is unknown, and the status's refresh rebuilds
+            // the watch; then a file in it is too, where each directory is
+            // its own watch as well.
             std::fs::create_dir(dir.join("drafts")).unwrap();
-            let seen = gather(&watch, &signal, id, |seen| seen.touched);
-            assert!(seen.touched, "{at}: a new directory");
-            gather_for(&watch, &signal, id, Duration::from_millis(500), |_| false);
-            let spec = status_sources(&plan, &[]).expect("watchable");
+            only("drafts", "a new directory");
+            settle();
+            let spec = status_sources(&plan, &[], &HashSet::new()).expect("watchable");
             watch.respec(id, spec).unwrap();
             std::fs::write(dir.join("drafts").join("plan.md"), "new\n").unwrap();
-            let seen = gather(&watch, &signal, id, |seen| seen.touched);
+            let seen = gather(&watch, &signal, id, |seen| !seen.unknown.is_empty());
             assert!(
-                seen.touched && !seen.lost,
-                "{at}: a file in the new directory"
+                seen.unknown.contains(&Path::new("drafts").join("plan.md")) && !seen.lost,
+                "{at}: a file in the new directory: {:?}",
+                seen.unknown
             );
             drop(watch);
         }
