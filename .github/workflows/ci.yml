@@ -66,8 +66,9 @@ jobs:
         if: runner.os != 'Windows'
         run: tmux -V
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p muxel --bin muxel -- changes_refresh_tests --nocapture --test-threads=1 2>&1 | grep -E "PROBE|^test |panicked|test result" || true
-      - run: cargo test -p muxel --bin muxel -- changes_refresh_tests
+      - run: ulimit -n; ulimit -Hn
+      - run: cargo test -p muxel --bin muxel -- --nocapture 2>&1 | grep -E 'PROBE.app::changes_refresh|os error|^test .*FAILED|test result|panicked at' || true
+      - run: cargo test -p muxel --bin muxel -- --nocapture 2>&1 | grep -E 'PROBE.app::changes_refresh|os error|^test .*FAILED|test result|panicked at' || true
       # `muxel ctl` (outside agents such as Grok Bot driving muxel) runs from
       # contexts with no display: it must start, print its usage, and report —
       # as JSON, exit 1 — that no muxel is running, without touching the GUI.

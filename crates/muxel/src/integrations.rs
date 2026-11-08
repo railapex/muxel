@@ -2082,6 +2082,7 @@ pub fn status_plan(dir: &Path) -> Option<StatusPlan> {
             "--directory",
         ])
         .profiled_output()
+        .inspect_err(|e| eprintln!("PROBE[{}] ignored listing spawn: {e}", std::thread::current().name().unwrap_or("?")))
         .ok()
         .filter(|out| out.status.success())?
         .stdout
@@ -2196,7 +2197,9 @@ pub fn check_ignored(root: &Path, paths: &[PathBuf]) -> Option<HashSet<PathBuf>>
     if crate::ui_profile::is_enabled() {
         crate::ui_profile::git_launched(&cmd, started.elapsed(), &out);
     }
+    if let Err(e) = &out { eprintln!("PROBE[{}] check-ignore spawn: {e}", std::thread::current().name().unwrap_or("?")); }
     let out = out.ok()?;
+    if !matches!(out.status.code(), Some(0 | 1)) { eprintln!("PROBE[{}] check-ignore exit {:?}: {}", std::thread::current().name().unwrap_or("?"), out.status.code(), String::from_utf8_lossy(&out.stderr)); }
     // 1: none of them is ignored.
     if !matches!(out.status.code(), Some(0 | 1)) {
         return None;
@@ -2248,8 +2251,14 @@ fn plan_with(dir: &Path, whole_tree: bool) -> Option<(DiffPlan, PathBuf, PathBuf
             .arg(dir)
             .args(args)
             .profiled_output()
+            .inspect_err(|e| eprintln!("PROBE[{}] plan git {:?} spawn: {e}", std::thread::current().name().unwrap_or("?"), args))
             .ok()
-            .filter(|out| out.status.success())
+            .filter(|out| {
+                if !out.status.success() {
+                    eprintln!("PROBE[{}] plan git {:?} exit {:?}: {}", std::thread::current().name().unwrap_or("?"), args, out.status.code(), String::from_utf8_lossy(&out.stderr));
+                }
+                out.status.success()
+            })
             .map(|out| out.stdout)
     };
     let dirs = String::from_utf8(git(&[
