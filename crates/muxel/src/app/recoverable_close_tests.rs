@@ -3333,7 +3333,17 @@ fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
     use muxel_core::{AgentActivity, AgentActivityState};
     with_app(|cx, window| {
         let pid = project(cx, window);
-        let (a, _, _a_child) = terminal(cx, window, pid);
+        // A has no live terminal (a pane not reopened since a restart), so it
+        // shows what it saved and its place can't change under the test.
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
         let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
         wait_for_view(cx, window, &b_view, |view| {
             view.runtime_snapshot().reason == TerminalStatusReason::Bell
