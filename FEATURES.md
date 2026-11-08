@@ -925,8 +925,11 @@ feature is added or changed, update the matching entry here in the same change**
   modifying the command or injecting startup input.
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
-  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
-  exited terminals keep their **done** badge and completion age.
+  The sidebar labels an unspawned restored literal pane as **stopped**. A
+  retained exited terminal keeps the state it had before it exited: an exit is
+  not a finish, so a command that ends only by exiting shows idle, while one
+  whose agent reported its finish first keeps its **done** badge and completion
+  age.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1391,8 +1394,10 @@ feature is added or changed, update the matching entry here in the same change**
   then sessions never used, newest open first. A working session counts as Today
   however long its turn has run. Reading, focusing or clicking a session never
   moves its row; only a change in its work or a new day does. Exiting is not a
-  finish. Pinned sessions follow the same order. Project order and keyboard
-  navigation stay the same. Live popped-out sessions remain in Recent work;
+  finish, though an agent that reported its finish before exiting is finished
+  and notifies. Pinned sessions follow the same order. Project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work, and
+  popping one out or docking it back never moves its row;
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
   recent rows can still be dragged onto panes.
