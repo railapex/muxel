@@ -19,6 +19,7 @@ const RECORD_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 pub struct CodexSubagents {
     store: Option<PathBuf>,
+    oldest_launch: Option<SystemTime>,
     scanned_through: Option<NaiveDate>,
     directories: HashMap<PathBuf, Option<SystemTime>>,
     children: HashMap<PathBuf, Child>,
@@ -45,6 +46,14 @@ impl CodexSubagents {
                 store: Some(store.to_path_buf()),
                 ..Self::default()
             };
+        }
+        if self.oldest_launch.is_none_or(|seen| oldest < seen) {
+            // An older pane can resolve after a newer one. Revisit files skipped
+            // by the previous cutoff without discarding parsed child history.
+            self.oldest_launch = Some(oldest);
+            self.scanned_through = None;
+            self.directories.clear();
+            self.last_backstop = None;
         }
         if !self.watch_attempted {
             self.new_rollouts = NewRollouts::watch(store);
@@ -443,6 +452,29 @@ mod tests {
             index
                 .refresh(&fixture.home, &fixture.parents(), fixture.now)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn background_codex_discovery_catches_up_when_an_older_pane_resolves_later() {
+        let fixture = Fixture::new();
+        let rows: Vec<_> = ROWS.split_inclusive('\n').collect();
+        fs::write(&fixture.child, rows[..6].concat()).unwrap();
+        let mut index = CodexSubagents::default();
+        let mut parents = vec![(Uuid::new_v4().to_string(), fixture.now)];
+        assert!(
+            index
+                .refresh(&fixture.home, &parents, fixture.now)
+                .is_empty()
+        );
+
+        // Without file changes or watcher events, the older pane still owns live work.
+        index.new_rollouts = None;
+        parents.extend(fixture.parents());
+        assert!(
+            index
+                .refresh(&fixture.home, &parents, fixture.now)
+                .contains(&fixture.parents()[0])
         );
     }
 

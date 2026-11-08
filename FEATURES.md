@@ -529,7 +529,8 @@ feature is added or changed, update the matching entry here in the same change**
   the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
   finished turn. Subagents hold until they end. Local Codex panes also read child-turn
   lifecycle records for subagents created during the current pane launch; their normal
-  composer has no live child count. Copied parent history and children left by an
+  composer has no live child count. Panes identified later also pick up children
+  already running beside them. Copied parent history and children left by an
   earlier launch do not count. Muse's completion hook can retire a leftover spinner
   title after five seconds without output or a title update; live work stays listed.
   A redraw alone cannot make that retired title read as new work. New titles and
