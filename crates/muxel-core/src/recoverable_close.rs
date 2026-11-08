@@ -36,6 +36,57 @@ pub fn shell_close_evidence(
     }
 }
 
+/// Windows prompt evidence. Windows has no foreground process group, and cmd
+/// and PowerShell run batch files, cmdlets and scripts in their own process, so
+/// neither a prompt nor an empty process tree proves idleness alone.
+/// ShellPrompt needs an OSC 133 prompt showing with nothing typed after it
+/// (muxel marks the local cmd and PowerShell it starts, [`crate::prompt_marks`])
+/// and no live child ([`shell_is_idle`]: `start /b` work behind the prompt).
+/// The child check walks the process table, so it runs only once the prompt
+/// holds. A shell that prints no marks never shows a prompt, so it asks.
+pub fn windows_shell_close_evidence(
+    at_empty_prompt: bool,
+    no_child: impl FnOnce() -> bool,
+) -> CloseEvidence {
+    if at_empty_prompt && no_child() {
+        CloseEvidence::ShellPrompt
+    } else {
+        CloseEvidence::Quiet
+    }
+}
+
+/// Whether a Windows shell sits at its prompt with nothing running, from one
+/// process snapshot: `(pid, parent pid)` for every process. The shell is the
+/// process `shell` that started at `shell_started` (a `FILETIME` tick, read at
+/// spawn while its handle pinned the pid); `started` reads a process's start
+/// time, or `None` when it can't.
+///
+/// Idle means the shell is in the snapshot with that start time and no live
+/// process names it as parent. A command it runs, `start /b` included, is its
+/// child. Windows records a parent's pid at creation and never updates it, so
+/// a process can name a pid that was later given to this shell; one that
+/// started before the shell isn't its child. A reused pid can only make an
+/// idle shell look busy, never the reverse: a real child always starts after
+/// its shell, an unreadable start time counts as a child, and a shell whose
+/// pid now belongs to another process isn't idle. A grandchild whose parent
+/// exited names that parent, not the shell, so it isn't seen.
+pub fn shell_is_idle(
+    processes: impl IntoIterator<Item = (u32, u32)>,
+    shell: u32,
+    shell_started: u64,
+    started: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let mut present = false;
+    for (pid, parent) in processes {
+        if pid == shell {
+            present = started(pid) == Some(shell_started);
+        } else if parent == shell && started(pid).is_none_or(|at| at >= shell_started) {
+            return false;
+        }
+    }
+    present
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloseFacts {
     pub status: AgentState,
@@ -302,12 +353,77 @@ mod recoverable_close_policy_tests {
         CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch,
         HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, UndoLaunch, decide,
         departure_finalizes, exit_proves_closed, expired_close_sync, held_launch, may_finalize,
-        rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
+        rehide_held, session_may_outlive, shell_close_evidence, shell_is_idle, undo_launch,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
+    use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn a_windows_shell_is_idle_only_while_it_has_no_child_of_its_own() {
+        const SHELL: u32 = 40;
+        const AT: u64 = 1_000;
+        // (pid, parent, start time) of every process besides the shell.
+        type Others = &'static [(u32, u32, Option<u64>)];
+        let cases: [(&str, Others, bool); 7] = [
+            ("nothing else", &[], true),
+            (
+                "unrelated processes",
+                &[(7, 4, Some(10)), (8, 7, Some(2_000))],
+                true,
+            ),
+            ("a running command", &[(51, SHELL, Some(1_500))], false),
+            (
+                "a child started the same tick",
+                &[(51, SHELL, Some(AT))],
+                false,
+            ),
+            (
+                "a child whose start can't be read",
+                &[(51, SHELL, None)],
+                false,
+            ),
+            // Its creator exited before the shell started with the same pid.
+            (
+                "an older process naming the pid",
+                &[(9, SHELL, Some(400))],
+                true,
+            ),
+            (
+                "one older, one real child",
+                &[(9, SHELL, Some(400)), (51, SHELL, Some(1_200))],
+                false,
+            ),
+        ];
+        for (name, others, idle) in cases {
+            let starts: HashMap<u32, Option<u64>> = others
+                .iter()
+                .map(|&(pid, _, at)| (pid, at))
+                .chain([(SHELL, Some(AT))])
+                .collect();
+            let processes = others
+                .iter()
+                .map(|&(pid, parent, _)| (pid, parent))
+                .chain([(SHELL, 4)]);
+            let started = |pid| starts.get(&pid).copied().flatten();
+            assert_eq!(shell_is_idle(processes, SHELL, AT, started), idle, "{name}");
+        }
+        // The shell must be in the snapshot as itself.
+        assert!(
+            !shell_is_idle([(7, 4)], SHELL, AT, |_| Some(10)),
+            "exited, or no snapshot"
+        );
+        assert!(
+            !shell_is_idle([(SHELL, 4)], SHELL, AT, |_| Some(5_000)),
+            "its pid now belongs to a later process"
+        );
+        assert!(
+            !shell_is_idle([(SHELL, 4)], SHELL, AT, |_| None),
+            "unreadable shell"
+        );
+    }
 
     fn quiet() -> CloseFacts {
         CloseFacts {

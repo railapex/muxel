@@ -127,7 +127,14 @@ feature is added or changed, update the matching entry here in the same change**
   If the pane disappears while `wait` polls or collects its result, `wait`
   returns `exited` with an explanation. A shell counts down only with prompt
   evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
-  always ask. A tmux pane that only looks dead here (never connected, a
+  always ask. On Windows, muxel has the local cmd and PowerShell it starts mark
+  their prompt with OSC 133, wrapping the prompt you already have (a profile's
+  oh-my-posh or starship included) so it looks the same. Such a shell counts
+  down only while that prompt shows with nothing typed on it and no process it
+  started, a `start /b` job included, still runs; a batch file's `pause` or a
+  running cmdlet asks. A shell with no marks (a cmd AutoRun that sets its own
+  prompt, PowerShell started with `-Command` or a script) always asks, and so
+  does Git Bash, whose `bash.exe` always runs a second bash. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
   session that may still run its agent; its client exiting mid-countdown also
   turns into Close / Keep. Undo reattaches a pane whose launch or reconnect was

@@ -15,6 +15,8 @@ mod keymap;
 mod links;
 mod listener;
 mod present_flag;
+#[cfg(windows)]
+mod process_tree;
 mod profile;
 mod profile_idle;
 pub mod profile_log;
@@ -31,6 +33,8 @@ pub use control_input::{
 };
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use present_flag::{mark_present_needed, take_present_needed};
+#[cfg(windows)]
+pub use process_tree::process_parent_map;
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{

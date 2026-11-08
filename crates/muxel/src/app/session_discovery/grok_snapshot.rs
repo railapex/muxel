@@ -74,7 +74,7 @@ pub(super) fn process_snapshot(
             roots,
             active,
             Instant::now(),
-            super::super::process_parent_map,
+            muxel_terminal::process_parent_map,
         )
 }
 

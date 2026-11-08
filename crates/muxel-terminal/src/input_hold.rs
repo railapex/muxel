@@ -28,17 +28,37 @@ impl InputGate {
 }
 
 #[derive(Default)]
-pub(super) struct ShellPrompt(AtomicBool);
+pub(super) struct ShellPrompt {
+    at_prompt: AtomicBool,
+    /// Something was typed since the last prompt mark. Enter clears
+    /// `at_prompt` instead; the next A/B mark clears both, so a Ctrl+C that
+    /// redraws the prompt leaves nothing behind.
+    typed: AtomicBool,
+}
 
 impl ShellPrompt {
     pub fn at_prompt(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.at_prompt.load(Ordering::Acquire)
+    }
+
+    /// At a prompt with nothing typed on it yet.
+    pub fn at_empty_prompt(&self) -> bool {
+        self.at_prompt() && !self.typed.load(Ordering::Acquire)
     }
 
     pub fn submitted(&self, bytes: &[u8]) {
         if bytes.iter().any(|&byte| matches!(byte, b'\r' | b'\n')) {
-            self.0.store(false, Ordering::Release);
+            self.at_prompt.store(false, Ordering::Release);
+        } else if !bytes.is_empty() {
+            self.typed.store(true, Ordering::Release);
         }
+    }
+
+    fn mark(&self, at_prompt: bool) {
+        if at_prompt {
+            self.typed.store(false, Ordering::Release);
+        }
+        self.at_prompt.store(at_prompt, Ordering::Release);
     }
 }
 
@@ -95,10 +115,7 @@ impl ShellMarks {
                     } else if (!escaped && byte == 0x07) || (escaped && byte == b'\\') {
                         if len >= 5 && &prefix[..4] == b"133;" {
                             let valid = len == 5 || prefix[5] == b';';
-                            prompt.0.store(
-                                valid && matches!(prefix[4], b'A' | b'B'),
-                                Ordering::Release,
-                            );
+                            prompt.mark(valid && matches!(prefix[4], b'A' | b'B'));
                         }
                         State::Ground
                     } else if escaped {
@@ -186,6 +203,31 @@ mod tests {
                 assert!(!prompt.at_prompt());
             }
         }
+    }
+
+    #[test]
+    fn typing_on_a_prompt_leaves_it_until_the_next_mark() {
+        let prompt = ShellPrompt::default();
+        let mut marks = ShellMarks::default();
+        marks.advance(b"\x1b]133;A\x1b\\C:\\>\x1b]133;B\x1b\\", &prompt);
+        assert!(prompt.at_empty_prompt());
+        prompt.submitted(b"del *");
+        assert!(
+            prompt.at_prompt() && !prompt.at_empty_prompt(),
+            "a draft on the prompt"
+        );
+        // Ctrl+C: cmd and PowerShell drop the line and draw a fresh prompt.
+        prompt.submitted(b"\x03");
+        marks.advance(b"\x1b]133;A\x1b\\C:\\>\x1b]133;B\x1b\\", &prompt);
+        assert!(prompt.at_empty_prompt());
+        prompt.submitted(b"dir");
+        prompt.submitted(b"\r");
+        assert!(
+            !prompt.at_prompt() && !prompt.at_empty_prompt(),
+            "submitted"
+        );
+        marks.advance(b"\x1b]133;A\x07", &prompt);
+        assert!(prompt.at_empty_prompt(), "the next prompt starts empty");
     }
 
     #[test]
