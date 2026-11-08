@@ -59,6 +59,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod accomplishments_ui;
+#[cfg(test)]
+mod changes_refresh_tests;
 #[cfg(all(test, windows))]
 mod claude_capture_tests;
 mod claude_launch;
@@ -90,6 +92,7 @@ mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
 mod sound_alerts;
+mod status_targets;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -2378,9 +2381,10 @@ fn program_stamp(presets: &[AgentPreset]) -> ProgramStamp {
     (programs, dirs)
 }
 
-/// How often worktrees' uncommitted changes are recounted (a `git status` each;
-/// nothing cheaper sees a file edit). Adding or removing a worktree, or a git
-/// action run from muxel, recounts at once.
+/// How often a worktree's uncommitted changes are recounted (a `git status`)
+/// while the file watcher can't cover it. A watched one recounts when its files
+/// change (see `status_targets`). Adding a worktree, or a git action run from
+/// muxel, recounts at once.
 const WORKTREE_CHANGES_EVERY: Duration = Duration::from_secs(10);
 /// How long the installed-program scan waits while no `PATH` directory changed.
 const PROGRAM_SCAN_BACKSTOP: Duration = Duration::from_secs(60);
@@ -2389,7 +2393,6 @@ const PROGRAM_SCAN_BACKSTOP: Duration = Duration::from_secs(60);
 /// and scans no `PATH` on most one-second ticks.
 struct StatusPolls {
     branches: RefreshGate<Uuid, integrations::GitRefStamp>,
-    worktrees: RefreshGate<(), Vec<(Uuid, PathBuf)>>,
     programs: RefreshGate<(), ProgramStamp>,
 }
 
@@ -2398,7 +2401,6 @@ impl Default for StatusPolls {
         Self {
             // An unchanged project's branches wait for the stamp's own backstop.
             branches: RefreshGate::per_stamp(integrations::GitRefStamp::backstop),
-            worktrees: RefreshGate::new(WORKTREE_CHANGES_EVERY),
             programs: RefreshGate::new(PROGRAM_SCAN_BACKSTOP),
         }
     }
@@ -5711,8 +5713,9 @@ pub struct MuxelApp {
     /// directory changes). New-agent menus hide presets whose program isn't here.
     available_programs: HashSet<String>,
     /// Cached git status so the sidebar doesn't shell out per render: each
-    /// project's current branch, and each worktree's change count. Refreshed by
-    /// `refresh_status` as `status_polls` finds them due.
+    /// project's current branch, refreshed by `refresh_status` as
+    /// `status_polls` finds it due, and each worktree's change count, by
+    /// `status_targets`.
     project_branches: HashMap<Uuid, Option<String>>,
     /// Cached branch lists for project context menus. Populated beside
     /// `project_branches` so opening a menu never waits on a git subprocess.
@@ -5727,9 +5730,6 @@ pub struct MuxelApp {
     alert_sound_error: Option<(AlertSound, String)>,
     /// What the status probes last saw; moved into each `refresh_status` job.
     status_polls: StatusPolls,
-    /// A git action ran from muxel: recount worktree changes on the next tick
-    /// instead of waiting out `WORKTREE_CHANGES_EVERY`.
-    worktree_changes_stale: bool,
     /// Parent-owned Codex thread names, keyed by the session UUID captured from
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
@@ -5830,17 +5830,10 @@ pub struct MuxelApp {
     git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
     /// Which worktree rows are expanded to show their changed files.
     git_diff_worktrees_expanded: std::collections::HashSet<Uuid>,
-    /// Cached branch names for the active project (the "Merge into…" picker),
-    /// refreshed off the UI thread so the menu doesn't run `git branch` per frame.
-    git_diff_branches: Vec<String>,
     /// Remote projects whose last connect attempt failed (pid → error). Drives
     /// the pane-area "Reconnect / Scan for projects" state; cleared on retry
     /// and on a successful connect.
     remote_connect_failed: HashMap<Uuid, String>,
-    /// Guards against overlapping git-status refreshes for the panel.
-    git_diff_loading: bool,
-    /// The same, for the panel's Worktrees tab.
-    git_diff_worktrees_loading: bool,
     /// The git-diff panel's commit-message input.
     git_diff_commit_input: Entity<InputState>,
     /// Open per-file diff windows, keyed by (project id, repo-relative path), so
@@ -6026,6 +6019,8 @@ pub struct MuxelApp {
     _loop_timer: Task<()>,
     /// When each diff pane on screen re-runs `git diff` (off the UI thread).
     diff_panes: diff_panes::DiffPanes,
+    /// When `git status` runs for the Changes view and the worktrees' counts.
+    status_targets: status_targets::StatusTargets,
     /// Polls open local text files and reads changed content off the UI thread.
     _resource_timer: Task<()>,
     /// Debounce handle for persisting the window geometry on resize/move.
@@ -8187,7 +8182,6 @@ impl MuxelApp {
             alert_playback: None,
             alert_sound_error: None,
             status_polls: StatusPolls::default(),
-            worktree_changes_stale: false,
             codex_session_names: HashMap::new(),
             codex_name_index: Default::default(),
             worktree_changes: HashMap::new(),
@@ -8313,9 +8307,6 @@ impl MuxelApp {
             git_diff_files: None,
             git_diff_worktree_files: HashMap::new(),
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
-            git_diff_branches: Vec::new(),
-            git_diff_loading: false,
-            git_diff_worktrees_loading: false,
             git_diff_commit_input,
             diff_file_windows: HashMap::new(),
             show_new_remote: false,
@@ -8386,6 +8377,7 @@ impl MuxelApp {
             _status_timer: status_timer,
             _loop_timer: loop_timer,
             diff_panes: diff_panes::DiffPanes::default(),
+            status_targets: status_targets::StatusTargets::default(),
             _resource_timer: resource_timer,
             bounds_save_task: None,
             show_terms,
@@ -12710,45 +12702,11 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Show or hide the docked Changes panel. Its files refresh as
+    /// `status_targets` finds them due: at once when shown stale.
     fn toggle_git_diff(&mut self, cx: &mut Context<Self>) {
         self.show_git_diff = !self.show_git_diff;
-        if self.show_git_diff {
-            self.refresh_git_diff_panel(cx);
-        }
         cx.notify();
-    }
-
-    /// Kick off a background `git_status_files` for the active project, caching the
-    /// result in `git_diff_files`. Guarded so refreshes never pile up (matters for
-    /// remote/SSH projects, where each call is an SSH round-trip).
-    fn refresh_git_diff_panel(&mut self, cx: &mut Context<Self>) {
-        if self.git_diff_loading {
-            return;
-        }
-        let Some(pid) = self.workspace.active_project else {
-            self.git_diff_files = None;
-            return;
-        };
-        let Some(loc) = self.repo_loc(pid) else {
-            self.git_diff_files = None;
-            return;
-        };
-        self.git_diff_loading = true;
-        cx.spawn(async move |this, cx| {
-            let files = cx
-                .background_executor()
-                .spawn(async move {
-                    let _git = ui_profile::git_caller("git-panel");
-                    integrations::git_status_files(&loc)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.git_diff_loading = false;
-                this.git_diff_files = Some(files);
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn set_git_diff_panel_width(&mut self, width: f32) {
@@ -12915,16 +12873,12 @@ impl MuxelApp {
         );
         self.git_diff_commit_input
             .update(cx, |s, cx| s.set_value("", window, cx));
-        self.refresh_git_diff_panel(cx);
+        self.request_changes(cx);
     }
 
     fn set_git_diff_tab(&mut self, tab: GitDiffTab, cx: &mut Context<Self>) {
         if self.git_diff_tab != tab {
             self.git_diff_tab = tab;
-            match tab {
-                GitDiffTab::Files => self.refresh_git_diff_panel(cx),
-                GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
-            }
             cx.notify();
         }
     }
@@ -12934,59 +12888,6 @@ impl MuxelApp {
             self.git_diff_worktrees_expanded.insert(wid);
         }
         cx.notify();
-    }
-
-    /// Refresh each active-project worktree's changed-file list off the UI thread.
-    fn refresh_git_diff_worktrees(&mut self, cx: &mut Context<Self>) {
-        let Some(pid) = self.workspace.active_project else {
-            self.git_diff_worktree_files.clear();
-            return;
-        };
-        let paths: Vec<(Uuid, PathBuf)> = self
-            .workspace
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == pid)
-            .map(|w| (w.id, w.path.clone()))
-            .collect();
-        if paths.is_empty() {
-            self.git_diff_worktree_files.clear();
-            self.git_diff_branches.clear();
-            return;
-        }
-        if self.git_diff_worktrees_loading {
-            return;
-        }
-        self.git_diff_worktrees_loading = true;
-        let loc = self.repo_loc(pid);
-        cx.spawn(async move |this, cx| {
-            let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
-                .background_executor()
-                .spawn(async move {
-                    let _git = ui_profile::git_caller("git-panel-worktrees");
-                    let files = paths
-                        .into_iter()
-                        .map(|(wid, path)| {
-                            (
-                                wid,
-                                integrations::git_status_files(&integrations::RepoLoc::Local(path)),
-                            )
-                        })
-                        .collect();
-                    let branches = loc
-                        .map(|l| integrations::list_branches(&l))
-                        .unwrap_or_default();
-                    (files, branches)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.git_diff_worktrees_loading = false;
-                this.git_diff_worktree_files = results.into_iter().collect();
-                this.git_diff_branches = branches;
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// Merge worktree `wid`'s branch into `target`: check out `target` in the main
@@ -13278,15 +13179,6 @@ impl MuxelApp {
     /// and an antivirus scan). Remote project branches are handled separately by
     /// `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        // Keep the git-diff panel current while it's open, docked or as the
-        // Changes view (covers edits and active-project switches; the calls
-        // self-guard re-entrancy).
-        if self.show_git_diff || self.main_view == hotbar::MainView::Changes {
-            match self.git_diff_tab {
-                GitDiffTab::Files => self.refresh_git_diff_panel(cx),
-                GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
-            }
-        }
         if self.status_refresh_in_flight {
             return;
         }
@@ -13298,12 +13190,6 @@ impl MuxelApp {
             .iter()
             .filter(|p| !p.is_remote())
             .map(|p| (p.id, p.root_path.clone()))
-            .collect();
-        let worktrees: Vec<(Uuid, PathBuf)> = self
-            .workspace
-            .worktrees
-            .iter()
-            .map(|w| (w.id, w.path.clone()))
             .collect();
         let codex_home = self
             .workspace
@@ -13321,9 +13207,8 @@ impl MuxelApp {
             .flatten();
         let mut codex_name_index = std::mem::take(&mut self.codex_name_index);
         let mut polls = std::mem::take(&mut self.status_polls);
-        let recount_worktrees = std::mem::take(&mut self.worktree_changes_stale);
         cx.spawn(async move |this, cx| {
-            let (programs, branches, changes, codex_names, codex_name_index, polls) = cx
+            let (programs, branches, codex_names, codex_name_index, polls) = cx
                 .background_executor()
                 .spawn(async move {
                     let now = Instant::now();
@@ -13359,29 +13244,12 @@ impl MuxelApp {
                         })
                         .collect();
                     drop(git_caller);
-                    let changes = (recount_worktrees || polls.worktrees.due(&(), &worktrees, now))
-                        .then(|| {
-                            let _git = ui_profile::git_caller("worktree-changes");
-                            let counts: Vec<(Uuid, usize)> = worktrees
-                                .iter()
-                                .map(|(id, path)| (*id, integrations::worktree_change_count(path)))
-                                .collect();
-                            polls.worktrees.record((), worktrees, now);
-                            counts
-                        });
                     let codex_names = codex_home.map(|home| {
                         codex_name_index
                             .refresh(&home)
                             .map(|changed| changed.then(|| codex_name_index.names().clone()))
                     });
-                    (
-                        programs,
-                        branches,
-                        changes,
-                        codex_names,
-                        codex_name_index,
-                        polls,
-                    )
+                    (programs, branches, codex_names, codex_name_index, polls)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -13403,9 +13271,6 @@ impl MuxelApp {
                 for (id, b, list) in branches {
                     this.project_branches.insert(id, b);
                     this.project_branch_lists.insert(id, list);
-                }
-                if let Some(changes) = changes {
-                    this.worktree_changes = changes.into_iter().collect();
                 }
                 match codex_names {
                     Some(Ok(Some(names))) => this.codex_session_names = names,
@@ -18448,7 +18313,7 @@ impl MuxelApp {
             let result = cx.background_executor().spawn(async move { op() }).await;
             let _ = this.update(cx, |this, cx| {
                 // Commit, stash, pull… may have changed a worktree's change count.
-                this.worktree_changes_stale = true;
+                this.request_worktree_counts(cx);
                 match result {
                     Ok(out) => this.add_event(NotifKind::Success, ok, git_notify_detail(&out)),
                     Err(e) => {
@@ -21330,7 +21195,7 @@ impl MuxelApp {
                     window,
                     cx,
                 );
-                self.refresh_git_diff_panel(cx);
+                self.request_changes(cx);
             }
             ConfirmAction::DeleteWorktreeFromPanel { wid } => self.worktree_delete(wid, window, cx),
             ConfirmAction::TrustHostKey { entry, file, retry } => {
@@ -26435,10 +26300,7 @@ impl MuxelApp {
                     .xsmall()
                     .icon(IconName::Redo)
                     .tooltip(t("Refresh"))
-                    .on_click(cx.listener(|this, _e, _w, cx| match this.git_diff_tab {
-                        GitDiffTab::Files => this.refresh_git_diff_panel(cx),
-                        GitDiffTab::Worktrees => this.refresh_git_diff_worktrees(cx),
-                    })),
+                    .on_click(cx.listener(|this, _e, _w, cx| this.request_changes(cx))),
             );
 
         // Files / Worktrees tab toggle.
@@ -26724,7 +26586,12 @@ impl MuxelApp {
         let files = self.git_diff_worktree_files.get(&wid);
         let count = files.map(|f| f.len()).unwrap_or(0);
         let hover_bg = cx.theme().sidebar_accent;
-        let branches = self.git_diff_branches.clone();
+        // The branch poll keeps the project's list current.
+        let branches = self
+            .project_branch_lists
+            .get(&w.project_id)
+            .cloned()
+            .unwrap_or_default();
         let chevron = if expanded {
             IconName::ChevronDown
         } else {
@@ -34937,6 +34804,8 @@ impl Render for MuxelApp {
         self.sync_browser_visibility(cx);
         // A diff pane coming into view refreshes at once (hidden ones run no git).
         self.sync_diff_visibility(cx);
+        // So does the Changes view; worktrees' counts follow their files.
+        self.sync_status_targets(cx);
         // Cache the settings pane width so deep helpers can size wrapping labels
         // absolutely (their multi-line height is otherwise mis-measured).
         if self.show_settings {

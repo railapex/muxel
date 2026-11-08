@@ -621,8 +621,11 @@ feature is added or changed, update the matching entry here in the same change**
   orphaned; Merge lands them on the base.
 - **Kept worktrees** — "kept" (detached) worktrees stay in the sidebar and can be
   resumed (spawn a new agent into them) or resolved later.
-- **Review workflow** — each worktree shows its uncommitted-change count;
-  right-click for **View changes** (opens the git-diff pane), **Review** /
+- **Review workflow** — each worktree shows its uncommitted-change count, which
+  follows its files the way the git diff panel does (and every 10 s where the
+  folder can't be watched); the panel's Worktrees tab lists the same files.
+  On Windows, while muxel runs, a worktree folder's parent folders can't be
+  renamed. Right-click for **View changes** (opens the git-diff pane), **Review** /
   **Security Review** (spawns that runner *inside* the worktree to review its
   diff), **Discard changes** (reset the worktree to its base, keeping it), or
   **Discard worktree** (close its panes + delete the worktree and branch).
@@ -1346,6 +1349,13 @@ feature is added or changed, update the matching entry here in the same change**
     (checks it out + merges, then offers to remove the worktree), and **Delete** the
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
+  The panel (or the Changes view) runs `git status` only while it's on screen:
+  for a local project, when a tracked file changes, a file git doesn't ignore
+  comes or goes, or HEAD's branch moves, once the writes settle as for the git
+  diff pane below, and every 30 s anyway. Build output and other ignored files
+  don't wake it. A remote project, or one that can't be watched, refreshes
+  every 1.5 s while shown. Hidden, it runs no git, and refreshes as soon as
+  it's shown if anything changed.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
   changes", the project menu, or a worktree) rather than splitting off a new pane.

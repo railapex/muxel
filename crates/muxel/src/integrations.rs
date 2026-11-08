@@ -1984,6 +1984,67 @@ fn git_path(bytes: &[u8]) -> Option<PathBuf> {
 /// Resolve [`DiffPlan`] for `dir` with two git commands, `rev-parse` and
 /// `ls-files`. `None` where `dir` isn't in a work tree git will read.
 pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
+    plan_with(dir, false).map(|(plan, _, _)| plan)
+}
+
+/// What a [`git_status_files`] at a folder reads, for a watch.
+pub struct StatusPlan {
+    /// The work tree's top level. `git status` reports the whole tree from
+    /// any folder in it, so every path here is relative to this.
+    pub root: PathBuf,
+    /// The whole tree's [`DiffPlan`], with git's exclude file among the
+    /// state that re-plans.
+    pub diff: DiffPlan,
+    /// Ignored paths, directories collapsed.
+    pub ignored: Vec<PathBuf>,
+    /// The git directory, when it's inside `root`.
+    pub git_dir: Option<PathBuf>,
+}
+
+/// Resolve [`StatusPlan`] for `dir` with three git commands: `rev-parse`,
+/// `ls-files` for the tracked files and again for the ignored ones. `None`
+/// where `dir` isn't in a work tree git will read.
+pub fn status_plan(dir: &Path) -> Option<StatusPlan> {
+    let (mut diff, git_dir, common) = plan_with(dir, true)?;
+    let root = PathBuf::from(&diff.toplevel);
+    let ignored = git_read_command()
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .profiled_output()
+        .ok()
+        .filter(|out| out.status.success())?
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(git_path)
+        // `target/` as `target`.
+        .map(|path| path.components().collect())
+        .collect();
+    diff.state.push(common.join("info").join("exclude"));
+    let git_dir = git_dir
+        .strip_prefix(lexical(&root))
+        .ok()
+        .map(Path::to_path_buf);
+    Some(StatusPlan {
+        root,
+        diff,
+        ignored,
+        git_dir,
+    })
+}
+
+/// [`diff_plan`], listing the tracked files of the whole work tree (relative
+/// to its top level) when `whole_tree`, else those under `dir`; with the
+/// git directory and the common one.
+fn plan_with(dir: &Path, whole_tree: bool) -> Option<(DiffPlan, PathBuf, PathBuf)> {
     let git = |args: &[&str]| {
         git_read_command()
             .arg("-C")
@@ -2005,7 +2066,12 @@ pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
     let git_dir = lexical(Path::new(lines.next()?));
     // As [`git_ref_stamp`] finds it, from the `commondir` file.
     let common = lexical(&common_git_dir(&git_dir));
-    let tracked = git(&["ls-files", "-z", "--", "."])?
+    let listing: &[&str] = if whole_tree {
+        &["ls-files", "-z", "--full-name", "--", ":/"]
+    } else {
+        &["ls-files", "-z", "--", "."]
+    };
+    let tracked = git(listing)?
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
         .filter_map(git_path)
@@ -2036,13 +2102,14 @@ pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
                 .any(|prefix| refname.starts_with(prefix));
         refs.push(if per_worktree { &git_dir } else { &common }.join(refname));
     }
-    Some(DiffPlan {
+    let plan = DiffPlan {
         toplevel,
         tracked,
         state: vec![git_dir.join("HEAD"), git_dir.join("index")],
         refs,
         settled: head.is_some(),
-    })
+    };
+    Some((plan, git_dir, common))
 }
 
 /// What a diff pane shows for a folder git won't read, or that's gone.
