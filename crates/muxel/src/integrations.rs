@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// `std::process::Command` for `program`, with the console window suppressed on
 /// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
@@ -2059,9 +2059,43 @@ pub struct DiffPlan {
     pub refs: Vec<PathBuf>,
     /// Whether those files settle what `git diff HEAD` reads, by the same
     /// rules as [`GitRefStamp`]: no variable from [`GIT_DISCOVERY_ENV`] set,
-    /// and a HEAD [`settled_head`] accepts. An unsettled repository isn't
+    /// and a HEAD [`settled_head`] accepts. Nor is a repository with a
+    /// submodule settled: an edit inside one changes the diff (`-dirty`)
+    /// without touching a tracked file. An unsettled repository isn't
     /// watched; its pane polls while visible.
     pub settled: bool,
+    /// HEAD and the index as they stood before the tracked files were
+    /// listed. When they differ at a later refresh, the event that should
+    /// have re-planned was lost, and the plan is resolved again.
+    pub inputs: PlanInputs,
+}
+
+/// The size and modification time of each file a plan was read from (or
+/// `None` where it was missing), compared at each refresh to catch a change
+/// whose event the watcher lost, without running git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanInputs(Vec<(PathBuf, Option<(u64, SystemTime)>)>);
+
+impl PlanInputs {
+    pub fn read(files: &[PathBuf]) -> Self {
+        Self(
+            files
+                .iter()
+                .map(|file| {
+                    let stamp = std::fs::metadata(file)
+                        .ok()
+                        .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+                    (file.clone(), stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether every file still stands as it did when read.
+    pub fn current(&self) -> bool {
+        let files: Vec<PathBuf> = self.0.iter().map(|(file, _)| file.clone()).collect();
+        Self::read(&files) == *self
+    }
 }
 
 /// `path` with `.` and `..` resolved without touching the disk, so it compares
@@ -2180,16 +2214,16 @@ fn plan_with(dir: &Path, whole_tree: bool) -> Option<(DiffPlan, PathBuf, PathBuf
     let git_dir = lexical(Path::new(lines.next()?));
     // As [`git_ref_stamp`] finds it, from the `commondir` file.
     let common = lexical(&common_git_dir(&git_dir));
+    let state = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    // Before listing: a change after this makes the plan stale, never the
+    // other way round.
+    let inputs = PlanInputs::read(&state);
     let listing: &[&str] = if whole_tree {
-        &["ls-files", "-z", "--full-name", "--", ":/"]
+        &["ls-files", "-z", "-s", "--full-name", "--", ":/"]
     } else {
-        &["ls-files", "-z", "--", "."]
+        &["ls-files", "-z", "-s", "--", "."]
     };
-    let tracked = git(listing)?
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-        .filter_map(git_path)
-        .collect();
+    let (tracked, submodules) = tracked_files(&git(listing)?);
     let head = (!GIT_DISCOVERY_ENV
         .iter()
         .any(|key| std::env::var_os(key).is_some()))
@@ -2219,11 +2253,29 @@ fn plan_with(dir: &Path, whole_tree: bool) -> Option<(DiffPlan, PathBuf, PathBuf
     let plan = DiffPlan {
         toplevel,
         tracked,
-        state: vec![git_dir.join("HEAD"), git_dir.join("index")],
+        state,
         refs,
-        settled: head.is_some(),
+        settled: head.is_some() && !submodules,
+        inputs,
     };
     Some((plan, git_dir, common))
+}
+
+/// The paths in `git ls-files -z -s` output (`<mode> <object> <stage>\t<path>`),
+/// once each though a conflict lists a path per stage, and whether any is a
+/// submodule (mode 160000).
+fn tracked_files(listing: &[u8]) -> (Vec<PathBuf>, bool) {
+    let mut submodules = false;
+    let mut tracked: Vec<PathBuf> = listing
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            submodules |= entry.starts_with(b"160000 ");
+            git_path(&entry[tab + 1..])
+        })
+        .collect();
+    tracked.dedup();
+    (tracked, submodules)
 }
 
 /// What a diff pane shows for a folder git won't read, or that's gone.
