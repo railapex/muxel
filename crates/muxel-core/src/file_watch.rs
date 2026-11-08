@@ -75,6 +75,63 @@ pub struct TrackedFiles {
     /// HEAD and the index. A change there re-runs the diff and re-lists the
     /// tracked files: an add, a removal, a branch switch.
     pub relist: Vec<DirNames>,
+    /// Set for `git status`, which also lists the files git neither tracks
+    /// nor ignores.
+    pub untracked: Option<Untracked>,
+}
+
+/// What `git status` reads beyond a diff's sources: which paths exist that
+/// git neither tracks nor ignores. Paths are relative to the root.
+#[derive(Debug, Default)]
+pub struct Untracked {
+    /// Ignored paths, directories collapsed, as `git ls-files --others
+    /// --ignored --exclude-standard --directory` lists them.
+    pub ignored: HashSet<PathBuf>,
+    /// Untracked directories `git status` shows collapsed (`?? notes/`):
+    /// entries coming or going inside one leave its output as it was.
+    pub dirs: HashSet<PathBuf>,
+    /// The repository's git directory, when it's under the root.
+    pub git_dir: Option<PathBuf>,
+}
+
+impl Untracked {
+    /// Whether `git status` never lists `rel`, or anything under it: it's in
+    /// the git directory, or ignored.
+    pub fn hides(&self, rel: &Path) -> bool {
+        self.git_dir
+            .as_deref()
+            .is_some_and(|git| rel.starts_with(git))
+            || rel.ancestors().any(|path| self.ignored.contains(path))
+    }
+
+    /// Route a path under the root that isn't tracked. Something that wasn't
+    /// there coming, or something going, can change what `git status`
+    /// lists; an untracked file's contents can't. A `.gitignore` changes
+    /// what's ignored, so the plan is listed again; so is a path appearing
+    /// in a directory the plan doesn't know, which may be a new ignored one
+    /// (a fresh `target/`) whose writes would otherwise keep waking it.
+    fn route(&self, rel: &Path, moved: bool, tracked_dirs: &HashSet<PathBuf>, change: &mut Change) {
+        if rel.as_os_str().is_empty()
+            || self.hides(rel)
+            || rel.ancestors().skip(1).any(|dir| self.dirs.contains(dir))
+        {
+            return;
+        }
+        if is_gitignore(rel) {
+            change.touched = true;
+            change.relist = true;
+        } else if moved {
+            change.touched = true;
+            let parent = rel.parent().unwrap_or(Path::new(""));
+            if !parent.as_os_str().is_empty() && !tracked_dirs.contains(parent) {
+                change.relist = true;
+            }
+        }
+    }
+}
+
+fn is_gitignore(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".gitignore")
 }
 
 impl TrackedFiles {
@@ -99,14 +156,21 @@ impl TrackedFiles {
             dirs,
             refs,
             relist,
+            untracked: None,
         }
+    }
+
+    /// These sources, read by `git status`: untracked paths count too.
+    pub fn with_untracked(mut self, untracked: Untracked) -> Self {
+        self.untracked = Some(untracked);
+        self
     }
 
     /// Route one event's paths. A tracked file counts for any change. A
     /// tracked directory counts when it's created, removed or renamed, and
     /// re-lists too, so a watch per directory follows it; its write time
     /// moving only means an entry inside changed, which a tracked file's own
-    /// event reports.
+    /// event reports. For `git status`, see [`Untracked::route`].
     fn route(&self, event: &WatchEvent, change: &mut Change) {
         let moved = matches!(
             event.kind,
@@ -119,11 +183,16 @@ impl TrackedFiles {
             } else if self.refs.iter().any(|name| name.is(path)) {
                 change.touched = true;
             } else if let Some(rel) = self.root.relative(path) {
-                if self.files.contains(rel) {
+                if self.untracked.is_some() && is_gitignore(rel) && self.files.contains(rel) {
+                    change.touched = true;
+                    change.relist = true;
+                } else if self.files.contains(rel) {
                     change.touched = true;
                 } else if moved && self.dirs.contains(rel) {
                     change.touched = true;
                     change.relist = true;
+                } else if let Some(untracked) = &self.untracked {
+                    untracked.route(rel, moved, &self.dirs, change);
                 }
             }
         }
@@ -483,8 +552,8 @@ impl WatchRouter {
 #[cfg(test)]
 mod tests {
     use super::{
-        Change, DirNames, EventKind, OsWatch, Recursion, TrackedFiles, WatchEvent, WatchFilter,
-        WatchId, WatchRouter, WatchSpec,
+        Change, DirNames, EventKind, OsWatch, Recursion, TrackedFiles, Untracked, WatchEvent,
+        WatchFilter, WatchId, WatchRouter, WatchSpec,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -554,6 +623,75 @@ mod tests {
             router.event(&event(kind, &[root.join("src")]));
             assert_eq!(change(&mut router), relist, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_status_also_wakes_for_untracked_paths_that_are_not_ignored() {
+        let root = PathBuf::from("repo");
+        let git = root.join(".git");
+        let tracked = TrackedFiles::new(
+            names(&root),
+            ["src/main.rs", ".gitignore"].map(PathBuf::from),
+            vec![names(&git.join("refs/heads/main"))],
+            vec![names(&git.join("HEAD")), names(&git.join("index"))],
+        )
+        .with_untracked(Untracked {
+            ignored: ["target", "debug.log"].map(PathBuf::from).into(),
+            dirs: [PathBuf::from("notes")].into(),
+            git_dir: Some(PathBuf::from(".git")),
+        });
+        let mut router = WatchRouter::new(false);
+        router.register(WatchSpec {
+            paths: vec![(root.clone(), Recursion::Tree)],
+            filter: WatchFilter::Tracked(Arc::new(tracked)),
+            lose_on: Vec::new(),
+        });
+        // None of these changes what `git status` lists: a build under an
+        // ignored directory, an ignored file, git's own writes, an untracked
+        // file's contents, an entry inside a directory status shows collapsed.
+        for (kind, path) in [
+            (EventKind::Create, root.join("target/debug/muxel.exe")),
+            (EventKind::Remove, root.join("target")),
+            (EventKind::Create, root.join("debug.log")),
+            (EventKind::Create, git.join("objects/ab/cdef")),
+            (EventKind::Modify, root.join("notes.txt")),
+            (EventKind::Create, root.join("notes/today.md")),
+            (EventKind::Modify, root.join("src")),
+        ] {
+            router.event(&event(kind, &[path]));
+        }
+        assert_eq!(change(&mut router), Change::default());
+        let touched = Change {
+            touched: true,
+            ..Change::default()
+        };
+        let relist = Change {
+            relist: true,
+            ..touched.clone()
+        };
+        // An untracked file coming or going, beside tracked ones or at the top.
+        for (kind, path) in [
+            (EventKind::Create, root.join("src/scratch.rs")),
+            (EventKind::Remove, root.join("notes.txt")),
+            (EventKind::Rename, root.join("notes")),
+        ] {
+            router.event(&event(kind, std::slice::from_ref(&path)));
+            assert_eq!(change(&mut router), touched, "{kind:?} {path:?}");
+        }
+        // A path in a directory the plan doesn't know: maybe a new ignored
+        // one, so the plan is listed again.
+        router.event(&event(EventKind::Create, &[root.join("build/out.o")]));
+        assert_eq!(change(&mut router), relist);
+        // A .gitignore, tracked or not, changes what's ignored.
+        for path in [root.join(".gitignore"), root.join("src/.gitignore")] {
+            router.event(&event(EventKind::Modify, std::slice::from_ref(&path)));
+            assert_eq!(change(&mut router), relist, "{path:?}");
+        }
+        // Tracked files and git's state route as for a diff.
+        router.event(&event(EventKind::Modify, &[root.join("src/main.rs")]));
+        assert_eq!(change(&mut router), touched);
+        router.event(&event(EventKind::Modify, &[git.join("index")]));
+        assert_eq!(change(&mut router), relist);
     }
 
     fn root_path() -> PathBuf {

@@ -115,11 +115,9 @@ impl MuxelApp {
         self.main_view = view;
         let active = self.workspace.active_project;
         match view {
-            MainView::Panes | MainView::Dashboard => {}
-            MainView::Changes => match self.git_diff_tab {
-                GitDiffTab::Files => self.refresh_git_diff_panel(cx),
-                GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
-            },
+            // Changes refresh as `status_targets` finds them due: at once
+            // when shown stale.
+            MainView::Panes | MainView::Dashboard | MainView::Changes => {}
             MainView::Memory => {
                 if let Some(pid) = active {
                     self.point_memory_at(pid, window, cx);
@@ -139,8 +137,8 @@ impl MuxelApp {
     }
 
     /// The active project became `pid`: keep a per-project view on it. (The
-    /// file browser follows it in `select_project`, and git changes refresh on
-    /// the status tick.)
+    /// file browser follows it in `select_project`, and the Changes view in
+    /// `sync_status_targets`.)
     pub(super) fn main_view_follow_project(
         &mut self,
         pid: Uuid,
@@ -151,7 +149,6 @@ impl MuxelApp {
             MainView::Memory if self.memory_pid != Some(pid) => {
                 self.point_memory_at(pid, window, cx)
             }
-            MainView::Changes => self.refresh_git_diff_panel(cx),
             _ => {}
         }
     }

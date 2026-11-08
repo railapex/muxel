@@ -25,6 +25,8 @@ pub const BACKSTOP: Duration = Duration::from_secs(30);
 struct Pane {
     visible: bool,
     watched: bool,
+    /// How often it refreshes while unwatched, when not [`POLL`].
+    poll: Option<Duration>,
     /// Changed since its last refresh started.
     dirty: bool,
     /// Refresh at the first chance: just shown while it may be stale, or
@@ -50,7 +52,7 @@ impl Pane {
             return Some(now);
         }
         if !self.watched {
-            return Some(landed + POLL);
+            return Some(landed + self.poll.unwrap_or(POLL));
         }
         let backstop = landed + BACKSTOP;
         if !self.dirty {
@@ -106,6 +108,12 @@ impl DiffSchedule {
             state.urgent = true;
         }
         state.watched = watched;
+    }
+
+    /// Refresh `pane` every `every` while it's unwatched, instead of [`POLL`]:
+    /// a count that was polled more slowly than a pane before it was watched.
+    pub fn set_poll(&mut self, pane: Uuid, every: Duration) {
+        self.pane(pane).poll = Some(every);
     }
 
     /// The watcher saw `pane`'s files change, or may have lost events (a
@@ -270,5 +278,36 @@ mod tests {
         assert_eq!(schedule.next_due(t0 + POLL), Some(t0 + POLL + BACKSTOP));
         schedule.set_watched(pane, false);
         assert_eq!(schedule.take_due(t0 + POLL + MS), vec![pane]);
+    }
+
+    #[test]
+    fn an_unwatched_target_keeps_its_own_poll() {
+        let mut schedule = DiffSchedule::default();
+        let (count, pane) = (Uuid::from_u128(3), Uuid::from_u128(4));
+        let every = Duration::from_secs(10);
+        let t0 = Instant::now();
+        schedule.set_poll(count, every);
+        for id in [count, pane] {
+            schedule.set_visible(id, true);
+        }
+        let mut first = schedule.take_due(t0);
+        first.sort();
+        assert_eq!(first, vec![count, pane]);
+        for id in [count, pane] {
+            schedule.landed(id, t0);
+        }
+        assert_eq!(
+            schedule.take_due(t0 + POLL),
+            vec![pane],
+            "the other polls as before"
+        );
+        schedule.landed(pane, t0 + POLL);
+        assert!(
+            schedule
+                .take_due(t0 + every - MS)
+                .iter()
+                .all(|id| *id != count)
+        );
+        assert!(schedule.take_due(t0 + every).contains(&count));
     }
 }
