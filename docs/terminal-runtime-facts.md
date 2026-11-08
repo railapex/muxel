@@ -467,7 +467,8 @@ Its earlier `Backgrounded` message remains after a task ends and is not live wor
 The tree's explicit `running` column identifies work independently of its animated
 glyph. Muse can leave its last Working title after a completed reply and task.
 With a Done hook, five seconds without output or a title update retires that
-cached title; a new Working hook or fresh activity keeps its normal authority.
+cached title. Its generation remains retired through later screen redraws; a new
+title generation or Working hook restores the normal title authority.
 
 Codex's parent can finish while a spawned agent runs. Its `Started`, `/subagents`
 and `Completed` output is history, so local panes use child rollout records instead.

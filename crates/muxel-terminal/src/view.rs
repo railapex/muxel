@@ -285,6 +285,8 @@ struct RuntimeStatusState {
     muse_cwd_label: Option<String>,
     /// Latest state reported by Muse's root-session hooks.
     muse_hook_state: Option<muxel_core::muse::MuseState>,
+    /// A finished title generation; output alone must not make it Working again.
+    muse_retired_title: Option<u64>,
     deadline: Option<Instant>,
     /// Independent of the evidence window, which can settle before an old
     /// Working title has had enough quiet time to retire.
@@ -330,6 +332,7 @@ impl RuntimeStatusState {
             grok_screen_working_at: None,
             muse_cwd_label: None,
             muse_hook_state: None,
+            muse_retired_title: None,
             deadline: None,
             silent_switch_until: None,
             timer_generation: 0,
@@ -391,6 +394,7 @@ impl RuntimeStatusState {
             // visible facts from the retired binding. The current generation is
             // recaptured below; the current semantic title is handled separately.
             self.semantic_title_status = None;
+            self.muse_retired_title = None;
             self.prev_raw = None;
             self.done_latch = false;
             self.completion_armed = false;
@@ -438,10 +442,17 @@ impl RuntimeStatusState {
             .settles_at
             .map(|at| now + at.duration_since(wall).unwrap_or_default() + Duration::from_millis(1));
         let (title_events, title_overflowed) = (evidence.titles, evidence.overflowed);
-        let (_, title_text) = session.title_snapshot();
+        let (title_generation, title_text) = session.title_snapshot();
         let muse_cwd_label = self.muse_cwd_label.as_deref();
         let observed_title = if title_provider == TitleProvider::Muse {
-            muse_title_status(title_text.as_deref(), muse_cwd_label)
+            if self.muse_hook_state != Some(muxel_core::muse::MuseState::Done) {
+                self.muse_retired_title = None;
+            }
+            if self.muse_retired_title == Some(title_generation) {
+                Some(AgentStatus::Idle)
+            } else {
+                muse_title_status(title_text.as_deref(), muse_cwd_label)
+            }
         } else {
             title_status(title_provider, title_text.as_deref(), session.title_age())
         };
@@ -568,6 +579,7 @@ impl RuntimeStatusState {
             if remaining.is_zero() {
                 title = Some(AgentStatus::Idle);
                 self.semantic_title_status = title;
+                self.muse_retired_title = Some(title_generation);
                 self.provider_settled = true;
             } else {
                 let deadline = now + remaining;
@@ -9441,14 +9453,47 @@ mod provider_switch_tests {
             assert_eq!(runtime.snapshot(&session).background, None);
             assert!(runtime.snapshot(&session).completion_ready);
 
+            let completion = runtime.snapshot(&session).completion_revision;
+            draw(&session, None, &background_fixture("muse", "ended"));
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            assert_eq!(runtime.snapshot(&session).completion_revision, completion);
+
             runtime.muse_hook_state = Some(MuseState::Working);
+            session.set_title_age_for_test(BACKGROUND_WAKE_GRACE);
+            session.set_idle_for_test(BACKGROUND_WAKE_GRACE);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+
+            runtime.muse_hook_state = Some(MuseState::Done);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                cleared + BACKGROUND_WAKE_GRACE,
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
             draw(
                 &session,
                 Some("⠋ project"),
                 &background_fixture("muse", "ended"),
             );
-            session.set_title_age_for_test(BACKGROUND_WAKE_GRACE);
-            session.set_idle_for_test(BACKGROUND_WAKE_GRACE);
             runtime.reconcile(
                 &session,
                 TitleProvider::Muse,

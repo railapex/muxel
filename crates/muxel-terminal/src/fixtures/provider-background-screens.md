@@ -23,6 +23,8 @@ past `Backgrounded` message above the composer remains after the tree vanishes.
 An additional run ended with the composer free and the last OSC spinner title
 unchanged after completion. A Done hook and five seconds of quiet distinguish
 that cached title from the live title updates during work.
+The runtime regression repaints the ended screen after Done to ensure output
+alone cannot restart that same cached title or repeat the completion.
 
 The child JSONL fixture retains Codex's first metadata record, copied parent
 history, the child-history boundary, its own turn start, assistant text, and turn
