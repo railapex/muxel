@@ -7,7 +7,7 @@ use super::{
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
+use muxel_core::sidebar::{BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
 use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
@@ -3471,8 +3471,7 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
                     &project.instances(),
                     &instances_by_id(&app.workspace),
                     &|_| None,
-                    None,
-                    chrono::Utc::now().timestamp_millis(),
+                    BandClock::at(&chrono::Local::now()),
                     SidebarSort::RecentWork,
                 );
                 assert!(rows.contains(&SidebarEntry::Pane(draft)), "{rows:?}");

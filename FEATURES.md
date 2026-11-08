@@ -553,9 +553,10 @@ feature is added or changed, update the matching entry here in the same change**
   Claude pane, built-in and edited lists alike match outside its input box,
   alongside Claude's own status-row and permission-form parsers.
 - **Heuristic fallback** — agents without markers fall back to bell + output
-  activity. They reach **done** only from the bell or process exit, never from a
-  quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
-  pane) can't fake a finished turn.
+  activity. They reach **done** only from the bell, never from a quiet spell — so
+  an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
+  finished turn. A process exit isn't a finish either: the pane keeps the state
+  it had, with no unread mark or Done notification.
 - **Event-driven status snapshots** — terminal output, semantic titles, bells,
   process exit, resize invalidation, and exact quiet/debounce deadlines update one
   per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
@@ -1382,14 +1383,15 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then the rest in Today (under 24 hours), This week (under seven
-  days), and Older bands. Within a band, sessions that need you (unread, or
-  asking for something) come first, newest first; then working sessions in the
-  order each started, so one that starts a turn joins the bottom of them; then
-  the rest, newest finish first. A working session counts as Today however long
-  ago it last finished. The focused session keeps its place until focus moves
-  on, so reading it doesn't move it, unless it starts working.
-  Sessions without work follow in layout order; project order and keyboard
+  each project, then the rest in Today (since midnight), This week (the six days
+  before), and Older bands, by each session's latest start, finish or question.
+  Within a band, sessions asking a question come first; then the ones that have
+  worked and aren't running, newest first, read or not; then working sessions in
+  the order each started, so one that starts a turn joins the bottom of them;
+  then sessions never used, newest open first. A working session counts as Today
+  however long its turn has run. Reading, focusing or clicking a session never
+  moves its row; only a change in its work or a new day does. Exiting is not a
+  finish. Pinned sessions follow the same order. Project order and keyboard
   navigation stay the same. Live popped-out sessions remain in Recent work;
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
@@ -1399,7 +1401,8 @@ feature is added or changed, update the matching entry here in the same change**
   opened) shows indented under that session's row and moves with it, newest
   first. Opening it again from another session moves it there; the file
   browser and palette leave it where it is. Once that session closes, or if it's
-  in another project, the resource is an ordinary row again. A pinned file stays
+  in another project, the resource is an ordinary row again, with the
+  never-used rows by when it was last opened. A pinned file stays
   with the pins unless its session is pinned too.
 - **Files close with their session** — in Recent work, closing a session (its
   tab, its pane, or Close terminals) also closes the files, diffs and pages it
