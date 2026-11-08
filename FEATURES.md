@@ -1654,6 +1654,9 @@ feature is added or changed, update the matching entry here in the same change**
   unsaved changes from HH:MM**; if the file changed on disk since, it says so, and
   restoring keeps both (the disk version waits behind **Reload / Keep mine**).
   Saving, reloading or closing without saving deletes the backup.
+- **Crash notice** — after muxel stops without closing a workspace cleanly, the
+  next time it opens one notice says how many prompts and editors were kept and
+  which agents were mid-turn.
 - **Rescue storage** — drafts and backups are small private files beside the
   workspace, written atomically, size-capped, and never logged. Settings →
   **Keep unsent prompts and unsaved editor changes** (on by default) turns it off

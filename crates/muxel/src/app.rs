@@ -8447,6 +8447,9 @@ impl MuxelApp {
             this.finalize_all_closes(cx);
             this.flush_rescue(cx);
             this.persist();
+            if let Some(id) = this.current_workspace {
+                muxel_store::rescue::mark_workspace_stopped(id);
+            }
             this.close_departure = None;
             this.close_departure_task = None;
             let kills = std::mem::take(&mut this.close_tmux_kills);
@@ -11888,6 +11891,9 @@ impl MuxelApp {
         }
         // The old workspace's panes go away below; save what they hold first.
         self.flush_rescue(cx);
+        if let Some(old) = self.current_workspace {
+            muxel_store::rescue::mark_workspace_stopped(old);
+        }
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
@@ -11984,10 +11990,11 @@ impl MuxelApp {
                 .filter(|w| !w.projects.is_empty())
         };
         self.rescue = rescue::Rescue::default();
+        let crash = self.note_workspace_running(id, loaded.as_ref());
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
         }
-        self.load_workspace_rescue();
+        self.load_workspace_rescue(crash);
         // Reopen per-monitor project windows for saved assignments whose display
         // is currently connected (a missing monitor keeps the pin for later).
         let assignments: Vec<(Uuid, Uuid)> = self

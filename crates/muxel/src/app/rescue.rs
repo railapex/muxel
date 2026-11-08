@@ -28,6 +28,20 @@ pub(super) struct Rescue {
     pub(super) closed: Vec<DraftOffer>,
     /// The strip was hidden; it shows again when another pane's draft is kept.
     pub(super) closed_hidden: bool,
+    /// What muxel kept when this workspace last stopped without closing
+    /// cleanly, until dismissed.
+    pub(super) crash: Option<CrashNotice>,
+}
+
+/// The one notice after an unclean exit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct CrashNotice {
+    /// Panes whose unsent prompt was kept.
+    pub(super) drafts: usize,
+    /// Editors whose unsaved changes were kept.
+    pub(super) editors: usize,
+    /// Agents that were mid-turn when muxel last saved.
+    pub(super) mid_turn: Vec<String>,
 }
 
 pub(super) use crate::editor::rescue_time;
@@ -366,9 +380,50 @@ impl MuxelApp {
         }
     }
 
+    /// Mark workspace `id` running. When it already was, the last run never
+    /// closed it: say what was kept and which agents were mid-turn
+    /// (`loaded`, its document as saved), if anything.
+    pub(super) fn note_workspace_running(
+        &self,
+        id: Uuid,
+        loaded: Option<&Workspace>,
+    ) -> Option<CrashNotice> {
+        if !muxel_store::rescue::mark_workspace_running(id) {
+            return None;
+        }
+        let counts = muxel_store::rescue::rescue_dir(id)
+            .filter(|_| self.settings.rescue_unsent_text)
+            .map(|dir| dir.counts())
+            .unwrap_or_default();
+        let mid_turn: Vec<String> = loaded
+            .map(|ws| {
+                ws.instances
+                    .iter()
+                    .filter(|i| {
+                        i.activity.current_state() == Some(muxel_core::AgentActivityState::Working)
+                    })
+                    .map(|i| i.display_name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        log::warn!(
+            "workspace {id} didn't close cleanly: kept {} draft(s) and {} editor backup(s); {} agent(s) mid-turn",
+            counts.drafts,
+            counts.editors,
+            mid_turn.len()
+        );
+        let notice = CrashNotice {
+            drafts: counts.drafts,
+            editors: counts.editors,
+            mid_turn,
+        };
+        (notice != CrashNotice::default()).then_some(notice)
+    }
+
     /// Load what the newly entered workspace kept: settle drafts of panes
     /// that no longer exist, and list closed panes' drafts.
-    pub(super) fn load_workspace_rescue(&mut self) {
+    pub(super) fn load_workspace_rescue(&mut self, crash: Option<CrashNotice>) {
+        self.rescue.crash = crash;
         let Some(dir) = self.rescue_dir() else {
             return;
         };
@@ -453,13 +508,79 @@ impl MuxelApp {
         )
     }
 
-    /// The strip under the title bar: closed panes' drafts.
+    /// The crash notice's text.
+    pub(super) fn crash_label(notice: &CrashNotice) -> String {
+        let mut kept = Vec::new();
+        if notice.drafts > 0 {
+            kept.push(tn(
+                "{n} unsent prompt",
+                "{n} unsent prompts",
+                notice.drafts,
+                &[("n", &notice.drafts.to_string())],
+            ));
+        }
+        if notice.editors > 0 {
+            kept.push(tn(
+                "{n} editor's unsaved changes",
+                "{n} editors' unsaved changes",
+                notice.editors,
+                &[("n", &notice.editors.to_string())],
+            ));
+        }
+        let mut label = t("muxel didn't close cleanly.").to_string();
+        if !kept.is_empty() {
+            label.push(' ');
+            label.push_str(&tf(
+                "Kept {what}; each pane offers its own.",
+                &[("what", &kept.join(", "))],
+            ));
+        }
+        if !notice.mid_turn.is_empty() {
+            label.push(' ');
+            label.push_str(&tf(
+                "Mid-turn when it stopped: {names}.",
+                &[("names", &notice.mid_turn.join(", "))],
+            ));
+        }
+        label
+    }
+
+    fn render_crash_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notice = self.rescue.crash.as_ref()?;
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(div().child(Self::crash_label(notice)))
+                .child(
+                    Button::new("rescue-crash-dismiss")
+                        .ghost()
+                        .xsmall()
+                        .label(t("Dismiss"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.rescue.crash = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The strip under the title bar: the crash notice, and closed panes'
+    /// drafts.
     pub(super) fn render_rescue_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.rescue.closed_hidden || self.rescue.closed.is_empty() {
+        let crash = self.render_crash_notice(cx);
+        let closed = if self.rescue.closed_hidden {
+            &[][..]
+        } else {
+            &self.rescue.closed[..]
+        };
+        if crash.is_none() && closed.is_empty() {
             return None;
         }
-        let closed = &self.rescue.closed[..];
-        let mut strip = div()
+        let strip = div()
             .flex_none()
             .flex()
             .flex_col()
@@ -470,6 +591,10 @@ impl MuxelApp {
             .bg(cx.theme().secondary)
             .border_b_1()
             .border_color(cx.theme().border);
+        let mut strip = strip.children(crash);
+        if closed.is_empty() {
+            return Some(strip.into_any_element());
+        }
         for (index, kept) in closed.iter().take(STRIP_ROWS).enumerate() {
             let time = rescue_time(kept.draft.saved_at_ms);
             let label = match kept.draft.pane.as_deref() {

@@ -3,11 +3,14 @@
 //! the pane is closed for good.
 //! An editor's unsaved changes are backed up once edits stop and offered
 //! when it opens again.
+//! After an unclean exit one notice says what was kept and who was mid-turn.
 
-use super::{Instance, MuxelApp, PaneNode, Project, TerminalSpawnMeta};
+use super::rescue::CrashNotice;
+use super::{Instance, MuxelApp, PaneNode, Project, TerminalSpawnMeta, Workspace};
 use crate::editor::{ExternalChange, read_disk_change};
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
+use muxel_core::rescue::{DraftSource, PromptDraft};
 use muxel_store::rescue::RescueDir;
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession};
 use std::path::PathBuf;
@@ -436,5 +439,74 @@ fn closing_an_editor_without_saving_deletes_its_backup() {
             .unwrap();
         cx.run_until_parked();
         assert!(dir.editor_backup(iid).is_none());
+    });
+}
+
+#[test]
+fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
+    with_app(|cx, window| {
+        let crashed = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // A previous run of `crashed` marked it running and never stopped it,
+        // leaving a draft and an agent mid-turn.
+        assert!(!muxel_store::rescue::mark_workspace_running(crashed));
+        let root = muxel_store::data_dir().unwrap().join("crashed-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut doc = Workspace::default();
+        let project = doc.add_project(Project::new("crashed", root));
+        let mut agent = Instance::shell(project);
+        agent.title = "Claude 2".into();
+        agent.activity.last_state = Some(muxel_core::AgentActivityState::Working);
+        let agent_id = agent.id;
+        doc.add_instance(agent);
+        doc.project_mut(project).unwrap().layout = Some(PaneNode::leaf(agent_id));
+        muxel_store::save_workspace_to(&muxel_store::workspace_doc_path(crashed).unwrap(), &doc)
+            .unwrap();
+        let draft = PromptDraft {
+            text: "where was I".into(),
+            partial: false,
+            saved_at_ms: 1,
+            source: DraftSource::Agent,
+            pane: None,
+        };
+        muxel_store::rescue::rescue_dir(crashed)
+            .unwrap()
+            .save_draft(agent_id, &draft)
+            .unwrap();
+        let mut empty = Workspace::default();
+        let root = muxel_store::data_dir().unwrap().join("other-project");
+        std::fs::create_dir_all(&root).unwrap();
+        empty.add_project(Project::new("other", root));
+        muxel_store::save_workspace_to(&muxel_store::workspace_doc_path(other).unwrap(), &empty)
+            .unwrap();
+
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(crashed, window, cx);
+                let notice = app
+                    .rescue
+                    .crash
+                    .clone()
+                    .expect("one notice after the crash");
+                assert_eq!(
+                    notice,
+                    CrashNotice {
+                        drafts: 1,
+                        editors: 0,
+                        mid_turn: vec!["Claude 2".into()],
+                    }
+                );
+                let label = MuxelApp::crash_label(&notice);
+                assert!(label.contains("1 unsent prompt"), "{label}");
+                assert!(label.contains("Claude 2"), "{label}");
+
+                // Leaving cleanly and coming back: no notice.
+                app.enter_workspace(other, window, cx);
+                assert!(app.rescue.crash.is_none());
+                app.enter_workspace(crashed, window, cx);
+                assert!(app.rescue.crash.is_none(), "a clean switch is not a crash");
+            })
+            .unwrap();
     });
 }
