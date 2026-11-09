@@ -1336,6 +1336,17 @@ pub struct TerminalSession {
     draft_touch: AtomicU64,
     /// A submission was admitted since the draft watcher last looked.
     draft_submitted: AtomicBool,
+    /// Line breaks this terminal's input could have typed into a provider's
+    /// input box, counted as input is written (see
+    /// [`muxel_core::rescue::input_newlines`]).
+    draft_newlines: AtomicU64,
+    /// Inputs that could bring in text with any number of line breaks
+    /// (history recall, search, undo).
+    draft_recalls: AtomicU64,
+    /// Both counts as they stood when the box was last read empty: the box
+    /// holds at most `draft_newlines - floor` line breaks, while no recall
+    /// happened since. `None` when that can't be known.
+    draft_floor: Mutex<Option<(u64, u64)>>,
     /// Where the shell's last OSC 133 B mark left the cursor: its input starts
     /// there.
     shell_input: Mutex<Option<crate::draft::ShellInputMark>>,
@@ -1859,6 +1870,12 @@ impl TerminalSession {
             draft_epoch: Instant::now(),
             draft_touch: AtomicU64::new(0),
             draft_submitted: AtomicBool::new(false),
+            draft_newlines: AtomicU64::new(0),
+            draft_recalls: AtomicU64::new(0),
+            // A program muxel just started has an empty box. A tmux session
+            // may have outlived muxel with text in it, and other clients of
+            // it type where muxel can't count.
+            draft_floor: Mutex::new(spec.tmux_input.is_none().then_some((0, 0))),
             shell_input: Mutex::new(None),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
@@ -2249,9 +2266,24 @@ impl TerminalSession {
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
         self.check_input_gate()?;
         self.admit_input(!data.is_empty());
+        self.count_draft_newlines(data);
         self.try_write_raw(data)?;
         self.shell_prompt.submitted(data);
         Ok(())
+    }
+
+    /// Count what `data` can do to the input box's line breaks before the
+    /// program sees it, so a read that shows its effect also counts it.
+    fn count_draft_newlines(&self, data: &[u8]) {
+        match muxel_core::rescue::input_newlines(data) {
+            Some(0) => {}
+            Some(newlines) => {
+                self.draft_newlines.fetch_add(newlines, Ordering::AcqRel);
+            }
+            None => {
+                self.draft_recalls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
 
     /// Refuse input while the terminal is held for closing.
@@ -2303,6 +2335,7 @@ impl TerminalSession {
         // until writer admission succeeds.
         let submitted_at = SystemTime::now();
         self.submission_pending.store(false, Ordering::Release);
+        self.count_draft_newlines(data);
         writer.write_all(data)?;
         writer.flush()?;
         self.shell_prompt.submitted(data);
@@ -2461,10 +2494,34 @@ impl TerminalSession {
     }
 
     /// A submission was admitted: the watcher drops the saved draft at once
-    /// and reads the box again once input stops.
+    /// and reads the box again once input stops. The pastes it sent can't
+    /// stand for a later marker.
     fn draft_submission(&self) {
+        self.paste_log.lock().clear();
         self.draft_submitted.store(true, Ordering::Release);
         self.touch_draft();
+    }
+
+    /// A submission is waiting for the watcher: whatever is saved was sent.
+    pub(crate) fn draft_submission_pending(&self) -> bool {
+        self.draft_submitted.load(Ordering::Acquire)
+    }
+
+    /// How many line breaks the input box can hold, `None` when unknown.
+    fn draft_newline_budget(&self) -> Option<u64> {
+        if self.tmux_input.is_some() {
+            return None;
+        }
+        let (newlines, recalls) = self.draft_counts();
+        let (floor, recalls_then) = (*self.draft_floor.lock())?;
+        (recalls == recalls_then).then(|| newlines.saturating_sub(floor))
+    }
+
+    fn draft_counts(&self) -> (u64, u64) {
+        (
+            self.draft_newlines.load(Ordering::Acquire),
+            self.draft_recalls.load(Ordering::Acquire),
+        )
     }
 
     /// Wakeups for [`crate::draft::watch`]. Receivers share one queue.
@@ -2491,13 +2548,18 @@ impl TerminalSession {
     ) -> muxel_core::rescue::DraftRead {
         use crate::view::TitleProvider;
         use muxel_core::rescue::DraftRead;
+        // Counted before the screen is copied: input after this point may
+        // already show in the copy, so an empty box proves only these.
+        let counts_before = self.draft_counts();
         let read = match provider {
             TitleProvider::Claude | TitleProvider::Codex => {
                 let capture = self.with_term(crate::draft::DraftCapture::from_term);
+                // Counted after the copy: everything it can show is in here.
+                let newlines = self.draft_newline_budget();
                 if provider == TitleProvider::Claude {
-                    crate::draft::claude(&capture)
+                    crate::draft::claude(&capture, newlines)
                 } else {
-                    crate::draft::codex(&capture)
+                    crate::draft::codex(&capture, newlines)
                 }
             }
             TitleProvider::Other if self.shell_at_prompt() => {
@@ -2515,13 +2577,23 @@ impl TerminalSession {
                 partial,
                 clipped,
             } => {
-                let substituted =
-                    muxel_core::rescue::substitute_pastes(&text, &self.paste_log.lock());
+                let mut pastes = self.paste_log.lock();
+                pastes.observe(&text);
+                let substituted = muxel_core::rescue::substitute_pastes(&text, &pastes);
                 DraftRead::Text {
                     text: substituted.text,
                     partial: partial || substituted.partial,
                     clipped,
                 }
+            }
+            DraftRead::Empty => {
+                // Input that hasn't been drawn yet would make an empty box a
+                // false floor; a second without input rules that out.
+                if self.draft_idle_for() >= muxel_core::rescue::DRAFT_DEBOUNCE {
+                    *self.draft_floor.lock() = Some(counts_before);
+                }
+                self.paste_log.lock().observe("");
+                DraftRead::Empty
             }
             other => other,
         }
@@ -8127,5 +8199,108 @@ mod throughput_bench {
             report(name, &mut off, &mut on);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Reading a shell's command line after its OSC 133 B mark.
+#[cfg(test)]
+mod shell_draft_tests {
+    use super::{CommandSpec, ShellMarks, TerminalSession};
+    use crate::view::TitleProvider;
+    use muxel_core::rescue::DraftRead;
+    use std::sync::Arc;
+
+    /// An inert child, killed when the test ends. Its own output is never
+    /// parsed: the test plays the shell with [`shell_output`].
+    struct Shell(
+        Arc<TerminalSession>,
+        #[allow(dead_code)] Box<dyn std::any::Any>,
+    );
+
+    impl Drop for Shell {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    impl std::ops::Deref for Shell {
+        type Target = TerminalSession;
+        fn deref(&self) -> &TerminalSession {
+            &self.0
+        }
+    }
+
+    fn shell() -> Shell {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        Shell(session, Box::new(output))
+    }
+
+    /// `bytes` as the shell's output: the PTY reader's prompt tracking sees
+    /// them first, as it does for real output, then the parser draws them.
+    fn shell_output(session: &TerminalSession, bytes: &[u8]) {
+        ShellMarks::default().advance(bytes, &session.shell_prompt);
+        session.process_probe_output(bytes);
+        assert!(session.shell_at_prompt(), "the shell is at its prompt");
+    }
+
+    fn read(session: &TerminalSession) -> DraftRead {
+        session.read_draft(TitleProvider::Other)
+    }
+
+    #[test]
+    fn a_typed_command_after_the_mark_is_read_whole() {
+        let session = shell();
+        shell_output(&session, b"\x1b]133;A\x07$ \x1b]133;B\x07git status");
+        assert_eq!(
+            read(&session),
+            DraftRead::Text {
+                text: "git status".into(),
+                partial: false,
+                clipped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_suggestion_after_the_cursor_is_never_saved_as_typed() {
+        let session = shell();
+        // An autosuggestion in an RGB grey, the cursor moved back over it.
+        shell_output(
+            &session,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07git sta\x1b[38;2;110;110;110mtus --short\x1b[0m\x1b[11D",
+        );
+        assert_eq!(
+            read(&session),
+            DraftRead::Text {
+                text: "git sta".into(),
+                partial: true,
+                clipped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_command_continued_on_another_line_is_partial() {
+        let session = shell();
+        shell_output(
+            &session,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo 'one\r\n> two",
+        );
+        assert_eq!(
+            read(&session),
+            DraftRead::Text {
+                text: "echo 'one".into(),
+                partial: true,
+                clipped: false,
+            },
+            "only the first line is provably the command"
+        );
     }
 }

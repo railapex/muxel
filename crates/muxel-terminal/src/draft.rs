@@ -8,6 +8,11 @@
 //! changed. Covered: Claude's and Codex's input boxes, and a shell's command
 //! line after its OSC 133 B mark. Grok, Muse, opencode and Amp draw boxes
 //! muxel can't yet read, so their panes run no watcher.
+//!
+//! A read that can't be sure of every character is flagged partial: a row
+//! break that fits more than one reading (see [`join_rows`]), a paste marker
+//! muxel can't tie to one paste, a box taller than the pane, or shell text
+//! drawn after the cursor (an autosuggestion can't be told from typed text).
 
 use crate::listener::MuxelListener;
 use crate::session::TerminalSession;
@@ -18,7 +23,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use muxel_core::rescue::{
-    DraftAction, DraftRead, DraftSource, DraftTracker, PromptDraft, debounce_remaining, join_rows,
+    DraftAction, DraftRead, DraftSource, DraftTracker, PromptDraft, RowWidths, debounce_remaining,
+    join_rows,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -129,7 +135,11 @@ impl DraftCapture {
                     continue;
                 }
                 if muted(cell) {
+                    // Blank, keeping the columns the glyph took.
                     text.push(' ');
+                    if cell.flags.contains(Flags::WIDE_CHAR) {
+                        text.push(' ');
+                    }
                     continue;
                 }
                 if !cell.c.is_whitespace() {
@@ -210,55 +220,48 @@ fn indent_of(row: &str) -> usize {
     row.chars().take_while(|ch| ch.is_whitespace()).count()
 }
 
-/// How a provider wraps its input box, measured on real screens: the columns
-/// a row of text gets, and what a row after the first spends on the space
-/// carried over from the wrap (see [`join_rows`]).
-#[derive(Clone, Copy)]
-struct Wrap {
-    width: usize,
-    lead: usize,
-}
-
-impl Wrap {
-    /// Claude: text gets the rule's length less the prompt's columns and
-    /// two more, and keeps the wrap's space at the start of the next row.
-    fn claude(edge: usize, indent: usize) -> Self {
-        Self {
-            width: edge.saturating_sub(indent + 2),
-            lead: 1,
-        }
-    }
-
-    /// Codex: text gets every column after the prompt glyph; the wrap's
-    /// space is dropped.
-    fn codex(columns: usize, indent: usize) -> Self {
-        Self {
-            width: columns.saturating_sub(indent),
-            lead: 0,
-        }
+/// How a provider wraps its input box, measured on real 166-column screens
+/// (Claude Code 2.1.319, Codex 0.167.0): the columns a row of text gets.
+///
+/// Claude: the rule's length less the prompt's columns and two more, one
+/// fewer on later rows (the wrap carries its space over). Codex: every column
+/// after the prompt glyph; the wrap's space is dropped.
+fn claude_widths(edge: usize, indent: usize) -> RowWidths {
+    let first = edge.saturating_sub(indent + 2);
+    RowWidths {
+        first,
+        rest: first.saturating_sub(1),
     }
 }
 
+fn codex_widths(columns: usize, indent: usize) -> RowWidths {
+    let first = columns.saturating_sub(indent);
+    RowWidths { first, rest: first }
+}
+
+/// `newlines`: how many line breaks the pane's input could have typed into
+/// the box, `None` when unknown (see [`muxel_core::rescue::input_newlines`]).
 fn text_read(
     capture: &DraftCapture,
     rows: Vec<String>,
     first_row: usize,
     indent: usize,
-    wrap: Wrap,
+    widths: RowWidths,
     clipped: bool,
+    newlines: Option<u64>,
 ) -> DraftRead {
     // A single muted row under the cursor is the box's placeholder.
     if rows.len() <= 1 && capture.cursor_at(first_row, indent) && capture.muted_row[first_row] {
         return DraftRead::Empty;
     }
     let lines: Vec<&str> = rows.iter().map(String::as_str).collect();
-    let text = join_rows(&lines, wrap.width, wrap.lead);
-    if text.trim().is_empty() {
+    let joined = join_rows(&lines, widths, newlines);
+    if joined.text.trim().is_empty() {
         DraftRead::Empty
     } else {
         DraftRead::Text {
-            text,
-            partial: false,
+            text: joined.text,
+            partial: !joined.exact,
             clipped,
         }
     }
@@ -272,7 +275,7 @@ fn rule(row: &str) -> bool {
 /// Claude's input box: the `❯` row and the rows under it, between two
 /// full-width rules. When the box is taller than the pane its top rule is off
 /// screen; the rows still visible are read and flagged clipped.
-pub(crate) fn claude(capture: &DraftCapture) -> DraftRead {
+pub(crate) fn claude(capture: &DraftCapture, newlines: Option<u64>) -> DraftRead {
     if !capture.bracketed {
         return DraftRead::Unknown;
     }
@@ -286,8 +289,9 @@ pub(crate) fn claude(capture: &DraftCapture) -> DraftRead {
             capture.text_rows(rows, indent),
             first,
             indent,
-            Wrap::claude(edge, indent),
+            claude_widths(edge, indent),
             false,
+            newlines,
         );
     }
     // Clipped: the last rule is the box's bottom edge, everything above it is
@@ -313,7 +317,7 @@ pub(crate) fn claude(capture: &DraftCapture) -> DraftRead {
     }
     let edge = capture.raw[bottom].trim_end().chars().count();
     let rows = capture.text_rows(0..bottom, 2);
-    match text_read(capture, rows, 0, 2, Wrap::claude(edge, 2), true) {
+    match text_read(capture, rows, 0, 2, claude_widths(edge, 2), true, newlines) {
         DraftRead::Empty => DraftRead::Unknown,
         read => read,
     }
@@ -321,7 +325,7 @@ pub(crate) fn claude(capture: &DraftCapture) -> DraftRead {
 
 /// Codex's editor: the last `›` row above its footer and the indented rows
 /// under it.
-pub(crate) fn codex(capture: &DraftCapture) -> DraftRead {
+pub(crate) fn codex(capture: &DraftCapture, newlines: Option<u64>) -> DraftRead {
     let screen = capture.screen();
     let Some(rows) = screen.codex_editor_rows() else {
         return DraftRead::Unknown;
@@ -350,14 +354,18 @@ pub(crate) fn codex(capture: &DraftCapture) -> DraftRead {
         lines,
         first,
         indent,
-        Wrap::codex(capture.columns, indent),
+        codex_widths(capture.columns, indent),
         clipped,
+        newlines,
     )
 }
 
-/// A shell's command line: the text from its last OSC 133 B mark to the end
-/// of that line, through soft wraps. A dim suggestion after the cursor (an
-/// autosuggestion or inline prediction) isn't part of it.
+/// A shell's command line: the text from its last OSC 133 B mark up to the
+/// cursor, through soft wraps. Anything drawn after the cursor (an
+/// autosuggestion, an inline prediction, or typed text the cursor was moved
+/// back over) can't be told apart, so it's left out and the read is partial.
+/// So is a command continued on another line, or anything drawn below the
+/// command (a prediction list): only the line with the mark is read.
 pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftRead {
     let grid = term.grid();
     let rows = grid.screen_lines() as i64;
@@ -372,8 +380,13 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
         return DraftRead::Unknown;
     }
     let cursor = grid.cursor.point;
-    // (char, muted, after the cursor)
-    let mut cells: Vec<(char, bool, bool)> = Vec::new();
+    let cursor = (i64::from(cursor.line.0), cursor.column.0);
+    if cursor < (line, mark.column) {
+        return DraftRead::Unknown;
+    }
+    let mut typed = String::new();
+    let mut after_cursor = false;
+    let mut reached_cursor = false;
     let mut row = line;
     let mut start = mark.column;
     loop {
@@ -383,8 +396,15 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
             if spacer(cell) {
                 continue;
             }
-            let after = (row as i32, column) >= (cursor.line.0, cursor.column.0);
-            cells.push((cell.c, muted(cell), after));
+            if (row, column) >= cursor {
+                reached_cursor = true;
+                after_cursor |= !cell.c.is_whitespace();
+                continue;
+            }
+            typed.push(cell.c);
+            if let Some(combining) = cell.zerowidth() {
+                typed.extend(combining);
+            }
         }
         let wrapped = columns > 0
             && grid_row[Column(columns - 1)]
@@ -396,21 +416,21 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
         row += 1;
         start = 0;
     }
-    while cells
-        .last()
-        .is_some_and(|&(ch, muted, after)| ch.is_whitespace() || (muted && after))
-    {
-        cells.pop();
-    }
-    let text: String = cells.into_iter().map(|(ch, _, _)| ch).collect();
-    if text.is_empty() {
-        DraftRead::Empty
-    } else {
-        DraftRead::Text {
-            text,
-            partial: false,
+    let drawn_below = (row + 1..rows).any(|below| {
+        let grid_row = &grid[Line(below as i32)];
+        (0..columns).any(|column| !grid_row[Column(column)].c.is_whitespace())
+    });
+    let partial = after_cursor || !reached_cursor || drawn_below;
+    let typed = typed.trim_end();
+    match (typed.is_empty(), partial) {
+        (true, false) => DraftRead::Empty,
+        // Nothing provably typed, but something is there: keep what was saved.
+        (true, true) => DraftRead::Unknown,
+        (false, partial) => DraftRead::Text {
+            text: typed.to_string(),
+            partial,
             clipped: false,
-        }
+        },
     }
 }
 
@@ -533,26 +553,35 @@ mod tests {
 
     #[test]
     fn claude_box_draft_rejoins_wraps_and_keeps_newlines() {
+        // Rows of 38 columns: "that" couldn't have fit after the first row.
+        let rule = "─".repeat(42);
         let screen = capture(
             &[
                 "⏺ Earlier answer",
                 "",
-                RULE,
+                &rule,
                 "❯ please refactor the session module so",
                 "  that it reads",
                 "  second paragraph",
-                RULE,
+                &rule,
                 "  ? for shortcuts",
             ],
             (5, 19),
             &[],
         );
+        let typed = "please refactor the session module so that it reads\nsecond paragraph";
+        // One newline typed, and the short row is it: the first break was the
+        // wrap's space.
+        assert_eq!(super::claude(&screen, Some(1)), text(typed, false));
+        // Without knowing how many were typed, the first break could have been
+        // a newline at the edge too.
         assert_eq!(
-            super::claude(&screen),
-            text(
-                "please refactor the session module so that it reads\nsecond paragraph",
-                false
-            )
+            super::claude(&screen, None),
+            DraftRead::Text {
+                text: typed.into(),
+                partial: true,
+                clipped: false,
+            }
         );
     }
 
@@ -563,12 +592,12 @@ mod tests {
             (1, 2),
             &[1],
         );
-        assert_eq!(super::claude(&placeholder), DraftRead::Empty);
+        assert_eq!(super::claude(&placeholder, None), DraftRead::Empty);
         let empty = capture(&[RULE, "❯ ", RULE], (1, 2), &[]);
-        assert_eq!(super::claude(&empty), DraftRead::Empty);
+        assert_eq!(super::claude(&empty, None), DraftRead::Empty);
         // Typed text with the cursor moved home is still a draft.
         let home = capture(&[RULE, "❯ keep me", RULE], (1, 2), &[]);
-        assert_eq!(super::claude(&home), text("keep me", false));
+        assert_eq!(super::claude(&home, None), text("keep me", false));
     }
 
     #[test]
@@ -584,12 +613,12 @@ mod tests {
             &[],
         );
         assert_eq!(
-            super::claude(&screen),
+            super::claude(&screen, None),
             text("line three of a long draft\nline four", true)
         );
         // An answer above a rule, with no box, is not a draft.
         let transcript = capture(&["⏺ Done.", "  All tests pass.", RULE], (2, 0), &[]);
-        assert_eq!(super::claude(&transcript), DraftRead::Unknown);
+        assert_eq!(super::claude(&transcript, None), DraftRead::Unknown);
     }
 
     #[test]
@@ -604,7 +633,7 @@ mod tests {
         ];
         let screen = capture(&rows, (3, 19), &[]);
         assert_eq!(
-            super::codex(&screen),
+            super::codex(&screen, None),
             text("add a draft rescue\nfor crashed panes", false)
         );
         let empty = capture(
@@ -617,7 +646,7 @@ mod tests {
             (1, 2),
             &[],
         );
-        assert_eq!(super::codex(&empty), DraftRead::Empty);
+        assert_eq!(super::codex(&empty, None), DraftRead::Empty);
     }
 
     /// A long typed draft and the rows it wrapped into on a real 166-column
@@ -652,10 +681,13 @@ mod tests {
         screen.push("  ⏸ plan mode on (shift+tab to cycle)".into());
         let cursor = (5, 2 + rows[3].chars().count());
         let screen: Vec<&str> = screen.iter().map(String::as_str).collect();
-        assert_eq!(
-            super::claude(&capture(&screen, cursor, &[])),
-            text(&typed, false)
-        );
+        let claude = capture(&screen, cursor, &[]);
+        assert_eq!(super::claude(&claude, Some(0)), text(&typed, false));
+        // A newline at a row's edge looks the same as a wrap.
+        assert!(matches!(
+            super::claude(&claude, None),
+            DraftRead::Text { partial: true, .. }
+        ));
 
         let (typed, rows) = wrapped(&[22, 42, 62]);
         let mut screen: Vec<String> = vec![String::new()];
@@ -671,10 +703,12 @@ mod tests {
         ));
         let cursor = (4, 2 + rows[3].chars().count());
         let screen: Vec<&str> = screen.iter().map(String::as_str).collect();
-        assert_eq!(
-            super::codex(&capture(&screen, cursor, &[])),
-            text(&typed, false)
-        );
+        let codex = capture(&screen, cursor, &[]);
+        assert_eq!(super::codex(&codex, Some(0)), text(&typed, false));
+        assert!(matches!(
+            super::codex(&codex, None),
+            DraftRead::Text { partial: true, .. }
+        ));
     }
 
     #[test]
@@ -684,7 +718,7 @@ mod tests {
             (1, 0),
             &[],
         );
-        assert_eq!(super::claude(&menu), DraftRead::Unknown);
-        assert_eq!(super::codex(&menu), DraftRead::Unknown);
+        assert_eq!(super::claude(&menu, None), DraftRead::Unknown);
+        assert_eq!(super::codex(&menu, None), DraftRead::Unknown);
     }
 }
