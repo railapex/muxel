@@ -5111,7 +5111,11 @@ mod tests {
                 .output()
                 .expect("the host shell runs");
             assert_eq!(out.status.code(), Some(code), "the host shell exits {code}");
-            assert_eq!(remote_branch_read(Ok(out)), BranchRead::Unknown, "exit {code}");
+            assert_eq!(
+                remote_branch_read(Ok(out)),
+                BranchRead::Unknown,
+                "exit {code}"
+            );
         }
         let missing = command("muxel-no-such-ssh").output();
         assert_eq!(remote_branch_read(missing), BranchRead::Unknown);
