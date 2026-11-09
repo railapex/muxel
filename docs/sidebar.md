@@ -22,8 +22,9 @@ latest event of any kind, a start, a finish or a question
 (`AgentActivity::last_work_at`), so a row that stops working stays in the band
 its turn started in. One exception: a working row is Today however long its
 turn has run, so a turn started yesterday and still running sits with today's
-work, not in the band of its start. A row that has never worked goes by when it was opened (`created_at` on its
-instance); a pane saved before muxel recorded that sits with Older. The sidebar
+work, not in the band of its start. A row that has never worked goes by when
+it was opened (`created_at` on its instance); a pane saved before muxel
+recorded that sits with Older. The sidebar
 redraws at midnight, when rows change band. A block spanning only one band
 needs no band label. Within each band, `sidebar::RecentPlace` puts rows in four
 groups:
@@ -57,13 +58,34 @@ terminal shows puts it before the status tick has recorded that work, and
 focusing the pane records exactly that, so clicking a row that has just
 finished moves nothing.
 
-Some states are not work. A process exiting records no finish, marks nothing
-unread and doesn't notify: a working row stops and joins the recent rows by
-when its turn started, so a turn cut short reads as idle. A provider that
-reported its own finish before exiting is finished all the same, and notifies.
-A relaunched agent reporting Working before any turn is submitted, and startup
-output while a restored terminal settles, record nothing. Row ages and
-`muxel ctl` use `last_work_at` too.
+A process exiting is a finish only for a pane started to run a command
+(`muxel_core::LaunchPurpose::Job`): a literal command, a custom command preset,
+or an agent's one-shot run (`claude -p`, `codex exec`). Its exit marks it
+unread, notifies Done, and moves the row to the top of the recent rows like any
+finish. A failing exit counts too; its notification says it failed instead of
+the usual unexpected-exit report, and the row shows Done, as there is no failed
+badge. An interactive session (an agent conversation or a shell) finishes turns
+while it runs, so its exit (`/exit`, a kill, a crash, `exit` typed in a shell)
+records no finish, marks nothing unread and doesn't notify: a working row stops
+and joins the recent rows by when its turn started. A provider that reported
+its own finish before exiting is finished all the same, and notifies.
+
+The purpose comes from the program and arguments the pane runs, so a pane
+saved before this rule gets the same answer as a new one. The provider comes
+from the program (a built-in agent preset's: `claude`, `codex`, `grok`, `muse`,
+`opencode`, `amp`, `pi`, `ollama`, `hermes`) and whether it runs one-shot from
+its arguments, so a literal `claude` is still a session. A shell is a session
+unless it was started with a command it exits after (`-c`, `/c`, `-Command`,
+`-File`); `cmd /k` and PowerShell's `-NoExit` keep their prompt, so those stay
+sessions. Any other program, an agent muxel doesn't know included, is a
+command. That has a known limit: quitting an interactive program started as a
+literal command or a custom preset (`lazygit`, `vim`, `htop`, a `python` or
+`node` REPL, `ssh host`) counts as its finish, with an unread mark and a Done
+notification, as every exit did before this rule.
+
+Some other states are not work either. A relaunched agent reporting Working
+before any turn is submitted, and startup output while a restored terminal
+settles, record nothing. Row ages and `muxel ctl` use `last_work_at` too.
 
 Read state stays on each machine, as the rest of a pane's activity does. Since
 reading never moves a row, two machines that saw the same work and keep the

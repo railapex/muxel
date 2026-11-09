@@ -540,8 +540,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell, never from a quiet spell — so
   an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
-  finished turn. A process exit isn't a finish either: the pane keeps the state
-  it had, with no unread mark or Done notification.
+  finished turn. An interactive session's process exit isn't a finish either
+  (`/exit`, a kill, a crash, `exit` typed in a shell): the pane keeps the state
+  it had, with no unread mark or Done notification. A command job's exit is its
+  finish (see Literal launches).
 - **Event-driven status snapshots** — terminal output, semantic titles, bells,
   process exit, resize invalidation, and exact quiet/debounce deadlines update one
   per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
@@ -908,11 +910,15 @@ feature is added or changed, update the matching entry here in the same change**
   modifying the command or injecting startup input.
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
-  The sidebar labels an unspawned restored literal pane as **stopped**. A
-  retained exited terminal keeps the state it had before it exited: an exit is
-  not a finish, so a command that ends only by exiting shows idle, while one
-  whose agent reported its finish first keeps its **done** badge and completion
-  age.
+  The sidebar labels an unspawned restored literal pane as **stopped**. A pane
+  started to run a command (a literal command, a custom command preset, an
+  agent's one-shot run such as `claude -p` or `codex exec`) finishes when it
+  exits, failing or not: **done** with its completion age, an unread mark and a
+  Done notification, which says **failed** for a non-zero exit. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish:
+  it keeps the state it had, unless its agent reported a finish first. The
+  purpose comes from the pane's program and arguments
+  (`muxel_core::LaunchPurpose`), so saved panes get it too.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1368,9 +1374,10 @@ feature is added or changed, update the matching entry here in the same change**
   the order each started, so one that starts a turn joins the bottom of them;
   then sessions never used, newest open first. A working session counts as Today
   however long its turn has run. Reading, focusing or clicking a session never
-  moves its row; only a change in its work or a new day does. Exiting is not a
-  finish, though an agent that reported its finish before exiting is finished
-  and notifies. Pinned sessions follow the same order. Project order and keyboard
+  moves its row; only a change in its work or a new day does. A command job's
+  exit is its finish; an interactive session's isn't, though an agent that
+  reported its finish before exiting is finished and notifies. Pinned sessions
+  follow the same order. Project order and keyboard
   navigation stay the same. Live popped-out sessions remain in Recent work, and
   popping one out or docking it back never moves its row;
   their external-window icon marks rows that raise an existing window on click.

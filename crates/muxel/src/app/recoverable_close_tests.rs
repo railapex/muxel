@@ -3326,6 +3326,102 @@ fn bell_terminal(
         .unwrap()
 }
 
+/// Both exit 3 through `cmd /c`. The job's instance runs that command; the
+/// session's is the default shell, standing for `exit 3` typed into it.
+#[test]
+fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
+    use muxel_core::sidebar::is_unread;
+    use muxel_core::{AgentActivityState, LaunchPurpose};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                // Unattended, without desktop toasts from the test.
+                app.window_active = false;
+                app.notifications_enabled = false;
+            })
+            .unwrap();
+        let exit_args = || -> Vec<String> { vec!["/d".into(), "/c".into(), "exit 3".into()] };
+        let spawn = |cx: &mut TestAppContext, name: &str, job: bool| {
+            window
+                .update(cx, |app, window, cx| {
+                    let mut instance = Instance::shell(pid);
+                    instance.custom_name = Some(name.into());
+                    if job {
+                        instance.program = Some("cmd.exe".into());
+                        instance.args = exit_args();
+                        instance.literal_argv = true;
+                    }
+                    let expected = if job {
+                        LaunchPurpose::Job
+                    } else {
+                        LaunchPurpose::Session
+                    };
+                    assert_eq!(instance.launch_purpose(), expected, "{name}");
+                    let iid = instance.id;
+                    let launch = TerminalLaunch::spawn(
+                        CommandSpec::program("cmd.exe", exit_args()),
+                        (80, 24),
+                    )
+                    .unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+                    app.workspace.add_instance(instance);
+                    let project = app.workspace.project_mut(pid).unwrap();
+                    if let Some(anchor) = project.first_instance() {
+                        assert!(add_tab(&mut project.layout, anchor, iid));
+                    } else {
+                        project.layout = Some(PaneNode::leaf(iid));
+                    }
+                    app.terminals.insert(iid, view.clone());
+                    (iid, view)
+                })
+                .unwrap()
+        };
+        let (job, job_view) = spawn(cx, "job fixture", true);
+        let (shell, shell_view) = spawn(cx, "shell fixture", false);
+        for view in [&job_view, &shell_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                assert_eq!(job_view.read(cx).exit_code(), Some(3));
+                app.tick(window, cx);
+                let job_activity = &app.workspace.instance(job).unwrap().activity;
+                assert_eq!(job_activity.current_state(), Some(AgentActivityState::Done));
+                assert!(job_activity.completed_at.is_some());
+                assert!(is_unread(job_activity));
+                let job_notices: Vec<_> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.instance == Some(job))
+                    .collect();
+                assert_eq!(job_notices.len(), 1, "one notice for the job");
+                assert!(matches!(job_notices[0].kind, NotifKind::Error));
+                assert!(job_notices[0].subtitle.starts_with("failed"));
+
+                let shell_activity = &app.workspace.instance(shell).unwrap().activity;
+                assert_eq!(shell_activity.completed_at, None);
+                assert!(!is_unread(shell_activity));
+                assert!(
+                    !app.notifications
+                        .iter()
+                        .any(|notice| notice.instance == Some(shell))
+                );
+                // The unexpected-exit report is the shell's alone: the job's
+                // failure is its own notice.
+                let unexpected: Vec<&str> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.title.contains("exited unexpectedly"))
+                    .map(|notice| notice.title.as_str())
+                    .collect();
+                assert_eq!(unexpected, ["shell fixture: process exited unexpectedly"]);
+            })
+            .unwrap();
+    });
+}
+
 #[test]
 fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
     use super::{SeenStatus, StatusBinding};

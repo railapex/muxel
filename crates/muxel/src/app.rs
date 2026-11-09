@@ -42,10 +42,10 @@ use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
-    InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode,
-    PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner,
-    SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
-    WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
+    InjectionMode, Instance, InstanceKind, LaunchPurpose, Loop, LoopSchedule, MEMORY_DIR,
+    MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef,
+    ResolvedLaunch, Runner, SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
+    WorkspaceMeta, WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
     agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
     file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
     migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to,
@@ -1088,7 +1088,7 @@ mod restored_activity_tests {
     }
 
     #[test]
-    fn an_exit_is_not_a_finish() {
+    fn a_sessions_exit_is_not_a_finish_and_a_jobs_is() {
         let exit = runtime(AgentStatus::Done, TerminalStatusReason::ProcessExit);
         let mut working = interrupted();
         working.activity.observe(
@@ -1096,10 +1096,43 @@ mod restored_activity_tests {
             AgentActivityState::Working,
             200,
         );
-        assert_eq!(
-            sample_status(&exit, Some(&working), false, true),
-            AgentStatus::Idle
-        );
+        let running = |program: Option<&str>, args: &[&str], literal| {
+            let mut pane = working.clone();
+            pane.program = program.map(str::to_string);
+            pane.args = args.iter().map(|arg| arg.to_string()).collect();
+            pane.literal_argv = literal;
+            pane
+        };
+        for (pane, shown, what) in [
+            (working.clone(), AgentStatus::Idle, "an agent session"),
+            (
+                running(Some("claude"), &[], true),
+                AgentStatus::Idle,
+                "a literal claude",
+            ),
+            (running(None, &[], false), AgentStatus::Idle, "a shell"),
+            (
+                running(Some("cargo"), &["test"], true),
+                AgentStatus::Done,
+                "a literal command",
+            ),
+            (
+                running(Some("npm"), &["run", "build"], false),
+                AgentStatus::Done,
+                "a custom command preset",
+            ),
+            (
+                running(Some("claude"), &["-p", "fix it"], false),
+                AgentStatus::Done,
+                "a one-shot agent run",
+            ),
+        ] {
+            assert_eq!(
+                sample_status(&exit, Some(&pane), false, true),
+                shown,
+                "{what}"
+            );
+        }
         // A turn that finished before the process exited stays finished.
         assert_eq!(
             sample_status(&exit, Some(&attended_completion()), false, true),
@@ -1499,18 +1532,21 @@ fn unprompted_report_working(
         && !submitted_turn
 }
 
-/// Whether the process exiting is all that supplies this status. An exit is
-/// not a finish for any pane yet: neither an agent quitting nor a command
-/// returning records one. A provider's own completion before the exit still
-/// does ([`apply_status_sample`]). A command job whose exit is its finish (a
-/// literal command, a custom command preset, a one-shot agent run) would be
-/// told apart here.
-fn exit_supplies_status(runtime: &muxel_terminal::TerminalRuntimeSnapshot) -> bool {
+/// Whether this status is a session's process exit, which is no finish. An
+/// interactive agent or shell finishes turns while it runs, so `/exit`, a
+/// kill, a crash or `exit` typed in a shell finishes nothing. A command job's
+/// exit is its finish, failing or not ([`LaunchPurpose`]). Either way a
+/// provider's own completion before the exit counts ([`apply_status_sample`]).
+fn session_exit(
+    runtime: &muxel_terminal::TerminalRuntimeSnapshot,
+    instance: Option<&Instance>,
+) -> bool {
     runtime.reason == muxel_terminal::TerminalStatusReason::ProcessExit
+        && instance.is_none_or(|instance| instance.launch_purpose() == LaunchPurpose::Session)
 }
 
 /// The lifecycle status one terminal sample stands for. Some runtime states
-/// are not work: a process exit ([`exit_supplies_status`]); a provider's
+/// are not work: a session's process exit ([`session_exit`]); a provider's
 /// Working before any turn in this launch (a relaunch booting); and Working
 /// while a restore settles (`restoring`). They read as idle, so none records a
 /// start or a finish, and durable Done stays.
@@ -1520,7 +1556,7 @@ fn sample_status(
     restoring: bool,
     submitted_turn: bool,
 ) -> AgentStatus {
-    let status = if exit_supplies_status(runtime)
+    let status = if session_exit(runtime, instance)
         || unprompted_report_working(runtime, submitted_turn)
         || (restoring && runtime.status == AgentStatus::Working)
     {
@@ -1849,7 +1885,7 @@ fn apply_status_sample(
     effect.completed = (changed && status == AgentStatus::Done || completion_pulse) && !restored;
     // A provider's finish notifies even when the pane exited or was cleared
     // to idle before this sample: the completion is the evidence, not the
-    // badge. An exit on its own is never a finish ([`exit_supplies_status`]).
+    // badge. A session's exit on its own is no finish ([`session_exit`]).
     // A finish whose agent is already working or asking again doesn't.
     effect.notify = if completion_pulse
         && matches!(status, AgentStatus::Done | AgentStatus::Idle)
@@ -7475,7 +7511,8 @@ impl NotifKind {
             NotifKind::Blocked => t("needs input"),
             NotifKind::Done => t("finished"),
             NotifKind::Success => t("success"),
-            NotifKind::Error => t("error"),
+            // A command job that exited failing.
+            NotifKind::Error => t("failed"),
         }
     }
 }
@@ -14812,7 +14849,20 @@ impl MuxelApp {
                 }
                 alert_states.insert(iid, status_alert_sound(status));
             }
-            if let Some(kind) = effect.notify {
+            // A command job that exits failing has finished all the same, and
+            // its notification says it failed, in place of the unexpected-exit
+            // report below.
+            let failed_job = exited
+                && exit_code != Some(0)
+                && self
+                    .workspace
+                    .instance(iid)
+                    .is_some_and(|i| i.launch_purpose() == LaunchPurpose::Job);
+            let notice = effect.notify.map(|kind| match kind {
+                NotifKind::Done if failed_job => NotifKind::Error,
+                kind => kind,
+            });
+            if let Some(kind) = notice {
                 // Collect the in-app entry regardless of the desktop toggle;
                 // only the OS popup respects `notifications_enabled`.
                 self.add_notification(iid, kind, &title, &project);
@@ -14913,7 +14963,10 @@ impl MuxelApp {
                 // closing it silently destroys the instance and looks like the
                 // pane randomly vanished.
                 to_close.push((iid, title));
-            } else if newly_exited && exit_code != Some(0) && !self.reconnecting.contains_key(&iid)
+            } else if newly_exited
+                && exit_code != Some(0)
+                && !self.reconnecting.contains_key(&iid)
+                && notice != Some(NotifKind::Error)
             {
                 // Abnormal exit: the pane stays as a tombstone; flag it in the
                 // feed (and as a desktop notification when unattended).

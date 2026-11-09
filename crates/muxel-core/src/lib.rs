@@ -15,6 +15,7 @@ pub mod geometry;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
+mod launch;
 pub mod library;
 pub mod locale;
 pub mod memory;
@@ -56,6 +57,7 @@ pub use agent::{
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
+pub use launch::LaunchPurpose;
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
@@ -670,6 +672,13 @@ impl Instance {
 
     pub fn working_directory(&self) -> Option<&std::path::Path> {
         self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// What this pane was started to do, from the program and arguments it
+    /// runs ([`LaunchPurpose::of`]). Saved panes get the same answer as new
+    /// ones, so nothing is stored for it.
+    pub fn launch_purpose(&self) -> LaunchPurpose {
+        LaunchPurpose::of(self.program.as_deref(), &self.args)
     }
 
     /// An unspawned saved literal command is stopped, rather than an idle agent.
