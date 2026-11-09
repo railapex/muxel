@@ -928,14 +928,20 @@ feature is added or changed, update the matching entry here in the same change**
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
   The sidebar labels an unspawned restored literal pane as **stopped**. A pane
-  started to run a command (a literal command, a custom command preset, an
-  agent's one-shot run such as `claude -p` or `codex exec`) finishes when it
-  exits, failing or not: **done** with its completion age, an unread mark and a
-  Done notification, which says **failed** for a non-zero exit. A literal
-  `claude`, `codex` or shell is an interactive session, whose exit is no finish:
-  it keeps the state it had, unless its agent reported a finish first. The
-  purpose comes from the pane's program and arguments
-  (`muxel_core::LaunchPurpose`), so saved panes get it too.
+  started to run a command (a literal command, a custom command preset, a
+  shell given a command or a script's path, an agent's one-shot run such as
+  `claude -p`, `codex exec` or `codex review`) finishes when it exits,
+  whatever its code: **done** with its completion age, an unread mark and a
+  Done notification. A non-zero exit's notification gives the code (**exited
+  with code 3**) in place of the unexpected-exit report, even after a finish
+  the pane already announced or while you watch it. Only the command's own exit
+  counts: behind tmux, or ssh through `sshpass`, a client's exit finishes
+  nothing, and ssh's own failures (code 255) don't either. A literal `claude`,
+  `codex` or shell is an interactive session, whose exit is no finish: it
+  keeps the state it had, unless its agent reported a finish first, whose
+  chime then still rings. The purpose comes from the pane's program and
+  arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a
+  wrapper such as `npx` or `wsl` counts as a command whatever it starts.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1429,7 +1435,9 @@ feature is added or changed, update the matching entry here in the same change**
   mark, even if another turn starts; Done persists. The mark and a read done's
   outline pill follow the same rule, so a done row's pill and mark always agree;
   the mark also keeps an unseen finish or question visible after the agent moves
-  on. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
+  on. A clock that steps back can't mark a seen event unread or a new one read:
+  attendance covers everything recorded before it, and a later event is stamped
+  after it. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
   instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
   and tray notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a

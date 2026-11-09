@@ -262,19 +262,65 @@ pub fn sidebar_rows(
     popped: &dyn Fn(Uuid) -> bool,
     sort: SidebarSort,
 ) -> Vec<Uuid> {
-    let docked = project.instances();
-    if sort == SidebarSort::Layout {
-        return docked;
-    }
-    let mut unlisted: HashSet<Uuid> = docked.iter().copied().collect();
-    let mut rows: Vec<Uuid> = workspace
-        .instances
-        .iter()
-        .filter(|i| unlisted.remove(&i.id) || (i.project_id == project.id && popped(i.id)))
-        .map(|i| i.id)
+    sidebar_rows_each([project], workspace, popped, sort)
+        .remove(&project.id)
+        .unwrap_or_default()
+}
+
+/// Each of `projects`' rows ([`sidebar_rows`]), by project id, from one pass
+/// over the workspace's instances however many projects there are.
+pub fn sidebar_rows_each<'a>(
+    projects: impl IntoIterator<Item = &'a Project>,
+    workspace: &Workspace,
+    popped: &dyn Fn(Uuid) -> bool,
+    sort: SidebarSort,
+) -> HashMap<Uuid, Vec<Uuid>> {
+    let docked: Vec<(Uuid, Vec<Uuid>)> = projects
+        .into_iter()
+        .map(|project| (project.id, project.instances()))
         .collect();
+    if sort == SidebarSort::Layout {
+        return docked.into_iter().collect();
+    }
+    // Each docked pane's projects that haven't listed it yet.
+    let mut unlisted: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let mut rows: HashMap<Uuid, Vec<Uuid>> = HashMap::with_capacity(docked.len());
+    for (pid, ids) in &docked {
+        rows.insert(*pid, Vec::with_capacity(ids.len()));
+        for id in ids {
+            let holders = unlisted.entry(*id).or_default();
+            if !holders.contains(pid) {
+                holders.push(*pid);
+            }
+        }
+    }
+    for instance in &workspace.instances {
+        let holders = unlisted.remove(&instance.id).unwrap_or_default();
+        for pid in &holders {
+            if let Some(listed) = rows.get_mut(pid) {
+                listed.push(instance.id);
+            }
+        }
+        if !holders.contains(&instance.project_id)
+            && let Some(own) = rows.get_mut(&instance.project_id)
+            && popped(instance.id)
+        {
+            own.push(instance.id);
+        }
+    }
     // A pane the layout holds without an instance still gets its row.
-    rows.extend(docked.into_iter().filter(|id| unlisted.contains(id)));
+    for (pid, ids) in &docked {
+        let Some(listed) = rows.get_mut(pid) else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        listed.extend(ids.iter().copied().filter(|id| {
+            unlisted
+                .get(id)
+                .is_some_and(|holders| holders.contains(pid))
+                && seen.insert(*id)
+        }));
+    }
     rows
 }
 
