@@ -5018,14 +5018,31 @@ mod tests {
         assert_eq!(read(), (Some("side".to_string()), both.clone()));
     }
 
-    /// [`remote_ops::branches`]' Unix command, run here by `sh` as ssh runs it
-    /// there, after `prelude` (a stand-in for that host's git).
+    /// A Unix host's shell, to run its commands here. On Windows that's Git for
+    /// Windows' bash, found where the Git Bash preset finds it: a bare `sh` is
+    /// on PATH only in a shell that put Git's `bin` there, and without it every
+    /// spawn would fail and read as ssh's failure.
+    fn host_sh() -> Command {
+        if !cfg!(windows) {
+            return command("sh");
+        }
+        let bash = muxel_core::git_bash_program();
+        assert!(
+            Path::new(&bash).is_file(),
+            "no Git for Windows bash to run a Unix host's command (tried {bash}; \
+             MUXEL_GIT_BASH names another)"
+        );
+        command(bash)
+    }
+
+    /// [`remote_ops::branches`]' Unix command, run here by a Unix shell as ssh
+    /// runs it there, after `prelude` (a stand-in for that host's git).
     fn remote_branches_here(dir: &Path, prelude: &str) -> std::io::Result<std::process::Output> {
         let script = remote_ops::branches(
             muxel_core::RemoteOs::Unix,
             &dir.to_string_lossy().replace('\\', "/"),
         );
-        command("sh")
+        host_sh()
             .arg("-c")
             .arg(format!("{prelude}{script}"))
             // A folder outside any repository stays outside one.
@@ -5086,7 +5103,7 @@ mod tests {
     #[test]
     fn a_failure_before_git_ran_is_not_blamed_on_git() {
         for code in [255, 5, 6] {
-            let out = command("sh")
+            let out = host_sh()
                 .arg("-c")
                 .arg(format!("echo 'Permission denied' >&2; exit {code}"))
                 .stdin(Stdio::null())
