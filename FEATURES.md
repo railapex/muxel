@@ -1098,8 +1098,10 @@ feature is added or changed, update the matching entry here in the same change**
   blank lines and Unicode; CRLF becomes one newline. Unsupported control
   characters, including tabs, refuse the whole paste before any write.
   Clipboard refusals appear in the error feed; ordinary clipboard ESC
-  sanitization remains. Unverified multiline controller input reports
-  `unsupported_input`; explicitly disabled bursts without a verified codec also
+  sanitization remains. Saved snippets and dictated transcripts also report
+  paste failures and cancel automatic submission. Unverified
+  multiline controller input reports `unsupported_input`; explicitly disabled
+  bursts without a verified codec also
   refuse advanced clipboard text. Literal argv is never changed.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
