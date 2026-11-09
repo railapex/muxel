@@ -568,6 +568,8 @@ impl RuntimeStatusState {
             None => {
                 !matches!(title, Some(AgentStatus::Working | AgentStatus::Blocked))
                     && self.provider_screen.is_none()
+                    && !self.working_marker
+                    && !self.blocked_marker
             }
         };
         // A switch doesn't change this. Until a new turn says otherwise the pane has
@@ -8896,6 +8898,41 @@ mod provider_switch_tests {
             assert!(held.attributable, "this is the new conversation's own turn");
             assert_eq!(held.completion_revision, 0, "a count would float the pane");
             session.kill();
+        }
+
+        /// A foreground marker must not become the background-only control exception.
+        #[test]
+        fn foreground_markers_prevent_a_background_only_hold() {
+            for (marker, expected) in [
+                ("FOREGROUND_BUSY", AgentStatus::Working),
+                ("FOREGROUND_PERMISSION", AgentStatus::Blocked),
+            ] {
+                let (session, _receiver) = fixture();
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                let screen = format!(
+                    "{HEADER}\n{marker}\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                    rule(),
+                    rule()
+                );
+                draw(&session, None, &screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &["FOREGROUND_BUSY".into()],
+                    &["FOREGROUND_PERMISSION".into()],
+                    false,
+                    Instant::now(),
+                );
+                let observed = runtime.snapshot(&session);
+                assert_eq!(observed.status, expected);
+                assert_ne!(
+                    observed.reason,
+                    crate::view::TerminalStatusReason::BackgroundWork
+                );
+                assert!(!runtime.background_hold.holding);
+                assert!(observed.background.is_some());
+                session.kill();
+            }
         }
 
         /// A switch leaves no report until the next turn, and between turns no title reads
