@@ -637,7 +637,10 @@ mod tests {
                         $global:LASTEXITCODE = $LASTEXITCODE }; ";
 
         let (code, out, err) = branches_in_windows_powershell(&repo, "");
-        assert_eq!((code, out.lines().collect::<Vec<_>>()), (0, vec!["*main", "main"]));
+        assert_eq!(
+            (code, out.lines().collect::<Vec<_>>()),
+            (0, vec!["*main", "main"])
+        );
         assert_eq!(err, "");
         let (code, out, err) = branches_in_windows_powershell(&repo, old_git);
         assert_eq!((code, out.as_str()), (2, BRANCHES_FAILED));
