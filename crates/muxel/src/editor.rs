@@ -1088,6 +1088,19 @@ impl EditorView {
         });
     }
 
+    /// Commit the input method's uncommitted text the way the pinned input
+    /// component does: `unmark_text` alone, which notifies nothing. Only the
+    /// Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn unmark_composition_silently(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| s.unmark_text(window, cx));
+    }
+
     /// Hold this editor's background backup writes just before they land,
     /// until the returned sender sends or drops. Only the Windows app tests
     /// use it.

@@ -1225,6 +1225,63 @@ fn text_an_input_method_commits_stays_backed_up() {
 }
 
 #[test]
+fn text_an_input_method_commits_silently_survives_a_disk_refresh() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("silent.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "text\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.compose_text("にほ", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n")
+        );
+        // The input method commits the text, and nothing notifies. Before
+        // anything else happens, the file changes on disk and the editor
+        // polls it.
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| {
+                    editor.unmark_composition_silently(window, cx);
+                    std::fs::write(&file, "theirs, longer\n").unwrap();
+                    let change = read_disk_change(&file, editor.disk_stamp())
+                        .expect("the poll sees their version");
+                    editor.apply_disk_change(change, window, cx);
+                });
+                let editor = editor.read(cx);
+                assert_eq!(editor.text(cx), "にほtext\n", "the committed text stays");
+                assert!(
+                    matches!(
+                        editor.external_change(),
+                        Some(ExternalChange::Modified(theirs)) if theirs == "theirs, longer\n"
+                    ),
+                    "the disk version waits beside it"
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        reopen_editor(cx, window, iid);
+        assert_eq!(
+            dir.editor_offer(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n"),
+            "it is still offered after a crash"
+        );
+    });
+}
+
+#[test]
 fn a_sent_prompt_the_screen_still_shows_is_never_saved_again() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);
