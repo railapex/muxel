@@ -38606,7 +38606,8 @@ mod agent_notification_tests {
 
 /// One remote branch poll's reads, landed: each `(project, host, host's
 /// name, read)`. A read replaces its project's branch and list; a project
-/// whose read failed, or got nothing back, keeps the last ones read. git
+/// whose read failed, or got nothing back, keeps the last ones read, with no
+/// expiry, until a read succeeds. git
 /// failing is said once per host and message, and said again only after a
 /// poll where every read on that host succeeded (a host can hold a folder
 /// with no repository, which reads fine, beside one git fails in). Returns
@@ -38617,7 +38618,9 @@ fn land_branch_reads(
     failures: &mut HashSet<(Uuid, String)>,
     reads: Vec<(Uuid, Uuid, String, integrations::BranchRead)>,
 ) -> Vec<(String, String)> {
-    let (mut read_on, mut failed_on) = (HashSet::new(), HashSet::new());
+    // The hosts with a read that worked, and those with one that didn't:
+    // git's failure, or nothing back at all.
+    let (mut read_on, mut unread_on) = (HashSet::new(), HashSet::new());
     let mut notices = Vec::new();
     for (project, host, name, read) in reads {
         match read {
@@ -38626,9 +38629,11 @@ fn land_branch_reads(
                 branches.insert(project, branch);
                 lists.insert(project, list);
             }
-            integrations::BranchRead::Unknown => {}
+            integrations::BranchRead::Unknown => {
+                unread_on.insert(host);
+            }
             integrations::BranchRead::Failed(said) => {
-                failed_on.insert(host);
+                unread_on.insert(host);
                 if failures.insert((host, said.clone())) {
                     let hint = t("muxel needs git 1.9 or newer there.");
                     notices.push((
@@ -38643,7 +38648,7 @@ fn land_branch_reads(
             }
         }
     }
-    failures.retain(|(host, _)| failed_on.contains(host) || !read_on.contains(host));
+    failures.retain(|(host, _)| unread_on.contains(host) || !read_on.contains(host));
     notices
 }
 
@@ -38701,6 +38706,11 @@ mod branch_read_tests {
         // Unreachable for a while: nothing said, nothing forgotten.
         assert_eq!(polls.round(vec![(repo, host, Unknown)]), 0);
         assert_eq!(polls.branches.get(&repo), Some(&Some("main".to_string())));
+        assert_eq!(polls.round(vec![(repo, host, old())]), 0);
+        // ssh failing for it while the folder with no repository on the same
+        // host reads: not every read there succeeded, so still once.
+        let reads = vec![(plain, host, Read(None, Vec::new())), (repo, host, Unknown)];
+        assert_eq!(polls.round(reads), 0);
         assert_eq!(polls.round(vec![(repo, host, old())]), 0);
         // git upgraded there: the next failure is news again.
         assert_eq!(polls.round(vec![(repo, host, main())]), 0);
