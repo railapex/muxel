@@ -13,17 +13,20 @@
 //!
 //! So are diff panes' sources ([`diff_sources`]): a visible diff pane runs
 //! `git diff` when a tracked file or HEAD's branch changes, instead of every
-//! 1.5 s (see [`muxel_core::diff_schedule`]).
+//! 1.5 s (see [`muxel_core::diff_schedule`]). And `git status`'s
+//! ([`status_sources`]), for the Changes view and the worktrees' change
+//! counts, which also wake for untracked files that aren't ignored.
 //! On Windows so is Grok's session registry (`grok_registry`), which each
 //! Grok pane otherwise reads every one to two seconds.
 
-use crate::integrations::DiffPlan;
+use crate::integrations::{DiffPlan, StatusPlan};
 use muxel_core::file_watch::{
-    DirNames, Drained, EventKind, OsWatch, Recursion, TrackedFiles, WatchEvent, WatchFilter,
-    WatchId, WatchRouter, WatchSpec,
+    DirNames, Drained, EventKind, OsWatch, Recursion, TrackedFiles, Untracked, WatchEvent,
+    WatchFilter, WatchId, WatchRouter, WatchSpec,
 };
 use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -64,18 +67,57 @@ pub(crate) const DIFF_WATCH_DIRS: usize = 4096;
 /// a `dir` that can't be resolved, or more directories than
 /// [`DIFF_WATCH_DIRS`]. It reads the disk, so it runs off the UI thread.
 pub(crate) fn diff_sources(dir: &Path, plan: &DiffPlan) -> Option<WatchSpec> {
-    // Windows and macOS watch a tree with one handle or stream.
-    let per_dir = !cfg!(any(windows, target_os = "macos"));
-    diff_sources_with(dir, plan, per_dir, DIFF_WATCH_DIRS)
+    diff_sources_with(dir, plan, PER_DIR, DIFF_WATCH_DIRS, None)
+}
+
+/// Windows and macOS watch a tree with one handle or stream; elsewhere each
+/// directory is its own watch.
+pub(crate) const PER_DIR: bool = !cfg!(any(windows, target_os = "macos"));
+
+/// What `git status` over `plan`'s work tree watches: a diff's sources for
+/// the whole tree, and any path coming or going there that git doesn't track
+/// and isn't known to ignore (see [`Untracked`]). `untracked_dirs` are those
+/// the last status showed collapsed; `learned`, paths git has said since the
+/// plan that it ignores. Where each directory is its own watch, that means
+/// every directory git may list a file in, found by walking the tree, so a
+/// refresh there rebuilds the watch. `None` where it polls instead, as a diff
+/// pane would. It reads the disk, so it runs off the UI thread.
+pub(crate) fn status_sources(
+    plan: &StatusPlan,
+    untracked_dirs: &[PathBuf],
+    learned: &HashSet<PathBuf>,
+) -> Option<WatchSpec> {
+    status_sources_with(plan, untracked_dirs, learned, PER_DIR)
+}
+
+fn status_sources_with(
+    plan: &StatusPlan,
+    untracked_dirs: &[PathBuf],
+    learned: &HashSet<PathBuf>,
+    per_dir: bool,
+) -> Option<WatchSpec> {
+    let untracked = Untracked {
+        ignored: plan.ignored.iter().chain(learned).cloned().collect(),
+        dirs: untracked_dirs.iter().cloned().collect(),
+        git_dir: plan.git_dir.clone(),
+    };
+    diff_sources_with(
+        &plan.root,
+        &plan.diff,
+        per_dir,
+        DIFF_WATCH_DIRS,
+        Some(untracked),
+    )
 }
 
 /// [`diff_sources`], watching each directory on its own when `per_dir`, and
-/// at most `budget` paths.
+/// at most `budget` paths; for `git status` with `untracked`.
 fn diff_sources_with(
     dir: &Path,
     plan: &DiffPlan,
     per_dir: bool,
     budget: usize,
+    untracked: Option<Untracked>,
 ) -> Option<WatchSpec> {
     if !plan.settled {
         return None;
@@ -83,8 +125,9 @@ fn diff_sources_with(
     let real_root = dir.canonicalize().ok()?;
     let root = DirNames::new(dir.to_path_buf(), Some(real_root.clone()));
     let mut paths: Vec<(PathBuf, Recursion)> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut watch = |path: PathBuf, recursion: Recursion| {
-        if !paths.iter().any(|(watched, _)| *watched == path) {
+        if seen.insert(path.clone()) {
             paths.push((path, recursion));
         }
     };
@@ -127,7 +170,10 @@ fn diff_sources_with(
         .filter_map(|file| git_file(file))
         .collect();
     let refs = plan.refs.iter().filter_map(|file| git_file(file)).collect();
-    let tracked = TrackedFiles::new(root.clone(), plan.tracked.iter().cloned(), refs, relist);
+    let mut tracked = TrackedFiles::new(root.clone(), plan.tracked.iter().cloned(), refs, relist);
+    if let Some(untracked) = untracked {
+        tracked = tracked.with_untracked(untracked);
+    }
     if per_dir {
         // A tracked directory that's gone gets its watch when it comes
         // back: its parent's watch reports that, and the pane re-plans.
@@ -136,6 +182,11 @@ fn diff_sources_with(
             if path.is_dir() {
                 watch(path, Recursion::Dir);
             }
+        }
+        if let Some(untracked) = &tracked.untracked
+            && !watch_listed_dirs(dir, untracked, budget, &mut watch)
+        {
+            return None;
         }
     }
     (paths.len() <= budget).then(|| WatchSpec {
@@ -186,6 +237,43 @@ pub(crate) fn grok_registry(dir: &Path) -> WatchSpec {
         },
         lose_on,
     }
+}
+
+/// Watch each directory under `root` that `git status` may list a file in,
+/// where each directory is its own watch: the untracked ones too, so a file
+/// appearing in a new directory is seen, and those inside a collapsed one
+/// (`?? notes/`), whose last file going anywhere below changes the status.
+/// Ignored ones and git's aren't. Symlinks aren't followed. False past
+/// `budget` directories.
+fn watch_listed_dirs(
+    root: &Path,
+    untracked: &Untracked,
+    budget: usize,
+    watch: &mut impl FnMut(PathBuf, Recursion),
+) -> bool {
+    let mut walked = 0;
+    let mut below = vec![PathBuf::new()];
+    while let Some(rel) = below.pop() {
+        let Ok(entries) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let child = rel.join(entry.file_name());
+            if untracked.hides(&child) {
+                continue;
+            }
+            walked += 1;
+            if walked > budget {
+                return false;
+            }
+            watch(root.join(&child), Recursion::Dir);
+            below.push(child);
+        }
+    }
+    true
 }
 
 fn watch_event(event: &notify::Event) -> WatchEvent {
@@ -240,6 +328,10 @@ pub(crate) struct FileWatch {
     router: Arc<Mutex<WatchRouter>>,
     /// Upgradable while the backend still holds its handler.
     backend: Weak<()>,
+    /// The handler's signal, for the news the router makes itself (see
+    /// [`Self::signal_news`]). Weak, so the receiver still closes when the
+    /// backend drops its handler.
+    signal: async_channel::WeakSender<()>,
 }
 
 impl FileWatch {
@@ -255,8 +347,26 @@ impl FileWatch {
     pub fn start_with<W: Watcher + 'static>(
         backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
     ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
-        let router = Arc::new(Mutex::new(WatchRouter::new(cfg!(target_os = "macos"))));
+        Self::start_with_router(cfg!(target_os = "macos"), backend)
+    }
+
+    /// As [`Self::start_with`], for a backend that restarts its event stream
+    /// whenever the watched set changes, as macOS's does, whatever this
+    /// machine is.
+    #[cfg(test)]
+    pub fn start_restarting_with<W: Watcher + 'static>(
+        backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
+        Self::start_with_router(true, backend)
+    }
+
+    fn start_with_router<W: Watcher + 'static>(
+        restarts_stream: bool,
+        backend: impl FnOnce(RouteEvents) -> notify::Result<W>,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<()>)> {
+        let router = Arc::new(Mutex::new(WatchRouter::new(restarts_stream)));
         let (signal, receiver) = async_channel::bounded(1);
+        let weak_signal = signal.downgrade();
         let alive = Arc::new(());
         let backend_alive = Arc::downgrade(&alive);
         let watcher = backend(RouteEvents {
@@ -269,6 +379,7 @@ impl FileWatch {
                 watcher: Some(Box::new(watcher)),
                 router,
                 backend: backend_alive,
+                signal: weak_signal,
             },
             receiver,
         ))
@@ -282,6 +393,7 @@ impl FileWatch {
             self.unregister(id);
             return Err(error);
         }
+        self.signal_news();
         Ok(id)
     }
 
@@ -294,6 +406,7 @@ impl FileWatch {
             self.unregister(id);
             return Err(error);
         }
+        self.signal_news();
         Ok(())
     }
 
@@ -302,6 +415,21 @@ impl FileWatch {
         let ops = lock(&self.router).unregister(id);
         if let Err(error) = self.apply(&ops) {
             log::warn!("file watcher could not narrow its watches: {error}");
+        }
+        self.signal_news();
+    }
+
+    /// Signal the news the router made itself, as the handler does after an
+    /// event. Where the stream restarts when the watched set changes (macOS),
+    /// the router marks every other registration for a rescan; unsignalled,
+    /// that waits for the next event, however late, and events lost in the
+    /// restart go unseen until then.
+    fn signal_news(&self) {
+        if lock(&self.router).has_news()
+            && let Some(signal) = self.signal.upgrade()
+        {
+            // Full means a signal is already waiting for this news.
+            let _ = signal.try_send(());
         }
     }
 
@@ -440,8 +568,11 @@ pub(crate) mod test_backend {
 #[cfg(test)]
 mod tests {
     use super::test_backend::TestBackend;
-    use super::{FileWatch, claude_records, diff_sources, diff_sources_with};
-    use crate::integrations::diff_plan;
+    use super::{
+        FileWatch, claude_records, diff_sources, diff_sources_with, status_sources,
+        status_sources_with,
+    };
+    use crate::integrations::{diff_plan, status_plan};
     use crate::test_support::{TestRepo, git_out, short_temp_path};
     use muxel_core::file_watch::{Change, Recursion, WatchId};
     use std::collections::HashSet;
@@ -465,6 +596,37 @@ mod tests {
         let (watch, _signal) = FileWatch::start_with(|handler| live.build(handler)).unwrap();
         drop(watch);
         assert!(live.dropped());
+    }
+
+    /// Where the stream restarts as the watched set changes (macOS), adding,
+    /// re-speccing or dropping a watch has every other one rescanned. That is
+    /// signalled as it happens, not left for whatever event comes next.
+    #[test]
+    fn a_restarted_streams_rescans_are_signalled_without_an_event() {
+        let backend = TestBackend::default();
+        let (mut watch, signal) =
+            FileWatch::start_restarting_with(|handler| backend.build(handler)).unwrap();
+        let root = short_temp_path();
+        let first = watch.register(claude_records(&root.join("a"))).unwrap();
+        let _ = watch.take();
+        let _ = signal.try_recv();
+        let rescanned = |watch: &FileWatch| -> Vec<WatchId> {
+            let news = watch.take().changes.into_iter();
+            news.filter(|(_, change)| change.rescan)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let second = watch.register(claude_records(&root.join("b"))).unwrap();
+        assert!(signal.try_recv().is_ok(), "adding one");
+        assert_eq!(rescanned(&watch), [first]);
+        watch
+            .respec(second, claude_records(&root.join("c")))
+            .unwrap();
+        assert!(signal.try_recv().is_ok(), "re-speccing one");
+        assert_eq!(rescanned(&watch), [first]);
+        watch.unregister(second);
+        assert!(signal.try_recv().is_ok(), "dropping one");
+        assert_eq!(rescanned(&watch), [first]);
     }
 
     /// Watch Claude's hook directory under `data` through the platform's
@@ -506,6 +668,7 @@ mod tests {
                 seen.hits.extend(change.hits);
                 seen.touched |= change.touched;
                 seen.relist |= change.relist;
+                seen.unknown.extend(change.unknown);
                 seen.rescan |= change.rescan;
                 seen.lost |= change.lost;
             }
@@ -531,7 +694,7 @@ mod tests {
         std::fs::create_dir_all(repo.path().join("untracked/deep")).unwrap();
         let root = repo.path();
         let plan = diff_plan(root).expect("a work tree");
-        let tree = diff_sources_with(root, &plan, false, 1).expect("within budget");
+        let tree = diff_sources_with(root, &plan, false, 1, None).expect("within budget");
         assert_eq!(
             resolved(&tree.paths),
             HashSet::from([(root.canonicalize().unwrap(), true)])
@@ -547,9 +710,60 @@ mod tests {
         .into_iter()
         .map(|dir| (dir, Recursion::Dir))
         .collect();
-        let per_dir = diff_sources_with(root, &plan, true, each.len()).expect("within budget");
+        let per_dir =
+            diff_sources_with(root, &plan, true, each.len(), None).expect("within budget");
         assert_eq!(resolved(&per_dir.paths), resolved(&each));
-        assert!(diff_sources_with(root, &plan, true, each.len() - 1).is_none());
+        assert!(diff_sources_with(root, &plan, true, each.len() - 1, None).is_none());
+    }
+
+    /// Where each directory is its own watch, `git status` watches every
+    /// directory it may list a file in: an empty untracked one too (its first
+    /// file shows), and a collapsed one and those below it (its last file
+    /// going clears its row), but nothing ignored, whether the plan listed it
+    /// or git said so since, and nothing of git's beyond the folders of the
+    /// files it reads (HEAD and the index, the branch, `info/exclude`).
+    #[test]
+    fn a_per_directory_status_watches_every_directory_git_may_list() {
+        let repo = TestRepo::init();
+        repo.commit(&[("src/lib.rs", ""), (".gitignore", "target/\n")], "seed");
+        let root = repo.path();
+        // `git init`'s templates usually make `info/`; not every install's do.
+        for dir in [
+            "scratch",
+            "notes/sub",
+            "target/debug",
+            "build/obj",
+            ".git/info",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("notes/sub/idea.md"), "").unwrap();
+        let plan = status_plan(root).expect("a work tree");
+        let collapsed = [PathBuf::from("notes")];
+        // `build/` came after the plan, and git has said it ignores it.
+        let learned = HashSet::from([PathBuf::from("build")]);
+        let spec = status_sources_with(&plan, &collapsed, &learned, true).expect("within budget");
+        let git = root.join(".git");
+        let each: Vec<_> = [
+            root.to_path_buf(),
+            root.join("src"),
+            root.join("scratch"),
+            root.join("notes"),
+            root.join("notes").join("sub"),
+            git.clone(),
+            git.join("refs").join("heads"),
+            git.join("info"),
+        ]
+        .into_iter()
+        // And the folder of git's global excludes file, where this machine
+        // has one: the only state file outside the repository.
+        .chain(plan.diff.state.iter().filter_map(|file| {
+            let dir = file.parent()?.canonicalize().ok()?;
+            (!dir.starts_with(root.canonicalize().unwrap())).then_some(dir)
+        }))
+        .map(|dir| (dir, Recursion::Dir))
+        .collect();
+        assert_eq!(resolved(&spec.paths), resolved(&each));
     }
 
     /// Real writes reach a diff pane's watch through the platform's backend,
@@ -603,6 +817,94 @@ mod tests {
             let seen = gather(&watch, &signal, id, |seen| seen.touched);
             assert!(seen.touched && !seen.relist, "{at}: the branch moved");
             assert!(!seen.lost, "{at}");
+            drop(watch);
+        }
+        repo.git(&["worktree", "remove", "--force", &linked.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&linked);
+    }
+
+    /// `git status`'s sources through the platform's backend, in a main
+    /// checkout and a linked worktree: a new untracked file is unknown (for
+    /// the target to ask git about), a build's output under an ignored
+    /// directory and an untracked file's contents are nothing, and a
+    /// `.gitignore` re-plans. Each negative is written before a positive, so
+    /// an event for it would arrive with the positive's.
+    #[test]
+    fn a_status_wakes_for_real_untracked_files_but_not_ignored_ones() {
+        let repo = TestRepo::init();
+        repo.commit(
+            &[("notes.txt", "first\n"), (".gitignore", "target/\n")],
+            "seed",
+        );
+        let linked = short_temp_path();
+        repo.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            &linked.to_string_lossy(),
+        ]);
+        for dir in [repo.path().to_path_buf(), linked.clone()] {
+            std::fs::create_dir_all(dir.join("target")).unwrap();
+            let at = dir.display().to_string();
+            let plan = status_plan(&dir).expect("a work tree");
+            assert!(
+                plan.ignored.iter().any(|path| path == Path::new("target")),
+                "{at}: {:?}",
+                plan.ignored
+            );
+            let spec = status_sources(&plan, &[], &HashSet::new()).expect("watchable");
+            let (mut watch, signal) = FileWatch::start().unwrap();
+            let id = watch.register(spec).unwrap();
+            let settle = || gather_for(&watch, &signal, id, Duration::from_millis(500), |_| false);
+            // Gather until something unknown comes, and check it's only `name`.
+            let only = |name: &str, what: &str| {
+                let seen = gather(&watch, &signal, id, |seen| !seen.unknown.is_empty());
+                assert!(
+                    !seen.unknown.is_empty()
+                        && seen.unknown.iter().all(|path| path == Path::new(name)),
+                    "{at}: {what}: {:?}",
+                    seen.unknown
+                );
+                assert!(!seen.touched && !seen.relist && !seen.lost, "{at}: {what}");
+            };
+
+            std::fs::write(dir.join("target").join("out.o"), "built\n").unwrap();
+            std::fs::write(dir.join("scratch.txt"), "new\n").unwrap();
+            only("scratch.txt", "a new untracked file, not a build's output");
+            settle();
+
+            // FSEvents may still flag a rewritten file as created.
+            if !cfg!(target_os = "macos") {
+                std::fs::write(dir.join("scratch.txt"), "more\n").unwrap();
+                std::fs::write(dir.join("other.txt"), "new\n").unwrap();
+                only("other.txt", "a new file, not an untracked file's contents");
+                settle();
+            }
+
+            std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
+            assert!(
+                gather(&watch, &signal, id, |seen| seen.relist).relist,
+                "{at}: .gitignore"
+            );
+            assert!(!settle().lost, "{at}");
+
+            // A new directory is unknown, and the status's refresh rebuilds
+            // the watch; then a file in it is too, where each directory is
+            // its own watch as well.
+            std::fs::create_dir(dir.join("drafts")).unwrap();
+            only("drafts", "a new directory");
+            settle();
+            let spec = status_sources(&plan, &[], &HashSet::new()).expect("watchable");
+            watch.respec(id, spec).unwrap();
+            std::fs::write(dir.join("drafts").join("plan.md"), "new\n").unwrap();
+            let seen = gather(&watch, &signal, id, |seen| !seen.unknown.is_empty());
+            assert!(
+                seen.unknown.contains(&Path::new("drafts").join("plan.md")) && !seen.lost,
+                "{at}: a file in the new directory: {:?}",
+                seen.unknown
+            );
             drop(watch);
         }
         repo.git(&["worktree", "remove", "--force", &linked.to_string_lossy()]);

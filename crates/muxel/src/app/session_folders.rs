@@ -30,15 +30,33 @@ pub(super) struct BranchResult {
     branch: Option<String>,
     list: Option<Vec<String>>,
     host_snapshot: Option<String>,
+    /// A remote project root's read, which decides its branch and list in
+    /// place of `branch` and `list`: a failed one keeps what it showed.
+    root_read: Option<integrations::BranchRead>,
 }
 
 pub(super) fn probe_branches(jobs: Vec<BranchJob>) -> Vec<BranchResult> {
     jobs.into_iter()
-        .map(|job| BranchResult {
-            branch: integrations::repo_current_branch(&job.loc),
-            list: job.is_root.then(|| integrations::list_branches(&job.loc)),
-            key: job.key,
-            host_snapshot: job.host_snapshot,
+        .map(|job| {
+            // A remote project's root reads its branch and list with one ssh.
+            if job.is_root && matches!(job.loc, integrations::RepoLoc::Remote(_)) {
+                return BranchResult {
+                    root_read: Some(integrations::read_branches(&job.loc)),
+                    branch: None,
+                    list: None,
+                    key: job.key,
+                    host_snapshot: job.host_snapshot,
+                };
+            }
+            // A local folder's branch usually comes from its git files, with
+            // no git at all; a local root's list costs one git.
+            BranchResult {
+                branch: integrations::repo_current_branch(&job.loc),
+                list: job.is_root.then(|| integrations::list_branches(&job.loc)),
+                root_read: None,
+                key: job.key,
+                host_snapshot: job.host_snapshot,
+            }
         })
         .collect()
 }
@@ -226,8 +244,25 @@ impl MuxelApp {
                 && (key.host.is_some() != remote || current.contains_key(key))
         });
         self.folder_filters.retain(|id, _| project_ids.contains(id));
+        let mut root_reads = Vec::new();
         for result in results {
             if current.get(&result.key) != Some(&result.host_snapshot) {
+                continue;
+            }
+            if let Some(read) = result.root_read {
+                if let integrations::BranchRead::Read(branch, _) = &read {
+                    self.folder_branches
+                        .insert(result.key.clone(), branch.clone());
+                }
+                if let Some(host) = result.key.host {
+                    let name = self
+                        .remotes
+                        .iter()
+                        .find(|h| h.id == host)
+                        .map(|h| h.name.clone())
+                        .unwrap_or_default();
+                    root_reads.push((result.key.project, host, name, read));
+                }
                 continue;
             }
             if let Some(list) = result.list {
@@ -236,6 +271,15 @@ impl MuxelApp {
                 self.project_branch_lists.insert(result.key.project, list);
             }
             self.folder_branches.insert(result.key, result.branch);
+        }
+        let notices = super::land_branch_reads(
+            &mut self.project_branches,
+            &mut self.project_branch_lists,
+            &mut self.branch_read_failures,
+            root_reads,
+        );
+        for (title, detail) in notices {
+            self.add_event(super::NotifKind::Error, title, detail);
         }
     }
 }

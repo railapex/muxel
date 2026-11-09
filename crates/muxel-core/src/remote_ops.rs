@@ -50,41 +50,92 @@ pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
 }
 
 fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
-    let policy = if read_only {
-        " -c diff.autoRefreshIndex=false"
-    } else {
-        ""
-    };
     match os {
-        RemoteOs::Unix => {
-            let env = if read_only {
-                "GIT_OPTIONAL_LOCKS=0 "
-            } else {
-                ""
-            };
-            let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
-            for a in args {
-                c.push(' ');
-                c.push_str(&sh_quote(a));
-            }
-            c
-        }
-        RemoteOs::Windows => {
-            let env = if read_only {
-                "$env:GIT_OPTIONAL_LOCKS='0'; "
-            } else {
-                ""
-            };
-            let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
-            for a in args {
-                body.push(' ');
-                body.push_str(&ps_quote(a));
-            }
-            // git signals failure by exit code, not a PowerShell error, so the
-            // strict prelude alone would not surface it.
-            body.push_str("; exit $LASTEXITCODE");
-            ps(&body)
-        }
+        RemoteOs::Unix => sh_git(repo, args, read_only),
+        // git signals failure by exit code, not a PowerShell error, so the
+        // strict prelude alone would not surface it.
+        RemoteOs::Windows => ps(&format!(
+            "{}; exit $LASTEXITCODE",
+            ps_git(repo, args, read_only)
+        )),
+    }
+}
+
+const READ_ONLY_POLICY: &str = " -c diff.autoRefreshIndex=false";
+
+/// `git -C <repo> <args…>` for `sh`.
+fn sh_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("GIT_OPTIONAL_LOCKS=0 ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
+    for a in args {
+        c.push(' ');
+        c.push_str(&sh_quote(a));
+    }
+    c
+}
+
+/// `git -C <repo> <args…>` as PowerShell statements, git's exit code left in
+/// `$LASTEXITCODE`.
+fn ps_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("$env:GIT_OPTIONAL_LOCKS='0'; ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
+    for a in args {
+        body.push(' ');
+        body.push_str(&ps_quote(a));
+    }
+    body
+}
+
+/// What [`branches`] prints, on a line of its own, when git failed to list
+/// the branches of a repository. ssh's failures and sshpass's have exit codes
+/// of their own (sshpass's 5 is a wrong password), so the code alone can't
+/// say whose failure it was.
+pub const BRANCHES_FAILED: &str = "muxel: git could not list the branches";
+
+/// The local branches, one a line, `*` before HEAD's and a space before the
+/// others; then the branch HEAD names on a line of its own, since git's list
+/// has none for it before the first commit (exit 1 where HEAD names none).
+/// One command, so one ssh for both. Where the listing fails in a repository
+/// (a git older than 1.9 doesn't know `%(HEAD)`), git's message goes to
+/// stderr and [`BRANCHES_FAILED`] to stdout; in a folder holding no
+/// repository, or none at all, it prints nothing and succeeds. Telling the
+/// two apart costs a `git rev-parse` after a failure only, run in the folder
+/// rather than with `-C`: a git older than 1.8.5 has no `-C`, which fails the
+/// listing before `%(HEAD)` does.
+pub fn branches(os: RemoteOs, repo: &str) -> String {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    const HEAD: &[&str] = &["symbolic-ref", "--quiet", "--short", "HEAD"];
+    match os {
+        RemoteOs::Unix => format!(
+            "{} || {{ {{ cd {} && git rev-parse --git-dir; }} >/dev/null 2>&1 || exit 0; \
+             echo {}; exit 2; }}; {}",
+            sh_git(repo, LIST, true),
+            sh_quote(repo),
+            sh_quote(BRANCHES_FAILED),
+            sh_git(repo, HEAD, true)
+        ),
+        RemoteOs::Windows => ps(&format!(
+            "{}; if ($LASTEXITCODE -ne 0) {{ \
+             if (-not (Test-Path -LiteralPath {repo} -PathType Container)) {{ exit 0 }}; \
+             Set-Location -LiteralPath {repo}; & git rev-parse --git-dir | Out-Null; \
+             if ($LASTEXITCODE -ne 0) {{ exit 0 }}; {}; exit 2 }}; {}; exit $LASTEXITCODE",
+            ps_git(repo, LIST, true),
+            ps_quote(BRANCHES_FAILED),
+            ps_git(repo, HEAD, true),
+            repo = ps_quote(repo),
+        )),
     }
 }
 
@@ -426,8 +477,9 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep, read_file,
-        scan_projects, test_dir, test_file, upload_paste, write_file,
+        BRANCHES_FAILED, branches, ensure_seeded_file, git, git_read_only, list_files,
+        paste_file_name, push_prep, read_file, scan_projects, test_dir, test_file, upload_paste,
+        write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -481,7 +533,38 @@ mod tests {
     }
 
     #[test]
+    fn branches_are_listed_and_head_named_in_one_command() {
+        // The Unix form runs in the app's tests (`integrations`); here, that
+        // Windows asks the same, in order, and says git failed only where a
+        // repository is.
+        let s = script_of(&branches(WIN, "C:/p"));
+        let list = s.find("'for-each-ref'").expect("lists");
+        let gone = s
+            .find("if (-not (Test-Path -LiteralPath 'C:/p' -PathType Container)) { exit 0 }")
+            .expect("no folder: no branch");
+        let repo = s
+            .find("Set-Location -LiteralPath 'C:/p'; & git rev-parse --git-dir | Out-Null")
+            .expect("checks for a repository in the folder");
+        let none = s[repo..]
+            .find("{ exit 0 }")
+            .expect("no repository: no branch")
+            + repo;
+        let said = s
+            .find(&format!("'{BRANCHES_FAILED}'; exit 2"))
+            .expect("marks git's failure");
+        let head = s.find("'symbolic-ref'").expect("names HEAD");
+        assert!(
+            list < gone && gone < repo && repo < none && none < said && said < head,
+            "{s}"
+        );
+        // A git older than 1.8.5 has no `-C`; the check mustn't need it.
+        assert!(!s[list..said].contains(" -C "), "{s}");
+        assert!(s[head..].contains("; exit $LASTEXITCODE"), "{s}");
+    }
+
+    #[test]
     fn windows_commands_are_all_opaque_base64() {
+        assert_opaque(&branches(WIN, "C:/p"));
         assert_opaque(&git(WIN, "C:/p", &["status"]));
         assert_opaque(&list_files(WIN, "C:/p", 10));
         assert_opaque(&read_file(WIN, "C:/p/a.txt", 10));

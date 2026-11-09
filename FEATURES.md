@@ -683,8 +683,14 @@ feature is added or changed, update the matching entry here in the same change**
   orphaned; Merge lands them on the base.
 - **Kept worktrees** — "kept" (detached) worktrees stay in the sidebar and can be
   resumed (spawn a new agent into them) or resolved later.
-- **Review workflow** — each worktree shows its uncommitted-change count;
-  right-click for **View changes** (opens the git-diff pane), **Review** /
+- **Review workflow** — each worktree shows its uncommitted-change count, which
+  follows its files the way the git diff panel's Files tab does (and every 10 s
+  where the folder can't be watched); the panel's Worktrees tab lists the same
+  files. Every worktree is watched while muxel runs, with the panel open or
+  not, so on Windows a worktree folder's parent folders can't be renamed
+  while muxel runs, nor can the folders above the one holding git's global
+  excludes file (`~/.config/git/ignore` unless `core.excludesFile` says
+  otherwise). Right-click for **View changes** (opens the git-diff pane), **Review** /
   **Security Review** (spawns that runner *inside* the worktree to review its
   diff), **Discard changes** (reset the worktree to its base, keeping it), or
   **Discard worktree** (close its panes + delete the worktree and branch).
@@ -1511,6 +1517,21 @@ feature is added or changed, update the matching entry here in the same change**
     (checks it out + merges, then offers to remove the worktree), and **Delete** the
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
+  The Files tab (in the panel or the Changes view) runs `git status` only
+  while it's on screen: for a local project, when a tracked file changes, a
+  file git doesn't ignore comes or goes (inside a folder it lists collapsed,
+  only a file going counts), or HEAD's branch moves, once the writes settle as
+  for the git diff pane below, and every 30 s anyway, re-reading which files
+  are tracked and ignored if HEAD, the index or an ignore file changed
+  unreported. A new path it doesn't know git ignores (a fresh `target/`, an
+  object file beside its source) costs one `git check-ignore` for the burst
+  instead; once git has said a path is ignored, nothing under it runs git
+  until an ignore rule changes. A remote project, or one that can't be watched
+  (a repository with submodules, for one), refreshes every 1.5 s while shown.
+  Hidden, the Files tab runs no git, and refreshes as soon as it's shown if
+  anything changed. The Worktrees tab shows the worktrees' own refreshes (see
+  Review workflow): opening it refreshes them, and while it lists them one
+  that can't be watched refreshes every 1.5 s.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
@@ -1518,9 +1539,11 @@ feature is added or changed, update the matching entry here in the same change**
   under its folder changes or HEAD's branch moves, once the writes have been
   quiet for 0.3 s (at most 2 s into a steady stream, and at most once a second),
   and keeps your scroll position. New untracked files and build output don't
-  wake it, and it re-checks every 30 s anyway. Where the folder can't be watched
-  (a checkout with more than 4096 tracked folders on Linux, or git pointed
-  elsewhere by `GIT_DIR`), it refreshes every 1.5 s instead. A pane hidden
+  wake it, and it re-checks every 30 s anyway, re-reading which files are
+  tracked if HEAD or the index changed unreported. Where the folder can't be
+  watched (a checkout with more than 4096 tracked folders on Linux, a
+  repository with submodules, or git pointed elsewhere by `GIT_DIR`), it
+  refreshes every 1.5 s instead. A pane hidden
   behind another tab, another view or a maximized pane runs no git, and
   refreshes as soon as it's shown if it may be stale. The ↻ button, reopening
   and popping out never wait on git. On Windows, while the pane is open the
@@ -1857,7 +1880,14 @@ feature is added or changed, update the matching entry here in the same change**
   without reselecting the project.
 - **Remote git** — the branch label and the project git menu (switch/new branch,
   commit, pull, push, fetch, stash) operate on the remote repo over the shared
-  connection; remote status is polled off the UI thread.
+  connection; remote status is polled off the UI thread. Every 5 s one ssh call
+  reads a remote project's branch and its branch list together, which needs
+  git 1.9 or newer on the host; where the host's git can't list them, an error
+  notice says so with git's message, once per host until a poll where every
+  read on that host succeeded. A read that fails, git's or ssh's, keeps the
+  branch last shown, with no expiry, until a read succeeds. The switch-branch
+  menu lists branches only, with no line for a detached HEAD, a rebase or a
+  bisect.
 - **Remote files** — the file browser lists a remote project's files over SSH
   (gitignore-aware via `git ls-files`, else `find`); opening a file reads it over
   SSH into the editor and Ctrl+S writes it back. Open-in-terminal opens a remote

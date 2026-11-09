@@ -6,11 +6,14 @@
 //! [`DiffPlan`] and watches what [`diff_sources`] builds from it, so a
 //! visible pane runs git when its tracked files or HEAD's branch change. One
 //! that can't be watched refreshes every 1.5 s while visible, as before.
+//! Each refresh of a watched pane first checks HEAD and the index against
+//! its plan's [`PlanInputs`], and a watcher overflow re-plans too, so a lost
+//! event can't leave the plan filtering by stale tracked files.
 
 use super::MuxelApp;
 use super::watching::WatchTarget;
 use crate::file_watch::diff_sources;
-use crate::integrations::{self, DiffPlan};
+use crate::integrations::{self, DiffPlan, PlanInputs};
 use crate::ui_profile;
 use gpui::{Context, Task, WeakEntity};
 use muxel_core::diff_schedule::DiffSchedule;
@@ -39,8 +42,11 @@ pub(super) struct DiffSource {
     /// The repository's top level from the last [`DiffPlan`]. `None` before
     /// the first refresh, or where `dir` isn't in a work tree.
     toplevel: Option<String>,
+    /// What the last plan was read from (see [`PlanInputs`]).
+    inputs: PlanInputs,
     /// Resolve the plan again at the next refresh: none yet, HEAD or the
-    /// index changed, a tracked directory came or went, or `dir` was gone.
+    /// index changed, a tracked directory came or went, the watcher lost
+    /// events, or `dir` was gone.
     pub(super) replan: bool,
     pub(super) watch: Option<WatchId>,
 }
@@ -50,15 +56,18 @@ struct DiffJob {
     pane: Uuid,
     dir: PathBuf,
     toplevel: Option<String>,
+    /// The watched plan's inputs, checked before reusing it; `None` for a
+    /// pane that polls, which doesn't need its plan.
+    inputs: Option<PlanInputs>,
     replan: bool,
 }
 
 struct DiffResult {
     pane: Uuid,
     text: String,
-    /// The top level this refresh resolved and the watch built from its
-    /// plan; `None` when it reused the pane's.
-    planned: Option<(Option<String>, Option<WatchSpec>)>,
+    /// The top level this refresh resolved, what its plan was read from,
+    /// and the watch built from it; `None` when it reused the pane's.
+    planned: Option<(Option<String>, PlanInputs, Option<WatchSpec>)>,
     /// `dir` was gone: resolve the plan once it's back.
     gone: bool,
 }
@@ -70,15 +79,22 @@ impl DiffJob {
             return DiffResult {
                 pane: self.pane,
                 text: integrations::not_a_git_repo(&self.dir),
-                planned: Some((None, None)),
+                planned: Some((None, PlanInputs::default(), None)),
                 gone: true,
             };
         }
-        let (toplevel, planned) = if self.replan {
+        // A watched plan whose HEAD or index moved unreported (a lost
+        // event) would keep filtering by the old tracked files.
+        let stale = self.inputs.as_ref().is_some_and(|inputs| !inputs.current());
+        let (toplevel, planned) = if self.replan || stale {
             let plan: Option<DiffPlan> = integrations::diff_plan(&self.dir);
             let spec = plan.as_ref().and_then(|plan| diff_sources(&self.dir, plan));
+            let inputs = plan
+                .as_ref()
+                .map(|plan| plan.inputs.clone())
+                .unwrap_or_default();
             let toplevel = plan.map(|plan| plan.toplevel);
-            (toplevel.clone(), Some((toplevel, spec)))
+            (toplevel.clone(), Some((toplevel, inputs, spec)))
         } else {
             (self.toplevel, None)
         };
@@ -126,6 +142,7 @@ impl MuxelApp {
                 .or_insert_with(|| DiffSource {
                     dir,
                     toplevel: None,
+                    inputs: PlanInputs::default(),
                     replan: true,
                     watch: None,
                 });
@@ -195,6 +212,7 @@ impl MuxelApp {
                     pane,
                     dir: source.dir.clone(),
                     toplevel: source.toplevel.clone(),
+                    inputs: source.watch.is_some().then(|| source.inputs.clone()),
                     replan: std::mem::take(&mut source.replan),
                 }),
                 // Asked for before its first frame; it rejoins once it's on
@@ -228,8 +246,9 @@ impl MuxelApp {
             return; // closed meanwhile
         };
         source.replan |= result.gone;
-        if let Some((toplevel, spec)) = result.planned {
+        if let Some((toplevel, inputs, spec)) = result.planned {
             source.toplevel = toplevel;
+            source.inputs = inputs;
             self.watch_diff(pane, spec, cx);
         }
         let editor = self

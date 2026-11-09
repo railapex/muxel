@@ -1,7 +1,8 @@
 //! The app's side of its one file watcher ([`FileWatch`]): starting it with
 //! the first registration, and handing each registration's news to what it
 //! wakes. A target whose watch is lost polls for the rest of the run (a diff
-//! pane, until it re-plans), as it would have without one.
+//! pane or a `git status` target, until it re-plans), as it would have
+//! without one.
 
 use super::MuxelApp;
 use crate::file_watch::FileWatch;
@@ -18,6 +19,8 @@ pub(super) enum WatchTarget {
     Provider(SessionProvider),
     /// A diff pane's refresh schedule.
     Diff(Uuid),
+    /// A `git status` target's: a project's Changes view, or a worktree.
+    Status(Uuid),
 }
 
 impl MuxelApp {
@@ -133,10 +136,26 @@ impl MuxelApp {
                     if change.rescan {
                         self.diff_panes.schedule.changed(pane, None);
                     }
-                    if change.relist
+                    // Lost events may include HEAD's or the index's.
+                    if (change.relist || change.rescan)
                         && let Some(source) = self.diff_panes.sources.get_mut(&pane)
                     {
                         source.replan = true;
+                    }
+                }
+                WatchTarget::Status(key) => {
+                    if change.lost {
+                        lost.push(id);
+                        continue;
+                    }
+                    let Some(source) = self.status_targets.sources.get_mut(&key) else {
+                        continue;
+                    };
+                    if source.note(&change) {
+                        self.status_targets.schedule.changed(key, Some(now));
+                    }
+                    if change.rescan {
+                        self.status_targets.schedule.changed(key, None);
                     }
                 }
             }
@@ -150,6 +169,7 @@ impl MuxelApp {
         }
         self.sync_provider_session_ids(cx);
         self.pump_diffs(cx);
+        self.pump_statuses(cx);
     }
 
     /// Drop `id` and forget its target, which its owner has dealt with.
@@ -175,6 +195,7 @@ impl MuxelApp {
                 ui_profile::session_watch(provider, "failed");
             }
             WatchTarget::Diff(pane) => self.diff_unwatched(pane),
+            WatchTarget::Status(key) => self.status_unwatched(key),
         }
     }
 
@@ -187,5 +208,6 @@ impl MuxelApp {
         }
         self.sync_provider_session_ids(cx);
         self.pump_diffs(cx);
+        self.pump_statuses(cx);
     }
 }

@@ -178,6 +178,18 @@ pub(crate) fn diff_watch(state: &'static str) {
     emit(&format!("ui-prof[diff-watch v1] state={state}"));
 }
 
+/// The same for a `git status` target: the Changes view's project
+/// (`target=project`) or a worktree's change count (`target=worktree`).
+pub(crate) fn status_watch(target: &'static str, state: &'static str) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    emit(&format!(
+        "ui-prof[status-watch v1] target={target} state={state}"
+    ));
+}
+
 enum DeferredRecord {
     SessionLookup {
         at: SystemTime,
