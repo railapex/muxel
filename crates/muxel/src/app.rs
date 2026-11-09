@@ -49,8 +49,8 @@ use muxel_core::{
     sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
-    AgentStatus, CommandSpec, LaunchBinding, TerminalLaunch, TerminalMouseMode, TerminalSession,
-    TerminalView, clean_agent_title,
+    AgentStatus, CommandSpec, DisplayEpoch, LaunchBinding, TerminalLaunch, TerminalMouseMode,
+    TerminalSession, TerminalView, clean_agent_title,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,8 @@ mod control_api;
 mod diff_panes;
 #[cfg(test)]
 mod diff_refresh_tests;
+#[cfg(all(test, windows))]
+mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
 mod popout_lifecycle;
@@ -3244,8 +3246,16 @@ fn split_resize_terminal_ids(
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
-/// itself. Shared by the main pane and pop-out windows.
-fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &App) -> AnyElement {
+/// itself. Every window that shows a terminal (main, project, pop-out) draws it
+/// here with its own [`DisplayEpoch`]: a terminal no window displays skips its
+/// screen repaints.
+fn terminal_pane_element(
+    view: &Entity<TerminalView>,
+    cache_paint: bool,
+    shown: &DisplayEpoch,
+    cx: &App,
+) -> AnyElement {
+    view.read(cx).mark_displayed(shown);
     // GPUI cached-paint replay transfers mouse listeners with `take()`. A second
     // reuse before a real paint can therefore leave a visible terminal without
     // selection or wheel handlers. The active/pop-out terminal stays uncached;
@@ -6067,6 +6077,8 @@ pub struct MuxelApp {
     /// render). Lets deep helpers (`check_row`) size wrapping labels absolutely so
     /// their multi-line height is measured correctly. See [`settings_content_w`].
     settings_pane_w: Pixels,
+    /// The main window's render count; see [`terminal_pane_element`].
+    shown: DisplayEpoch,
     /// Settings card offset from centre, set by dragging its title bar.
     settings_offset: Point<Pixels>,
     /// Active settings-resize drag: (start cursor pos, base size).
@@ -6459,6 +6471,7 @@ struct PopoutView {
     /// bookkeeping or suppressing the first transition after re-dock.
     profile_status: Option<AgentStatus>,
     profile_window_active: bool,
+    shown: DisplayEpoch,
 }
 
 /// App-owned inputs to a popout. Its PaneView supplies title, status and
@@ -6501,6 +6514,7 @@ impl PopoutAppState {
 #[cfg(test)]
 thread_local! {
     static POPOUT_TEST_RENDERS: std::cell::RefCell<HashMap<Uuid, usize>> = Default::default();
+    static MAIN_TEST_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl PopoutView {
@@ -6593,6 +6607,7 @@ impl PopoutView {
             app_state: None,
             profile_status,
             profile_window_active,
+            shown: DisplayEpoch::default(),
         }
     }
 
@@ -6611,7 +6626,7 @@ impl PopoutView {
 
     fn content(&self, cx: &App) -> AnyElement {
         match &self.view {
-            PaneView::Terminal(v) => terminal_pane_element(v, false, cx),
+            PaneView::Terminal(v) => terminal_pane_element(v, false, &self.shown, cx),
             PaneView::Editor(v) => v.clone().into_any_element(),
             PaneView::Browser(v) => v.clone().into_any_element(),
         }
@@ -6640,6 +6655,7 @@ struct WorkspaceWindow {
     display_uuid: Uuid,
     focus_handle: FocusHandle,
     bounds_save_task: Option<Task<()>>,
+    shown: DisplayEpoch,
 }
 
 impl WorkspaceWindow {
@@ -6722,18 +6738,21 @@ impl WorkspaceWindow {
             display_uuid,
             focus_handle: cx.focus_handle(),
             bounds_save_task: None,
+            shown: DisplayEpoch::default(),
         }
     }
 }
 
 impl Render for WorkspaceWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shown.advance();
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Workspace);
         let root = if let Some(app) = self.app.upgrade() {
             let pid = self.pid;
             let focus = self.focus_handle.clone();
+            let shown = self.shown.clone();
             app.update(cx, |app, cx| {
-                app.render_secondary_content(pid, &focus, window, cx)
+                app.render_secondary_content(pid, &focus, &shown, window, cx)
             })
         } else {
             div().into_any_element()
@@ -7128,6 +7147,7 @@ impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         POPOUT_TEST_RENDERS.with(|counts| *counts.borrow_mut().entry(self.iid).or_default() += 1);
+        self.shown.advance();
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
         let has_close_confirm = self.central_close_confirm(cx).is_some();
@@ -8266,6 +8286,7 @@ impl MuxelApp {
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
+            shown: DisplayEpoch::default(),
             settings_offset: point(px(0.0), px(0.0)),
             settings_resize: None,
             settings_move: None,
@@ -9129,7 +9150,7 @@ impl MuxelApp {
             )
         }) {
             create_missing_cwd(&spec)?;
-            return Ok(spec);
+            return Ok(spec.with_memory_limit(self.settings.pane_memory_limit_bytes()));
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -9455,7 +9476,10 @@ impl MuxelApp {
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
                 .with_binding(binding)
-                .with_launch_resumed(resuming),
+                .with_launch_resumed(resuming)
+                // Covers the pane's local process tree only: for an ssh or
+                // tmux client, that's the client, not the remote or server side.
+                .with_memory_limit(self.settings.pane_memory_limit_bytes()),
         ))
     }
 
@@ -13990,6 +14014,7 @@ impl MuxelApp {
             restoring: bool,
             runtime: muxel_terminal::TerminalRuntimeSnapshot,
             binding_rev: u64,
+            memory_hits: Vec<muxel_terminal::MemoryLimitHit>,
         }
         let snapshot: Vec<Snap> = self
             .terminals
@@ -14009,6 +14034,7 @@ impl MuxelApp {
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
+                let memory_hits = v.session().take_memory_limit_hits();
                 let inst = self.workspace.instance(*iid);
                 // Some providers hang after reporting a missing conversation.
                 // The Codex message names the exact saved ID; a generic failure
@@ -14046,6 +14072,7 @@ impl MuxelApp {
                     restoring,
                     runtime,
                     binding_rev,
+                    memory_hits,
                 }
             })
             .collect();
@@ -14089,8 +14116,13 @@ impl MuxelApp {
             restoring,
             runtime,
             binding_rev,
+            memory_hits,
         } in snapshot
         {
+            for hit in &memory_hits {
+                self.report_memory_limit_hit(hit, &title, &project);
+                dirty = true;
+            }
             // A completion that happens in the pane the user is actively watching
             // is already attended. Record that at the same transition timestamp so
             // it cannot reappear as unseen after restart.
@@ -14958,6 +14990,64 @@ impl MuxelApp {
             title: title.to_string(),
             subtitle: format!("{} · {}", kind.label(), project),
         });
+    }
+
+    /// Tell the user a process in pane `title` reached the pane's memory limit:
+    /// the feed (and developer console) now, the durable event log for later.
+    fn report_memory_limit_hit(
+        &mut self,
+        hit: &muxel_terminal::MemoryLimitHit,
+        title: &str,
+        project: &str,
+    ) {
+        let gb = hit.limit_bytes as f64 / f64::from(1u32 << 30);
+        let limit = if gb.fract() == 0.0 {
+            format!("{gb:.0}")
+        } else {
+            format!("{gb:.1}")
+        };
+        let program = hit
+            .program
+            .clone()
+            .unwrap_or_else(|| t("A process").to_string());
+        let pid = hit.pid.to_string();
+        let args = [
+            ("program", program.as_str()),
+            ("pid", pid.as_str()),
+            ("limit", limit.as_str()),
+        ];
+        let (body, status) = match hit.status {
+            muxel_terminal::HitStatus::Stopped => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "stopped",
+            ),
+            muxel_terminal::HitStatus::Running => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "running",
+            ),
+            muxel_terminal::HitStatus::Unknown => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; muxel couldn't check whether it stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "unknown",
+            ),
+        };
+        muxel_store::append_event_log(&format!(
+            "memory-limit: \"{title}\" [{project}] pid={pid} program=\"{program}\" limit_bytes={} status={status}",
+            hit.limit_bytes
+        ));
+        self.add_event(
+            NotifKind::Error,
+            tf("{title}: memory limit reached", &[("title", title)]),
+            body,
+        );
     }
 
     /// Add a generic event notification to the sidebar feed (replaces pop-up
@@ -20602,6 +20692,7 @@ impl MuxelApp {
         &mut self,
         pid: Uuid,
         root_focus: &FocusHandle,
+        shown: &DisplayEpoch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -20621,10 +20712,10 @@ impl MuxelApp {
         let main_content: AnyElement = if let Some(msg) = failed_remote {
             self.render_remote_connect_failed(pid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
-            self.render_pane(&leaf, cx)
+            self.render_pane(&leaf, shown, cx)
         } else {
             match layout {
-                Some(root) => self.render_pane_root(pid, &root, cx),
+                Some(root) => self.render_pane_root(pid, &root, shown, cx),
                 None => div()
                     .size_full()
                     .flex()
@@ -24270,11 +24361,12 @@ impl MuxelApp {
         &mut self,
         pid: Uuid,
         root: &PaneNode,
+        shown: &DisplayEpoch,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let scroll = self.panes_scroll.entry(pid).or_default().clone();
         let min_w = px(root.min_width(f32::from(MIN_PANE_WIDTH)));
-        let panes = self.render_pane(root, cx);
+        let panes = self.render_pane(root, shown, cx);
         // X is the only scrolling axis here, and gpui redirects a *vertical* wheel
         // onto whichever single axis scrolls. Without this, rolling the wheel over
         // a terminal to walk its scrollback also dragged the whole pane strip
@@ -24393,7 +24485,13 @@ impl MuxelApp {
             })
     }
 
-    fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
+    /// `shown` belongs to the window being rendered; see [`terminal_pane_element`].
+    fn render_pane(
+        &self,
+        node: &PaneNode,
+        shown: &DisplayEpoch,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match node {
             PaneNode::Leaf(ld) => {
                 // A leaf should never carry zero tabs (pane.rs prunes an emptied
@@ -24488,7 +24586,7 @@ impl MuxelApp {
                                 div()
                                     .flex_1()
                                     .overflow_hidden()
-                                    .child(terminal_pane_element(view, !is_active, cx)),
+                                    .child(terminal_pane_element(view, !is_active, shown, cx)),
                             )
                             .child(
                                 div()
@@ -24507,7 +24605,7 @@ impl MuxelApp {
                     } else if !v.has_visible_content() {
                         self.terminal_starting(iid, cx)
                     } else {
-                        terminal_pane_element(view, !is_active, cx)
+                        terminal_pane_element(view, !is_active, shown, cx)
                     }
                 } else if let Some(ed) = self.editors.get(&iid) {
                     // Clicking the editor makes it the active pane (so toolbar
@@ -25479,7 +25577,7 @@ impl MuxelApp {
                 // ~12 columns, which makes wide TUIs like Claude overflow). The
                 // cross axis (height for a horizontal split) keeps the default.
                 for (i, child) in children.iter().enumerate() {
-                    let pane = self.render_pane(child, cx);
+                    let pane = self.render_pane(child, shown, cx);
                     let minimum = if horizontal {
                         child.min_width(f32::from(MIN_PANE_WIDTH))
                     } else {
@@ -29495,6 +29593,43 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Settings → Behavior: the per-process memory limit for local panes.
+    fn render_pane_memory_limit(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.settings.pane_memory_limit_gb;
+        let mut choices = vec![0, 8, 16, 32, 64];
+        // A hand-edited value still shows as the selected choice.
+        if !choices.contains(&current) {
+            choices.push(current);
+            choices.sort_unstable();
+        }
+        let mut row = div().flex().flex_wrap().gap_1();
+        for gb in choices {
+            let label = if gb == 0 {
+                t("Off")
+            } else {
+                tf("{gb} GB", &[("gb", &gb.to_string())]).into()
+            };
+            row = row.child(self.option_btn(
+                SharedString::from(format!("b-mem-{gb}")),
+                label,
+                current == gb,
+                cx,
+                move |s| s.pane_memory_limit_gb = gb,
+            ));
+        }
+        v_flex()
+            .gap_1()
+            .child(self.settings_label(&t("Memory limit for each process in a pane"), cx))
+            .child(row)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
+            )
+            .into_any_element()
+    }
+
     fn set_close_on_exit(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.close_on_exit = on;
         self.persist_settings();
@@ -32976,6 +33111,8 @@ impl MuxelApp {
                     &t("Ask before closing a busy terminal"),
                 ),
             )
+            // Job objects are Windows-only; elsewhere the setting does nothing.
+            .children(cfg!(windows).then(|| self.render_pane_memory_limit(cx)))
             .child(
                 self.check_row(
                     Checkbox::new("b-dev-console")
@@ -34798,6 +34935,11 @@ impl Focusable for MuxelApp {
 
 impl Render for MuxelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        MAIN_TEST_RENDERS.with(|count| count.set(count.get() + 1));
+        // Before any early return: a render that shows no panes hides them all.
+        self.shown.advance();
+        let shown = self.shown.clone();
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Main);
         // Native browser webviews draw above all gpui content in their bounds —
         // keep them shown/hidden in lockstep with what this frame displays.
@@ -34895,10 +35037,10 @@ impl Render for MuxelApp {
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
-            self.render_pane(&leaf, cx)
+            self.render_pane(&leaf, &shown, cx)
         } else {
             match (active_layout, self.workspace.active_project) {
-                (Some(root), Some(pid)) => self.render_pane_root(pid, &root, cx),
+                (Some(root), Some(pid)) => self.render_pane_root(pid, &root, &shown, cx),
                 // A workspace with zero projects gets the full get-started state;
                 // projects-with-no-panes keeps the small transient hint (the
                 // toolbar affordances already cover that case).
