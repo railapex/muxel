@@ -3326,12 +3326,75 @@ fn bell_terminal(
         .unwrap()
 }
 
+/// A pane named `name` running `cmd /d /c "exit <code>"`, as a literal
+/// command job, or (`job` false) as the default shell, standing for
+/// `exit <code>` typed into it.
+fn spawn_exit_fixture(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    name: &str,
+    code: i32,
+    job: bool,
+) -> (Uuid, Entity<TerminalView>) {
+    use muxel_core::LaunchPurpose;
+    let exit_args = || -> Vec<String> { vec!["/d".into(), "/c".into(), format!("exit {code}")] };
+    window
+        .update(cx, |app, window, cx| {
+            let mut instance = Instance::shell(pid);
+            instance.custom_name = Some(name.into());
+            if job {
+                instance.program = Some("cmd.exe".into());
+                instance.args = exit_args();
+                instance.literal_argv = true;
+            }
+            let expected = if job {
+                LaunchPurpose::Job
+            } else {
+                LaunchPurpose::Session
+            };
+            assert_eq!(instance.launch_purpose(), expected, "{name}");
+            let iid = instance.id;
+            let launch =
+                TerminalLaunch::spawn(CommandSpec::program("cmd.exe", exit_args()), (80, 24))
+                    .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view)
+        })
+        .unwrap()
+}
+
+/// `iid`'s notifications, and every unexpected-exit report's title.
+fn exit_notices(app: &MuxelApp, iid: Uuid) -> (Vec<(NotifKind, String)>, Vec<String>) {
+    let mine = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.instance == Some(iid))
+        .map(|notice| (notice.kind, notice.subtitle.clone()))
+        .collect();
+    let unexpected = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.title.contains("exited unexpectedly"))
+        .map(|notice| notice.title.clone())
+        .collect();
+    (mine, unexpected)
+}
+
 /// Both exit 3 through `cmd /c`. The job's instance runs that command; the
 /// session's is the default shell, standing for `exit 3` typed into it.
 #[test]
 fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
+    use muxel_core::AgentActivityState;
     use muxel_core::sidebar::is_unread;
-    use muxel_core::{AgentActivityState, LaunchPurpose};
     with_app(|cx, window| {
         let pid = project(cx, window);
         window
@@ -3341,45 +3404,8 @@ fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
                 app.notifications_enabled = false;
             })
             .unwrap();
-        let exit_args = || -> Vec<String> { vec!["/d".into(), "/c".into(), "exit 3".into()] };
-        let spawn = |cx: &mut TestAppContext, name: &str, job: bool| {
-            window
-                .update(cx, |app, window, cx| {
-                    let mut instance = Instance::shell(pid);
-                    instance.custom_name = Some(name.into());
-                    if job {
-                        instance.program = Some("cmd.exe".into());
-                        instance.args = exit_args();
-                        instance.literal_argv = true;
-                    }
-                    let expected = if job {
-                        LaunchPurpose::Job
-                    } else {
-                        LaunchPurpose::Session
-                    };
-                    assert_eq!(instance.launch_purpose(), expected, "{name}");
-                    let iid = instance.id;
-                    let launch = TerminalLaunch::spawn(
-                        CommandSpec::program("cmd.exe", exit_args()),
-                        (80, 24),
-                    )
-                    .unwrap();
-                    let view =
-                        cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
-                    app.workspace.add_instance(instance);
-                    let project = app.workspace.project_mut(pid).unwrap();
-                    if let Some(anchor) = project.first_instance() {
-                        assert!(add_tab(&mut project.layout, anchor, iid));
-                    } else {
-                        project.layout = Some(PaneNode::leaf(iid));
-                    }
-                    app.terminals.insert(iid, view.clone());
-                    (iid, view)
-                })
-                .unwrap()
-        };
-        let (job, job_view) = spawn(cx, "job fixture", true);
-        let (shell, shell_view) = spawn(cx, "shell fixture", false);
+        let (job, job_view) = spawn_exit_fixture(cx, window, pid, "job fixture", 3, true);
+        let (shell, shell_view) = spawn_exit_fixture(cx, window, pid, "shell fixture", 3, false);
         for view in [&job_view, &shell_view] {
             wait_for_view(cx, window, view, TerminalView::exited);
         }
@@ -3398,7 +3424,11 @@ fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
                     .collect();
                 assert_eq!(job_notices.len(), 1, "one notice for the job");
                 assert!(matches!(job_notices[0].kind, NotifKind::Error));
-                assert!(job_notices[0].subtitle.starts_with("failed"));
+                assert!(
+                    job_notices[0].subtitle.starts_with("exited with code 3"),
+                    "{}",
+                    job_notices[0].subtitle
+                );
 
                 let shell_activity = &app.workspace.instance(shell).unwrap().activity;
                 assert_eq!(shell_activity.completed_at, None);
@@ -3417,6 +3447,71 @@ fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
                     .map(|notice| notice.title.as_str())
                     .collect();
                 assert_eq!(unexpected, ["shell fixture: process exited unexpectedly"]);
+            })
+            .unwrap();
+    });
+}
+
+/// A job's failing exit is reported on its own: after a Done the tick already
+/// sampled (no transition left for the exit), and while the pane is watched
+/// (no notification for a finish the user sees).
+#[test]
+fn a_jobs_failing_exit_is_reported_after_a_sampled_finish_and_while_watched() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::AgentActivityState;
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| app.notifications_enabled = false)
+            .unwrap();
+        let (sampled, sampled_view) = spawn_exit_fixture(cx, window, pid, "sampled job", 3, true);
+        let (watched, watched_view) = spawn_exit_fixture(cx, window, pid, "watched job", 4, true);
+        for view in [&sampled_view, &watched_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                // `sampled` already reported Done and the tick sampled and
+                // announced it, as its badge still shows.
+                let runtime = sampled_view.read(cx).runtime_snapshot();
+                assert_eq!(runtime.status, AgentStatus::Done);
+                app.last_status.insert(
+                    sampled,
+                    SeenStatus {
+                        status: AgentStatus::Done,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        sampled_at: chrono::Utc::now().timestamp_millis(),
+                    },
+                );
+                let activity = &mut app.workspace.instance_mut(sampled).unwrap().activity;
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    200,
+                );
+                app.add_notification(sampled, NotifKind::Done, "sampled job", "fixture");
+                // `watched` is the focused pane of the active window.
+                app.window_active = true;
+                app.active_instance = Some(watched);
+                app.tick(window, cx);
+
+                for (iid, code) in [(sampled, 3), (watched, 4)] {
+                    let (mine, unexpected) = exit_notices(app, iid);
+                    assert_eq!(mine.len(), 1, "{code}: {mine:?}");
+                    assert!(matches!(mine[0].0, NotifKind::Error), "{code}");
+                    assert!(
+                        mine[0].1.starts_with(&format!("exited with code {code}")),
+                        "{}",
+                        mine[0].1
+                    );
+                    assert!(unexpected.is_empty(), "{unexpected:?}");
+                }
             })
             .unwrap();
     });

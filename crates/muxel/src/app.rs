@@ -35,7 +35,7 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
     ActivityBand, BandClock, InstancesById, SidebarEntry, SidebarSort, instances_by_id, is_unread,
-    notification_in_feed, sidebar_order, sidebar_rows, unread_count,
+    notification_in_feed, sidebar_order, sidebar_rows_each, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -1048,9 +1048,9 @@ struct ActivityUpdates {
 #[cfg(test)]
 mod restored_activity_tests {
     use super::{
-        AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attention_rank, done_is_read, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample, sample_status,
+        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose,
+        activity_needs_observation, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample, sample_status,
         unprompted_report_working,
     };
     use muxel_terminal::{TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason};
@@ -1128,14 +1128,38 @@ mod restored_activity_tests {
             ),
         ] {
             assert_eq!(
-                sample_status(&exit, Some(&pane), false, true),
+                sample_status(&exit, Some(&pane), false, true, true),
                 shown,
                 "{what}"
             );
         }
         // A turn that finished before the process exited stays finished.
         assert_eq!(
-            sample_status(&exit, Some(&attended_completion()), false, true),
+            sample_status(&exit, Some(&attended_completion()), false, true, true),
+            AgentStatus::Done
+        );
+    }
+
+    /// A tmux client or ssh connection ending is the transport's exit, not
+    /// the job's: the job may still be running behind it.
+    #[test]
+    fn a_transports_exit_does_not_finish_the_job_behind_it() {
+        let exit = runtime(AgentStatus::Done, TerminalStatusReason::ProcessExit);
+        let mut job = interrupted();
+        job.program = Some("cargo".into());
+        job.args = vec!["test".into()];
+        job.activity.observe(
+            Some(AgentActivityState::Idle),
+            AgentActivityState::Working,
+            200,
+        );
+        assert_eq!(job.launch_purpose(), LaunchPurpose::Job);
+        assert_eq!(
+            sample_status(&exit, Some(&job), false, true, false),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            sample_status(&exit, Some(&job), false, true, true),
             AgentStatus::Done
         );
     }
@@ -1149,26 +1173,26 @@ mod restored_activity_tests {
         );
         // Codex reports Working while it boots, before any turn is submitted.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, false),
+            sample_status(&booting, Some(&saved), false, false, true),
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&booting, Some(&attended_completion()), false, false),
+            sample_status(&booting, Some(&attended_completion()), false, false, true),
             AgentStatus::Done
         );
         // Startup output while the relaunch settles is not a turn either.
         let noise = runtime(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
         assert_eq!(
-            sample_status(&noise, Some(&saved), true, false),
+            sample_status(&noise, Some(&saved), true, false, true),
             AgentStatus::Idle
         );
         // A submitted turn is, and so is visible work once the relaunch settles.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, true),
+            sample_status(&booting, Some(&saved), false, true, true),
             AgentStatus::Working
         );
         assert_eq!(
-            sample_status(&noise, Some(&saved), false, false),
+            sample_status(&noise, Some(&saved), false, false, true),
             AgentStatus::Working
         );
     }
@@ -1532,31 +1556,44 @@ fn unprompted_report_working(
         && !submitted_turn
 }
 
-/// Whether this status is a session's process exit, which is no finish. An
+/// Whether this status is a process exit that finishes nothing. An
 /// interactive agent or shell finishes turns while it runs, so `/exit`, a
 /// kill, a crash or `exit` typed in a shell finishes nothing. A command job's
-/// exit is its finish, failing or not ([`LaunchPurpose`]). Either way a
-/// provider's own completion before the exit counts ([`apply_status_sample`]).
-fn session_exit(
+/// own exit is its finish, failing or not ([`LaunchPurpose`]), but not a
+/// transport's (`own_exit` false: a tmux client or a lost ssh connection,
+/// [`muxel_core::PaneTransport`]), which says nothing about the job behind
+/// it. Either way a provider's own completion before the exit counts
+/// ([`apply_status_sample`]).
+fn exit_finishes_nothing(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     instance: Option<&Instance>,
+    own_exit: bool,
 ) -> bool {
     runtime.reason == muxel_terminal::TerminalStatusReason::ProcessExit
-        && instance.is_none_or(|instance| instance.launch_purpose() == LaunchPurpose::Session)
+        && (!own_exit
+            || instance.is_none_or(|instance| instance.launch_purpose() == LaunchPurpose::Session))
+}
+
+/// Whether `view`'s child exited as its command ([`muxel_core::PaneTransport`]).
+fn own_exit(view: &TerminalView) -> bool {
+    view.session()
+        .transport()
+        .exit_is_the_commands(view.exit_code(), view.exit_signal().is_some())
 }
 
 /// The lifecycle status one terminal sample stands for. Some runtime states
-/// are not work: a session's process exit ([`session_exit`]); a provider's
-/// Working before any turn in this launch (a relaunch booting); and Working
-/// while a restore settles (`restoring`). They read as idle, so none records a
-/// start or a finish, and durable Done stays.
+/// are not work: an exit that finishes nothing ([`exit_finishes_nothing`]); a
+/// provider's Working before any turn in this launch (a relaunch booting); and
+/// Working while a restore settles (`restoring`). They read as idle, so none
+/// records a start or a finish, and durable Done stays.
 fn sample_status(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     instance: Option<&Instance>,
     restoring: bool,
     submitted_turn: bool,
+    own_exit: bool,
 ) -> AgentStatus {
-    let status = if session_exit(runtime, instance)
+    let status = if exit_finishes_nothing(runtime, instance, own_exit)
         || unprompted_report_working(runtime, submitted_turn)
         || (restoring && runtime.status == AgentStatus::Working)
     {
@@ -1578,6 +1615,7 @@ fn shown_terminal_status(
         instance,
         restoring,
         view.session().has_submitted_turn(),
+        own_exit(view),
     )
 }
 
@@ -1596,6 +1634,28 @@ fn status_alert_sound(status: AgentStatus) -> Option<AlertSound> {
         AgentStatus::Done => Some(AlertSound::Done),
         AgentStatus::Blocked => Some(AlertSound::Blocked),
         AgentStatus::Working | AgentStatus::Idle => None,
+    }
+}
+
+/// The alert a pane showing `status` is in ([`status_alert_sound`]). An
+/// exited pane does no more work, so a finish nobody has seen keeps its
+/// chime through the exit, which shows a session as Idle, until it's
+/// attended.
+fn pane_alert_sound(
+    status: AgentStatus,
+    exited: bool,
+    activity: Option<&AgentActivity>,
+) -> Option<AlertSound> {
+    let unseen_finish = exited
+        && activity.is_some_and(|activity| {
+            activity
+                .completed_at
+                .is_some_and(|done| activity.last_attended_at.is_none_or(|seen| done > seen))
+        });
+    if unseen_finish {
+        Some(AlertSound::Done)
+    } else {
+        status_alert_sound(status)
     }
 }
 
@@ -1799,7 +1859,10 @@ fn apply_status_sample(
     // came no earlier than the switch. A status the last sample couldn't show
     // (held back while a restore settled, or before any turn was submitted)
     // appeared after that sample, which showed something else. Without times,
-    // everything happened now.
+    // everything happened now. A time the clock now reads as in the future is
+    // kept: the clock stepped back after the event, and clamping it to `now`
+    // could put it before an attendance it followed. Only labels clamp it
+    // ([`muxel_core::agent_activity_label`]).
     let (status_at, completion_at) = times.map_or((now, now), |times| {
         let mut status_at = times
             .status
@@ -1807,10 +1870,7 @@ fn apply_status_sample(
         if new_binding && let Some(switched) = times.binding {
             status_at = status_at.max(switched);
         }
-        (
-            status_at.min(now),
-            times.completion.map_or(now, |at| at.min(now)),
-        )
+        (status_at, times.completion.unwrap_or(now))
     });
     let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
     let completion_pulse = record
@@ -1903,11 +1963,13 @@ fn apply_status_sample(
 mod sidebar_attendance_tests {
     use super::{
         AgentStatus, EventTimes, NotifKind, SeenStatus, StatusBinding, StatusSample,
-        activity_state, apply_status_sample, observe_popout_activity,
+        activity_state, apply_status_sample, observe_popout_activity, pane_alert_sound,
     };
     use muxel_core::sidebar::is_unread;
+    use muxel_core::sound_alert::{AlertGate, AlertSound, SETTLE};
     use muxel_core::{AgentActivity, AgentActivityState};
     use muxel_terminal::TerminalStatusCoverage;
+    use std::time::Instant;
     use uuid::Uuid;
 
     fn sample(status: AgentStatus, launch: Uuid) -> StatusSample {
@@ -2021,6 +2083,88 @@ mod sidebar_attendance_tests {
         assert_eq!(activity.completed_at, Some(400));
         assert!(is_unread(&activity), "the new finish came after the look");
         assert_eq!(effect.notify, Some(NotifKind::Done));
+    }
+
+    #[test]
+    fn a_finish_sampled_after_the_clock_steps_back_stays_after_the_look() {
+        // Looked at at 250, finished at 400, then the clock stepped back: the
+        // tick reads the finish at 200.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(SeenStatus {
+            completion_revision: 1,
+            sampled_at: 240,
+            ..record(AgentStatus::Done, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            150,
+        );
+        activity.attend(250);
+        let finished = |revision, completion| {
+            StatusSample {
+                attended: false,
+                completion_revision: revision,
+                ..sample(AgentStatus::Done, launch)
+            }
+            .times(EventTimes {
+                status: 150,
+                completion: Some(completion),
+                binding: None,
+            })
+        };
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), finished(2, 400), 200);
+        assert_eq!(activity.completed_at, Some(400), "kept as it happened");
+        assert!(is_unread(&activity), "the finish came after the look");
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        // Looking at it now, at 210 by the clock, covers it.
+        activity.attend(210);
+        assert!(!is_unread(&activity));
+        // A finish after that look is new, though the clock reads 260.
+        apply_status_sample(&mut seen, Some(&mut activity), finished(3, 260), 270);
+        assert!(is_unread(&activity), "the next finish came after the look");
+    }
+
+    #[test]
+    fn a_finish_sampled_with_its_sessions_exit_keeps_its_chime() {
+        // The provider finished and the session exited before the tick, which
+        // shows the exited session as idle.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(record(AgentStatus::Working, launch));
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        let effect = apply_status_sample(
+            &mut seen,
+            Some(&mut activity),
+            StatusSample {
+                attended: false,
+                completion_revision: 1,
+                ..sample(AgentStatus::Idle, launch)
+            },
+            200,
+        );
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        let (pane, armed) = (Uuid::new_v4(), Instant::now());
+        let mut gate = AlertGate::default();
+        gate.arm(pane, AlertSound::Done, armed);
+        let shown = pane_alert_sound(AgentStatus::Idle, true, Some(&activity));
+        assert_eq!(gate.due(|_| shown, armed + SETTLE), Some(AlertSound::Done));
+        // Seen, it has nothing more to ring for; a live idle pane never had.
+        activity.attend(300);
+        assert_eq!(
+            pane_alert_sound(AgentStatus::Idle, true, Some(&activity)),
+            None
+        );
+        let unseen = AgentActivity {
+            completed_at: Some(200),
+            ..AgentActivity::default()
+        };
+        assert_eq!(
+            pane_alert_sound(AgentStatus::Idle, false, Some(&unseen)),
+            None
+        );
     }
 
     #[test]
@@ -7511,8 +7655,7 @@ impl NotifKind {
             NotifKind::Blocked => t("needs input"),
             NotifKind::Done => t("finished"),
             NotifKind::Success => t("success"),
-            // A command job that exited failing.
-            NotifKind::Error => t("failed"),
+            NotifKind::Error => t("error"),
         }
     }
 }
@@ -9760,7 +9903,15 @@ impl MuxelApp {
             });
             let (program, args, env) =
                 self.remote_program_args(inst, &host, &control_path, &remote_cwd, &resolved);
-            let mut spec = CommandSpec::program(program, args);
+            // ssh exits with the command's status; a tmux client or sshpass
+            // in front of it doesn't (`PaneTransport`).
+            let transport =
+                if host.use_tmux(inst.is_some_and(|i| i.use_tmux)) || program == "sshpass" {
+                    muxel_core::PaneTransport::Client
+                } else {
+                    muxel_core::PaneTransport::Ssh
+                };
+            let mut spec = CommandSpec::program(program, args).with_transport(transport);
             // The same gate and session `remote_program_args` launched the
             // client with. Its ctl input runs tmux on that host over the host's
             // commands master, as the shared claim does.
@@ -9849,7 +10000,8 @@ impl MuxelApp {
                     (
                         CommandSpec::program("tmux", launch.args)
                             .with_title_source(title)
-                            .with_tmux_input(input),
+                            .with_tmux_input(input)
+                            .with_transport(muxel_core::PaneTransport::Client),
                         launch.env,
                     )
                 }
@@ -13026,7 +13178,10 @@ impl MuxelApp {
             // places it, so the click moves no row. That keeps a finish the
             // bell supplied after the click clears the bell below.
             let now = chrono::Utc::now().timestamp_millis();
-            let pending = self.pending_activity(iid, now, cx);
+            let pending = self
+                .workspace
+                .instance(iid)
+                .and_then(|instance| self.pending_activity(instance, now, cx));
             if let Some(instance) = self.workspace.instance_mut(iid) {
                 let recorded = pending.is_some();
                 if let Some(activity) = pending {
@@ -14598,6 +14753,9 @@ impl MuxelApp {
             /// killed pane from one that genuinely called `exit(1)`.
             exit_signal: Option<String>,
             read_error: Option<String>,
+            /// The exit is the command's own, not a transport's
+            /// ([`muxel_core::PaneTransport`]).
+            exit_is_own: bool,
             title: String,
             project: String,
             resume_error: bool,
@@ -14613,6 +14771,7 @@ impl MuxelApp {
             .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| {
                 let v = view.read(cx);
+                let inst = self.workspace.instance(*iid);
                 let TerminalActivitySample {
                     status,
                     raw_status,
@@ -14621,12 +14780,12 @@ impl MuxelApp {
                     runtime,
                     binding_rev,
                     times,
-                } = self.terminal_activity_sample(*iid, v);
+                } = self.terminal_activity_sample(*iid, inst, v);
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
-                let inst = self.workspace.instance(*iid);
+                let exit_is_own = own_exit(v);
                 // Some providers hang after reporting a missing conversation.
                 // The Codex message names the exact saved ID; a generic failure
                 // or unrelated screen text cannot erase its binding.
@@ -14656,6 +14815,7 @@ impl MuxelApp {
                     exit_code,
                     exit_signal,
                     read_error,
+                    exit_is_own,
                     title,
                     project,
                     resume_error,
@@ -14707,6 +14867,7 @@ impl MuxelApp {
             exit_code,
             exit_signal,
             read_error,
+            exit_is_own,
             title,
             project,
             resume_error,
@@ -14847,21 +15008,28 @@ impl MuxelApp {
                 if let Some(sound) = chime {
                     self.alert_gate.arm(iid, sound, alert_now);
                 }
-                alert_states.insert(iid, status_alert_sound(status));
+                alert_states.insert(
+                    iid,
+                    pane_alert_sound(
+                        status,
+                        exited,
+                        self.workspace.instance(iid).map(|i| &i.activity),
+                    ),
+                );
             }
-            // A command job that exits failing has finished all the same, and
-            // its notification says it failed, in place of the unexpected-exit
-            // report below.
-            let failed_job = exited
+            // A command job's own exit with a non-zero code finished it all the
+            // same. Its first is reported once, as the pane's notification,
+            // whatever this sample notified and whether or not the pane is
+            // watched (below), in place of a "finished" and of the
+            // unexpected-exit report.
+            let failed_job = newly_exited
+                && exit_is_own
                 && exit_code != Some(0)
                 && self
                     .workspace
                     .instance(iid)
                     .is_some_and(|i| i.launch_purpose() == LaunchPurpose::Job);
-            let notice = effect.notify.map(|kind| match kind {
-                NotifKind::Done if failed_job => NotifKind::Error,
-                kind => kind,
-            });
+            let notice = effect.notify.filter(|_| !failed_job);
             if let Some(kind) = notice {
                 // Collect the in-app entry regardless of the desktop toggle;
                 // only the OS popup respects `notifications_enabled`.
@@ -14963,10 +15131,7 @@ impl MuxelApp {
                 // closing it silently destroys the instance and looks like the
                 // pane randomly vanished.
                 to_close.push((iid, title));
-            } else if newly_exited
-                && exit_code != Some(0)
-                && !self.reconnecting.contains_key(&iid)
-                && notice != Some(NotifKind::Error)
+            } else if newly_exited && exit_code != Some(0) && !self.reconnecting.contains_key(&iid)
             {
                 // Abnormal exit: the pane stays as a tombstone; flag it in the
                 // feed (and as a desktop notification when unattended).
@@ -14976,25 +15141,53 @@ impl MuxelApp {
                 // the outage is already reported once as "connection lost —
                 // reconnecting…". Announcing every failed retry would ring the
                 // desktop once a half-minute for as long as the host is down.
-                let detail = match (&read_error, &exit_signal, exit_code) {
-                    (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
-                    (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
-                    (None, None, Some(code)) => {
-                        tf("exit code {code}", &[("code", &code.to_string())])
-                    }
-                    (None, None, None) => t("exit code unknown").to_string(),
-                };
-                self.add_event(
-                    NotifKind::Error,
-                    tf("{title}: process exited unexpectedly", &[("title", &title)]),
-                    detail,
-                );
-                if self.notifications_enabled && !self.window_active {
-                    notify(
-                        tf("{title} exited unexpectedly", &[("title", &title)]),
-                        project,
-                        Some(iid),
+                if failed_job {
+                    // A job's code is its result, not necessarily a failure
+                    // (grep exits 1 when nothing matches), so the notice says
+                    // the code.
+                    let detail = match (&read_error, &exit_signal, exit_code) {
+                        (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
+                        (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
+                        (None, None, Some(code)) => {
+                            tf("exited with code {code}", &[("code", &code.to_string())])
+                        }
+                        (None, None, None) => t("exited, code unknown").to_string(),
+                    };
+                    self.put_pane_notification(
+                        iid,
+                        NotifKind::Error,
+                        &title,
+                        format!("{detail} · {project}"),
                     );
+                    if self.notifications_enabled && !self.window_active {
+                        notify_with(
+                            format!("{title} {detail}"),
+                            project,
+                            Some(iid),
+                            chime.is_some(),
+                        );
+                    }
+                } else {
+                    let detail = match (&read_error, &exit_signal, exit_code) {
+                        (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
+                        (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
+                        (None, None, Some(code)) => {
+                            tf("exit code {code}", &[("code", &code.to_string())])
+                        }
+                        (None, None, None) => t("exit code unknown").to_string(),
+                    };
+                    self.add_event(
+                        NotifKind::Error,
+                        tf("{title}: process exited unexpectedly", &[("title", &title)]),
+                        detail,
+                    );
+                    if self.notifications_enabled && !self.window_active {
+                        notify(
+                            tf("{title} exited unexpectedly", &[("title", &title)]),
+                            project,
+                            Some(iid),
+                        );
+                    }
                 }
                 dirty = true;
             }
@@ -15596,13 +15789,18 @@ impl MuxelApp {
     /// Add an in-app notification for `iid`, replacing any existing one for that
     /// pane so notifications don't pile up.
     fn add_notification(&mut self, iid: Uuid, kind: NotifKind, title: &str, project: &str) {
+        self.put_pane_notification(iid, kind, title, format!("{} · {}", kind.label(), project));
+    }
+
+    /// Show `iid`'s notification, replacing any earlier one for that pane.
+    fn put_pane_notification(&mut self, iid: Uuid, kind: NotifKind, title: &str, subtitle: String) {
         self.notifications.retain(|n| n.instance != Some(iid));
         self.notifications.push(Notification {
             id: Uuid::new_v4(),
             instance: Some(iid),
             kind,
             title: title.to_string(),
-            subtitle: format!("{} · {}", kind.label(), project),
+            subtitle,
         });
     }
 
@@ -21570,7 +21768,8 @@ impl MuxelApp {
         };
         match popout.view {
             PaneView::Terminal(view) => {
-                let sample = self.terminal_activity_sample(iid, view.read(cx));
+                let sample =
+                    self.terminal_activity_sample(iid, self.workspace.instance(iid), view.read(cx));
                 let status = sample
                     .runtime
                     .is_attributable_to(sample.binding_rev)
@@ -23149,15 +23348,16 @@ impl MuxelApp {
     /// leaves it and a click never moves it. `None` when the sample changes
     /// nothing, or `iid` has no live terminal or is held for Undo, which the
     /// tick doesn't sample.
-    fn pending_activity(&self, iid: Uuid, now: i64, cx: &App) -> Option<AgentActivity> {
+    fn pending_activity(&self, instance: &Instance, now: i64, cx: &App) -> Option<AgentActivity> {
+        let iid = instance.id;
         if self.is_closing(iid) {
             return None;
         }
         let terminal = self.terminal_view(iid)?.read(cx);
-        let sample = self.terminal_activity_sample(iid, terminal);
+        let sample = self.terminal_activity_sample(iid, Some(instance), terminal);
         let (preserve, _) =
             restored_activity_sample(sample.restoring, sample.submitted_turn, sample.raw_status);
-        let mut activity = self.workspace.instance(iid)?.activity.clone();
+        let mut activity = instance.activity.clone();
         let mut record = self.last_status.get(&iid).copied();
         let sample = StatusSample::from_runtime(
             sample.runtime,
@@ -23188,7 +23388,7 @@ impl MuxelApp {
             .iter()
             .filter(|instance| instance.kind == InstanceKind::Terminal)
             .filter_map(|instance| {
-                let activity = self.pending_activity(instance.id, now, cx)?;
+                let activity = self.pending_activity(instance, now, cx)?;
                 Some(Instance {
                     activity,
                     ..instance.clone()
@@ -23197,17 +23397,18 @@ impl MuxelApp {
             .collect()
     }
 
-    /// The rows `project` lists in the sidebar ([`sidebar_rows`]).
-    fn sidebar_rows(&self, project: &Project) -> Vec<Uuid> {
-        sidebar_rows(
-            project,
+    /// The rows each project lists in the sidebar ([`sidebar_rows_each`]), by
+    /// project id.
+    fn sidebar_rows_each(&self) -> HashMap<Uuid, Vec<Uuid>> {
+        sidebar_rows_each(
+            &self.workspace.projects,
             &self.workspace,
             &|iid| self.popouts.contains_key(&iid),
             self.settings.sidebar_sort,
         )
     }
 
-    /// `pane_ids` ([`Self::sidebar_rows`]) as the sidebar lists them, placed
+    /// `pane_ids` ([`Self::sidebar_rows_each`]) as the sidebar lists them, placed
     /// by `placing` ([`with_pending`]) and by the status each row shows, like
     /// its badge.
     fn sidebar_entries(
@@ -23228,11 +23429,10 @@ impl MuxelApp {
     /// app tests that click rows.
     #[cfg(all(test, windows))]
     fn sidebar_entries_now(&self, pid: Uuid, cx: &App) -> Vec<SidebarEntry> {
-        let project = self.workspace.project(pid).expect("project");
         let instances = instances_by_id(&self.workspace);
         let pending = self.pending_instances(cx);
         self.sidebar_entries(
-            &self.sidebar_rows(project),
+            &self.sidebar_rows_each().remove(&pid).expect("project"),
             &with_pending(&instances, &pending),
             BandClock::at(&chrono::Local::now()),
             cx,
@@ -23249,16 +23449,18 @@ impl MuxelApp {
         persisted_status(status, instance, restoring)
     }
 
+    /// `terminal`'s sample for pane `iid`, whose instance the caller has
+    /// already found (`None`: none).
     fn terminal_activity_sample(
         &self,
         iid: Uuid,
+        instance: Option<&Instance>,
         terminal: &TerminalView,
     ) -> TerminalActivitySample {
         let runtime = terminal.runtime_snapshot();
         let binding_rev = terminal.session().binding_revision();
         let raw_status = runtime.status;
         let submitted_turn = terminal.session().has_submitted_turn();
-        let instance = self.workspace.instance(iid);
         let startup_delay_ms = instance
             .and_then(|instance| {
                 instance
@@ -23281,7 +23483,13 @@ impl MuxelApp {
             startup_delay_ms,
         );
         TerminalActivitySample {
-            status: sample_status(&runtime, instance, restoring, submitted_turn),
+            status: sample_status(
+                &runtime,
+                instance,
+                restoring,
+                submitted_turn,
+                own_exit(terminal),
+            ),
             raw_status,
             submitted_turn,
             restoring,
@@ -23299,7 +23507,11 @@ impl MuxelApp {
                 .map(|(iid, popout, view)| {
                     (
                         *iid,
-                        self.terminal_activity_sample(*iid, view.read(cx)),
+                        self.terminal_activity_sample(
+                            *iid,
+                            self.workspace.instance(*iid),
+                            view.read(cx),
+                        ),
                         popout.window,
                     )
                 })
@@ -27539,6 +27751,7 @@ impl MuxelApp {
         let instances = instances_by_id(&self.workspace);
         let pending = self.pending_instances(cx);
         let placing = with_pending(&instances, &pending);
+        let mut rows = self.sidebar_rows_each();
         let bands = BandClock::at(&chrono::Local::now());
         let sort = self.settings.sidebar_sort;
         let entity = cx.entity();
@@ -27570,7 +27783,7 @@ impl MuxelApp {
             let collapsed = self.collapsed.contains(&pid);
             // Popouts leave the layout but keep their session row in Recent
             // work, where their feed entry is folded away.
-            let pane_ids = self.sidebar_rows(project);
+            let pane_ids = rows.remove(&pid).unwrap_or_default();
             let unread = if sort == SidebarSort::RecentWork {
                 unread_count(&pane_ids, &instances)
             } else {

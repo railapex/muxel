@@ -40,6 +40,36 @@ impl LaunchPurpose {
     }
 }
 
+/// What a terminal pane's child process is to the command it runs, which
+/// decides whose exit the child's is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaneTransport {
+    /// The child is the command.
+    #[default]
+    Direct,
+    /// `ssh … exec <command>`, which exits with the command's status, or with
+    /// 255 when ssh itself fails.
+    Ssh,
+    /// A client in front of the command whose exit isn't the command's: a
+    /// tmux client, which a lost server, a detach and the session ending all
+    /// end without passing on the command's status, or `sshpass`, whose own
+    /// failures exit 1 to 6.
+    Client,
+}
+
+impl PaneTransport {
+    /// Whether the child's exit, with `code` (`None`: unknown) or killed by a
+    /// signal, is the command's own: it ended, and how. A job's own exit is
+    /// its finish; a transport's is no evidence about the job.
+    pub fn exit_is_the_commands(self, code: Option<i32>, signalled: bool) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::Ssh => !signalled && code.is_some_and(|code| code != 255),
+            Self::Client => false,
+        }
+    }
+}
+
 /// Whether `program` is a shell (`None` or empty: the user's default shell).
 pub fn is_shell_program(program: Option<&str>) -> bool {
     program_name(program).is_none_or(|name| shell_of(&name).is_some())
@@ -387,8 +417,31 @@ const AGENTS: &[(&str, OneShot)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchPurpose, is_shell_program};
+    use super::{LaunchPurpose, PaneTransport, is_shell_program};
     use crate::AgentPreset;
+
+    /// Only a child that is the command, or ssh passing on its status, exits
+    /// for it. A tmux client's exit 0 can be a detach; its 1, a lost server.
+    #[test]
+    fn only_the_commands_own_exit_is_its_exit() {
+        for (transport, code, signalled, expected) in [
+            (PaneTransport::Direct, Some(3), false, true),
+            (PaneTransport::Direct, None, true, true),
+            (PaneTransport::Ssh, Some(0), false, true),
+            (PaneTransport::Ssh, Some(3), false, true),
+            (PaneTransport::Ssh, Some(255), false, false),
+            (PaneTransport::Ssh, None, true, false),
+            (PaneTransport::Ssh, None, false, false),
+            (PaneTransport::Client, Some(0), false, false),
+            (PaneTransport::Client, Some(1), false, false),
+        ] {
+            assert_eq!(
+                transport.exit_is_the_commands(code, signalled),
+                expected,
+                "{transport:?} {code:?} {signalled}"
+            );
+        }
+    }
 
     fn purpose(program: Option<&str>, args: &[&str]) -> LaunchPurpose {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
