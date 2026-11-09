@@ -1665,12 +1665,7 @@ feature is added or changed, update the matching entry here in the same change**
   without reselecting the project.
 - **Remote git** — the branch label and the project git menu (switch/new branch,
   commit, pull, push, fetch, stash) operate on the remote repo over the shared
-  connection; remote status is polled off the UI thread. Every 5 s one ssh call
-  reads a remote project's branch and its branch list together, which needs
-  git 1.9 or newer on the host; where the host's git can't list them, an error
-  notice says so with git's message, once per host until a read there works.
-  A read that fails keeps the branch last shown. The switch-branch menu lists
-  branches only, with no line for a detached HEAD, a rebase or a bisect.
+  connection; remote status is polled off the UI thread.
 - **Remote files** — the file browser lists a remote project's files over SSH
   (gitignore-aware via `git ls-files`, else `find`); opening a file reads it over
   SSH into the editor and Ctrl+S writes it back. Open-in-terminal opens a remote
