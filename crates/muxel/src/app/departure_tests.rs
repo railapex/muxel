@@ -451,7 +451,7 @@ fn a_restart_takes_over_a_waiting_quit_and_starts_the_new_version_once() {
                 assert_eq!(app.departing, Some(Stage::Preparing));
             })
             .unwrap();
-        // It saves and then waits for the kill, as the Quit would have.
+        // It waits for the kill, as the Quit would have.
         for _ in 0..50 {
             cx.run_until_parked();
             cx.executor().advance_clock(Duration::from_millis(20));
@@ -479,5 +479,142 @@ fn a_restart_takes_over_a_waiting_quit_and_starts_the_new_version_once() {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(STARTED.load(Ordering::SeqCst), 1);
+    });
+}
+
+fn started_quietly(_: &RelaunchPlan) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// A test's own workspace document, removed with it.
+struct TestDoc(std::path::PathBuf);
+
+impl TestDoc {
+    fn new(name: &str) -> Self {
+        Self(std::env::temp_dir().join(format!("muxel-departure-{name}-{}.json", Uuid::new_v4())))
+    }
+
+    fn read(&self) -> Option<muxel_core::Workspace> {
+        let bytes = std::fs::read(&self.0).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+impl Drop for TestDoc {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Change the workspace in a way a save shows: a window placement under `key`.
+fn mark(app: &mut MuxelApp, key: Uuid) {
+    app.workspace.project_windows.insert(
+        key,
+        muxel_core::ProjectWindow {
+            display: Uuid::nil(),
+            geom: None,
+        },
+    );
+}
+
+/// A Restart's save comes after its waits and holds what changed during them;
+/// routine saves write nothing meanwhile. Once the new version has started,
+/// nothing more is written.
+#[test]
+fn a_restart_saves_last_and_writes_nothing_once_the_new_version_starts() {
+    with_app(|cx, window| {
+        let doc = TestDoc::new("saves");
+        let (kill, killed) = async_channel::bounded::<()>(1);
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                app.relaunch = started_quietly;
+                app.test_doc_path = Some(doc.0.clone());
+                app.current_workspace = Some(Uuid::new_v4());
+                app.close_tmux_kills
+                    .push(cx.background_executor().spawn(async move {
+                        let _ = killed.recv().await;
+                    }));
+                app.confirm_exit(ExitKind::Restart, cx);
+                assert_eq!(app.departing, Some(Stage::Preparing));
+            })
+            .unwrap();
+        for _ in 0..20 {
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+        }
+        let during = Uuid::new_v4();
+        window
+            .update(cx, |app, _, _| {
+                mark(app, during);
+                app.persist();
+            })
+            .unwrap();
+        assert!(
+            doc.read().is_none(),
+            "something saved while the Restart waited"
+        );
+
+        kill.try_send(()).unwrap();
+        run_until(cx, window, "the Restart never ended", |app| {
+            app.restart_ended
+        });
+        let saved = doc.read().expect("the Restart saved the workspace");
+        assert!(
+            saved.project_windows.contains_key(&during),
+            "the Restart's save missed a change made while it waited"
+        );
+        let bytes = std::fs::read(&doc.0).unwrap();
+        window
+            .update(cx, |app, _, _| {
+                mark(app, Uuid::new_v4());
+                app.persist();
+                app.current_workspace = None;
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&doc.0).unwrap(),
+            bytes,
+            "a save after the new version started"
+        );
+    });
+}
+
+const CHANGED: Uuid = Uuid::from_u128(0x5b);
+
+/// The Restart checks that it saved the workspace it holds. A change between
+/// its save and that check makes it give up, and the saves it held then run.
+#[test]
+fn a_restart_whose_workspace_changes_as_it_saves_gives_up() {
+    with_app(|cx, window| {
+        let doc = TestDoc::new("changed");
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                app.relaunch = must_not_start;
+                app.test_doc_path = Some(doc.0.clone());
+                app.current_workspace = Some(Uuid::new_v4());
+                app.after_departure_save = Some(|app| mark(app, CHANGED));
+                app.confirm_exit(ExitKind::Restart, cx);
+            })
+            .unwrap();
+        run_until(cx, window, "the Restart never gave up", |app| {
+            app.departing.is_none()
+        });
+        window
+            .update(cx, |app, _, _| {
+                assert!(
+                    last_event(app).contains("changed as it was saved"),
+                    "{}",
+                    last_event(app)
+                );
+                app.current_workspace = None;
+            })
+            .unwrap();
+        let saved = doc.read().expect("the workspace was saved");
+        assert!(
+            saved.project_windows.contains_key(&CHANGED),
+            "the held save didn't run after the Restart gave up"
+        );
     });
 }

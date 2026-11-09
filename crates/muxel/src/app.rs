@@ -6111,6 +6111,12 @@ pub struct MuxelApp {
     /// Set where a committed Restart would quit: tests never quit the app.
     #[cfg(test)]
     restart_ended: bool,
+    /// Where tests save the workspace document instead of the data dir.
+    #[cfg(test)]
+    test_doc_path: Option<PathBuf>,
+    /// Runs between a Restart's save and its check of what it saved.
+    #[cfg(test)]
+    after_departure_save: Option<fn(&mut MuxelApp)>,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
     /// reset each time the dialog opens).
     quit_kill_tmux_local: bool,
@@ -8340,6 +8346,10 @@ impl MuxelApp {
             },
             #[cfg(test)]
             restart_ended: false,
+            #[cfg(test)]
+            test_doc_path: None,
+            #[cfg(test)]
+            after_departure_save: None,
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
             show_keys: false,
@@ -8499,6 +8509,11 @@ impl MuxelApp {
             cx.defer(move |cx| {
                 if let Some(app) = weak.upgrade() {
                     app.update(cx, |this, cx| {
+                        // A Restart that has started the new version closes its
+                        // windows by quitting, and keeps their layout as saved.
+                        if this.departing == Some(departure::Stage::Committed) {
+                            return;
+                        }
                         this.handle_secondary_closed(window_id, cx);
                         this.close_popout(window_id, cx);
                         // The generational ID cannot match a replacement window.
@@ -11849,15 +11864,41 @@ impl MuxelApp {
     /// Persist and report whether the write completed. Workspace switching uses
     /// this to preserve an unsaved auto-title or finalized hold on a failed flush.
     fn try_persist(&mut self) -> bool {
+        match self.departing {
+            // A Restart saves once, after its waits, and that save holds
+            // whatever changed meanwhile.
+            Some(departure::Stage::Preparing) => return false,
+            // That save was the last write: nothing that changes as this app
+            // shuts down may reach the new version.
+            Some(departure::Stage::Committed) => return true,
+            None => {}
+        }
         let Some(id) = self.current_workspace else {
             return true; // no workspace chosen yet (selector still open)
         };
-        let Some(path) = muxel_store::workspace_doc_path(id) else {
+        let Some(path) = self.workspace_doc_path(id) else {
             return false;
         };
         let durable =
             (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
-        match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
+        let saved =
+            muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace));
+        self.note_workspace_save(&path, saved)
+    }
+
+    /// Where workspace `id`'s document is saved.
+    fn workspace_doc_path(&self, id: Uuid) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.test_doc_path {
+            return Some(path.clone());
+        }
+        muxel_store::workspace_doc_path(id)
+    }
+
+    /// Record how a save of the workspace document to `path` went. `true` if
+    /// it was written.
+    fn note_workspace_save(&mut self, path: &Path, saved: anyhow::Result<()>) -> bool {
+        match saved {
             Ok(()) => {
                 self.auto_name_save_due = None;
                 self.close_persist_pending = false;
@@ -11880,6 +11921,10 @@ impl MuxelApp {
     /// workspace. Used at launch (from the selector) and to switch workspaces.
     fn enter_workspace(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let _phase = ui_profile::phase("workspace", "enter", None);
+        // A Restart under way leaves with this workspace, and saves it last.
+        if self.departing.is_some() {
+            return;
+        }
         // Re-entering the current workspace is a no-op except for closing the
         // selector — don't tear it down and re-lock (we already hold the lock).
         if self.current_workspace == Some(id) {
@@ -28750,6 +28795,9 @@ impl MuxelApp {
     /// Save the current main-window geometry (called debounced from the
     /// window-bounds observer).
     fn save_window_geom(&self, window: &Window) {
+        if self.departing == Some(departure::Stage::Committed) {
+            return;
+        }
         let (bounds, maximized) = match window.inner_window_bounds() {
             WindowBounds::Windowed(b) => (b, false),
             WindowBounds::Maximized(b) => (b, true),

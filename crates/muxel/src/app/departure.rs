@@ -8,6 +8,11 @@
 //! terminal's input and waits for the writes queued before the hold, saves,
 //! starts the new version, and only then quits. Until the new version has
 //! started it can give up, and this one stays running.
+//!
+//! While a Restart prepares, the workspace's routine saves wait for its own,
+//! which comes last and holds every change made meanwhile. Once the new
+//! version has started, nothing more is written: closing windows and the
+//! app's shutdown change nothing the new version loads.
 
 use super::pending_input::{PendingEntry, PendingKind};
 use super::recoverable_close::CloseDeparture;
@@ -348,31 +353,69 @@ impl MuxelApp {
             )));
         }
 
-        // Save, then let the tmux sessions of closed panes finish dying, as a
-        // Quit does.
-        this.update(cx, |app, cx| {
-            app.finalize_all_closes(cx);
-            if app.try_persist() {
-                Ok(())
-            } else {
-                Err(Abort::Failed(
-                    t("The workspace couldn't be saved.").to_string(),
-                ))
-            }
-        })
-        .map_err(|_| Abort::Gone)??;
-        while !this
-            .update(cx, |app, _| {
-                app.close_tmux_kills.retain(|task| !task.is_ready());
-                app.close_tmux_kills.is_empty()
+        // Finish the panes still closing and let their tmux sessions die, as a
+        // Quit does. Then save and start the new version in one turn, so
+        // nothing changes between them. A pane closed during the wait is
+        // finished the same way first.
+        loop {
+            this.update(cx, |app, cx| {
+                app.finalize_all_closes(cx);
             })
-            .map_err(|_| Abort::Gone)?
-        {
-            cx.background_executor().timer(TICK).await;
+            .map_err(|_| Abort::Gone)?;
+            while !this
+                .update(cx, |app, _| {
+                    app.close_tmux_kills.retain(|task| !task.is_ready());
+                    app.close_tmux_kills.is_empty()
+                })
+                .map_err(|_| Abort::Gone)?
+            {
+                cx.background_executor().timer(TICK).await;
+            }
+            let started = this
+                .update(cx, |app, cx| {
+                    if !app.close_groups.is_empty() {
+                        return Ok(false);
+                    }
+                    app.save_for_departure()?;
+                    app.commit_restart(plan, cx).map(|()| true)
+                })
+                .map_err(|_| Abort::Gone)??;
+            if started {
+                return Ok(());
+            }
         }
+    }
 
-        this.update(cx, |app, cx| app.commit_restart(plan, cx))
-            .map_err(|_| Abort::Gone)?
+    /// The Restart's one save, and its last write. It writes the workspace's
+    /// bytes, then checks that the workspace still serializes to them, so the
+    /// new version loads what this one holds.
+    fn save_for_departure(&mut self) -> Result<(), Abort> {
+        let failed = || Abort::Failed(t("The workspace couldn't be saved.").to_string());
+        let Some(id) = self.current_workspace else {
+            return Ok(());
+        };
+        let path = self.workspace_doc_path(id).ok_or_else(failed)?;
+        let json = match muxel_store::workspace_json(&self.workspace) {
+            Ok(json) => json,
+            Err(error) => {
+                self.note_workspace_save(&path, Err(error));
+                return Err(failed());
+            }
+        };
+        let written = muxel_store::write_workspace_json(&path, &json);
+        if !self.note_workspace_save(&path, written) {
+            return Err(failed());
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_departure_save {
+            hook(self);
+        }
+        if muxel_store::workspace_json(&self.workspace).ok().as_ref() != Some(&json) {
+            return Err(Abort::Failed(
+                t("The workspace changed as it was saved.").to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Start the new version, then quit.
@@ -425,6 +468,8 @@ impl MuxelApp {
             session.release_departure();
         }
         self.departing = None;
+        // Saves were held for the Restart's own; write what they held.
+        self.persist();
         self.pending_inputs.resume();
         if let Some(task) = self.restart_task.take() {
             task.detach();
