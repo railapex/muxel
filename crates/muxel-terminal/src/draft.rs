@@ -9,16 +9,15 @@
 //! line after its OSC 133 B mark. Grok, Muse, opencode and Amp draw boxes
 //! muxel can't yet read, so their panes run no watcher.
 //!
-//! A read that can't be sure of every character is flagged partial: a row
-//! break that fits more than one reading (see [`join_rows`]), a paste marker
-//! muxel can't tie to one paste, a box taller than the pane, shell text drawn
-//! after the cursor (an autosuggestion can't be told from typed text), or
-//! whitespace the screen can't show. A terminal draws spaces at the end of a
-//! row, and how many spaces a wrap took, as empty cells. When what muxel
-//! typed into the box since it was last empty is known (see
+//! A read that can't be sure of every character is flagged partial. The
+//! screen alone never is: a terminal draws spaces at the end of a row, how
+//! many spaces a wrap took, and spaces after the cursor as empty cells. When
+//! what muxel typed into the box since it was last empty is known (see
 //! [`muxel_core::rescue::TypedDraft`]) and the screen shows that text, the
-//! typed text is the
-//! draft, whitespace and all.
+//! typed text is the draft, whitespace and all. Even then a paste marker
+//! muxel can't tie to one paste, a box taller than the pane, or shell text
+//! drawn after the cursor (an autosuggestion can't be told from typed text)
+//! leaves it partial.
 
 use crate::listener::MuxelListener;
 use crate::session::TerminalSession;
@@ -30,7 +29,7 @@ use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use muxel_core::rescue::{
     DraftAction, DraftRead, DraftSource, DraftTracker, PromptDraft, RowWidths, debounce_remaining,
-    has_paste_markers, hides_whitespace, join_rows, text_columns, typed_matches,
+    has_paste_markers, join_rows, text_columns, typed_matches,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -220,18 +219,15 @@ impl DraftCapture {
     }
 
     /// The spaces between the end of `row`'s text and the cursor when the
-    /// cursor is on that row after the text (they were typed), and whether
-    /// the cursor shows where the draft ends. Text starts `indent` columns in.
-    /// A hidden cursor can be anywhere, so it shows nothing.
-    fn blanks_before_cursor(&self, row: usize, indent: usize) -> (usize, bool) {
+    /// cursor is on that row after the text: they were typed. Text starts
+    /// `indent` columns in. A hidden cursor can be anywhere, so it shows
+    /// none. Spaces after the cursor can't be seen at all.
+    fn blanks_before_cursor(&self, row: usize, indent: usize) -> usize {
         if !self.cursor_visible || usize::try_from(self.cursor_row).ok() != Some(row) {
-            return (0, false);
+            return 0;
         }
         let end = text_columns(self.content[row].trim_end()).max(indent);
-        match self.cursor_column.checked_sub(end) {
-            Some(blanks) => (blanks, true),
-            None => (0, false),
-        }
+        self.cursor_column.saturating_sub(end)
     }
 
     /// The cursor sits at the start of the box's first row: an empty box
@@ -301,14 +297,14 @@ fn text_read(
             clipped: false,
         };
     }
-    // Only the screen: spaces before the cursor were typed; any other
-    // whitespace at a row's end can't be seen.
-    let (blanks, end_known) = capture.blanks_before_cursor(first_row + rows.len() - 1, indent);
+    // Only the screen: spaces before the cursor were typed, but nothing
+    // shows whether more whitespace ends a row, the cursor's included.
+    let blanks = capture.blanks_before_cursor(first_row + rows.len() - 1, indent);
     let mut text = joined.text;
     text.extend(std::iter::repeat_n(' ', blanks));
     DraftRead::Text {
         text,
-        partial: !joined.exact || !end_known || hides_whitespace(&lines, widths, newlines),
+        partial: true,
         clipped,
     }
 }
@@ -434,8 +430,14 @@ pub(crate) fn codex(
 /// autosuggestion, an inline prediction, or typed text the cursor was moved
 /// back over) can't be told apart, so it's left out and the read is partial.
 /// So is a command continued on another line, or anything drawn below the
-/// command (a prediction list): only the line with the mark is read.
-pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftRead {
+/// command (a prediction list): only the line with the mark is read. Spaces
+/// after the cursor can't be seen either, so the read is exact only when it
+/// is `typed`, what muxel saw typed since the line was last empty.
+pub(crate) fn shell(
+    term: &Term<MuxelListener>,
+    mark: &ShellInputMark,
+    typed: Option<&str>,
+) -> DraftRead {
     let grid = term.grid();
     let rows = grid.screen_lines() as i64;
     let columns = grid.columns();
@@ -453,7 +455,7 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
     if cursor < (line, mark.column) {
         return DraftRead::Unknown;
     }
-    let mut typed = String::new();
+    let mut shown = String::new();
     let mut after_cursor = false;
     let mut reached_cursor = false;
     let mut row = line;
@@ -470,9 +472,9 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
                 after_cursor |= !cell.c.is_whitespace();
                 continue;
             }
-            typed.push(cell.c);
+            shown.push(cell.c);
             if let Some(combining) = cell.zerowidth() {
-                typed.extend(combining);
+                shown.extend(combining);
             }
         }
         let wrapped = columns > 0
@@ -492,18 +494,18 @@ pub(crate) fn shell(term: &Term<MuxelListener>, mark: &ShellInputMark) -> DraftR
     let partial = after_cursor || !reached_cursor || drawn_below;
     // Cells before the cursor are typed, blanks included; past the cursor
     // nothing was kept.
-    let typed = if reached_cursor {
-        typed.as_str()
+    let shown = if reached_cursor {
+        shown.as_str()
     } else {
-        typed.trim_end()
+        shown.trim_end()
     };
-    match (typed.trim().is_empty(), partial) {
+    match (shown.trim().is_empty(), partial) {
         (true, false) => DraftRead::Empty,
         // Nothing provably typed, but something is there: keep what was saved.
         (true, true) => DraftRead::Unknown,
         (false, partial) => DraftRead::Text {
-            text: typed.to_string(),
-            partial,
+            text: shown.to_string(),
+            partial: partial || typed != Some(shown),
             clipped: false,
         },
     }
@@ -882,9 +884,37 @@ mod tests {
         );
         // A space typed last: the cursor is after it.
         let mut screen = capture(&[RULE, "❯ hello ", RULE], (1, 8), &[]);
-        assert_eq!(super::claude(&screen, Some(0), None), text("hello ", false));
+        assert_eq!(super::claude(&screen, Some(0), None), partial("hello "));
+        assert_eq!(
+            super::claude(&screen, Some(0), Some("hello ")),
+            text("hello ", false)
+        );
         // A hidden cursor can be anywhere: it doesn't show where the draft ends.
         screen.cursor_visible = false;
         assert_eq!(super::claude(&screen, Some(0), None), partial("hello"));
+    }
+
+    #[test]
+    fn spaces_after_the_cursor_are_never_dropped_unlabelled() {
+        // `hello   `, then Home and Right five times: the cursor is after
+        // `hello`, and the three spaces after it draw as empty cells.
+        let screen = capture(&[RULE, "❯ hello   ", RULE], (1, 7), &[]);
+        assert_eq!(super::claude(&screen, Some(0), None), partial("hello"));
+        let codex = capture(
+            &[
+                "",
+                "› hello   ",
+                "",
+                "  ? for shortcuts            98% context left",
+            ],
+            (1, 7),
+            &[],
+        );
+        assert_eq!(super::codex(&codex, Some(0), None), partial("hello"));
+        // What was typed, when known, is the draft.
+        assert_eq!(
+            super::claude(&screen, Some(0), Some("hello   ")),
+            text("hello   ", false)
+        );
     }
 }

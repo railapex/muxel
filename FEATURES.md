@@ -1644,16 +1644,16 @@ feature is added or changed, update the matching entry here in the same change**
   after typing stops, off the UI thread; closing the pane, Restart and quitting
   save it at once. When muxel sees the prompt submitted in that pane, the saved
   draft goes straight away, even within that second, and the sent prompt still
-  on screen isn't saved again. What muxel saw typed into an agent's box is kept
-  as typed, spaces and line breaks included, when the screen shows that text. A
-  draft muxel can't read exactly is saved as far as it can be read and labelled
-  partial: one taller than the pane, a paste marker muxel can't tie to one
-  paste, a wrapped line whose break could be a space, a newline or a cut word,
-  spaces the screen can't show (before a line break, or how many a wrap took)
-  when what was typed isn't known, and in a shell, a grey suggestion, text after
-  the cursor or a continued line (only the text up to the cursor is kept, spaces
-  included). When the pane starts again after a crash, a restart or a relaunch,
-  it offers **Unsent prompt from HH:MM · Restore · Discard**; Restore types the
+  on screen isn't saved again until the program redraws its box, even if keys
+  are typed first. Enter after a backslash in Claude starts a new line, so it
+  isn't taken as sending. What muxel saw typed into the box is kept as typed,
+  spaces and line breaks included, when the screen shows that text. A draft
+  read from the screen alone is labelled partial, because the screen can't show
+  spaces at a row's end, after the cursor, or how many a wrap took. So is one
+  taller than the pane, a paste marker muxel can't tie to one paste, and in a
+  shell, a grey suggestion, text after the cursor or a continued line (only the
+  text up to the cursor is kept). When the pane starts again after a crash, a
+  restart or a relaunch, it offers **Unsent prompt from HH:MM · Restore · Discard**; Restore types the
   text back into the box as it was saved, line breaks included, and never
   presses Enter, and a prompt with a line break goes to the clipboard instead
   when the program would read it as Enter. A pane closed for good keeps its

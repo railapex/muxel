@@ -1912,6 +1912,17 @@ fn is_submission_input(bytes: &[u8]) -> bool {
     bytes == b"\r"
 }
 
+/// Whether `bytes`, typed into a pane running `provider`, sends what is in
+/// its input box. Claude Code turns Enter after a backslash into a new line.
+pub(crate) fn submits_turn(
+    bytes: &[u8],
+    provider: TitleProvider,
+    session: &TerminalSession,
+) -> bool {
+    is_submission_input(bytes)
+        && !(provider == TitleProvider::Claude && session.backslash_before_cursor())
+}
+
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
 /// `Settings.terminal_mouse`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3503,17 +3514,15 @@ impl TerminalView {
     }
 
     /// What the pane's saved draft should become now, as the pane goes away
-    /// (close, Restart, quit). A prompt sent with nothing typed after it
-    /// clears it, whatever the screen still shows, even once the watcher has
-    /// cleared the file; an empty box clears it; text read whole replaces it.
-    /// `None` keeps what was saved: a box muxel can't read whole, or one it
-    /// can't read at all.
+    /// (close, Restart, quit). An empty box clears it, and so does a box
+    /// still showing the prompt just sent; text read whole replaces it.
+    /// After a submission no read has seen redrawn, a box muxel can't read
+    /// (a shell running the command, a covered box) clears it too: what is
+    /// saved was sent. Otherwise `None` keeps what was saved: a box muxel
+    /// can't read whole, or one it can't read at all.
     pub fn settle_draft(&self) -> Option<crate::DraftUpdate> {
         if !crate::draft::readable(self.title_provider) {
             return None;
-        }
-        if self.session.draft_sent() {
-            return Some(crate::DraftUpdate::Clear);
         }
         match self.session.read_draft(self.title_provider) {
             muxel_core::rescue::DraftRead::Text {
@@ -3528,6 +3537,7 @@ impl TerminalView {
                 pane: None,
             })),
             muxel_core::rescue::DraftRead::Empty => Some(crate::DraftUpdate::Clear),
+            _ if self.session.draft_sent() => Some(crate::DraftUpdate::Clear),
             _ => None,
         }
     }
@@ -3987,7 +3997,7 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if is_submission_input(&bytes) {
+            if submits_turn(&bytes, self.title_provider, &self.session) {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);

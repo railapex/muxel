@@ -355,16 +355,6 @@ fn readings(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> (Vec<u8>
     (breaks, exact)
 }
 
-/// Whether the text `rows` show can hold whitespace the screen can't: spaces
-/// at the end of a row a line break follows (a row that looks empty too), or
-/// more than one space where a line wrapped. A terminal draws both as empty
-/// cells; only what was typed can settle them.
-pub fn hides_whitespace(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> bool {
-    let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
-    let (breaks, _) = readings(&rows, widths, newlines);
-    breaks.iter().any(|&can| can & (NEWLINE | SPACE) != 0)
-}
-
 /// Whether `typed` is text the box's `rows` show: the same characters on
 /// every row, and between rows and after the last only whitespace the
 /// screen can't show, at breaks whose reading the rows allow (a typed
@@ -450,6 +440,11 @@ impl TypedDraft {
     /// What was typed, when every key since the box was empty is known.
     pub fn text(&self) -> Option<&str> {
         self.text.as_deref()
+    }
+
+    /// What was typed before the cursor, when known.
+    pub fn before_cursor(&self) -> Option<&str> {
+        self.text.as_deref().map(|text| &text[..self.cursor])
     }
 
     /// `input` was written to the pane.
@@ -1068,8 +1063,8 @@ mod tests {
     use super::{
         BackupOffer, DRAFT_DEBOUNCE, DraftAction, DraftRead, DraftTracker, EditorBackup, FileStamp,
         Joined, MAX_RESCUE_BYTES, PASTE_LOG_BYTES, PASTE_LOG_ENTRIES, PasteLog, PromptDraft,
-        RowWidths, TypedDraft, backup_offer, debounce_remaining, hides_whitespace, input_newlines,
-        join_rows, merge_clipped, substitute_pastes, typed_matches,
+        RowWidths, TypedDraft, backup_offer, debounce_remaining, input_newlines, join_rows,
+        merge_clipped, substitute_pastes, typed_matches,
     };
     use std::time::Duration;
 
@@ -1546,12 +1541,6 @@ mod tests {
         assert!(typed_matches("a\n  b", &["a", "  b"], TWELVE));
         assert!(!typed_matches("a\n b", &["a", "  b"], TWELVE));
         assert!(typed_matches("hello\n", &["hello", ""], TWELVE));
-
-        assert!(hides_whitespace(&rows, TWELVE, None));
-        assert!(hides_whitespace(&wrapped, TWELVE, Some(0)));
-        assert!(!hides_whitespace(&["one row"], TWELVE, None));
-        // A row that looks empty can hold spaces before its line break.
-        assert!(hides_whitespace(&["", "after blank"], TWELVE, None));
     }
 
     #[test]

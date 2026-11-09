@@ -259,7 +259,9 @@ fn a_typed_prompt_is_saved_once_typing_stops_and_offered_when_the_pane_starts_ag
             )
         });
         assert_eq!(saved.text, "fix the flaky resize test");
-        assert!(!saved.partial);
+        // Painted, never typed through muxel: the screen alone can't show
+        // where the prompt ends.
+        assert!(saved.partial);
 
         // The pane starts again (a crash and relaunch, or Restart): its old
         // draft is offered, and the new launch can't overwrite it. This
