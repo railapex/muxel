@@ -2117,6 +2117,7 @@ mod grok_regressions {
                     session.mark_turn_submitted();
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
+                        background: None,
                         status: AgentStatus::Done,
                         attributable: true,
                         reason: TerminalStatusReason::Quiet,
