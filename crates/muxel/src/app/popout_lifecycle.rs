@@ -13,7 +13,7 @@ pub(super) fn loop_heartbeat<'a, T, P>(
     popouts: &'a HashMap<Uuid, P>,
     terminal: impl Fn(&'a P) -> Option<&'a T>,
     launching: impl Fn(Uuid, u64) -> bool,
-    cleanup: impl Fn(&T, &mut LoopRun) -> LoopCleanup,
+    cleanup: impl Fn(Uuid, &T, &mut LoopRun) -> LoopCleanup,
 ) -> Vec<Uuid> {
     let mut close = Vec::new();
     runs.retain(|iid, run| {
@@ -23,7 +23,7 @@ pub(super) fn loop_heartbeat<'a, T, P>(
         let Some(view) = terminal_view_in(*iid, docked, popouts, &terminal) else {
             return false;
         };
-        match cleanup(view, run) {
+        match cleanup(*iid, view, run) {
             LoopCleanup::Continue => true,
             LoopCleanup::Abandon => false,
             LoopCleanup::Finish => {
@@ -88,8 +88,8 @@ mod tests {
                 popouts,
                 Option::as_ref,
                 |_, _| false,
-                |view: &Rc<Cell<TerminalRuntimeSnapshot>>, run| {
-                    run.cleanup(view.get(), 1, Some(1), Duration::ZERO)
+                |_, view: &Rc<Cell<TerminalRuntimeSnapshot>>, run| {
+                    run.cleanup(view.get(), 1, Some(1), false, Duration::ZERO)
                 },
             )
         };

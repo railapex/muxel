@@ -1299,8 +1299,9 @@ impl MuxelApp {
             return;
         };
         if let Some(iid) = self.spawn_loop_agent(&fire.to_runtime_loop(), &preset, window, cx) {
-            let launch = self.loop_launch(iid, cx);
-            self.running_loops.insert(iid, loop_run_for(&fire, launch));
+            if let Some(launch) = self.loop_launch(iid, cx) {
+                self.running_loops.insert(iid, loop_run_for(&fire, launch));
+            }
             let project = self
                 .workspace
                 .project(fire.project_id)

@@ -711,7 +711,14 @@ feature is added or changed, update the matching entry here in the same change**
   copy. A loop whose agent starts through a deferred launch (Claude's launch
   check) is tracked from the moment it fires and adopts only the terminal that
   launch installs; if the launch fails or the pane is relaunched first, the run
-  ends without closing anything. Cleanup requires current attributable evidence from the launch and
+  ends without closing anything. A launch that fails at once and leaves a
+  fallback shell showing the error is not tracked either. A run finishes when
+  the pane records a completed turn after the loop's prompt (the agent's own
+  completion report, or Done after its working marker or title), so a short
+  turn closes an Exit pane at the next loop check and later scheduled runs
+  can fire. Terminals with neither (no working markers and no recognised
+  agent title, such as opencode, Amp or Pi) finish once a loop check has seen
+  them working and then idle. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which
