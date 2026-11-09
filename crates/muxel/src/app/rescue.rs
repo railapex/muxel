@@ -336,8 +336,10 @@ impl MuxelApp {
         }
     }
 
-    /// Restore: paste the newest offered draft into the pane's input box,
-    /// never with a trailing newline, and never submit it.
+    /// Restore: paste the newest offered draft into the pane's input box as
+    /// it was saved, line breaks and all, and never submit it. Where a
+    /// pasted line break would reach the program as Enter, the draft goes to
+    /// the clipboard instead.
     pub(super) fn restore_draft(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(offer) = self
             .rescue
@@ -351,7 +353,7 @@ impl MuxelApp {
         let Some(session) = self.paste_session(iid, cx) else {
             return;
         };
-        let text = offer.draft.text.trim_end_matches(['\r', '\n']);
+        let text = offer.draft.text.as_str();
         if !session.is_bracketed_paste() && text.contains(['\r', '\n']) {
             // Without bracketed paste a newline reaches the program as Enter.
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));

@@ -219,6 +219,11 @@ fn columns(text: &str) -> usize {
     text.width()
 }
 
+/// The terminal columns `text` takes.
+pub fn text_columns(text: &str) -> usize {
+    columns(text)
+}
+
 fn char_columns(ch: char) -> usize {
     ch.width().unwrap_or(0)
 }
@@ -266,6 +271,38 @@ fn first_segment(row: &str) -> &str {
 /// usually ambiguous; the screen alone can't settle it.
 pub fn join_rows(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> Joined {
     let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+    let (breaks, mut exact) = readings(&rows, widths, newlines);
+    let mut text = String::with_capacity(rows.iter().map(|row| row.len() + 1).sum());
+    for (index, row) in rows.iter().enumerate() {
+        text.push_str(row);
+        let Some(&can) = breaks.get(index) else {
+            break;
+        };
+        if can.count_ones() != 1 {
+            exact = false;
+        }
+        let next = rows[index + 1];
+        let wide = row.chars().last().is_some_and(|ch| char_columns(ch) > 1)
+            || next.chars().next().is_some_and(|ch| char_columns(ch) > 1);
+        let one_word = !row.contains(char::is_whitespace);
+        // The likeliest reading: a cut through wide text or one long word,
+        // otherwise the space of a wrap, otherwise a newline.
+        text.push_str(if can & CUT != 0 && (can == CUT || wide || one_word) {
+            ""
+        } else if can & SPACE != 0 {
+            " "
+        } else if can & CUT != 0 {
+            ""
+        } else {
+            "\n"
+        });
+    }
+    Joined { text, exact }
+}
+
+/// The readings each break between `rows` (trimmed) can have, and whether
+/// the rows fit the box and the typed newlines at all.
+fn readings(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> (Vec<u8>, bool) {
     let room = |index: usize| {
         if index == 0 {
             widths.first
@@ -315,32 +352,210 @@ pub fn join_rows(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> Joi
         }
         _ => {}
     }
-    let mut text = String::with_capacity(rows.iter().map(|row| row.len() + 1).sum());
+    (breaks, exact)
+}
+
+/// Whether the text `rows` show can hold whitespace the screen can't: spaces
+/// at the end of a row a line break follows (a row that looks empty too), or
+/// more than one space where a line wrapped. A terminal draws both as empty
+/// cells; only what was typed can settle them.
+pub fn hides_whitespace(rows: &[&str], widths: RowWidths, newlines: Option<u64>) -> bool {
+    let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+    let (breaks, _) = readings(&rows, widths, newlines);
+    breaks.iter().any(|&can| can & (NEWLINE | SPACE) != 0)
+}
+
+/// Whether `typed` is text the box's `rows` show: the same characters on
+/// every row, and between rows and after the last only whitespace the
+/// screen can't show, at breaks whose reading the rows allow (a typed
+/// newline where a line break fits, spaces where a wrap fits, nothing where
+/// a cut fits).
+pub fn typed_matches(typed: &str, rows: &[&str], widths: RowWidths) -> bool {
+    let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+    let (breaks, _) = readings(&rows, widths, None);
+    let blank = |ch: char| ch == ' ' || ch == '\t';
+    let mut at = 0;
     for (index, row) in rows.iter().enumerate() {
-        text.push_str(row);
-        let Some(&can) = breaks.get(index) else {
-            break;
+        let Some(rest) = typed[at..].strip_prefix(row) else {
+            return false;
         };
-        if can.count_ones() != 1 {
-            exact = false;
+        let run = rest.len() - rest.trim_start_matches(blank).len();
+        let after = &rest[run..];
+        let Some(next) = rows.get(index + 1) else {
+            return after.is_empty();
+        };
+        let can = breaks[index];
+        if let Some(line) = after.strip_prefix('\n') {
+            if can & NEWLINE == 0 {
+                return false;
+            }
+            at = typed.len() - line.len();
+            continue;
         }
-        let next = rows[index + 1];
-        let wide = row.chars().last().is_some_and(|ch| char_columns(ch) > 1)
-            || next.chars().next().is_some_and(|ch| char_columns(ch) > 1);
-        let one_word = !row.contains(char::is_whitespace);
-        // The likeliest reading: a cut through wide text or one long word,
-        // otherwise the space of a wrap, otherwise a newline.
-        text.push_str(if can & CUT != 0 && (can == CUT || wide || one_word) {
-            ""
-        } else if can & SPACE != 0 {
-            " "
-        } else if can & CUT != 0 {
-            ""
-        } else {
-            "\n"
-        });
+        // A wrap: the run's end is the next row's own leading blanks.
+        let lead = next.len() - next.trim_start_matches(blank).len();
+        if !rest[..run].ends_with(&next[..lead]) {
+            return false;
+        }
+        let taken = run - lead;
+        if can & (if taken == 0 { CUT } else { SPACE }) == 0 {
+            return false;
+        }
+        at = typed.len() - rest.len() + taken;
     }
-    Joined { text, exact }
+    // No rows: only blanks were typed.
+    typed[at..].chars().all(blank)
+}
+
+/// The text muxel typed into a pane's input box since the box was last seen
+/// empty, while every key it sent typed or deleted at a cursor it can
+/// follow: text, Backspace, Delete, Left and Right inside the text,
+/// Shift+Enter, and bracketed pastes. Any other key (Enter, history,
+/// completion, Home and End, a word jump, Right at the end where it can take
+/// a suggestion) makes it unknown until the box is seen empty again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedDraft {
+    text: Option<String>,
+    /// Byte offset of the cursor in `text`.
+    cursor: usize,
+}
+
+impl Default for TypedDraft {
+    /// An empty box.
+    fn default() -> Self {
+        Self {
+            text: Some(String::new()),
+            cursor: 0,
+        }
+    }
+}
+
+/// A key that edits at the cursor.
+enum EditKey {
+    Left,
+    Right,
+    Delete,
+    Newline,
+}
+
+impl TypedDraft {
+    /// Nothing is known about what the box holds.
+    pub fn unknown() -> Self {
+        Self {
+            text: None,
+            cursor: 0,
+        }
+    }
+
+    /// What was typed, when every key since the box was empty is known.
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    /// `input` was written to the pane.
+    pub fn feed(&mut self, input: &[u8]) {
+        if self.apply(input).is_none() {
+            *self = Self::unknown();
+        }
+    }
+
+    fn apply(&mut self, input: &[u8]) -> Option<()> {
+        let text = self.text.as_mut()?;
+        let mut at = 0;
+        while at < input.len() {
+            match input[at] {
+                0x1b => {
+                    let rest = &input[at..];
+                    if let Some(body) = rest.strip_prefix(b"\x1b[200~") {
+                        let end = body.windows(6).position(|w| w == b"\x1b[201~")?;
+                        let paste = std::str::from_utf8(&body[..end]).ok()?;
+                        let paste = paste.replace("\r\n", "\n").replace('\r', "\n");
+                        text.insert_str(self.cursor, &paste);
+                        self.cursor += paste.len();
+                        at += 6 + end + 6;
+                    } else {
+                        let (len, key) = edit_key(rest)?;
+                        match key {
+                            EditKey::Left => {
+                                let back = text[..self.cursor].chars().next_back();
+                                self.cursor -= back.map_or(0, char::len_utf8);
+                            }
+                            EditKey::Right => {
+                                // At the end, Right can take a suggestion.
+                                self.cursor += text[self.cursor..].chars().next()?.len_utf8();
+                            }
+                            EditKey::Delete => {
+                                if self.cursor < text.len() {
+                                    text.remove(self.cursor);
+                                }
+                            }
+                            EditKey::Newline => {
+                                text.insert(self.cursor, '\n');
+                                self.cursor += 1;
+                            }
+                        }
+                        at += len;
+                    }
+                }
+                0x7f | 0x08 => {
+                    if let Some(back) = text[..self.cursor].chars().next_back() {
+                        self.cursor -= back.len_utf8();
+                        text.remove(self.cursor);
+                    }
+                    at += 1;
+                }
+                0x00..=0x1f => return None,
+                _ => {
+                    let end = input[at..]
+                        .iter()
+                        .position(|&byte| byte < 0x20 || byte == 0x7f)
+                        .map_or(input.len(), |offset| at + offset);
+                    let typed = std::str::from_utf8(&input[at..end]).ok()?;
+                    text.insert_str(self.cursor, typed);
+                    self.cursor += typed.len();
+                    at = end;
+                }
+            }
+            if text.len() > MAX_RESCUE_BYTES {
+                return None;
+            }
+        }
+        Some(())
+    }
+}
+
+/// The editing key at the start of `input` (an escape sequence) and its
+/// length; `None` for any other.
+fn edit_key(input: &[u8]) -> Option<(usize, EditKey)> {
+    match input.get(1)? {
+        b'\r' => return Some((2, EditKey::Newline)),
+        b'O' => {
+            return match input.get(2)? {
+                b'D' => Some((3, EditKey::Left)),
+                b'C' => Some((3, EditKey::Right)),
+                _ => None,
+            };
+        }
+        b'[' => {}
+        _ => return None,
+    }
+    let body = &input[2..];
+    let params_len = body.iter().position(|byte| !(0x20..=0x3f).contains(byte))?;
+    let params = std::str::from_utf8(&body[..params_len]).ok()?;
+    let len = 2 + params_len + 1;
+    let numbers: Vec<u32> = params
+        .split(';')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    let key = match (body[params_len], numbers.as_slice()) {
+        (b'D', [0]) => EditKey::Left,
+        (b'C', [0]) => EditKey::Right,
+        (b'~', [3]) => EditKey::Delete,
+        // Shift+Enter, as the kitty and xterm keyboard protocols send it.
+        (b'u', [13, 2]) | (b'~', [27, 2, 13]) => EditKey::Newline,
+        _ => return None,
+    };
+    Some((len, key))
 }
 
 /// How many line breaks writing `input` to a pane can put in its input box:
@@ -498,10 +713,19 @@ struct PasteEntry {
 /// the read, a paste Claude kept inline, a paste from another client) leaves
 /// the new markers unbound, and an unbound marker is never replaced. Codex's
 /// markers carry no number; one is replaced only when exactly one remembered
-/// paste and one marker in the draft have its character count.
+/// paste and one marker in the draft have its character count, and no paste
+/// with that count and other text was pushed out of the log since the last
+/// submission.
 #[derive(Clone, Debug, Default)]
 pub struct PasteLog {
     entries: VecDeque<PasteEntry>,
+    /// Pastes pushed out of the log since the last submission, newest last,
+    /// at most [`PASTE_LOG_ENTRIES`] times four: still pastes a Codex marker
+    /// can stand for.
+    evicted: Vec<Evicted>,
+    /// More were pushed out than `evicted` holds: no Codex marker is
+    /// replaced until the next submission.
+    evicted_overflow: bool,
     bytes: usize,
     /// The last paste number given out.
     last_seq: u64,
@@ -510,6 +734,22 @@ pub struct PasteLog {
     /// Claude marker numbers seen in the box, each with its paste (`None`
     /// when it couldn't be told).
     claude: HashMap<u64, Option<u64>>,
+}
+
+/// A paste pushed out of the log: its counts, and a digest of its text
+/// (`None` when it was too large to keep).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Evicted {
+    chars: usize,
+    lf_chars: usize,
+    digest: Option<u64>,
+}
+
+fn digest(text: &str) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(text.as_bytes());
+    hasher.finish()
 }
 
 impl PasteLog {
@@ -535,7 +775,31 @@ impl PasteLog {
                 break;
             };
             self.bytes -= old.text.as_ref().map_or(0, String::len);
+            if self.evicted.len() >= PASTE_LOG_ENTRIES * 4 {
+                self.evicted.clear();
+                self.evicted_overflow = true;
+            }
+            if !self.evicted_overflow {
+                self.evicted.push(Evicted {
+                    chars: old.chars,
+                    lf_chars: old.lf_chars,
+                    digest: old.text.as_deref().map(digest),
+                });
+            }
         }
+    }
+
+    /// Whether a paste pushed out of the log can be what a Codex marker of
+    /// `chars` characters stands for, other than one with `text`.
+    fn evicted_other(&self, chars: usize, text: Option<&str>) -> bool {
+        if self.evicted_overflow {
+            return true;
+        }
+        let digest = text.map(digest);
+        self.evicted.iter().any(|old| {
+            (old.chars == chars || old.lf_chars == chars)
+                && (old.digest.is_none() || old.digest != digest)
+        })
     }
 
     /// A read of the box found `draft`: tie the Claude markers that are new
@@ -575,6 +839,8 @@ impl PasteLog {
     /// A submission sent the box's contents: forget its pastes and markers.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.evicted.clear();
+        self.evicted_overflow = false;
         self.bytes = 0;
         self.claude.clear();
         self.read_through = self.last_seq;
@@ -644,6 +910,11 @@ fn marker_at(s: &str) -> Option<(Marker, usize)> {
     None
 }
 
+/// Whether `text` holds a paste, image or truncation marker.
+pub fn has_paste_markers(text: &str) -> bool {
+    !markers(text).is_empty()
+}
+
 fn markers(text: &str) -> Vec<(std::ops::Range<usize>, Marker)> {
     let mut found = Vec::new();
     let mut at = 0;
@@ -694,19 +965,24 @@ pub fn substitute_pastes(draft: &str, log: &PasteLog) -> Substituted {
             partial: false,
         };
     }
-    let codex_markers = |chars: usize| {
-        found
-            .iter()
-            .filter(|(_, marker)| *marker == Marker::Codex { chars })
-            .count()
-    };
+    // Counted once: a read holds the log, which Enter and paste wait for.
+    let mut codex_markers: HashMap<usize, usize> = HashMap::new();
+    for (_, marker) in &found {
+        if let Marker::Codex { chars } = marker {
+            *codex_markers.entry(*chars).or_default() += 1;
+        }
+    }
     let paste_for = |marker: Marker| -> Option<&PasteEntry> {
         match marker {
             Marker::Claude { id, .. } => log.entry(log.claude.get(&id).copied().flatten()?),
             Marker::Codex { chars } => {
+                if codex_markers.get(&chars) != Some(&1) {
+                    return None;
+                }
                 let mut matching = log.entries.iter().filter(|entry| consistent(marker, entry));
                 let only = matching.next()?;
-                (matching.next().is_none() && codex_markers(chars) == 1).then_some(only)
+                (matching.next().is_none() && !log.evicted_other(chars, only.text.as_deref()))
+                    .then_some(only)
             }
             Marker::Opaque => None,
         }
@@ -792,8 +1068,8 @@ mod tests {
     use super::{
         BackupOffer, DRAFT_DEBOUNCE, DraftAction, DraftRead, DraftTracker, EditorBackup, FileStamp,
         Joined, MAX_RESCUE_BYTES, PASTE_LOG_BYTES, PASTE_LOG_ENTRIES, PasteLog, PromptDraft,
-        RowWidths, backup_offer, debounce_remaining, input_newlines, join_rows, merge_clipped,
-        substitute_pastes,
+        RowWidths, TypedDraft, backup_offer, debounce_remaining, hides_whitespace, input_newlines,
+        join_rows, merge_clipped, substitute_pastes, typed_matches,
     };
     use std::time::Duration;
 
@@ -1154,6 +1430,128 @@ mod tests {
         pastes.record("");
         let out = substitute_pastes(&format!("[Pasted Content {} chars]", half.len()), &pastes);
         assert_eq!(out.text, half);
+    }
+
+    #[test]
+    fn a_paste_pushed_out_of_the_log_still_makes_its_count_ambiguous() {
+        // Two pastes of one size, the second deleted from the box; more
+        // pastes push the first out of the log. The marker left in the box is
+        // the first one's, and the second must never stand in for it.
+        let first = "a".repeat(40);
+        let deleted = "b".repeat(40);
+        let mut pastes = log(&[first.as_str(), deleted.as_str()]);
+        for i in 0..PASTE_LOG_ENTRIES - 1 {
+            pastes.record(&"x".repeat(100 + i));
+        }
+        let draft = "[Pasted Content 40 chars]";
+        let out = substitute_pastes(draft, &pastes);
+        assert_eq!(out.text, draft);
+        assert!(out.partial);
+    }
+
+    #[test]
+    fn markers_sharing_a_count_are_counted_in_one_pass() {
+        // A read holds the paste log, which Enter and paste wait for. A draft
+        // merged from clipped reads can reach the size cap: 80,000 markers.
+        // Counted once per marker, that's 6.4 billion comparisons; once per
+        // read, milliseconds.
+        let pastes = log(&["c".repeat(40).as_str()]);
+        let draft = "[Pasted Content 40 chars] ".repeat(80_000);
+        assert!(draft.len() <= MAX_RESCUE_BYTES);
+        let started = std::time::Instant::now();
+        let out = substitute_pastes(&draft, &pastes);
+        let took = started.elapsed();
+        assert!(out.partial, "a count markers share stands for no one paste");
+        assert!(
+            took < Duration::from_millis(500),
+            "{took:?} for 80,000 markers"
+        );
+    }
+
+    fn typed(keys: &[&[u8]]) -> Option<String> {
+        let mut draft = TypedDraft::default();
+        for key in keys {
+            draft.feed(key);
+        }
+        draft.text().map(str::to_string)
+    }
+
+    #[test]
+    fn keys_muxel_can_follow_keep_the_typed_text() {
+        assert_eq!(
+            typed(&[b"fix ", b"teh", b"\x7f\x7f\x7f", b"the bug"]).as_deref(),
+            Some("fix the bug")
+        );
+        // Left and Right inside the text, Delete, and a key in the middle.
+        assert_eq!(
+            typed(&[b"ac", b"\x1b[D", b"b", b"\x1b[C"]).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            typed(&[b"abc", b"\x1bOD\x1bOD", b"\x1b[3~"]).as_deref(),
+            Some("ac")
+        );
+        // Shift+Enter in its encodings, and a paste with its CRLF as the box keeps it.
+        assert_eq!(
+            typed(&[
+                b"one",
+                b"\x1b\r",
+                b"two",
+                b"\x1b[13;2u",
+                b"\x1b[200~three\r\nfour  \x1b[201~"
+            ])
+            .as_deref(),
+            Some("one\ntwo\nthree\nfour  ")
+        );
+        assert_eq!(
+            typed(&["界".as_bytes(), b"\x7f", b"x"]).as_deref(),
+            Some("x")
+        );
+        // Keys whose effect muxel can't follow.
+        for key in [
+            b"\r".as_slice(),
+            b"\t",
+            b"\x1b[A",
+            b"\x1b[H",
+            b"\x1b[1;5D",
+            b"\x17",
+            b"\x1b",
+            b"\x1b[200~unfinished",
+        ] {
+            assert_eq!(typed(&[b"abc", key]), None, "{key:?}");
+        }
+        // Right at the end can take a suggestion.
+        assert_eq!(typed(&[b"abc", b"\x1b[C"]), None);
+    }
+
+    #[test]
+    fn typed_text_matches_the_rows_only_where_the_screen_could_hide_its_whitespace() {
+        let rows = ["line", "next"];
+        assert!(typed_matches("line\nnext", &rows, TWELVE));
+        assert!(typed_matches("line  \nnext ", &rows, TWELVE));
+        assert!(
+            !typed_matches("line next", &rows, TWELVE),
+            "next would have fit: no wrap"
+        );
+        assert!(!typed_matches("lines\nnext", &rows, TWELVE));
+        assert!(!typed_matches("line\nnext\n", &rows, TWELVE));
+        let wrapped = ["hello world", "again"];
+        assert!(typed_matches("hello world  again", &wrapped, TWELVE));
+        assert!(typed_matches("hello world\nagain", &wrapped, TWELVE));
+        assert!(
+            !typed_matches("hello worldagain", &wrapped, TWELVE),
+            "no cut fits there"
+        );
+        // Visible blanks must match exactly.
+        assert!(typed_matches("a\n  b", &["a", "  b"], TWELVE));
+        assert!(!typed_matches("a\n b", &["a", "  b"], TWELVE));
+        assert!(typed_matches("hello\n", &["hello", ""], TWELVE));
+
+        assert!(hides_whitespace(&rows, TWELVE, None));
+        assert!(hides_whitespace(&wrapped, TWELVE, Some(0)));
+        assert!(!hides_whitespace(&["one row"], TWELVE, None));
+        // A row that looks empty can hold spaces before its line break.
+        assert!(hides_whitespace(&["", "after blank"], TWELVE, None));
     }
 
     #[test]

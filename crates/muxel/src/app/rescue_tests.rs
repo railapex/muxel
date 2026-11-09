@@ -1075,6 +1075,81 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
 }
 
 #[test]
+fn a_sent_prompt_the_screen_still_shows_is_never_saved_again() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "sent before the redraw");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert!(dir.draft(iid).is_some());
+
+        // Enter; the watcher deletes the file before the program redraws its
+        // box, and the pane is closed.
+        session.mark_turn_submitted();
+        cx.run_until_parked();
+        assert!(dir.draft(iid).is_none(), "submission clears the draft");
+        window
+            .update(cx, |app, _, cx| {
+                app.close_instance_inner(iid, "close (test)", cx)
+            })
+            .unwrap();
+        assert!(
+            dir.closed_drafts().is_empty(),
+            "closing before the redraw doesn't keep it"
+        );
+
+        // Nor does the next read once input stops, or a Restart.
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "also sent");
+        session.mark_user_input();
+        after_debounce(cx);
+        session.mark_turn_submitted();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert!(
+            dir.draft(iid).is_none(),
+            "the next read doesn't save the sent prompt again"
+        );
+        window
+            .update(cx, |app, window, cx| app.restart_agent(iid, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dir.draft(iid).is_none());
+        assert!(dir.draft_offers(iid).is_empty());
+    });
+}
+
+#[test]
+fn restore_keeps_the_line_break_a_draft_ends_with() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        dir.save_draft(iid, &draft("one line\n")).unwrap();
+        let (child, reader) = LineReader::spawn();
+        let session = launch_child(cx, window, iid, child);
+        paint_claude(&session, "");
+        session.process_probe_output(b"\x1b[?2004l");
+        window
+            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .unwrap();
+        settle(cx);
+        assert_eq!(reader.line(), None, "nothing reached the child");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("one line\n"),
+            "the draft, line break and all, is on the clipboard"
+        );
+        session.try_write_input(b"\r").unwrap();
+        assert_eq!(
+            reader.wait_line().as_deref(),
+            Some(""),
+            "nothing was typed into the child"
+        );
+    });
+}
+
+#[test]
 fn deleting_a_workspace_open_in_another_window_leaves_it_listed() {
     with_app(|cx, window| {
         let busy = saved_workspace("busy");

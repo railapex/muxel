@@ -3503,15 +3503,16 @@ impl TerminalView {
     }
 
     /// What the pane's saved draft should become now, as the pane goes away
-    /// (close, Restart, quit). A prompt sent since the last read clears it,
-    /// whatever the screen still shows; an empty box clears it; text read
-    /// whole replaces it. `None` keeps what was saved: a box muxel can't read
-    /// whole, or one it can't read at all.
+    /// (close, Restart, quit). A prompt sent with nothing typed after it
+    /// clears it, whatever the screen still shows, even once the watcher has
+    /// cleared the file; an empty box clears it; text read whole replaces it.
+    /// `None` keeps what was saved: a box muxel can't read whole, or one it
+    /// can't read at all.
     pub fn settle_draft(&self) -> Option<crate::DraftUpdate> {
         if !crate::draft::readable(self.title_provider) {
             return None;
         }
-        if self.session.draft_submission_pending() {
+        if self.session.draft_sent() {
             return Some(crate::DraftUpdate::Clear);
         }
         match self.session.read_draft(self.title_provider) {
