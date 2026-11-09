@@ -8552,6 +8552,16 @@ impl MuxelApp {
 
         this.start_library_startup(library_config_ok, cx);
 
+        if crate::restart_handoff::still_held() {
+            this.add_event(
+                NotifKind::Error,
+                t("Restart"),
+                t(
+                    "The previous muxel still had its workspace open 30 seconds after the restart. Until it closes, opening that workspace here says it's in use.",
+                ),
+            );
+        }
+
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
         this

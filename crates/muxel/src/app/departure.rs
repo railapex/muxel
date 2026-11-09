@@ -380,7 +380,7 @@ impl MuxelApp {
         if self.departing != Some(Stage::Preparing) {
             return Ok(());
         }
-        (self.relaunch)(plan).map_err(|error| {
+        (self.relaunch)(&self.restart_plan(plan)).map_err(|error| {
             Abort::Failed(tf(
                 "The new version didn't start: {error}",
                 &[("error", error.to_string().as_str())],
@@ -389,6 +389,15 @@ impl MuxelApp {
         self.departing = Some(Stage::Committed);
         self.end_after_restart(cx);
         Ok(())
+    }
+
+    /// `plan`, telling the new version to wait until this one has released
+    /// its workspace.
+    pub(super) fn restart_plan(&self, plan: &RelaunchPlan) -> RelaunchPlan {
+        RelaunchPlan {
+            app_args: crate::restart_handoff::args_for(self.current_workspace),
+            ..plan.clone()
+        }
     }
 
     /// Quit once the new version has started. Tests record it instead: the

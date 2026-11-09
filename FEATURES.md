@@ -1828,7 +1828,8 @@ feature is added or changed, update the matching entry here in the same change**
   version and quits. If a launch is still going at 5 s, sent input isn't written
   within 2 s, the save fails or the new version doesn't start, muxel stays
   running and says why; the input it cancelled stays cancelled. It won't start
-  while a file dialog is open.
+  while a file dialog is open. The new version waits up to 30 s for the old one
+  to let go of its workspace before it opens, and says so if it still hasn't.
 - **Windows installer** — a basic per-user Inno Setup installer (`.exe`, no
   admin) with a Start Menu shortcut and an uninstaller; it installs to a
   user-writable location so the in-app auto-updater keeps working without

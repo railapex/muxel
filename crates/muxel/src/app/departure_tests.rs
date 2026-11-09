@@ -23,7 +23,7 @@ use uuid::Uuid;
 fn ready(app: &mut MuxelApp) {
     app.update_state = UpdateState::Ready(RelaunchPlan {
         program: "muxel-next".into(),
-        args: vec![],
+        ..RelaunchPlan::default()
     });
 }
 
@@ -395,6 +395,29 @@ fn a_quit_confirmed_during_a_restart_runs_when_the_restart_gives_up() {
                 app.close_departure = None;
                 app.close_departure_task = None;
                 assert!(quitting, "the Quit didn't run after the Restart gave up");
+            })
+            .unwrap();
+    });
+}
+
+/// The new version is told which workspace to wait for, and none when no
+/// workspace is open.
+#[test]
+fn a_restart_names_the_workspace_the_new_version_waits_for() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, _| {
+                let plan = RelaunchPlan {
+                    program: "muxel-next".into(),
+                    ..RelaunchPlan::default()
+                };
+                assert!(app.restart_plan(&plan).argv().is_empty());
+                let id = Uuid::new_v4();
+                // Not saved: setting it alone writes nothing.
+                app.current_workspace = Some(id);
+                let argv = app.restart_plan(&plan).argv();
+                app.current_workspace = None;
+                assert_eq!(argv, ["--after-restart".to_string(), id.to_string()]);
             })
             .unwrap();
     });

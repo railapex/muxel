@@ -106,10 +106,38 @@ pub struct UpdateInfo {
 }
 
 /// What to run after an update is staged, to start the new version.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RelaunchPlan {
     pub program: PathBuf,
+    /// The launcher's own arguments.
     pub args: Vec<String>,
+    /// Arguments for the new muxel itself, added as the Restart starts it.
+    pub app_args: Vec<String>,
+    /// What separates the app's arguments from the launcher's: macOS `open`
+    /// keeps everything before `--args` for itself.
+    pub app_args_after: Option<&'static str>,
+}
+
+impl RelaunchPlan {
+    /// Start the macOS app `bundle` as a new instance.
+    fn open_bundle(bundle: &Path) -> Self {
+        Self {
+            program: PathBuf::from("/usr/bin/open"),
+            args: vec!["-n".into(), bundle.to_string_lossy().into_owned()],
+            app_args: vec![],
+            app_args_after: Some("--args"),
+        }
+    }
+
+    /// Every argument, the launcher's first and then the app's.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = self.args.clone();
+        if !self.app_args.is_empty() {
+            argv.extend(self.app_args_after.map(str::to_string));
+            argv.extend(self.app_args.iter().cloned());
+        }
+        argv
+    }
 }
 
 /// Compare dotted numeric versions; `true` iff `latest` is strictly newer than
@@ -233,7 +261,7 @@ pub fn download_and_apply(kind: InstallKind, asset_url: &str) -> Result<Relaunch
 /// Start the freshly-installed version. The caller quits once it has.
 pub fn relaunch(plan: &RelaunchPlan) -> std::io::Result<()> {
     muxel_core::child_env::command(&plan.program)
-        .args(&plan.args)
+        .args(plan.argv())
         .spawn()
         .map(drop)
 }
@@ -252,14 +280,14 @@ fn apply_linux(url: &str, work: &Path) -> Result<RelaunchPlan> {
         overwrite_in_place(&dl, &appimage)?;
         Ok(RelaunchPlan {
             program: appimage,
-            args: vec![],
+            ..RelaunchPlan::default()
         })
     } else {
         let exe = std::env::current_exe().context("resolving current_exe")?;
         self_replace::self_replace(&dl).context("replacing the muxel binary")?;
         Ok(RelaunchPlan {
             program: exe,
-            args: vec![],
+            ..RelaunchPlan::default()
         })
     }
 }
@@ -272,7 +300,7 @@ fn apply_windows(url: &str, work: &Path) -> Result<RelaunchPlan> {
     let exe = std::env::current_exe().context("resolving current_exe")?;
     Ok(RelaunchPlan {
         program: exe,
-        args: vec![],
+        ..RelaunchPlan::default()
     })
 }
 
@@ -313,10 +341,7 @@ fn apply_macos(url: &str, work: &Path) -> Result<RelaunchPlan> {
         .arg(&bundle)
         .status();
 
-    Ok(RelaunchPlan {
-        program: PathBuf::from("/usr/bin/open"),
-        args: vec!["-n".into(), bundle.to_string_lossy().into_owned()],
-    })
+    Ok(RelaunchPlan::open_bundle(&bundle))
 }
 
 // ----------------------------------------------------------------------------
@@ -428,6 +453,32 @@ fn extract_all(zip_path: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The new version's own arguments reach it: straight after the program,
+    /// or after `--args` when macOS `open` launches the bundle.
+    #[test]
+    fn a_restart_hands_the_new_version_its_own_arguments() {
+        let app_args = vec!["--after-restart".to_string(), "id".to_string()];
+        let direct = RelaunchPlan {
+            program: "muxel".into(),
+            app_args: app_args.clone(),
+            ..RelaunchPlan::default()
+        };
+        assert_eq!(direct.argv(), app_args);
+        let mut open = RelaunchPlan::open_bundle(Path::new("/Applications/muxel.app"));
+        assert_eq!(open.argv(), ["-n", "/Applications/muxel.app"]);
+        open.app_args = app_args;
+        assert_eq!(
+            open.argv(),
+            [
+                "-n",
+                "/Applications/muxel.app",
+                "--args",
+                "--after-restart",
+                "id"
+            ]
+        );
+    }
 
     #[test]
     fn is_newer_compares_versions() {
