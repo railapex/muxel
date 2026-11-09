@@ -963,16 +963,33 @@ fn write_queued(
 /// A departure's fence on one terminal's writers; see
 /// [`TerminalSession::hold_for_departure`].
 pub struct InputFence {
-    acks: Vec<async_channel::Receiver<()>>,
+    /// The PTY writer's. A writer that stops drops it unanswered, which is
+    /// settled too: it writes on its own thread, nothing it dropped can be
+    /// written later, and each write's facts were committed as it was queued.
+    pty: async_channel::Receiver<()>,
+    tmux: Option<crate::control_input::TmuxFence>,
+}
+
+/// A departure's fence couldn't confirm its writes: a writer died with input
+/// in hand, so what it was writing may still arrive or may never have been
+/// recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceUnknown(pub String);
+
+impl std::fmt::Display for FenceUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl InputFence {
     /// Wait until every write admitted before the hold has been written or
-    /// has failed.
-    pub async fn acked(self) {
-        for ack in self.acks {
-            // A writer that stopped first drops its fence unanswered: done too.
-            let _ = ack.recv().await;
+    /// has failed, or a writer has died with writes unaccounted for.
+    pub async fn acked(self) -> Result<(), FenceUnknown> {
+        let _ = self.pty.recv().await;
+        match self.tmux {
+            Some(tmux) => tmux.answered().await,
+            None => Ok(()),
         }
     }
 }
@@ -995,8 +1012,17 @@ fn fence_pty(
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Run on the writing thread after a gated write's bytes are queued and
+    /// before its facts are committed, so a test can pause it there.
+    static PAUSE_AFTER_ENQUEUE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod input_hold_queue_tests {
     use super::{ChannelWriter, Hold, InputGate, PtyInput, fence_pty, write_queued};
+    use crate::test_wait::{joined, settle};
     use parking_lot::Mutex;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
@@ -1075,7 +1101,7 @@ mod input_hold_queue_tests {
 
         fn stop(self) -> Vec<Vec<u8>> {
             let _ = self.queue.send(PtyInput::Stop);
-            self.thread.join().unwrap();
+            joined(self.thread, "the writer thread never stopped");
             self.written.lock().clone()
         }
     }
@@ -1142,11 +1168,11 @@ mod input_hold_queue_tests {
                 .collect();
             start.wait();
             let fence = input.fence();
-            let _ = fence.recv_blocking();
+            let _ = settle(fence.recv(), "the fence never answered");
             let at_ack = input.written.lock().clone();
             let mut admitted: Vec<_> = writers
                 .into_iter()
-                .flat_map(|writer| writer.join().unwrap())
+                .flat_map(|writer| joined(writer, "a writer never stopped"))
                 .collect();
             let input = Arc::into_inner(input).expect("the writers are done");
             let written = input.stop();
@@ -1184,14 +1210,14 @@ mod input_hold_queue_tests {
         );
         let second = input.fence();
         permit.send(()).unwrap();
-        first.recv_blocking().unwrap();
+        settle(first.recv(), "the first fence never answered").unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             second.try_recv().is_err(),
             "the first fence's answer doesn't answer the second"
         );
         permit.send(()).unwrap();
-        second.recv_blocking().unwrap();
+        settle(second.recv(), "the second fence never answered").unwrap();
         assert!(!input.write(b"held"));
         assert_eq!(input.stop(), [b"first".to_vec(), b"second".to_vec()]);
     }
@@ -2571,6 +2597,12 @@ impl TerminalSession {
             self.check_input_gate()?;
             writer.write_all(data)?;
             writer.flush()?;
+            #[cfg(test)]
+            PAUSE_AFTER_ENQUEUE.with_borrow_mut(|pause| {
+                if let Some(pause) = pause.as_mut() {
+                    pause();
+                }
+            });
             if !data.is_empty() {
                 match facts {
                     InputFacts::Pointer => self.advance_input(None),
@@ -2700,6 +2732,14 @@ impl TerminalSession {
         self.pending_ops.begin()
     }
 
+    /// Interrupt this terminal's pending input for a confirmed departure, and
+    /// return how much there was. The startup automation stops at its next
+    /// stage and never resumes, even if the departure gives up; writes
+    /// already queued for tmux still go.
+    pub fn interrupt_pending_input(&self) -> usize {
+        self.pending_ops.interrupt_all()
+    }
+
     /// Run `probe` with this terminal's submission facts each time its pending
     /// input drops to none.
     #[cfg(test)]
@@ -2752,15 +2792,14 @@ impl TerminalSession {
 
     /// Stop new input for quitting or restarting, and fence the writers: the
     /// returned fence answers once every write admitted before the hold, by
-    /// PTY or through tmux, has been written or has failed. Unlike a close,
-    /// input already queued is still written. Each call makes its own fence,
-    /// so an answer that comes after its departure gave up can't answer a
-    /// later one.
+    /// PTY or through tmux, has been written or has failed, and reports a
+    /// writer that died with input unaccounted for. Unlike a close, input
+    /// already queued is still written. Each call makes its own fence, so an
+    /// answer that comes after its departure gave up can't answer a later one.
     pub fn hold_for_departure(&self) -> InputFence {
-        let pty = fence_pty(&self.writer, &self.input_gate, &self.input_queue);
-        let tmux = self.tmux_input.as_ref().and_then(|tmux| tmux.fence());
         InputFence {
-            acks: std::iter::once(pty).chain(tmux).collect(),
+            pty: fence_pty(&self.writer, &self.input_gate, &self.input_queue),
+            tmux: self.tmux_input.as_ref().map(|tmux| tmux.fence()),
         }
     }
 
@@ -6642,9 +6681,11 @@ mod windows_spawn_resolve {
 #[cfg(test)]
 mod runtime_fact_tests {
     use super::{
-        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+        CommandSpec, PAUSE_AFTER_ENQUEUE, PtyOutput, RESIZE_SETTLE, TerminalSession,
+        draft_after_input, next_input_state,
     };
     use crate::listener::SWITCH_SLACK;
+    use crate::test_wait::{joined, received, settle};
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -7110,6 +7151,52 @@ mod runtime_fact_tests {
             "the resume selector Enter must not arm the replacement conversation"
         );
         assert!(later_submitted, "a later Enter must still arm a turn");
+    }
+
+    /// A departure that finds a write queued but its facts not yet committed
+    /// waits for them before it holds input: what quitting reads after the
+    /// hold includes every write the PTY was given.
+    #[test]
+    fn a_departure_waits_for_the_facts_of_a_write_already_queued() {
+        let session = fixture();
+        let before = session.input_snapshot();
+        let (paused, at_pause) = std::sync::mpsc::channel();
+        let (permit, permits) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                PAUSE_AFTER_ENQUEUE.set(Some(Box::new(move || {
+                    let _ = paused.send(());
+                    received(&permits, "the paused write was never let through");
+                })));
+                session.try_write_submission(b"go\r", crate::Submission::Turn)
+            })
+        };
+        received(&at_pause, "the write never queued");
+        let (held, at_hold) = std::sync::mpsc::channel();
+        let departure = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let fence = session.hold_for_departure();
+                let _ = held.send((session.input_snapshot(), session.has_submitted_turn()));
+                fence
+            })
+        };
+        assert!(
+            at_hold.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the departure held input while a queued write's facts were uncommitted"
+        );
+        permit.send(()).unwrap();
+        assert_eq!(
+            received(&at_hold, "the departure never held input"),
+            ((before.0 + 1, false), true),
+            "the departure read the write without its facts"
+        );
+        assert!(joined(writer, "the write never finished").is_ok());
+        let fence = joined(departure, "the departure never fenced");
+        assert_eq!(settle(fence.acked(), "the fence never answered"), Ok(()));
+        session.release_departure();
+        session.kill();
     }
 
     fn fixture() -> std::sync::Arc<TerminalSession> {

@@ -2551,21 +2551,27 @@ struct QuietStartup {
 /// mistaken for ready. Capped by MAX_WAIT in case a UI never goes quiet: the
 /// input is still typed at the cap. No provider title or composer is required,
 /// so this works the same under tmux, for any agent and any Codex footer.
+///
+/// It stops at its next wait once the terminal has been held for closing
+/// since `input_epoch`, or a departure has set `interrupt`, which stays set
+/// even if the departure gives up.
 async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Output = ()>>(
     target: &T,
     input_epoch: u64,
+    interrupt: &crate::pending_ops::Interrupt,
     mut timer: impl FnMut(u64) -> F,
     plan: QuietStartup,
     mut event: impl FnMut(&'static str, usize),
 ) {
-    if !target.accepts_input_epoch(input_epoch) {
+    let stopped = || !target.accepts_input_epoch(input_epoch) || interrupt.is_set();
+    if stopped() {
         return;
     }
     // Wait for the agent's first output (it has started up).
     let mut waited = 0u64;
     while !target.has_output() && waited < STARTUP_MAX_WAIT_MS {
         timer(STARTUP_POLL_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
         waited += STARTUP_POLL_MS;
@@ -2575,14 +2581,14 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
         // Preset-configured fixed delay after first output — for agents that
         // keep loading well past their first draw (e.g. opencode).
         timer(plan.startup_delay_ms as u64).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     } else {
         // Auto: wait until output goes quiet (UI finished drawing).
         while waited < STARTUP_MAX_WAIT_MS && target.idle_for().as_millis() < STARTUP_SETTLE_MS {
             timer(STARTUP_POLL_MS).await;
-            if !target.accepts_input_epoch(input_epoch) {
+            if stopped() {
                 return;
             }
             waited += STARTUP_POLL_MS;
@@ -2592,7 +2598,7 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
     for _ in 0..plan.auto_mode_presses {
         target.write_input(SHIFT_TAB);
         timer(STARTUP_KEY_GAP_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     }
@@ -2600,13 +2606,13 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
     if plan.auto_mode_presses > 0 {
         target.write_input(b"\r");
         timer(STARTUP_KEY_GAP_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     }
     if let Some(input) = plan.input {
         timer(STARTUP_PRE_TYPE_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
         target.paste(&input);
@@ -2614,7 +2620,7 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
         // On restore, leave the prompt typed but unsubmitted.
         if plan.submit {
             timer(STARTUP_SUBMIT_DELAY_MS).await;
-            if !target.accepts_input_epoch(input_epoch) {
+            if stopped() {
                 return;
             }
             target.submit_prompt(b"\r");
@@ -3015,8 +3021,11 @@ impl TerminalView {
                 matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
             let armed_at = Instant::now();
             let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
+            // Counted from before the task is queued until it has stopped; a
+            // departure's interrupt stops it at its next check.
             let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
-                .with_control_turn(Some(owner));
+                .with_control_turn(Some(owner))
+                .with_pending(session.begin_pending_op());
             // Only a task that is still waiting pays for reading the title
             // through tmux, and only until its startup settles either way.
             let probe = title_source.map(|source| {
@@ -3026,10 +3035,7 @@ impl TerminalView {
                     deadline + crate::startup::ACCEPTANCE_WINDOW + Duration::from_secs(5),
                 )
             });
-            // Counted from before the task is queued until it has stopped.
-            let pending = session.begin_pending_op();
             cx.spawn(async move |view: WeakEntity<Self>, cx| {
-                let _pending = pending;
                 let probe = probe.as_ref();
                 let result: Result<(), crate::startup::Stop> = async {
                     if !known_provider {
@@ -3234,13 +3240,14 @@ impl TerminalView {
                 startup_delay_ms,
                 submit,
             };
+            // Counted from before the task is queued until it has stopped.
             let pending = session.begin_pending_op();
             cx.spawn(async move |_view: WeakEntity<Self>, cx| {
-                let _pending = pending;
                 let executor = cx.background_executor().clone();
                 quiet_startup(
                     &*session,
                     input_epoch,
+                    &pending.interrupt(),
                     |ms| executor.timer(Duration::from_millis(ms)),
                     plan,
                     |phase, bytes| {
@@ -3254,6 +3261,7 @@ impl TerminalView {
                     },
                 )
                 .await;
+                drop(pending);
             })
             .detach();
         }
@@ -4478,7 +4486,9 @@ mod startup_readiness_tests {
         ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
         startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
+    use crate::pending_ops::{Interrupt, PendingOps};
     use crate::startup::Screen;
+    use std::sync::Arc;
 
     fn codex_screen(draft: &str) -> Screen {
         Screen {
@@ -4565,6 +4575,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             0,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -4610,6 +4621,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             admitted_epoch,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 if ms == STARTUP_SUBMIT_DELAY_MS {
@@ -4638,6 +4650,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             session.input_epoch(),
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -4664,6 +4677,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             queued_epoch,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -4685,6 +4699,7 @@ mod startup_readiness_tests {
             run_now(quiet_startup(
                 &ui,
                 session.input_epoch(),
+                &Interrupt::default(),
                 |ms| {
                     clock.set(clock.get() + ms);
                     waits += 1;
@@ -4713,6 +4728,76 @@ mod startup_readiness_tests {
                 "cancellation at delay {cancel_at}",
             );
             assert!(!ui.submitted.get());
+        }
+        session.kill();
+    }
+
+    /// A departure that holds the terminal and gives up inside one of the
+    /// startup's waits leaves the input epoch where it was. Its interrupt
+    /// still stops the automation at that wait, and for good.
+    #[test]
+    fn an_interrupted_quiet_startup_stops_even_after_the_departure_gives_up() {
+        #[cfg(windows)]
+        let spec = crate::session::CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = crate::session::CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = crate::session::TerminalSession::spawn(spec, 80, 24).unwrap();
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ui = FakeUi {
+            clock: clock.clone(),
+            epoch_session: Some(session.clone()),
+            output_at: Some(0),
+            never_quiet: false,
+            writes: Default::default(),
+            submitted: Default::default(),
+        };
+        let full_sequence = [SHIFT_TAB, SHIFT_TAB, b"\r", b"review the diff", b"\r"];
+        for (interrupt_at, expected_writes) in [(1, 1), (2, 2), (3, 3), (4, 3), (5, 4)] {
+            clock.set(100_000);
+            ui.writes.borrow_mut().clear();
+            ui.submitted.set(false);
+            let ops = Arc::<PendingOps>::default();
+            let startup = ops.begin();
+            let mut waits = 0;
+            run_now(quiet_startup(
+                &ui,
+                session.input_epoch(),
+                &startup.interrupt(),
+                |ms| {
+                    clock.set(clock.get() + ms);
+                    waits += 1;
+                    if waits == interrupt_at {
+                        let _fence = session.hold_for_departure();
+                        assert_eq!(ops.interrupt_all(), 1);
+                        session.release_departure();
+                    }
+                    std::future::ready(())
+                },
+                QuietStartup {
+                    input: Some("review the diff".into()),
+                    auto_mode_presses: 2,
+                    startup_delay_ms: 0,
+                    submit: true,
+                },
+                |_, _| {},
+            ));
+            assert_eq!(
+                ui.writes
+                    .borrow()
+                    .iter()
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect::<Vec<_>>(),
+                full_sequence[..expected_writes]
+                    .iter()
+                    .map(|bytes| bytes.to_vec())
+                    .collect::<Vec<_>>(),
+                "interrupted at wait {interrupt_at}",
+            );
+            assert!(!ui.submitted.get());
+            assert!(startup.interrupted());
         }
         session.kill();
     }

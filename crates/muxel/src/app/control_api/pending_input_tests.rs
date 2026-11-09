@@ -6,7 +6,8 @@ use super::super::MuxelApp;
 use super::super::popout_lifecycle_tests::with_app;
 use super::SUBMIT_DELAY_MS;
 use gpui::{AppContext as _, Context, Window};
-use muxel_core::control::ErrorCode;
+use muxel_core::control::{self as ctl, ErrorCode};
+use muxel_core::tmux::SessionTarget;
 use muxel_core::{Instance, Project};
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView, TmuxInputRoute};
 use std::sync::{Arc, Mutex, mpsc};
@@ -146,6 +147,84 @@ fn a_send_outlives_its_requester_and_stays_pending_until_its_enter_is_recorded()
         assert!(session.has_submitted_turn());
         assert!(session.first_submission_at().is_some());
         assert_eq!(session.pending_input_ops(), 0);
+        session.kill();
+    });
+}
+
+/// A claimed send refused before it types gives its claim back, and stays
+/// pending until the claim is back: quitting can't find it settled while the
+/// claim still holds other muxels off the pane.
+#[test]
+fn a_refused_claimed_send_stays_pending_until_its_claim_is_given_back() {
+    with_app(|cx, window| {
+        let (give_back, given_back) = async_channel::bounded::<()>(1);
+        let (answer, answered) = mpsc::channel();
+        let session = window
+            .update(cx, |app, window, cx| {
+                let (pane, session) = add_shell(app, None, "pending-claim", window, cx);
+                let typing = app
+                    .control_send(pane, "first".into(), true, None, cx)
+                    .unwrap();
+                // Closed since it was admitted, so it's refused before its paste.
+                session.hold_input();
+                let claim = ctl::Claim {
+                    owner: "test".into(),
+                    host: "here".into(),
+                    at: 1,
+                    grace_ms: 0,
+                    nonce: Some(Uuid::new_v4()),
+                };
+                let site = Arc::new(super::ClaimSite {
+                    loc: crate::integrations::RepoLoc::Local(".".into()),
+                    session: SessionTarget::new("muxel_p_1", None),
+                });
+                let executor = cx.background_executor().clone();
+                let restore = move |_: ctl::Claim, _: Option<ctl::Claim>| {
+                    executor.spawn(async move {
+                        let _ = given_back.recv().await;
+                    })
+                };
+                let claimed = std::future::ready(Ok::<_, ctl::Error>((
+                    claim,
+                    None::<super::DeferredClaim>,
+                    None::<ctl::Claim>,
+                )));
+                cx.spawn(async move |this, cx| {
+                    let sent =
+                        MuxelApp::press_claimed(&this, cx, typing, site, claimed, restore).await;
+                    answer.send(sent).unwrap();
+                })
+                .detach();
+                session
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, _, _| {
+                assert_eq!(
+                    app.pending_inputs.pending().len(),
+                    1,
+                    "the send stopped pending before its claim was back"
+                );
+            })
+            .unwrap();
+        assert!(
+            answered.try_recv().is_err(),
+            "it answered before the claim was back"
+        );
+
+        give_back.try_send(()).unwrap();
+        cx.run_until_parked();
+        let error = answered
+            .try_recv()
+            .expect("the send answered")
+            .expect_err("a refused send typed");
+        assert_eq!(error.code, Some(ErrorCode::InputChanged));
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.pending_inputs.pending().is_empty())
+            })
+            .unwrap();
         session.kill();
     });
 }

@@ -82,11 +82,11 @@ impl PendingInputs {
         registry
             .live
             .push((id, PendingEntry { kind, pane }, interrupt.clone()));
-        PendingInput {
+        PendingInput(Arc::new(Registration {
             registry: self.clone(),
             id,
             interrupt,
-        }
+        }))
     }
 
     /// The operations still pending, oldest first.
@@ -111,9 +111,14 @@ impl PendingInputs {
     }
 }
 
-/// One operation's registration; dropping it ends the operation.
+/// One operation's registration. A clone is the same registration, so an
+/// operation whose work passes between tasks stays pending, with no gap,
+/// until its last clone drops.
 #[must_use = "an operation is pending only while its guard is held"]
-pub(crate) struct PendingInput {
+#[derive(Clone)]
+pub(crate) struct PendingInput(Arc<Registration>);
+
+struct Registration {
     registry: PendingInputs,
     id: u64,
     interrupt: Interrupt,
@@ -122,20 +127,20 @@ pub(crate) struct PendingInput {
 impl PendingInput {
     /// Whether a confirmed departure has interrupted this operation.
     pub(crate) fn interrupted(&self) -> bool {
-        self.interrupt.is_set()
+        self.0.interrupt.is_set()
     }
 }
 
 impl std::fmt::Debug for PendingInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingInput")
-            .field("id", &self.id)
+            .field("id", &self.0.id)
             .field("interrupted", &self.interrupted())
             .finish()
     }
 }
 
-impl Drop for PendingInput {
+impl Drop for Registration {
     fn drop(&mut self) {
         self.registry
             .registry()
@@ -176,7 +181,12 @@ mod tests {
         assert_eq!(inputs.pending().len(), 2);
         // Nothing clears a flag once it is set.
         assert!(send.interrupted());
-        drop((send, later));
+        // A clone is the same operation: listed once, pending until both go.
+        let held = send.clone();
+        drop(send);
+        assert_eq!(inputs.pending().len(), 2);
+        assert!(held.interrupted());
+        drop((held, later));
         assert!(inputs.pending().is_empty());
     }
 }

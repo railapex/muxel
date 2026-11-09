@@ -870,54 +870,26 @@ impl MuxelApp {
                 let (state, activity, force) =
                     (typing.state, typing.activity.clone(), typing.force);
                 let can_force = matches!(typing.input, Input::Prompt(_));
+                let executor = cx.background_executor().clone();
+                let claim_site = site.clone();
+                let claimed = executor.spawn(async move {
+                    if force {
+                        defer_forced_claim(&claim_site, grace_ms, lead_ms)
+                            .map(|deferred| (deferred.claim.clone(), Some(deferred), None))
+                    } else {
+                        claim_agent(&claim_site, grace_ms, lead_ms, can_force, state, &activity)
+                            .map(|start| (start.claim, None, start.previous))
+                    }
+                });
+                let restore_site = site.clone();
+                let restore = move |claim: ctl::Claim, previous: Option<ctl::Claim>| {
+                    executor.spawn(async move {
+                        restore_claim(&restore_site, &claim, previous.as_ref())
+                    })
+                };
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
-                    let claim_site = site.clone();
-                    let claimed = cx
-                        .background_executor()
-                        .spawn(async move {
-                            if force {
-                                defer_forced_claim(&claim_site, grace_ms, lead_ms)
-                                    .map(|deferred| (deferred.claim.clone(), Some(deferred), None))
-                            } else {
-                                claim_agent(
-                                    &claim_site,
-                                    grace_ms,
-                                    lead_ms,
-                                    can_force,
-                                    state,
-                                    &activity,
-                                )
-                                .map(|start| (start.claim, None, start.previous))
-                            }
-                        })
-                        .await;
-                    let result = match claimed {
-                        Ok((claim, deferred, previous)) => {
-                            let published =
-                                deferred.as_ref().map(|deferred| deferred.published.clone());
-                            let deferred = deferred.map(|deferred| (site.clone(), deferred));
-                            let pressed = this.update(cx, |app, cx| {
-                                app.control_press(*typing, Some(claim.at), deferred, cx)
-                            });
-                            let sent = match pressed {
-                                Ok(pressed) => pressed.await,
-                                Err(_) => Err("muxel is shutting down".into()),
-                            };
-                            if release_claim_after_result(&sent)
-                                && published
-                                    .as_ref()
-                                    .is_none_or(|published| published.load(Ordering::Acquire))
-                            {
-                                cx.background_executor()
-                                    .spawn(async move {
-                                        restore_claim(&site, &claim, previous.as_ref())
-                                    })
-                                    .await;
-                            }
-                            sent
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let result =
+                        Self::press_claimed(&this, cx, *typing, site, claimed, restore).await;
                     let _ = reply.send(respond(result));
                 })
                 .detach();
@@ -1620,6 +1592,43 @@ impl MuxelApp {
             app_cursor,
         };
         self.control_typing(iid, input, turn, false, reply, cx)
+    }
+
+    /// Type a claimed `typing` once `claimed` has its claim, then give the
+    /// claim back with `restore` if the typing left the turn untaken. The
+    /// typing stays pending from admission until the claim is back, refusals
+    /// included: what it holds outlives the guard [`Self::control_press`]
+    /// lets go with its last press.
+    async fn press_claimed(
+        this: &WeakEntity<Self>,
+        cx: &mut gpui::AsyncApp,
+        typing: Typing,
+        site: Arc<ClaimSite>,
+        claimed: impl std::future::Future<
+            Output = CtlResult<(ctl::Claim, Option<DeferredClaim>, Option<ctl::Claim>)>,
+        >,
+        restore: impl FnOnce(ctl::Claim, Option<ctl::Claim>) -> Task<()>,
+    ) -> CtlResult<Value> {
+        let held = typing.pending.clone();
+        let (claim, deferred, previous) = claimed.await?;
+        let published = deferred.as_ref().map(|deferred| deferred.published.clone());
+        let deferred = deferred.map(|deferred| (site, deferred));
+        let pressed = this.update(cx, |app, cx| {
+            app.control_press(typing, Some(claim.at), deferred, cx)
+        });
+        let sent = match pressed {
+            Ok(pressed) => pressed.await,
+            Err(_) => Err("muxel is shutting down".into()),
+        };
+        if release_claim_after_result(&sent)
+            && published
+                .as_ref()
+                .is_none_or(|published| published.load(Ordering::Acquire))
+        {
+            restore(claim, previous).await;
+        }
+        drop(held);
+        sent
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a

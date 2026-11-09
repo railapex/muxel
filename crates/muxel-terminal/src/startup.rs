@@ -58,6 +58,9 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    /// The automation's place in its terminal's pending input, held until it
+    /// stops; a departure's interrupt stops it.
+    pending: Option<crate::pending_ops::PendingOp>,
 }
 
 impl Guard {
@@ -68,6 +71,7 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            pending: None,
         }
     }
 
@@ -76,6 +80,11 @@ impl Guard {
         owner: Option<muxel_core::control::StartupTurnOwner>,
     ) -> Self {
         self.control_turn = owner;
+        self
+    }
+
+    pub(crate) fn with_pending(mut self, pending: crate::pending_ops::PendingOp) -> Self {
+        self.pending = Some(pending);
         self
     }
 
@@ -118,6 +127,10 @@ impl Guard {
             .as_ref()
             .is_some_and(|owner| !owner.is_pending())
             || revision != self.expected_revision
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(crate::pending_ops::PendingOp::interrupted)
         {
             Some(Stop::Interrupted)
         } else if self.deadline.is_some_and(|deadline| elapsed >= deadline) {
@@ -858,6 +871,30 @@ mod tests {
             Err(Stop::Interrupted)
         );
     }
+
+    /// A departure's interrupt stops a controlled startup at its next check,
+    /// whatever its input revision says, and its task is cancelled rather
+    /// than failed.
+    #[test]
+    fn a_departure_interrupt_stops_a_controlled_startup_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let ops = std::sync::Arc::<crate::pending_ops::PendingOps>::default();
+        let turn = StartupTurn::default();
+        let mut guard = Guard::new(0, None)
+            .with_control_turn(turn.claim())
+            .with_pending(ops.begin());
+        guard.write(ms(1), 0, || Ok(())).unwrap();
+        assert_eq!(ops.interrupt_all(), 1);
+        assert_eq!(
+            guard.write(ms(2), 1, || panic!("interrupted automation must not write")),
+            Err(Stop::Interrupted)
+        );
+        assert_eq!(guard.check(ms(3), 1), Err(Stop::Interrupted));
+        drop(guard);
+        assert_eq!(turn.state(), StartupTurnState::Cancelled);
+        assert_eq!(ops.count(), 0, "the stopped automation no longer counts");
+    }
+
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {
         let mut guard = Guard::new(0, Some(ms(30_000)));
