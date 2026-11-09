@@ -532,7 +532,8 @@ feature is added or changed, update the matching entry here in the same change**
   composer has no live child count. Panes identified later also pick up children
   already running beside them. Copied parent history and children left by an
   earlier launch do not count. Rollout catch-up stays pending until complete records
-  reach the current end, under a shared worker read budget. Codex screen checks exclude
+  reach the current end, under a shared worker read budget. Cached unrelated rollouts
+  do not let one child's backlog monopolize catch-up. Codex screen checks exclude
   the live composer draft, reconstruct wrapped badges, and keep unreadable chrome
   separate from a readable empty footer. Provider layout or wording changes can require
   new fixtures. Muse's completion hook can retire a leftover spinner

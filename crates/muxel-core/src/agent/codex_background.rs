@@ -168,8 +168,8 @@ impl CodexSubagents {
         let count = children.len();
         let start = self.next_child.checked_rem(count).unwrap_or(0);
         children.rotate_left(start);
-        let mut visited = 0;
-        for (path, child) in children {
+        let mut read_through = 0;
+        for (position, (path, child)) in children.into_iter().enumerate() {
             // Read a new file's metadata once, then follow only requested parents.
             if (child.ordinal > 0 && child.parent.is_none())
                 || child
@@ -182,7 +182,8 @@ impl CodexSubagents {
             let current = if budget.exhausted() {
                 false
             } else {
-                visited += 1;
+                // Rotation includes excluded paths, not just eligible reads.
+                read_through = position + 1;
                 child.refresh(path, budget, &requested)
             };
             if !current {
@@ -203,7 +204,7 @@ impl CodexSubagents {
                 }
             }
         }
-        self.next_child = (start + visited).checked_rem(count).unwrap_or(0);
+        self.next_child = (start + read_through).checked_rem(count).unwrap_or(0);
         result
     }
 
@@ -478,7 +479,7 @@ struct Payload {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexReadBudget, CodexSubagentSnapshot, CodexSubagents};
+    use super::{Child, CodexReadBudget, CodexSubagentSnapshot, CodexSubagents};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -596,6 +597,95 @@ mod tests {
         let current = fixture.read(&mut index, &fixture.parents());
         assert!(current.catching_up.is_empty());
         assert!(current.running.is_empty());
+    }
+
+    #[test]
+    fn background_codex_excluded_files_do_not_starve_another_parents_completion() {
+        for excluded in [1, 8, 64] {
+            let fixture = Fixture::new();
+            let launched = fixture.parents()[0].1;
+            let parents = vec![(PARENT.into(), launched), ("other-parent".into(), launched)];
+            let mut index = CodexSubagents {
+                store: Some(fixture.home.clone()),
+                watch_attempted: true,
+                ..Default::default()
+            };
+            for slot in 0..excluded + 2 {
+                let id = format!("01a1bbaa-121c-7000-8000-{slot:012x}");
+                let path = fixture
+                    .child
+                    .parent()
+                    .unwrap()
+                    .join(format!("rollout-2026-11-08T07-57-27-{id}.jsonl"));
+                index.children.insert(
+                    path,
+                    Child {
+                        id,
+                        created: fixture.now,
+                        ..Default::default()
+                    },
+                );
+            }
+            // Assign roles after insertion to fix the adverse order without
+            // assuming a HashMap seed. Existing-path discovery cannot grow it.
+            index.children.reserve(1);
+            let order: Vec<_> = index.children.keys().cloned().collect();
+            let rows: Vec<_> = ROWS.lines().collect();
+            for (position, path) in order.iter().enumerate() {
+                let parent = if position == excluded {
+                    Some(PARENT)
+                } else if position == excluded + 1 {
+                    Some("other-parent")
+                } else if position % 2 == 0 {
+                    None // Already-parsed roots are excluded.
+                } else {
+                    Some("unrequested-parent") // So are other parents' children.
+                };
+                let child = index.children.get_mut(path).unwrap();
+                let metadata = serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": child.id, "parent_thread_id": parent},
+                });
+                let mut prefix = format!("{metadata}\n");
+                if position >= excluded {
+                    prefix.push_str(rows[5]); // A previously observed own turn.
+                    prefix.push('\n');
+                }
+                for record in prefix.as_bytes().split_inclusive(|byte| *byte == b'\n') {
+                    child.record(record);
+                    child.ordinal += 1;
+                }
+                child.offset = prefix.len() as u64;
+                let tail = if position == excluded {
+                    format!(
+                        "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"{}\"}}}}\n",
+                        "x".repeat(200_000)
+                    )
+                } else if position == excluded + 1 {
+                    format!("{}\n", rows[7]) // This child has already completed.
+                } else {
+                    String::new()
+                };
+                fs::write(path, prefix + &tail).unwrap();
+            }
+            let mut refresh = || {
+                let mut budget = CodexReadBudget {
+                    remaining: 64 * 1024,
+                    deadline: std::time::Instant::now() + Duration::from_secs(5),
+                };
+                index.refresh_with_budget(&fixture.home, &parents, fixture.now, &mut budget)
+            };
+            let first = refresh();
+            assert!(first.running.contains(&parents[1]));
+            assert!(first.catching_up.contains(&parents[1]));
+            let second = refresh();
+            assert!(second.catching_up.contains(&parents[0]));
+            assert!(
+                !second.catching_up.contains(&parents[1]),
+                "{excluded} excluded files must not put the large child first again"
+            );
+            assert!(!second.running.contains(&parents[1]));
+        }
     }
 
     #[test]
