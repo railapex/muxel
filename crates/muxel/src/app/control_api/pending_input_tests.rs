@@ -24,7 +24,18 @@ fn output(stdout: &str) -> std::process::Output {
 
 /// A fake tmux whose agent pane is `%7`. Every command answers at once except
 /// `send-keys`, which waits until the test lets it through.
-fn tmux_route() -> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
+pub(in crate::app) fn tmux_route() -> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
+    fake_tmux(false)
+}
+
+/// The same fake tmux, whose input worker dies once its held `send-keys` is
+/// let through.
+pub(in crate::app) fn dying_tmux_route()
+-> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
+    fake_tmux(true)
+}
+
+fn fake_tmux(die: bool) -> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let seen = calls.clone();
     let (release, released) = mpsc::channel::<()>();
@@ -45,6 +56,7 @@ fn tmux_route() -> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
             "display-message" => output("%7\n"),
             "send-keys" => {
                 let _ = released.lock().unwrap().recv();
+                assert!(!die, "the tmux input worker died mid-job");
                 output("")
             }
             _ => output(""),
@@ -55,7 +67,7 @@ fn tmux_route() -> (TmuxInputRoute, Arc<Mutex<Vec<String>>>, mpsc::Sender<()>) {
 
 /// A cmd pane outside control may type into, its input through `tmux` when
 /// given.
-fn add_shell(
+pub(in crate::app) fn add_shell(
     app: &mut MuxelApp,
     tmux: Option<TmuxInputRoute>,
     name: &str,
@@ -81,6 +93,24 @@ fn add_shell(
     let session = view.read(cx).session().clone();
     app.terminals.insert(pane, view);
     (pane, session)
+}
+
+/// A forced ctl send into `pane`, pressed and left to run: its answer arrives
+/// on the returned channel. Refused at admission, it returns the refusal.
+pub(in crate::app) fn press_send(
+    app: &mut MuxelApp,
+    pane: Uuid,
+    text: &str,
+    cx: &mut Context<MuxelApp>,
+) -> Result<mpsc::Receiver<Result<serde_json::Value, ctl::Error>>, ctl::Error> {
+    let typing = app.control_send(pane, text.into(), true, None, cx)?;
+    let pressed = app.control_press(typing, None, None, cx);
+    let (tx, rx) = mpsc::channel();
+    cx.spawn(async move |_, _| {
+        let _ = tx.send(pressed.await);
+    })
+    .detach();
+    Ok(rx)
 }
 
 /// A send through tmux whose requester goes away before tmux takes its Enter
@@ -253,7 +283,7 @@ fn an_interrupted_send_never_presses_its_enter_and_later_input_still_works() {
         // Pasted, and waiting out the delay before its Enter.
         cx.run_until_parked();
         let interrupted = window
-            .update(cx, |app, _, _| app.pending_inputs.interrupt_all())
+            .update(cx, |app, _, _| app.pending_inputs.depart())
             .unwrap();
         assert_eq!(interrupted.len(), 1);
         cx.executor()
@@ -270,9 +300,11 @@ fn an_interrupted_send_never_presses_its_enter_and_later_input_still_works() {
             "{error:?}"
         );
         assert!(!session.has_submitted_turn());
+        // The departure gives up, so input is admitted again.
         window
             .update(cx, |app, _, _| {
-                assert!(app.pending_inputs.pending().is_empty())
+                assert!(app.pending_inputs.pending().is_empty());
+                app.pending_inputs.resume();
             })
             .unwrap();
 

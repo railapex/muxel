@@ -1688,7 +1688,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
-  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead). The quit
+  confirmation names input still being typed that quitting cancels: a ctl send
+  waiting for its Enter or keys mid-sequence (what was already typed stays),
+  dictation, an upload not yet pasted, a wake sweep.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
@@ -1819,7 +1822,13 @@ feature is added or changed, update the matching entry here in the same change**
   portable binary, the Windows `.exe`, or the macOS `.app`), then relaunches;
   package-managed installs get the right upgrade command instead. The update
   dialog shows the release's full changelog rendered as markdown, and is
-  resizable.
+  resizable. **Restart now** asks first, naming input it would cancel as Quit
+  does. Confirming stops new launches and input, lets launches already under way
+  finish, waits for input already sent, saves the workspace, starts the new
+  version and quits. If a launch is still going at 5 s, sent input isn't written
+  within 2 s, the save fails or the new version doesn't start, muxel stays
+  running and says why; the input it cancelled stays cancelled. It won't start
+  while a file dialog is open.
 - **Windows installer** — a basic per-user Inno Setup installer (`.exe`, no
   admin) with a Start Menu shortcut and an uninstaller; it installs to a
   user-writable location so the in-app auto-updater keeps working without

@@ -29,7 +29,7 @@ pub(super) use approval::PreparedCreation;
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
 #[cfg(all(test, windows))]
-mod pending_input_tests;
+pub(super) mod pending_input_tests;
 #[cfg(all(test, windows))]
 mod startup_reservation_tests;
 
@@ -343,7 +343,7 @@ const LOCAL_CLAIM_PENDING_MS: i64 = 2_000;
 
 /// Give the child a head start before its first Enter. This pause does not
 /// establish consumption; provider acceptance is checked separately below.
-const SUBMIT_DELAY_MS: u64 = 400;
+pub(super) const SUBMIT_DELAY_MS: u64 = 400;
 /// These are observation allowances, not a bound on the child's input queue.
 /// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
 /// sleeping before a pipe write cannot establish that. Retry only visible proof.
@@ -1431,7 +1431,10 @@ impl MuxelApp {
             iid,
             input_epoch: admitted.input_epoch(),
             admitted_launch: admitted.id,
-            pending: self.pending_inputs.begin(kind, Some(iid)),
+            pending: self
+                .pending_inputs
+                .begin(kind, Some(iid))
+                .map_err(|_| departing_refused())?,
             input,
             turn,
             site: self.control_claim_site(inst),
@@ -2140,6 +2143,11 @@ fn detach_typing(
             .await
             .unwrap_or_else(|_| Err("muxel is shutting down".into()))
     })
+}
+
+/// The error for typing asked for while muxel is quitting or restarting.
+fn departing_refused() -> ctl::Error {
+    ctl::Error::new(ErrorCode::Closing, "muxel is quitting or restarting")
 }
 
 /// The error for typing that quitting or restarting muxel interrupted:

@@ -7,7 +7,9 @@
 //! the task that finishes it; the guard goes when the operation's last write
 //! and bookkeeping are done. Each guard carries an [`Interrupt`]: once a
 //! confirmed departure sets it, it stays set, and the operation stops at its
-//! next stage boundary instead of starting new work.
+//! next stage boundary instead of starting new work. While a departure is
+//! under way no new operation is admitted, so none starts between the
+//! interruption and the exit.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -30,9 +32,6 @@ pub(crate) enum PendingKind {
 }
 
 /// One pending operation, as the app reports it.
-// Confirmed departure reads these (the next build step); until then only
-// the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingEntry {
     pub kind: PendingKind,
@@ -50,16 +49,20 @@ impl Interrupt {
         self.0.load(Ordering::Acquire)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set(&self) {
         self.0.store(true, Ordering::Release);
     }
 }
 
+/// A confirmed Quit or Restart is under way: no new input operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Departing;
+
 #[derive(Default)]
 struct Registry {
     next: u64,
     live: Vec<(u64, PendingEntry, Interrupt)>,
+    departing: bool,
 }
 
 /// The app's pending input operations.
@@ -74,23 +77,30 @@ impl PendingInputs {
     }
 
     /// Register an operation. Take this before scheduling anything it does.
-    pub(crate) fn begin(&self, kind: PendingKind, pane: Option<Uuid>) -> PendingInput {
+    /// Refused while a departure is under way.
+    pub(crate) fn begin(
+        &self,
+        kind: PendingKind,
+        pane: Option<Uuid>,
+    ) -> Result<PendingInput, Departing> {
         let interrupt = Interrupt::default();
         let mut registry = self.registry();
+        if registry.departing {
+            return Err(Departing);
+        }
         registry.next += 1;
         let id = registry.next;
         registry
             .live
             .push((id, PendingEntry { kind, pane }, interrupt.clone()));
-        PendingInput(Arc::new(Registration {
+        Ok(PendingInput(Arc::new(Registration {
             registry: self.clone(),
             id,
             interrupt,
-        }))
+        })))
     }
 
     /// The operations still pending, oldest first.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> Vec<PendingEntry> {
         self.registry()
             .live
@@ -99,15 +109,24 @@ impl PendingInputs {
             .collect()
     }
 
-    /// Interrupt every operation pending now, and return them. Their flags stay
-    /// set; an operation admitted later starts uninterrupted.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn interrupt_all(&self) -> Vec<PendingEntry> {
-        let registry = self.registry();
+    /// Start a confirmed departure: interrupt every operation pending now, and
+    /// admit no new one until [`Self::resume`]. Both happen under one lock, so
+    /// an operation is either interrupted here or never starts. Returns the
+    /// interrupted operations; their flags stay set even if the departure
+    /// gives up.
+    pub(crate) fn depart(&self) -> Vec<PendingEntry> {
+        let mut registry = self.registry();
+        registry.departing = true;
         for (_, _, interrupt) in &registry.live {
             interrupt.set();
         }
         registry.live.iter().map(|(_, entry, _)| *entry).collect()
+    }
+
+    /// The departure gave up: admit operations again. Those it interrupted
+    /// stay interrupted.
+    pub(crate) fn resume(&self) {
+        self.registry().departing = false;
     }
 }
 
@@ -151,17 +170,17 @@ impl Drop for Registration {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingEntry, PendingInputs, PendingKind};
+    use super::{Departing, PendingEntry, PendingInputs, PendingKind};
     use uuid::Uuid;
 
     #[test]
     fn an_interrupt_stays_set_and_reaches_only_operations_pending_then() {
         let inputs = PendingInputs::default();
         let pane = Uuid::new_v4();
-        let send = inputs.begin(PendingKind::CtlSend, Some(pane));
-        let sweep = inputs.begin(PendingKind::WakeSweep, None);
+        let send = inputs.begin(PendingKind::CtlSend, Some(pane)).unwrap();
+        let sweep = inputs.begin(PendingKind::WakeSweep, None).unwrap();
         assert_eq!(
-            inputs.interrupt_all(),
+            inputs.depart(),
             [
                 PendingEntry {
                     kind: PendingKind::CtlSend,
@@ -173,7 +192,15 @@ mod tests {
                 },
             ]
         );
-        let later = inputs.begin(PendingKind::Dictation, None);
+        // Nothing starts while the departure is under way.
+        assert_eq!(
+            inputs.begin(PendingKind::Dictation, None).unwrap_err(),
+            Departing
+        );
+        assert_eq!(inputs.pending().len(), 2);
+        // Once it gives up, a new operation starts uninterrupted.
+        inputs.resume();
+        let later = inputs.begin(PendingKind::Dictation, None).unwrap();
         assert!(send.interrupted() && sweep.interrupted());
         assert!(!later.interrupted());
 

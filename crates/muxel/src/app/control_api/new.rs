@@ -39,8 +39,8 @@ impl MuxelApp {
         if self.settings.control_allow_new == ctl::CreationPolicy::Off {
             return Err(ctl::creation_refusal(ErrorCode::CreationDisabled));
         }
-        if self.confirm_quit || self.show_quit_confirm {
-            return Err("muxel is quitting".into());
+        if self.confirm_quit || self.show_quit_confirm || self.departing.is_some() {
+            return Err("muxel is quitting or restarting".into());
         }
         if self.current_workspace.is_none()
             || self.workspace_busy.is_some()

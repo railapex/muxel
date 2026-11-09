@@ -7173,6 +7173,13 @@ mod runtime_fact_tests {
             })
         };
         received(&at_pause, "the write never queued");
+        // Paused, the write still holds the writer lock its facts commit
+        // under. A departure takes that lock to hold and fence, so it waits:
+        // this is the proof, and the timed wait below only watches for it.
+        assert!(
+            session.writer.try_lock().is_none(),
+            "the paused write let go of the writer lock before its facts"
+        );
         let (held, at_hold) = std::sync::mpsc::channel();
         let departure = {
             let session = session.clone();

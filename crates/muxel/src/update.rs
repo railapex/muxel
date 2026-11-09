@@ -230,12 +230,12 @@ pub fn download_and_apply(kind: InstallKind, asset_url: &str) -> Result<Relaunch
     result
 }
 
-/// Start the freshly-installed version and exit the current process.
-pub fn relaunch_and_exit(plan: &RelaunchPlan) -> ! {
-    let _ = muxel_core::child_env::command(&plan.program)
+/// Start the freshly-installed version. The caller quits once it has.
+pub fn relaunch(plan: &RelaunchPlan) -> std::io::Result<()> {
+    muxel_core::child_env::command(&plan.program)
         .args(&plan.args)
-        .spawn();
-    std::process::exit(0);
+        .spawn()
+        .map(drop)
 }
 
 // ----------------------------------------------------------------------------
