@@ -19,7 +19,8 @@ impl LaunchPurpose {
     /// shell) with `args`, as saved on its instance. The provider comes from the
     /// program and the purpose from its arguments, so a literal `claude` is
     /// still an interactive agent. An agent muxel doesn't know, like any other
-    /// program, counts as a command.
+    /// program, counts as a command, and so does a wrapper that starts one
+    /// (`npx`, `uvx`, `wsl`, `ssh`): the program it wraps isn't looked at.
     pub fn of(program: Option<&str>, args: &[String]) -> Self {
         let Some(name) = program_name(program) else {
             return Self::Session;
@@ -62,16 +63,24 @@ fn program_name(program: Option<&str>) -> Option<String> {
 
 #[derive(Clone, Copy)]
 enum ShellFamily {
-    /// `sh`-style: `-c` alone or in a group (`-lc`), or `--command(s)`.
-    Posix,
+    /// POSIX `sh` and the shells that keep its command line (bash, zsh, dash,
+    /// ksh): options, then `-c`'s command or a script file.
+    Sh,
+    /// fish, nu, xonsh, tcsh and csh, known by their command flag alone: `-c`
+    /// alone or in a group (`-lc`), or `--command(s)`. A script they run by
+    /// path reads as a session.
+    CommandFlag,
+    /// elvish, whose options are single-dash words (`-norc`): `-c` alone.
+    Elvish,
     PowerShell,
     Cmd,
 }
 
 fn shell_of(name: &str) -> Option<ShellFamily> {
     match name {
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "nu" | "elvish"
-        | "xonsh" => Some(ShellFamily::Posix),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => Some(ShellFamily::Sh),
+        "fish" | "nu" | "xonsh" | "tcsh" | "csh" => Some(ShellFamily::CommandFlag),
+        "elvish" => Some(ShellFamily::Elvish),
         "pwsh" | "powershell" => Some(ShellFamily::PowerShell),
         "cmd" => Some(ShellFamily::Cmd),
         _ => None,
@@ -79,47 +88,184 @@ fn shell_of(name: &str) -> Option<ShellFamily> {
 }
 
 impl ShellFamily {
-    /// Whether these arguments start the shell to run a command and exit.
-    /// PowerShell's `-NoExit` keeps it at its prompt after the command. A
-    /// POSIX shell's `-c` exits after its command even with `-i`.
+    /// Whether these arguments start the shell to run a command or a script
+    /// and exit. Each shell reads its own options only up to the command, so
+    /// a word after it (`-NoExit`, `/c`) is the command's.
     fn runs_a_command(self, args: &[String]) -> bool {
-        if matches!(self, Self::PowerShell)
-            && args
-                .iter()
-                .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-noexit" | "-noe"))
-        {
-            return false;
-        }
-        args.iter().any(|arg| match self {
-            Self::Posix => {
+        match self {
+            Self::Sh => sh_runs_a_command(args),
+            Self::CommandFlag => args.iter().any(|arg| {
                 matches!(arg.as_str(), "--command" | "--commands")
                     || arg
                         .strip_prefix('-')
                         .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
-            }
-            Self::PowerShell => matches!(
-                arg.to_ascii_lowercase().as_str(),
-                "-c" | "-command"
-                    | "-commandwithargs"
-                    | "-cwa"
-                    | "-f"
-                    | "-file"
-                    | "-e"
-                    | "-ec"
-                    | "-encodedcommand"
-            ),
-            // `/k` runs a command and stays open.
-            Self::Cmd => matches!(arg.to_ascii_lowercase().as_str(), "/c" | "/r"),
-        })
+            }),
+            Self::Elvish => args.iter().any(|arg| arg == "-c"),
+            Self::PowerShell => powershell_runs_a_command(args),
+            Self::Cmd => cmd_runs_a_command(args),
+        }
     }
+}
+
+/// POSIX `sh` (and bash): options, then the first operand, which is `-c`'s
+/// command string or else a script file. `-c` exits after its command even
+/// with `-i`; `-s` reads commands from the terminal, its operands only
+/// setting `$1`…. `-o`/`+o` (and bash's `-O`/`+O`) take an option name,
+/// and bash's `--rcfile`/`--init-file` a file.
+fn sh_runs_a_command(args: &[String]) -> bool {
+    let (mut command, mut stdin) = (false, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str();
+        if matches!(arg, "--" | "-") {
+            // The end of the options: what follows is the first operand.
+            return command || (!stdin && args.next().is_some());
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if matches!(long, "rcfile" | "init-file") {
+                args.next();
+            }
+            continue;
+        }
+        let Some(group) = arg
+            .strip_prefix(['-', '+'])
+            .filter(|group| !group.is_empty())
+        else {
+            // The first operand: `-c`'s command, a script, or `-s`'s `$1`.
+            return command || !stdin;
+        };
+        if arg.starts_with('-') {
+            command |= group.contains('c');
+            stdin |= group.contains('s');
+        }
+        for _ in group.chars().filter(|letter| matches!(letter, 'o' | 'O')) {
+            args.next();
+        }
+    }
+    command
+}
+
+/// What a PowerShell host option does to the command line.
+#[derive(Clone, Copy)]
+enum PwshSwitch {
+    /// `-NoExit`: stay at the prompt after the command.
+    NoExit,
+    /// `-Command`, `-CommandWithArgs` or `-File`: the rest of the line is
+    /// the command's, and it runs.
+    Command,
+    /// `-EncodedCommand <base64>`: runs its command.
+    Encoded,
+    /// An option that takes a value (`-ExecutionPolicy Bypass`).
+    Value,
+    /// Any other option (`-NoProfile`).
+    Flag,
+}
+
+/// PowerShell's host options as `pwsh` matches them: the name, the shortest
+/// prefix of it accepted, and any other alias.
+const PWSH_SWITCHES: &[(&str, &str, &str, PwshSwitch)] = &[
+    ("noexit", "noe", "", PwshSwitch::NoExit),
+    ("command", "c", "", PwshSwitch::Command),
+    (
+        "commandwithargs",
+        "commandwithargs",
+        "cwa",
+        PwshSwitch::Command,
+    ),
+    ("file", "f", "", PwshSwitch::Command),
+    ("encodedcommand", "e", "ec", PwshSwitch::Encoded),
+    ("encodedarguments", "encodeda", "ea", PwshSwitch::Value),
+    ("configurationname", "config", "", PwshSwitch::Value),
+    (
+        "configurationfile",
+        "configurationfile",
+        "",
+        PwshSwitch::Value,
+    ),
+    ("custompipename", "cus", "", PwshSwitch::Value),
+    ("executionpolicy", "ex", "ep", PwshSwitch::Value),
+    ("inputformat", "inp", "if", PwshSwitch::Value),
+    ("outputformat", "o", "of", PwshSwitch::Value),
+    ("settingsfile", "settings", "", PwshSwitch::Value),
+    ("windowstyle", "w", "", PwshSwitch::Value),
+    ("workingdirectory", "wo", "wd", PwshSwitch::Value),
+];
+
+/// `arg` as a PowerShell host option: `-Name`, `--Name` or `/Name`, any
+/// case, abbreviated as far as PowerShell allows. `None` for a value, like
+/// a script's path; an unknown `/word` is a path too.
+fn pwsh_switch(arg: &str) -> Option<PwshSwitch> {
+    let (name, slash) = match arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) {
+        Some(name) => (name, false),
+        None => (arg.strip_prefix('/')?, true),
+    };
+    let name = name.to_ascii_lowercase();
+    let known = PWSH_SWITCHES
+        .iter()
+        .find(|(full, shortest, alias, _)| {
+            (full.starts_with(name.as_str()) && name.starts_with(shortest))
+                || (!alias.is_empty() && name == *alias)
+        })
+        .map(|(.., switch)| *switch);
+    match known {
+        Some(switch) => Some(switch),
+        None if slash => None,
+        None => Some(PwshSwitch::Flag),
+    }
+}
+
+/// PowerShell reads host options up to `-Command`, `-CommandWithArgs`,
+/// `-File` or a bare script path (`-File` is the default parameter;
+/// Windows PowerShell's is `-Command`), and passes everything after to the
+/// command. So a `-NoExit` only counts before them.
+fn powershell_runs_a_command(args: &[String]) -> bool {
+    let (mut no_exit, mut encoded) = (false, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match pwsh_switch(arg) {
+            None | Some(PwshSwitch::Command) => return !no_exit,
+            Some(PwshSwitch::NoExit) => no_exit = true,
+            Some(PwshSwitch::Encoded) => {
+                encoded = true;
+                args.next();
+            }
+            Some(PwshSwitch::Value) => {
+                args.next();
+            }
+            Some(PwshSwitch::Flag) => {}
+        }
+    }
+    encoded && !no_exit
+}
+
+/// cmd reads its switches up to the first `/c` or `/r` (run the command and
+/// exit) or `/k` (run it and stay open); the rest is the command's.
+fn cmd_runs_a_command(args: &[String]) -> bool {
+    for arg in args {
+        match arg
+            .strip_prefix('/')
+            .and_then(|switch| switch.chars().next())
+            .map(|letter| letter.to_ascii_lowercase())
+        {
+            Some('c' | 'r') => return true,
+            Some('k') => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// How an agent is started for a single run instead of a conversation.
 enum OneShot {
     /// Any of these flags, alone or as `--flag=value`.
     Flags(&'static [&'static str]),
-    /// Any of these subcommands.
-    Subcommand(&'static [&'static str]),
+    /// One of `names` as the agent's subcommand: its first operand, once the
+    /// `values` options' values are skipped. A prompt is an operand too, so
+    /// a word after one (`codex resume <id> e`) is never the subcommand.
+    Subcommand {
+        names: &'static [&'static str],
+        values: &'static [&'static str],
+    },
     /// `ollama`: interactive only for `launch <agent>`, or `run <model>`
     /// without a prompt. Its other subcommands (`pull`, `serve`, a `run` with
     /// a prompt) are jobs.
@@ -140,7 +286,9 @@ impl OneShot {
                                 .is_some_and(|rest| rest.starts_with('=')))
                 })
             }),
-            Self::Subcommand(names) => args.iter().any(|arg| names.contains(&arg.as_str())),
+            Self::Subcommand { names, values } => {
+                first_operand(args, values).is_some_and(|operand| names.contains(&operand))
+            }
             Self::Ollama => {
                 let mut positional = args.iter().filter(|arg| !arg.starts_with('-'));
                 match positional.next().map(String::as_str) {
@@ -154,18 +302,82 @@ impl OneShot {
     }
 }
 
+/// An agent's first operand, skipping the options and the values of those
+/// in `values` (`-m o3`; `--model=o3` carries its own). `None` without one,
+/// or after `--`, which makes the rest prompt text.
+fn first_operand<'a>(args: &'a [String], values: &[&str]) -> Option<&'a str> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return Some(arg);
+        }
+        if values.contains(&arg.as_str()) {
+            args.next();
+        }
+    }
+    None
+}
+
 /// The agent providers muxel knows, the programs of its built-in agent presets
 /// ([`crate::AgentPreset::builtin_agents`]), with their one-shot forms. Claude,
-/// Codex and Grok's are from their `--help`; opencode `run`, Amp `--execute`,
-/// Pi `--print` and Ollama's `run` with a prompt from their documentation.
+/// Codex and Grok's are from their `--help` (Codex 0.167's for its options
+/// that take a value); opencode `run` and its options, Amp `--execute`, Pi
+/// `--print` and Ollama's `run` with a prompt from their documentation.
 const AGENTS: &[(&str, OneShot)] = &[
     ("claude", OneShot::Flags(&["-p", "--print"])),
-    ("codex", OneShot::Subcommand(&["exec", "e"])),
+    (
+        "codex",
+        OneShot::Subcommand {
+            names: &["exec", "e", "review"],
+            values: &[
+                "-c",
+                "--config",
+                "--enable",
+                "--disable",
+                "--remote",
+                "--remote-auth-token-env",
+                "-i",
+                "--image",
+                "-m",
+                "--model",
+                "--local-provider",
+                "-p",
+                "--profile",
+                "-s",
+                "--sandbox",
+                "-C",
+                "--cd",
+                "--add-dir",
+                "-a",
+                "--ask-for-approval",
+            ],
+        },
+    ),
     (
         "grok",
         OneShot::Flags(&["-p", "--single", "--prompt-file", "--prompt-json"]),
     ),
-    ("opencode", OneShot::Subcommand(&["run"])),
+    (
+        "opencode",
+        OneShot::Subcommand {
+            names: &["run"],
+            values: &[
+                "-m",
+                "--model",
+                "-s",
+                "--session",
+                "-p",
+                "--prompt",
+                "--agent",
+                "--port",
+                "--hostname",
+                "--log-level",
+            ],
+        },
+    ),
     ("amp", OneShot::Flags(&["-x", "--execute"])),
     ("pi", OneShot::Flags(&["-p", "--print"])),
     ("ollama", OneShot::Ollama),
@@ -221,8 +433,11 @@ mod tests {
             ("npm", &["run", "build"]),
             ("C:\\tools\\build.exe", &[]),
             ("/usr/bin/make", &["-j8"]),
-            // An agent muxel doesn't know counts as a command.
+            // An agent muxel doesn't know counts as a command, and so does a
+            // wrapper, whatever it starts.
             ("aider", &[]),
+            ("npx", &["@openai/codex"]),
+            ("wsl", &["claude"]),
         ] {
             assert_eq!(
                 purpose(Some(program), args),
@@ -304,5 +519,118 @@ mod tests {
         assert!(is_shell_program(None));
         assert!(is_shell_program(Some("C:\\Windows\\System32\\cmd.exe")));
         assert!(!is_shell_program(Some("claude")));
+    }
+
+    /// Codex's subcommand is its first operand: a prompt is one too, and an
+    /// option's value isn't. `codex resume <id> e` resumes a conversation
+    /// with the prompt `e`; `codex review` runs once (Codex 0.167 `--help`).
+    #[test]
+    fn an_agents_subcommand_is_its_first_operand() {
+        for (program, args, expected) in [
+            (
+                "codex",
+                &["resume", "0199a213-81c0-7800-8aa1-bbab2a035a53", "e"][..],
+                LaunchPurpose::Session,
+            ),
+            ("codex", &["fix the exec path"], LaunchPurpose::Session),
+            ("codex", &["--", "exec"], LaunchPurpose::Session),
+            ("codex", &["--profile", "e"], LaunchPurpose::Session),
+            ("codex", &["review", "--uncommitted"], LaunchPurpose::Job),
+            (
+                "codex",
+                &[
+                    "-m",
+                    "o3",
+                    "-c",
+                    "model_reasoning_effort=high",
+                    "exec",
+                    "fix it",
+                ],
+                LaunchPurpose::Job,
+            ),
+            (
+                "opencode",
+                &["--model", "x/y", "run", "hi"],
+                LaunchPurpose::Job,
+            ),
+            ("opencode", &["--session", "run"], LaunchPurpose::Session),
+            ("opencode", &["./run"], LaunchPurpose::Session),
+        ] {
+            assert_eq!(purpose(Some(program), args), expected, "{program} {args:?}");
+        }
+    }
+
+    /// PowerShell's options end at the command or the script, whose own
+    /// arguments follow. `pwsh -NoProfile -CommandWithArgs '...' -NoExit`
+    /// exits (probed with PowerShell 7).
+    #[test]
+    fn powershell_options_end_at_the_command() {
+        for (program, args, expected) in [
+            ("pwsh", &["build.ps1"][..], LaunchPurpose::Job),
+            (
+                "pwsh",
+                &["-NoProfile", "build.ps1", "-NoExit"],
+                LaunchPurpose::Job,
+            ),
+            (
+                "pwsh",
+                &[
+                    "-NoProfile",
+                    "-CommandWithArgs",
+                    "Write-Output $args.Count",
+                    "-NoExit",
+                ],
+                LaunchPurpose::Job,
+            ),
+            ("pwsh", &["-File", "x.ps1", "-NoExit"], LaunchPurpose::Job),
+            (
+                "pwsh",
+                &["-ExecutionPolicy", "Bypass", "-File", "x.ps1"],
+                LaunchPurpose::Job,
+            ),
+            // Windows PowerShell's default parameter is `-Command`.
+            ("powershell.exe", &["Get-Date"], LaunchPurpose::Job),
+            ("pwsh", &["-ec", "ZQB4AGkAdAA="], LaunchPurpose::Job),
+            // An option's value is not a script.
+            (
+                "pwsh",
+                &["-WorkingDirectory", "C:\\src", "-NoLogo"],
+                LaunchPurpose::Session,
+            ),
+            ("pwsh", &["-wd", "src"], LaunchPurpose::Session),
+            // `-NoExit` before the command, abbreviated or not.
+            ("pwsh", &["-noex", "build.ps1"], LaunchPurpose::Session),
+            (
+                "powershell",
+                &["/NoExit", "-ec", "ZQB4AGkAdAA="],
+                LaunchPurpose::Session,
+            ),
+            ("pwsh", &["-nop", "-noe"], LaunchPurpose::Session),
+        ] {
+            assert_eq!(purpose(Some(program), args), expected, "{program} {args:?}");
+        }
+    }
+
+    /// A POSIX shell runs a script given by path, as PowerShell does, and
+    /// each shell's options end where its command begins.
+    #[test]
+    fn a_shell_runs_a_script_and_its_options_end_at_the_command() {
+        for (program, args, expected) in [
+            ("bash", &["build.sh"][..], LaunchPurpose::Job),
+            ("sh", &["-e", "build.sh", "--fast"], LaunchPurpose::Job),
+            ("bash", &["--", "build.sh"], LaunchPurpose::Job),
+            ("bash", &["-o", "vi"], LaunchPurpose::Session),
+            ("bash", &["-O", "extglob", "-l"], LaunchPurpose::Session),
+            ("zsh", &["-s", "first"], LaunchPurpose::Session),
+            ("bash", &["--init-file", "dev.rc"], LaunchPurpose::Session),
+            // elvish's `-norc` is a word, not a group holding `c`.
+            ("elvish", &["-norc"], LaunchPurpose::Session),
+            ("elvish", &["-c", "make"], LaunchPurpose::Job),
+            // cmd's `/k` stays open; a `/c` after it is the command's.
+            ("cmd", &["/k", "echo", "/c"], LaunchPurpose::Session),
+            ("cmd", &["/d", "/s", "/c", "build.bat"], LaunchPurpose::Job),
+        ] {
+            assert_eq!(purpose(Some(program), args), expected, "{program} {args:?}");
+        }
     }
 }
