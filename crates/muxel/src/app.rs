@@ -4451,9 +4451,11 @@ struct LoopRun {
     loop_id: Uuid,
     /// The launch we spawned; reopening the pane never transfers this run.
     launch: LoopLaunch,
-    /// True once a heartbeat has seen the agent Working (so we don't close it
-    /// during the brief idle window before its prompt is typed). Only the
-    /// fallback for terminals that record no completions of their own.
+    /// True once the agent was seen Working after the run's first submission,
+    /// in the conversation that submission went to (so we don't close it
+    /// during the brief idle window before its prompt is typed, or on a Done
+    /// left from startup). The status tick checks each second
+    /// ([`Self::observe`]) and each heartbeat checks too.
     seen_working: bool,
     /// When the run was spawned (for the max-runtime safety cap).
     started: std::time::Instant,
@@ -4487,19 +4489,29 @@ impl LoopRun {
         launch_current && elapsed < MAX_LOOP_RUNTIME
     }
 
-    /// `completed`: the pane recorded a finished turn at or after the run's
-    /// first submission (see [`turn_completed_since`]). The status tick writes
-    /// that record each second, from the provider's own completion report or
-    /// the terminal's Done latch, so a turn that starts and ends between two
-    /// loop heartbeats still finishes the run. A heartbeat that sampled Working is
-    /// the fallback for terminals with neither (no working markers and no
-    /// provider title or status reports).
+    /// The status tick's sample of this run's pane. Working counts only in the
+    /// run's own launch, after its first submission and in the conversation
+    /// that submission went to, so it is the run's turn underway. Sampling
+    /// each second means a turn that starts and ends between two loop
+    /// heartbeats still finishes the run; one shorter than a second may not,
+    /// and then waits for the runtime cap.
+    fn observe(
+        &mut self,
+        runtime: muxel_terminal::TerminalRuntimeSnapshot,
+        current_binding_rev: u64,
+        first_submission_binding: Option<u64>,
+    ) {
+        self.seen_working |= runtime.status == AgentStatus::Working
+            && self.launch == LoopLaunch::Installed(runtime.launch_id)
+            && first_submission_binding == Some(current_binding_rev)
+            && runtime.is_attributable_to(current_binding_rev);
+    }
+
     fn cleanup(
         &mut self,
         runtime: muxel_terminal::TerminalRuntimeSnapshot,
         current_binding_rev: u64,
         first_submission_binding: Option<u64>,
-        completed: bool,
         elapsed: Duration,
     ) -> LoopCleanup {
         if self.launch != LoopLaunch::Installed(runtime.launch_id) {
@@ -4529,23 +4541,12 @@ impl LoopRun {
         self.seen_working |= runtime.status == AgentStatus::Working;
         // Never while it is working again or waiting on someone.
         let settled = matches!(runtime.status, AgentStatus::Idle | AgentStatus::Done);
-        if (settled && (completed || self.seen_working)) || elapsed >= MAX_LOOP_RUNTIME {
+        if (settled && self.seen_working) || elapsed >= MAX_LOOP_RUNTIME {
             LoopCleanup::Finish
         } else {
             LoopCleanup::Continue
         }
     }
-}
-
-/// Whether a pane recorded a finished turn at or after its first submission:
-/// `completed_at` is its durable activity's completion (wall-clock
-/// milliseconds), `submitted` the session's first submission. A completion
-/// recorded before the submission belongs to no turn of this run.
-fn turn_completed_since(completed_at: Option<i64>, submitted: Option<SystemTime>) -> bool {
-    let Some(submitted) = submitted.and_then(|at| at.duration_since(UNIX_EPOCH).ok()) else {
-        return false;
-    };
-    completed_at.is_some_and(|at| i128::from(at) >= submitted.as_millis() as i128)
 }
 
 /// Current wall-clock time in unix seconds (local clock; never negative here).
@@ -4578,7 +4579,6 @@ mod loop_cleanup_tests {
     use super::{
         AgentStatus, LoopCleanup, LoopLaunch, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, SeenStatus,
         StatusBinding, StatusSample, apply_status_sample, launch_binding, loop_heartbeat,
-        turn_completed_since,
     };
     use muxel_core::{AgentPreset, Instance};
     use muxel_terminal::{
@@ -4670,13 +4670,12 @@ mod loop_cleanup_tests {
             &popouts,
             |_| None,
             |_, _| false,
-            |_, session, run| {
+            |session, run| {
                 let rev = session.binding_revision();
                 run.cleanup(
                     snapshot(session.id, rev, status),
                     rev,
                     session.first_submission_binding(),
-                    false,
                     Duration::ZERO,
                 )
             },
@@ -4698,7 +4697,7 @@ mod loop_cleanup_tests {
                 &popouts,
                 |_| None,
                 |iid, token| iid == pane && token == pending_token,
-                |_, _: &(), _| unreachable!("a run still launching has no terminal to judge"),
+                |_: &(), _| unreachable!("a run still launching has no terminal to judge"),
             )
         };
         // No terminal yet, but its launch is still the pane's pending one.
@@ -4718,34 +4717,53 @@ mod loop_cleanup_tests {
     }
 
     #[test]
-    fn a_turn_completed_after_the_runs_submission_finishes_it_unsampled() {
+    fn only_working_after_the_runs_own_submission_is_its_turn() {
         let launch = Uuid::new_v4();
         let at = |status| snapshot(launch, 1, status);
-        // No heartbeat saw it Working: the whole turn ran between two.
-        assert_eq!(
-            run(launch).cleanup(at(AgentStatus::Idle), 1, Some(1), false, Duration::ZERO),
-            LoopCleanup::Continue,
-            "startup idle is still not a finished turn"
-        );
+        let observed = |snapshot, binding, submitted| {
+            let mut run = run(launch);
+            run.observe(snapshot, binding, submitted);
+            run.seen_working
+        };
+        assert!(observed(at(AgentStatus::Working), 1, Some(1)));
+        // Before the submission, in another launch or conversation, or while
+        // not attributable: not this run's turn.
+        assert!(!observed(at(AgentStatus::Working), 1, None));
+        assert!(!observed(
+            snapshot(Uuid::new_v4(), 1, AgentStatus::Working),
+            1,
+            Some(1)
+        ));
+        assert!(!observed(
+            snapshot(launch, 2, AgentStatus::Working),
+            2,
+            Some(1)
+        ));
+        let mut uncertain = at(AgentStatus::Working);
+        uncertain.attributable = false;
+        assert!(!observed(uncertain, 1, Some(1)));
+        // Done or Idle left from startup is no turn at all.
         for status in [AgentStatus::Idle, AgentStatus::Done] {
+            assert!(!observed(at(status), 1, Some(1)));
             assert_eq!(
-                run(launch).cleanup(at(status), 1, Some(1), true, Duration::ZERO),
-                LoopCleanup::Finish
+                run(launch).cleanup(at(status), 1, Some(1), Duration::ZERO),
+                LoopCleanup::Continue
             );
         }
+        // Once the status tick saw the turn, the next heartbeat at Idle or
+        // Done finishes it; Working or Blocked again keeps it.
+        let mut seen = run(launch);
+        seen.observe(at(AgentStatus::Working), 1, Some(1));
         for status in [AgentStatus::Working, AgentStatus::Blocked] {
             assert_eq!(
-                run(launch).cleanup(at(status), 1, Some(1), true, Duration::ZERO),
-                LoopCleanup::Continue,
-                "a pane working or waiting on someone again stays open"
+                seen.cleanup(at(status), 1, Some(1), Duration::ZERO),
+                LoopCleanup::Continue
             );
         }
-        // Only a completion recorded at or after the first submission counts.
-        let sent = SystemTime::UNIX_EPOCH + Duration::from_millis(5_000);
-        assert!(!turn_completed_since(Some(4_999), Some(sent)));
-        assert!(turn_completed_since(Some(5_000), Some(sent)));
-        assert!(!turn_completed_since(None, Some(sent)));
-        assert!(!turn_completed_since(Some(9_000), None));
+        assert_eq!(
+            seen.cleanup(at(AgentStatus::Done), 1, Some(1), Duration::ZERO),
+            LoopCleanup::Finish
+        );
     }
 
     #[test]
@@ -4949,7 +4967,6 @@ mod loop_cleanup_tests {
                 working,
                 a,
                 session.first_submission_binding(),
-                false,
                 Duration::ZERO
             ),
             LoopCleanup::Continue
@@ -4972,13 +4989,7 @@ mod loop_cleanup_tests {
         let b = session.binding_revision();
         assert_ne!(a, b);
         assert_eq!(
-            run.cleanup(
-                done,
-                b,
-                session.first_submission_binding(),
-                true,
-                Duration::ZERO
-            ),
+            run.cleanup(done, b, session.first_submission_binding(), Duration::ZERO),
             LoopCleanup::Abandon
         );
         let uncertain = TerminalRuntimeSnapshot {
@@ -5001,7 +5012,6 @@ mod loop_cleanup_tests {
                     runtime,
                     b,
                     session.first_submission_binding(),
-                    true,
                     MAX_LOOP_RUNTIME
                 ),
                 LoopCleanup::Abandon,
@@ -5033,7 +5043,6 @@ mod loop_cleanup_tests {
                 uncertain,
                 rev,
                 session.first_submission_binding(),
-                true,
                 MAX_LOOP_RUNTIME - Duration::from_secs(1)
             ),
             LoopCleanup::Continue
@@ -5043,7 +5052,6 @@ mod loop_cleanup_tests {
                 uncertain,
                 rev,
                 session.first_submission_binding(),
-                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon,
@@ -5079,7 +5087,6 @@ mod loop_cleanup_tests {
                         snapshot(session.id, rev, status),
                         rev,
                         session.first_submission_binding(),
-                        true,
                         elapsed
                     ),
                     if elapsed >= MAX_LOOP_RUNTIME {
@@ -5102,7 +5109,6 @@ mod loop_cleanup_tests {
                 snapshot(session.id, replaced, AgentStatus::Done),
                 replaced,
                 session.first_submission_binding(),
-                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon
@@ -5120,25 +5126,25 @@ mod loop_cleanup_tests {
             ..working
         };
         assert_eq!(
-            run.cleanup(uncertain, 1, Some(1), true, Duration::ZERO),
+            run.cleanup(uncertain, 1, Some(1), Duration::ZERO),
             LoopCleanup::Continue
         );
         assert_eq!(
-            run.cleanup(uncertain, 1, Some(1), true, MAX_LOOP_RUNTIME),
+            run.cleanup(uncertain, 1, Some(1), MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert!(!run.seen_working);
         assert_eq!(
-            run.cleanup(working, 2, Some(2), true, MAX_LOOP_RUNTIME),
+            run.cleanup(working, 2, Some(2), MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert!(!run.seen_working, "a stale snapshot cannot seed Working");
         assert_eq!(
-            run.cleanup(working, 1, None, true, Duration::ZERO),
+            run.cleanup(working, 1, None, Duration::ZERO),
             LoopCleanup::Continue
         );
         assert_eq!(
-            run.cleanup(working, 1, None, true, MAX_LOOP_RUNTIME),
+            run.cleanup(working, 1, None, MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert_eq!(
@@ -5146,14 +5152,13 @@ mod loop_cleanup_tests {
                 snapshot(launch, 1, AgentStatus::Idle),
                 1,
                 Some(1),
-                false,
                 Duration::ZERO
             ),
             LoopCleanup::Continue,
             "startup idle is not a completed turn"
         );
         assert_eq!(
-            run.cleanup(working, 1, Some(1), false, Duration::ZERO),
+            run.cleanup(working, 1, Some(1), Duration::ZERO),
             LoopCleanup::Continue
         );
         assert!(run.seen_working);
@@ -5162,13 +5167,12 @@ mod loop_cleanup_tests {
                 snapshot(launch, 1, AgentStatus::Done),
                 1,
                 Some(1),
-                false,
                 Duration::ZERO
             ),
             LoopCleanup::Finish
         );
         assert_eq!(
-            run.cleanup(working, 1, Some(1), false, MAX_LOOP_RUNTIME),
+            run.cleanup(working, 1, Some(1), MAX_LOOP_RUNTIME),
             LoopCleanup::Finish
         );
         assert_eq!(
@@ -5176,7 +5180,6 @@ mod loop_cleanup_tests {
                 snapshot(Uuid::new_v4(), 1, AgentStatus::Done),
                 1,
                 Some(1),
-                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon
@@ -10202,15 +10205,17 @@ impl MuxelApp {
             return;
         }
         self.terminal_launching.remove(&instance_id);
-        // A launch that failed still installs a view, to show its error.
-        let launched = matches!(&result, Ok(launch) if launch.launch_error().is_none());
+        // A launch that failed to start its program still installs a fallback
+        // view showing the error; an Err installs nothing.
+        let launched = result.is_ok();
         self.install_terminal_spawn(meta, result, window, cx);
         self.settle_loop_launch(instance_id, token, launched, cx);
     }
 
     /// The deferred launch holding `token` has finished in pane `iid`. A loop
-    /// run waiting on exactly that launch adopts the terminal it installed, or
-    /// ends if it failed. No other terminal ever becomes the run's.
+    /// run waiting on exactly that launch adopts the terminal it installed
+    /// (a fallback shell included), or ends if it installed none. No other
+    /// terminal ever becomes the run's.
     fn settle_loop_launch(&mut self, iid: Uuid, token: u64, launched: bool, cx: &App) {
         if self.running_loops.get(&iid).map(|run| run.launch) != Some(LoopLaunch::Deferred(token)) {
             return;
@@ -14164,6 +14169,7 @@ impl MuxelApp {
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.expire_closes(Instant::now(), cx);
+        self.observe_running_loops(cx);
         // Remember the grid each pane settled at, so a restart respawns its program
         // already at the right size instead of resizing it after its first paint —
         // which a re-attached tmux session shows as visibly wrong spacing until the
@@ -15135,29 +15141,19 @@ impl MuxelApp {
             .filter_map(|iid| self.running_loops.remove(iid).map(|run| (*iid, run)))
             .collect();
         let launching = &self.terminal_launching;
-        let workspace = &self.workspace;
         let close = loop_heartbeat(
             &mut self.running_loops,
             &self.terminals,
             &self.popouts,
             PopOut::terminal_view,
             |iid, token| launch_token_current(launching, iid, token),
-            |iid, view, run| {
+            |view, run| {
                 let view = view.read(cx);
                 let session = view.session();
-                // The status tick records completions as they happen, so a
-                // turn that ends between heartbeats is still seen.
-                let completed = turn_completed_since(
-                    workspace
-                        .instance(iid)
-                        .and_then(|instance| instance.activity.completed_at),
-                    session.first_submission_at(),
-                );
                 run.cleanup(
                     view.runtime_snapshot(),
                     session.binding_revision(),
                     session.first_submission_binding(),
-                    completed,
                     run.started.elapsed(),
                 )
             },
@@ -15168,17 +15164,34 @@ impl MuxelApp {
         }
     }
 
+    /// Latch each loop run's Working from the status tick
+    /// ([`LoopRun::observe`]).
+    fn observe_running_loops(&mut self, cx: &App) {
+        for (iid, run) in &mut self.running_loops {
+            let Some(view) =
+                terminal_view_in(*iid, &self.terminals, &self.popouts, PopOut::terminal_view)
+            else {
+                continue;
+            };
+            let view = view.read(cx);
+            let session = view.session();
+            run.observe(
+                view.runtime_snapshot(),
+                session.binding_revision(),
+                session.first_submission_binding(),
+            );
+        }
+    }
+
     /// The launch a loop run just started in pane `iid` owns: its installed
     /// terminal, or the deferred launch still creating it (Claude's launch
-    /// preflight defers the spawn). `None` when it owns neither: the spawn was
-    /// refused, waits on the user, or failed and left a fallback shell showing
-    /// the error. Such a run isn't tracked, so it never holds the loop.
+    /// preflight defers the spawn). An installed terminal includes a fallback
+    /// shell showing a launch error, which holds the loop until the cap as
+    /// before, so a missing program can't open a pane at every fire. `None`
+    /// when it owns neither: the spawn was refused or waits on the user.
     fn loop_launch(&self, iid: Uuid, cx: &App) -> Option<LoopLaunch> {
         if let Some(view) = self.terminal_view(iid) {
-            let view = view.read(cx);
-            view.launch_error()
-                .is_none()
-                .then(|| LoopLaunch::Installed(view.session().id))
+            Some(LoopLaunch::Installed(view.read(cx).session().id))
         } else {
             self.terminal_launching
                 .get(&iid)

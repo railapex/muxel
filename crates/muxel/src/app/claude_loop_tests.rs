@@ -23,7 +23,8 @@ impl Drop for Kill {
 }
 
 /// A project with an Exit-policy loop on `preset`; returns the project and
-/// the loop's index. Heartbeats run only when a test calls them.
+/// the loop's index. Loop heartbeats and status ticks run only when a test
+/// calls them.
 fn exit_loop(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
@@ -32,6 +33,7 @@ fn exit_loop(
     window
         .update(cx, |app, _, _| {
             app._loop_timer = Task::ready(());
+            app._status_timer = Task::ready(());
             app.notifications_enabled = false;
             let cwd = muxel_store::data_dir().unwrap().join("loop-project");
             std::fs::create_dir_all(&cwd).unwrap();
@@ -139,6 +141,17 @@ fn run_turn(
     between_working_and_idle: impl FnOnce(&mut TestAppContext),
 ) {
     session.mark_turn_submitted();
+    work(cx, window, pane, session, between_working_and_idle);
+}
+
+/// Claude's working marker on the stand-in's screen, then scrolled away.
+fn work(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+    session: &TerminalSession,
+    between_working_and_idle: impl FnOnce(&mut TestAppContext),
+) {
     session.write_input(b"esc to interrupt\r");
     wait_for(cx, window, "the pane to work", |app, cx| {
         (app.terminals[&pane].read(cx).status() == AgentStatus::Working).then_some(())
@@ -157,6 +170,42 @@ fn run_turn(
 fn heartbeat(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
     window
         .update(cx, |app, _, cx| app.process_running_loops(cx))
+        .unwrap();
+}
+
+/// The app's once-a-second status tick.
+fn status_tick(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    window
+        .update(cx, |app, window, cx| app.tick(window, cx))
+        .unwrap();
+}
+
+fn status(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, pane: Uuid) -> AgentStatus {
+    window
+        .update(cx, |app, _, cx| app.terminals[&pane].read(cx).status())
+        .unwrap()
+}
+
+fn panes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, pid: Uuid) -> usize {
+    window
+        .update(cx, |app, _, _| {
+            app.workspace
+                .instances
+                .iter()
+                .filter(|i| i.project_id == pid)
+                .count()
+        })
+        .unwrap()
+}
+
+/// Make loop `idx` due again and run the loop tick: its heartbeat, then the
+/// fire.
+fn next_due_tick(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, idx: usize) {
+    window
+        .update(cx, |app, window, cx| {
+            app.loops[idx].last_run = Some(1);
+            app.tick_loops(window, cx);
+        })
         .unwrap();
 }
 
@@ -228,12 +277,8 @@ fn a_turn_between_two_heartbeats_closes_its_exit_pane_and_frees_the_next_fire() 
         assert!(tracked(cx, window, pane));
 
         // The whole turn runs before the next heartbeat, which never sees it
-        // Working. The app's status tick runs in between, as it does every
-        // second.
-        run_turn(cx, window, pane, &session, |_| {});
-        window
-            .update(cx, |app, window, cx| app.tick(window, cx))
-            .unwrap();
+        // Working. The app's status tick, which runs every second, does.
+        run_turn(cx, window, pane, &session, |cx| status_tick(cx, window));
 
         // The next loop tick: its heartbeat, then whatever loop is due.
         window
@@ -260,7 +305,33 @@ fn a_turn_between_two_heartbeats_closes_its_exit_pane_and_frees_the_next_fire() 
 }
 
 #[test]
-fn a_loop_whose_launch_fails_at_once_does_not_hold_the_loop() {
+fn a_startup_done_seen_after_the_submission_does_not_finish_the_run() {
+    with_app(|cx, window| {
+        let (pid, idx, _home) = claude_loop(cx, window);
+        let pane = fire(cx, window, pid, idx, "cmd.exe", &["/d", "/q", "/c", "more"]);
+        let session = installed(cx, window, pane);
+        let _kill = Kill(session.clone());
+        heartbeat(cx, window);
+
+        // Startup works and settles to Done before the loop's prompt goes in,
+        // and no status tick runs until after the submission.
+        work(cx, window, pane, &session, |_| {});
+        wait_for(cx, window, "a startup Done", |app, cx| {
+            (app.terminals[&pane].read(cx).status() == AgentStatus::Done).then_some(())
+        });
+        session.mark_turn_submitted();
+        status_tick(cx, window);
+        assert_eq!(status(cx, window, pane), AgentStatus::Done);
+        heartbeat(cx, window);
+        assert!(
+            tracked(cx, window, pane),
+            "a Done from before the loop's turn finished its run"
+        );
+    });
+}
+
+#[test]
+fn a_failed_launchs_fallback_shell_holds_the_loop_until_the_cap() {
     with_app(|cx, window| {
         // No preflight: the launch runs at once, fails, and a fallback shell
         // shows the error in the pane.
@@ -292,14 +363,23 @@ fn a_loop_whose_launch_fails_at_once_does_not_hold_the_loop() {
             .unwrap();
         heartbeat(cx, window);
         assert!(
-            !tracked(cx, window, pane),
-            "a failed launch's fallback shell holds the loop"
+            tracked(cx, window, pane),
+            "a failed launch's fallback shell doesn't hold the loop"
+        );
+        // A missing program can't open a pane at every fire.
+        next_due_tick(cx, window, idx);
+        assert_eq!(
+            panes(cx, window, pid),
+            1,
+            "the next fire opened another pane"
         );
     });
 }
 
+/// A superseded launch ends the run. A failed one installs a fallback shell,
+/// which the run adopts and holds until the cap, as an immediate launch's.
 #[test]
-fn a_claude_loop_run_never_adopts_a_terminal_its_own_launch_did_not_install() {
+fn a_claude_loop_run_adopts_only_what_its_own_launch_installs() {
     for case in ["superseded", "failed"] {
         with_app(|cx, window| {
             let (pid, idx, _home) = claude_loop(cx, window);
@@ -326,9 +406,11 @@ fn a_claude_loop_run_never_adopts_a_terminal_its_own_launch_did_not_install() {
                 })
                 .unwrap();
             heartbeat(cx, window);
-            assert!(
-                !tracked(cx, window, pane),
-                "{case}: the run outlived its launch or took another one's terminal"
+            assert_eq!(
+                tracked(cx, window, pane),
+                case == "failed",
+                "{case}: the run outlived its launch, took another one's terminal, \
+                 or dropped its fallback shell"
             );
         });
     }

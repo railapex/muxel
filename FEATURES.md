@@ -710,15 +710,14 @@ feature is added or changed, update the matching entry here in the same change**
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy. A loop whose agent starts through a deferred launch (Claude's launch
   check) is tracked from the moment it fires and adopts only the terminal that
-  launch installs; if the launch fails or the pane is relaunched first, the run
-  ends without closing anything. A launch that fails at once and leaves a
-  fallback shell showing the error is not tracked either. A run finishes when
-  the pane records a completed turn after the loop's prompt (the agent's own
-  completion report, or Done after its working marker or title), so a short
-  turn closes an Exit pane at the next loop check and later scheduled runs
-  can fire. Terminals with neither (no working markers and no recognised
-  agent title, such as opencode, Amp or Pi) finish once a loop check has seen
-  them working and then idle. Cleanup requires current attributable evidence from the launch and
+  launch installs; if the pane is relaunched first or the launch starts
+  nothing, the run ends without closing anything. A launch that fails and
+  leaves a fallback shell showing the error holds the loop until the runtime
+  cap, so a missing program can't open a pane at every fire. A run finishes
+  once the agent has been seen working after the loop's prompt (checked every
+  second) and is idle again, so a short turn closes an Exit pane at the next
+  loop check and later scheduled runs can fire; a turn shorter than about a
+  second can go unseen and then waits for the cap. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which
