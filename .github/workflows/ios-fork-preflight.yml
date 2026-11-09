@@ -1,0 +1,41 @@
+name: ios-fork-preflight
+
+# Fork-only: compiles and tests the Swift companion before a PR goes upstream.
+# Upstream CI builds only the cargo workspace.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Fork pull request number whose merge ref to build
+        required: true
+
+run-name: ios preflight ${{ inputs.pr && format('PR {0}', inputs.pr) || github.ref_name }}
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+      - run: git log -1 --format='%H %s' && git log -1 --format='%H' HEAD^2 2>/dev/null || true
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Pick an iPhone simulator
+        id: sim
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")))')
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+      - name: Build and test
+        run: |
+          xcodebuild test -project Muxel.xcodeproj -scheme Muxel \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tail -300

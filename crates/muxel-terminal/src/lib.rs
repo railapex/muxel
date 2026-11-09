@@ -14,6 +14,7 @@ mod element;
 mod keymap;
 mod links;
 mod listener;
+mod pane_job;
 mod present_flag;
 #[cfg(windows)]
 mod process_tree;
@@ -32,6 +33,7 @@ pub use control_input::{
     ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner,
 };
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
+pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};
 #[cfg(windows)]
 pub use process_tree::process_parent_map;
@@ -43,7 +45,7 @@ pub use session::{
     literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
-    AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
+    AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
