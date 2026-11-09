@@ -34,8 +34,8 @@ feature is added or changed, update the matching entry here in the same change**
   new size. A launch waits for its pane's next layout, bounded at 250 ms. A tab
   opened into a project that isn't on screen starts at the size its pane last
   had. A loop's new pane, a new split in a project that isn't on screen, and a
-  pane behind a maximized one start at their best earlier guess and resize once
-  they're drawn.
+  pane behind a maximized one can start at their best earlier guess and resize
+  once they're drawn.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
   unusable (keeps a sane terminal width).
 - **Scrollable pane area** — because panes have that minimum width, a layout with
