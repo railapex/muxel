@@ -400,7 +400,7 @@ fn background_turn_over(
     runtime: muxel_terminal::TerminalRuntimeSnapshot,
     binding_rev: u64,
 ) -> bool {
-    runtime.is_attributable_to(binding_rev)
+    runtime.binding_rev == binding_rev
         && runtime.reason == muxel_terminal::TerminalStatusReason::BackgroundWork
 }
 
@@ -4167,7 +4167,10 @@ mod runtime_control_tests {
 
     fn held_snapshot() -> TerminalRuntimeSnapshot {
         TerminalRuntimeSnapshot {
-            background: None,
+            background: Some(ctl::BackgroundWork {
+                shells: 1,
+                ..Default::default()
+            }),
             status: AgentStatus::Working,
             attributable: true,
             reason: TerminalStatusReason::BackgroundWork,
@@ -4199,7 +4202,8 @@ mod runtime_control_tests {
                 just_submitted: false,
                 force: false,
             });
-            assert_eq!(result.is_ok(), binding == 1 && attributable);
+            // Attribution belongs to activity, not to the free foreground composer.
+            assert_eq!(result.is_ok(), binding == 1);
         }
     }
 
@@ -4208,7 +4212,7 @@ mod runtime_control_tests {
         let runtime = held_snapshot();
         assert!(super::background_turn_over(runtime, 1));
         assert!(!super::background_turn_over(runtime, 2));
-        assert!(!super::background_turn_over(
+        assert!(super::background_turn_over(
             TerminalRuntimeSnapshot {
                 attributable: false,
                 ..runtime
