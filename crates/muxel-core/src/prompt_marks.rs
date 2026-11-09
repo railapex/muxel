@@ -4,10 +4,10 @@
 //! scripts, thread jobs and event actions in its own process, so a pane can only
 //! tell its shell sits idle at a prompt if the shell says so. muxel wraps
 //! PowerShell's prompt function so it prints `ESC ] 133 ; A` before the user's
-//! own prompt and [`BUSY_MARK`] after it, and wraps its line editor so that
-//! when PowerShell asks it for a line it prints a plain `ESC ] 133 ; B` if the
-//! shell found nothing running inside itself and no input waiting, and
-//! `ESC ] 133 ; C` as each line it returns starts to run. These are the marks
+//! own prompt and [`BUSY_MARK`] after it, and wraps its line editor so that a
+//! plain `ESC ] 133 ; B` follows once the line editor has waited for a key, if
+//! the prompt found nothing running inside the shell, and `ESC ] 133 ; C` as
+//! each line it returns starts to run. These are the marks
 //! Windows Terminal uses for shell integration. What the user sees is
 //! unchanged. cmd isn't marked: an echoing batch file prints cmd's `PROMPT`
 //! while it runs, so a mark there can't tell a prompt from a running batch. An
@@ -16,6 +16,15 @@
 macro_rules! busy_option {
     () => {
         "muxel=busy"
+    };
+}
+
+/// Whether nothing is running inside the shell: no nested prompt, unfinished
+/// job, other event subscriber or other runspace. `$mine` is the subscription
+/// the check may ignore: none at the prompt, the one-shot itself as it fires.
+macro_rules! nothing_running {
+    () => {
+        "$NestedPromptLevel -eq 0 -and -not (Get-Job -ErrorAction Ignore | Where-Object { $_.State -notin 'Completed', 'Failed', 'Stopped' }) -and -not (Get-EventSubscriber -Force -ErrorAction Ignore | Where-Object { $_.SubscriptionId -ne $mine }) -and @(Get-Runspace -ErrorAction Ignore).Count -eq 1"
     };
 }
 
@@ -33,77 +42,89 @@ pub const BUSY_MARK: &str = concat!("133;B;", busy_option!());
 /// A prompt being drawn doesn't mean the shell waits for input. PSReadLine
 /// draws it again from inside a key handler, as a transient prompt (Starship,
 /// oh-my-posh) does on Enter before it accepts the line, and the handler can
-/// go on working; a running command can call `prompt` itself. So the prompt
-/// always ends with [`BUSY_MARK`], and only the line editor grants idle. After
-/// the original prompt has run, the wrapper makes sure the line editor's
+/// go on working; a running command can call `prompt` itself; a line editor
+/// can work before it reads; keys can be on their way. So the prompt always
+/// ends with [`BUSY_MARK`], and only the line editor's own wait for a key
+/// grants idle.
+///
+/// After the original prompt has run, the wrapper makes sure the line editor's
 /// `PSConsoleHostReadLine` (PSReadLine's, or whatever replaced it since the
 /// last prompt) is wrapped. PowerShell calls it straight after drawing a
-/// prompt, to read the next line; nothing else normally does. As it starts, the
-/// wrap prints a plain `ESC ] 133 ; B` if the prompt PowerShell just drew
-/// found nothing running and nothing is waiting to be read (below); once it
-/// returns a line, just before PowerShell runs it, it prints `ESC ] 133 ; C`,
-/// as VS Code's shell integration does. The prompt leaves what it found in
-/// `$global:__muxel_idle`, and the wrap clears it as it reads it, so a prompt
-/// drawn by a redraw or a command can only speak for a read that follows a
-/// prompt PowerShell draws, which finds things afresh. The wrapper checks for
-/// a line editor at every prompt, not once at startup, so one imported or
+/// prompt, to read the next line. The wrap sets `$global:__muxel_reading` as
+/// it starts and prints nothing; once the line editor returns a line, just
+/// before PowerShell runs it, the wrap clears the flag and prints
+/// `ESC ] 133 ; C`, as VS Code's shell integration does. The wrapper checks
+/// for a line editor at every prompt, not once at startup, so one imported or
 /// replaced later is wrapped too. The wrapped function is held in a closure,
 /// not a global, so a hook that later chains the wrap can't loop back into
-/// itself; that hook only prints the marks twice. The wrap hands the line
-/// editor the same `$?`, which PSReadLine reads as the last command's status,
-/// and is hidden from the debugger like PSReadLine's own. Without a
+/// itself; that hook only prints `C` twice. The wrap hands the line editor
+/// the same `$?`, which PSReadLine reads as the last command's status, and is
+/// hidden from the debugger like PSReadLine's own.
+///
+/// When the prompt finds nothing running (below), it registers a hidden
+/// one-shot handler for `PowerShell.OnIdle` (`-MaxTriggerCount 1
+/// -SupportEvent`). PSReadLine raises that event only from its wait for a
+/// key, once it has waited about 300 ms with no key available and none it read
+/// ahead still queued. It raises none while a key handler works, while a
+/// command runs, between the lines of a paste, or while a replacement line
+/// editor works before it reads. The handler prints a plain `ESC ] 133 ; B`
+/// only while the wrap's flag is set, so a PSReadLine read that a command
+/// makes itself grants nothing, and only if the prompt's checks (below) still
+/// pass as it fires. Work can start after the prompt has checked: a pipeline
+/// started with `BeginInvoke` opens its runspace on another thread, which on
+/// PowerShell 7 can come after the next prompt has drawn. A one-shot left
+/// pending, by a prompt a command drew or by prompts quicker than PSReadLine's
+/// wait, stays the only one: each later prompt sees it as a subscriber and
+/// registers none, and it grants for whichever read it fires in. Without a
 /// `PSConsoleHostReadLine` there's nothing to wrap, nothing grants idle, and
 /// the pane's close asks.
 ///
-/// Input on its way when the wrap starts, sent before the shell read it,
-/// still reads idle until the line it ends runs and prints `C`. That took a
-/// few milliseconds in our runs, but a key handler that works before it
-/// accepts the line holds it as long as it works, and a close made then
-/// counts down. The pane counts every mark the shell prints, so an Undo expiry
-/// with a mark printed since the close asks.
-///
-/// The prompt checks for work that outlives it inside PowerShell's own
-/// process, where no child process shows it:
+/// The prompt, and the one-shot again as it fires, check for work that
+/// outlives a command inside PowerShell's own process, where no child process
+/// shows it:
 ///
 /// - `$NestedPromptLevel`: a debugger stop or `$host.EnterNestedPrompt()`;
 /// - an unfinished job (`Get-Job`) of any type, including a module's own job
 ///   types, which can run without a runspace;
-/// - any event subscriber (`Get-EventSubscriber -Force`);
+/// - any event subscriber (`Get-EventSubscriber -Force`) but the one-shot
+///   that is firing;
 /// - a runspace beyond the shell's own (`Get-Runspace`).
 ///
-/// The wrap, as it starts, checks for input the line editor would read at
-/// once:
+/// Unless all are clear, the prompt registers no one-shot, or the one-shot
+/// prints nothing, and the prompt's [`BUSY_MARK`] stands; a check that throws
+/// leaves it standing. So a module that keeps an idle runspace or a standing
+/// event subscriber, as current oh-my-posh streaming does with both, always
+/// reads busy and its panes ask; so does a user's own `PowerShell.OnIdle`
+/// subscriber.
 ///
-/// - a key waiting in the console's input buffer (`[Console]::KeyAvailable`),
-///   such as keys typed while the last command ran, a whole command sent with
-///   Enter included;
-/// - keys PSReadLine has already read and holds. It reads a paste ahead into
-///   its own queue, past the prompt the line before ends with. No public API
-///   shows that queue, so the wrap reads PSReadLine's private fields
-///   (`_singleton._queuedKeys`, present in 2.0.0 on 5.1 and 2.4.5 on 7); if
-///   they can't be read, it doesn't grant idle.
+/// Known limits:
 ///
-/// .NET's `KeyAvailable` reads and drops the records at the head of the
-/// buffer that aren't keys the line editor would read (key-ups, lone modifier
-/// keys, focus and resize events) and stops at the first that is, which
-/// stays. Nothing the line editor reads is lost: on PowerShell 7 the filter is
-/// `Console.ReadKey`'s own, and on 5.1 the one record `ReadKey` reads that
-/// `KeyAvailable` drops, an Alt key-up carrying the character an Alt+numpad
-/// sequence composed, can't head the buffer while the keys before it in that
-/// sequence wait there. The host's `$Host.UI.RawUI.KeyAvailable` stays true at
-/// every prompt after a Ctrl+C, though the line editor has read every key.
+/// - Idle comes about 300 ms after each prompt, once PSReadLine has waited
+///   that long; a close before then asks. Work still starting as the one-shot
+///   checks, such as a runspace that hasn't opened 300 ms after the
+///   `BeginInvoke` that asked for it, isn't seen.
+/// - A script that draws the prompt and then reads a line through
+///   `PSConsoleHostReadLine`, as the host does, reads idle while it waits for
+///   that line. Nothing runs while it waits.
+/// - `Unregister-Event -Force` naming `PowerShell.OnIdle`, or every
+///   subscriber (`Get-EventSubscriber -Force | Unregister-Event -Force`),
+///   removes the one-shot, and that prompt asks. Without `-Force`,
+///   `Unregister-Event` leaves hidden subscribers alone.
+/// - Input sent in the moment the one-shot prints, before the shell has read
+///   it, still reads idle until the line it ends runs and prints `C`, and a
+///   key handler that works before it accepts that line holds it as long as
+///   it works. The pane counts every mark the shell prints, so an Undo expiry
+///   with a mark printed since the close asks.
 ///
-/// Unless all are clear, the wrap prints no `B` of its own and the prompt's
-/// [`BUSY_MARK`] stands; a check that throws leaves it standing. So a module
-/// that keeps an idle runspace or a standing event subscriber, as current
-/// oh-my-posh streaming does with both, always reads busy and its panes ask.
-/// Measured in a real console, the wrapper costs about 0.5 ms per prompt on
-/// Windows PowerShell 5.1 and 0.2 ms on PowerShell 7, the wrap's checks (under
-/// 0.1 ms) included.
+/// Measured in a real console on a loaded machine, the wrapper costs about
+/// 1 to 1.5 ms per prompt on Windows PowerShell 5.1 and 0.5 ms on PowerShell
+/// 7. The one `OnIdle` event that grants each prompt idle takes another
+/// 2.5 ms and 1.2 ms of CPU, and its checks 0.7 to 1.5 ms and 0.4 to 1 ms,
+/// while the shell waits rather than as it draws the prompt.
 const POWERSHELL_WRAP: &str = concat!(
     "$global:__muxel_prompt = $function:prompt; ",
     "function global:prompt { ",
-    "$ok = $global:?; $global:__muxel_idle = $false; $e = [char]27; ",
+    "$ok = $global:?; $e = [char]27; ",
     "if (-not $ok) { Write-Error muxel -ErrorAction Ignore }; ",
     "$text = & $global:__muxel_prompt; ",
     "try { ",
@@ -111,22 +132,22 @@ const POWERSHELL_WRAP: &str = concat!(
     "if ($read -and -not [object]::ReferenceEquals($read, $global:__muxel_readline)) { ",
     "Set-Item Function:global:PSConsoleHostReadLine (& { param($line) { ",
     "[System.Diagnostics.DebuggerHidden()] param() ",
-    "$ok = $?; $idle = $global:__muxel_idle; $global:__muxel_idle = $false; ",
-    "if ($idle) { try { ",
-    "$held = 0; $psrl = 'Microsoft.PowerShell.PSConsoleReadLine' -as [type]; ",
-    "if ($psrl) { $one = $psrl.GetField('_singleton', 'NonPublic, Static').GetValue($null); ",
-    "$held = $one.GetType().GetField('_queuedKeys', 'NonPublic, Instance').GetValue($one).Count }; ",
-    "$idle = $held -eq 0 -and -not [Console]::KeyAvailable ",
-    "} catch { $idle = $false } }; ",
-    "if ($idle) { [Console]::Write(\"$([char]27)]133;B$([char]27)\\\") }; ",
+    "$ok = $?; $global:__muxel_reading = $true; ",
     "if (-not $ok) { Write-Error muxel -ErrorAction Ignore }; ",
-    "$typed = & $line; [Console]::Write(\"$([char]27)]133;C$([char]27)\\\"); $typed ",
+    "try { $typed = & $line } finally { $global:__muxel_reading = $false }; ",
+    "[Console]::Write(\"$([char]27)]133;C$([char]27)\\\"); $typed ",
     "}.GetNewClosure() } $read); ",
     "$global:__muxel_readline = $function:PSConsoleHostReadLine }; ",
-    "$global:__muxel_idle = $NestedPromptLevel -eq 0 -and ",
-    "-not (Get-Job -ErrorAction Ignore | Where-Object { $_.State -notin 'Completed', 'Failed', 'Stopped' }) -and ",
-    "-not (Get-EventSubscriber -Force -ErrorAction Ignore) -and ",
-    "@(Get-Runspace -ErrorAction Ignore).Count -eq 1 } catch { }; ",
+    "$mine = $null; ",
+    "if ($read -and ",
+    nothing_running!(),
+    ") { ",
+    "$null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -MaxTriggerCount 1 -SupportEvent -Action { ",
+    "$mine = $EventSubscriber.SubscriptionId; ",
+    "try { if ($global:__muxel_reading -and ",
+    nothing_running!(),
+    ") { [Console]::Write(\"$([char]27)]133;B$([char]27)\\\") } } catch { } } } ",
+    "} catch { }; ",
     "\"$e]133;A$e\\\" + $text + \"$e]133;B;",
     busy_option!(),
     "$e\\\" }",

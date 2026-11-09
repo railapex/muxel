@@ -43,9 +43,9 @@ pub fn shell_close_evidence(
 ///
 /// - `first.idle`: an OSC 133 prompt showing, its last mark not
 ///   [`crate::prompt_marks::BUSY_MARK`], with nothing typed since. muxel's
-///   PowerShell wrapper ends every prompt with that mark, and only its line
-///   editor's plain `B`, printed as PowerShell starts reading a line with
-///   nothing running and no input waiting, follows it;
+///   PowerShell wrapper ends every prompt with that mark, and only a plain
+///   `B`, printed once the line editor has waited for a key after a prompt
+///   that found nothing running, follows it;
 /// - `no_child`: no live child of the shell ([`shell_is_idle`]), such as a
 ///   process started in the background.
 ///

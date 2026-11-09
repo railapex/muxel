@@ -39,8 +39,8 @@ pub(super) struct ShellPrompt(parking_lot::Mutex<PromptState>);
 struct PromptState {
     /// The last OSC 133 mark was A or B, with no Enter written since.
     at_prompt: bool,
-    /// That mark was [`BUSY_MARK`]: muxel's PowerShell wrapper found work
-    /// running inside the shell when it drew this prompt, or couldn't check.
+    /// That mark was [`BUSY_MARK`], which muxel's PowerShell wrapper ends
+    /// every prompt with. Only a plain `B` after it grants idle.
     busy: bool,
     /// Input that may still be waiting on a prompt: a draft, a recalled
     /// command, an unsent last line of a paste, or keys typed ahead while a
@@ -256,11 +256,12 @@ mod tests {
     }
 
     /// A prompt as muxel's PowerShell wrapper draws it, around a user prompt
-    /// that prints its own marks, and the line editor's `B` as PowerShell
-    /// starts reading a line with nothing running.
+    /// that prints its own marks, and the `B` that follows once the line
+    /// editor has waited for a key with nothing running.
     const IDLE: &[u8] = b"\x1b]133;A\x1b\\\x1b]133;A\x07PS> \x1b]133;B\x07\x1b]133;B;muxel=busy\x1b\\\x1b]133;B\x1b\\";
-    /// The same prompt without the line editor's `B`: drawn again from a key
-    /// handler or by a command, or with work running inside the shell.
+    /// The same prompt without that `B`: drawn again from a key handler or by
+    /// a command, before the line editor has waited, or with work running
+    /// inside the shell.
     const BUSY: &[u8] =
         b"\x1b]133;A\x1b\\\x1b]133;A\x07PS> \x1b]133;B\x07\x1b]133;B;muxel=busy\x1b\\";
 

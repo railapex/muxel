@@ -5329,6 +5329,34 @@ mod windows_shell_idle_tests {
         all
     }
 
+    fn is_windows_powershell(program: &str) -> bool {
+        program.to_ascii_lowercase().ends_with(r"\powershell.exe")
+    }
+
+    /// A module path entry of PowerShell 7's own: its `$PSHOME\Modules`, and
+    /// `PowerShell\Modules` under Program Files and Documents. Windows
+    /// PowerShell's sit under `WindowsPowerShell`.
+    fn is_powershell_7_modules(entry: &str) -> bool {
+        entry
+            .replace('/', r"\")
+            .to_ascii_lowercase()
+            .contains(r"\powershell\")
+    }
+
+    /// The module path pwsh hands a Windows PowerShell it starts: this
+    /// process's, without PowerShell 7's own entries. Cargo run from pwsh
+    /// inherits pwsh's path, and Windows PowerShell given it loads PowerShell
+    /// 7's PSReadLine, not the one a pane started from Explorer gets.
+    fn windows_powershell_module_path() -> Option<String> {
+        let path = std::env::var("PSModulePath").ok()?;
+        Some(
+            path.split(';')
+                .filter(|entry| !is_powershell_7_modules(entry))
+                .collect::<Vec<_>>()
+                .join(";"),
+        )
+    }
+
     /// Work the test holds open: it runs while this file exists and ends by
     /// itself once the file is gone. Dropping the hold releases it, so a
     /// failed assertion leaves nothing running, and no test kills a process by
@@ -5375,9 +5403,33 @@ mod windows_shell_idle_tests {
             Self::spawn(CommandSpec::program(program, args))
         }
 
-        fn spawn(spec: CommandSpec) -> Self {
+        fn spawn(mut spec: CommandSpec) -> Self {
+            if is_windows_powershell(&spec.program)
+                && let Some(path) = windows_powershell_module_path()
+            {
+                spec.env.push(("PSModulePath".into(), path));
+            }
             let (session, rx) = TerminalSession::spawn(spec, 100, 30).expect("spawn shell");
             Self { session, rx }
+        }
+
+        /// PSReadLine's version and folder, as this shell loaded them.
+        fn line_editor(&self) -> (String, String) {
+            self.type_text(
+                "'PS' + 'RL=' + (Get-Module PSReadLine).Version + '|' + (Get-Module PSReadLine).ModuleBase + '|'\r",
+            );
+            let mut found = None;
+            self.until("PSReadLine's version", |shell| {
+                let text = shell.session.visible_text();
+                found = text.split_once("PSRL=").and_then(|(_, rest)| {
+                    let (version, rest) = rest.split_once('|')?;
+                    let (base, _) = rest.split_once('|')?;
+                    Some((version.to_string(), base.to_string()))
+                });
+                found.is_some()
+            });
+            self.at_prompt();
+            found.expect("found")
         }
 
         /// What a pane close reads on Windows (`close_facts`).
@@ -5882,8 +5934,10 @@ mod windows_shell_idle_tests {
         let shell = Shell::start(powershell());
         shell.run(TRANSIENT_ENTER, "BOUND");
         // A line editor of its own, as a module loaded later might define.
+        // It reads through PSReadLine's own function, whose call into
+        // PSReadLine's API differs between versions.
         shell.run(
-            "function global:PSConsoleHostReadLine { $global:reads++; [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($host.Runspace, $ExecutionContext) }",
+            "function global:PSConsoleHostReadLine { $global:reads++; & (Get-Module PSReadLine) { PSConsoleHostReadLine } }",
             "REPLACED",
         );
         shell.becomes_idle();
@@ -5914,6 +5968,196 @@ mod windows_shell_idle_tests {
         shell.stays_busy("a running job of a module's own type");
         shell.run("$held.StopJob()", "STOPPED");
         shell.becomes_idle();
+    }
+
+    /// Windows PowerShell loads its own PSReadLine, not PowerShell 7's, as a
+    /// pane started outside pwsh does, whatever shell runs the tests.
+    #[test]
+    fn each_powershell_loads_its_own_line_editor() {
+        for (program, args) in powershells() {
+            let shell = Shell::start((program.clone(), args));
+            let (version, base) = shell.line_editor();
+            eprintln!("{program}: PSReadLine {version} from {base}");
+            assert!(!version.is_empty(), "{program} loaded no PSReadLine");
+            if is_windows_powershell(&program) {
+                assert!(
+                    !is_powershell_7_modules(&base),
+                    "{program} loaded PowerShell 7's PSReadLine {version} from {base}"
+                );
+            }
+        }
+    }
+
+    /// The idle mark comes from the one-shot `PowerShell.OnIdle` handler the
+    /// prompt registers, which PSReadLine runs once it has waited about 300 ms
+    /// for a key, and reaches the pane through ConPTY like any output.
+    #[test]
+    fn idle_arrives_once_the_line_editor_has_waited_for_a_key() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            shell.type_text("'WAIT' + 'ED'\r");
+            shell.shows("WAITED");
+            shell.at_prompt();
+            let drawn = Instant::now();
+            shell.becomes_idle();
+            let waited = drawn.elapsed();
+            assert!(
+                waited >= Duration::from_millis(200),
+                "idle {waited:?} after the prompt was drawn"
+            );
+        }
+    }
+
+    /// One grant per prompt. PSReadLine raises `OnIdle` about every 300 ms
+    /// while it waits, and each would print a mark.
+    #[test]
+    fn a_waiting_prompt_prints_its_idle_mark_once() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            let marks = shell.session.shell_reading().marks;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                shell.pump();
+                assert_eq!(
+                    shell.session.shell_reading().marks,
+                    marks,
+                    "a mark while the prompt waits"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    /// A line editor, put in place by a command, that works once as it
+    /// starts. With `returns`, it then hands back a line of its own without
+    /// reading one; without, it goes on to read.
+    fn a_line_editor_working_first(launch: (String, Vec<String>), returns: bool) {
+        let shell = Shell::start(launch);
+        shell.becomes_idle();
+        let hold = Hold::new(if returns {
+            "reader-returns"
+        } else {
+            "reader-reads"
+        });
+        let then = if returns {
+            "; return \"'READER' + 'RETURNED'\""
+        } else {
+            ""
+        };
+        shell.run(
+            &format!(
+                "$global:inner = $function:PSConsoleHostReadLine; $global:once = $true; function global:PSConsoleHostReadLine {{ if ($global:once) {{ $global:once = $false; [Console]::WriteLine('READER' + 'WORKING'); {}{then} }}; & $global:inner }}",
+                hold.wait()
+            ),
+            "DEFINED",
+        );
+        shell.busy_until("READERWORKING");
+        shell.stays_busy("a line editor working before it reads");
+        hold.release();
+        if returns {
+            shell.busy_until("READERRETURNED");
+        }
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_line_editor_that_returns_a_line_without_reading_is_not_idle() {
+        for launch in powershells() {
+            a_line_editor_working_first(launch, true);
+        }
+    }
+
+    #[test]
+    fn a_line_editor_that_works_before_it_reads_is_not_idle_while_it_works() {
+        for launch in powershells() {
+            a_line_editor_working_first(launch, false);
+        }
+    }
+
+    /// Enter bound to work before it accepts the line, the line sent as soon
+    /// as the prompt is drawn, before the line editor has waited for a key.
+    #[test]
+    fn an_enter_handler_working_before_it_accepts_the_line_is_not_idle() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            let hold = Hold::new("enter-handler");
+            shell.run(
+                &format!(
+                    "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {{ [Console]::WriteLine('HANDLER' + 'WORKING'); {}; [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }}",
+                    hold.wait()
+                ),
+                "BOUND",
+            );
+            shell.type_text("'LINE' + 'RAN'\r");
+            shell.busy_until("HANDLERWORKING");
+            shell.stays_busy("an Enter handler working before it accepts the line");
+            hold.release();
+            shell.busy_until("LINERAN");
+            shell.becomes_idle();
+        }
+    }
+
+    /// The line editor holds the rest of a paste while each line runs, and
+    /// waits for no key between them.
+    #[test]
+    fn a_paste_whose_middle_line_works_is_not_idle_until_its_last_line_has_run() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            let hold = Hold::new("middle");
+            shell.session.paste(&format!(
+                "'FIRST' + 'PASTED'\n'MIDDLE' + 'STARTED'; {}; 'MIDDLE' + 'DONE'\n'THIRD' + 'RAN'\n",
+                hold.wait()
+            ));
+            shell.busy_until("MIDDLESTARTED");
+            shell.stays_busy("the paste's middle line");
+            hold.release();
+            shell.busy_until("THIRDRAN");
+            shell.becomes_idle();
+        }
+    }
+
+    /// A command that draws the prompt, then reads a line from PSReadLine
+    /// itself rather than through the wrapped `PSConsoleHostReadLine`, is
+    /// still running while it waits.
+    #[test]
+    fn a_command_reading_from_the_line_editor_itself_is_not_idle() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            shell.type_text(
+                "& prompt; 'READ' + 'ING'; $line = & (Get-Module PSReadLine) { PSConsoleHostReadLine }; 'GOT=' + $line\r",
+            );
+            shell.shows("READING");
+            shell.stays_busy("a command waiting on its own read");
+            shell.type_text("yes\r");
+            shell.shows("GOT=yes");
+            shell.becomes_idle();
+        }
+    }
+
+    /// A prompt a command draws can leave a grant pending. Work the command
+    /// starts after it must still keep the next prompt from granting idle.
+    #[test]
+    fn work_started_after_a_command_draws_the_prompt_is_not_idle() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            let hold = Hold::new("after-prompt");
+            shell.run(
+                &format!(
+                    "& prompt; $ps = [powershell]::Create().AddScript(\"{}\"); $h = $ps.BeginInvoke()",
+                    hold.wait().replace('"', "`\"")
+                ),
+                "BEGUN",
+            );
+            shell.stays_busy("a pipeline started after the command drew the prompt");
+            hold.release();
+            shell.run("$null = $ps.EndInvoke($h); $ps.Dispose()", "ENDED");
+            shell.becomes_idle();
+        }
     }
 }
 
