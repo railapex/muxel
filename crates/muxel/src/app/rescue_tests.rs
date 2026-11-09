@@ -529,6 +529,19 @@ fn closing_an_editor_without_saving_deletes_its_backup() {
     });
 }
 
+/// A workspace saved to disk with one empty project, as another run left it.
+fn saved_workspace(name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let root = muxel_store::data_dir()
+        .unwrap()
+        .join(format!("{name}-project"));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut doc = Workspace::default();
+    doc.add_project(Project::new(name, root));
+    muxel_store::save_workspace_to(&muxel_store::workspace_doc_path(id).unwrap(), &doc).unwrap();
+    id
+}
+
 fn draft(text: &str) -> PromptDraft {
     PromptDraft {
         text: text.into(),
@@ -537,6 +550,60 @@ fn draft(text: &str) -> PromptDraft {
         source: DraftSource::Agent,
         pane: None,
     }
+}
+
+/// Every file under `dir`, recursively, as paths relative to it.
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path.strip_prefix(dir).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn turning_rescue_off_deletes_what_every_workspace_kept_and_stops_other_writers() {
+    with_app(|cx, window| {
+        let (iid, first) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "kept in the first workspace");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert!(first.draft(iid).is_some());
+
+        // Move to another workspace, then turn saving off there.
+        let other = saved_workspace("other");
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(other, window, cx);
+                app.set_rescue_enabled(false, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            files_under(first.path()),
+            Vec::<String>::new(),
+            "the first workspace's draft is deleted too"
+        );
+
+        // A writer that still thinks saving is on (another muxel window on
+        // the same data) leaves nothing behind either.
+        let elsewhere = Uuid::new_v4();
+        let _ = first.save_draft(elsewhere, &draft("typed in another window"));
+        assert!(first.draft(elsewhere).is_none());
+    });
 }
 
 #[test]
@@ -634,6 +701,52 @@ fn a_submission_during_the_debounce_clears_the_draft_at_once() {
             })
             .unwrap();
         assert!(dir.closed_drafts().is_empty(), "a sent prompt isn't kept");
+    });
+}
+
+#[test]
+fn a_write_cut_off_by_a_crash_leaves_no_hidden_copy() {
+    with_app(|cx, window| {
+        let crashed = saved_workspace("cut-off");
+        let dir = muxel_store::rescue::rescue_dir(crashed).unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let pane = Uuid::new_v4();
+        let temp = dir
+            .path()
+            .join(format!(".draft-{pane}.json.{}.tmp", Uuid::new_v4()));
+        std::fs::write(&temp, r#"{"text":"half-written secret","saved_at_ms":1}"#).unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(crashed, window, cx);
+            })
+            .unwrap();
+        assert!(!temp.exists(), "the interrupted write's temporary is gone");
+    });
+}
+
+#[test]
+fn deleting_a_workspace_deletes_what_it_kept() {
+    with_app(|cx, window| {
+        let doomed = saved_workspace("doomed");
+        let dir = muxel_store::rescue::rescue_dir(doomed).unwrap();
+        dir.save_draft(Uuid::new_v4(), &draft("never sent"))
+            .unwrap();
+        let workspace_dir = dir.path().parent().unwrap().to_path_buf();
+        window
+            .update(cx, |app, _, cx| {
+                let current = *app.current_workspace.get_or_insert_with(Uuid::new_v4);
+                for id in [current, doomed] {
+                    app.workspaces.workspaces.push(muxel_core::WorkspaceMeta {
+                        id,
+                        name: id.to_string(),
+                    });
+                }
+                app.delete_workspace(doomed, cx);
+            })
+            .unwrap();
+        assert_eq!(files_under(&workspace_dir), Vec::<String>::new());
+        assert!(!workspace_dir.exists(), "its directory is gone");
     });
 }
 

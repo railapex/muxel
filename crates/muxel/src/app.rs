@@ -11990,6 +11990,7 @@ impl MuxelApp {
                 .filter(|w| !w.projects.is_empty())
         };
         self.rescue = rescue::Rescue::default();
+        self.prepare_workspace_rescue(id);
         let crash = self.note_workspace_running(id, loaded.as_ref());
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
@@ -21628,6 +21629,9 @@ impl MuxelApp {
             self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
         }
         if self.current_workspace == Some(id) {
+            // Its panes stop saving into the directory about to go.
+            self.point_rescue_writers(None, cx);
+            self.rescue = rescue::Rescue::default();
             self.current_workspace = None;
             // Release the lock so the now-deleted workspace's id is free.
             self.workspace_lock = None;
@@ -21639,11 +21643,15 @@ impl MuxelApp {
             Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
             Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
         }
-        if let Some(path) = muxel_store::workspace_doc_path(id) {
-            let _ = std::fs::remove_file(&path);
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::remove_dir(dir);
-            }
+        // Its document, the unsent prompts and unsaved changes it kept, and
+        // its lock file.
+        if let Err(e) = muxel_store::rescue::delete_workspace_dir(id) {
+            log::warn!("couldn't delete workspace {id}'s files: {e:#}");
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't delete all of the workspace's files"),
+                format!("{e:#}"),
+            );
         }
         cx.notify();
     }

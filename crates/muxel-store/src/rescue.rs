@@ -1,18 +1,30 @@
 //! Text a person typed but hadn't sent or saved, kept beside a workspace's
 //! document so a crash, a restart or an accidental close doesn't lose it.
 //!
-//! One small JSON file per pane in `workspaces/<id>/rescue/`:
+//! Plain JSON files in `workspaces/<id>/rescue/`:
 //!
 //! - `draft-<instance>.json` — the live draft a pane keeps up to date;
 //! - `draft-<instance>.<ms>.offer.json` — a draft offered when its pane
 //!   started again, kept until Restore or Discard;
-//! - `closed-<instance>.<ms>.json` — the draft of a pane closed for good;
-//! - `editor-<instance>.json` — an editor's unsaved buffer.
+//! - `closed-<instance>.<ms>.json` — the draft of a pane closed for good,
+//!   the newest [`MAX_CLOSED_DRAFTS`] kept;
+//! - `editor-<instance>.json` — an editor's unsaved buffer, kept up to date;
+//! - `editor-<instance>.offer.json` — the buffer offered when the editor
+//!   opened again, kept until Restore or Discard.
 //!
-//! Every write goes to a unique temporary sibling, is flushed, and is renamed
-//! over its target, so a reader never sees half a file. On Unix the files are
-//! readable by their owner only; elsewhere they take the data directory's
-//! permissions, as `workspace.json` does. File contents never reach a log.
+//! Each file is capped in size. Offers have no age or count limit: they stay
+//! until someone decides, the pane is closed for good, or saving is turned
+//! off. Every write goes to a unique temporary sibling, is flushed, and is
+//! renamed over its target, so a reader never sees half a file; a temporary
+//! left by a crash is deleted when the workspace opens again. On Unix the
+//! files are readable by their owner only; elsewhere they take the data
+//! directory's permissions, as `workspace.json` does. File contents never
+//! reach a log.
+//!
+//! Turning saving off leaves a `rescue-off` marker in the data directory and
+//! deletes every workspace's files. A write that lands after that (from
+//! another muxel window still running with saving on) sees the marker and
+//! deletes itself.
 
 use anyhow::{Context, Result, bail};
 use muxel_core::Uuid;
@@ -27,6 +39,9 @@ const ENVELOPE_BYTES: usize = 64 * 1024;
 
 /// The marker a workspace keeps while it is open.
 const RUNNING: &str = "running";
+
+/// The marker in the data directory while saving is turned off.
+const RESCUE_OFF: &str = "rescue-off";
 
 /// A saved draft and the file holding it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +66,8 @@ pub struct RescueCounts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RescueDir {
     dir: PathBuf,
+    /// The data directory's [`RESCUE_OFF`] marker, checked by every write.
+    off: Option<PathBuf>,
 }
 
 /// The rescue directory of `workspace`, under the data directory.
@@ -58,17 +75,116 @@ pub fn rescue_dir(workspace: Uuid) -> Option<RescueDir> {
     let dir = crate::workspaces_dir()?
         .join(workspace.to_string())
         .join("rescue");
-    Some(RescueDir::at(dir))
+    Some(RescueDir {
+        dir,
+        off: crate::data_dir().map(|data| data.join(RESCUE_OFF)),
+    })
+}
+
+/// Whether saving was turned off, in this window or another on the same data.
+pub fn rescue_turned_off() -> bool {
+    crate::data_dir().is_some_and(|data| data.join(RESCUE_OFF).exists())
+}
+
+/// Turn saving off or on for every muxel window on this data directory. Off
+/// writes the marker first, so a write racing the purge that follows deletes
+/// itself.
+pub fn set_rescue_turned_off(off: bool) -> Result<()> {
+    let marker = crate::data_dir()
+        .context("could not determine data directory")?
+        .join(RESCUE_OFF);
+    if off {
+        write_private(&marker, b"", 0, None)
+    } else {
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("deleting {}", marker.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Delete what every workspace kept, as turning saving off does. Returns how
+/// many workspaces had something to delete; a file that couldn't be deleted
+/// is reported.
+pub fn purge_every_workspace() -> Result<usize> {
+    let root = crate::workspaces_dir().context("could not determine data directory")?;
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(0);
+    };
+    let mut purged = 0;
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| Uuid::parse_str(name).ok())
+        else {
+            continue;
+        };
+        let Some(dir) = rescue_dir(id) else {
+            continue;
+        };
+        if dir.names().is_empty() {
+            let _ = std::fs::remove_dir(dir.path());
+            continue;
+        }
+        purged += 1;
+        failed.extend(dir.purge());
+        let _ = std::fs::remove_dir(dir.path());
+    }
+    if !failed.is_empty() {
+        bail!(
+            "couldn't delete {} rescue file(s), e.g. {}",
+            failed.len(),
+            failed[0].display()
+        );
+    }
+    Ok(purged)
 }
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Write `bytes` to `path` atomically, owner-only on Unix, refusing more
-/// than `cap` bytes of text.
-fn write_private(path: &Path, bytes: &[u8], cap: usize) -> Result<()> {
+/// A file written in full beside its target, not yet in place. Dropping it
+/// without [`StagedWrite::commit`] deletes it.
+#[derive(Debug)]
+pub struct StagedWrite {
+    tmp: PathBuf,
+    target: PathBuf,
+    off: Option<PathBuf>,
+}
+
+impl StagedWrite {
+    /// Rename the file over its target. If saving was turned off meanwhile,
+    /// the file is deleted again and this fails.
+    pub fn commit(self) -> Result<()> {
+        let renamed = crate::rename_with_retry(&self.tmp, &self.target)
+            .with_context(|| format!("writing {}", self.target.display()));
+        if renamed.is_ok() && self.off.as_ref().is_some_and(|off| off.exists()) {
+            remove(&self.target);
+            bail!("saving unsent text is turned off");
+        }
+        renamed
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        // Gone after a commit; otherwise this write was abandoned.
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+/// Write `bytes` beside `path`, owner-only on Unix, refusing more than `cap`
+/// bytes of text, or anything while `off` exists.
+fn stage_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> Result<StagedWrite> {
     use std::io::Write as _;
+    if off.is_some_and(Path::exists) {
+        bail!("saving unsent text is turned off");
+    }
     if bytes.len() > cap + ENVELOPE_BYTES {
         bail!("rescue file too large ({} bytes)", bytes.len());
     }
@@ -79,26 +195,30 @@ fn write_private(path: &Path, bytes: &[u8], cap: usize) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
-    let written = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        crate::rename_with_retry(&tmp, path)
-    })()
-    .with_context(|| format!("writing {}", path.display()));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let staged = StagedWrite {
+        tmp: parent.join(format!(".{name}.{}.tmp", Uuid::new_v4())),
+        target: path.to_path_buf(),
+        off: off.map(Path::to_path_buf),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
-    written
+    (|| -> std::io::Result<()> {
+        let mut file = options.open(&staged.tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })()
+    .with_context(|| format!("writing {}", path.display()))?;
+    Ok(staged)
+}
+
+/// Write `bytes` to `path` atomically; see [`stage_private`].
+fn write_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> Result<()> {
+    stage_private(path, bytes, cap, off)?.commit()
 }
 
 fn read_draft(path: &Path) -> Option<PromptDraft> {
@@ -141,11 +261,18 @@ fn unused(dir: &Path, prefix: &str, at: i64, ending: &str) -> PathBuf {
 
 impl RescueDir {
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            off: None,
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    fn off(&self) -> Option<&Path> {
+        self.off.as_deref()
     }
 
     fn live_draft(&self, instance: Uuid) -> PathBuf {
@@ -154,6 +281,10 @@ impl RescueDir {
 
     fn editor_file(&self, instance: Uuid) -> PathBuf {
         self.dir.join(format!("editor-{instance}.json"))
+    }
+
+    fn editor_offer_file(&self, instance: Uuid) -> PathBuf {
+        self.dir.join(format!("editor-{instance}.offer.json"))
     }
 
     fn names(&self) -> Vec<String> {
@@ -168,7 +299,12 @@ impl RescueDir {
     /// Replace a pane's live draft.
     pub fn save_draft(&self, instance: Uuid, draft: &PromptDraft) -> Result<()> {
         let bytes = serde_json::to_vec(draft).context("serializing draft")?;
-        write_private(&self.live_draft(instance), &bytes, MAX_RESCUE_BYTES)
+        write_private(
+            &self.live_draft(instance),
+            &bytes,
+            MAX_RESCUE_BYTES,
+            self.off(),
+        )
     }
 
     /// The pane's live draft, if it has one.
@@ -252,7 +388,7 @@ impl RescueDir {
             );
             let saved = serde_json::to_vec(&draft)
                 .context("serializing draft")
-                .and_then(|bytes| write_private(&to, &bytes, MAX_RESCUE_BYTES));
+                .and_then(|bytes| write_private(&to, &bytes, MAX_RESCUE_BYTES, self.off()));
             match saved {
                 Ok(()) => {
                     kept += 1;
@@ -299,25 +435,73 @@ impl RescueDir {
         }
     }
 
+    /// Write an editor's backup beside its file, to be put in place with
+    /// [`StagedWrite::commit`] once the caller knows it's still wanted.
+    pub fn stage_editor_backup(
+        &self,
+        instance: Uuid,
+        backup: &EditorBackup,
+    ) -> Result<StagedWrite> {
+        let bytes = serde_json::to_vec(backup).context("serializing editor backup")?;
+        stage_private(
+            &self.editor_file(instance),
+            &bytes,
+            MAX_EDITOR_BACKUP_BYTES,
+            self.off(),
+        )
+    }
+
     /// Replace an editor's backup.
     pub fn save_editor_backup(&self, instance: Uuid, backup: &EditorBackup) -> Result<()> {
-        let bytes = serde_json::to_vec(backup).context("serializing editor backup")?;
-        write_private(&self.editor_file(instance), &bytes, MAX_EDITOR_BACKUP_BYTES)
+        self.stage_editor_backup(instance, backup)?.commit()
     }
 
+    /// The editor's live backup.
     pub fn editor_backup(&self, instance: Uuid) -> Option<EditorBackup> {
-        let data = std::fs::read(self.editor_file(instance)).ok()?;
-        serde_json::from_slice(&data).ok()
+        read_backup(&self.editor_file(instance))
     }
 
-    /// Delete an editor's backup (saved, discarded, or closed without saving).
+    /// The editor is opening: turn its live backup into its offer, so the
+    /// backups of edits made while the offer shows can't replace it, and
+    /// return the offer. A newer live backup replaces an older offer: it holds
+    /// the edits made last.
+    pub fn offer_editor_backup(&self, instance: Uuid) -> Option<EditorBackup> {
+        let live = self.editor_file(instance);
+        let offer = self.editor_offer_file(instance);
+        if read_backup(&live).is_some() {
+            if let Err(e) = crate::rename_with_retry(&live, &offer) {
+                log::warn!("couldn't keep editor backup offer for {instance}: {e}");
+            }
+        } else {
+            remove(&live);
+        }
+        self.editor_offer(instance)
+    }
+
+    /// The backup the editor is offering.
+    pub fn editor_offer(&self, instance: Uuid) -> Option<EditorBackup> {
+        read_backup(&self.editor_offer_file(instance))
+    }
+
+    /// Delete the editor's live backup (saved, reloaded, or no longer dirty).
     pub fn delete_editor_backup(&self, instance: Uuid) {
         remove(&self.editor_file(instance));
     }
 
+    /// Delete the backup the editor offered (restored or discarded).
+    pub fn delete_editor_offer(&self, instance: Uuid) {
+        remove(&self.editor_offer_file(instance));
+    }
+
+    /// Delete both of an editor's files (closed for good).
+    pub fn drop_editor(&self, instance: Uuid) {
+        self.delete_editor_backup(instance);
+        self.delete_editor_offer(instance);
+    }
+
     /// Settle files whose pane no longer exists in the workspace (it closed
     /// while muxel was going down): a draft is kept as a closed draft, an
-    /// editor backup is deleted, as closing an editor without saving does.
+    /// editor's files are deleted, as closing an editor without saving does.
     pub fn adopt_orphans(&self, live: &std::collections::HashSet<Uuid>) {
         let mut orphans = std::collections::BTreeSet::new();
         for name in self.names() {
@@ -325,10 +509,10 @@ impl RescueDir {
                 && !live.contains(&instance)
             {
                 orphans.insert(instance);
-            } else if let Some((instance, ".json")) = split_name(&name, "editor-")
+            } else if let Some((instance, _)) = split_name(&name, "editor-")
                 && !live.contains(&instance)
             {
-                self.delete_editor_backup(instance);
+                self.drop_editor(instance);
             }
         }
         for instance in orphans {
@@ -336,34 +520,103 @@ impl RescueDir {
         }
     }
 
+    /// Delete the temporaries of writes a crash cut off. Call it only while
+    /// holding the workspace lock and before any of its panes start writing.
+    pub fn remove_temporaries(&self) -> usize {
+        let temporaries: Vec<String> = self
+            .names()
+            .into_iter()
+            .filter(|name| name.starts_with('.') && name.ends_with(".tmp"))
+            .collect();
+        for name in &temporaries {
+            remove(&self.dir.join(name));
+        }
+        temporaries.len()
+    }
+
     /// What the directory holds.
     pub fn counts(&self) -> RescueCounts {
         let mut drafts = std::collections::BTreeSet::new();
+        let mut editors = std::collections::BTreeSet::new();
         let mut counts = RescueCounts::default();
         for name in self.names() {
             if let Some((instance, _)) = split_name(&name, "draft-") {
                 drafts.insert(instance);
-            } else if split_name(&name, "editor-").is_some_and(|(_, rest)| rest == ".json") {
-                counts.editors += 1;
+            } else if let Some((instance, _)) = split_name(&name, "editor-") {
+                editors.insert(instance);
             } else if split_name(&name, "closed-").is_some() {
                 counts.closed += 1;
             }
         }
         counts.drafts = drafts.len();
+        counts.editors = editors.len();
         counts
     }
 
-    /// Delete everything kept, as turning saving off does.
-    pub fn purge(&self) {
+    /// Delete everything kept, as turning saving off does. Returns the files
+    /// that couldn't be deleted.
+    pub fn purge(&self) -> Vec<PathBuf> {
+        let mut failed = Vec::new();
         for name in self.names() {
             if ["draft-", "closed-", "editor-", "."]
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
             {
-                remove(&self.dir.join(name));
+                let path = self.dir.join(name);
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        log::warn!("couldn't delete rescue file {}: {e}", path.display());
+                        failed.push(path);
+                    }
+                    _ => {}
+                }
             }
         }
+        failed
     }
+}
+
+fn read_backup(path: &Path) -> Option<EditorBackup> {
+    let data = std::fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Delete workspace `workspace`'s directory: its document, everything it
+/// kept, and its lock file. Refuses while another muxel window has the
+/// workspace open; a file that couldn't be deleted is reported.
+pub fn delete_workspace_dir(workspace: Uuid) -> Result<()> {
+    let dir = crate::workspaces_dir()
+        .context("could not determine data directory")?
+        .join(workspace.to_string());
+    if !dir.exists() {
+        return Ok(());
+    }
+    let lock = crate::try_lock_dir(&dir).context("it is open in another muxel window")?;
+    let mut failed = Vec::new();
+    let entries = std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
+    for entry in entries.flatten() {
+        if entry.file_name() == "instance.lock" {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = removed {
+            failed.push(format!("{}: {e}", path.display()));
+        }
+    }
+    drop(lock);
+    let _ = std::fs::remove_file(dir.join("instance.lock"));
+    if let Err(e) = std::fs::remove_dir(&dir) {
+        failed.push(format!("{}: {e}", dir.display()));
+    }
+    if !failed.is_empty() {
+        bail!("couldn't delete {}", failed.join("; "));
+    }
+    Ok(())
 }
 
 /// Mark `workspace` open. Returns whether the marker was already there: the
@@ -387,7 +640,7 @@ fn mark_running_in(dir: &Path) -> bool {
     let marker = dir.join(RUNNING);
     let unclean = marker.exists();
     let stamp = format!("{} {}\n", std::process::id(), now_ms());
-    if let Err(e) = write_private(&marker, stamp.as_bytes(), MAX_RESCUE_BYTES) {
+    if let Err(e) = write_private(&marker, stamp.as_bytes(), MAX_RESCUE_BYTES, None) {
         log::warn!("couldn't mark workspace running: {e:#}");
     }
     unclean
@@ -543,9 +796,96 @@ mod tests {
         );
         assert_eq!(dir.editor_backup(editor).unwrap(), backup);
         assert!(dir.editor_backup(gone_editor).is_none());
-        dir.purge();
+        assert!(dir.purge().is_empty());
         assert_eq!(dir.counts(), RescueCounts::default());
         assert!(files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    fn backup(text: &str) -> EditorBackup {
+        EditorBackup {
+            path: None,
+            text: text.into(),
+            base: None,
+            saved_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_staged_write_lands_only_when_committed() {
+        let dir = scratch("staged");
+        let pane = Uuid::new_v4();
+        dir.save_editor_backup(pane, &backup("kept")).unwrap();
+        // Abandoned: the old file stays and no temporary is left.
+        drop(dir.stage_editor_backup(pane, &backup("abandoned")).unwrap());
+        assert_eq!(dir.editor_backup(pane).unwrap().text, "kept");
+        assert_eq!(files(&dir), vec![format!("editor-{pane}.json")]);
+        let staged = dir.stage_editor_backup(pane, &backup("newer")).unwrap();
+        assert_eq!(dir.editor_backup(pane).unwrap().text, "kept");
+        staged.commit().unwrap();
+        assert_eq!(dir.editor_backup(pane).unwrap().text, "newer");
+        assert_eq!(files(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn once_saving_is_off_a_write_leaves_nothing_even_one_already_staged() {
+        let dir = scratch("off");
+        let marker = dir.path().with_extension("off");
+        let dir = RescueDir {
+            off: Some(marker.clone()),
+            ..dir
+        };
+        let pane = Uuid::new_v4();
+        let staged = dir.stage_editor_backup(pane, &backup("racing")).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        assert!(staged.commit().is_err());
+        assert!(dir.save_draft(pane, &draft("after", 2)).is_err());
+        assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn an_opening_editor_offers_its_backup_and_new_backups_go_beside_it() {
+        let dir = scratch("editor-offer");
+        let pane = Uuid::new_v4();
+        dir.save_editor_backup(pane, &backup("before the crash"))
+            .unwrap();
+        assert_eq!(
+            dir.offer_editor_backup(pane).unwrap().text,
+            "before the crash"
+        );
+        assert!(dir.editor_backup(pane).is_none());
+        dir.save_editor_backup(pane, &backup("typed while offered"))
+            .unwrap();
+        assert_eq!(dir.editor_offer(pane).unwrap().text, "before the crash");
+        assert_eq!(dir.counts().editors, 1);
+        // Discarding the offer keeps the newer backup.
+        dir.delete_editor_offer(pane);
+        assert_eq!(dir.editor_backup(pane).unwrap().text, "typed while offered");
+        // Opening again offers the newest.
+        assert_eq!(
+            dir.offer_editor_backup(pane).unwrap().text,
+            "typed while offered"
+        );
+        dir.drop_editor(pane);
+        assert!(files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn a_crash_between_write_and_rename_leaves_a_temporary_that_opening_deletes() {
+        let dir = scratch("temporaries");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let pane = Uuid::new_v4();
+        dir.save_draft(pane, &draft("whole", 1)).unwrap();
+        let cut_off = dir
+            .path()
+            .join(format!(".draft-{pane}.json.{}.tmp", Uuid::new_v4()));
+        std::fs::write(&cut_off, b"{\"text\":\"half").unwrap();
+        assert_eq!(dir.remove_temporaries(), 1);
+        assert_eq!(files(&dir), vec![format!("draft-{pane}.json")]);
         let _ = std::fs::remove_dir_all(dir.path());
     }
 

@@ -52,7 +52,7 @@ pub(super) use crate::editor::rescue_time;
 impl MuxelApp {
     /// Where the current workspace keeps rescued text, while keeping it is on.
     pub(super) fn rescue_dir(&self) -> Option<RescueDir> {
-        if !self.settings.rescue_unsent_text {
+        if !self.settings.rescue_unsent_text || muxel_store::rescue::rescue_turned_off() {
             return None;
         }
         muxel_store::rescue::rescue_dir(self.current_workspace?)
@@ -102,10 +102,37 @@ impl MuxelApp {
     }
 
     /// Settings toggled keeping rescued text on or off. Off stops every
-    /// watcher and deletes what is kept.
+    /// watcher and backup in this window, then deletes what every workspace
+    /// kept; other muxel windows on the same data stop writing too.
     pub(super) fn set_rescue_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.rescue_unsent_text = on;
         self.persist_settings();
+        if on && let Err(e) = muxel_store::rescue::set_rescue_turned_off(false) {
+            log::warn!("couldn't turn saving unsent text back on: {e:#}");
+        }
+        self.point_rescue_writers(self.rescue_dir(), cx);
+        if !on {
+            self.rescue = Rescue::default();
+            // The marker first: a write that races the purge deletes itself.
+            let purged = muxel_store::rescue::set_rescue_turned_off(true)
+                .and_then(|()| muxel_store::rescue::purge_every_workspace());
+            match purged {
+                Ok(workspaces) => {
+                    log::info!("saving unsent text off: purged {workspaces} workspace(s)")
+                }
+                Err(e) => self.add_event(
+                    NotifKind::Error,
+                    t("Couldn't delete all saved unsent text"),
+                    format!("{e:#}"),
+                ),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Point every pane's draft watcher and every editor's backups in this
+    /// window at `dir`; `None` stops them, with no write left to land.
+    pub(super) fn point_rescue_writers(&self, dir: Option<RescueDir>, cx: &mut App) {
         let views: Vec<(Uuid, Entity<TerminalView>)> = self
             .terminals
             .iter()
@@ -119,7 +146,6 @@ impl MuxelApp {
                     }),
             )
             .collect();
-        let dir = self.rescue_dir();
         for (iid, view) in views {
             let sink = dir.clone().map(|dir| Self::draft_sink(dir, iid));
             view.update(cx, |view, cx| view.set_draft_sink(sink, cx));
@@ -128,13 +154,6 @@ impl MuxelApp {
             let target = dir.clone().map(|dir| (dir, iid));
             editor.update(cx, |editor, cx| editor.adopt_backup(target, false, cx));
         }
-        if !on {
-            if let Some(dir) = self.rescue_dir_any() {
-                dir.purge();
-            }
-            self.rescue = Rescue::default();
-        }
-        cx.notify();
     }
 
     /// The terminal view of `iid`, docked or popped out.
@@ -412,6 +431,29 @@ impl MuxelApp {
             log::info!("kept the unsent draft of closed pane {iid}");
             self.rescue.closed = dir.closed_drafts();
             self.rescue.closed_hidden = false;
+        }
+    }
+
+    /// Workspace `id` is opening, its lock held and none of its panes
+    /// started: delete what it kept if saving is off (here or in another
+    /// window), else the temporaries of writes a crash cut off.
+    pub(super) fn prepare_workspace_rescue(&mut self, id: Uuid) {
+        let Some(dir) = muxel_store::rescue::rescue_dir(id) else {
+            return;
+        };
+        if muxel_store::rescue::rescue_turned_off() {
+            self.settings.rescue_unsent_text = false;
+        }
+        if !self.settings.rescue_unsent_text {
+            let failed = dir.purge();
+            if !failed.is_empty() {
+                log::warn!("couldn't delete {} rescue file(s)", failed.len());
+            }
+            return;
+        }
+        let removed = dir.remove_temporaries();
+        if removed > 0 {
+            log::info!("deleted {removed} rescue temporary file(s) a crash left");
         }
     }
 
