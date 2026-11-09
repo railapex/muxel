@@ -602,7 +602,6 @@ impl MuxelApp {
         else {
             return;
         };
-        self.status_targets.schedule.landed(key, now);
         let kind = source.kind;
         source.replan |= result.gone;
         if result.replanned {
@@ -610,8 +609,13 @@ impl MuxelApp {
         }
         source.learned.extend(result.ignored);
         let Some(files) = result.files else {
+            // git ignores all the news: the backstop still counts from the
+            // last `git status`, or new ignored files coming more often than
+            // that would put it off for good.
+            self.status_targets.schedule.skipped(key);
             return;
         };
+        self.status_targets.schedule.landed(key, now);
         source.status_at = Some(now);
         source.untracked_dirs = result.untracked_dirs;
         if let Some((plan, spec)) = result.planned {

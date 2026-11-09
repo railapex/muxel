@@ -155,6 +155,15 @@ impl DiffSchedule {
         }
     }
 
+    /// `pane`'s refresh finished without reading what it shows (a status
+    /// target whose news git ignores): its gap and backstop still count from
+    /// the last refresh that did.
+    pub fn skipped(&mut self, pane: Uuid) {
+        if let Some(state) = self.panes.get_mut(&pane) {
+            state.in_flight = false;
+        }
+    }
+
     /// The earliest moment any pane is due, for the one timer that waits for
     /// it. `None` while nothing could come due without news.
     pub fn next_due(&self, now: Instant) -> Option<Instant> {
