@@ -130,25 +130,32 @@ feature is added or changed, update the matching entry here in the same change**
   always ask. On Windows, muxel has the local PowerShell it starts mark its
   prompt with OSC 133, wrapping the prompt you already have so it looks the
   same (tested without a profile, and with a prompt that prints its own
-  marks). Such a shell counts down only when PowerShell, drawing that prompt,
-  found nothing running inside itself (no unfinished job of any kind, no
-  event subscriber, no runspace beyond its own, no nested or debugger
-  prompt) and no keys waiting to be read, a command typed ahead while the
-  last one ran included; no command has started since, as PowerShell's line
-  editor marks each line it returns (so a command accepted after a transient
-  prompt redraws on Enter, or the next line of a pasted batch, isn't idle);
-  nothing has been typed since; and no process it started still runs. A
-  draft kept through a redraw (Ctrl+L), the unsent last line of a paste or a
-  recalled command asks until Enter sends it or Ctrl+C drops it. Work
-  PowerShell can't see, such as a process whose parent has exited, isn't
-  counted. A module that keeps an idle runspace or an event subscriber, as
-  current oh-my-posh streaming does, makes every close ask. Undo expiry walks
-  the process table again and rereads the last prompt mark, but doesn't ask
-  PowerShell to check itself again; a close in the few milliseconds between a
-  prompt and the next pasted line starting counts down, and expiry asks if
-  that line is still running. cmd isn't marked, since an echoing batch
-  file prints cmd's prompt while it runs, so it asks, as does PowerShell
-  started with `-Command` or a script or given a new prompt after launch. A
+  marks). Such a shell counts down only when PowerShell has drawn its prompt
+  and asked its line editor for the next line; a prompt drawn again from a
+  key handler (a transient prompt's Enter) or by a running command doesn't
+  count. Drawing that prompt, PowerShell must have found nothing running
+  inside itself (no unfinished job of any kind, no event subscriber, no
+  runspace beyond its own, no nested or debugger prompt), and as it asks, no
+  keys may be waiting to be read, whether in the console (a command typed
+  ahead while the last one ran included) or already read by PSReadLine (the
+  next lines of a paste). Since then, no line may have started as far as its
+  marks show
+  (PowerShell's line editor marks each line it returns), nothing may have
+  been typed, and no process it started may still run. A draft kept through
+  a redraw (Ctrl+L), the unsent last line of a paste or a recalled command
+  asks until Enter sends it or Ctrl+C drops it. Work PowerShell can't see,
+  such as a process whose parent has exited, isn't counted. A module that
+  keeps an idle runspace or an event subscriber, as current oh-my-posh
+  streaming does, makes every close ask. Undo expiry walks the process table
+  again and rereads the marks, but doesn't ask PowerShell to check itself
+  again; it asks if the shell has printed any mark since the close. Input
+  already on its way as PowerShell starts reading, such as a line sent the
+  moment its prompt appears, reads idle until that line starts, which a key
+  handler working before it accepts the line can delay; a close made then
+  counts down, and expiry asks once the line has started. cmd isn't marked,
+  since an echoing batch file prints cmd's prompt while it runs, so it asks,
+  as does PowerShell started with `-Command` or a script, given a new prompt
+  after launch, or running without a line editor (PSReadLine). A
   shell that prints its own OSC 133 marks counts down on them with nothing
   typed and no child running; Git Bash still asks, since its `bash.exe`
   always runs a second bash. A tmux pane that only looks dead here (never connected, a

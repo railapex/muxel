@@ -23,6 +23,7 @@ use alacritty_terminal::term::{
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
 use muxel_core::path_paste::{PastePathError, PasteShell};
+use muxel_core::recoverable_close::ShellReading;
 use parking_lot::{Condvar, Mutex};
 #[cfg(unix)]
 use portable_pty::Child;
@@ -2414,11 +2415,11 @@ impl TerminalSession {
         self.shell_prompt.at_prompt()
     }
 
-    /// [`Self::shell_at_prompt`], not marked busy by muxel's PowerShell wrapper
-    /// ([`muxel_core::prompt_marks::BUSY_MARK`]), with nothing typed since that
-    /// could still run.
-    pub fn shell_at_idle_prompt(&self) -> bool {
-        self.shell_prompt.idle_prompt()
+    /// Whether the shell is [`Self::shell_at_prompt`], its last mark not
+    /// [`muxel_core::prompt_marks::BUSY_MARK`], with nothing typed since that
+    /// could still run, read together with the count of marks it has printed.
+    pub fn shell_reading(&self) -> ShellReading {
+        self.shell_prompt.reading()
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -3254,7 +3255,7 @@ impl TerminalSession {
     /// no live process of its own ([`muxel_core::recoverable_close::shell_is_idle`]);
     /// a command it starts, `start /b` included, is its child. That alone isn't
     /// idle on Windows, where cmd and PowerShell run batch files and cmdlets in
-    /// their own process: callers pair it with [`Self::shell_at_idle_prompt`].
+    /// their own process: callers pair it with [`Self::shell_reading`].
     /// The process snapshot may be up to 250 ms old and shared with other
     /// panes ([`crate::process_tree::recent_process_parent_map`]), so one close
     /// walks the process table once; [`Self::is_idle_foreground_now`] walks it
@@ -5381,9 +5382,11 @@ mod windows_shell_idle_tests {
 
         /// What a pane close reads on Windows (`close_facts`).
         fn proves_idle(&self) -> bool {
-            windows_shell_close_evidence(self.session.shell_at_idle_prompt(), || {
-                self.session.is_idle_foreground()
-            }) == CloseEvidence::ShellPrompt
+            windows_shell_close_evidence(
+                self.session.shell_reading(),
+                || self.session.is_idle_foreground(),
+                || self.session.shell_reading(),
+            ) == CloseEvidence::ShellPrompt
         }
 
         fn pump(&self) {
@@ -5724,8 +5727,13 @@ mod windows_shell_idle_tests {
         let shell = Shell::start(powershell());
         shell.becomes_idle();
         let (first, second) = (Hold::new("first"), Hold::new("second"));
-        shell.type_text(&format!("{}; 'FIRST' + 'DONE'\r", first.wait()));
-        std::thread::sleep(Duration::from_millis(500));
+        // The first command holds on until the second has reached the
+        // console's input, so it can't end before PowerShell could read it.
+        shell.type_text(&format!(
+            "'FIRST' + 'RUNNING'; while (-not [Console]::KeyAvailable) {{ Start-Sleep -Milliseconds 10 }}; 'SEEN' + 'AHEAD'; {}; 'FIRST' + 'DONE'\r",
+            first.wait()
+        ));
+        shell.shows("FIRSTRUNNING");
         // Sent with Enter while the first runs. PowerShell reads it straight
         // after the first's prompt, which must not read idle, even for the
         // moment before the line editor returns it; nor may the pane while it
@@ -5734,6 +5742,7 @@ mod windows_shell_idle_tests {
             "'SECOND' + 'STARTED'; {}; 'SECOND' + 'DONE'\r",
             second.wait()
         ));
+        shell.shows("SEENAHEAD");
         first.release();
         shell.busy_until("SECONDSTARTED");
         shell.stays_busy("the command typed ahead");
@@ -5788,6 +5797,83 @@ mod windows_shell_idle_tests {
             shell.run(TRANSIENT_ENTER, "BOUND");
             shell.becomes_idle();
             runs_busy_after_a_redraw(&shell, "TRANSIENT");
+        }
+    }
+
+    /// Enter bound to draw the prompt again and then work before it accepts
+    /// the line. The redraw prints a prompt, but nothing is waiting for input.
+    #[test]
+    fn a_redraw_inside_the_line_editor_is_not_idle_while_its_handler_works() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            let hold = Hold::new("redraw-handler");
+            shell.run(
+                &format!(
+                    "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {{ [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt(); [Console]::WriteLine('HANDLER' + 'WORKING'); {}; [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }}",
+                    hold.wait()
+                ),
+                "BOUND",
+            );
+            shell.becomes_idle();
+            shell.type_text("'LINE' + 'RAN'\r");
+            shell.shows("HANDLERWORKING");
+            shell.stays_busy("an Enter handler working after its redraw");
+            hold.release();
+            shell.shows("LINERAN");
+            shell.becomes_idle();
+        }
+    }
+
+    /// A command that calls the prompt prints one, then runs on.
+    #[test]
+    fn a_prompt_drawn_by_a_running_command_is_not_idle() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            for (tag, call) in [
+                ("CALLED", "& prompt"),
+                ("INVOKED", "Invoke-Command { prompt }"),
+            ] {
+                let hold = Hold::new(&tag.to_ascii_lowercase());
+                shell.type_text(&format!(
+                    "{call}; '{tag}' + 'RUNNING'; {}; '{tag}' + 'DONE'\r",
+                    hold.wait()
+                ));
+                shell.shows(&format!("{tag}RUNNING"));
+                shell.stays_busy(&format!("{call}, then work"));
+                hold.release();
+                shell.shows(&format!("{tag}DONE"));
+                shell.becomes_idle();
+            }
+        }
+    }
+
+    /// The line editor reads a paste ahead, so the console holds none of the
+    /// next line at the prompt the first line ends with. That line's Enter
+    /// handler still runs before the line editor returns it.
+    #[test]
+    fn a_pasted_line_the_line_editor_holds_is_not_idle_while_its_enter_handler_works() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            let hold = Hold::new("held-line");
+            // Quick for the paste's first Enter, held for its second.
+            shell.run(
+                &format!(
+                    "$global:enters = 0; Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {{ if ($global:enters++) {{ [Console]::WriteLine('HANDLER' + 'HELD'); {} }}; [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }}",
+                    hold.wait()
+                ),
+                "BOUND",
+            );
+            shell.becomes_idle();
+            shell
+                .session
+                .paste("'FIRST' + 'PASTED'\n'SECOND' + 'RAN'\n");
+            shell.shows("FIRSTPASTED");
+            shell.shows("HANDLERHELD");
+            shell.stays_busy("a pasted line held by its Enter handler");
+            hold.release();
+            shell.shows("SECONDRAN");
+            shell.becomes_idle();
         }
     }
 
