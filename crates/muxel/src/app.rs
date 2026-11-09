@@ -62,6 +62,8 @@ mod accomplishments_ui;
 #[cfg(all(test, windows))]
 mod claude_capture_tests;
 mod claude_launch;
+#[cfg(all(test, windows))]
+mod claude_loop_tests;
 mod close_probes;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
@@ -4433,11 +4435,25 @@ enum ActiveRunner {
     },
 }
 
+/// The launch a loop run owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopLaunch {
+    /// Its terminal is installed: this launch id.
+    Installed(Uuid),
+    /// Its terminal is still being created by the deferred launch holding this
+    /// token (Claude's launch preflight defers a loop's spawn). Only the
+    /// terminal that launch installs is adopted.
+    Deferred(u64),
+    /// Neither: no terminal and no launch pending (the spawn was refused or
+    /// waits on the user). The next heartbeat drops the run.
+    Absent,
+}
+
 /// Runtime state for one in-flight Loop run (its spawned pane).
 struct LoopRun {
     loop_id: Uuid,
     /// The launch we spawned; reopening the pane never transfers this run.
-    launch: Option<Uuid>,
+    launch: LoopLaunch,
     /// True once the agent has been seen Working (so we don't close it during the
     /// brief idle window before its prompt is typed).
     seen_working: bool,
@@ -4454,6 +4470,25 @@ enum LoopCleanup {
 }
 
 impl LoopRun {
+    /// A run of `loop_id` that owns `launch`, starting now.
+    fn new(loop_id: Uuid, launch: LoopLaunch, post_run: PostRunAction) -> Self {
+        Self {
+            loop_id,
+            launch,
+            seen_working: false,
+            started: std::time::Instant::now(),
+            post_run,
+        }
+    }
+
+    /// Whether a run still waiting for its deferred launch keeps waiting. It
+    /// does while that launch is the pane's pending one (`launch_current`) and
+    /// the run is inside the runtime cap. A cancelled or superseded launch ends
+    /// the run.
+    fn keeps_waiting(launch_current: bool, elapsed: Duration) -> bool {
+        launch_current && elapsed < MAX_LOOP_RUNTIME
+    }
+
     fn cleanup(
         &mut self,
         runtime: muxel_terminal::TerminalRuntimeSnapshot,
@@ -4461,7 +4496,7 @@ impl LoopRun {
         first_submission_binding: Option<u64>,
         elapsed: Duration,
     ) -> LoopCleanup {
-        if self.launch != Some(runtime.launch_id) {
+        if self.launch != LoopLaunch::Installed(runtime.launch_id) {
             return LoopCleanup::Abandon;
         }
         let Some(owner) = first_submission_binding else {
@@ -4524,7 +4559,7 @@ const MAX_LOOP_RUNTIME: Duration = Duration::from_secs(30 * 60);
 #[cfg(test)]
 mod loop_cleanup_tests {
     use super::{
-        AgentStatus, LoopCleanup, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, SeenStatus,
+        AgentStatus, LoopCleanup, LoopLaunch, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, SeenStatus,
         StatusBinding, StatusSample, apply_status_sample, launch_binding, loop_heartbeat,
     };
     use muxel_core::{AgentPreset, Instance};
@@ -4540,7 +4575,7 @@ mod loop_cleanup_tests {
     fn run(launch: Uuid) -> LoopRun {
         LoopRun {
             loop_id: Uuid::new_v4(),
-            launch: Some(launch),
+            launch: LoopLaunch::Installed(launch),
             seen_working: false,
             started: Instant::now(),
             post_run: PostRunAction::Exit,
@@ -4616,6 +4651,7 @@ mod loop_cleanup_tests {
             &docked,
             &popouts,
             |_| None,
+            |_, _| false,
             |session, run| {
                 let rev = session.binding_revision();
                 run.cleanup(
@@ -4626,6 +4662,40 @@ mod loop_cleanup_tests {
                 )
             },
         )
+    }
+
+    #[test]
+    fn a_run_waits_for_its_own_deferred_launch_only_and_only_inside_the_cap() {
+        let pane = Uuid::new_v4();
+        let docked: HashMap<Uuid, ()> = HashMap::new();
+        let popouts: HashMap<Uuid, ()> = HashMap::new();
+        let mut pending = run(Uuid::new_v4());
+        pending.launch = LoopLaunch::Deferred(7);
+        let mut runs = HashMap::from([(pane, pending)]);
+        let beat = |runs: &mut HashMap<Uuid, LoopRun>, pending_token: u64| {
+            loop_heartbeat(
+                runs,
+                &docked,
+                &popouts,
+                |_| None,
+                |iid, token| iid == pane && token == pending_token,
+                |_: &(), _| unreachable!("a run still launching has no terminal to judge"),
+            )
+        };
+        // No terminal yet, but its launch is still the pane's pending one.
+        assert!(beat(&mut runs, 7).is_empty());
+        assert!(runs.contains_key(&pane), "the run was dropped mid-launch");
+        // Another launch took the pane over: the run ends and closes nothing.
+        assert!(beat(&mut runs, 8).is_empty());
+        assert!(runs.is_empty(), "the run outlived its superseded launch");
+        assert!(LoopRun::keeps_waiting(
+            true,
+            MAX_LOOP_RUNTIME - Duration::from_secs(1)
+        ));
+        assert!(
+            !LoopRun::keeps_waiting(true, MAX_LOOP_RUNTIME),
+            "a launch that never lands must not hold the loop past its cap"
+        );
     }
 
     #[test]
@@ -10067,7 +10137,29 @@ impl MuxelApp {
             return;
         }
         self.terminal_launching.remove(&instance_id);
+        // A launch that failed still installs a view, to show its error.
+        let launched = matches!(&result, Ok(launch) if launch.launch_error().is_none());
         self.install_terminal_spawn(meta, result, window, cx);
+        self.settle_loop_launch(instance_id, token, launched, cx);
+    }
+
+    /// The deferred launch holding `token` has finished in pane `iid`. A loop
+    /// run waiting on exactly that launch adopts the terminal it installed, or
+    /// ends if it failed. No other terminal ever becomes the run's.
+    fn settle_loop_launch(&mut self, iid: Uuid, token: u64, launched: bool, cx: &App) {
+        if self.running_loops.get(&iid).map(|run| run.launch) != Some(LoopLaunch::Deferred(token)) {
+            return;
+        }
+        let installed = self
+            .terminal_view(iid)
+            .filter(|_| launched)
+            .map(|view| view.read(cx).session().id);
+        match (installed, self.running_loops.get_mut(&iid)) {
+            (Some(id), Some(run)) => run.launch = LoopLaunch::Installed(id),
+            _ => {
+                self.running_loops.remove(&iid);
+            }
+        }
     }
 
     /// Queue one interactive terminal launch after its pane already exists.
@@ -14977,11 +15069,13 @@ impl MuxelApp {
             .keys()
             .filter_map(|iid| self.running_loops.remove(iid).map(|run| (*iid, run)))
             .collect();
+        let launching = &self.terminal_launching;
         let close = loop_heartbeat(
             &mut self.running_loops,
             &self.terminals,
             &self.popouts,
             PopOut::terminal_view,
+            |iid, token| launch_token_current(launching, iid, token),
             |view, run| {
                 let view = view.read(cx);
                 let session = view.session();
@@ -14996,6 +15090,19 @@ impl MuxelApp {
         self.running_loops.extend(held);
         for iid in close {
             self.close_instance_inner(iid, "loop post-run", cx);
+        }
+    }
+
+    /// The launch a loop run just started in pane `iid` owns: its installed
+    /// terminal, or the deferred launch still creating it (Claude's launch
+    /// preflight defers the spawn).
+    fn loop_launch(&self, iid: Uuid, cx: &App) -> LoopLaunch {
+        if let Some(view) = self.terminal_view(iid) {
+            LoopLaunch::Installed(view.read(cx).session().id)
+        } else if let Some(ticket) = self.terminal_launching.get(&iid) {
+            LoopLaunch::Deferred(ticket.token)
+        } else {
+            LoopLaunch::Absent
         }
     }
 
@@ -15045,19 +15152,9 @@ impl MuxelApp {
         }
         self.persist_settings();
         if let Some(iid) = self.spawn_loop_agent(&lp, &preset, window, cx) {
-            self.running_loops.insert(
-                iid,
-                LoopRun {
-                    loop_id: lp.id,
-                    launch: self
-                        .terminals
-                        .get(&iid)
-                        .map(|view| view.read(cx).session().id),
-                    seen_working: false,
-                    started: std::time::Instant::now(),
-                    post_run: lp.post_run,
-                },
-            );
+            let launch = self.loop_launch(iid, cx);
+            self.running_loops
+                .insert(iid, LoopRun::new(lp.id, launch, lp.post_run));
             let project = self
                 .workspace
                 .project(lp.project_id)

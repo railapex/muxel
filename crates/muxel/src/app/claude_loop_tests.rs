@@ -1,0 +1,222 @@
+//! A loop whose agent needs Claude's launch preflight starts its terminal
+//! through a deferred launch, so for a moment its pane has no terminal. The
+//! run must outlast that gap, own exactly the terminal that launch installs,
+//! and close its pane after the turn like any other loop.
+
+use super::codex_capture_tests::with_app;
+use super::{MuxelApp, claude_test_home, unix_now};
+use gpui::{TestAppContext, WindowHandle};
+use muxel_core::{AgentPreset, InjectionMode, Loop, PostRunAction, Project};
+use muxel_terminal::{AgentStatus, TerminalSession};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// Kills the stand-in child however the test ends.
+struct Kill(Arc<TerminalSession>);
+
+impl Drop for Kill {
+    fn drop(&mut self) {
+        self.0.kill();
+    }
+}
+
+/// A project with an Exit-policy loop on a Claude preset; returns the
+/// project and the loop's index.
+fn claude_loop(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> (Uuid, usize) {
+    window
+        .update(cx, |app, _, _| {
+            let cwd = muxel_store::data_dir().unwrap().join("loop-project");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let pid = app.workspace.add_project(Project::new("Loops", cwd));
+            app.workspace.active_project = Some(pid);
+            app.current_workspace = Some(Uuid::new_v4());
+            // The stock preset: a Claude program with a resume flag, so its
+            // launch goes through the preflight, and a session flag, so muxel
+            // knows the conversation the loop's turn goes to.
+            let preset = AgentPreset::claude();
+            let mut lp = Loop::new("Nightly", pid);
+            lp.preset_id = Some(preset.id);
+            lp.post_run = PostRunAction::Exit;
+            app.presets.push(preset);
+            app.loops.push(lp);
+            (pid, app.loops.len() - 1)
+        })
+        .unwrap()
+}
+
+/// Fire loop `idx` and return its new pane, whose launch the preflight has
+/// deferred. `program` and `args` stand in for Claude.
+fn fire(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    idx: usize,
+    program: &str,
+    args: &[&str],
+) -> Uuid {
+    window
+        .update(cx, |app, window, cx| {
+            app.fire_loop(idx, unix_now(), window, cx);
+            let pane = app
+                .workspace
+                .instances
+                .iter()
+                .find(|i| i.project_id == pid)
+                .expect("the loop opened a pane")
+                .id;
+            assert!(
+                !app.terminals.contains_key(&pane) && app.terminal_launching.contains_key(&pane),
+                "Claude's preflight should defer this launch"
+            );
+            let row = app.workspace.instance_mut(pane).unwrap();
+            row.program = Some(program.into());
+            row.args = args.iter().map(|a| a.to_string()).collect();
+            row.injection = InjectionMode::None;
+            row.system_prompt = None;
+            pane
+        })
+        .unwrap()
+}
+
+/// Run the app until `done` returns something.
+fn wait_for<T>(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    what: &str,
+    mut done: impl FnMut(&mut MuxelApp, &mut gpui::Context<MuxelApp>) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        if let Some(found) = window.update(cx, |app, _, cx| done(app, cx)).unwrap() {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn heartbeat(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    window
+        .update(cx, |app, _, cx| app.process_running_loops(cx))
+        .unwrap();
+}
+
+fn tracked(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, pane: Uuid) -> bool {
+    window
+        .update(cx, |app, _, _| app.running_loops.contains_key(&pane))
+        .unwrap()
+}
+
+#[test]
+fn a_claude_loop_keeps_its_run_through_its_deferred_launch_and_closes_after_its_turn() {
+    with_app(|cx, window| {
+        let home = muxel_store::data_dir().unwrap().join("home");
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        let _home = claude_test_home(Some(home));
+        let (pid, idx) = claude_loop(cx, window);
+        // `more` echoes what it's typed and stays up. cmd ignores the session
+        // flag muxel puts ahead of these arguments.
+        let pane = fire(cx, window, pid, idx, "cmd.exe", &["/d", "/q", "/c", "more"]);
+
+        heartbeat(cx, window);
+        assert!(
+            tracked(cx, window, pane),
+            "the run was dropped while its terminal was still launching"
+        );
+        window
+            .update(cx, |app, window, cx| {
+                app.run_loop_now(idx, window, cx);
+                let panes = app
+                    .workspace
+                    .instances
+                    .iter()
+                    .filter(|i| i.project_id == pid)
+                    .count();
+                assert_eq!(panes, 1, "a second fire started while the first runs");
+            })
+            .unwrap();
+
+        let session = wait_for(cx, window, "the deferred launch to install", |app, cx| {
+            app.terminals
+                .get(&pane)
+                .map(|view| view.read(cx).session().clone())
+        });
+        let _kill = Kill(session.clone());
+        heartbeat(cx, window);
+        assert!(
+            tracked(cx, window, pane),
+            "the run doesn't own the terminal its deferred launch installed"
+        );
+
+        // The turn: submitted, then working (Claude's marker on screen) ...
+        session.mark_turn_submitted();
+        session.write_input(b"esc to interrupt\r");
+        wait_for(cx, window, "the pane to work", |app, cx| {
+            (app.terminals[&pane].read(cx).status() == AgentStatus::Working).then_some(())
+        });
+        heartbeat(cx, window);
+        assert!(tracked(cx, window, pane), "the run ended mid-turn");
+
+        // ... then finished (the marker scrolled away).
+        session.write_input(&b"\r".repeat(80));
+        wait_for(cx, window, "the turn to finish", |app, cx| {
+            matches!(
+                app.terminals[&pane].read(cx).status(),
+                AgentStatus::Idle | AgentStatus::Done
+            )
+            .then_some(())
+        });
+        heartbeat(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                assert!(
+                    app.workspace.instance(pane).is_none(),
+                    "an Exit loop left its pane open after its turn"
+                );
+                assert!(!app.running_loops.contains_key(&pane));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_claude_loop_run_never_adopts_a_terminal_its_own_launch_did_not_install() {
+    for case in ["superseded", "failed"] {
+        with_app(|cx, window| {
+            let home = muxel_store::data_dir().unwrap().join("home");
+            std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+            let _home = claude_test_home(Some(home));
+            let (pid, idx) = claude_loop(cx, window);
+            let program = match case {
+                "failed" => "muxel-no-such-program.exe",
+                _ => "cmd.exe",
+            };
+            let pane = fire(cx, window, pid, idx, program, &["/d", "/q", "/c", "more"]);
+            if case == "superseded" {
+                // Relaunching the pane replaces the loop's launch with a new one.
+                window
+                    .update(cx, |app, window, cx| app.spawn_terminal(pane, window, cx))
+                    .unwrap();
+            }
+            wait_for(cx, window, "the launch to finish", |app, _| {
+                (app.terminals.contains_key(&pane) || app.failed_launches.contains_key(&pane))
+                    .then_some(())
+            });
+            let _kill = window
+                .update(cx, |app, _, cx| {
+                    app.terminals
+                        .get(&pane)
+                        .map(|view| Kill(view.read(cx).session().clone()))
+                })
+                .unwrap();
+            heartbeat(cx, window);
+            assert!(
+                !tracked(cx, window, pane),
+                "{case}: the run outlived its launch or took another one's terminal"
+            );
+        });
+    }
+}

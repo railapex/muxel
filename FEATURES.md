@@ -708,7 +708,10 @@ feature is added or changed, update the matching entry here in the same change**
   or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy. Cleanup requires current attributable evidence from the launch and
+  copy. A loop whose agent starts through a deferred launch (Claude's launch
+  check) is tracked from the moment it fires and adopts only the terminal that
+  launch installs; if the launch fails or the pane is relaunched first, the run
+  ends without closing anything. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which
