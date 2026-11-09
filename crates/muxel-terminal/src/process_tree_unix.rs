@@ -309,6 +309,15 @@ mod linux {
         }
 
         #[test]
+        fn only_children_in_the_shells_session_count() {
+            let proc = Proc::new();
+            // zsh's zpty worker: the shell's child, in a session of its own.
+            proc.write("40/task/40/children", b"51");
+            proc.write("51/stat", b"51 (zsh) S 40 51 51");
+            assert!(has_no_children(&proc.0, 40).unwrap());
+        }
+
+        #[test]
         fn missing_children_files_fall_back_to_parent_pids() {
             for options in ["rw", "rw,hidepid=0", "rw,hidepid=off"] {
                 let proc = Proc::new();
