@@ -194,10 +194,10 @@ impl MuxelApp {
     /// [`Self::close_facts`] for the last check before a close kills the pane:
     /// a Windows shell's children come from a process table walked now, not
     /// the snapshot another pane's close may have just taken. Its prompt
-    /// evidence is only the last mark the shell printed, read again: nothing
-    /// asks PowerShell to check itself a second time, so work inside
-    /// PowerShell shows here only through a mark printed since (a command
-    /// start, a busy prompt).
+    /// evidence is the shell's marks, read again: nothing asks PowerShell to
+    /// check itself a second time, so work inside PowerShell shows here only
+    /// through a mark printed since, which [`CloseFacts::shell_marks`] counts
+    /// even when the shell is back at an idle prompt.
     fn close_facts_at_expiry(&self, iid: Uuid, cx: &App) -> CloseFacts {
         self.close_facts_walking(iid, true, cx)
     }
@@ -212,17 +212,24 @@ impl MuxelApp {
         let attributable = view.zip(snapshot).is_some_and(|(view, snapshot)| {
             snapshot.is_attributable_to(view.session().binding_revision())
         });
+        let mut shell_marks = 0;
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
                 if cfg!(windows) {
                     let session = view.session();
-                    windows_shell_close_evidence(session.shell_at_idle_prompt(), || {
-                        if fresh_walk {
-                            session.is_idle_foreground_now()
-                        } else {
-                            session.is_idle_foreground()
-                        }
-                    })
+                    let prompt = session.shell_reading();
+                    shell_marks = prompt.marks;
+                    windows_shell_close_evidence(
+                        prompt,
+                        || {
+                            if fresh_walk {
+                                session.is_idle_foreground_now()
+                            } else {
+                                session.is_idle_foreground()
+                            }
+                        },
+                        || session.shell_reading(),
+                    )
                 } else {
                     shell_close_evidence(
                         inst.and_then(|inst| inst.program.as_deref()),
@@ -275,6 +282,7 @@ impl MuxelApp {
             binding_rev: view.map_or(0, |view| view.session().binding_revision()),
             input_rev: view.map_or(0, |view| view.session().input_rev()),
             completion_rev: view.map_or(0, TerminalView::launch_completion_revision),
+            shell_marks,
         }
     }
 
@@ -1574,7 +1582,83 @@ mod tests {
             binding_rev: 0,
             input_rev: 0,
             completion_rev: 0,
+            shell_marks: 0,
         }
+    }
+
+    /// A Windows shell back at an idle prompt, with nothing typed and no
+    /// child, that printed marks after its close was made doesn't finish the
+    /// close. Here the marks come from a PowerShell whose parent cmd has
+    /// exited, which no check sees; in use they'd come from a line PowerShell
+    /// ran from input it had already read.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_shell_that_printed_marks_since_its_close_does_not_finish_it() {
+        use gpui::AppContext as _;
+        use muxel_core::recoverable_close::{CloseEvidence, CloseFacts, may_finalize};
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+        use std::time::Duration;
+
+        let powershell = std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+            .to_string_lossy()
+            .into_owned();
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let (pane, session) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("close-marks");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("close", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some(powershell.clone());
+                    instance.args = vec!["-NoLogo".into(), "-NoProfile".into()];
+                    let pane = instance.id;
+                    let spec = CommandSpec::program(&powershell, instance.args.clone());
+                    app.workspace.add_instance(instance);
+                    let launch = TerminalLaunch::spawn(spec, (100, 30)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    (pane, session)
+                })
+                .unwrap();
+            let facts = |cx: &mut gpui::TestAppContext| -> CloseFacts {
+                window
+                    .update(cx, |app, _, cx| app.close_facts(pane, cx))
+                    .unwrap()
+            };
+            let until =
+                |cx: &mut gpui::TestAppContext, what: &str, done: &dyn Fn(CloseFacts) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        cx.run_until_parked();
+                        let now = facts(cx);
+                        if done(now) {
+                            return now;
+                        }
+                        assert!(Instant::now() < deadline, "no {what}: {now:?}");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                };
+            let idle = |facts: CloseFacts| facts.evidence == CloseEvidence::ShellPrompt;
+            until(cx, "idle prompt", &idle);
+            // In 2 s, print a command start and then a plain prompt mark.
+            let late = muxel_core::winshell::encoded_command(
+                "Start-Sleep -Seconds 2; [Console]::Write(\"$([char]27)]133;C$([char]27)\\$([char]27)]133;B$([char]27)\\\")",
+            );
+            session.write_input(
+                format!("cmd /d /c start /b {powershell} -NoProfile -EncodedCommand {late}\r")
+                    .as_bytes(),
+            );
+            let before = until(cx, "the prompt after cmd exits", &idle);
+            let now = until(cx, "the late marks", &|now| {
+                idle(now) && now.shell_marks != before.shell_marks
+            });
+            assert_eq!(now.input_rev, before.input_rev, "nothing typed since");
+            assert!(!may_finalize(before, now, false), "{before:?} then {now:?}");
+        });
     }
 
     #[test]

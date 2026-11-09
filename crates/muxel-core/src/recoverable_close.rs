@@ -41,26 +41,40 @@ pub fn shell_close_evidence(
 /// process, so neither a prompt nor an empty process tree proves idleness
 /// alone. ShellPrompt needs both:
 ///
-/// - `idle_prompt`: an OSC 133 prompt showing, not marked busy
+/// - `first.idle`: an OSC 133 prompt showing, not marked busy
 ///   ([`crate::prompt_marks::BUSY_MARK`], which muxel's PowerShell wrapper
 ///   prints when it finds work running inside the shell), with nothing typed
 ///   since;
 /// - `no_child`: no live child of the shell ([`shell_is_idle`]), such as a
 ///   process started in the background.
 ///
-/// The child check walks the process table, so it runs only once the prompt
-/// holds. A shell that prints no marks (cmd, PowerShell muxel didn't wrap)
-/// never shows a prompt, so it asks. One that prints its own marks keeps the
-/// trust OSC 133 alone had before, with both checks added.
+/// The child check walks the process table, so it runs only once `first`
+/// shows an idle prompt, and the prompt is read `again` after it: a mark the
+/// shell printed during the walk, such as a command starting, means the
+/// prompt the walk was checking for is gone. A shell that prints no marks
+/// (cmd, PowerShell muxel didn't wrap) never shows a prompt, so it asks. One
+/// that prints its own marks keeps the trust OSC 133 alone had before, with
+/// both checks added.
 pub fn windows_shell_close_evidence(
-    idle_prompt: bool,
+    first: ShellReading,
     no_child: impl FnOnce() -> bool,
+    again: impl FnOnce() -> ShellReading,
 ) -> CloseEvidence {
-    if idle_prompt && no_child() {
+    if first.idle && no_child() && again() == first {
         CloseEvidence::ShellPrompt
     } else {
         CloseEvidence::Quiet
     }
+}
+
+/// What a pane's OSC 133 marks say at one moment: whether they show an idle
+/// prompt ([`windows_shell_close_evidence`]'s `first.idle`), and how many marks
+/// the shell has printed, so two readings show whether the shell printed any
+/// mark between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShellReading {
+    pub idle: bool,
+    pub marks: u64,
 }
 
 /// Whether a Windows shell sits at its prompt with nothing running, from one
@@ -109,6 +123,12 @@ pub struct CloseFacts {
     pub binding_rev: u64,
     pub input_rev: u64,
     pub completion_rev: u64,
+    /// For a Windows shell, how many OSC 133 marks it had printed when its
+    /// prompt was read ([`ShellReading::marks`]); 0 otherwise. A close made at
+    /// one count doesn't finish at another: whatever the shell did between,
+    /// such as running a line the line editor already held, the prompt it was
+    /// closed at is no longer the shell's last word.
+    pub shell_marks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,9 +379,10 @@ pub fn expired_close_sync(
 mod recoverable_close_policy_tests {
     use super::{
         CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch,
-        HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, UndoLaunch, decide,
+        HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, ShellReading, UndoLaunch, decide,
         departure_finalizes, exit_proves_closed, expired_close_sync, held_launch, may_finalize,
         rehide_held, session_may_outlive, shell_close_evidence, shell_is_idle, undo_launch,
+        windows_shell_close_evidence,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
@@ -445,6 +466,37 @@ mod recoverable_close_policy_tests {
             binding_rev: 3,
             input_rev: 7,
             completion_rev: 2,
+            shell_marks: 5,
+        }
+    }
+
+    #[test]
+    fn a_windows_prompt_counts_only_if_the_shell_printed_nothing_during_the_walk() {
+        let idle = ShellReading {
+            idle: true,
+            marks: 4,
+        };
+        assert_eq!(
+            windows_shell_close_evidence(idle, || true, || idle),
+            CloseEvidence::ShellPrompt
+        );
+        // A command starting while the process table was walked, or one that
+        // started and ended back at an idle prompt.
+        for after in [
+            ShellReading {
+                idle: false,
+                marks: 5,
+            },
+            ShellReading {
+                idle: true,
+                marks: 6,
+            },
+        ] {
+            assert_eq!(
+                windows_shell_close_evidence(idle, || true, || after),
+                CloseEvidence::Quiet,
+                "{after:?}"
+            );
         }
     }
 
@@ -628,6 +680,10 @@ mod recoverable_close_policy_tests {
             },
             CloseFacts {
                 completion_rev: 3,
+                ..before
+            },
+            CloseFacts {
+                shell_marks: 6,
                 ..before
             },
             CloseFacts {

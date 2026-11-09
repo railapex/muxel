@@ -1,6 +1,7 @@
 //! Launch-local input cancellation and bounded OSC 133 shell evidence.
 
 use muxel_core::prompt_marks::BUSY_MARK;
+use muxel_core::recoverable_close::ShellReading;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
@@ -50,6 +51,8 @@ struct PromptState {
     /// The last input ended with Ctrl+C, so the line is being discarded. The
     /// next prompt the shell draws completes that.
     cancel: bool,
+    /// Every OSC 133 mark the shell has printed, counted, whatever it changed.
+    marks: u64,
 }
 
 impl ShellPrompt {
@@ -57,11 +60,19 @@ impl ShellPrompt {
         self.0.lock().at_prompt
     }
 
-    /// At a prompt not marked busy, with nothing typed since that could still
-    /// run.
-    pub fn idle_prompt(&self) -> bool {
+    /// Whether the shell sits at a prompt not marked busy, with nothing typed
+    /// since that could still run, and how many marks it has printed.
+    pub fn reading(&self) -> ShellReading {
         let state = self.0.lock();
-        state.at_prompt && !state.busy && !state.typed
+        ShellReading {
+            idle: state.at_prompt && !state.busy && !state.typed,
+            marks: state.marks,
+        }
+    }
+
+    #[cfg(test)]
+    fn idle_prompt(&self) -> bool {
+        self.reading().idle
     }
 
     pub fn submitted(&self, bytes: &[u8]) {
@@ -86,6 +97,7 @@ impl ShellPrompt {
 
     fn mark(&self, at_prompt: bool, busy: bool) {
         let mut state = self.0.lock();
+        state.marks = state.marks.wrapping_add(1);
         state.at_prompt = at_prompt;
         state.busy = busy;
         if at_prompt && state.cancel {
@@ -284,6 +296,33 @@ mod tests {
             marks.advance(start, &prompt);
             assert!(!prompt.idle_prompt(), "a command started: {start:?}");
         }
+    }
+
+    #[test]
+    fn every_mark_the_shell_prints_counts_even_one_that_changes_nothing() {
+        let prompt = ShellPrompt::default();
+        let mut marks = ShellMarks::default();
+        marks.advance(IDLE, &prompt);
+        let drawn = prompt.reading();
+        assert!(drawn.idle);
+        // The same idle prompt drawn again.
+        marks.advance(IDLE, &prompt);
+        let again = prompt.reading();
+        assert!(again.idle);
+        assert_ne!(again, drawn);
+        // A mark that leaves the prompt's state as it was.
+        marks.advance(b"\x1b]133;A\x07", &prompt);
+        let unchanged = prompt.reading();
+        assert!(unchanged.idle);
+        assert_ne!(unchanged, again);
+        // A command that started and ended between two readings.
+        marks.advance(b"\x1b]133;C\x07", &prompt);
+        marks.advance(IDLE, &prompt);
+        assert_ne!(prompt.reading(), unchanged);
+        // Other strings aren't marks.
+        let settled = prompt.reading();
+        marks.advance(b"\x1b]0;title\x07\x1b]1333;A\x07\x1b]2;133;A\x07", &prompt);
+        assert_eq!(prompt.reading(), settled);
     }
 
     #[test]
