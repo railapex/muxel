@@ -2,28 +2,68 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Why a terminal takes no new input. A terminal can be held for both at once,
+/// and each is released on its own, so a restored close can't release a
+/// departure and a failed departure can't release a closing pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// The pane is closing. Holding moves the epoch on, so input queued before
+    /// the close is dropped, even after Undo releases the hold.
+    Close,
+    /// muxel is quitting or restarting. The epoch stays, so input queued
+    /// before the hold is still written.
+    Departure,
+}
+
+impl Hold {
+    fn bit(self) -> u64 {
+        match self {
+            Hold::Close => 1,
+            Hold::Departure => 2,
+        }
+    }
+}
+
+/// The input epoch and the holds, in one atomic: the holds in the low two bits,
+/// the epoch above them.
 #[derive(Default)]
 pub(crate) struct InputGate(AtomicU64);
 
 impl InputGate {
     pub fn epoch(&self) -> u64 {
-        self.0.load(Ordering::Acquire) >> 1
+        self.0.load(Ordering::Acquire) >> 2
     }
 
+    /// Whether new input admitted in `epoch` may be queued: nothing holds the
+    /// terminal and no close has happened since.
     pub fn accepts(&self, epoch: u64) -> bool {
-        self.0.load(Ordering::Acquire) == epoch << 1
+        self.0.load(Ordering::Acquire) == epoch << 2
     }
 
-    pub fn hold(&self) {
-        self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                Some(state.wrapping_add(2) | 1)
-            })
-            .expect("input gate update always succeeds");
+    /// Whether input already queued in `epoch` may still be written: no close
+    /// has happened since. A departure hold doesn't stop it.
+    pub fn current(&self, epoch: u64) -> bool {
+        self.0.load(Ordering::Acquire) >> 2 == epoch
     }
 
-    pub fn resume(&self) {
-        self.0.fetch_and(!1, Ordering::AcqRel);
+    pub fn hold(&self, hold: Hold) {
+        match hold {
+            Hold::Close => {
+                self.0
+                    // Adding 4 moves the epoch on and leaves the holds alone.
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                        Some(state.wrapping_add(4) | Hold::Close.bit())
+                    })
+                    .expect("input gate update always succeeds");
+            }
+            Hold::Departure => {
+                self.0.fetch_or(Hold::Departure.bit(), Ordering::AcqRel);
+            }
+        }
+    }
+
+    pub fn resume(&self, hold: Hold) {
+        self.0.fetch_and(!hold.bit(), Ordering::AcqRel);
     }
 }
 
@@ -143,19 +183,51 @@ impl ShellMarks {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputGate, ShellMarks, ShellPrompt};
+    use super::{Hold, InputGate, ShellMarks, ShellPrompt};
 
     #[test]
     fn hold_changes_the_epoch_and_resume_only_clears_the_hold() {
         let gate = InputGate::default();
         let queued = gate.epoch();
         assert!(gate.accepts(queued));
-        gate.hold();
+        gate.hold(Hold::Close);
         assert!(!gate.accepts(queued));
+        assert!(!gate.current(queued));
         assert!(!gate.accepts(gate.epoch()));
-        gate.resume();
+        gate.resume(Hold::Close);
         assert!(!gate.accepts(queued));
+        assert!(!gate.current(queued));
         assert!(gate.accepts(gate.epoch()));
+    }
+
+    /// Departure stops new input but lets queued input through, and each hold
+    /// is released on its own: a departure that gives up doesn't reopen a
+    /// closing pane, whose earlier input stays dead.
+    #[test]
+    fn a_departure_hold_keeps_queued_input_and_releases_only_itself() {
+        let gate = InputGate::default();
+        let before = gate.epoch();
+        gate.hold(Hold::Departure);
+        assert!(!gate.accepts(before), "no new input while departing");
+        assert!(gate.current(before), "queued input is still written");
+        gate.resume(Hold::Departure);
+        assert!(gate.accepts(before), "the epoch didn't move");
+
+        gate.hold(Hold::Close);
+        let closing = gate.epoch();
+        gate.hold(Hold::Departure);
+        gate.resume(Hold::Departure);
+        assert!(!gate.accepts(closing), "the close still holds");
+        assert!(
+            !gate.current(before),
+            "input from before the close stays dead"
+        );
+        gate.hold(Hold::Departure);
+        gate.resume(Hold::Close);
+        assert!(!gate.accepts(closing), "the departure still holds");
+        assert!(gate.current(closing));
+        gate.resume(Hold::Departure);
+        assert!(gate.accepts(closing));
     }
 
     #[test]

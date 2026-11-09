@@ -265,12 +265,21 @@ struct Job {
     _pending: crate::pending_ops::PendingOp,
 }
 
+/// What the input worker takes, in the order it was queued.
+enum Work {
+    Write(Job),
+    /// Answered once every job queued before it has been answered.
+    Fence(async_channel::Sender<()>),
+}
+
 /// A terminal's tmux route and its ordered input worker. ctl writes to one
 /// terminal run one at a time, in the order they were made.
 pub(crate) struct TmuxInput {
     route: TmuxInputRoute,
     shared: Arc<Shared>,
-    worker: Mutex<Option<mpsc::Sender<Job>>>,
+    /// Held to check the input gate and queue a job, and to queue a fence, so
+    /// each job is either ahead of a departure's fence or refused.
+    worker: Mutex<Option<mpsc::Sender<Work>>>,
 }
 
 impl TmuxInput {
@@ -295,13 +304,17 @@ impl TmuxInput {
     /// Queue `input`, admitted in input `epoch`, for the agent's pane, which
     /// the first write looks up. `pending` counts the write as pending input
     /// until the worker has answered it, and committed `submit` first when
-    /// tmux took it.
+    /// tmux took it. A terminal held since `epoch` refuses it. Once it is
+    /// queued, and before anyone can fence the worker, `queued` records what
+    /// queuing it changes; it runs under the worker's lock, so it must only
+    /// update atomics.
     pub(crate) fn deliver(
         &self,
         input: ControlInput,
         epoch: u64,
         submit: Option<Submit>,
         pending: crate::pending_ops::PendingOp,
+        queued: impl FnOnce(),
     ) -> async_channel::Receiver<Delivered> {
         let (done, rx) = async_channel::bounded(1);
         let job = Job {
@@ -311,16 +324,20 @@ impl TmuxInput {
             submit,
             _pending: pending,
         };
-        if let Err(job) = self.send(job) {
-            let _ = job.done.try_send(Err(ControlWriteError::Refused(
-                "muxel couldn't start its tmux input worker".into(),
-            )));
+        if let Err((job, error)) = self.send(job, queued) {
+            let _ = job.done.try_send(Err(error));
         }
         rx
     }
 
-    fn send(&self, job: Job) -> Result<(), Job> {
+    fn send(&self, job: Job, queued: impl FnOnce()) -> Result<(), (Job, ControlWriteError)> {
         let mut worker = self.worker.lock();
+        // Checked under the lock a departure fences with: a hold set before
+        // the fence was queued refuses this job, and a job that passes is
+        // queued ahead of any fence.
+        if !self.shared.gate.accepts(job.epoch) {
+            return Err((job, ControlWriteError::Closed("terminal is closing".into())));
+        }
         if worker.is_none() {
             let (tx, rx) = mpsc::channel();
             let route = self.route.clone();
@@ -329,15 +346,39 @@ impl TmuxInput {
                 .name("muxel-tmux-input".into())
                 .spawn(move || work(&route, &shared, rx));
             if spawned.is_err() {
-                return Err(job);
+                return Err((
+                    job,
+                    ControlWriteError::Refused("muxel couldn't start its tmux input worker".into()),
+                ));
             }
             *worker = Some(tx);
         }
-        worker
+        let sent = worker
             .as_ref()
             .expect("worker started above")
-            .send(job)
-            .map_err(|error| error.0)
+            .send(Work::Write(job));
+        match sent {
+            Ok(()) => {
+                queued();
+                Ok(())
+            }
+            Err(mpsc::SendError(Work::Write(job))) => Err((
+                job,
+                ControlWriteError::Refused("muxel's tmux input worker stopped".into()),
+            )),
+            Err(mpsc::SendError(Work::Fence(_))) => unreachable!("a write was sent"),
+        }
+    }
+
+    /// Queue a fence behind every job queued so far. It answers once they're
+    /// all answered; `None` means nothing was ever queued, or nothing more
+    /// can be delivered. The caller has already held the gate, so no job
+    /// queued after the fence is delivered.
+    pub(crate) fn fence(&self) -> Option<async_channel::Receiver<()>> {
+        let worker = self.worker.lock();
+        let (done, acked) = async_channel::bounded(1);
+        worker.as_ref()?.send(Work::Fence(done)).ok()?;
+        Some(acked)
     }
 }
 
@@ -353,13 +394,21 @@ impl Drop for TmuxInput {
 /// the answer goes back, then the job stops counting as pending input. So a
 /// delivered Enter is recorded whether or not anyone still waits for it, and
 /// quitting can't see the terminal's input settled before it is.
-fn work(route: &TmuxInputRoute, shared: &Shared, jobs: mpsc::Receiver<Job>) {
-    while let Ok(job) = jobs.recv() {
+fn work(route: &TmuxInputRoute, shared: &Shared, jobs: mpsc::Receiver<Work>) {
+    while let Ok(work) = jobs.recv() {
+        let job = match work {
+            Work::Write(job) => job,
+            Work::Fence(done) => {
+                let _ = done.try_send(());
+                continue;
+            }
+        };
         let result = if shared.closed.load(Ordering::Acquire) {
             Err(ControlWriteError::Refused("the terminal closed".into()))
-        } else if !shared.gate.accepts(job.epoch) {
+        } else if !shared.gate.current(job.epoch) {
             // As a held PTY write fails: the pane closed, or was closed and
-            // brought back, after this write was queued.
+            // brought back, after this write was queued. A departure hold
+            // lets it through.
             Err(ControlWriteError::Closed("terminal is closing".into()))
         } else {
             pinned_pane(route, shared, Instant::now())
@@ -683,7 +732,7 @@ mod tests {
     fn deliver(input: &TmuxInput, write: ControlInput) -> Result<(), ControlWriteError> {
         let pending = Arc::<crate::pending_ops::PendingOps>::default();
         input
-            .deliver(write, 0, None, pending.begin())
+            .deliver(write, 0, None, pending.begin(), || {})
             .recv_blocking()
             .unwrap()
     }
@@ -1144,6 +1193,149 @@ mod tests {
             .collect();
         assert_eq!(typed, ["send-keys", "send-keys"]);
         session.kill();
+    }
+
+    /// A departure refuses new ctl input through tmux and moves nothing for
+    /// it, but writes queued before it are still delivered, and its fence
+    /// answers only once they have been.
+    #[test]
+    fn a_departure_lets_queued_tmux_writes_through_and_fences_behind_them() {
+        let calls: Calls = Arc::default();
+        let seen = calls.clone();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let route = TmuxInputRoute::new(
+            "muxel_p_1",
+            true,
+            move |args: &[String], stdin: Option<&[u8]>| {
+                let args = admitted_args(args);
+                seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
+                Ok(match args[0].as_str() {
+                    "list-panes" => output(0, AGENT_PANES, ""),
+                    // Each press waits to be let through.
+                    "send-keys" => {
+                        let _ = released.lock().recv();
+                        output(0, "", "")
+                    }
+                    _ => output(0, "", ""),
+                })
+            },
+        );
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) =
+            TerminalSession::spawn(spec.with_tmux_input(route), 80, 24).expect("spawn PTY");
+        let presses = |count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while commands(&calls)
+                .iter()
+                .filter(|c| *c == "send-keys")
+                .count()
+                < count
+            {
+                assert!(Instant::now() < deadline, "press {count} never ran");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let pressing = session.control_write(ControlInput::Keys {
+            keys: vec![Key::Enter],
+            app_cursor: false,
+        });
+        let queued = session.control_write(ControlInput::Submit);
+        presses(1);
+
+        let fence = session.hold_for_departure().acked();
+        let mut fence = std::pin::pin!(fence);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let rev = session.input_rev();
+        let held = session.control_write(ControlInput::Paste("held".into()));
+        assert!(
+            matches!(held.ready(), Some(Err(ControlWriteError::Closed(_)))),
+            "{held:?}"
+        );
+        assert_eq!(session.input_rev(), rev, "a refused write moves nothing");
+        assert!(
+            fence.as_mut().poll(&mut cx).is_pending(),
+            "a press is in flight"
+        );
+        release.send(()).unwrap();
+        finish(pressing).unwrap();
+        presses(2);
+        assert!(
+            fence.as_mut().poll(&mut cx).is_pending(),
+            "the queued Enter is still to come"
+        );
+        release.send(()).unwrap();
+        finish(queued).unwrap();
+        assert!(
+            session.has_submitted_turn(),
+            "the queued Enter was delivered"
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while fence.as_mut().poll(&mut cx).is_pending() {
+            assert!(Instant::now() < deadline, "the fence never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        session.release_departure();
+        finish(session.control_write(ControlInput::Paste("after".into()))).unwrap();
+        session.kill();
+    }
+
+    /// Writers on other threads race a departure through tmux. Every write is
+    /// either refused or delivered before the fence answers, none after.
+    #[test]
+    fn a_tmux_fence_answers_after_every_admitted_write_and_before_any_other() {
+        use crate::session::{Hold, InputGate};
+        for round in 0..100 {
+            let (route, calls) = route(|_| Ok(output(0, "", "")));
+            let gate = Arc::new(InputGate::default());
+            let input = Arc::new(TmuxInput::new(route, gate.clone()));
+            let pending = Arc::<crate::pending_ops::PendingOps>::default();
+            let start = Arc::new(std::sync::Barrier::new(4));
+            let writers: Vec<_> = (0..3)
+                .map(|id| {
+                    let (input, pending, start) = (input.clone(), pending.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut answers = Vec::new();
+                        for seq in 0u32.. {
+                            let write = ControlInput::Paste(format!("{id}-{seq}"));
+                            let answer = input.deliver(write, 0, None, pending.begin(), || {});
+                            match answer.try_recv() {
+                                // Refused as it was queued: the hold is set.
+                                Ok(Err(ControlWriteError::Closed(_))) => break,
+                                Ok(done) => assert!(done.is_ok(), "{done:?}"),
+                                Err(_) => answers.push(answer),
+                            }
+                        }
+                        answers
+                    })
+                })
+                .collect();
+            start.wait();
+            gate.hold(Hold::Departure);
+            if let Some(fence) = input.fence() {
+                let _ = fence.recv_blocking();
+            }
+            let at_ack = calls.lock().len();
+            for writer in writers {
+                for answer in writer.join().unwrap() {
+                    assert!(
+                        answer.recv_blocking().unwrap().is_ok(),
+                        "round {round}: an admitted write wasn't delivered"
+                    );
+                }
+            }
+            assert_eq!(
+                calls.lock().len(),
+                at_ack,
+                "round {round}: delivered after the fence answered"
+            );
+        }
     }
 
     /// A submit tmux takes is the terminal's to record, whoever waits for it.

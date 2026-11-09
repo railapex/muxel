@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 #[path = "input_hold.rs"]
 mod input_hold;
-pub(crate) use input_hold::InputGate;
+pub(crate) use input_hold::{Hold, InputGate};
 use input_hold::{ShellMarks, ShellPrompt};
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
@@ -890,22 +890,200 @@ struct QueuedWrite {
 }
 
 impl QueuedWrite {
+    /// Whether the writer may still write it: no close since it was queued. A
+    /// departure hold doesn't drop it.
     fn admitted(&self, gate: &InputGate) -> bool {
-        self.epoch.is_none_or(|epoch| gate.accepts(epoch))
+        self.epoch.is_none_or(|epoch| gate.current(epoch))
     }
+}
+
+/// What the PTY writer thread takes, in the order it was sent.
+enum PtyInput {
+    Write(QueuedWrite),
+    /// Answered once every write sent before it has been written, failed or
+    /// been dropped. If the writer stops first, the sender drops unanswered,
+    /// which means the same: nothing sent before it can be written any more.
+    Fence(async_channel::Sender<()>),
+    /// The session is going: write nothing more.
+    Stop,
+}
+
+/// The PTY writer thread: writes each queued write in turn and answers each
+/// fence once the writes before it are done. Returns when the session stops
+/// it, every sender is gone, or a write fails (the child is gone).
+fn write_queued(
+    queue: std::sync::mpsc::Receiver<PtyInput>,
+    pipe: &mut dyn Write,
+    gate: &InputGate,
+    closed: &AtomicBool,
+    profile: Option<Uuid>,
+) {
+    let mut prior_profiler_interval = None;
+    while let Ok(input) = queue.recv() {
+        let write = match input {
+            PtyInput::Write(write) => write,
+            PtyInput::Fence(done) => {
+                let _ = done.try_send(());
+                continue;
+            }
+            PtyInput::Stop => break,
+        };
+        if closed.load(Ordering::Acquire) {
+            break;
+        }
+        let queue_delay = write.queued_at.map(|queued_at| {
+            queue_delay_excluding_profiler(queued_at, Instant::now(), prior_profiler_interval)
+        });
+        let write_started = write.queued_at.map(|_| Instant::now());
+        if !write.admitted(gate) {
+            continue;
+        }
+        let result = pipe.write_all(&write.bytes);
+        if result.is_ok() {
+            let _ = pipe.flush();
+        }
+        if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
+            (profile, queue_delay, write_started)
+        {
+            let profile_started = Instant::now();
+            crate::profile::pty_write(
+                instance_id,
+                write.bytes.len(),
+                queue_delay,
+                write_started.elapsed(),
+            );
+            prior_profiler_interval = Some((profile_started, Instant::now()));
+        }
+        if result.is_err() {
+            break;
+        }
+    }
+}
+
+/// A departure's fence on one terminal's writers; see
+/// [`TerminalSession::hold_for_departure`].
+pub struct InputFence {
+    acks: Vec<async_channel::Receiver<()>>,
+}
+
+impl InputFence {
+    /// Wait until every write admitted before the hold has been written or
+    /// has failed.
+    pub async fn acked(self) {
+        for ack in self.acks {
+            // A writer that stopped first drops its fence unanswered: done too.
+            let _ = ack.recv().await;
+        }
+    }
+}
+
+/// Hold `gate` for departure and queue a fence behind every write `writer`
+/// has queued. Both happen under `writer`'s lock, which every gated write
+/// takes to check the gate and queue its bytes, so each write is either ahead
+/// of the fence or refused.
+fn fence_pty(
+    writer: &Mutex<Box<dyn Write + Send>>,
+    gate: &InputGate,
+    queue: &std::sync::mpsc::Sender<PtyInput>,
+) -> async_channel::Receiver<()> {
+    let (done, acked) = async_channel::bounded(1);
+    let _writer = writer.lock();
+    gate.hold(Hold::Departure);
+    // A writer that has stopped drops this unanswered, which counts as done.
+    let _ = queue.send(PtyInput::Fence(done));
+    acked
 }
 
 #[cfg(test)]
 mod input_hold_queue_tests {
-    use super::{ChannelWriter, InputGate, QueuedWrite};
+    use super::{ChannelWriter, Hold, InputGate, PtyInput, fence_pty, write_queued};
+    use parking_lot::Mutex;
     use std::io::Write;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
+    type Written = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// A PTY that keeps what it's written and, when `paced`, waits for a
+    /// permit before each write, as a child that has stopped reading does.
+    struct Pipe {
+        written: Written,
+        paced: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(permits) = &self.paced {
+                permits.recv().map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            }
+            self.written.lock().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pieces of a session's PTY input: its gate, its gated writer, and
+    /// its writer thread, writing to a [`Pipe`].
+    struct Input {
+        gate: Arc<InputGate>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        queue: mpsc::Sender<PtyInput>,
+        written: Written,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Input {
+        fn new(paced: Option<mpsc::Receiver<()>>) -> Self {
+            let gate = Arc::new(InputGate::default());
+            let closed = Arc::new(AtomicBool::new(false));
+            let (queue, rx) = mpsc::channel();
+            let written = Written::default();
+            let mut pipe = Pipe {
+                written: written.clone(),
+                paced,
+            };
+            let thread = std::thread::spawn({
+                let gate = gate.clone();
+                let closed = closed.clone();
+                move || write_queued(rx, &mut pipe, &gate, &closed, None)
+            });
+            let writer: Box<dyn Write + Send> = Box::new(ChannelWriter {
+                tx: queue.clone(),
+                profile: false,
+                closed,
+                gate: Some(gate.clone()),
+            });
+            Self {
+                gate,
+                writer: Arc::new(Mutex::new(writer)),
+                queue,
+                written,
+                thread,
+            }
+        }
+
+        fn write(&self, bytes: &[u8]) -> bool {
+            self.writer.lock().write_all(bytes).is_ok()
+        }
+
+        fn fence(&self) -> async_channel::Receiver<()> {
+            fence_pty(&self.writer, &self.gate, &self.queue)
+        }
+
+        fn stop(self) -> Vec<Vec<u8>> {
+            let _ = self.queue.send(PtyInput::Stop);
+            self.thread.join().unwrap();
+            self.written.lock().clone()
+        }
+    }
 
     #[test]
     fn queued_ctl_writes_die_with_the_close_even_after_undo() {
         let gate = Arc::new(InputGate::default());
-        let (tx, rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (tx, rx) = mpsc::channel::<PtyInput>();
         let mut actor = ChannelWriter {
             tx: tx.clone(),
             profile: false,
@@ -920,18 +1098,102 @@ mod input_hold_queue_tests {
         };
         actor.write_all(b"queued keys").unwrap();
         actor.write_all(b"\r").unwrap();
-        gate.hold();
+        gate.hold(Hold::Close);
         assert!(actor.write_all(b"held").is_err());
         protocol.write_all(b"\x1b[0n").unwrap();
-        gate.resume();
+        gate.resume(Hold::Close);
         actor.write_all(b"new input").unwrap();
         let accepted: Vec<_> = rx
             .try_iter()
-            .flatten()
-            .filter(|write| write.admitted(&gate))
-            .map(|write| write.bytes)
+            .filter_map(|input| match input {
+                PtyInput::Write(write) => write.admitted(&gate).then_some(write.bytes),
+                _ => None,
+            })
             .collect();
         assert_eq!(accepted, [b"\x1b[0n".to_vec(), b"new input".to_vec()]);
+    }
+
+    /// Writers on other threads race a departure. Every write is either
+    /// refused or written before the fence answers, and none is written after.
+    #[test]
+    fn a_departure_fence_answers_after_every_admitted_write_and_before_any_other() {
+        const WRITERS: u8 = 4;
+        for round in 0..200 {
+            let input = Arc::new(Input::new(None));
+            let start = Arc::new(Barrier::new(usize::from(WRITERS) + 1));
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|id| {
+                    let input = input.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut admitted = Vec::new();
+                        for seq in 0u32.. {
+                            let mut bytes = vec![id];
+                            bytes.extend(seq.to_le_bytes());
+                            if !input.write(&bytes) {
+                                break;
+                            }
+                            admitted.push(bytes);
+                        }
+                        admitted
+                    })
+                })
+                .collect();
+            start.wait();
+            let fence = input.fence();
+            let _ = fence.recv_blocking();
+            let at_ack = input.written.lock().clone();
+            let mut admitted: Vec<_> = writers
+                .into_iter()
+                .flat_map(|writer| writer.join().unwrap())
+                .collect();
+            let input = Arc::into_inner(input).expect("the writers are done");
+            let written = input.stop();
+            assert_eq!(
+                written, at_ack,
+                "round {round}: written after the fence answered"
+            );
+            let mut sorted = written.clone();
+            sorted.sort();
+            admitted.sort();
+            assert_eq!(
+                sorted, admitted,
+                "round {round}: an admitted write went missing"
+            );
+        }
+    }
+
+    /// A fence that went unanswered, and whose departure gave up, can't answer
+    /// for the next one: each waits for the writes queued before itself.
+    #[test]
+    fn a_late_fence_answer_belongs_to_its_own_departure() {
+        let (permit, permits) = mpsc::channel();
+        let input = Input::new(Some(permits));
+        assert!(input.write(b"first"));
+        let first = input.fence();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            first.try_recv().is_err(),
+            "the first write is still blocked"
+        );
+        input.gate.resume(Hold::Departure);
+        assert!(
+            input.write(b"second"),
+            "input flows once the departure gives up"
+        );
+        let second = input.fence();
+        permit.send(()).unwrap();
+        first.recv_blocking().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            second.try_recv().is_err(),
+            "the first fence's answer doesn't answer the second"
+        );
+        permit.send(()).unwrap();
+        second.recv_blocking().unwrap();
+        assert!(!input.write(b"held"));
+        assert_eq!(input.stop(), [b"first".to_vec(), b"second".to_vec()]);
     }
 }
 
@@ -950,7 +1212,7 @@ fn queue_delay_excluding_profiler(
 }
 
 struct ChannelWriter {
-    tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    tx: std::sync::mpsc::Sender<PtyInput>,
     profile: bool,
     closed: Arc<AtomicBool>,
     gate: Option<Arc<InputGate>>,
@@ -977,7 +1239,7 @@ impl Write for ChannelWriter {
             ));
         }
         self.tx
-            .send(Some(QueuedWrite {
+            .send(PtyInput::Write(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
                 epoch,
@@ -1323,7 +1585,9 @@ pub struct TerminalSession {
     input_closed: Arc<AtomicBool>,
     input_gate: Arc<InputGate>,
     shell_prompt: Arc<ShellPrompt>,
-    input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    /// The PTY writer thread's queue, for its stop and departure fences. Input
+    /// goes through `writer`, which checks the gate.
+    input_queue: std::sync::mpsc::Sender<PtyInput>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
     /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
@@ -1692,7 +1956,7 @@ impl TerminalSession {
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<PtyInput>();
         let input_closed = Arc::new(AtomicBool::new(false));
         let input_gate = Arc::new(InputGate::default());
         let worker_gate = input_gate.clone();
@@ -1701,44 +1965,13 @@ impl TerminalSession {
         let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
-                // Exits when every sender is gone (session dropped) or the
-                // pipe breaks (child gone).
-                let mut prior_profiler_interval = None;
-                while let Ok(Some(write)) = write_rx.recv() {
-                    if worker_closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let queue_delay = write.queued_at.map(|queued_at| {
-                        queue_delay_excluding_profiler(
-                            queued_at,
-                            Instant::now(),
-                            prior_profiler_interval,
-                        )
-                    });
-                    let write_started = write.queued_at.map(|_| Instant::now());
-                    if !write.admitted(&worker_gate) {
-                        continue;
-                    }
-                    let result = pipe_writer.write_all(&write.bytes);
-                    if result.is_ok() {
-                        let _ = pipe_writer.flush();
-                    }
-                    if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
-                        (profile_writes, queue_delay, write_started)
-                    {
-                        let profile_started = Instant::now();
-                        crate::profile::pty_write(
-                            instance_id,
-                            write.bytes.len(),
-                            queue_delay,
-                            write_started.elapsed(),
-                        );
-                        prior_profiler_interval = Some((profile_started, Instant::now()));
-                    }
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                write_queued(
+                    write_rx,
+                    &mut *pipe_writer,
+                    &worker_gate,
+                    &worker_closed,
+                    profile_writes,
+                )
             })
             .context("spawn pty writer thread")?;
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
@@ -1817,7 +2050,7 @@ impl TerminalSession {
                     let mut child = child;
                     let status = child.wait();
                     monitor_closed.store(true, Ordering::Release);
-                    let _ = monitor_stop.send(None);
+                    let _ = monitor_stop.send(PtyInput::Stop);
                     // Publish before close: the reader emits Exit only after
                     // draining all output produced before the child died.
                     let _ = exit_tx.send(status);
@@ -1828,7 +2061,7 @@ impl TerminalSession {
             monitor_spawn_result(monitor, &output_queue, || {
                 let _ = killer.lock().kill();
                 input_closed.store(true, Ordering::Release);
-                let _ = write_tx.send(None);
+                let _ = write_tx.send(PtyInput::Stop);
                 master.close();
             })
             .context("spawn PTY child monitor")?
@@ -1889,7 +2122,7 @@ impl TerminalSession {
             input_closed,
             input_gate: input_gate.clone(),
             shell_prompt,
-            input_stop: write_tx,
+            input_queue: write_tx,
             child_pid,
             title,
             evidence,
@@ -2386,16 +2619,6 @@ impl TerminalSession {
         self.submission.record(submitted_at, prompt);
     }
 
-    /// The bookkeeping a ctl paste or key press through tmux does when it is
-    /// queued: tmux reports delivery later, and these facts don't wait for it.
-    fn note_control_input(&self, nonempty: bool) {
-        self.scroll_input_to_bottom();
-        if nonempty {
-            self.advance_input(Some(false));
-            self.mark_interactive();
-        }
-    }
-
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
     /// tmux client gets it at its agent's tmux pane through tmux, queued in order
     /// behind this terminal's earlier ctl writes; any other terminal gets the
@@ -2423,34 +2646,46 @@ impl TerminalSession {
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
-        // Held for closing, the pane takes no ctl input by this route either.
-        // A write queued before the hold dies on the worker, even after Undo.
+        // Held, the pane takes no ctl input by this route either; the worker
+        // checks under the lock a departure fences with. A write queued
+        // before a close dies on the worker, even after Undo.
         let epoch = self.input_epoch();
-        if !self.accepts_input_epoch(epoch) {
-            return ControlWrite::done(Err(ControlWriteError::Closed(
-                "terminal is closing".into(),
-            )));
-        }
-        let submit = match &input {
+        let (submit, typed) = match &input {
             ControlInput::Submit | ControlInput::SubmitKey => {
-                self.scroll_input_to_bottom();
                 let prompt = input == ControlInput::Submit;
-                Some(crate::control_input::Submit {
+                let submit = crate::control_input::Submit {
                     facts: self.submission.clone(),
                     at: SystemTime::now(),
                     prompt,
-                })
+                };
+                (Some(submit), false)
             }
-            ControlInput::Paste(text) => {
-                self.note_control_input(!text.is_empty());
-                None
-            }
-            ControlInput::Keys { keys, .. } => {
-                self.note_control_input(!keys.is_empty());
-                None
-            }
+            ControlInput::Paste(text) => (None, !text.is_empty()),
+            ControlInput::Keys { keys, .. } => (None, !keys.is_empty()),
         };
-        ControlWrite::queued(tmux.deliver(input, epoch, submit, self.begin_pending_op()))
+        let mut queued = false;
+        let delivered = tmux.deliver(input, epoch, submit, self.begin_pending_op(), || {
+            // A paste or key press moves the input revision as it's queued;
+            // tmux reports delivery later, and this doesn't wait for it.
+            if typed {
+                self.advance_input(Some(false));
+            }
+            queued = true;
+        });
+        if !queued {
+            // Refused as it was queued, and answered already: known at once,
+            // as a refused PTY write is.
+            return ControlWrite::done(delivered.try_recv().unwrap_or_else(|_| {
+                Err(ControlWriteError::Refused(
+                    "muxel's tmux input worker stopped".into(),
+                ))
+            }));
+        }
+        self.scroll_input_to_bottom();
+        if typed {
+            self.mark_interactive();
+        }
+        ControlWrite::queued(delivered)
     }
 
     /// How many pieces of admitted input can still reach this terminal's
@@ -2507,11 +2742,31 @@ impl TerminalSession {
 
     /// Hide-time cancellation: old queued input stays invalid after Undo.
     pub fn hold_input(&self) {
-        self.input_gate.hold();
+        self.input_gate.hold(Hold::Close);
     }
 
+    /// Release the close hold. A departure hold, if any, stays.
     pub fn resume_input(&self) {
-        self.input_gate.resume();
+        self.input_gate.resume(Hold::Close);
+    }
+
+    /// Stop new input for quitting or restarting, and fence the writers: the
+    /// returned fence answers once every write admitted before the hold, by
+    /// PTY or through tmux, has been written or has failed. Unlike a close,
+    /// input already queued is still written. Each call makes its own fence,
+    /// so an answer that comes after its departure gave up can't answer a
+    /// later one.
+    pub fn hold_for_departure(&self) -> InputFence {
+        let pty = fence_pty(&self.writer, &self.input_gate, &self.input_queue);
+        let tmux = self.tmux_input.as_ref().and_then(|tmux| tmux.fence());
+        InputFence {
+            acks: std::iter::once(pty).chain(tmux).collect(),
+        }
+    }
+
+    /// Release the departure hold. A close hold, if any, stays.
+    pub fn release_departure(&self) {
+        self.input_gate.resume(Hold::Departure);
     }
 
     pub fn input_epoch(&self) -> u64 {
@@ -3954,7 +4209,7 @@ fn appimage_env_fixups(
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         self.input_closed.store(true, Ordering::Release);
-        let _ = self.input_stop.send(None);
+        let _ = self.input_queue.send(PtyInput::Stop);
         // Release a reader parked on a full output queue before the `master`
         // field drops and closes the platform PTY; a receiver that outlives
         // the session must not hold that close hostage.
@@ -4212,7 +4467,7 @@ impl HangupChild {
 /// before reaping the child; OSC 133 evidence is observed before UI admission.
 struct InputShutdown {
     closed: Arc<AtomicBool>,
-    stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    stop: std::sync::mpsc::Sender<PtyInput>,
     shell_prompt: Arc<ShellPrompt>,
 }
 
@@ -4305,7 +4560,7 @@ fn read_loop(
         }
     }
     input_shutdown.closed.store(true, Ordering::Release);
-    let _ = input_shutdown.stop.send(None);
+    let _ = input_shutdown.stop.send(PtyInput::Stop);
     // The reader's master-fd dups are no longer needed; free them before the
     // (potentially long) reap below so closed sessions don't hold PTYs open.
     drop(reader);
