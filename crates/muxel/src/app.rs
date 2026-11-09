@@ -85,6 +85,13 @@ mod remote_reconnect_tests;
 mod rescue;
 #[cfg(all(test, windows))]
 mod rescue_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: deleting a workspace stops once the index is saved, as
+    /// a crash there would.
+    static STOP_AFTER_INDEX_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 #[cfg(all(test, windows))]
 mod restart_completion_tests;
 mod restart_guard;
@@ -21631,7 +21638,21 @@ impl MuxelApp {
         } else {
             None
         };
-        let deletion = match muxel_store::rescue::hold_workspace_for_deletion(id, held) {
+        // Then its deletion is recorded, before the index forgets it: a crash
+        // from here on leaves nothing it kept once muxel starts again.
+        let marked =
+            muxel_store::rescue::hold_workspace_for_deletion(id, held).and_then(|deletion| {
+                match deletion.mark() {
+                    Ok(()) => Ok(deletion),
+                    Err(e) => {
+                        if current {
+                            self.workspace_lock = deletion.release();
+                        }
+                        Err(e)
+                    }
+                }
+            });
+        let deletion = match marked {
             Ok(deletion) => deletion,
             Err(e) => {
                 log::warn!("couldn't delete workspace {id}: {e:#}");
@@ -21660,6 +21681,10 @@ impl MuxelApp {
         match muxel_store::save_workspaces_index(&self.workspaces) {
             Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
             Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+        }
+        #[cfg(test)]
+        if STOP_AFTER_INDEX_SAVE.with(std::cell::Cell::get) {
+            return;
         }
         // Its document, the unsent prompts and unsaved changes it kept, and
         // its lock file. A rescue write still on its way leaves nothing.

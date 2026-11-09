@@ -915,6 +915,68 @@ fn deleting_a_workspace_deletes_what_it_kept() {
 }
 
 #[test]
+fn a_crash_while_deleting_a_workspace_leaves_nothing_it_kept_once_muxel_starts_again() {
+    with_app(|cx, window| {
+        let doomed = saved_workspace("doomed");
+        let kept = saved_workspace("kept");
+        let dir = muxel_store::rescue::rescue_dir(doomed).unwrap();
+        dir.save_draft(Uuid::new_v4(), &draft("never sent"))
+            .unwrap();
+        let workspace_dir = dir.path().parent().unwrap().to_path_buf();
+        super::STOP_AFTER_INDEX_SAVE.with(|stop| stop.set(true));
+        window
+            .update(cx, |app, _, cx| {
+                let current = *app.current_workspace.get_or_insert_with(Uuid::new_v4);
+                for id in [current, doomed, kept] {
+                    app.workspaces.workspaces.push(muxel_core::WorkspaceMeta {
+                        id,
+                        name: id.to_string(),
+                    });
+                }
+                app.delete_workspace(doomed, cx);
+            })
+            .unwrap();
+        super::STOP_AFTER_INDEX_SAVE.with(|stop| stop.set(false));
+        // muxel starts again and opens a workspace.
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(kept, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            files_under(&workspace_dir),
+            Vec::<String>::new(),
+            "nothing the deleted workspace kept is left"
+        );
+    });
+}
+
+#[test]
+fn saving_turned_off_elsewhere_deletes_what_every_workspace_kept_when_muxel_starts() {
+    with_app(|cx, window| {
+        let other = saved_workspace("other");
+        let opened = saved_workspace("opened");
+        let dir = muxel_store::rescue::rescue_dir(other).unwrap();
+        dir.save_draft(Uuid::new_v4(), &draft("never sent"))
+            .unwrap();
+        // Another window turned saving off; this draft outlived its purge.
+        muxel_store::rescue::set_rescue_turned_off(true).unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(opened, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            files_under(dir.path()),
+            Vec::<String>::new(),
+            "the other workspace's draft is gone too"
+        );
+    });
+}
+
+#[test]
 fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);

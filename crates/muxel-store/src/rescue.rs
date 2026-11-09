@@ -104,7 +104,9 @@ impl Stops {
 
     /// A write landed at `target`: take it back if a stop appeared after it
     /// started, with the directory it may have recreated for a deleted
-    /// workspace.
+    /// workspace. This cleans up after the write; it doesn't stop it. What
+    /// it can't delete stays until a workspace next opens, whose sweep (or
+    /// purge, with saving off) tries again.
     fn undo(&self, target: &Path) -> Result<()> {
         if self.workspace_gone() {
             bail!("the workspace was deleted");
@@ -132,6 +134,12 @@ impl Stops {
 /// The marker left beside workspace directory `dir` once it was deleted.
 fn deleted_marker(dir: &Path) -> PathBuf {
     dir.with_extension(DELETED)
+}
+
+/// Whether workspace `workspace`, under the workspaces directory
+/// `workspaces`, was marked deleted.
+pub(crate) fn marked_deleted_in(workspaces: &Path, workspace: Uuid) -> bool {
+    deleted_marker(&workspaces.join(workspace.to_string())).exists()
 }
 
 fn remove_tree(dir: &Path) {
@@ -731,14 +739,27 @@ fn hold_in(root: &Path, workspace: Uuid, held: Option<std::fs::File>) -> Result<
 }
 
 impl WorkspaceDeletion {
+    /// Record that the workspace is being deleted, before anything else about
+    /// it changes. From here on it is never listed again, a rescue write
+    /// still on its way deletes what it lands, and the sweep when a
+    /// workspace next opens deletes whatever is left, so a crash before
+    /// [`Self::delete`] finishes strands nothing.
+    pub fn mark(&self) -> Result<()> {
+        write_private(&deleted_marker(&self.dir), b"", 0, &Stops::default())
+            .context("marking the workspace deleted")
+    }
+
+    /// Give back the lock this held, deleting nothing: marking it failed.
+    pub fn release(self) -> Option<std::fs::File> {
+        self.lock
+    }
+
     /// Delete the workspace's directory: its document, everything it kept,
-    /// and its lock file. Its deleted marker goes first, so a rescue write
-    /// still on its way deletes what it writes, directory and all. What
+    /// and its lock file. It is marked first (see [`Self::mark`]). What
     /// couldn't be deleted is reported.
     pub fn delete(self) -> Result<()> {
+        self.mark()?;
         let Self { dir, lock } = self;
-        write_private(&deleted_marker(&dir), b"", 0, &Stops::default())
-            .context("marking the workspace deleted")?;
         let mut failed = Vec::new();
         match std::fs::read_dir(&dir) {
             Ok(entries) => {
@@ -794,8 +815,11 @@ fn delete_workspace_dir_in(root: &Path, workspace: Uuid) -> Result<()> {
     hold_in(root, workspace, None)?.delete()
 }
 
-/// Delete what is left of deleted workspaces: a write cut off between
-/// landing and checking for the marker leaves its directory behind.
+/// Delete what is left of deleted workspaces, each time a workspace opens: a
+/// crash during a deletion, a write cut off between landing and checking for
+/// the marker, or a deletion that failed leaves a directory beside its
+/// marker. Until then it stays on disk; this is cleanup after the fact, not
+/// a barrier that stops the write.
 pub fn sweep_deleted_workspaces() {
     let Some(root) = crate::workspaces_dir() else {
         return;

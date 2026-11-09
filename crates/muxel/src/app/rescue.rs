@@ -437,8 +437,9 @@ impl MuxelApp {
     }
 
     /// Workspace `id` is opening, its lock held and none of its panes
-    /// started: delete what it kept if saving is off (here or in another
-    /// window), else the temporaries of writes a crash cut off. What a crash
+    /// started: if saving is off (here or in another window), delete what
+    /// every workspace kept, a write that landed after an earlier purge
+    /// included; else the temporaries of writes a crash cut off. What is
     /// left of deleted workspaces goes too.
     pub(super) fn prepare_workspace_rescue(&mut self, id: Uuid) {
         muxel_store::rescue::sweep_deleted_workspaces();
@@ -449,9 +450,8 @@ impl MuxelApp {
             self.settings.rescue_unsent_text = false;
         }
         if !self.settings.rescue_unsent_text {
-            let failed = dir.purge();
-            if !failed.is_empty() {
-                log::warn!("couldn't delete {} rescue file(s)", failed.len());
+            if let Err(e) = muxel_store::rescue::purge_every_workspace() {
+                log::warn!("couldn't delete everything kept: {e:#}");
             }
             return;
         }

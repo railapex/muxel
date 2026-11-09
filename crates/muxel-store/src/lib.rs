@@ -433,7 +433,9 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let index_path = base.join("workspaces.json");
     if index_path.exists() {
-        return load_workspaces_index_from(&index_path);
+        let mut index = load_workspaces_index_from(&index_path);
+        forget_deleted(&mut index, &base.join("workspaces"));
+        return index;
     }
     let id = Uuid::new_v4();
     let index = WorkspacesIndex {
@@ -460,6 +462,21 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let _ = save_workspaces_index_to(&index_path, &index);
     index
+}
+
+/// Leave out workspaces marked deleted: muxel stopped after marking one and
+/// before saving the index without it. What it kept goes with the next
+/// sweep (see [`rescue::sweep_deleted_workspaces`]).
+fn forget_deleted(index: &mut WorkspacesIndex, workspaces: &Path) {
+    index
+        .workspaces
+        .retain(|meta| !rescue::marked_deleted_in(workspaces, meta.id));
+    if index
+        .current
+        .is_some_and(|id| !index.workspaces.iter().any(|meta| meta.id == id))
+    {
+        index.current = index.workspaces.first().map(|meta| meta.id);
+    }
 }
 
 #[cfg(test)]
@@ -827,6 +844,40 @@ mod tests {
 
         // Re-running is idempotent (index already exists).
         assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_workspace_marked_deleted_is_not_listed_again() {
+        let base = std::env::temp_dir().join(format!("muxel-store-test-marked-{}", Uuid::new_v4()));
+        let kept = Uuid::new_v4();
+        let doomed = Uuid::new_v4();
+        let index = WorkspacesIndex {
+            workspaces: vec![
+                WorkspaceMeta {
+                    id: kept,
+                    name: "kept".into(),
+                },
+                WorkspaceMeta {
+                    id: doomed,
+                    name: "doomed".into(),
+                },
+            ],
+            current: Some(doomed),
+        };
+        save_workspaces_index_to(&base.join("workspaces.json"), &index).unwrap();
+        // Deleting it got as far as its marker before muxel stopped.
+        std::fs::create_dir_all(base.join("workspaces").join(doomed.to_string())).unwrap();
+        std::fs::write(
+            base.join("workspaces").join(format!("{doomed}.deleted")),
+            "",
+        )
+        .unwrap();
+
+        let index = migrate_workspaces_at(&base);
+        let listed: Vec<Uuid> = index.workspaces.iter().map(|w| w.id).collect();
+        assert_eq!(listed, vec![kept], "the deleted workspace stays deleted");
+        assert_eq!(index.current, Some(kept));
         let _ = std::fs::remove_dir_all(&base);
     }
 
