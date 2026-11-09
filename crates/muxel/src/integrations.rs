@@ -5103,12 +5103,15 @@ mod tests {
     #[test]
     fn a_failure_before_git_ran_is_not_blamed_on_git() {
         for code in [255, 5, 6] {
+            // The shell has to run, or this reads Unknown for the wrong reason.
             let out = host_sh()
                 .arg("-c")
                 .arg(format!("echo 'Permission denied' >&2; exit {code}"))
                 .stdin(Stdio::null())
-                .output();
-            assert_eq!(remote_branch_read(out), BranchRead::Unknown, "exit {code}");
+                .output()
+                .expect("the host shell runs");
+            assert_eq!(out.status.code(), Some(code), "the host shell exits {code}");
+            assert_eq!(remote_branch_read(Ok(out)), BranchRead::Unknown, "exit {code}");
         }
         let missing = command("muxel-no-such-ssh").output();
         assert_eq!(remote_branch_read(missing), BranchRead::Unknown);
