@@ -51,6 +51,10 @@ pub struct EditorView {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     dirty: bool,
+    /// A digest of the text when the buffer was last clean (loaded, saved or
+    /// reloaded): an input method that commits its text sends no Change
+    /// event, and this tells the commit from a cancellation.
+    clean: Option<u64>,
     config: EditorConfig,
     /// Set for read-only diff panes: the directory whose `git diff` is shown.
     diff_dir: Option<PathBuf>,
@@ -251,6 +255,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> Self {
         let cfg = config.clone();
+        let clean = (!dirty).then(|| text_digest(&content));
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(language)
@@ -295,6 +300,7 @@ impl EditorView {
             input,
             path,
             dirty,
+            clean,
             config,
             diff_dir: None,
             is_image,
@@ -328,6 +334,7 @@ impl EditorView {
             input,
             path: None,
             dirty: false,
+            clean: None,
             config,
             diff_dir: Some(dir),
             is_image: false,
@@ -502,6 +509,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clean = Some(text_digest(&content));
         if &*self.input.read(cx).value() == content.as_str() {
             return;
         }
@@ -574,10 +582,16 @@ impl EditorView {
         if self.dirty {
             self.dirty = false;
         }
+        self.note_clean(cx);
         if was_dirty || changed {
             cx.notify();
         }
         self.backup_clean(cx);
+    }
+
+    /// The buffer is clean now: remember its text.
+    fn note_clean(&mut self, cx: &App) {
+        self.clean = Some(text_digest(&self.input.read(cx).value()));
     }
 
     /// Replace the buffer contents (used after an async remote read), keeping the
@@ -585,6 +599,7 @@ impl EditorView {
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| s.set_value(text, window, cx));
         self.dirty = false;
+        self.note_clean(cx);
         self.external_change = None;
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         cx.notify();
@@ -599,6 +614,7 @@ impl EditorView {
         self.input.update(cx, |s, cx| s.set_highlighter(lang, cx));
         self.path = Some(path);
         self.dirty = false;
+        self.note_clean(cx);
         self.external_change = None;
         self.disk_stamp = stamp;
         cx.notify();
@@ -628,6 +644,7 @@ impl EditorView {
                         };
                         this.replace_disk_content(content, window, cx);
                         this.dirty = false;
+                        this.note_clean(cx);
                         cx.notify();
                         this.backup_clean(cx);
                     })),
@@ -665,6 +682,14 @@ impl EditorView {
                 .into_any_element(),
         )
     }
+}
+
+/// A digest of a buffer's text, to tell whether it changed.
+fn text_digest(text: &str) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(text.as_bytes());
+    hasher.finish()
 }
 
 /// A disk stamp as a backup records it.
@@ -757,8 +782,10 @@ impl EditorView {
     }
 
     /// The input notified: an input method's uncommitted text may have
-    /// changed, which no Change event reports. Back it up like an edit; once
-    /// it's cancelled from a clean buffer, the backup goes.
+    /// changed, which no Change event reports. Back it up like an edit. When
+    /// the composition ends, the buffer is compared with its clean text: a
+    /// commit left changes (the buffer is dirty now, as an edit makes it), a
+    /// cancellation from a clean buffer left none, and the backup goes.
     fn note_composition(
         &mut self,
         input: &Entity<InputState>,
@@ -778,7 +805,13 @@ impl EditorView {
         if composing == self.rescue.composing {
             return;
         }
+        let ended = composing.is_none();
         self.rescue.composing = composing;
+        if ended && !self.dirty && self.clean != Some(text_digest(&input.read(cx).value())) {
+            self.dirty = true;
+            self.rescue.base = self.disk_stamp.map(file_stamp);
+            cx.notify();
+        }
         if self.needs_backup(cx) {
             self.note_edit(cx);
         } else {
@@ -944,6 +977,18 @@ impl EditorView {
         });
     }
 
+    /// Commit the input method's uncommitted text as it stands, as an input
+    /// method does when it unmarks it: no Change event, and nothing else
+    /// until the input next notifies. Only the Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn commit_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| {
+            s.unmark_text(window, cx);
+            cx.notify();
+        });
+    }
+
     /// Hold this editor's background backup writes just before they land,
     /// until the returned sender sends or drops. Only the Windows app tests
     /// use it.
@@ -958,13 +1003,11 @@ impl EditorView {
     /// changed is decided now, against the version the backup's edits started
     /// from: a disk version newer than that (written before muxel started
     /// again, or while the offer showed) is kept beside the restored changes.
+    /// The offer's file goes only once a live backup holds the restored text.
     pub(crate) fn restore_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((backup, _)) = self.rescue.offer.take() else {
             return;
         };
-        if let Some((dir, iid)) = &self.rescue.target {
-            dir.delete_editor_offer(*iid);
-        }
         let base = backup.base;
         self.input
             .update(cx, |s, cx| s.set_value(backup.text, window, cx));
@@ -982,6 +1025,25 @@ impl EditorView {
                         self.external_change = Some(ExternalChange::Deleted);
                     }
                 }
+            }
+        }
+        // Until now the offer was the only copy: write the live backup after
+        // any write on its way, and let the offer go once it's there.
+        if let Some((dir, iid)) = self.rescue.target.clone() {
+            self.rescue.pending = None;
+            let live = EditorBackup {
+                path: self.path.clone(),
+                text: self.text(cx),
+                base,
+                saved_at_ms: now_ms(),
+            };
+            match self
+                .rescue
+                .lane
+                .barrier(|| dir.save_editor_backup(iid, &live))
+            {
+                Ok(()) => dir.delete_editor_offer(iid),
+                Err(e) => log::warn!("couldn't back up editor {iid}; its offer stays: {e:#}"),
             }
         }
         cx.notify();

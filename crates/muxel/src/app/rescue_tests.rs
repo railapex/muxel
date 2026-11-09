@@ -1075,6 +1075,90 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
 }
 
 #[test]
+fn restored_changes_survive_a_crash_before_the_next_backup_is_due() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("restored.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "base\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        type_into(cx, window, iid, "mine ");
+        after_debounce(cx);
+        reopen_editor(cx, window, iid);
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.restore_backup(window, cx));
+            })
+            .unwrap();
+        // muxel dies at once, before the restored buffer's backup is due.
+        reopen_editor(cx, window, iid);
+        window
+            .read_with(cx, |app, cx| {
+                assert!(
+                    app.editors[&iid].read(cx).backup_offered(),
+                    "the restored changes are offered again"
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            dir.editor_offer(iid).map(|b| b.text).as_deref(),
+            Some("mine base\n")
+        );
+    });
+}
+
+#[test]
+fn text_an_input_method_commits_stays_backed_up() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("committed.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "text\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.compose_text("にほ", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n")
+        );
+        // The input method commits the text as it stands.
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.commit_composition(window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n"),
+            "committed text is an unsaved change, not a cancellation"
+        );
+        window
+            .read_with(cx, |app, cx| assert!(app.editors[&iid].read(cx).is_dirty()))
+            .unwrap();
+        reopen_editor(cx, window, iid);
+        assert_eq!(
+            dir.editor_offer(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n"),
+            "it is offered after a crash"
+        );
+    });
+}
+
+#[test]
 fn a_sent_prompt_the_screen_still_shows_is_never_saved_again() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);

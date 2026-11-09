@@ -1661,11 +1661,13 @@ feature is added or changed, update the matching entry here in the same change**
   Muse, opencode and Amp input boxes are not read yet.
 - **Unsaved editor changes survive** — an editor with unsaved changes, or an
   input method's uncommitted text, backs them up about a second after edits
-  stop. When it opens again it offers **Restore unsaved changes from HH:MM**,
-  and edits made while the offer shows are backed up too. Restore checks the
-  file again: if it changed since the edits began (before muxel started again
-  or while the offer showed), restoring keeps both, with the disk version
-  behind **Reload / Keep mine**. Saving, reloading or closing without saving
+  stop; text an input method commits counts as an unsaved change. When it opens
+  again it offers **Restore unsaved changes from HH:MM**, and edits made while
+  the offer shows are backed up too. Restore checks the file again: if it
+  changed since the edits began (before muxel started again or while the offer
+  showed), restoring keeps both, with the disk version behind **Reload / Keep
+  mine**. The restored changes are backed up before the offer goes, so a crash
+  straight after Restore still finds them. Saving, reloading or closing without saving
   deletes the backup, and a backup write still on its way can't bring it back.
 - **Crash notice** — after muxel stops without closing a workspace cleanly, the
   next time it opens one notice says how many prompts and editors were kept and
