@@ -1,4 +1,4 @@
-//! Delivery facts and safe next commands, separate from writer admission.
+//! Delivery facts and read-only next commands, separate from writer admission.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -45,10 +45,9 @@ impl PromptDelivery {
             outcome: Some(outcome),
             next: match outcome {
                 PromptOutcome::Submitted => None,
-                PromptOutcome::PendingInComposer => Some(format!("muxel ctl keys {agent} enter")),
-                PromptOutcome::NotDelivered | PromptOutcome::Unconfirmed => {
-                    Some(format!("muxel ctl screen {agent}"))
-                }
+                PromptOutcome::PendingInComposer
+                | PromptOutcome::NotDelivered
+                | PromptOutcome::Unconfirmed => Some(format!("muxel ctl screen {agent}")),
             },
             submission_confirmed: Some(outcome == PromptOutcome::Submitted),
             ..Self::default()
@@ -86,12 +85,12 @@ mod tests {
     use super::{PromptDelivery, PromptOutcome};
 
     #[test]
-    fn next_command_uses_only_proven_delivery_facts() {
+    fn pending_advice_is_read_only() {
         for (outcome, next) in [
             (PromptOutcome::Submitted, None),
             (
                 PromptOutcome::PendingInComposer,
-                Some("muxel ctl keys abcd enter"),
+                Some("muxel ctl screen abcd"),
             ),
             (PromptOutcome::NotDelivered, Some("muxel ctl screen abcd")),
             (PromptOutcome::Unconfirmed, Some("muxel ctl screen abcd")),

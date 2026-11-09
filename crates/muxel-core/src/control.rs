@@ -1301,7 +1301,7 @@ usage: muxel ctl <command> [args]
   help [COMMAND]                 show general or command-specific help
 
 AGENT is an id from `panes` (also pane<ID>), a name, project/name, or `focused`.
-Never re-send text after an uncertain receipt. If outcome is pending_in_composer, use `muxel ctl keys AGENT enter`; otherwise follow `next`.
+Never re-send text after an uncertain receipt. Follow the read-only `next` command to inspect the current pane; a pending_in_composer receipt does not authorize a later Enter.
 send, answer and keys refuse the caller's own pane unless --force is explicit.
 Everything after `--` is taken literally (for text that starts with -).
 Input to a pane kept in tmux goes to its tmux pane through tmux, never through the tmux client; agent panes need no shell grant.
@@ -1362,7 +1362,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and next. Never re-send text after an uncertain receipt: pending_in_composer means use `muxel ctl keys AGENT enter`; unconfirmed means inspect screen. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides busy and own-pane refusal, but never a launch mismatch."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
             "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
@@ -1869,10 +1869,15 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   only with the complete retained draft and current guards, or `not_delivered`
   when input was refused before delivery. `unconfirmed` preserves uncertainty,
   including clipped or collapsed drafts. Follow the exact command in `next`.
-  Never re-send the text. For `pending_in_composer`, use `keys AGENT enter`.
-  Native Windows Codex launches disable heuristic paste bursts. Codex 0.167+
-  preserves line breaks and Unicode; CRLF becomes one newline. Other control
-  characters are refused before typing.
+  Never re-send the text. `next` inspects the current pane; a pending receipt
+  cannot guard a later Enter after the draft or launch changes. Switch and
+  input protection covers muxel-observed changes; another tmux client's input
+  is untracked.
+  Native Windows Codex launches disable heuristic paste bursts only after a
+  version probe verifies the matching codec. Configured Codex 0.167+ preserves
+  line breaks and Unicode; CRLF becomes one newline. Unsupported controller
+  characters, including tabs, are refused before typing. Its clipboard encoder
+  also refuses unsupported controls before writing and reports the refusal.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
   ends (or it blocks on a question, or exits), then print what `show` prints.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
@@ -2007,9 +2012,10 @@ also withhold Enter and return an error without a code; inspect the input first.
 
 - One prompt at a time per agent. Never `send` to an agent that is `working` or
   `blocked`.
-- Never re-send prompt text after a pasted or uncertain receipt. If `outcome` is `pending_in_composer`,
-  run its `next` command (`keys AGENT enter`); if it is `unconfirmed`, inspect the
-  screen. `not_delivered` means nothing was typed; resolve its refusal before
+- Never re-send prompt text after a pasted or uncertain receipt. Follow the
+  read-only `next` command to inspect the current screen. `pending_in_composer`
+  describes an observed draft; it does not guard or authorize a later Enter.
+  `not_delivered` means nothing was typed; resolve its refusal before
   sending the task. Never repeat `new`; use its existing pane. `new --prompt`
   waits for provider input readiness and acceptance;
   `--no-wait` returns `prompt_pending` and a read-only next command. `status` and

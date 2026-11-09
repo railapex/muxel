@@ -716,11 +716,6 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
             args.push("--config".to_string());
             args.push("check_for_update_on_startup=false".to_string());
         }
-        #[cfg(windows)]
-        {
-            args.push("--config".to_string());
-            args.push("disable_paste_burst=true".to_string());
-        }
     }
 
     let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
@@ -1516,6 +1511,18 @@ mod tests {
     }
 
     #[test]
+    fn windows_settings_wait_for_verified_codec() {
+        let launch = resolve_launch(&instance(&AgentPreset::codex(), None));
+        assert!(
+            !launch
+                .args
+                .iter()
+                .any(|arg| arg.contains("disable_paste_burst")),
+            "pure launch resolution cannot verify the native codec; leave paste detection enabled"
+        );
+    }
+
+    #[test]
     fn codex_control_launches_configure_input_without_changing_literal_argv() {
         let mut pane = instance(&AgentPreset::codex(), Some("startup task"));
         pane.control_prompt = true;
@@ -1528,12 +1535,11 @@ mod tests {
                 .windows(2)
                 .any(|pair| { pair == ["--config", "check_for_update_on_startup=false"] })
         );
-        assert_eq!(
-            launch
+        assert!(
+            !launch
                 .args
                 .windows(2)
-                .any(|pair| { pair == ["--config", "disable_paste_burst=true"] }),
-            cfg!(windows)
+                .any(|pair| { pair == ["--config", "disable_paste_burst=true"] })
         );
         let resumed = resolve_launch_for_session(&pane, true);
         assert!(resumed.startup_input.is_none());

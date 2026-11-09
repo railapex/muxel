@@ -1069,15 +1069,20 @@ feature is added or changed, update the matching entry here in the same change**
   composer. A compact composer frame captured before paste and an added blank
   cursor line must prove that its first Enter was consumed, with no resize or
   later title change. Learning the first provider thread does not cancel the
-  confirmation. Wrapped prose is supported; clipped, multiline, Unicode,
+  confirmation. Switch and input protection covers muxel-observed changes;
+  another tmux client's input is untracked. Wrapped prose is supported;
+  clipped, multiline, Unicode,
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
 - **Delivery outcomes and next commands** — `send` and `new --prompt` report
   `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
   `next` command when more action is needed. Existing receipt fields remain.
-  A complete pending draft calls for `keys enter`, never another paste; clipped
-  or otherwise uncertain input calls for screen inspection. Agent IDs also
+  All unsubmitted outcomes recommend read-only screen inspection. A pending
+  receipt describes the draft observed at that time and cannot guard a later
+  Enter; never paste the task again after uncertain delivery. Startup pending
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. Agent
+  IDs also
   accept the `pane<ID>` spelling.
 - **Startup input waits for the provider** — `new --prompt` waits for a real
   editable composer and provider acceptance. Known folder trust, update and
@@ -1085,12 +1090,17 @@ feature is added or changed, update the matching entry here in the same change**
   trust prompts are never answered automatically. `--no-wait` returns
   `prompt_pending` and a polling command. Status exposes the same delivery facts.
   Codex launches carrying a startup task suppress its startup update menu.
-- **Windows Codex multiline control** — configured Codex launches disable
-  heuristic paste bursts so controller Enter submits the task. With
+- **Windows Codex multiline control** — native presets disable heuristic paste
+  bursts only after a version probe verifies the matching input codec. Older
+  versions and failed probes receive no automatic paste-burst override. With
+  verified, configured
   Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
-  blank lines and Unicode; CRLF becomes one newline. Other control characters in
-  controller text are refused before typing; an unverified multiline protocol
-  reports `unsupported_input`.
+  blank lines and Unicode; CRLF becomes one newline. Unsupported control
+  characters, including tabs, refuse the whole paste before any write.
+  Clipboard refusals appear in the error feed; ordinary clipboard ESC
+  sanitization remains. Unverified multiline controller input reports
+  `unsupported_input`; explicitly disabled bursts without a verified codec also
+  refuse advanced clipboard text. Literal argv is never changed.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

@@ -44,5 +44,5 @@ pub use view::{
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    TextPasteErrorHandler, clean_agent_title, paste_clipboard_into_session,
 };

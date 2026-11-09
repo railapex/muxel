@@ -27,8 +27,11 @@ impl ControlPaste {
             let setting = if matches!(arg.as_str(), "--config" | "-c") {
                 args.next().map(String::as_str)
             } else {
-                arg.strip_prefix("--config=")
-                    .or_else(|| arg.strip_prefix("-c="))
+                arg.strip_prefix("--config=").or_else(|| {
+                    arg.strip_prefix("-c")
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.strip_prefix('=').unwrap_or(value))
+                })
             };
             if let Some((key, value)) = setting.and_then(|setting| setting.split_once('='))
                 && key.trim() == "disable_paste_burst"
@@ -47,10 +50,43 @@ impl ControlPaste {
         if self != Self::WindowsCodexUnverified {
             return self;
         }
+        if Self::supported_version(output) {
+            Self::WindowsCodex
+        } else {
+            self
+        }
+    }
+
+    /// Change paste behavior only when the matching native encoder is available.
+    /// Literal argv and launches without verified support retain their settings.
+    pub(crate) fn configure_launch(
+        program: &str,
+        args: &mut Vec<String>,
+        windows: bool,
+        literal: bool,
+        version: &str,
+    ) -> Self {
+        if Self::for_launch(program, args, windows) == Self::Terminal {
+            return Self::Terminal;
+        }
+        if !literal && Self::supported_version(version) {
+            let index = args
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(args.len());
+            args.splice(
+                index..index,
+                ["--config".into(), "disable_paste_burst=true".into()],
+            );
+        }
+        Self::for_launch(program, args, windows).with_version(version)
+    }
+
+    fn supported_version(output: &str) -> bool {
         let version = output
             .lines()
             .find_map(|line| line.trim().strip_prefix("codex-cli "));
-        let supported = version
+        version
             .and_then(|version| {
                 let mut parts = version.split('.');
                 Some((
@@ -58,8 +94,7 @@ impl ControlPaste {
                     parts.next()?.parse::<u32>().ok()?,
                 ))
             })
-            .is_some_and(|(major, minor)| major > 0 || minor >= 167);
-        if supported { Self::WindowsCodex } else { self }
+            .is_some_and(|(major, minor)| major > 0 || minor >= 167)
     }
 
     /// Explicit Win32 input records preserve Unicode code units and Shift+Enter
@@ -80,7 +115,7 @@ impl ControlPaste {
         }
         if self == Self::WindowsCodexUnconfigured {
             return if text.contains(['\r', '\n']) || !text.is_ascii() {
-                Err("Reliable multiline or Unicode input requires this Codex launch to use --config disable_paste_burst=true. Nothing was typed".into())
+                Err("Reliable multiline or Unicode input requires a verified Codex 0.167+ launch with --config disable_paste_burst=true. Nothing was typed".into())
             } else {
                 Ok(None)
             };
@@ -93,10 +128,15 @@ impl ControlPaste {
     }
 
     /// Clipboard paste shares the configured decoder so disabling bursts does
-    /// not drop its line breaks. Keep the existing ESC sanitization and other
-    /// clipboard control handling; strict validation belongs to outside input.
-    pub(crate) fn clipboard(self, text: &str) -> Option<String> {
-        (self == Self::WindowsCodex).then(|| Self::encode_records(&text.replace('\x1b', "")))
+    /// not drop its line breaks. Sanitize ESC as ordinary terminal paste does,
+    /// then refuse the whole paste if any remaining character is unsupported.
+    pub(crate) fn clipboard(self, text: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Terminal | Self::WindowsCodexUnconfigured => Ok(None),
+            Self::WindowsCodex | Self::WindowsCodexUnverified => {
+                self.encode(&text.replace('\x1b', ""))
+            }
+        }
     }
 
     fn encode_records(text: &str) -> String {
@@ -196,14 +236,19 @@ mod tests {
             None
         );
         assert_eq!(
-            ControlPaste::WindowsCodex.clipboard("AA\r\n\n🛰️"),
+            ControlPaste::WindowsCodex.clipboard("AA\r\n\n🛰️").unwrap(),
             Some(encoded)
         );
         assert_eq!(
             ControlPaste::WindowsCodex.encode("a\rb").unwrap(),
             ControlPaste::WindowsCodex.encode("a\nb").unwrap()
         );
-        assert!(ControlPaste::Terminal.clipboard("first\nlast").is_none());
+        assert!(
+            ControlPaste::Terminal
+                .clipboard("first\nlast")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -218,6 +263,96 @@ mod tests {
             ControlPaste::WindowsCodex
         );
         assert!(unverified.encode("one line").is_ok());
+    }
+
+    #[test]
+    fn clipboard_refuses_unsupported_controls_atomically() {
+        for control in ['\t', '\0', '\u{8}', '\u{7f}', '\u{85}'] {
+            let result = ControlPaste::WindowsCodex.clipboard(&format!("prefix{control}suffix"));
+            assert!(
+                result.is_err(),
+                "unsupported clipboard character {control:?} must return no payload"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_setting_always_has_its_codec() {
+        for program in [
+            "codex",
+            "codex.exe",
+            "codex.cmd",
+            "codex.bat",
+            "ssh",
+            "cmd.exe",
+        ] {
+            for windows in [false, true] {
+                for literal in [false, true] {
+                    for version in ["", "codex-cli 0.166.0", "unrecognized", "codex-cli 0.167.0"] {
+                        for original in [
+                            vec![],
+                            vec!["-c".into(), "disable_paste_burst=false".into()],
+                            vec!["--".into(), "literal task".into()],
+                        ] {
+                            let mut args = original.clone();
+                            let codec = ControlPaste::configure_launch(
+                                program, &mut args, windows, literal, version,
+                            );
+                            let native = ControlPaste::for_launch(program, &[], windows)
+                                != ControlPaste::Terminal;
+                            if !native || literal || version != "codex-cli 0.167.0" {
+                                assert_eq!(
+                                    args, original,
+                                    "unverified or literal launch must retain its arguments"
+                                );
+                            } else {
+                                assert_eq!(codec, ControlPaste::WindowsCodex);
+                                assert_ne!(args, original);
+                            }
+                            if args != original {
+                                assert_eq!(
+                                    codec,
+                                    ControlPaste::WindowsCodex,
+                                    "automatically disabling detection requires its replacement encoder"
+                                );
+                                assert_eq!(
+                                    ControlPaste::for_launch(program, &args, windows),
+                                    ControlPaste::WindowsCodexUnverified
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_literal_setting_gets_its_codec() {
+        let original = vec!["-cdisable_paste_burst=true".into()];
+        let mut args = original.clone();
+        let codec =
+            ControlPaste::configure_launch("codex", &mut args, true, true, "codex-cli 0.167.0");
+        assert_eq!(args, original, "literal arguments remain untouched");
+        assert_eq!(
+            codec,
+            ControlPaste::WindowsCodex,
+            "a supported explicit setting must not fall back to ordinary clipboard input"
+        );
+    }
+
+    #[test]
+    fn explicit_unverified_setting_cannot_lose_clipboard_text() {
+        let args = ["--config".into(), "disable_paste_burst=true".into()];
+        for version in ["", "codex-cli 0.166.0", "unrecognized"] {
+            let codec = ControlPaste::for_launch("codex", &args, true).with_version(version);
+            for text in ["first\nsecond", "café", "first\tsecond"] {
+                assert!(
+                    codec.clipboard(text).is_err(),
+                    "no legacy fallback with disabled detection"
+                );
+            }
+        }
     }
 
     #[test]
