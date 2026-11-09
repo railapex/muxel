@@ -438,6 +438,27 @@ fn the_backstop_re_plans_the_status_after_a_lost_index_event() {
 }
 
 #[test]
+fn ignored_output_leaves_the_backstop_where_the_last_status_put_it() {
+    with_app(|cx, window, fx| {
+        let backend = watch_with(cx, window);
+        show_changes(cx, window);
+        // An edit the watcher lost: only the backstop's `git status` lists it.
+        add_line(fx.repo.path());
+        wait(cx, BACKSTOP - 5 * MIN_GAP);
+        // Build output git ignores, which git is asked about late in the
+        // backstop's wait.
+        std::fs::write(fx.top.join("main.o"), "built\n").unwrap();
+        created(&backend, &fx.top.join("main.o"));
+        wait(cx, SOON);
+        assert!(files(cx, window).is_empty(), "the ignored file ran no status");
+        // Past the backstop counted from the last `git status`, well short of
+        // one counted from that check.
+        wait(cx, 5 * MIN_GAP);
+        assert_eq!(files(cx, window), ["notes.txt"]);
+    });
+}
+
+#[test]
 fn the_worktrees_tab_refreshes_as_it_opens_and_polls_an_unwatched_worktree() {
     with_app(|cx, window, fx| {
         // No watcher: every target polls.
