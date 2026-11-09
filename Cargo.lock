@@ -5101,6 +5101,7 @@ dependencies = [
  "async-channel",
  "base64",
  "chrono",
+ "futures-lite",
  "gpui",
  "libc",
  "log",

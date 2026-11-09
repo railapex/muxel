@@ -3502,6 +3502,35 @@ impl TerminalView {
         }
     }
 
+    /// What the pane's saved draft should become now, as the pane goes away
+    /// (close, Restart, quit). A prompt sent since the last read clears it,
+    /// whatever the screen still shows; an empty box clears it; text read
+    /// whole replaces it. `None` keeps what was saved: a box muxel can't read
+    /// whole, or one it can't read at all.
+    pub fn settle_draft(&self) -> Option<crate::DraftUpdate> {
+        if !crate::draft::readable(self.title_provider) {
+            return None;
+        }
+        if self.session.draft_submission_pending() {
+            return Some(crate::DraftUpdate::Clear);
+        }
+        match self.session.read_draft(self.title_provider) {
+            muxel_core::rescue::DraftRead::Text {
+                text,
+                partial,
+                clipped: false,
+            } => Some(crate::DraftUpdate::Save(muxel_core::rescue::PromptDraft {
+                text,
+                partial,
+                saved_at_ms: crate::draft::now_ms(),
+                source: crate::draft::source(self.title_provider),
+                pane: None,
+            })),
+            muxel_core::rescue::DraftRead::Empty => Some(crate::DraftUpdate::Clear),
+            _ => None,
+        }
+    }
+
     /// Snapshot evidence before the caller pastes. This never marks a turn as
     /// submitted and does not authorize any subsequent write.
     pub fn begin_prompt_submission(&self, text: &str) -> Option<PromptSubmission> {

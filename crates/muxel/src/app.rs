@@ -21720,6 +21720,9 @@ impl MuxelApp {
         self.redock_for_restart(iid, cx);
         self.terminal_launching.remove(&iid);
         self.failed_launches.remove(&iid);
+        // A prompt typed within the watcher's debounce is saved before the
+        // view goes, so the relaunch offers it.
+        self.flush_draft(iid, cx);
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }

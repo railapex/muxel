@@ -1641,13 +1641,18 @@ feature is added or changed, update the matching entry here in the same change**
   are persisted and restored on launch.
 - **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box,
   or after a shell prompt that marks itself with OSC 133, is saved about a second
-  after typing stops, off the UI thread, and forgotten once it is sent. Pasted
-  blocks shown as `[Pasted text …]` markers are saved as the pasted text; a draft
-  taller than the pane, or a marker muxel can't match, is saved as far as it can be
-  read and flagged partial. When the pane starts again after a crash, a restart or
-  a relaunch, it offers **Unsent prompt from HH:MM · Restore · Discard**; Restore
-  puts the text back into the box and never sends it. A pane closed for good keeps
-  its draft in a strip under the title bar with **Copy** and **Discard**. Grok,
+  after typing stops, off the UI thread; closing the pane, Restart and quitting
+  save it at once. Pressing Enter deletes it straight away, even within that
+  second. A draft muxel can't read exactly is saved as far as it can be read and
+  labelled partial: one taller than the pane, a `[Pasted text …]` marker muxel
+  can't tie to one paste, a wrapped line whose break could be a space, a newline
+  or a cut word, and in a shell, a grey suggestion, text after the cursor or a
+  continued line (only the text up to the cursor is kept). When the pane starts
+  again after a crash, a restart or a relaunch, it offers **Unsent prompt from
+  HH:MM · Restore · Discard**; Restore types the text back into the box and never
+  presses Enter, and a multi-line prompt goes to the clipboard instead when the
+  program would read its newlines as Enter. A pane closed for good keeps its
+  draft in a strip under the title bar with **Copy** and **Discard**. Grok,
   Muse, opencode and Amp input boxes are not read yet.
 - **Unsaved editor changes survive** — an editor with unsaved changes backs them
   up about a second after edits stop. When it opens again it offers **Restore

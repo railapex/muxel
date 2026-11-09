@@ -138,11 +138,12 @@ impl DraftTracker {
         self.saved = None;
     }
 
+    /// Always a delete, even when this tracker saved nothing: the app can
+    /// write the pane's file too (a restored offer), and deleting a missing
+    /// file costs nothing.
     fn clear(&mut self) -> DraftAction {
-        match self.saved.take() {
-            Some(_) => DraftAction::Clear,
-            None => DraftAction::Keep,
-        }
+        self.saved = None;
+        DraftAction::Clear
     }
 }
 
@@ -818,7 +819,8 @@ mod tests {
     #[test]
     fn a_draft_is_written_once_per_change_and_cleared_when_the_box_empties() {
         let mut tracker = DraftTracker::default();
-        assert_eq!(tracker.observe(DraftRead::Empty), DraftAction::Keep);
+        // An empty box deletes the file whoever wrote it.
+        assert_eq!(tracker.observe(DraftRead::Empty), DraftAction::Clear);
         assert_eq!(
             tracker.observe(text("fix the")),
             DraftAction::Save {
@@ -838,7 +840,7 @@ mod tests {
             }
         );
         assert_eq!(tracker.observe(text("   ")), DraftAction::Clear);
-        assert_eq!(tracker.observe(DraftRead::Empty), DraftAction::Keep);
+        assert_eq!(tracker.observe(DraftRead::Empty), DraftAction::Clear);
     }
 
     #[test]
@@ -849,7 +851,8 @@ mod tests {
             DraftAction::Save { .. }
         ));
         assert_eq!(tracker.submitted(), DraftAction::Clear);
-        assert_eq!(tracker.submitted(), DraftAction::Keep);
+        // The app may have written the file itself (a restored offer).
+        assert_eq!(tracker.submitted(), DraftAction::Clear);
         // Enter that only picked a completion leaves the text in the box.
         assert!(matches!(
             tracker.observe(text("ship it")),

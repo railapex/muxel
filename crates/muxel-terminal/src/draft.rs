@@ -465,7 +465,21 @@ pub(crate) async fn watch(
                 sink(DraftUpdate::Clear);
             }
             match debounce_remaining(session.draft_idle_for()) {
-                Some(wait) => executor.timer(wait).await,
+                Some(wait) => {
+                    // A key or a submission ends the wait early: a submission
+                    // clears the file now, not a second later.
+                    let woken = futures_lite::future::or(
+                        async {
+                            executor.timer(wait).await;
+                            true
+                        },
+                        async { events.recv().await.is_ok() },
+                    )
+                    .await;
+                    if !woken {
+                        return;
+                    }
+                }
                 None => {
                     // Wakeups queued by keys during the wait are covered by
                     // the read below, so it runs once per pause. Input or a

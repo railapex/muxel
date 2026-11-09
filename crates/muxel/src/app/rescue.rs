@@ -3,8 +3,10 @@
 //! a pane closed for good leaves its prompt in a strip under the title bar.
 //!
 //! The pane's draft watcher (see `muxel_terminal::DraftSink`) keeps the live
-//! file current from a background thread. This module only renames, lists
-//! and deletes those files, on events that happen once per pane.
+//! file current from a background thread. This module renames, lists and
+//! deletes those files, and writes a pane's draft itself only on events that
+//! happen once per pane: the pane going away, or an offer giving way to the
+//! text the pane now shows.
 
 use super::*;
 use muxel_core::rescue::PromptDraft;
@@ -40,16 +42,12 @@ pub(super) struct CrashNotice {
     pub(super) drafts: usize,
     /// Editors whose unsaved changes were kept.
     pub(super) editors: usize,
-    /// Agents that were mid-turn when muxel last saved.
+    /// Agents the workspace's last save recorded as working. That save can
+    /// be older than the crash, so this is what was last known, not checked.
     pub(super) mid_turn: Vec<String>,
 }
 
 pub(super) use crate::editor::rescue_time;
-
-/// Two drafts that differ only in how whitespace was wrapped are the same.
-pub(super) fn same_draft(a: &str, b: &str) -> bool {
-    a.split_whitespace().eq(b.split_whitespace())
-}
 
 impl MuxelApp {
     /// Where the current workspace keeps rescued text, while keeping it is on.
@@ -149,8 +147,10 @@ impl MuxelApp {
             })
     }
 
-    /// Save a pane's draft now, for a pane about to go away within its
-    /// watcher's debounce (closed, or muxel quitting).
+    /// Settle a pane's draft now, for a pane about to go away within its
+    /// watcher's debounce (closed, restarted, or muxel quitting): save what
+    /// its box shows, or delete the file when the box is empty or a
+    /// submission hasn't been cleared yet.
     pub(super) fn flush_draft(&self, iid: Uuid, cx: &App) {
         let Some(dir) = self.rescue_dir() else {
             return;
@@ -161,10 +161,14 @@ impl MuxelApp {
         if !view.draft_watched() {
             return;
         }
-        if let Some(draft) = view.current_draft()
-            && let Err(e) = dir.save_draft(iid, &draft)
-        {
-            log::warn!("couldn't save draft for {iid}: {e:#}");
+        match view.settle_draft() {
+            Some(muxel_terminal::DraftUpdate::Save(draft)) => {
+                if let Err(e) = dir.save_draft(iid, &draft) {
+                    log::warn!("couldn't save draft for {iid}: {e:#}");
+                }
+            }
+            Some(muxel_terminal::DraftUpdate::Clear) => dir.delete_draft(iid),
+            None => {}
         }
     }
 
@@ -285,10 +289,31 @@ impl MuxelApp {
         else {
             return;
         };
-        if same_draft(&offer.draft.text, &current.text) {
+        // Exactly the same text, spaces and all: `a  b` isn't `a b`.
+        if offer.draft.text == current.text {
             log::info!("pane {iid} still shows its unsent draft; dropping the offer");
+            // The pane's watcher waits for a keystroke before it saves, so
+            // the text it shows is saved here before the offer goes.
+            if !self.keep_as_live_draft(iid, current) {
+                return;
+            }
             self.forget_draft_offer(iid, &offer.path);
             cx.notify();
+        }
+    }
+
+    /// Save `draft` as the pane's live draft, so a copy outlives the offer
+    /// that held it. False when it couldn't be saved.
+    fn keep_as_live_draft(&self, iid: Uuid, draft: &PromptDraft) -> bool {
+        let Some(dir) = self.rescue_dir() else {
+            return false;
+        };
+        match dir.save_draft(iid, draft) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("couldn't save draft for {iid}: {e:#}");
+                false
+            }
         }
     }
 
@@ -328,6 +353,16 @@ impl MuxelApp {
                 cx.notify();
                 return;
             }
+        }
+        // Until the watcher reads the box again, the offer's text is the
+        // pane's draft.
+        let restored = PromptDraft {
+            pane: None,
+            ..offer.draft.clone()
+        };
+        if !self.keep_as_live_draft(iid, &restored) {
+            cx.notify();
+            return;
         }
         self.forget_draft_offer(iid, &offer.path);
         self.focus_instance(iid, window, cx);
@@ -381,8 +416,8 @@ impl MuxelApp {
     }
 
     /// Mark workspace `id` running. When it already was, the last run never
-    /// closed it: say what was kept and which agents were mid-turn
-    /// (`loaded`, its document as saved), if anything.
+    /// closed it: say what was kept and which agents were last saved as
+    /// mid-turn (`loaded`, its document as saved), if anything.
     pub(super) fn note_workspace_running(
         &self,
         id: Uuid,
@@ -537,8 +572,9 @@ impl MuxelApp {
         }
         if !notice.mid_turn.is_empty() {
             label.push(' ');
+            // The workspace's last save, not the moment it stopped.
             label.push_str(&tf(
-                "Mid-turn when it stopped: {names}.",
+                "Working when muxel last saved: {names}.",
                 &[("names", &notice.mid_turn.join(", "))],
             ));
         }
@@ -597,13 +633,21 @@ impl MuxelApp {
         }
         for (index, kept) in closed.iter().take(STRIP_ROWS).enumerate() {
             let time = rescue_time(kept.draft.saved_at_ms);
-            let label = match kept.draft.pane.as_deref() {
-                Some(pane) => tf(
+            let label = match (kept.draft.pane.as_deref(), kept.draft.partial) {
+                (Some(pane), false) => tf(
                     "Unsent prompt from closed pane “{pane}”, {time}",
                     &[("pane", pane), ("time", &time)],
                 ),
-                None => tf(
+                (Some(pane), true) => tf(
+                    "Unsent prompt from closed pane “{pane}”, {time} (partial)",
+                    &[("pane", pane), ("time", &time)],
+                ),
+                (None, false) => tf(
                     "Unsent prompt from a closed pane, {time}",
+                    &[("time", &time)],
+                ),
+                (None, true) => tf(
+                    "Unsent prompt from a closed pane, {time} (partial)",
                     &[("time", &time)],
                 ),
             };

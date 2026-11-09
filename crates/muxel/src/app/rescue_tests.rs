@@ -81,22 +81,39 @@ fn pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> (Uuid, Rescu
 }
 
 /// Start (or restart) the pane's view on an inert child that muxel reads as
-/// Claude. The screen is painted by the test through the production parser.
+/// Claude. The child prints one line, as a real program draws its screen
+/// (muxel waits for visible output before it compares an offer with the
+/// box); the test then paints the screen through the production parser.
 fn launch(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
     iid: Uuid,
+) -> Arc<TerminalSession> {
+    let inert = CommandSpec::program(
+        "cmd.exe",
+        vec![
+            "/d".into(),
+            "/q".into(),
+            "/c".into(),
+            "echo ready&more".into(),
+        ],
+    );
+    launch_child(cx, window, iid, inert)
+}
+
+/// [`launch`] with `child` as the pane's program.
+fn launch_child(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    iid: Uuid,
+    child: CommandSpec,
 ) -> Arc<TerminalSession> {
     window
         .update(cx, |app, window, cx| {
             if let Some(old) = app.terminals.remove(&iid) {
                 old.read(cx).session().kill();
             }
-            let spec = CommandSpec::program(
-                "cmd.exe",
-                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
-            )
-            .with_status_program(Some("claude".into()));
+            let spec = child.with_status_program(Some("claude".into()));
             let meta = TerminalSpawnMeta {
                 instance_id: iid,
                 token: 0,
@@ -149,6 +166,67 @@ fn paint_claude(session: &TerminalSession, draft: &str) {
     session.process_probe_output(screen.as_bytes());
 }
 
+/// A child that reads one line from its terminal, as a program in cooked
+/// mode does, and writes the line to a file. What reached the child, and
+/// when, is then on disk instead of in muxel's bookkeeping.
+struct LineReader(PathBuf);
+
+impl LineReader {
+    fn spawn() -> (CommandSpec, LineReader) {
+        let dir = std::env::temp_dir();
+        let name = format!("muxel-line-{}.txt", Uuid::new_v4());
+        // `title` because nothing else here is a program cmd starts, so no
+        // title reaches the pane otherwise and `launch_child` waits for one.
+        // `line` starts as one space: an empty line leaves it as it was, and
+        // cmd would write an undefined `!line!` as it stands.
+        let read_a_line = format!("title line reader&set line= &set /p line=&>{name} echo(!line!");
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec![
+                "/d".into(),
+                "/q".into(),
+                "/v:on".into(),
+                "/c".into(),
+                read_a_line,
+            ],
+        )
+        .with_cwd(dir.display().to_string());
+        (spec, LineReader(dir.join(name)))
+    }
+
+    /// The line the child read, if it has read one yet, without trailing
+    /// whitespace.
+    fn line(&self) -> Option<String> {
+        let text = std::fs::read_to_string(&self.0).ok()?;
+        Some(text.trim_end().to_string())
+    }
+
+    /// Wait (eight seconds at most) for the child to read a line.
+    fn wait_line(&self) -> Option<String> {
+        let started = Instant::now();
+        while !self.0.exists() && started.elapsed() < Duration::from_secs(8) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        self.line()
+    }
+}
+
+impl Drop for LineReader {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A second of real and test time for the pane's child and timers.
+fn settle(cx: &mut TestAppContext) {
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(250));
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+    }
+}
+
 /// Let the watcher's one-second debounce run out, in real and test time.
 fn after_debounce(cx: &mut TestAppContext) {
     std::thread::sleep(muxel_core::rescue::DRAFT_DEBOUNCE + Duration::from_millis(150));
@@ -184,8 +262,10 @@ fn a_typed_prompt_is_saved_once_typing_stops_and_offered_when_the_pane_starts_ag
         assert!(!saved.partial);
 
         // The pane starts again (a crash and relaunch, or Restart): its old
-        // draft is offered, and the new launch can't overwrite it.
-        let session = launch(cx, window, iid);
+        // draft is offered, and the new launch can't overwrite it. This
+        // child writes down the line it reads.
+        let (child, reader) = LineReader::spawn();
+        let session = launch_child(cx, window, iid, child);
         window
             .read_with(cx, |app, _| {
                 let offers = &app.rescue.offers[&iid];
@@ -195,14 +275,21 @@ fn a_typed_prompt_is_saved_once_typing_stops_and_offered_when_the_pane_starts_ag
             .unwrap();
         assert!(dir.draft(iid).is_none());
         paint_claude(&session, "");
+        session.process_probe_output(b"\x1b[?2004l");
 
-        // Restore pastes it into the box without submitting it.
-        let rev = session.input_rev();
+        // Restore types it into the box without pressing Enter: the child
+        // has no line until the test presses Enter itself.
         window
             .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
             .unwrap();
-        assert!(session.input_rev() > rev, "the draft was pasted");
-        assert!(!session.has_submitted_turn(), "Restore never submits");
+        settle(cx);
+        assert_eq!(reader.line(), None, "Restore never sends Enter");
+        session.try_write_input(b"\r").unwrap();
+        assert_eq!(
+            reader.wait_line().as_deref(),
+            Some("fix the flaky resize test"),
+            "the child got the draft as it was typed"
+        );
         window
             .read_with(cx, |app, _| assert!(!app.rescue.offers.contains_key(&iid)))
             .unwrap();
@@ -439,6 +526,148 @@ fn closing_an_editor_without_saving_deletes_its_backup() {
             .unwrap();
         cx.run_until_parked();
         assert!(dir.editor_backup(iid).is_none());
+    });
+}
+
+fn draft(text: &str) -> PromptDraft {
+    PromptDraft {
+        text: text.into(),
+        partial: false,
+        saved_at_ms: 1,
+        source: DraftSource::Agent,
+        pane: None,
+    }
+}
+
+#[test]
+fn a_pane_still_showing_its_offered_draft_keeps_a_saved_copy_and_whitespace_counts() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "printf 'a  b'");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert_eq!(dir.draft(iid).unwrap().text, "printf 'a  b'");
+
+        // The pane starts again showing nearly the same text: one space
+        // fewer is a different command, so the offer stays.
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "printf 'a b'");
+        settle(cx);
+        settle(cx);
+        window
+            .read_with(cx, |app, _| {
+                assert!(
+                    app.rescue.offers.contains_key(&iid),
+                    "whitespace that differs keeps the offer"
+                )
+            })
+            .unwrap();
+
+        // Started again showing exactly the offered text (a tmux session that
+        // outlived muxel): the offer goes, but a saved copy stays.
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "printf 'a  b'");
+        settle(cx);
+        settle(cx);
+        window
+            .read_with(cx, |app, _| assert!(!app.rescue.offers.contains_key(&iid)))
+            .unwrap();
+        assert_eq!(
+            dir.draft(iid).map(|d| d.text).as_deref(),
+            Some("printf 'a  b'"),
+            "the text the pane shows is still saved"
+        );
+    });
+}
+
+#[test]
+fn restart_keeps_a_prompt_typed_just_before_it() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "typed right before Restart");
+        session.mark_user_input();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, window, cx| app.restart_agent(iid, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let kept = dir
+            .draft(iid)
+            .or_else(|| dir.draft_offers(iid).into_iter().next().map(|o| o.draft))
+            .map(|d| d.text);
+        assert_eq!(kept.as_deref(), Some("typed right before Restart"));
+    });
+}
+
+#[test]
+fn a_submission_during_the_debounce_clears_the_draft_at_once() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "first");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert_eq!(dir.draft(iid).unwrap().text, "first");
+
+        // More typing starts the debounce; Enter lands inside it.
+        paint_claude(&session, "first, then more");
+        session.mark_user_input();
+        cx.run_until_parked();
+        session.mark_turn_submitted();
+        cx.run_until_parked();
+        assert!(
+            dir.draft(iid).is_none(),
+            "submission clears it without waiting"
+        );
+
+        // Typed, sent and closed inside one debounce: nothing is kept.
+        paint_claude(&session, "sent just before closing");
+        session.mark_user_input();
+        cx.run_until_parked();
+        session.mark_turn_submitted();
+        paint_claude(&session, "");
+        window
+            .update(cx, |app, _, cx| {
+                app.close_instance_inner(iid, "close (test)", cx)
+            })
+            .unwrap();
+        assert!(dir.closed_drafts().is_empty(), "a sent prompt isn't kept");
+    });
+}
+
+#[test]
+fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        dir.save_draft(iid, &draft("first line\nsecond line"))
+            .unwrap();
+        let (child, reader) = LineReader::spawn();
+        let session = launch_child(cx, window, iid, child);
+        window
+            .read_with(cx, |app, _| assert_eq!(app.rescue.offers[&iid].len(), 1))
+            .unwrap();
+        // This child never asked for bracketed paste, so a pasted newline
+        // would reach it as Enter.
+        paint_claude(&session, "");
+        session.process_probe_output(b"\x1b[?2004l");
+        window
+            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .unwrap();
+        settle(cx);
+        assert_eq!(reader.line(), None, "nothing reached the child");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("first line\nsecond line"),
+            "the prompt is on the clipboard instead"
+        );
+        session.try_write_input(b"\r").unwrap();
+        assert_eq!(
+            reader.wait_line().as_deref(),
+            Some(""),
+            "the child's line is empty: nothing was typed into it"
+        );
     });
 }
 
