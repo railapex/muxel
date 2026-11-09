@@ -450,7 +450,10 @@ fn ignored_output_leaves_the_backstop_where_the_last_status_put_it() {
         std::fs::write(fx.top.join("main.o"), "built\n").unwrap();
         created(&backend, &fx.top.join("main.o"));
         wait(cx, SOON);
-        assert!(files(cx, window).is_empty(), "the ignored file ran no status");
+        assert!(
+            files(cx, window).is_empty(),
+            "the ignored file ran no status"
+        );
         // Past the backstop counted from the last `git status`, well short of
         // one counted from that check.
         wait(cx, 5 * MIN_GAP);
