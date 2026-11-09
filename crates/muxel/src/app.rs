@@ -21618,22 +21618,41 @@ impl MuxelApp {
     }
 
     /// Delete a workspace: remove it from the index + delete its workspace file.
-    /// Never deletes the last remaining workspace.
+    /// Never deletes the last remaining workspace, nor one open in another
+    /// muxel window: that one stays listed, to delete once it's closed.
     fn delete_workspace(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if self.workspaces.workspaces.len() <= 1 {
             return;
         }
+        // Its lock first: nothing about it changes unless deleting can go on.
+        let current = self.current_workspace == Some(id);
+        let held = if current {
+            self.workspace_lock.take()
+        } else {
+            None
+        };
+        let deletion = match muxel_store::rescue::hold_workspace_for_deletion(id, held) {
+            Ok(deletion) => deletion,
+            Err(e) => {
+                log::warn!("couldn't delete workspace {id}: {e:#}");
+                self.add_event(
+                    NotifKind::Error,
+                    t("Couldn't delete the workspace"),
+                    format!("{e:#}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
         self.workspaces.workspaces.retain(|p| p.id != id);
         if self.workspaces.current == Some(id) {
             self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
         }
-        if self.current_workspace == Some(id) {
+        if current {
             // Its panes stop saving into the directory about to go.
             self.point_rescue_writers(None, cx);
             self.rescue = rescue::Rescue::default();
             self.current_workspace = None;
-            // Release the lock so the now-deleted workspace's id is free.
-            self.workspace_lock = None;
         }
         if self.workspace_busy == Some(id) {
             self.workspace_busy = None;
@@ -21643,8 +21662,8 @@ impl MuxelApp {
             Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
         }
         // Its document, the unsent prompts and unsaved changes it kept, and
-        // its lock file.
-        if let Err(e) = muxel_store::rescue::delete_workspace_dir(id) {
+        // its lock file. A rescue write still on its way leaves nothing.
+        if let Err(e) = deletion.delete() {
             log::warn!("couldn't delete workspace {id}'s files: {e:#}");
             self.add_event(
                 NotifKind::Error,

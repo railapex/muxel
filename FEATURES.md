@@ -1669,9 +1669,12 @@ feature is added or changed, update the matching entry here in the same change**
   workspace, written atomically, never logged, and capped at 2 MB per draft and
   8 MB per editor backup. Each pane keeps one live draft, and its offers until
   Restore or Discard, with no age or count limit; a workspace keeps the newest
-  20 closed panes' drafts. Deleting a workspace deletes what it kept. Settings → **Keep unsent prompts
-  and unsaved editor changes** (on by default) turns it off and deletes what
-  every workspace kept; other muxel windows on the same data stop saving too.
+  20 closed panes' drafts. Deleting a workspace deletes what it kept, and a
+  rescue write still on its way deletes what it wrote; a workspace open in
+  another muxel window isn't deleted and stays listed. Settings → **Keep unsent
+  prompts and unsaved editor changes** (on by default) turns it off and deletes
+  what every workspace kept, reporting any folder it couldn't read; other muxel
+  windows on the same data stop saving too.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
   `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
   a separate keychain service on Windows, macOS and Linux. This separates Muxel

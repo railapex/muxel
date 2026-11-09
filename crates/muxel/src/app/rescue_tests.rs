@@ -1073,3 +1073,42 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
             .unwrap();
     });
 }
+
+#[test]
+fn deleting_a_workspace_open_in_another_window_leaves_it_listed() {
+    with_app(|cx, window| {
+        let busy = saved_workspace("busy");
+        let dir = muxel_store::rescue::rescue_dir(busy).unwrap();
+        let pane = Uuid::new_v4();
+        dir.save_draft(pane, &draft("kept while open elsewhere"))
+            .unwrap();
+        let workspace_dir = dir.path().parent().unwrap().to_path_buf();
+        // Another muxel window has it open.
+        let elsewhere = muxel_store::try_lock_workspace(busy).expect("lock the workspace");
+        let listed = |app: &MuxelApp| app.workspaces.workspaces.iter().any(|w| w.id == busy);
+        window
+            .update(cx, |app, _, cx| {
+                let current = *app.current_workspace.get_or_insert_with(Uuid::new_v4);
+                for id in [current, busy] {
+                    app.workspaces.workspaces.push(muxel_core::WorkspaceMeta {
+                        id,
+                        name: id.to_string(),
+                    });
+                }
+                app.delete_workspace(busy, cx);
+                assert!(listed(app), "it stays listed, to delete later");
+            })
+            .unwrap();
+        assert!(dir.draft(pane).is_some(), "nothing of it is deleted");
+
+        // Once the other window lets go, deleting it works.
+        drop(elsewhere);
+        window
+            .update(cx, |app, _, cx| {
+                app.delete_workspace(busy, cx);
+                assert!(!listed(app));
+            })
+            .unwrap();
+        assert!(!workspace_dir.exists());
+    });
+}

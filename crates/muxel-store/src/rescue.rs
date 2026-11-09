@@ -22,9 +22,12 @@
 //! reach a log.
 //!
 //! Turning saving off leaves a `rescue-off` marker in the data directory and
-//! deletes every workspace's files. A write that lands after that (from
-//! another muxel window still running with saving on) sees the marker and
-//! deletes itself.
+//! deletes every workspace's files. Deleting a workspace leaves a
+//! `<id>.deleted` marker beside its directory before the directory goes.
+//! Every write checks for both markers before it starts and again once it has
+//! landed. A write that finds one afterwards (one already on its way, or one
+//! from another muxel window or process) deletes what it wrote, and for a
+//! deleted workspace the directory it recreated.
 
 use anyhow::{Context, Result, bail};
 use muxel_core::Uuid;
@@ -42,6 +45,10 @@ const RUNNING: &str = "running";
 
 /// The marker in the data directory while saving is turned off.
 const RESCUE_OFF: &str = "rescue-off";
+
+/// The extension of the marker beside a deleted workspace's directory.
+/// Workspace ids are never reused, so it stays.
+const DELETED: &str = "deleted";
 
 /// A saved draft and the file holding it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,19 +73,94 @@ pub struct RescueCounts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RescueDir {
     dir: PathBuf,
-    /// The data directory's [`RESCUE_OFF`] marker, checked by every write.
+    /// What stops its writes, checked by every one.
+    stops: Stops,
+}
+
+/// What stops a rescue write: saving turned off, or its workspace deleted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Stops {
+    /// The data directory's [`RESCUE_OFF`] marker.
     off: Option<PathBuf>,
+    /// The workspace's [`DELETED`] marker and the directory it stands for.
+    deleted: Option<(PathBuf, PathBuf)>,
+}
+
+impl Stops {
+    /// Refuse to start a write.
+    fn check(&self) -> Result<()> {
+        if self.off.as_deref().is_some_and(Path::exists) {
+            bail!("saving unsent text is turned off");
+        }
+        if self
+            .deleted
+            .as_ref()
+            .is_some_and(|(marker, _)| marker.exists())
+        {
+            bail!("the workspace was deleted");
+        }
+        Ok(())
+    }
+
+    /// A write landed at `target`: take it back if a stop appeared after it
+    /// started, with the directory it may have recreated for a deleted
+    /// workspace.
+    fn undo(&self, target: &Path) -> Result<()> {
+        if self.workspace_gone() {
+            bail!("the workspace was deleted");
+        }
+        if self.off.as_deref().is_some_and(Path::exists) {
+            remove(target);
+            bail!("saving unsent text is turned off");
+        }
+        Ok(())
+    }
+
+    /// When the workspace was deleted, delete the directory a write may have
+    /// recreated, and say so.
+    fn workspace_gone(&self) -> bool {
+        match &self.deleted {
+            Some((marker, workspace)) if marker.exists() => {
+                remove_tree(workspace);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The marker left beside workspace directory `dir` once it was deleted.
+fn deleted_marker(dir: &Path) -> PathBuf {
+    dir.with_extension(DELETED)
+}
+
+fn remove_tree(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("couldn't delete {}: {e}", dir.display()),
+    }
 }
 
 /// The rescue directory of `workspace`, under the data directory.
 pub fn rescue_dir(workspace: Uuid) -> Option<RescueDir> {
-    let dir = crate::workspaces_dir()?
-        .join(workspace.to_string())
-        .join("rescue");
-    Some(RescueDir {
-        dir,
-        off: crate::data_dir().map(|data| data.join(RESCUE_OFF)),
-    })
+    Some(rescue_dir_in(
+        &crate::workspaces_dir()?,
+        crate::data_dir().as_deref(),
+        workspace,
+    ))
+}
+
+/// [`rescue_dir`] under `workspaces`, with the marker of `data` (if any).
+fn rescue_dir_in(workspaces: &Path, data: Option<&Path>, workspace: Uuid) -> RescueDir {
+    let dir = workspaces.join(workspace.to_string());
+    RescueDir {
+        stops: Stops {
+            off: data.map(|data| data.join(RESCUE_OFF)),
+            deleted: Some((deleted_marker(&dir), dir.clone())),
+        },
+        dir: dir.join("rescue"),
+    }
 }
 
 /// Whether saving was turned off, in this window or another on the same data.
@@ -94,7 +176,7 @@ pub fn set_rescue_turned_off(off: bool) -> Result<()> {
         .context("could not determine data directory")?
         .join(RESCUE_OFF);
     if off {
-        write_private(&marker, b"", 0, None)
+        write_private(&marker, b"", 0, &Stops::default())
     } else {
         match std::fs::remove_file(&marker) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -106,29 +188,48 @@ pub fn set_rescue_turned_off(off: bool) -> Result<()> {
 }
 
 /// Delete what every workspace kept, as turning saving off does. Returns how
-/// many workspaces had something to delete; a file that couldn't be deleted
-/// is reported.
+/// many workspaces had something to delete. A directory that couldn't be
+/// listed and a file that couldn't be deleted are reported; only a data
+/// directory with no workspaces yet holds nothing.
 pub fn purge_every_workspace() -> Result<usize> {
     let root = crate::workspaces_dir().context("could not determine data directory")?;
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Ok(0);
+    purge_every_workspace_in(&root)
+}
+
+fn purge_every_workspace_in(root: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", root.display())),
     };
     let mut purged = 0;
     let mut failed = Vec::new();
-    for entry in entries.flatten() {
-        let Some(id) = entry
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failed.push(format!("{}: {e}", root.display()));
+                continue;
+            }
+        };
+        let workspace = entry
             .file_name()
             .to_str()
-            .and_then(|name| Uuid::parse_str(name).ok())
-        else {
+            .is_some_and(|name| Uuid::parse_str(name).is_ok());
+        if !workspace {
             continue;
-        };
-        let Some(dir) = rescue_dir(id) else {
-            continue;
-        };
-        if dir.names().is_empty() {
-            let _ = std::fs::remove_dir(dir.path());
-            continue;
+        }
+        let dir = RescueDir::at(entry.path().join("rescue"));
+        match dir.try_names() {
+            Ok(names) if names.is_empty() => {
+                let _ = std::fs::remove_dir(dir.path());
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                failed.push(format!("{}: {e}", dir.path().display()));
+                continue;
+            }
         }
         purged += 1;
         failed.extend(dir.purge());
@@ -136,9 +237,14 @@ pub fn purge_every_workspace() -> Result<usize> {
     }
     if !failed.is_empty() {
         bail!(
-            "couldn't delete {} rescue file(s), e.g. {}",
+            "couldn't delete everything kept ({} failure(s)): {}",
             failed.len(),
-            failed[0].display()
+            failed
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     }
     Ok(purged)
@@ -154,37 +260,36 @@ fn now_ms() -> i64 {
 pub struct StagedWrite {
     tmp: PathBuf,
     target: PathBuf,
-    off: Option<PathBuf>,
+    stops: Stops,
 }
 
 impl StagedWrite {
-    /// Rename the file over its target. If saving was turned off meanwhile,
-    /// the file is deleted again and this fails.
+    /// Rename the file over its target. If saving was turned off or the
+    /// workspace deleted after the write started, what landed is deleted
+    /// again and this fails.
     pub fn commit(self) -> Result<()> {
-        let renamed = crate::rename_with_retry(&self.tmp, &self.target)
-            .with_context(|| format!("writing {}", self.target.display()));
-        if renamed.is_ok() && self.off.as_ref().is_some_and(|off| off.exists()) {
-            remove(&self.target);
-            bail!("saving unsent text is turned off");
-        }
-        renamed
+        crate::rename_with_retry(&self.tmp, &self.target)
+            .with_context(|| format!("writing {}", self.target.display()))?;
+        self.stops.undo(&self.target)
     }
 }
 
 impl Drop for StagedWrite {
     fn drop(&mut self) {
-        // Gone after a commit; otherwise this write was abandoned.
+        // Gone after a commit; otherwise this write was abandoned, and for a
+        // deleted workspace the directory it recreated goes too.
         let _ = std::fs::remove_file(&self.tmp);
+        self.stops.workspace_gone();
     }
 }
 
 /// Write `bytes` beside `path`, owner-only on Unix, refusing more than `cap`
-/// bytes of text, or anything while `off` exists.
-fn stage_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> Result<StagedWrite> {
+/// bytes of text, or anything once one of `stops` exists.
+fn stage_private(path: &Path, bytes: &[u8], cap: usize, stops: &Stops) -> Result<StagedWrite> {
     use std::io::Write as _;
-    if off.is_some_and(Path::exists) {
-        bail!("saving unsent text is turned off");
-    }
+    stops.check()?;
+    #[cfg(test)]
+    tests::after_check();
     if bytes.len() > cap + ENVELOPE_BYTES {
         bail!("rescue file too large ({} bytes)", bytes.len());
     }
@@ -198,7 +303,7 @@ fn stage_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> R
     let staged = StagedWrite {
         tmp: parent.join(format!(".{name}.{}.tmp", Uuid::new_v4())),
         target: path.to_path_buf(),
-        off: off.map(Path::to_path_buf),
+        stops: stops.clone(),
     };
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -217,8 +322,8 @@ fn stage_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> R
 }
 
 /// Write `bytes` to `path` atomically; see [`stage_private`].
-fn write_private(path: &Path, bytes: &[u8], cap: usize, off: Option<&Path>) -> Result<()> {
-    stage_private(path, bytes, cap, off)?.commit()
+fn write_private(path: &Path, bytes: &[u8], cap: usize, stops: &Stops) -> Result<()> {
+    stage_private(path, bytes, cap, stops)?.commit()
 }
 
 fn read_draft(path: &Path) -> Option<PromptDraft> {
@@ -263,16 +368,12 @@ impl RescueDir {
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            off: None,
+            stops: Stops::default(),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.dir
-    }
-
-    fn off(&self) -> Option<&Path> {
-        self.off.as_deref()
     }
 
     fn live_draft(&self, instance: Uuid) -> PathBuf {
@@ -287,13 +388,26 @@ impl RescueDir {
         self.dir.join(format!("editor-{instance}.offer.json"))
     }
 
+    /// The directory's file names, for reading: one that can't be listed
+    /// reads as empty.
     fn names(&self) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+        self.try_names().unwrap_or_default()
+    }
+
+    /// The directory's file names. Only a missing directory is empty.
+    fn try_names(&self) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        entries
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .collect()
+        let mut names = Vec::new();
+        for entry in entries {
+            if let Ok(name) = entry?.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     /// Replace a pane's live draft.
@@ -303,7 +417,7 @@ impl RescueDir {
             &self.live_draft(instance),
             &bytes,
             MAX_RESCUE_BYTES,
-            self.off(),
+            &self.stops,
         )
     }
 
@@ -388,7 +502,7 @@ impl RescueDir {
             );
             let saved = serde_json::to_vec(&draft)
                 .context("serializing draft")
-                .and_then(|bytes| write_private(&to, &bytes, MAX_RESCUE_BYTES, self.off()));
+                .and_then(|bytes| write_private(&to, &bytes, MAX_RESCUE_BYTES, &self.stops));
             match saved {
                 Ok(()) => {
                     kept += 1;
@@ -447,7 +561,7 @@ impl RescueDir {
             &self.editor_file(instance),
             &bytes,
             MAX_EDITOR_BACKUP_BYTES,
-            self.off(),
+            &self.stops,
         )
     }
 
@@ -553,11 +667,15 @@ impl RescueDir {
         counts
     }
 
-    /// Delete everything kept, as turning saving off does. Returns the files
-    /// that couldn't be deleted.
-    pub fn purge(&self) -> Vec<PathBuf> {
+    /// Delete everything kept, as turning saving off does. Returns what
+    /// couldn't be listed or deleted.
+    pub fn purge(&self) -> Vec<String> {
+        let names = match self.try_names() {
+            Ok(names) => names,
+            Err(e) => return vec![format!("{}: {e}", self.dir.display())],
+        };
         let mut failed = Vec::new();
-        for name in self.names() {
+        for name in names {
             if ["draft-", "closed-", "editor-", "."]
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
@@ -566,7 +684,7 @@ impl RescueDir {
                 match std::fs::remove_file(&path) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                         log::warn!("couldn't delete rescue file {}: {e}", path.display());
-                        failed.push(path);
+                        failed.push(format!("{}: {e}", path.display()));
                     }
                     _ => {}
                 }
@@ -581,42 +699,116 @@ fn read_backup(path: &Path) -> Option<EditorBackup> {
     serde_json::from_slice(&data).ok()
 }
 
-/// Delete workspace `workspace`'s directory: its document, everything it
-/// kept, and its lock file. Refuses while another muxel window has the
-/// workspace open; a file that couldn't be deleted is reported.
+/// A workspace held for deleting: its lock is taken before anything about
+/// it changes, so one open in another muxel window stays as it is.
+#[derive(Debug)]
+pub struct WorkspaceDeletion {
+    dir: PathBuf,
+    lock: Option<std::fs::File>,
+}
+
+/// Hold workspace `workspace` for deleting. `held` is the lock this window
+/// already holds on it (its current workspace); otherwise the lock is taken
+/// here, and refused while another muxel window has the workspace open.
+pub fn hold_workspace_for_deletion(
+    workspace: Uuid,
+    held: Option<std::fs::File>,
+) -> Result<WorkspaceDeletion> {
+    let root = crate::workspaces_dir().context("could not determine data directory")?;
+    hold_in(&root, workspace, held)
+}
+
+fn hold_in(root: &Path, workspace: Uuid, held: Option<std::fs::File>) -> Result<WorkspaceDeletion> {
+    let dir = root.join(workspace.to_string());
+    let lock = match held {
+        Some(lock) => Some(lock),
+        None if dir.exists() => {
+            Some(crate::try_lock_dir(&dir).context("it is open in another muxel window")?)
+        }
+        None => None,
+    };
+    Ok(WorkspaceDeletion { dir, lock })
+}
+
+impl WorkspaceDeletion {
+    /// Delete the workspace's directory: its document, everything it kept,
+    /// and its lock file. Its deleted marker goes first, so a rescue write
+    /// still on its way deletes what it writes, directory and all. What
+    /// couldn't be deleted is reported.
+    pub fn delete(self) -> Result<()> {
+        let Self { dir, lock } = self;
+        write_private(&deleted_marker(&dir), b"", 0, &Stops::default())
+            .context("marking the workspace deleted")?;
+        let mut failed = Vec::new();
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = match entry {
+                        Ok(entry) if entry.file_name() == "instance.lock" => continue,
+                        Ok(entry) => entry.path(),
+                        Err(e) => {
+                            failed.push(format!("{}: {e}", dir.display()));
+                            continue;
+                        }
+                    };
+                    let removed = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    if let Err(e) = removed
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        failed.push(format!("{}: {e}", path.display()));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(format!("{}: {e}", dir.display())),
+        }
+        drop(lock);
+        let _ = std::fs::remove_file(dir.join("instance.lock"));
+        // A write racing this one can recreate the directory; it deletes it
+        // again when it lands, and this tries once more.
+        let removed = std::fs::remove_dir(&dir).or_else(|_| std::fs::remove_dir_all(&dir));
+        if let Err(e) = removed
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            failed.push(format!("{}: {e}", dir.display()));
+        }
+        if !failed.is_empty() {
+            bail!("couldn't delete {}", failed.join("; "));
+        }
+        Ok(())
+    }
+}
+
+/// Delete workspace `workspace`'s directory, refused while another muxel
+/// window has it open. See [`WorkspaceDeletion::delete`].
 pub fn delete_workspace_dir(workspace: Uuid) -> Result<()> {
-    let dir = crate::workspaces_dir()
-        .context("could not determine data directory")?
-        .join(workspace.to_string());
-    if !dir.exists() {
-        return Ok(());
-    }
-    let lock = crate::try_lock_dir(&dir).context("it is open in another muxel window")?;
-    let mut failed = Vec::new();
-    let entries = std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
+    hold_workspace_for_deletion(workspace, None)?.delete()
+}
+
+#[cfg(test)]
+fn delete_workspace_dir_in(root: &Path, workspace: Uuid) -> Result<()> {
+    hold_in(root, workspace, None)?.delete()
+}
+
+/// Delete what is left of deleted workspaces: a write cut off between
+/// landing and checking for the marker leaves its directory behind.
+pub fn sweep_deleted_workspaces() {
+    let Some(root) = crate::workspaces_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
     for entry in entries.flatten() {
-        if entry.file_name() == "instance.lock" {
-            continue;
-        }
         let path = entry.path();
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if let Err(e) = removed {
-            failed.push(format!("{}: {e}", path.display()));
+        if path.extension().is_some_and(|ext| ext == DELETED) {
+            remove_tree(&path.with_extension(""));
         }
     }
-    drop(lock);
-    let _ = std::fs::remove_file(dir.join("instance.lock"));
-    if let Err(e) = std::fs::remove_dir(&dir) {
-        failed.push(format!("{}: {e}", dir.display()));
-    }
-    if !failed.is_empty() {
-        bail!("couldn't delete {}", failed.join("; "));
-    }
-    Ok(())
 }
 
 /// Mark `workspace` open. Returns whether the marker was already there: the
@@ -640,7 +832,12 @@ fn mark_running_in(dir: &Path) -> bool {
     let marker = dir.join(RUNNING);
     let unclean = marker.exists();
     let stamp = format!("{} {}\n", std::process::id(), now_ms());
-    if let Err(e) = write_private(&marker, stamp.as_bytes(), MAX_RESCUE_BYTES, None) {
+    if let Err(e) = write_private(
+        &marker,
+        stamp.as_bytes(),
+        MAX_RESCUE_BYTES,
+        &Stops::default(),
+    ) {
         log::warn!("couldn't mark workspace running: {e:#}");
     }
     unclean
@@ -648,9 +845,87 @@ fn mark_running_in(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CLOSED_DRAFTS, RescueCounts, RescueDir, mark_running_in};
+    use super::{
+        MAX_CLOSED_DRAFTS, RescueCounts, RescueDir, delete_workspace_dir_in, mark_running_in,
+        purge_every_workspace_in, rescue_dir_in,
+    };
     use muxel_core::Uuid;
     use muxel_core::rescue::{DraftSource, EditorBackup, MAX_RESCUE_BYTES, PromptDraft};
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Run once by this thread's next write, just after it checked
+        /// whether it may write: what a writer paused there would meet.
+        static AFTER_CHECK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_check() {
+        if let Some(run) = AFTER_CHECK.with(|hook| hook.borrow_mut().take()) {
+            run();
+        }
+    }
+
+    fn pause_next_write_after_its_check(run: impl FnOnce() + 'static) {
+        AFTER_CHECK.with(|hook| *hook.borrow_mut() = Some(Box::new(run)));
+    }
+
+    fn scratch_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "muxel-rescue-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn a_write_paused_past_its_check_never_brings_a_deleted_workspace_back() {
+        let root = scratch_root("deleted");
+        let workspaces = root.join("workspaces");
+        let workspace = Uuid::new_v4();
+        let dir = rescue_dir_in(&workspaces, Some(&root), workspace);
+        let pane = Uuid::new_v4();
+        dir.save_draft(pane, &draft("typed before the delete", 1))
+            .unwrap();
+        let deleted = workspaces.join(workspace.to_string());
+        assert!(deleted.exists());
+
+        // The next draft write has checked it may write when the workspace is
+        // deleted; then it goes on.
+        let root_for_delete = workspaces.clone();
+        pause_next_write_after_its_check(move || {
+            delete_workspace_dir_in(&root_for_delete, workspace).unwrap();
+        });
+        let _ = dir.save_draft(pane, &draft("landing after the delete", 2));
+        assert!(
+            !deleted.exists(),
+            "the paused write left {:?}",
+            std::fs::read_dir(&deleted)
+                .map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        // A write that starts afterwards leaves nothing either.
+        let _ = dir.save_draft(pane, &draft("written later", 3));
+        assert!(!deleted.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rescue_directory_that_cant_be_listed_is_reported_not_taken_for_empty() {
+        let root = scratch_root("unlisted");
+        std::fs::create_dir_all(&root).unwrap();
+        let workspaces = root.join("workspaces");
+        // The workspaces directory itself can't be listed.
+        std::fs::write(&workspaces, b"not a directory").unwrap();
+        assert!(purge_every_workspace_in(&workspaces).is_err());
+        std::fs::remove_file(&workspaces).unwrap();
+        // One workspace's rescue directory can't be listed.
+        let workspace = workspaces.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("rescue"), b"not a directory").unwrap();
+        assert!(purge_every_workspace_in(&workspaces).is_err());
+        // No workspaces yet: nothing to delete, and that's not a failure.
+        assert_eq!(purge_every_workspace_in(&root.join("missing")).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn scratch(name: &str) -> RescueDir {
         let dir = std::env::temp_dir().join(format!(
@@ -833,7 +1108,10 @@ mod tests {
         let dir = scratch("off");
         let marker = dir.path().with_extension("off");
         let dir = RescueDir {
-            off: Some(marker.clone()),
+            stops: super::Stops {
+                off: Some(marker.clone()),
+                deleted: None,
+            },
             ..dir
         };
         let pane = Uuid::new_v4();

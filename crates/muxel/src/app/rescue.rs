@@ -436,8 +436,10 @@ impl MuxelApp {
 
     /// Workspace `id` is opening, its lock held and none of its panes
     /// started: delete what it kept if saving is off (here or in another
-    /// window), else the temporaries of writes a crash cut off.
+    /// window), else the temporaries of writes a crash cut off. What a crash
+    /// left of deleted workspaces goes too.
     pub(super) fn prepare_workspace_rescue(&mut self, id: Uuid) {
+        muxel_store::rescue::sweep_deleted_workspaces();
         let Some(dir) = muxel_store::rescue::rescue_dir(id) else {
             return;
         };
