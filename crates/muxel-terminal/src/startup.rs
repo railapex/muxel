@@ -292,6 +292,38 @@ struct CodexCtlDraft {
 }
 
 impl Screen {
+    /// Status never reads the draft. Codex draws its real prompt at column zero;
+    /// pasted prompt glyphs are indented continuation rows inside that editor.
+    /// The independent model/shortcut footer bounds it even with a hidden cursor.
+    pub(crate) fn codex_status_context(&self, wrapped: &[bool]) -> Option<String> {
+        if !self.bracketed_paste {
+            return None;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let bottom = rows.iter().rposition(|row| codex_footer(row))?;
+        let top = rows[..bottom].iter().rposition(|row| {
+            row.strip_prefix('›')
+                .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        })?;
+        if self.cursor_visible {
+            let cursor = usize::try_from(self.cursor_row).ok()?;
+            if cursor < top || cursor >= bottom {
+                return None;
+            }
+        }
+        let mut context = String::new();
+        for (index, row) in rows[..top].iter().enumerate() {
+            if wrapped.get(index) == Some(&true) {
+                context.push_str(row);
+            } else {
+                context.push_str(row.trim_end());
+                context.push('\n');
+            }
+        }
+        context.push_str("›\n");
+        Some(context)
+    }
+
     // Master can render a model row followed by a shortcuts footer. The
     // generic composer scan uses the last footer; ctl's geometry proof pins
     // the earlier model row when both are present.

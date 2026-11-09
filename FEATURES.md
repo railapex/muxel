@@ -524,14 +524,18 @@ feature is added or changed, update the matching entry here in the same change**
   at **working**, labelled with what's running
   (`working · 1 shell`). The screen readers cover tmux and SSH panes too, and beat Claude's own
   finished report. A held turn doesn't alert or move in Recent, and it reads **done**
-  once when the work ends and the agent has had a moment to wake for it. Shells and
-  monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
-  the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
-  finished turn. Subagents hold until they end. Local Codex panes also read child-turn
-  lifecycle records for subagents created during the current pane launch; their normal
+  once when the work ends and the agent has had a moment to wake for it. All background
+  holds have a 30-minute cap, including subagents and
+  unreadable evidence. Past that the pane reads `done · 1 shell` if work is still listed
+  and alerts as a finished turn. Local Codex panes also read child-turn
+  lifecycle records for child turns started during the current pane launch; their normal
   composer has no live child count. Panes identified later also pick up children
   already running beside them. Copied parent history and children left by an
-  earlier launch do not count. Muse's completion hook can retire a leftover spinner
+  earlier launch do not count. Rollout catch-up stays pending until complete records
+  reach the current end, under a shared worker read budget. Codex screen checks exclude
+  the live composer draft, reconstruct wrapped badges, and keep unreadable chrome
+  separate from a readable empty footer. Provider layout or wording changes can require
+  new fixtures. Muse's completion hook can retire a leftover spinner
   title after five seconds without output or a title update; live work stays listed.
   A redraw alone cannot make that retired title read as new work. New titles and
   Working hooks remain valid work signals.

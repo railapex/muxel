@@ -462,6 +462,13 @@ the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watch
 is a scheduled wake, not running work. Codex 0.167.0's terminal badge sits directly
 above the composer and includes `/ps` and `/stop` hints. Its report already stays
 Working while a background terminal runs; the screen adds the listed shell count.
+Codex status capture excludes the column-zero composer through its independently
+recognized model/shortcut footer, even when the cursor is hidden. Indented pasted
+screens stay inside that draft. Terminal soft-wrap flags and up to nine contiguous
+provider word-wrapped rows reconstruct the badge. A missing composer or incomplete
+badge is unreadable, not a confirmed empty footer; once chrome has been recognized,
+unreadable frames retain the last confirmed count and withhold completion. Unsupported
+footer/composer layouts, wording or locale changes can require new fixtures.
 Muse 1.4.14 lists running terminals in the tree below the lower composer rule.
 Its earlier `Backgrounded` message remains after a task ends and is not live work.
 The tree's explicit `running` column identifies work independently of its animated
@@ -477,11 +484,34 @@ uses directory stamps as a backstop, caches their `parent_thread_id`, and
 reads matching children forward in bounded chunks. `subagent_history_start_ordinal`
 excludes copied parent events; a matching `task_complete` or `turn_aborted` ends
 the child's own `task_started` turn. Incomplete records wait for their newline.
-Results are guarded by parent session, launch and binding. Only children created
-and turns started during that pane launch count, so a restarted pane does not
+Rollout reads share a 2 MiB allowance and a cooperative 50 ms deadline across all
+stores in one worker refresh, checked between chunks of at most 256 KiB. Each pending
+record is capped at 1 MiB. Catch-up, a partial JSONL record or an I/O error reports
+uncertainty separately from a current result with no active child. The first request
+is pending until its worker returns. Pending evidence holds a finished turn without
+inventing a running count; later refreshes continue from the cached byte offset.
+Unconfirmed holds are not new activity or completion edges. Plain `ctl wait`
+follows the hold until the evidence is current or the cap expires. A current-binding
+background-only hold leaves the foreground composer available to send and `--turn`,
+even while completion attribution is suppressed. Foreground working/blocked markers
+prevent fallback evidence from becoming that background-only exception.
+Directory discovery, retained-file metadata checks and notification setup also cost
+work outside that read allowance, so it is not a hard wall-clock limit for the worker.
+Results are guarded by parent session, launch and binding. Only child turns
+started during that pane launch count, so a restarted pane does not
 inherit abandoned work. A historical child thread resumed after a restart may
 be unobserved; remote child files are not read. File and record format changes can disable
-this source; terminal footer layout changes can disable the screen sources.
+this source; terminal footer layout changes can disable the screen sources. Only
+local direct children are aggregated. Remote and deeper descendants, compressed
+rollouts and metadata/lifecycle records over 1 MiB are outside this reader's coverage.
+
+Every background hold has a 30-minute cap, including
+subagents with missing end records and uncertain lifecycle reads. Listed work can
+remain after expiry and still makes close busy. A new foreground turn restarts the
+clock when that turn is observed ending. A replacement conversation starts its own
+hold. A readable empty footer or current child result releases
+the hold after the five-second wake grace once all relevant sources are current
+and no work remains listed.
 
 Plain `ctl wait` now follows the background hold rather than returning at the
 foreground turn's end. `ctl wait --turn` stops at an observable turn end with

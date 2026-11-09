@@ -1,5 +1,6 @@
 use super::{MuxelApp, is_codex_program};
 use gpui::Context;
+use muxel_core::CodexReadBudget;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
@@ -43,6 +44,13 @@ impl MuxelApp {
             self.codex_subagents = Default::default();
             return;
         }
+        for (pane, launch, binding, _, _, _) in &requests {
+            if let Some(view) = self.terminal_view(*pane).cloned() {
+                view.update(cx, |view, cx| {
+                    view.begin_codex_subagents(*launch, *binding, cx);
+                });
+            }
+        }
         let mut stores: HashMap<_, Vec<_>> = HashMap::new();
         for (_, _, _, parent, launched, store) in &requests {
             stores
@@ -53,24 +61,34 @@ impl MuxelApp {
         let mut index = std::mem::take(&mut self.codex_subagents);
         self.codex_subagents_in_flight = true;
         cx.spawn(async move |this, cx| {
-            let (index, running) = cx
+            let (index, running, catching_up) = cx
                 .background_executor()
                 .spawn(async move {
                     index.retain(|store, _| stores.contains_key(store));
                     let mut running = HashSet::new();
+                    let mut catching_up = HashSet::new();
+                    let mut budget = CodexReadBudget::default();
                     for (store, parents) in stores {
-                        let active = index.entry(store.clone()).or_default().refresh(
+                        let active = index.entry(store.clone()).or_default().refresh_with_budget(
                             &store,
                             &parents,
                             SystemTime::now(),
+                            &mut budget,
                         );
                         running.extend(
                             active
+                                .running
+                                .into_iter()
+                                .map(|(parent, launched)| (store.clone(), parent, launched)),
+                        );
+                        catching_up.extend(
+                            active
+                                .catching_up
                                 .into_iter()
                                 .map(|(parent, launched)| (store.clone(), parent, launched)),
                         );
                     }
-                    (index, running)
+                    (index, running, catching_up)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -85,7 +103,8 @@ impl MuxelApp {
                         continue;
                     }
                     if let Some(view) = this.terminal_view(pane).cloned() {
-                        let active = running.contains(&(store, parent, launched));
+                        let key = (store, parent, launched);
+                        let active = (!catching_up.contains(&key)).then(|| running.contains(&key));
                         view.update(cx, |view, cx| {
                             view.set_codex_subagents(launch, binding, active, cx);
                         });

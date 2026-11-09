@@ -11,10 +11,37 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const READ_BYTES: u64 = 256 * 1024;
 const RECORD_BYTES: usize = 1024 * 1024;
+
+/// Shared by all stores in one app refresh, including repeated catch-up reads.
+pub struct CodexReadBudget {
+    remaining: u64,
+    deadline: Instant,
+}
+
+impl Default for CodexReadBudget {
+    fn default() -> Self {
+        Self {
+            remaining: 2 * 1024 * 1024,
+            deadline: Instant::now() + Duration::from_millis(50),
+        }
+    }
+}
+
+impl CodexReadBudget {
+    fn exhausted(&self) -> bool {
+        self.remaining == 0 || Instant::now() >= self.deadline
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct CodexSubagentSnapshot {
+    pub running: HashSet<(String, SystemTime)>,
+    pub catching_up: HashSet<(String, SystemTime)>,
+}
 
 #[derive(Default)]
 pub struct CodexSubagents {
@@ -26,20 +53,31 @@ pub struct CodexSubagents {
     new_rollouts: Option<NewRollouts>,
     watch_attempted: bool,
     last_backstop: Option<SystemTime>,
+    next_child: usize,
 }
 
 impl CodexSubagents {
-    /// Return parents with a child turn started during the current launch.
+    /// Return running children and parents whose lifecycle evidence is not current.
     /// Call on a worker; remote panes must not query the local rollout store.
     pub fn refresh(
         &mut self,
         store: &Path,
         parents: &[(String, SystemTime)],
         now: SystemTime,
-    ) -> HashSet<(String, SystemTime)> {
+    ) -> CodexSubagentSnapshot {
+        self.refresh_with_budget(store, parents, now, &mut CodexReadBudget::default())
+    }
+
+    pub fn refresh_with_budget(
+        &mut self,
+        store: &Path,
+        parents: &[(String, SystemTime)],
+        now: SystemTime,
+        budget: &mut CodexReadBudget,
+    ) -> CodexSubagentSnapshot {
         let Some(oldest) = parents.iter().map(|(_, launched)| *launched).min() else {
             *self = Self::default();
-            return HashSet::new();
+            return CodexSubagentSnapshot::default();
         };
         if self.store.as_deref() != Some(store) {
             *self = Self {
@@ -73,11 +111,15 @@ impl CodexSubagents {
             .scanned_through
             .and_then(|day| day.succ_opt())
             .unwrap_or(first_day);
+        let mut discovery_current = true;
         for _ in 0..32 {
             if next > last_day {
                 break;
             }
-            self.discover(store, next, oldest);
+            if !self.discover(store, next, oldest) {
+                discovery_current = false;
+                break;
+            }
             self.scanned_through = Some(next);
             let Some(day) = next.succ_opt() else {
                 break;
@@ -110,7 +152,7 @@ impl CodexSubagents {
                     self.directories
                         .remove(&store.join(day.format("%Y/%m/%d").to_string()));
                 }
-                self.discover(store, day, oldest);
+                discovery_current &= self.discover(store, day, oldest);
             }
             self.last_backstop = Some(now);
         }
@@ -118,8 +160,16 @@ impl CodexSubagents {
         for (id, launched) in parents {
             requested.entry(id).or_default().push(*launched);
         }
-        let mut running = HashSet::new();
-        for (path, child) in &mut self.children {
+        let mut result = CodexSubagentSnapshot::default();
+        if !discovery_current || self.scanned_through.is_none_or(|day| day < last_day) {
+            result.catching_up.extend(parents.iter().cloned());
+        }
+        let mut children: Vec<_> = self.children.iter_mut().collect();
+        let count = children.len();
+        let start = self.next_child.checked_rem(count).unwrap_or(0);
+        children.rotate_left(start);
+        let mut visited = 0;
+        for (path, child) in children {
             // Read a new file's metadata once, then follow only requested parents.
             if (child.ordinal > 0 && child.parent.is_none())
                 || child
@@ -129,33 +179,59 @@ impl CodexSubagents {
             {
                 continue;
             }
-            child.refresh(path);
+            let current = if budget.exhausted() {
+                false
+            } else {
+                visited += 1;
+                child.refresh(path, budget, &requested)
+            };
+            if !current {
+                if let Some(parent) = &child.parent {
+                    for launched in requested.get(parent.as_str()).into_iter().flatten() {
+                        result.catching_up.insert((parent.clone(), *launched));
+                    }
+                } else {
+                    // Until metadata is read, any requested parent could own it.
+                    result.catching_up.extend(parents.iter().cloned());
+                }
+            }
             if let (Some(parent), Some((_, started))) = (&child.parent, &child.active) {
                 for launched in requested.get(parent.as_str()).into_iter().flatten() {
                     if started >= launched {
-                        running.insert((parent.clone(), *launched));
+                        result.running.insert((parent.clone(), *launched));
                     }
                 }
             }
         }
-        running
+        self.next_child = (start + visited).checked_rem(count).unwrap_or(0);
+        result
     }
 
-    fn discover(&mut self, store: &Path, day: NaiveDate, oldest: SystemTime) {
+    fn discover(&mut self, store: &Path, day: NaiveDate, oldest: SystemTime) -> bool {
         let path = store.join(day.format("%Y/%m/%d").to_string());
-        let stamp = std::fs::metadata(&path)
-            .ok()
-            .and_then(|meta| meta.modified().ok());
-        if self.directories.get(&path) == Some(&stamp) {
-            return;
+        let stamp = match std::fs::metadata(&path) {
+            Ok(meta) => meta.modified().ok(),
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        };
+        if stamp.is_some() && self.directories.get(&path) == Some(&stamp) {
+            return true;
         }
         let Ok(entries) = std::fs::read_dir(&path) else {
-            return;
+            return false;
         };
-        self.directories.insert(path, stamp);
-        for entry in entries.flatten() {
-            self.discover_path(entry.path(), oldest);
+        let mut current = true;
+        for entry in entries {
+            match entry {
+                Ok(entry) => self.discover_path(entry.path(), oldest),
+                Err(_) => current = false,
+            }
         }
+        if current {
+            self.directories.insert(path, stamp);
+        } else {
+            self.directories.remove(&path);
+        }
+        current
     }
 
     fn discover_path(&mut self, path: PathBuf, oldest: SystemTime) {
@@ -252,15 +328,29 @@ impl Default for Child {
 }
 
 impl Child {
-    fn refresh(&mut self, path: &Path) {
-        let Ok(meta) = std::fs::metadata(path) else {
-            self.active = None;
-            self.stamp = None;
-            return;
+    fn refresh(
+        &mut self,
+        path: &Path,
+        budget: &mut CodexReadBudget,
+        requested: &HashMap<&str, Vec<SystemTime>>,
+    ) -> bool {
+        if budget.exhausted() {
+            return false;
+        }
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    self.active = None;
+                    self.stamp = None;
+                    return true;
+                }
+                return false;
+            }
         };
         let stamp = (meta.len(), meta.modified().ok());
         if self.stamp == Some(stamp) && self.offset == meta.len() {
-            return;
+            return self.pending.is_empty() && !self.skipping;
         }
         if meta.len() < self.offset {
             *self = Self {
@@ -270,37 +360,56 @@ impl Child {
             };
         }
         let Ok(mut file) = std::fs::File::open(path) else {
-            self.active = None;
-            self.stamp = None;
-            return;
+            return false;
         };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
+            return false;
         }
-        let mut bytes = Vec::new();
-        if file.take(READ_BYTES).read_to_end(&mut bytes).is_err() {
-            return;
-        }
-        self.offset += bytes.len() as u64;
-        self.stamp = Some(stamp);
-        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
-            if !self.skipping {
-                if self.pending.len() + part.len() > RECORD_BYTES {
-                    self.pending.clear();
-                    self.skipping = true;
-                } else {
-                    self.pending.extend_from_slice(part);
-                }
+        while self.offset < meta.len() && !budget.exhausted() {
+            let mut bytes = Vec::new();
+            if (&mut file)
+                .take(READ_BYTES.min(budget.remaining))
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                return false;
             }
-            if part.last() == Some(&b'\n') {
+            if bytes.is_empty() {
+                break;
+            }
+            budget.remaining -= bytes.len() as u64;
+            self.offset += bytes.len() as u64;
+            self.stamp = Some(stamp);
+            for part in bytes.split_inclusive(|byte| *byte == b'\n') {
                 if !self.skipping {
-                    let pending = std::mem::take(&mut self.pending);
-                    self.record(&pending);
+                    if self.pending.len() + part.len() > RECORD_BYTES {
+                        self.pending.clear();
+                        self.skipping = true;
+                    } else {
+                        self.pending.extend_from_slice(part);
+                    }
                 }
-                self.skipping = false;
-                self.ordinal += 1;
+                if part.last() == Some(&b'\n') {
+                    if !self.skipping {
+                        let pending = std::mem::take(&mut self.pending);
+                        self.record(&pending);
+                    }
+                    self.skipping = false;
+                    self.ordinal += 1;
+                }
+            }
+            // Newly discovered root files and other parents need only their header.
+            // Finish parsing the chunk so a later parent request loses no records.
+            if self.ordinal > 0
+                && self
+                    .parent
+                    .as_deref()
+                    .is_none_or(|id| !requested.contains_key(id))
+            {
+                return true;
             }
         }
+        self.offset >= meta.len() && self.pending.is_empty() && !self.skipping
     }
 
     fn record(&mut self, bytes: &[u8]) {
@@ -369,7 +478,7 @@ struct Payload {
 
 #[cfg(test)]
 mod tests {
-    use super::CodexSubagents;
+    use super::{CodexReadBudget, CodexSubagentSnapshot, CodexSubagents};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -403,12 +512,112 @@ mod tests {
         fn parents(&self) -> Vec<(String, SystemTime)> {
             vec![(PARENT.into(), self.now - Duration::from_secs(240))]
         }
+
+        fn read(
+            &self,
+            index: &mut CodexSubagents,
+            parents: &[(String, SystemTime)],
+        ) -> CodexSubagentSnapshot {
+            // Lifecycle assertions do not impose the production clock slice.
+            // Exhausted byte/time budgets are exercised separately below.
+            let mut budget = CodexReadBudget {
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                ..CodexReadBudget::default()
+            };
+            index.refresh_with_budget(&self.home, parents, self.now, &mut budget)
+        }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.home).unwrap();
         }
+    }
+
+    #[test]
+    fn background_codex_failed_directory_scan_is_pending_and_can_recover() {
+        let fixture = Fixture::new();
+        let day = fixture.child.parent().unwrap();
+        fs::remove_dir(day).unwrap();
+        fs::write(day, "not a directory").unwrap();
+        let mut index = CodexSubagents::default();
+        let parent = fixture.parents()[0].clone();
+        let pending = fixture.read(&mut index, &fixture.parents());
+        assert!(pending.running.is_empty());
+        assert!(pending.catching_up.contains(&parent));
+        fs::remove_file(day).unwrap();
+        fs::create_dir(day).unwrap();
+        let rows: Vec<_> = ROWS.split_inclusive('\n').collect();
+        fs::write(&fixture.child, rows[..6].concat()).unwrap();
+        let current = fixture.read(&mut index, &fixture.parents());
+        assert!(current.running.contains(&parent));
+        assert!(current.catching_up.is_empty());
+    }
+
+    #[test]
+    fn background_codex_shared_budget_withholds_a_partial_completion() {
+        let fixture = Fixture::new();
+        let rows: Vec<_> = ROWS.split_inclusive('\n').collect();
+        let mut history = rows[..6].concat();
+        for _ in 0..3 {
+            history.push_str(&format!(
+                "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"{}\"}}}}\n",
+                "x".repeat(200_000)
+            ));
+        }
+        history.push_str(rows[7]);
+        fs::write(&fixture.child, history).unwrap();
+        let parent = fixture.parents()[0].clone();
+        let mut index = CodexSubagents::default();
+        let mut budget = CodexReadBudget {
+            remaining: 256 * 1024,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+        };
+        let partial =
+            index.refresh_with_budget(&fixture.home, &fixture.parents(), fixture.now, &mut budget);
+        assert!(partial.running.contains(&parent));
+        assert!(partial.catching_up.contains(&parent));
+        assert_eq!(budget.remaining, 0);
+        // A second store in the same worker receives no additional read allowance.
+        let mut other = CodexSubagents::default();
+        let pending =
+            other.refresh_with_budget(&fixture.home, &fixture.parents(), fixture.now, &mut budget);
+        assert!(pending.running.is_empty());
+        assert!(pending.catching_up.contains(&parent));
+        let mut expired = CodexReadBudget {
+            deadline: std::time::Instant::now() - Duration::from_secs(1),
+            ..CodexReadBudget::default()
+        };
+        let pending =
+            other.refresh_with_budget(&fixture.home, &fixture.parents(), fixture.now, &mut expired);
+        assert!(pending.running.is_empty());
+        assert!(pending.catching_up.contains(&parent));
+        assert_eq!(expired.remaining, 2 * 1024 * 1024);
+        let current = fixture.read(&mut index, &fixture.parents());
+        assert!(current.catching_up.is_empty());
+        assert!(current.running.is_empty());
+    }
+
+    #[test]
+    fn background_codex_large_history_is_not_published_as_no_child() {
+        let fixture = Fixture::new();
+        let rows: Vec<_> = ROWS.split_inclusive('\n').collect();
+        let mut history = rows[0].to_string();
+        for _ in 0..3 {
+            history.push_str(&format!(
+                "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"{}\"}}}}\n",
+                "x".repeat(200_000)
+            ));
+        }
+        history.push_str(rows[5]);
+        fs::write(&fixture.child, history).unwrap();
+        let mut index = CodexSubagents::default();
+        let observed = index.refresh(&fixture.home, &fixture.parents(), fixture.now);
+        let parent = fixture.parents()[0].clone();
+        assert!(observed.running.contains(&parent) || observed.catching_up.contains(&parent));
+        let current = fixture.read(&mut index, &fixture.parents());
+        assert!(current.catching_up.is_empty());
+        assert!(current.running.contains(&parent));
     }
 
     #[test]
@@ -419,8 +628,9 @@ mod tests {
         // The copied parent's last turn is running. It belongs to the parent.
         fs::write(&fixture.child, rows[..4].concat()).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .is_empty()
         );
         let mut file = OpenOptions::new()
@@ -429,28 +639,31 @@ mod tests {
             .unwrap();
         file.write_all(rows[4..6].concat().as_bytes()).unwrap();
         assert_eq!(
-            index.refresh(&fixture.home, &fixture.parents(), fixture.now),
+            fixture.read(&mut index, &fixture.parents()).running,
             [fixture.parents()[0].clone()].into()
         );
         // An assistant's final text is not a completed turn.
         file.write_all(rows[6].as_bytes()).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .contains(&fixture.parents()[0])
         );
         let complete = rows[7];
         let split = complete.len() / 2;
         file.write_all(&complete.as_bytes()[..split]).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .contains(&fixture.parents()[0])
         );
         file.write_all(&complete.as_bytes()[split..]).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .is_empty()
         );
     }
@@ -462,18 +675,15 @@ mod tests {
         fs::write(&fixture.child, rows[..6].concat()).unwrap();
         let mut index = CodexSubagents::default();
         let mut parents = vec![(Uuid::new_v4().to_string(), fixture.now)];
-        assert!(
-            index
-                .refresh(&fixture.home, &parents, fixture.now)
-                .is_empty()
-        );
+        assert!(fixture.read(&mut index, &parents).running.is_empty());
 
         // Without file changes or watcher events, the older pane still owns live work.
         index.new_rollouts = None;
         parents.extend(fixture.parents());
         assert!(
-            index
-                .refresh(&fixture.home, &parents, fixture.now)
+            fixture
+                .read(&mut index, &parents)
+                .running
                 .contains(&fixture.parents()[0])
         );
     }
@@ -485,27 +695,27 @@ mod tests {
         fs::write(&fixture.child, rows[..6].concat()).unwrap();
         let mut index = CodexSubagents::default();
         assert!(
-            index
-                .refresh(
-                    &fixture.home,
-                    &[(CHILD.into(), fixture.parents()[0].1)],
-                    fixture.now
-                )
+            fixture
+                .read(&mut index, &[(CHILD.into(), fixture.parents()[0].1)])
+                .running
                 .is_empty()
         );
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .contains(&fixture.parents()[0])
         );
         assert!(
-            index
-                .refresh(&fixture.home, &[(PARENT.into(), fixture.now)], fixture.now)
+            fixture
+                .read(&mut index, &[(PARENT.into(), fixture.now)])
+                .running
                 .is_empty()
         );
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .contains(&fixture.parents()[0])
         );
         let mut file = OpenOptions::new()
@@ -514,21 +724,24 @@ mod tests {
             .unwrap();
         file.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"child-turn\"}}\n").unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .is_empty()
         );
         file.write_all(rows[5].as_bytes()).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .contains(&fixture.parents()[0])
         );
         drop(file);
         fs::remove_file(&fixture.child).unwrap();
         assert!(
-            index
-                .refresh(&fixture.home, &fixture.parents(), fixture.now)
+            fixture
+                .read(&mut index, &fixture.parents())
+                .running
                 .is_empty()
         );
     }
