@@ -14518,9 +14518,8 @@ impl MuxelApp {
         if resized {
             self.persist();
         }
-        self.pane_grids
-            .borrow_mut()
-            .retain(|iid| self.workspace.instance(iid).is_some());
+        let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
+        self.pane_grids.borrow_mut().prune(&live);
         self.claim_remote_window_sizes(cx);
 
         // Keep the program-supplied name for restart/resume UI. A manual name is

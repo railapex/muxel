@@ -11,7 +11,7 @@
 use gpui::{App, IntoElement, SharedString, Styled, Window, canvas};
 use muxel_terminal::TerminalSession;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,9 +48,15 @@ impl PaneGrids {
         woken
     }
 
-    /// Forget panes that no longer exist.
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(Uuid) -> bool) {
-        self.grids.retain(|iid, _| keep(*iid));
+    /// Forget panes that no longer exist, and launches that stopped waiting: one
+    /// that timed out (its window drew nothing) dropped its receiver, and its
+    /// project may never draw again to clear it.
+    pub(super) fn prune(&mut self, live: &HashSet<Uuid>) {
+        self.grids.retain(|iid, _| live.contains(iid));
+        self.waiting.retain(|_, wakes| {
+            wakes.retain(|wake| !wake.is_closed());
+            !wakes.is_empty()
+        });
     }
 }
 
@@ -102,4 +108,33 @@ pub(super) fn layout_done(grids: SharedPaneGrids, pid: Uuid) -> impl IntoElement
         |_, _, _, _| {},
     )
     .absolute()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PaneGrids;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn pruning_forgets_gone_panes_and_launches_that_stopped_waiting() {
+        let mut grids = PaneGrids::default();
+        let (kept, gone) = (Uuid::new_v4(), Uuid::new_v4());
+        grids.grids.insert(kept, (120, 30));
+        grids.grids.insert(gone, (120, 30));
+        let project = Uuid::new_v4();
+        let waiting = grids.next_layout(project);
+        // A launch whose window drew nothing gives up and drops its receiver.
+        drop(grids.next_layout(project));
+        let live = HashSet::from([kept]);
+
+        grids.prune(&live);
+        assert_eq!(grids.grid(kept), Some((120, 30)));
+        assert_eq!(grids.grid(gone), None);
+        assert_eq!(grids.waiting.get(&project).map(Vec::len), Some(1));
+
+        drop(waiting);
+        grids.prune(&live);
+        assert!(grids.waiting.is_empty());
+    }
 }

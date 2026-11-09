@@ -35,13 +35,15 @@ feature is added or changed, update the matching entry here in the same change**
   `muxel ctl new` pane or runner opens its terminal at the size its pane is laid
   out at, including a tab hidden behind another in the same pane, rather than at
   80×24 or at the size it had in a differently sized window last time. A shell
-  draws its first prompt before muxel paints it, so a prompt longer than 80
-  columns no longer wraps and reflows; that reflow made PowerShell draw the first
+  can draw its first prompt before muxel paints its terminal (a hidden tab always
+  does), so a prompt wider than the starting size no longer wraps and then
+  reflows when the pane resizes; that reflow made PowerShell draw the first
   command over the prompt. A pane resized while its program starts follows the
-  new size. The launch waits at most one frame for the layout. A tab opened into
-  a project that isn't on screen starts at the size its pane last had; a new
-  split there, or a pane behind a maximized one, starts at its best earlier guess
-  and resizes when it's shown.
+  new size. A launch waits for its pane's next layout, bounded at 250 ms. A tab
+  opened into a project that isn't on screen starts at the size its pane last
+  had. A loop's new pane, a new split in a project that isn't on screen, and a
+  pane behind a maximized one start at their best earlier guess and resize once
+  they're drawn.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
   unusable (keeps a sane terminal width).
 - **Scrollable pane area** — because panes have that minimum width, a layout with
