@@ -51,6 +51,14 @@ struct PromptState {
     /// The last input ended with Ctrl+C, so the line is being discarded. The
     /// next prompt the shell draws completes that.
     cancel: bool,
+    /// An Enter has gone to the shell since its last C, the mark muxel's
+    /// line editor wrap prints as it hands a line over. Only a C clears it.
+    /// A B can't: the grant can be under way when the Enter lands, print its
+    /// B after it, and leave the line's key handler working with nothing
+    /// else to show. An Enter a command reads for itself (`Read-Host`, a
+    /// program's own prompt, an editor) gets no C, so the pane stays busy
+    /// until the next line goes through the line editor.
+    line_unstarted: bool,
     /// Every OSC 133 mark the shell has printed, counted, whatever it changed.
     marks: u64,
 }
@@ -61,11 +69,12 @@ impl ShellPrompt {
     }
 
     /// Whether the shell sits at a prompt not marked busy, with nothing typed
-    /// since that could still run, and how many marks it has printed.
+    /// since that could still run and no Enter it hasn't started a line for,
+    /// and how many marks it has printed.
     pub fn reading(&self) -> ShellReading {
         let state = self.0.lock();
         ShellReading {
-            idle: state.at_prompt && !state.busy && !state.typed,
+            idle: state.at_prompt && !state.busy && !state.typed && !state.line_unstarted,
             marks: state.marks,
         }
     }
@@ -85,6 +94,7 @@ impl ShellPrompt {
             .rposition(|&byte| matches!(byte, b'\r' | b'\n'));
         if line_end.is_some() {
             state.at_prompt = false;
+            state.line_unstarted = true;
         }
         // Anything after the last Enter may still run: text, an arrow or
         // history recall, Esc (a mode switch in PSReadLine's vi mode, not a
@@ -95,11 +105,17 @@ impl ShellPrompt {
         state.cancel = last_line.last() == Some(&0x03);
     }
 
-    fn mark(&self, at_prompt: bool, busy: bool) {
+    /// Apply an OSC 133 mark: its letter, when its payload is well formed,
+    /// and whether it is [`BUSY_MARK`].
+    fn mark(&self, letter: Option<u8>, busy: bool) {
         let mut state = self.0.lock();
         state.marks = state.marks.wrapping_add(1);
+        let at_prompt = matches!(letter, Some(b'A' | b'B'));
         state.at_prompt = at_prompt;
         state.busy = busy;
+        if letter == Some(b'C') {
+            state.line_unstarted = false;
+        }
         if at_prompt && state.cancel {
             state.typed = false;
             state.cancel = false;
@@ -163,7 +179,7 @@ impl ShellMarks {
                         if len >= 5 && &prefix[..4] == b"133;" {
                             let valid = len == 5 || prefix[5] == b';';
                             prompt.mark(
-                                valid && matches!(prefix[4], b'A' | b'B'),
+                                valid.then_some(prefix[4]),
                                 len == BUSY_MARK.len() && prefix == BUSY_MARK.as_bytes(),
                             );
                         }
@@ -264,6 +280,10 @@ mod tests {
     /// inside the shell.
     const BUSY: &[u8] =
         b"\x1b]133;A\x1b\\\x1b]133;A\x07PS> \x1b]133;B\x07\x1b]133;B;muxel=busy\x1b\\";
+    /// The C the line editor wrap prints as it hands a line over.
+    const STARTED: &[u8] = b"\x1b]133;C\x1b\\";
+    /// The B a grant prints once its checks pass.
+    const GRANTED: &[u8] = b"\x1b]133;B\x1b\\";
 
     #[test]
     fn the_wrappers_closing_mark_decides_whether_the_prompt_is_busy() {
@@ -352,9 +372,11 @@ mod tests {
                 drawn(&prompt);
                 assert!(!prompt.idle_prompt(), "{pending:?}");
             }
-            // Enter sends it; the next idle prompt is idle.
+            // Enter sends it; once the shell has started it, the next idle
+            // prompt is idle.
             prompt.submitted(b"\r");
             assert!(!prompt.idle_prompt(), "{pending:?} sent");
+            ShellMarks::default().advance(STARTED, &prompt);
             drawn(&prompt);
             assert!(prompt.idle_prompt(), "{pending:?} ran");
         }
@@ -366,6 +388,50 @@ mod tests {
         prompt.submitted(b"Remove-Item *");
         drawn(&prompt);
         assert!(!prompt.idle_prompt(), "typed ahead");
+    }
+
+    /// An Enter that lands as the shell grants idle: the grant's B comes
+    /// after it, and the line's key handler may still be working. Only the
+    /// line's C ends that, however many prompts are drawn meanwhile.
+    #[test]
+    fn an_enter_stays_unstarted_through_any_b_until_its_c() {
+        for split in 0..=GRANTED.len() {
+            let prompt = ShellPrompt::default();
+            let mut marks = ShellMarks::default();
+            marks.advance(BUSY, &prompt);
+            prompt.submitted(b"'LINE'\r");
+            marks.advance(&GRANTED[..split], &prompt);
+            marks.advance(&GRANTED[split..], &prompt);
+            assert!(prompt.at_prompt(), "split {split}");
+            assert!(!prompt.idle_prompt(), "split {split}: a B after the Enter");
+            // The handler redraws the prompt, and a grant follows.
+            marks.advance(IDLE, &prompt);
+            assert!(
+                !prompt.idle_prompt(),
+                "split {split}: a whole prompt after the Enter"
+            );
+            marks.advance(STARTED, &prompt);
+            assert!(!prompt.idle_prompt(), "split {split}: the line runs");
+            marks.advance(IDLE, &prompt);
+            assert!(prompt.idle_prompt(), "split {split}: the prompt after it");
+        }
+        // An Enter a command reads for itself gets no C: the pane stays busy
+        // until a line goes through the line editor.
+        let prompt = ShellPrompt::default();
+        let mut marks = ShellMarks::default();
+        marks.advance(IDLE, &prompt);
+        prompt.submitted(b"Read-Host\r");
+        marks.advance(STARTED, &prompt);
+        prompt.submitted(b"yes\r");
+        marks.advance(IDLE, &prompt);
+        assert!(!prompt.idle_prompt(), "a command's own read");
+        prompt.submitted(b"\r");
+        marks.advance(STARTED, &prompt);
+        marks.advance(IDLE, &prompt);
+        assert!(
+            prompt.idle_prompt(),
+            "an empty line through the line editor"
+        );
     }
 
     #[test]

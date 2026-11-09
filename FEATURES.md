@@ -145,8 +145,16 @@ feature is added or changed, update the matching entry here in the same change**
   (PowerShell's line editor marks each line it returns), nothing may have
   been typed, and no process it started may still run. A draft kept through
   a redraw (Ctrl+L), the unsent last line of a paste or a recalled command
-  asks until Enter sends it or Ctrl+C drops it. Work PowerShell can't see,
-  such as a process whose parent has exited, isn't counted. A module that
+  asks until Enter sends it or Ctrl+C drops it. After Enter, the pane is
+  busy until the line editor hands that line over, whatever marks come
+  first, so a line sent as the line editor grants idle doesn't count down
+  while its key handler works. A line a command reads for itself
+  (`Read-Host`, a program's own prompt, an editor) is never handed over, so
+  the pane asks until the next line goes through the line editor. Work
+  PowerShell can't see isn't counted: a process whose parent has exited, or
+  .NET work started directly, such as `[Task]::Run` or a
+  `System.Threading.Timer`, which runs on while the pane counts down.
+  Nothing muxel checks proves that all work in the shell has stopped. A module that
   keeps an idle runspace or an event subscriber, as current oh-my-posh
   streaming does, makes every close ask, as does a `PowerShell.OnIdle`
   subscriber of your own; `Unregister-Event -Force` on every subscriber
@@ -154,15 +162,13 @@ feature is added or changed, update the matching entry here in the same change**
   and reads a line the way PowerShell does counts down while it waits for
   that line. Undo expiry walks the process table again and rereads the
   marks, but doesn't ask PowerShell to check itself again; it asks if the
-  shell has printed any mark since the close. A line sent in the moment the
-  line editor grants idle reads idle until that line starts, which a key
-  handler working before it accepts the line can delay; a close made then
-  counts down, and expiry asks once the line has started. cmd isn't marked,
+  shell has printed any mark since the close. cmd isn't marked,
   since an echoing batch file prints cmd's prompt while it runs, so it asks,
   as does PowerShell started with `-Command` or a script, given a new prompt
   after launch, or running without a line editor (PSReadLine). A
   shell that prints its own OSC 133 marks counts down on them with nothing
-  typed and no child running; Git Bash still asks, since its `bash.exe`
+  typed, no child running and, after an Enter, the line's C mark since;
+  Git Bash still asks, since its `bash.exe`
   always runs a second bash. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
   session that may still run its agent; its client exiting mid-countdown also

@@ -110,11 +110,17 @@ pub const BUSY_MARK: &str = concat!("133;B;", busy_option!());
 ///   subscriber (`Get-EventSubscriber -Force | Unregister-Event -Force`),
 ///   removes the one-shot, and that prompt asks. Without `-Force`,
 ///   `Unregister-Event` leaves hidden subscribers alone.
-/// - Input sent in the moment the one-shot prints, before the shell has read
-///   it, still reads idle until the line it ends runs and prints `C`, and a
-///   key handler that works before it accepts that line holds it as long as
-///   it works. The pane counts every mark the shell prints, so an Undo expiry
-///   with a mark printed since the close asks.
+/// - .NET work started directly, such as `[System.Threading.Tasks.Task]::Run`
+///   or a `System.Threading.Timer`, shows in none of these checks and runs on
+///   while the pane reads idle. No check here proves that all work in the
+///   shell has stopped.
+/// - An Enter sent in the moment the one-shot fires lands before its `B`, and
+///   that line's key handler may then work with nothing more printed. The
+///   pane doesn't take that `B` as idle: after an Enter it reads busy until
+///   the wrap's `C`. A line a command reads for itself never gets one, so the
+///   pane stays busy until the next line goes through the line editor. The
+///   pane also counts every mark the shell prints, so an Undo expiry with a
+///   mark printed since the close asks.
 ///
 /// Measured in a real console on a loaded machine, the wrapper costs about
 /// 1 to 1.5 ms per prompt on Windows PowerShell 5.1 and 0.5 ms on PowerShell

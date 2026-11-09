@@ -5432,6 +5432,23 @@ mod windows_shell_idle_tests {
             found.expect("found")
         }
 
+        /// What `expression` comes to in the shell, printed and read back.
+        fn evaluate(&self, expression: &str) -> String {
+            self.type_text(&format!("'VAL' + 'UE=' + ({expression}) + '|'\r"));
+            let mut found = None;
+            self.until("the value", |shell| {
+                found = shell
+                    .session
+                    .visible_text()
+                    .split_once("VALUE=")
+                    .and_then(|(_, rest)| rest.split_once('|'))
+                    .map(|(value, _)| value.to_string());
+                found.is_some()
+            });
+            self.at_prompt();
+            found.expect("found")
+        }
+
         /// What a pane close reads on Windows (`close_facts`).
         fn proves_idle(&self) -> bool {
             windows_shell_close_evidence(
@@ -5443,11 +5460,15 @@ mod windows_shell_idle_tests {
 
         fn pump(&self) {
             while let Ok(chunk) = self.rx.try_recv() {
-                match chunk {
-                    PtyChunk::Output(bytes) => self.session.process_output(&bytes),
-                    PtyChunk::Exit { .. } => {
-                        panic!("shell exited: {:?}", self.session.visible_text())
-                    }
+                self.apply(chunk);
+            }
+        }
+
+        fn apply(&self, chunk: PtyChunk) {
+            match chunk {
+                PtyChunk::Output(bytes) => self.session.process_output(&bytes),
+                PtyChunk::Exit { .. } => {
+                    panic!("shell exited: {:?}", self.session.visible_text())
                 }
             }
         }
@@ -5482,16 +5503,31 @@ mod windows_shell_idle_tests {
             self.until("idle prompt", Self::proves_idle);
         }
 
-        /// Never idle at any millisecond until `marker` shows.
+        /// Never idle until `marker` shows. Output is read a chunk at a time,
+        /// and the marker is looked for after each before idle is: the work
+        /// is over once it shows, and a prompt after it may rightly be idle.
         fn busy_until(&self, marker: &str) {
             let deadline = Instant::now() + PATIENCE;
-            while !self.session.visible_text().contains(marker) {
-                self.pump();
-                assert!(
-                    !self.proves_idle(),
-                    "idle before {marker}: {:?}",
-                    self.session.visible_text()
-                );
+            loop {
+                let shown = || self.session.visible_text().contains(marker);
+                let busy = || {
+                    assert!(
+                        !self.proves_idle(),
+                        "idle before {marker}: {:?}",
+                        self.session.visible_text()
+                    );
+                };
+                if shown() {
+                    return;
+                }
+                busy();
+                while let Ok(chunk) = self.rx.try_recv() {
+                    self.apply(chunk);
+                    if shown() {
+                        return;
+                    }
+                    busy();
+                }
                 assert!(Instant::now() < deadline, "no {marker}");
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -5990,21 +6026,26 @@ mod windows_shell_idle_tests {
 
     /// The idle mark comes from the one-shot `PowerShell.OnIdle` handler the
     /// prompt registers, which PSReadLine runs once it has waited about 300 ms
-    /// for a key, and reaches the pane through ConPTY like any output.
+    /// for a key, and reaches the pane through ConPTY like any output. The
+    /// wait is timed inside the shell, from the prompt's checks to the
+    /// grant's: a `Get-Runspace` of the test's own notes when each runs.
     #[test]
     fn idle_arrives_once_the_line_editor_has_waited_for_a_key() {
         for launch in powershells() {
             let shell = Shell::start(launch);
             shell.becomes_idle();
-            shell.type_text("'WAIT' + 'ED'\r");
-            shell.shows("WAITED");
-            shell.at_prompt();
-            let drawn = Instant::now();
+            shell.run(
+                "function global:Get-Runspace { if ($global:__muxel_reading) { $global:granted = [DateTime]::UtcNow } else { $global:drawn = [DateTime]::UtcNow }; & (Get-Command Get-Runspace -CommandType Cmdlet) @args }",
+                "NOTED",
+            );
             shell.becomes_idle();
-            let waited = drawn.elapsed();
+            let waited: i64 = shell
+                .evaluate("[int64]($global:granted - $global:drawn).TotalMilliseconds")
+                .parse()
+                .expect("the wait in milliseconds");
             assert!(
-                waited >= Duration::from_millis(200),
-                "idle {waited:?} after the prompt was drawn"
+                waited >= 200,
+                "granted {waited} ms after the prompt's checks"
             );
         }
     }
@@ -6121,7 +6162,8 @@ mod windows_shell_idle_tests {
 
     /// A command that draws the prompt, then reads a line from PSReadLine
     /// itself rather than through the wrapped `PSConsoleHostReadLine`, is
-    /// still running while it waits.
+    /// still running while it waits. The line it reads never starts as a
+    /// command, so the pane stays busy after it until one does.
     #[test]
     fn a_command_reading_from_the_line_editor_itself_is_not_idle() {
         for launch in powershells() {
@@ -6134,6 +6176,47 @@ mod windows_shell_idle_tests {
             shell.stays_busy("a command waiting on its own read");
             shell.type_text("yes\r");
             shell.shows("GOT=yes");
+            shell.at_prompt();
+            shell.stays_busy("the prompt after a line the command read itself");
+            shell.type_text("\r");
+            shell.becomes_idle();
+        }
+    }
+
+    /// An Enter that lands while the shell grants idle: the grant's B comes
+    /// after it, and the line's Enter handler then works for longer than a
+    /// close waits (15 s) before it kills a pane that reads idle. The pane
+    /// stays busy until the line starts. The grant's checks take a second
+    /// here, through a `Get-Job` of the test's own, so the Enter can land
+    /// after the one-shot fires and before its B.
+    #[test]
+    fn an_enter_landing_as_idle_is_granted_stays_busy_until_its_line_starts() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            let hold = Hold::new("enter-during-grant");
+            shell.run(
+                &format!(
+                    "function global:Get-Job {{ if ($global:__muxel_reading) {{ [Console]::Write('GRANT' + 'CHECKING'); Start-Sleep -Milliseconds 1000 }}; & (Get-Command Get-Job -CommandType Cmdlet) @args }}; Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {{ [Console]::WriteLine('HANDLER' + 'WORKING'); {}; [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }}",
+                    hold.wait()
+                ),
+                "BOUND",
+            );
+            shell.shows("GRANTCHECKING");
+            shell.type_text("'LINE' + 'RAN'\r");
+            shell.busy_until("HANDLERWORKING");
+            let deadline = Instant::now() + Duration::from_secs(16);
+            while Instant::now() < deadline {
+                shell.pump();
+                assert!(
+                    !shell.proves_idle(),
+                    "idle while the Enter's handler works: {:?}",
+                    shell.session.visible_text()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            hold.release();
+            shell.busy_until("LINERAN");
             shell.becomes_idle();
         }
     }
