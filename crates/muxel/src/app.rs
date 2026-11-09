@@ -68,8 +68,11 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+#[cfg(all(test, windows))]
+mod first_prompt_size_tests;
 mod hotbar;
 mod libraries_ui;
+mod pane_grid;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
@@ -6033,6 +6036,9 @@ pub struct MuxelApp {
     /// projects (or detaching one to its own window) doesn't drag another one's
     /// scroll position along; a project is only ever in one window at a time.
     panes_scroll: HashMap<Uuid, ScrollHandle>,
+    /// The grid each pane gives its terminal, measured as panes are laid out,
+    /// so a launch opens its PTY at that size (see `pane_grid`).
+    pane_grids: pane_grid::SharedPaneGrids,
     /// Live state captured on open so the settings Cancel button can revert.
     settings_snapshot: Option<SettingsSnapshot>,
     /// The active workspace (None until one is chosen in the selector).
@@ -8278,6 +8284,7 @@ impl MuxelApp {
             collapsed: HashSet::new(),
             settings_scroll: ScrollHandle::new(),
             panes_scroll: HashMap::new(),
+            pane_grids: Default::default(),
             settings_snapshot: None,
             current_workspace: None,
             workspaces,
@@ -9602,18 +9609,7 @@ impl MuxelApp {
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
-        // Open the PTY at the size this pane will actually be laid out at, so its
-        // program never has to be resized after its first paint. A `tmux attach`
-        // otherwise draws the session's long-since-painted UI at 80×24, and rights
-        // itself only when the user types. Falls back to a sibling tab's size (same
-        // pane, same bounds), then to 80×24 for a genuinely new pane — which lays out
-        // before its program has drawn anything, so a resize there costs nothing.
-        let size = self
-            .workspace
-            .instance(instance_id)
-            .and_then(|i| i.grid)
-            .or_else(|| self.sibling_grid(instance_id, cx))
-            .unwrap_or((80, 24));
+        let size = self.launch_grid(instance_id, cx);
         let meta = TerminalSpawnMeta {
             instance_id,
             token: 0,
@@ -10009,12 +10005,7 @@ impl MuxelApp {
             was_resume,
             started,
         };
-        let size = self
-            .workspace
-            .instance(instance_id)
-            .and_then(|i| i.grid)
-            .or_else(|| self.sibling_grid(instance_id, cx))
-            .unwrap_or((80, 24));
+        let size = self.launch_grid(instance_id, cx);
         Some((meta, spec, size))
     }
 
@@ -10076,6 +10067,18 @@ impl MuxelApp {
                 .timer(Duration::from_millis(1))
                 .await;
             Self::await_codex_restore_lookup(&this, instance_id, cx).await;
+            // A new tab or split hasn't been laid out yet: open at its size.
+            let pid = this
+                .read_with(cx, |this, _| {
+                    this.workspace.instance(instance_id).map(|i| i.project_id)
+                })
+                .ok()
+                .flatten();
+            if let Some(pid) = pid
+                && let Some(waited) = Self::await_pane_layout(&this, pid, cx).await
+            {
+                muxel_terminal::startup_event(instance_id, "", "pane-layout", waited, 0);
+            }
             let Some(prepared) = this
                 .update(cx, |this, cx| {
                     this.prepare_reserved_terminal_spawn(instance_id, token, reason, cx)
@@ -10696,6 +10699,60 @@ impl MuxelApp {
         for pid in failed {
             self.reconnect_project(pid, window, cx);
         }
+    }
+
+    /// The grid to open `iid`'s PTY at. Its program draws its first screen
+    /// before muxel paints the terminal (the pane shows "Starting terminal…"
+    /// until then), so this must be the size the pane is laid out at: anything
+    /// else is reflowed by the first resize, and a shell prompt longer than the
+    /// starting width ends up with the first command drawn over it.
+    ///
+    /// The pane's own measurement comes first (`pane_grid`; a launch waits up to
+    /// a frame for it), then a sibling tab's (same pane, same bounds), which is
+    /// what a tab opened into a project no window shows gets: its pane's size
+    /// when last laid out. Without either, a sibling's live size, then the grid
+    /// the pane last had, then 80×24.
+    fn launch_grid(&self, iid: Uuid, cx: &App) -> (u16, u16) {
+        let grids = self.pane_grids.borrow();
+        grids
+            .grid(iid)
+            .or_else(|| {
+                let project = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|i| self.workspace.project(i.project_id))?;
+                let tabs = project.layout.as_ref()?.tab_group(iid)?;
+                tabs.iter().find_map(|tab| grids.grid(*tab))
+            })
+            .or_else(|| self.sibling_grid(iid, cx))
+            .or_else(|| self.workspace.instance(iid).and_then(|i| i.grid))
+            .unwrap_or((80, 24))
+    }
+
+    /// Wait, at most [`pane_grid::PANE_LAYOUT_WAIT`], for the window showing
+    /// `pid` to lay out its panes, so a launch that follows opens at its pane's
+    /// size. Returns how long that took; `None` when no window shows `pid`.
+    async fn await_pane_layout(
+        this: &WeakEntity<Self>,
+        pid: Uuid,
+        cx: &mut AsyncApp,
+    ) -> Option<Duration> {
+        let next = this
+            .update(cx, |this, cx| {
+                this.window_showing(pid)?;
+                let next = this.pane_grids.borrow_mut().next_layout(pid);
+                // The new pane may be the only change; make sure a frame comes.
+                cx.notify();
+                Some(next)
+            })
+            .ok()
+            .flatten()?;
+        let started = Instant::now();
+        let _ = next
+            .recv()
+            .with_timeout(pane_grid::PANE_LAYOUT_WAIT, cx.background_executor())
+            .await;
+        Some(started.elapsed())
     }
 
     /// The grid of a live terminal sharing this instance's pane (a sibling tab).
@@ -11355,6 +11412,17 @@ impl MuxelApp {
                 let Some(wave_end) = wave_end else {
                     break;
                 };
+                // Open the wave at the sizes its panes are laid out at, not the
+                // grids they had in last session's window.
+                if let Some(waited) = Self::await_pane_layout(&this, pid, cx).await {
+                    muxel_terminal::startup_event(
+                        instances[wave_start],
+                        "",
+                        "pane-layout",
+                        waited,
+                        0,
+                    );
+                }
                 let mut preparations = Vec::new();
                 let mut order = Vec::new();
                 let mut cancelled = false;
@@ -14001,6 +14069,9 @@ impl MuxelApp {
         if resized {
             self.persist();
         }
+        self.pane_grids
+            .borrow_mut()
+            .retain(|iid| self.workspace.instance(iid).is_some());
         self.claim_remote_window_sizes(cx);
 
         // Keep the program-supplied name for restart/resume UI. A manual name is
@@ -20846,7 +20917,8 @@ impl MuxelApp {
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().child(main_content));
+            .child(div().flex_1().min_h_0().child(main_content))
+            .child(pane_grid::layout_done(self.pane_grids.clone(), pid));
         let body: AnyElement = if sidebar_hidden {
             main_column.into_any_element()
         } else {
@@ -24595,6 +24667,27 @@ impl MuxelApp {
             })
     }
 
+    /// Measures a pane body for its tabs' launches (`pane_grid::measure_pane`),
+    /// moving along any of its terminals that hasn't drawn anything yet.
+    fn measure_pane(&self, tabs: &[Uuid], cx: &App) -> AnyElement {
+        let starting = tabs
+            .iter()
+            .filter_map(|tab| self.terminals.get(tab))
+            .filter_map(|view| {
+                let view = view.read(cx);
+                (!view.exited() && !view.has_visible_content()).then(|| view.session().clone())
+            })
+            .collect();
+        pane_grid::measure_pane(
+            self.pane_grids.clone(),
+            tabs.to_vec(),
+            starting,
+            self.settings.font_family.clone().into(),
+            self.settings.font_size * self.settings.zoom,
+        )
+        .into_any_element()
+    }
+
     fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
         match node {
             PaneNode::Leaf(ld) => {
@@ -25631,6 +25724,7 @@ impl MuxelApp {
                                 },
                             ))
                             .child(content)
+                            .child(self.measure_pane(&tabs, cx))
                             .children(drop_overlay_zone.map(|z| drop_zone_overlay(z, accent))),
                     );
                 if is_active {
@@ -35121,7 +35215,12 @@ impl Render for MuxelApp {
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().child(main_content));
+            .child(div().flex_1().min_h_0().child(main_content))
+            .children(
+                self.workspace
+                    .active_project
+                    .map(|pid| pane_grid::layout_done(self.pane_grids.clone(), pid)),
+            );
         // The file browser (second sidebar) nests its own resizable so its width
         // persists independently of the project sidebar.
         // A hotbar view fills everything right of the sidebar: the docked panels
