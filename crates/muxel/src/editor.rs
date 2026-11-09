@@ -12,6 +12,8 @@ use gpui_component::{ActiveTheme, Sizable};
 use muxel_core::rescue::{BackupOffer, EditorBackup, FileStamp};
 use muxel_store::rescue::RescueDir;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 use uuid::Uuid;
 
@@ -77,6 +79,55 @@ struct EditorRescue {
     base: Option<FileStamp>,
     /// A backup left by the last run, until it is restored or discarded.
     offer: Option<(EditorBackup, BackupOffer)>,
+    /// Orders this pane's backup writes; an editor rebuilt in another window
+    /// keeps it.
+    lane: Arc<BackupLane>,
+    /// An input method's uncommitted text in the buffer: where it is and
+    /// what it says.
+    composing: Option<(std::ops::Range<usize>, String)>,
+    /// Background writes wait on this before they land (tests only).
+    #[cfg(all(test, windows))]
+    gate: Option<async_channel::Receiver<()>>,
+}
+
+/// One pane's backup writes, in order. A background write takes a ticket
+/// when it starts and lands only if no write or delete came after it, so an
+/// older snapshot never replaces a newer one or brings a deleted one back.
+#[derive(Debug, Default)]
+pub(crate) struct BackupLane {
+    /// Bumped by every write and delete.
+    generation: AtomicU64,
+    /// Held while a write lands or a delete runs.
+    order: std::sync::Mutex<()>,
+}
+
+impl BackupLane {
+    fn ticket(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Land a background write holding `ticket`, unless something came after.
+    fn land<T>(&self, ticket: u64, write: impl FnOnce() -> T) -> Option<T> {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        (self.generation.load(Ordering::SeqCst) == ticket).then(write)
+    }
+
+    /// Act now, after any write that is landing, and void those still on
+    /// their way.
+    fn barrier<T>(&self, act: impl FnOnce() -> T) -> T {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        act()
+    }
+}
+
+/// What an editor's backups carry when it is rebuilt in another window.
+#[derive(Clone, Default)]
+pub(crate) struct BackupState {
+    target: Option<(RescueDir, Uuid)>,
+    base: Option<FileStamp>,
+    offer: Option<(EditorBackup, BackupOffer)>,
+    lane: Arc<BackupLane>,
 }
 
 #[derive(Clone)]
@@ -227,6 +278,12 @@ impl EditorView {
                 }
             },
         )
+        .detach();
+        // An input method's uncommitted text changes the buffer without a
+        // Change event; only observers hear of it.
+        cx.observe_in(&input, window, |this: &mut Self, input, window, cx| {
+            this.note_composition(&input, window, cx)
+        })
         .detach();
         if let Some(pos) = cursor {
             input.update(cx, |s, cx| s.set_cursor_position(pos, window, cx));
@@ -638,22 +695,23 @@ pub(crate) fn rescue_time(ms: i64) -> String {
     }
 }
 
-/// Backing up unsaved changes. A dirty buffer is written about a second after
-/// edits stop, off the UI thread; saving, reloading from disk, or closing
-/// without saving deletes the backup.
+/// Backing up unsaved changes. A dirty buffer (or one holding an input
+/// method's uncommitted text) is written about a second after edits stop,
+/// staged off the UI thread; saving, reloading from disk, or closing without
+/// saving deletes the backup. Deletes and the final write when an editor goes
+/// away (quit, workspace switch) run on the UI thread, after any write that
+/// is landing, and no earlier write lands after them.
 impl EditorView {
     /// Back up this editor's unsaved changes to `target` (its workspace's
-    /// rescue directory and its pane); `None` stops.
+    /// rescue directory and its pane); `None` stops, and no write already on
+    /// its way lands after it.
     pub(crate) fn set_backup_target(&mut self, target: Option<(RescueDir, Uuid)>) {
         if target.is_none() {
             self.rescue.pending = None;
             self.rescue.offer = None;
+            self.rescue.lane.barrier(|| ());
         }
         self.rescue.target = target;
-    }
-
-    pub(crate) fn backup_target(&self) -> Option<(RescueDir, Uuid)> {
-        self.rescue.target.clone()
     }
 
     /// Keep this editor's unsaved changes backed up under `target`; with
@@ -671,16 +729,66 @@ impl EditorView {
         self.note_edit(cx);
     }
 
+    /// What this editor's backups need to carry on in a rebuilt editor.
+    pub(crate) fn backup_state(&self) -> BackupState {
+        BackupState {
+            target: self.rescue.target.clone(),
+            base: self.rescue.base,
+            offer: self.rescue.offer.clone(),
+            lane: self.rescue.lane.clone(),
+        }
+    }
+
+    /// Carry on the backups of the editor this one was rebuilt from.
+    pub(crate) fn adopt_backup_state(&mut self, state: BackupState, cx: &mut Context<Self>) {
+        self.rescue.target = state.target;
+        self.rescue.base = state.base;
+        self.rescue.offer = state.offer;
+        self.rescue.lane = state.lane;
+        self.note_edit(cx);
+    }
+
     /// Whether the buffer holds changes a backup must keep. Backups ask this
     /// and nothing else about dirtiness.
     fn needs_backup(&self, _cx: &App) -> bool {
-        self.diff_dir.is_none() && !self.is_image && self.is_dirty()
+        self.diff_dir.is_none()
+            && !self.is_image
+            && (self.is_dirty() || self.rescue.composing.is_some())
+    }
+
+    /// The input notified: an input method's uncommitted text may have
+    /// changed, which no Change event reports. Back it up like an edit; once
+    /// it's cancelled from a clean buffer, the backup goes.
+    fn note_composition(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::EntityInputHandler as _;
+        use gpui_component::RopeExt as _;
+        let marked = input.update(cx, |state, cx| state.marked_text_range(window, cx));
+        let composing = marked.map(|utf16| {
+            let text = input.read(cx).text();
+            let start = text.offset_utf16_to_offset(utf16.start);
+            let bytes = start..text.offset_utf16_to_offset(utf16.end).max(start);
+            let marked = text.slice(bytes.clone()).to_string();
+            (bytes, marked)
+        });
+        if composing == self.rescue.composing {
+            return;
+        }
+        self.rescue.composing = composing;
+        if self.needs_backup(cx) {
+            self.note_edit(cx);
+        } else {
+            self.backup_clean(cx);
+        }
     }
 
     /// An edit (or the editor losing focus): restart the debounce.
     fn note_edit(&mut self, cx: &mut Context<Self>) {
-        // A backup still on offer keeps its file until it is decided.
-        if self.rescue.target.is_none() || self.rescue.offer.is_some() || !self.needs_backup(cx) {
+        if self.rescue.target.is_none() || !self.needs_backup(cx) {
             return;
         }
         self.rescue.last_edit = Some(Instant::now());
@@ -707,55 +815,71 @@ impl EditorView {
         }));
     }
 
-    /// Write the backup, or delete it once the buffer is clean. `now` does the
-    /// file work on this thread, for an editor about to be dropped.
+    /// Write the backup, or delete it once the buffer is clean. A write is
+    /// staged in the background and lands only if nothing came after it;
+    /// `now` writes on this thread, for an editor about to be dropped. A
+    /// delete always runs now.
     fn write_backup(&mut self, now: bool, cx: &mut Context<Self>) {
         let Some((dir, iid)) = self.rescue.target.clone() else {
             return;
         };
-        if self.rescue.offer.is_some() {
+        let lane = self.rescue.lane.clone();
+        if !self.needs_backup(cx) {
+            self.rescue.base = None;
+            lane.barrier(|| dir.delete_editor_backup(iid));
             return;
         }
-        let job: Box<dyn FnOnce() + Send> = if self.needs_backup(cx) {
-            let text = self.text(cx);
-            if text.len() > muxel_core::rescue::MAX_EDITOR_BACKUP_BYTES {
-                log::warn!(
-                    "editor {iid} is too large to back up ({} bytes)",
-                    text.len()
-                );
-                return;
+        let text = self.text(cx);
+        if text.len() > muxel_core::rescue::MAX_EDITOR_BACKUP_BYTES {
+            log::warn!(
+                "editor {iid} is too large to back up ({} bytes)",
+                text.len()
+            );
+            return;
+        }
+        if self.rescue.base.is_none() {
+            self.rescue.base = self.disk_stamp.map(file_stamp);
+        }
+        let backup = EditorBackup {
+            path: self.path.clone(),
+            text,
+            base: self.rescue.base,
+            saved_at_ms: now_ms(),
+        };
+        if now {
+            if let Err(e) = lane.barrier(|| dir.save_editor_backup(iid, &backup)) {
+                log::warn!("couldn't back up editor {iid}: {e:#}");
             }
-            if self.rescue.base.is_none() {
-                self.rescue.base = self.disk_stamp.map(file_stamp);
-            }
-            let backup = EditorBackup {
-                path: self.path.clone(),
-                text,
-                base: self.rescue.base,
-                saved_at_ms: now_ms(),
-            };
-            Box::new(move || {
+            return;
+        }
+        let ticket = lane.ticket();
+        #[cfg(all(test, windows))]
+        let gate = self.rescue.gate.clone();
+        cx.background_executor()
+            .spawn(async move {
                 let started = Instant::now();
-                match dir.save_editor_backup(iid, &backup) {
-                    Ok(()) => log::debug!(
+                let staged = match dir.stage_editor_backup(iid, &backup) {
+                    Ok(staged) => staged,
+                    Err(e) => {
+                        log::warn!("couldn't back up editor {iid}: {e:#}");
+                        return;
+                    }
+                };
+                #[cfg(all(test, windows))]
+                if let Some(gate) = gate {
+                    let _ = gate.recv().await;
+                }
+                match lane.land(ticket, || staged.commit()) {
+                    Some(Ok(())) => log::debug!(
                         "editor backup saved: {} bytes in {:?}",
                         backup.text.len(),
                         started.elapsed()
                     ),
-                    Err(e) => log::warn!("couldn't back up editor {iid}: {e:#}"),
+                    Some(Err(e)) => log::warn!("couldn't back up editor {iid}: {e:#}"),
+                    None => log::debug!("editor backup superseded before it landed"),
                 }
             })
-        } else {
-            self.rescue.base = None;
-            Box::new(move || dir.delete_editor_backup(iid))
-        };
-        if now {
-            job();
-        } else {
-            cx.background_executor()
-                .spawn(async move { job() })
-                .detach();
-        }
+            .detach();
     }
 
     /// Back up unsaved changes now (quit, workspace switch).
@@ -767,11 +891,8 @@ impl EditorView {
     }
 
     /// The buffer now matches the disk (saved, reloaded, replaced): its
-    /// backup has nothing left to keep.
+    /// backup has nothing left to keep. An offered backup stays offered.
     fn backup_clean(&mut self, cx: &mut Context<Self>) {
-        if self.rescue.offer.is_some() {
-            return;
-        }
         self.rescue.pending = None;
         self.write_backup(false, cx);
     }
@@ -782,14 +903,14 @@ impl EditorView {
         let Some((dir, iid)) = self.rescue.target.clone() else {
             return;
         };
-        let Some(backup) = dir.editor_backup(iid) else {
+        let Some(backup) = dir.offer_editor_backup(iid) else {
             return;
         };
         let current = self.path.as_deref().and_then(disk_stamp).map(file_stamp);
         let loaded = self.text(cx);
         let disk_text = current.is_some().then_some(loaded.as_str());
         match muxel_core::rescue::backup_offer(&backup, current, disk_text) {
-            BackupOffer::Stale => dir.delete_editor_backup(iid),
+            BackupOffer::Stale => dir.delete_editor_offer(iid),
             offer => {
                 log::info!("editor {iid} offers unsaved changes ({offer:?})");
                 self.rescue.offer = Some((backup, offer));
@@ -798,7 +919,9 @@ impl EditorView {
         }
     }
 
-    /// Whether this editor is offering a backup.
+    /// Whether this editor is offering a backup. Only the Windows app tests
+    /// use it.
+    #[cfg(all(test, windows))]
     pub(crate) fn backup_offered(&self) -> bool {
         self.rescue.offer.is_some()
     }
@@ -811,33 +934,70 @@ impl EditorView {
         self.input.update(cx, |s, cx| s.insert(text, window, cx));
     }
 
-    /// Restore the offered backup into the buffer, unsaved. When the file
-    /// changed on disk since, the next poll shows the disk version beside it.
+    /// Put `text` in the buffer as an input method's uncommitted composition
+    /// does; empty cancels it. Only the Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn compose_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, text, None, window, cx)
+        });
+    }
+
+    /// Hold this editor's background backup writes just before they land,
+    /// until the returned sender sends or drops. Only the Windows app tests
+    /// use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn hold_backup_writes(&mut self) -> async_channel::Sender<()> {
+        let (release, gate) = async_channel::unbounded();
+        self.rescue.gate = Some(gate);
+        release
+    }
+
+    /// Restore the offered backup into the buffer, unsaved. Whether the file
+    /// changed is decided now, against the version the backup's edits started
+    /// from: a disk version newer than that (written before muxel started
+    /// again, or while the offer showed) is kept beside the restored changes.
     pub(crate) fn restore_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((backup, offer)) = self.rescue.offer.take() else {
+        let Some((backup, _)) = self.rescue.offer.take() else {
             return;
         };
+        if let Some((dir, iid)) = &self.rescue.target {
+            dir.delete_editor_offer(*iid);
+        }
+        let base = backup.base;
         self.input
             .update(cx, |s, cx| s.set_value(backup.text, window, cx));
         self.dirty = true;
-        self.rescue.base = backup.base;
-        if offer == BackupOffer::ChangedOnDisk {
-            // Forget the stamp so the poller reads the disk version and offers
-            // it beside these changes, neither replacing the other.
-            self.disk_stamp = None;
+        self.rescue.base = base;
+        if let Some(path) = self.path.clone() {
+            let now = disk_stamp(&path);
+            if base.is_some() && now.map(file_stamp) == base {
+                self.disk_stamp = now;
+            } else {
+                match read_disk_change(&path, None) {
+                    Some(change) => self.apply_disk_change(change, window, cx),
+                    None => {
+                        self.disk_stamp = None;
+                        self.external_change = Some(ExternalChange::Deleted);
+                    }
+                }
+            }
         }
         cx.notify();
         self.note_edit(cx);
     }
 
-    /// Discard the offered backup and its file.
+    /// Discard the offered backup and its file. Edits made while it showed
+    /// are still backed up.
     pub(crate) fn discard_backup(&mut self, cx: &mut Context<Self>) {
         if self.rescue.offer.take().is_some()
             && let Some((dir, iid)) = self.rescue.target.clone()
         {
-            dir.delete_editor_backup(iid);
+            dir.delete_editor_offer(iid);
         }
         cx.notify();
+        self.note_edit(cx);
     }
 
     fn render_backup_offer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

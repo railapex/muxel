@@ -488,13 +488,8 @@ fn a_backup_of_a_file_changed_on_disk_since_keeps_both_versions() {
             .update(cx, |app, window, cx| {
                 let editor = app.editors[&iid].clone();
                 assert!(editor.read(cx).backup_offered());
-                editor.update(cx, |editor, cx| {
-                    editor.restore_backup(window, cx);
-                    // The next disk poll offers their version beside mine.
-                    let change = read_disk_change(&file, editor.disk_stamp())
-                        .expect("the poll sees the disk version");
-                    editor.apply_disk_change(change, window, cx);
-                });
+                // Restoring offers their version beside mine at once.
+                editor.update(cx, |editor, cx| editor.restore_backup(window, cx));
                 let editor = editor.read(cx);
                 assert_eq!(editor.text(cx), "mine v1\n");
                 assert!(matches!(
@@ -607,6 +602,54 @@ fn turning_rescue_off_deletes_what_every_workspace_kept_and_stops_other_writers(
 }
 
 #[test]
+fn restore_checks_the_disk_again_and_keeps_a_newer_version_beside_the_backup() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("late.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "v1\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        type_into(cx, window, iid, "mine ");
+        after_debounce(cx);
+        assert!(dir.editor_backup(iid).is_some());
+
+        reopen_editor(cx, window, iid);
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                assert!(editor.read(cx).backup_offered());
+                editor.update(cx, |editor, cx| {
+                    // Someone writes the file while the offer is showing; the
+                    // clean buffer takes their version.
+                    std::fs::write(&file, "theirs, written later\n").unwrap();
+                    let change = read_disk_change(&file, editor.disk_stamp())
+                        .expect("the poll sees their version");
+                    editor.apply_disk_change(change, window, cx);
+                    assert_eq!(editor.text(cx), "theirs, written later\n");
+                    editor.restore_backup(window, cx);
+                    // A later poll changes nothing about the outcome.
+                    if let Some(change) = read_disk_change(&file, editor.disk_stamp()) {
+                        editor.apply_disk_change(change, window, cx);
+                    }
+                });
+                let editor = editor.read(cx);
+                assert_eq!(editor.text(cx), "mine v1\n");
+                assert!(editor.is_dirty());
+                assert!(
+                    matches!(
+                        editor.external_change(),
+                        Some(ExternalChange::Modified(theirs)) if theirs == "theirs, written later\n"
+                    ),
+                    "their version is kept beside the restored changes"
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
 fn a_pane_still_showing_its_offered_draft_keeps_a_saved_copy_and_whitespace_counts() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);
@@ -644,6 +687,127 @@ fn a_pane_still_showing_its_offered_draft_keeps_a_saved_copy_and_whitespace_coun
             dir.draft(iid).map(|d| d.text).as_deref(),
             Some("printf 'a  b'"),
             "the text the pane shows is still saved"
+        );
+    });
+}
+
+#[test]
+fn an_editor_offering_an_old_backup_still_backs_up_new_edits() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("both.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "base\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        type_into(cx, window, iid, "old ");
+        after_debounce(cx);
+        assert_eq!(dir.editor_backup(iid).unwrap().text, "old base\n");
+
+        reopen_editor(cx, window, iid);
+        type_into(cx, window, iid, "new ");
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("new base\n"),
+            "edits made while the offer shows are backed up"
+        );
+
+        // Discarding the old backup keeps the new edits' backup.
+        window
+            .update(cx, |app, _, cx| {
+                let editor = app.editors[&iid].clone();
+                assert!(editor.read(cx).backup_offered());
+                editor.update(cx, |editor, cx| editor.discard_backup(cx));
+            })
+            .unwrap();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("new base\n")
+        );
+    });
+}
+
+#[test]
+fn a_popped_out_editor_keeps_the_disk_version_its_edits_started_from() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("moved.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "A\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        type_into(cx, window, iid, "x");
+        window
+            .update(cx, |app, _, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.flush_backup(cx));
+            })
+            .unwrap();
+        let base = dir.editor_backup(iid).unwrap().base;
+        assert!(base.is_some());
+
+        // The file changes on disk beside the unsaved edits, then the pane
+        // is popped out (its editor rebuilt) and backed up again.
+        std::fs::write(&file, "B, written elsewhere\n").unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| {
+                    let change = read_disk_change(&file, editor.disk_stamp()).unwrap();
+                    editor.apply_disk_change(change, window, cx);
+                });
+                let rebuilt = super::EditorSnapshot::capture(&editor, cx).build(
+                    app.editor_config(),
+                    window,
+                    cx,
+                );
+                rebuilt.update(cx, |editor, cx| editor.flush_backup(cx));
+                app.editors.insert(iid, rebuilt);
+            })
+            .unwrap();
+        assert_eq!(
+            dir.editor_backup(iid).unwrap().base,
+            base,
+            "the backup still names the version the edits started from"
+        );
+    });
+}
+
+#[test]
+fn an_input_method_composition_is_backed_up_and_its_cancellation_too() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("ime.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "text\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        let compose = |cx: &mut TestAppContext, text: &str| {
+            window
+                .update(cx, |app, window, cx| {
+                    let editor = app.editors[&iid].clone();
+                    editor.update(cx, |editor, cx| editor.compose_text(text, window, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        compose(cx, "にほ");
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("にほtext\n"),
+            "an uncommitted composition is backed up"
+        );
+        compose(cx, "");
+        after_debounce(cx);
+        assert!(
+            dir.editor_backup(iid).is_none(),
+            "a cancelled composition leaves the buffer as the file is"
         );
     });
 }
@@ -780,6 +944,63 @@ fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
             reader.wait_line().as_deref(),
             Some(""),
             "the child's line is empty: nothing was typed into it"
+        );
+    });
+}
+
+#[test]
+fn a_backup_write_still_in_flight_never_brings_back_what_saving_or_closing_deleted() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("racing.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "v1\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        let hold = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.editors[&iid].update(cx, |editor, _| editor.hold_backup_writes())
+                })
+                .unwrap()
+        };
+
+        // A backup write is on its way when the file is saved; it lands after.
+        let release = hold(cx);
+        type_into(cx, window, iid, "mine ");
+        after_debounce(cx);
+        assert!(dir.editor_backup(iid).is_none(), "the write is held");
+        window
+            .update(cx, |app, _, cx| {
+                let editor = app.editors[&iid].clone();
+                std::fs::write(&file, editor.read(cx).text(cx)).unwrap();
+                editor.update(cx, |editor, cx| editor.mark_saved(cx));
+            })
+            .unwrap();
+        drop(release);
+        cx.run_until_parked();
+        assert_eq!(
+            files_under(dir.path()),
+            Vec::<String>::new(),
+            "the older write doesn't bring the saved edits back"
+        );
+
+        // The same race against closing without saving.
+        let release = hold(cx);
+        type_into(cx, window, iid, "more ");
+        after_debounce(cx);
+        window
+            .update(cx, |app, _, cx| {
+                app.close_instance_inner(iid, "close (without saving)", cx)
+            })
+            .unwrap();
+        drop(release);
+        cx.run_until_parked();
+        assert_eq!(
+            files_under(dir.path()),
+            Vec::<String>::new(),
+            "nothing is left of the closed editor"
         );
     });
 }

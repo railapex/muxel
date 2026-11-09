@@ -1654,11 +1654,14 @@ feature is added or changed, update the matching entry here in the same change**
   program would read its newlines as Enter. A pane closed for good keeps its
   draft in a strip under the title bar with **Copy** and **Discard**. Grok,
   Muse, opencode and Amp input boxes are not read yet.
-- **Unsaved editor changes survive** — an editor with unsaved changes backs them
-  up about a second after edits stop. When it opens again it offers **Restore
-  unsaved changes from HH:MM**; if the file changed on disk since, it says so, and
-  restoring keeps both (the disk version waits behind **Reload / Keep mine**).
-  Saving, reloading or closing without saving deletes the backup.
+- **Unsaved editor changes survive** — an editor with unsaved changes, or an
+  input method's uncommitted text, backs them up about a second after edits
+  stop. When it opens again it offers **Restore unsaved changes from HH:MM**,
+  and edits made while the offer shows are backed up too. Restore checks the
+  file again: if it changed since the edits began (before muxel started again
+  or while the offer showed), restoring keeps both, with the disk version
+  behind **Reload / Keep mine**. Saving, reloading or closing without saving
+  deletes the backup, and a backup write still on its way can't bring it back.
 - **Crash notice** — after muxel stops without closing a workspace cleanly, the
   next time it opens one notice says how many prompts and editors were kept and
   which agents were working when muxel last saved the workspace.

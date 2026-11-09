@@ -250,7 +250,7 @@ impl MuxelApp {
         };
         editor.update(cx, |editor, _| editor.set_backup_target(None));
         if let Some(dir) = self.rescue_dir_any() {
-            dir.delete_editor_backup(iid);
+            dir.drop_editor(iid);
         }
     }
 

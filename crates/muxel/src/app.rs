@@ -6321,10 +6321,9 @@ struct EditorSnapshot {
     show_rendered: bool,
     /// Set when the snapshot is of a diff pane (rebuilds via `EditorView::diff`).
     diff_dir: Option<PathBuf>,
-    /// Where the editor backs up its unsaved changes, and whether it was
-    /// still offering the backup a previous run left.
-    backup_target: Option<(muxel_store::rescue::RescueDir, Uuid)>,
-    backup_offered: bool,
+    /// Where the editor backs up its unsaved changes, the disk version they
+    /// started from, the offer it was still showing, and its write order.
+    backup: crate::editor::BackupState,
 }
 
 impl EditorSnapshot {
@@ -6340,8 +6339,7 @@ impl EditorSnapshot {
             disk_stamp: e.disk_stamp(),
             show_rendered: e.show_rendered(),
             diff_dir: e.diff_dir().map(|p| p.to_path_buf()),
-            backup_target: e.backup_target(),
-            backup_offered: e.backup_offered(),
+            backup: e.backup_state(),
         }
     }
     fn build(self, config: EditorConfig, window: &mut Window, cx: &mut App) -> Entity<EditorView> {
@@ -6362,7 +6360,7 @@ impl EditorSnapshot {
                 window,
                 cx,
             );
-            editor.adopt_backup(self.backup_target, self.backup_offered, cx);
+            editor.adopt_backup_state(self.backup, cx);
             editor
         })
     }
@@ -6372,7 +6370,8 @@ impl EditorSnapshot {
 /// window, and restored if the window fails to open).
 enum PopoutContent {
     Terminal(Entity<TerminalView>),
-    Editor(EditorSnapshot),
+    /// Boxed: the snapshot carries the buffer's text and its backup state.
+    Editor(Box<EditorSnapshot>),
     /// Just the URL: the native webview child belongs to the window that built
     /// it, so the pane is re-created in its new window rather than moved.
     Browser(String),
@@ -20988,7 +20987,7 @@ impl MuxelApp {
         let content = if let Some(view) = self.terminals.remove(&iid) {
             PopoutContent::Terminal(view)
         } else if let Some(ed) = self.editors.remove(&iid) {
-            PopoutContent::Editor(EditorSnapshot::capture(&ed, cx))
+            PopoutContent::Editor(Box::new(EditorSnapshot::capture(&ed, cx)))
         } else if let Some(bv) = self.browsers.remove(&iid) {
             PopoutContent::Browser(bv.read(cx).url().to_string())
         } else {
@@ -21036,7 +21035,7 @@ impl MuxelApp {
                         match content {
                             PopoutContent::Terminal(view) => PaneView::Terminal(view),
                             PopoutContent::Editor(snap) => {
-                                PaneView::Editor(snap.build(config, window, cx))
+                                PaneView::Editor((*snap).build(config, window, cx))
                             }
                             PopoutContent::Browser(url) => PaneView::Browser(cx.new(|cx| {
                                 crate::browser::BrowserView::new(iid, pid, url, window, cx)
@@ -21080,7 +21079,7 @@ impl MuxelApp {
                         self.terminals.insert(iid, view);
                     }
                     PopoutContent::Editor(snap) => {
-                        let ed = snap.build(config, window, cx);
+                        let ed = (*snap).build(config, window, cx);
                         self.editors.insert(iid, ed);
                     }
                     PopoutContent::Browser(url) => {
