@@ -4033,8 +4033,7 @@ pub fn read_branches(loc: &RepoLoc) -> BranchRead {
     let out = match loc {
         RepoLoc::Remote(c) => {
             return remote_branch_read(
-                remote_ssh_command(c, remote_ops::branches(c.host.os, &c.remote_path))
-                    .profiled_output(),
+                remote_ssh_command(c, remote_ops::branches(c.host.os, &c.remote_path)).output(),
             );
         }
         // The same two reads, the second only where the first marks no branch.
