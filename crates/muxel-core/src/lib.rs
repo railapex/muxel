@@ -15,6 +15,7 @@ pub mod geometry;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
+mod launch;
 pub mod library;
 pub mod locale;
 pub mod memory;
@@ -22,12 +23,14 @@ pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
+pub mod sidebar;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -55,6 +58,7 @@ pub use agent::{
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
+pub use launch::{LaunchPurpose, PaneTransport};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
@@ -122,7 +126,7 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
@@ -146,17 +150,22 @@ impl AgentActivity {
         })
     }
 
-    /// Whether a completed turn is newer than the last time the pane was
-    /// attended. A missing attendance timestamp means the completion is unseen.
+    /// Whether the pane is Done and unread. Unread is [`sidebar::is_unread`], the
+    /// one read rule shared by the read pill and the unread mark. Recent work's
+    /// order never reads it. A missing attendance timestamp means the
+    /// completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
-        self.current_state() == Some(AgentActivityState::Done)
-            && self
-                .completed_at
-                .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
+        self.current_state() == Some(AgentActivityState::Done) && sidebar::is_unread(self)
     }
 
-    /// Apply one displayed-status transition. Returns whether durable state
-    /// changed, so callers can avoid rewriting the workspace on idle ticks.
+    /// Apply one displayed-status transition, which happened at `now`.
+    /// Returns whether durable state changed, so callers can avoid rewriting
+    /// the workspace on idle ticks.
+    ///
+    /// Attendance is recorded only after what it saw ([`Self::attend`]), so
+    /// a new finish or question happened after the last attendance. If the
+    /// clock has stepped back behind that attendance, the event is recorded
+    /// just after it instead, so it still reads as unseen.
     pub fn observe(
         &mut self,
         previous: Option<AgentActivityState>,
@@ -164,6 +173,7 @@ impl AgentActivity {
         now: i64,
     ) -> bool {
         let now = now.max(0);
+        let event_at = self.last_attended_at.map_or(now, |seen| now.max(seen + 1));
         let before = self.clone();
         let previous_persisted = self.current_state();
         match status {
@@ -171,13 +181,13 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Working) {
                     self.work_started_at = Some(now);
                 }
-                self.blocked_at = None;
             }
             AgentActivityState::Blocked => {
                 if previous != Some(AgentActivityState::Blocked)
-                    && !(previous.is_none() && self.blocked_at.is_some())
+                    && !(previous.is_none()
+                        && previous_persisted == Some(AgentActivityState::Blocked))
                 {
-                    self.blocked_at = Some(now);
+                    self.blocked_at = Some(event_at);
                 }
             }
             AgentActivityState::Done => {
@@ -187,15 +197,10 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Done)
                     && !(previous.is_none() && previous_persisted == Some(AgentActivityState::Done))
                 {
-                    self.completed_at = Some(now);
-                }
-                self.blocked_at = None;
-            }
-            AgentActivityState::Idle => {
-                if previous == Some(AgentActivityState::Blocked) {
-                    self.blocked_at = None;
+                    self.completed_at = Some(event_at);
                 }
             }
+            AgentActivityState::Idle => {}
         }
         if self.last_state.is_some() || previous_persisted != Some(status) {
             self.last_state = Some(status);
@@ -203,14 +208,25 @@ impl AgentActivity {
         *self != before
     }
 
-    /// Record deliberate attendance. This clears unattended completion by
-    /// ordering rather than by maintaining a second persisted boolean.
+    /// Record deliberate attendance at `now`: everything recorded so far has
+    /// been seen. This clears unattended completion by ordering rather than
+    /// by maintaining a second persisted boolean. It covers every recorded
+    /// event, even one the clock now reads as in the future, and never moves
+    /// back, so a seen event can't turn unread when the clock steps back.
     pub fn attend(&mut self, now: i64) -> bool {
-        let now = now.max(0);
-        if self.last_attended_at == Some(now) {
+        let seen = [
+            Some(now.max(0)),
+            self.last_attended_at,
+            self.completed_at,
+            self.blocked_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if self.last_attended_at == seen {
             return false;
         }
-        self.last_attended_at = Some(now);
+        self.last_attended_at = seen;
         true
     }
 }
@@ -226,7 +242,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -376,6 +392,32 @@ mod agent_activity_tests {
             100_001
         ));
         assert!(activity.has_unattended_completion());
+    }
+
+    /// When the clock steps back, attendance still covers what it saw, and
+    /// what happens after it still comes after it.
+    #[test]
+    fn attendance_covers_what_it_saw_whatever_the_clock_reads() {
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        // Finished at 400 by a clock that then stepped back to 200.
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            400,
+        );
+        assert!(activity.attend(200));
+        assert!(!activity.has_unattended_completion(), "seen at 200");
+        assert!(!activity.attend(150), "attendance never moves back");
+        assert_eq!(activity.last_attended_at, Some(400));
+        // Asked at 300 by the clock, after that look.
+        activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Blocked,
+            300,
+        );
+        assert_eq!(activity.blocked_at, Some(401));
+        assert!(crate::sidebar::is_unread(&activity));
     }
 
     #[test]
@@ -621,6 +663,22 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// For a file, diff or page: the session that last opened it (a link
+    /// clicked in it, its diff button, or a file or page that session opened).
+    /// Recent work nests the resource under that session. `None` when only
+    /// muxel's own chrome opened it. Kept on this machine: the shared layout
+    /// leaves it out, as it does a pane's activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<Uuid>,
+    /// When `opened_by` last opened it, in Unix milliseconds. A session's
+    /// nested resources go newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<i64>,
+    /// When this pane was opened, in Unix milliseconds. Recent work places a
+    /// pane that has never worked by it. `None` for panes saved before muxel
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,6 +728,13 @@ impl Instance {
 
     pub fn working_directory(&self) -> Option<&std::path::Path> {
         self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// What this pane was started to do, from the program and arguments it
+    /// runs ([`LaunchPurpose::of`]). Saved panes get the same answer as new
+    /// ones, so nothing is stored for it.
+    pub fn launch_purpose(&self) -> LaunchPurpose {
+        LaunchPurpose::of(self.program.as_deref(), &self.args)
     }
 
     /// An unspawned saved literal command is stopped, rather than an idle agent.
@@ -725,19 +790,37 @@ impl Instance {
         true
     }
 
-    /// A duplicated pane copies launch settings, not the source conversation.
+    /// A duplicated pane copies launch settings, not the source conversation or
+    /// its activity. The copy has done no work and has nothing unread of its own.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        self.activity = AgentActivity::default();
+        // The copy is opened when it is added, not when its source was.
+        self.created_at = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
         // approved, never to a copy of its pane.
         if self.control_prompt {
             self.system_prompt = None;
+        }
+        // The user made the copy; no session opened it.
+        self.opened_by = None;
+        self.opened_at = None;
+    }
+
+    /// `session` opened this resource at `now`, either for the first time or
+    /// again while it was already open: the last opener wins. An open no
+    /// session asked for (`None`: the file browser, palette or sidebar) leaves
+    /// an earlier opener in place.
+    pub fn record_opener(&mut self, session: Option<Uuid>, now: i64) {
+        if let Some(session) = session {
+            self.opened_by = Some(session);
+            self.opened_at = Some(now);
         }
     }
 
@@ -796,6 +879,9 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
+            created_at: None,
         }
     }
 
@@ -865,6 +951,9 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            opened_by: None,
+            opened_at: None,
+            created_at: None,
         }
     }
 }
@@ -1428,6 +1517,23 @@ impl Workspace {
         self.worktrees.retain(|w| w.id != id);
     }
 
+    /// The session behind an open that pane `pane` asked for, recorded as the
+    /// resource's [`Instance::opened_by`]: the pane itself when it is a session
+    /// (a terminal), or the live session that opened it when it is a file,
+    /// diff or page. A page opened from a file Claude opened is Claude's too.
+    pub fn opener_session(&self, pane: Uuid) -> Option<Uuid> {
+        let is_session = |id: Uuid| {
+            self.instance(id)
+                .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+        };
+        if is_session(pane) {
+            return Some(pane);
+        }
+        self.instance(pane)?
+            .opened_by
+            .filter(|&session| is_session(session))
+    }
+
     /// Where `instance` runs, for its close's ledger entry. Capture before
     /// removing its metadata.
     pub fn closed_worktree_of(&self, instance: &Instance) -> tmux::ClosedWorktree {
@@ -1527,7 +1633,8 @@ pub struct RemoteLayout {
     pub accomplishments_enabled: Option<bool>,
 }
 
-// Local Workspace persistence keeps receipts; only the shared document omits them.
+// Local Workspace persistence keeps receipts and openers; only the shared
+// document omits them.
 fn serialize_shared_instances<S: serde::Serializer>(
     instances: &[Instance],
     serializer: S,
@@ -1536,9 +1643,14 @@ fn serialize_shared_instances<S: serde::Serializer>(
 
     let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
     for instance in instances {
-        if instance.claude_hook_record.is_some() {
+        if instance.claude_hook_record.is_some()
+            || instance.opened_by.is_some()
+            || instance.opened_at.is_some()
+        {
             let mut shared = instance.clone();
             shared.claude_hook_record = None;
+            shared.opened_by = None;
+            shared.opened_at = None;
             sequence.serialize_element(&shared)?;
         } else {
             sequence.serialize_element(instance)?;
@@ -1618,7 +1730,8 @@ impl RemoteLayout {
     /// Per-machine state is left out, so it never reads as a layout change: the
     /// owning project's id (every machine has its own id for the same project) and
     /// what this machine observes of a pane — its program-supplied title, terminal
-    /// grid, agent activity and consumed hook receipts. Counting those pushed the
+    /// grid, agent activity, consumed hook receipts and which session opened a
+    /// file or page. Counting those pushed the
     /// layout on every resize and agent turn, and made two peers look out of sync
     /// when nothing differed.
     pub fn content_key(&self) -> String {
@@ -1661,6 +1774,10 @@ impl RemoteLayout {
                 instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                instance.opened_by = None;
+                instance.opened_at = None;
+                // Set once, and dropped by older peers: never a layout change.
+                instance.created_at = None;
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
@@ -1852,8 +1969,8 @@ pub fn observed_close_revision(current: Option<u64>) -> u64 {
 /// A peer layout's instances as this machine should hold them: every one the peer
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
-/// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content. A validated rollout path survives a peer
+/// program-supplied title, terminal grid, agent activity and the session that
+/// opened it), which is per-machine and never part of the shared content. A validated rollout path survives a peer
 /// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
@@ -1866,11 +1983,19 @@ pub fn merge_peer_instances(
             // A peer's consumed receipt says nothing about this machine, even
             // when this is the first time it has seen the pane.
             instance.claude_hook_record = None;
+            // Which session opened a file is this machine's to know: the
+            // shared document never carries it.
+            instance.opened_by = None;
+            instance.opened_at = None;
             if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
                 instance.auto_name = mine.auto_name.clone();
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                instance.opened_by = mine.opened_by;
+                instance.opened_at = mine.opened_at;
+                // An older peer doesn't write the open time.
+                instance.created_at = mine.created_at.or(instance.created_at);
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()
@@ -1901,6 +2026,10 @@ pub fn merge_peer_instances(
                 if instance.instruction_injection.is_none() {
                     instance.instruction_injection = mine.instruction_injection.clone();
                 }
+            } else {
+                // Work and attendance are observations on this machine. A new
+                // peer pane starts fresh; its own runtime samples record them.
+                instance.activity = AgentActivity::default();
             }
             instance
         })
@@ -2039,6 +2168,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -2641,6 +2771,9 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Sidebar presentation only; navigation and pane layout keep their order.
+    #[serde(default)]
+    pub sidebar_sort: sidebar::SidebarSort,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3183,6 +3316,7 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            sidebar_sort: sidebar::SidebarSort::default(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,
@@ -4130,6 +4264,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4214,6 +4349,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4228,6 +4364,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4243,6 +4380,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4396,6 +4534,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4448,6 +4587,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4495,6 +4635,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4537,6 +4678,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4934,11 +5076,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -5096,6 +5240,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -5144,6 +5289,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
