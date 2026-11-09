@@ -106,31 +106,35 @@ pub const BRANCHES_FAILED: &str = "muxel: git could not list the branches";
 /// One command, so one ssh for both. Where the listing fails in a repository
 /// (a git older than 1.9 doesn't know `%(HEAD)`), git's message goes to
 /// stderr and [`BRANCHES_FAILED`] to stdout; in a folder holding no
-/// repository it prints nothing and succeeds. Telling the two apart costs a
-/// `git rev-parse` after a failure only.
+/// repository, or none at all, it prints nothing and succeeds. Telling the
+/// two apart costs a `git rev-parse` after a failure only, run in the folder
+/// rather than with `-C`: a git older than 1.8.5 has no `-C`, which fails the
+/// listing before `%(HEAD)` does.
 pub fn branches(os: RemoteOs, repo: &str) -> String {
     const LIST: &[&str] = &[
         "for-each-ref",
         "--format=%(HEAD)%(refname:short)",
         "refs/heads/",
     ];
-    const REPO: &[&str] = &["rev-parse", "--git-dir"];
     const HEAD: &[&str] = &["symbolic-ref", "--quiet", "--short", "HEAD"];
     match os {
         RemoteOs::Unix => format!(
-            "{} || {{ {} >/dev/null 2>&1 || exit 0; echo {}; exit 2; }}; {}",
+            "{} || {{ {{ cd {} && git rev-parse --git-dir; }} >/dev/null 2>&1 || exit 0; \
+             echo {}; exit 2; }}; {}",
             sh_git(repo, LIST, true),
-            sh_git(repo, REPO, true),
+            sh_quote(repo),
             sh_quote(BRANCHES_FAILED),
             sh_git(repo, HEAD, true)
         ),
         RemoteOs::Windows => ps(&format!(
-            "{}; if ($LASTEXITCODE -ne 0) {{ {} | Out-Null; \
+            "{}; if ($LASTEXITCODE -ne 0) {{ \
+             if (-not (Test-Path -LiteralPath {repo} -PathType Container)) {{ exit 0 }}; \
+             Set-Location -LiteralPath {repo}; & git rev-parse --git-dir | Out-Null; \
              if ($LASTEXITCODE -ne 0) {{ exit 0 }}; {}; exit 2 }}; {}; exit $LASTEXITCODE",
             ps_git(repo, LIST, true),
-            ps_git(repo, REPO, true),
             ps_quote(BRANCHES_FAILED),
             ps_git(repo, HEAD, true),
+            repo = ps_quote(repo),
         )),
     }
 }
@@ -535,18 +539,26 @@ mod tests {
         // repository is.
         let s = script_of(&branches(WIN, "C:/p"));
         let list = s.find("'for-each-ref'").expect("lists");
+        let gone = s
+            .find("if (-not (Test-Path -LiteralPath 'C:/p' -PathType Container)) { exit 0 }")
+            .expect("no folder: no branch");
         let repo = s
-            .find("'rev-parse' '--git-dir' | Out-Null")
-            .expect("checks for a repository");
-        let none = s.find("{ exit 0 }").expect("no repository: no branch");
+            .find("Set-Location -LiteralPath 'C:/p'; & git rev-parse --git-dir | Out-Null")
+            .expect("checks for a repository in the folder");
+        let none = s[repo..]
+            .find("{ exit 0 }")
+            .expect("no repository: no branch")
+            + repo;
         let said = s
             .find(&format!("'{BRANCHES_FAILED}'; exit 2"))
             .expect("marks git's failure");
         let head = s.find("'symbolic-ref'").expect("names HEAD");
         assert!(
-            list < repo && repo < none && none < said && said < head,
+            list < gone && gone < repo && repo < none && none < said && said < head,
             "{s}"
         );
+        // A git older than 1.8.5 has no `-C`; the check mustn't need it.
+        assert!(!s[list..said].contains(" -C "), "{s}");
         assert!(s[head..].contains("; exit $LASTEXITCODE"), "{s}");
     }
 

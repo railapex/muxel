@@ -6043,11 +6043,33 @@ mod tests {
             remote_branch_read(remote_branches_here(repo.path(), "")),
             BranchRead::Read(Some("main".into()), vec!["main".into()])
         );
+        // git before 1.8.5 has no `-C` either, so the listing fails before it
+        // reaches `%(HEAD)`; telling a repository apart mustn't need `-C`.
+        let older_git = "git() { case \" $* \" in *' -C '*) \
+                         echo 'Unknown option: -C' >&2; return 129;; esac; \
+                         command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), older_git)),
+            BranchRead::Failed("Unknown option: -C".into())
+        );
         let plain = crate::test_support::short_temp_path();
         std::fs::create_dir_all(&plain).unwrap();
         let read = remote_branch_read(remote_branches_here(&plain, ""));
+        let older = remote_branch_read(remote_branches_here(&plain, older_git));
         let _ = std::fs::remove_dir_all(&plain);
         assert_eq!(read, BranchRead::Read(None, Vec::new()), "no repository");
+        assert_eq!(
+            older,
+            BranchRead::Read(None, Vec::new()),
+            "nor with that git"
+        );
+        // A folder that's gone is no repository either, wherever ssh starts.
+        let gone = remote_branch_read(remote_branches_here(&plain, older_git));
+        assert_eq!(
+            gone,
+            BranchRead::Read(None, Vec::new()),
+            "a folder that's gone"
+        );
     }
 
     /// ssh's own failure is 255; sshpass's wrong password is 5 and its unknown
