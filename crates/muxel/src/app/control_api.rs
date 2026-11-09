@@ -472,6 +472,14 @@ fn send_admission_state(
     state
 }
 
+fn background_turn_over(
+    runtime: muxel_terminal::TerminalRuntimeSnapshot,
+    binding_rev: u64,
+) -> bool {
+    runtime.binding_rev == binding_rev
+        && runtime.reason == muxel_terminal::TerminalStatusReason::BackgroundWork
+}
+
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
     if !admission.force {
         if admission.just_submitted {
@@ -1659,8 +1667,8 @@ impl MuxelApp {
     /// hasn't started yet, whose reply this would pass off as the previous one.
     fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
         self.terminal_view(inst.id).is_some_and(|view| {
-            view.read(cx).runtime_snapshot().reason
-                == muxel_terminal::TerminalStatusReason::BackgroundWork
+            let view = view.read(cx);
+            background_turn_over(view.runtime_snapshot(), view.session().binding_revision())
         }) && !self
             .control_turns
             .get(&inst.id)
@@ -1672,7 +1680,11 @@ impl MuxelApp {
         send_admission_state(
             self.control_state(inst, cx),
             self.terminal_view(inst.id)
-                .map(|view| view.read(cx).runtime_snapshot().reason),
+                .filter(|view| {
+                    let view = view.read(cx);
+                    background_turn_over(view.runtime_snapshot(), view.session().binding_revision())
+                })
+                .map(|_| muxel_terminal::TerminalStatusReason::BackgroundWork),
         )
     }
 
@@ -4550,6 +4562,62 @@ mod runtime_control_tests {
         TerminalStatusReason,
     };
     use std::time::SystemTime;
+
+    fn held_snapshot() -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            background: Some(ctl::BackgroundWork {
+                shells: 1,
+                ..Default::default()
+            }),
+            status: AgentStatus::Working,
+            attributable: true,
+            reason: TerminalStatusReason::BackgroundWork,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: uuid::Uuid::nil(),
+            binding_rev: 1,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: false,
+            completion_revision: 0,
+        }
+    }
+
+    #[test]
+    fn background_hold_send_requires_current_binding() {
+        let runtime = held_snapshot();
+        for (binding, attributable) in [(1, true), (2, true), (1, false)] {
+            let runtime = TerminalRuntimeSnapshot {
+                attributable,
+                ..runtime
+            };
+            let reason = super::background_turn_over(runtime, binding)
+                .then_some(TerminalStatusReason::BackgroundWork);
+            let state =
+                super::send_admission_state(Some(runtime_control_state(runtime, binding)), reason);
+            let result = check_send_state(SendAdmission {
+                state,
+                just_submitted: false,
+                force: false,
+            });
+            // Attribution belongs to activity, not to the free foreground composer.
+            assert_eq!(result.is_ok(), binding == 1);
+        }
+    }
+
+    #[test]
+    fn background_hold_turn_end_requires_current_binding() {
+        let runtime = held_snapshot();
+        assert!(super::background_turn_over(runtime, 1));
+        assert!(!super::background_turn_over(runtime, 2));
+        assert!(super::background_turn_over(
+            TerminalRuntimeSnapshot {
+                attributable: false,
+                ..runtime
+            },
+            1,
+        ));
+    }
 
     #[test]
     fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {

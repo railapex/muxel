@@ -1368,8 +1368,9 @@ usage: muxel ctl <command> [args]
                                  --launch-id refuses a replaced terminal
   wait AGENT [--timeout SECS] [--full] [--turn]
                                  wait for the agent to finish, then show it;
-                                 --turn stops at the turn's end, even with
-                                 background work still running
+                                 --turn stops at an observable turn end, even
+                                 with background work; a provider still
+                                 reporting Working keeps waiting
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
@@ -1442,7 +1443,7 @@ Open a terminal as a tab in the calling pane's group (else the focused group); -
             "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result. --turn stops at an observable turn end even if background work remains; it cannot override a provider still reporting Working."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
