@@ -449,7 +449,7 @@ fn an_editors_unsaved_changes_are_backed_up_and_restored_after_a_crash() {
                 editor.update(cx, |editor, cx| editor.restore_backup(window, cx));
                 let editor = editor.read(cx);
                 assert_eq!(editor.text(cx), "mine: original\n");
-                assert!(editor.is_dirty(), "restored changes are unsaved");
+                assert!(editor.is_dirty(cx), "restored changes are unsaved");
             })
             .unwrap();
 
@@ -638,7 +638,7 @@ fn restore_checks_the_disk_again_and_keeps_a_newer_version_beside_the_backup() {
                 });
                 let editor = editor.read(cx);
                 assert_eq!(editor.text(cx), "mine v1\n");
-                assert!(editor.is_dirty());
+                assert!(editor.is_dirty(cx));
                 assert!(
                     matches!(
                         editor.external_change(),
@@ -1211,7 +1211,9 @@ fn text_an_input_method_commits_stays_backed_up() {
             "committed text is an unsaved change, not a cancellation"
         );
         window
-            .read_with(cx, |app, cx| assert!(app.editors[&iid].read(cx).is_dirty()))
+            .read_with(cx, |app, cx| {
+                assert!(app.editors[&iid].read(cx).is_dirty(cx))
+            })
             .unwrap();
         reopen_editor(cx, window, iid);
         assert_eq!(
