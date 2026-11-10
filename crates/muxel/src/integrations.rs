@@ -293,6 +293,14 @@ thread_local! {
     static LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Commands this thread has run through [`ProfiledOutput`] so far. gpui's test
+/// executor runs background tasks on the test's own thread, so an app test
+/// sees its panes' git here too.
+#[cfg(test)]
+pub(crate) fn git_launches() -> usize {
+    LAUNCHES.with(std::cell::Cell::get)
+}
+
 impl ProfiledOutput for Command {
     fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
         #[cfg(test)]
@@ -1212,8 +1220,8 @@ pub fn repo_head(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "HEAD"])
 }
 
-/// The repo's current branch, including before its first commit, spelled as
-/// [`list_branches`] spells it so the branch switcher can mark it. `None` when
+/// The repo's current branch, including before its first commit, shortened as
+/// `git branch` shortens it and trimmed. `None` when
 /// detached or git fails. Used only for display; works for local and remote
 /// repos. The branch poll reads a local project's branch with its branch list
 /// instead (see [`read_branches`]).
@@ -4856,8 +4864,7 @@ pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BranchRead {
     /// The branch HEAD names (`None` when it names none, or the folder holds
-    /// no repository), spelled as [`list_branches`] spells it, and the local
-    /// branches.
+    /// no repository), spelled as the list spells it, and the local branches.
     Read(Option<String>, Vec<String>),
     /// Nothing came back: ssh or sshpass failed, couldn't start, or was
     /// stopped.
@@ -4868,8 +4875,10 @@ pub enum BranchRead {
 }
 
 /// What the branch poll shows for a project at `loc`. One git round, so one
-/// ssh for a remote one, where a [`repo_current_branch`] and a
-/// [`list_branches`] were two. A local failure reads as no branches.
+/// ssh for a remote one, where a [`repo_current_branch`] and a separate
+/// branch list were two. Read with `for-each-ref`, which lists branches only:
+/// `git branch` adds a line for a detached HEAD, a rebase or a bisect. A local
+/// failure reads as no branches.
 pub fn read_branches(loc: &RepoLoc) -> BranchRead {
     const LIST: &[&str] = &[
         "for-each-ref",
@@ -9226,8 +9235,8 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// The switcher marks the current branch by finding it in the branch list,
-    /// which trims Unicode whitespace from its lines.
+    /// The switcher marks the current branch by finding it in the branch list.
+    /// Both come from one read, which keeps a name's Unicode whitespace.
     #[test]
     fn a_name_with_unicode_whitespace_still_matches_the_branch_list() {
         let repo = TestRepo::init();
@@ -9236,11 +9245,13 @@ mod tests {
         for name in ["topic\u{a0}", "\u{a0}topic"] {
             repo.git(&["switch", "-q", "-c", name]);
             if !discovery_env_set() {
-                let current = repo_current_branch(&loc);
-                let listed = list_branches(&loc);
+                let BranchRead::Read(current, listed) = read_branches(&loc) else {
+                    panic!("{name:?}: the branch list is unreadable");
+                };
+                assert_eq!(current.as_deref(), Some(name), "{name:?}");
                 assert!(
-                    current.as_ref().is_some_and(|c| listed.contains(c)),
-                    "{name:?}: {current:?} isn't in {listed:?}"
+                    listed.iter().any(|branch| branch == name),
+                    "{name:?} isn't in {listed:?}"
                 );
             }
             repo.git(&["switch", "-q", "main"]);
