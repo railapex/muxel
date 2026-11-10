@@ -89,7 +89,7 @@ mod tests {
                 Option::as_ref,
                 |_, _| false,
                 |view: &Rc<Cell<TerminalRuntimeSnapshot>>, run| {
-                    run.cleanup(view.get(), 1, Some(1), Duration::ZERO)
+                    run.cleanup(view.get(), 1, Some(1), true, Duration::ZERO)
                 },
             )
         };

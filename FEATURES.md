@@ -716,8 +716,12 @@ feature is added or changed, update the matching entry here in the same change**
   cap, so a missing program can't open a pane at every fire. A run finishes
   once the agent has been seen working after the loop's prompt (checked every
   second) and is idle again, so a short turn closes an Exit pane at the next
-  loop check and later scheduled runs can fire; a turn shorter than about a
-  second can go unseen and then waits for the cap. Cleanup requires current attributable evidence from the launch and
+  loop check and later scheduled runs can fire. Working already under way when
+  the prompt goes in, such as an agent still starting up, doesn't count until
+  it stops. A terminal whose work shows only as output is checked at each loop
+  check rather than every second, since a command can print and then run
+  silently. A turn shorter than about a second, or one that runs inside
+  startup's working, can go unseen and then waits for the cap. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which

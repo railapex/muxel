@@ -2285,6 +2285,7 @@ mod grok_regressions {
                             cached_done,
                             session.binding_revision(),
                             session.first_submission_binding(),
+                            true,
                             Duration::ZERO
                         ),
                         LoopCleanup::Abandon,

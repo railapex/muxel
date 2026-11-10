@@ -8,7 +8,7 @@ use super::codex_capture_tests::with_app;
 use super::{MuxelApp, claude_test_home, unix_now};
 use gpui::{Task, TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, InjectionMode, Loop, PostRunAction, Project};
-use muxel_terminal::{AgentStatus, TerminalSession};
+use muxel_terminal::{AgentStatus, TerminalSession, TerminalStatusReason};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -327,6 +327,104 @@ fn a_startup_done_seen_after_the_submission_does_not_finish_the_run() {
             tracked(cx, window, pane),
             "a Done from before the loop's turn finished its run"
         );
+    });
+}
+
+#[test]
+fn a_turn_submitted_while_startup_still_works_waits_for_a_spell_of_its_own() {
+    with_app(|cx, window| {
+        let (pid, idx, _home) = claude_loop(cx, window);
+        let pane = fire(cx, window, pid, idx, "cmd.exe", &["/d", "/q", "/c", "more"]);
+        let session = installed(cx, window, pane);
+        let _kill = Kill(session.clone());
+        heartbeat(cx, window);
+
+        // Startup is still Working when the loop's prompt goes in, a status
+        // tick sees it, and it settles without running the task.
+        session.write_input(b"esc to interrupt\r");
+        wait_for(cx, window, "startup to work", |app, cx| {
+            (app.terminals[&pane].read(cx).status() == AgentStatus::Working).then_some(())
+        });
+        session.mark_turn_submitted();
+        status_tick(cx, window);
+        session.write_input(&b"\r".repeat(80));
+        wait_for(cx, window, "startup to settle", |app, cx| {
+            matches!(
+                app.terminals[&pane].read(cx).status(),
+                AgentStatus::Idle | AgentStatus::Done
+            )
+            .then_some(())
+        });
+        heartbeat(cx, window);
+        assert!(
+            tracked(cx, window, pane),
+            "startup's Working, still running when the prompt went in, finished the run"
+        );
+
+        // The turn itself works after that, and then finishes the run.
+        work(cx, window, pane, &session, |cx| status_tick(cx, window));
+        heartbeat(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                assert!(
+                    app.workspace.instance(pane).is_none(),
+                    "an Exit loop left its pane open after its turn"
+                );
+                assert!(!app.running_loops.contains_key(&pane));
+            })
+            .unwrap();
+    });
+}
+
+/// A shell command that prints and then runs silently reads as Working from
+/// its output, then Idle two seconds later while it still runs.
+#[test]
+fn a_command_gone_quiet_after_its_output_keeps_its_run() {
+    with_app(|cx, window| {
+        let cmd = AgentPreset {
+            name: "Cmd".into(),
+            program: Some("cmd.exe".into()),
+            args: ["/d", "/q", "/c", "more"].map(String::from).to_vec(),
+            ..AgentPreset::shell()
+        };
+        let (pid, idx) = exit_loop(cx, window, cmd);
+        let pane = window
+            .update(cx, |app, window, cx| {
+                app.fire_loop(idx, unix_now(), window, cx);
+                app.workspace
+                    .instances
+                    .iter()
+                    .find(|i| i.project_id == pid)
+                    .expect("the loop opened a pane")
+                    .id
+            })
+            .unwrap();
+        let session = installed(cx, window, pane);
+        let _kill = Kill(session.clone());
+        heartbeat(cx, window);
+        assert!(tracked(cx, window, pane));
+        let idle = |cx: &mut TestAppContext, what: &str| {
+            wait_for(cx, window, what, |app, cx| {
+                (app.terminals[&pane].read(cx).status() == AgentStatus::Idle).then_some(())
+            })
+        };
+        idle(cx, "the shell to start quiet");
+
+        session.mark_turn_submitted();
+        session.write_input(b"started\r");
+        let reason = wait_for(cx, window, "the output to read as Working", |app, cx| {
+            let view = app.terminals[&pane].read(cx);
+            (view.status() == AgentStatus::Working).then(|| view.runtime_snapshot().reason)
+        });
+        assert_eq!(reason, TerminalStatusReason::RecentOutput);
+        status_tick(cx, window);
+        idle(cx, "the output to go quiet");
+        heartbeat(cx, window);
+        assert!(
+            tracked(cx, window, pane),
+            "a command still running after its output went quiet finished the run"
+        );
+        assert_eq!(panes(cx, window, pid), 1);
     });
 }
 

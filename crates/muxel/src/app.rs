@@ -4490,28 +4490,39 @@ impl LoopRun {
     }
 
     /// The status tick's sample of this run's pane. Working counts only in the
-    /// run's own launch, after its first submission and in the conversation
-    /// that submission went to, so it is the run's turn underway. Sampling
-    /// each second means a turn that starts and ends between two loop
-    /// heartbeats still finishes the run; one shorter than a second may not,
-    /// and then waits for the runtime cap.
+    /// run's own launch, in a spell that began after its first submission
+    /// (`working_after_submission`, so not an agent still starting up when
+    /// the prompt went in), and in the conversation that submission went to:
+    /// the run's turn underway. Sampling each second means a turn that starts
+    /// and ends between two loop heartbeats still finishes the run; one
+    /// shorter than a second may not, and then waits for the runtime cap.
+    /// Working inferred from output alone isn't taken here: a shell command
+    /// that prints and then runs silently would look finished two seconds
+    /// later. Those terminals keep the heartbeat's sample.
     fn observe(
         &mut self,
         runtime: muxel_terminal::TerminalRuntimeSnapshot,
         current_binding_rev: u64,
         first_submission_binding: Option<u64>,
+        working_after_submission: bool,
     ) {
         self.seen_working |= runtime.status == AgentStatus::Working
+            && working_after_submission
+            && runtime.reason != muxel_terminal::TerminalStatusReason::RecentOutput
             && self.launch == LoopLaunch::Installed(runtime.launch_id)
             && first_submission_binding == Some(current_binding_rev)
             && runtime.is_attributable_to(current_binding_rev);
     }
 
+    /// `working_after_submission`: as for [`Self::observe`]. The heartbeat
+    /// takes Working inferred from output too, as the only sample terminals
+    /// without working markers or a known provider get.
     fn cleanup(
         &mut self,
         runtime: muxel_terminal::TerminalRuntimeSnapshot,
         current_binding_rev: u64,
         first_submission_binding: Option<u64>,
+        working_after_submission: bool,
         elapsed: Duration,
     ) -> LoopCleanup {
         if self.launch != LoopLaunch::Installed(runtime.launch_id) {
@@ -4538,7 +4549,7 @@ impl LoopRun {
                 LoopCleanup::Continue
             };
         }
-        self.seen_working |= runtime.status == AgentStatus::Working;
+        self.seen_working |= runtime.status == AgentStatus::Working && working_after_submission;
         // Never while it is working again or waiting on someone.
         let settled = matches!(runtime.status, AgentStatus::Idle | AgentStatus::Done);
         if (settled && self.seen_working) || elapsed >= MAX_LOOP_RUNTIME {
@@ -4676,6 +4687,7 @@ mod loop_cleanup_tests {
                     snapshot(session.id, rev, status),
                     rev,
                     session.first_submission_binding(),
+                    true,
                     Duration::ZERO,
                 )
             },
@@ -4722,7 +4734,7 @@ mod loop_cleanup_tests {
         let at = |status| snapshot(launch, 1, status);
         let observed = |snapshot, binding, submitted| {
             let mut run = run(launch);
-            run.observe(snapshot, binding, submitted);
+            run.observe(snapshot, binding, submitted, true);
             run.seen_working
         };
         assert!(observed(at(AgentStatus::Working), 1, Some(1)));
@@ -4746,22 +4758,49 @@ mod loop_cleanup_tests {
         for status in [AgentStatus::Idle, AgentStatus::Done] {
             assert!(!observed(at(status), 1, Some(1)));
             assert_eq!(
-                run(launch).cleanup(at(status), 1, Some(1), Duration::ZERO),
+                run(launch).cleanup(at(status), 1, Some(1), true, Duration::ZERO),
                 LoopCleanup::Continue
             );
         }
         // Once the status tick saw the turn, the next heartbeat at Idle or
         // Done finishes it; Working or Blocked again keeps it.
         let mut seen = run(launch);
-        seen.observe(at(AgentStatus::Working), 1, Some(1));
+        seen.observe(at(AgentStatus::Working), 1, Some(1), true);
         for status in [AgentStatus::Working, AgentStatus::Blocked] {
             assert_eq!(
-                seen.cleanup(at(status), 1, Some(1), Duration::ZERO),
+                seen.cleanup(at(status), 1, Some(1), true, Duration::ZERO),
                 LoopCleanup::Continue
             );
         }
         assert_eq!(
-            seen.cleanup(at(AgentStatus::Done), 1, Some(1), Duration::ZERO),
+            seen.cleanup(at(AgentStatus::Done), 1, Some(1), true, Duration::ZERO),
+            LoopCleanup::Finish
+        );
+        // A Working spell already running when the prompt went in (an agent
+        // still starting up) is no turn on either path.
+        let mut startup = run(launch);
+        startup.observe(at(AgentStatus::Working), 1, Some(1), false);
+        assert_eq!(
+            startup.cleanup(at(AgentStatus::Working), 1, Some(1), false, Duration::ZERO),
+            LoopCleanup::Continue
+        );
+        assert_eq!(
+            startup.cleanup(at(AgentStatus::Idle), 1, Some(1), false, Duration::ZERO),
+            LoopCleanup::Continue,
+            "startup settling finished the run"
+        );
+        // Working inferred from output alone waits for a heartbeat to see it:
+        // the fast tick would latch a burst a silent command then outlives.
+        let mut output = at(AgentStatus::Working);
+        output.reason = TerminalStatusReason::RecentOutput;
+        assert!(!observed(output, 1, Some(1)));
+        let mut heard = run(launch);
+        assert_eq!(
+            heard.cleanup(output, 1, Some(1), true, Duration::ZERO),
+            LoopCleanup::Continue
+        );
+        assert_eq!(
+            heard.cleanup(at(AgentStatus::Idle), 1, Some(1), true, Duration::ZERO),
             LoopCleanup::Finish
         );
     }
@@ -4967,6 +5006,7 @@ mod loop_cleanup_tests {
                 working,
                 a,
                 session.first_submission_binding(),
+                true,
                 Duration::ZERO
             ),
             LoopCleanup::Continue
@@ -4989,7 +5029,13 @@ mod loop_cleanup_tests {
         let b = session.binding_revision();
         assert_ne!(a, b);
         assert_eq!(
-            run.cleanup(done, b, session.first_submission_binding(), Duration::ZERO),
+            run.cleanup(
+                done,
+                b,
+                session.first_submission_binding(),
+                true,
+                Duration::ZERO
+            ),
             LoopCleanup::Abandon
         );
         let uncertain = TerminalRuntimeSnapshot {
@@ -5012,6 +5058,7 @@ mod loop_cleanup_tests {
                     runtime,
                     b,
                     session.first_submission_binding(),
+                    true,
                     MAX_LOOP_RUNTIME
                 ),
                 LoopCleanup::Abandon,
@@ -5043,6 +5090,7 @@ mod loop_cleanup_tests {
                 uncertain,
                 rev,
                 session.first_submission_binding(),
+                true,
                 MAX_LOOP_RUNTIME - Duration::from_secs(1)
             ),
             LoopCleanup::Continue
@@ -5052,6 +5100,7 @@ mod loop_cleanup_tests {
                 uncertain,
                 rev,
                 session.first_submission_binding(),
+                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon,
@@ -5087,6 +5136,7 @@ mod loop_cleanup_tests {
                         snapshot(session.id, rev, status),
                         rev,
                         session.first_submission_binding(),
+                        true,
                         elapsed
                     ),
                     if elapsed >= MAX_LOOP_RUNTIME {
@@ -5109,6 +5159,7 @@ mod loop_cleanup_tests {
                 snapshot(session.id, replaced, AgentStatus::Done),
                 replaced,
                 session.first_submission_binding(),
+                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon
@@ -5126,25 +5177,25 @@ mod loop_cleanup_tests {
             ..working
         };
         assert_eq!(
-            run.cleanup(uncertain, 1, Some(1), Duration::ZERO),
+            run.cleanup(uncertain, 1, Some(1), true, Duration::ZERO),
             LoopCleanup::Continue
         );
         assert_eq!(
-            run.cleanup(uncertain, 1, Some(1), MAX_LOOP_RUNTIME),
+            run.cleanup(uncertain, 1, Some(1), true, MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert!(!run.seen_working);
         assert_eq!(
-            run.cleanup(working, 2, Some(2), MAX_LOOP_RUNTIME),
+            run.cleanup(working, 2, Some(2), true, MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert!(!run.seen_working, "a stale snapshot cannot seed Working");
         assert_eq!(
-            run.cleanup(working, 1, None, Duration::ZERO),
+            run.cleanup(working, 1, None, true, Duration::ZERO),
             LoopCleanup::Continue
         );
         assert_eq!(
-            run.cleanup(working, 1, None, MAX_LOOP_RUNTIME),
+            run.cleanup(working, 1, None, true, MAX_LOOP_RUNTIME),
             LoopCleanup::Abandon
         );
         assert_eq!(
@@ -5152,13 +5203,14 @@ mod loop_cleanup_tests {
                 snapshot(launch, 1, AgentStatus::Idle),
                 1,
                 Some(1),
+                true,
                 Duration::ZERO
             ),
             LoopCleanup::Continue,
             "startup idle is not a completed turn"
         );
         assert_eq!(
-            run.cleanup(working, 1, Some(1), Duration::ZERO),
+            run.cleanup(working, 1, Some(1), true, Duration::ZERO),
             LoopCleanup::Continue
         );
         assert!(run.seen_working);
@@ -5167,12 +5219,13 @@ mod loop_cleanup_tests {
                 snapshot(launch, 1, AgentStatus::Done),
                 1,
                 Some(1),
+                true,
                 Duration::ZERO
             ),
             LoopCleanup::Finish
         );
         assert_eq!(
-            run.cleanup(working, 1, Some(1), MAX_LOOP_RUNTIME),
+            run.cleanup(working, 1, Some(1), true, MAX_LOOP_RUNTIME),
             LoopCleanup::Finish
         );
         assert_eq!(
@@ -5180,6 +5233,7 @@ mod loop_cleanup_tests {
                 snapshot(Uuid::new_v4(), 1, AgentStatus::Done),
                 1,
                 Some(1),
+                true,
                 MAX_LOOP_RUNTIME
             ),
             LoopCleanup::Abandon
@@ -15154,6 +15208,7 @@ impl MuxelApp {
                     view.runtime_snapshot(),
                     session.binding_revision(),
                     session.first_submission_binding(),
+                    view.working_after_submission(),
                     run.started.elapsed(),
                 )
             },
@@ -15179,6 +15234,7 @@ impl MuxelApp {
                 view.runtime_snapshot(),
                 session.binding_revision(),
                 session.first_submission_binding(),
+                view.working_after_submission(),
             );
         }
     }
