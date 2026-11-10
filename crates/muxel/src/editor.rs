@@ -697,8 +697,18 @@ impl Focusable for EditorView {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times each editor view has rendered, for tests that need a
+    /// pane to have been drawn or not.
+    pub(crate) static TEST_RENDERS: std::cell::RefCell<std::collections::HashMap<gpui::EntityId, usize>> =
+        Default::default();
+}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        TEST_RENDERS.with(|renders| *renders.borrow_mut().entry(cx.entity_id()).or_default() += 1);
         let notice = self
             .external_change
             .as_ref()

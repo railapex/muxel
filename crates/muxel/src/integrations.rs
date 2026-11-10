@@ -180,6 +180,14 @@ thread_local! {
     static LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Commands this thread has run through [`ProfiledOutput`] so far. gpui's test
+/// executor runs background tasks on the test's own thread, so an app test
+/// sees its panes' git here too.
+#[cfg(test)]
+pub(crate) fn git_launches() -> usize {
+    LAUNCHES.with(std::cell::Cell::get)
+}
+
 impl ProfiledOutput for Command {
     fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
         #[cfg(test)]
