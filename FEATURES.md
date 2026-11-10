@@ -583,21 +583,36 @@ feature is added or changed, update the matching entry here in the same change**
   pushing status out of the sidebar. Title-derived lifecycle and automatic-name
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
-  Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, and background work listed by Claude's footer
-  or Grok's panel holds a finished turn at **working**, labelled with what's running
-  (`working · 1 shell`). That covers tmux and SSH panes too, and it beats Claude's own
-  finished report. A held turn doesn't alert or move in Recent, and it reads **done**
-  once when the work ends and the agent has had a moment to wake for it. Shells and
-  monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
-  the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
-  finished turn. Subagents hold until they end. Closing a pane asks while anything is
-  listed as running, and `ctl status` reports it as `background`. `ctl send` still
-  delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
-  keeps waiting through a hold, changing its previous behavior of returning when
-  the foreground turn finished. It lists what's still running if it times out
-  first; `ctl wait --turn` stops at an observable turn end even if background work
-  remains. It cannot override a provider still reporting **working**. Claude's
+  Provider-owned screen rows can add precise state that titles omit. Claude
+  permission forms report **blocked**. Claude's footer and Grok's panel list
+  background work in supported layouts and wording; Codex's terminal badge and
+  Muse's terminal tree add live shell counts. The screen readers cover tmux and
+  SSH panes too. Only subagents hold a finished foreground turn at **working**,
+  for at most three hours. A held turn doesn't alert or move in Recent; it reads
+  **done** once when its hold ends and the agent has had a moment to wake. Shell
+  and monitor counts remain visible beside the activity label without delaying
+  Done, notifications, Recent work or plain `ctl wait`. An authoritative foreground
+  **working** report still wins, including Codex's report while a background
+  terminal runs. Neither plain wait nor `--turn` can override it. Interruptible
+  legacy command rows remain foreground work; unknown task kinds are not counted.
+  Local Codex panes also read direct child-turn lifecycle records for turns started
+  during the current pane launch; their normal composer has no live child count.
+  Panes identified later also pick up qualifying children already running beside
+  them. Copied history and children left by an earlier launch do not count.
+  Catch-up and incomplete records stay pending under a shared worker read budget,
+  separately from a confirmed result with no active children. Excluded paths advance
+  traversal, so unrelated rollouts do not starve a matching child's catch-up.
+  Unreadable terminal chrome can preserve a known shell count without establishing
+  a subagent hold. A released foreground turn stays released through redraws or
+  stale evidence until new foreground work runs. Codex screen checks exclude the
+  live composer and reconstruct wrapped badges. Provider layout or wording changes
+  can require new fixtures. Muse's completion hook can retire a leftover spinner
+  title after five seconds without output or a title update; redraws do not revive
+  it. New titles and Working hooks remain valid work signals. Closing a pane asks
+  while anything is listed as running; `ctl status` reports counts as `background`.
+  A background-only held turn leaves its composer available to `ctl send`. Plain
+  wait follows a subagent hold; `--turn` stops at an observable foreground turn end.
+  Both return the available background metadata. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity

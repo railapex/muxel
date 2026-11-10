@@ -3330,13 +3330,32 @@ impl TerminalSession {
 
     /// Capture input geometry and modes with the same grid generation.
     pub(crate) fn startup_screen(&self) -> crate::startup::Screen {
+        self.capture_screen(false).0
+    }
+
+    /// Status also needs physical wrap boundaries; capture them under the same lock.
+    pub(crate) fn status_screen(&self) -> (crate::startup::Screen, Vec<bool>) {
+        self.capture_screen(true)
+    }
+
+    fn capture_screen(&self, with_wraps: bool) -> (crate::startup::Screen, Vec<bool>) {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
+        use alacritty_terminal::term::cell::Flags;
         self.with_term(|term| {
             let grid = term.grid();
             let rows = grid.screen_lines();
             let cols = grid.columns();
             let mut s = String::with_capacity(rows * (cols + 1));
+            let mut wrapped = Vec::with_capacity(if with_wraps { rows } else { 0 });
             for row in 0..rows {
+                if with_wraps {
+                    wrapped.push(
+                        cols > 0
+                            && grid[Line(row as i32)][Column(cols - 1)]
+                                .flags
+                                .contains(Flags::WRAPLINE),
+                    );
+                }
                 for col in 0..cols {
                     s.push(
                         grid[GridPoint {
@@ -3349,13 +3368,16 @@ impl TerminalSession {
                 s.push('\n');
             }
             let cursor = grid.cursor.point;
-            crate::startup::Screen {
-                text: s,
-                cursor_column: cursor.column.0,
-                cursor_row: cursor.line.0,
-                cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
-                bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
-            }
+            (
+                crate::startup::Screen {
+                    text: s,
+                    cursor_column: cursor.column.0,
+                    cursor_row: cursor.line.0,
+                    cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
+                    bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+                },
+                wrapped,
+            )
         })
     }
 
@@ -3498,6 +3520,11 @@ impl TerminalSession {
     /// rather than treating a cached spinner frame as permanent Working.
     pub fn title_age(&self) -> Option<Duration> {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_title_age_for_test(&self, age: Duration) {
+        *self.title_changed_at.lock() = Some(Instant::now() - age);
     }
 
     /// The running TUI switched provider conversations at some instant in

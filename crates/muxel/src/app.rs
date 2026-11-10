@@ -71,6 +71,7 @@ mod changes_refresh_tests;
 mod claude_capture_tests;
 mod claude_launch;
 mod close_probes;
+mod codex_background;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
 #[cfg(all(test, windows))]
@@ -2587,9 +2588,55 @@ fn localized_activity_label(
         "stale" => t("stale").to_string(),
         _ => word.to_string(),
     };
-    match beside.as_deref().or(age) {
-        Some(detail) => format!("{word} · {detail}"),
-        None => word,
+    match (age, beside.as_deref()) {
+        (Some(age), Some(beside)) => format!("{word} · {age} · {beside}"),
+        (Some(detail), None) | (None, Some(detail)) => format!("{word} · {detail}"),
+        (None, None) => word,
+    }
+}
+
+#[cfg(test)]
+mod activity_label_tests {
+    use super::localized_activity_label;
+    use muxel_core::{AgentActivity, control::BackgroundWork};
+    use muxel_terminal::AgentStatus;
+
+    #[test]
+    fn pr136_shared_background_label_retains_activity_age() {
+        let activity = AgentActivity {
+            work_started_at: Some(60_000),
+            completed_at: Some(60_000),
+            blocked_at: Some(60_000),
+            ..AgentActivity::default()
+        };
+        let background = Some(BackgroundWork {
+            shells: 1,
+            ..BackgroundWork::default()
+        });
+        for (status, expected) in [
+            (AgentStatus::Working, "working · 1 shell"),
+            (AgentStatus::Idle, "idle · 3m · 1 shell"),
+            (AgentStatus::Done, "done · 3m · 1 shell"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, background, 240_000),
+                expected,
+                "{status:?} must retain its age beside background work"
+            );
+        }
+        for (status, expected) in [
+            (AgentStatus::Working, "working"),
+            (AgentStatus::Idle, "idle · 3m"),
+            (AgentStatus::Done, "done · 3m"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, None, 240_000),
+                expected,
+                "{status:?} without background work must retain its label"
+            );
+        }
     }
 }
 
@@ -6058,6 +6105,8 @@ pub struct MuxelApp {
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
     codex_name_index: muxel_core::CodexSessionNames,
+    codex_subagents: HashMap<PathBuf, muxel_core::CodexSubagents>,
+    codex_subagents_in_flight: bool,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -8573,6 +8622,8 @@ impl MuxelApp {
             status_polls: StatusPolls::default(),
             codex_session_names: HashMap::new(),
             codex_name_index: Default::default(),
+            codex_subagents: Default::default(),
+            codex_subagents_in_flight: false,
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -13842,6 +13893,7 @@ impl MuxelApp {
     /// and an antivirus scan). Remote project branches are handled separately by
     /// `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.refresh_codex_background(cx);
         if self.status_refresh_in_flight {
             return;
         }
@@ -27549,7 +27601,7 @@ impl MuxelApp {
                                                 status,
                                                 &instance.activity,
                                                 self.terminal_view(iid).and_then(|view| {
-                                                    view.read(cx).runtime_snapshot().background
+                                                    view.read(cx).background_work()
                                                 }),
                                                 chrono::Utc::now().timestamp_millis(),
                                             )
@@ -29406,9 +29458,8 @@ impl MuxelApp {
                                     let label = localized_activity_label(
                                         status,
                                         &instance.activity,
-                                        self.terminal_view(iid).and_then(|view| {
-                                            view.read(cx).runtime_snapshot().background
-                                        }),
+                                        self.terminal_view(iid)
+                                            .and_then(|view| view.read(cx).background_work()),
                                         chrono::Utc::now().timestamp_millis(),
                                     );
                                     if dormant {
