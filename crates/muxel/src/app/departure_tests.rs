@@ -618,3 +618,140 @@ fn a_restart_whose_workspace_changes_as_it_saves_gives_up() {
         );
     });
 }
+
+/// Past the first-run screens, with nothing else covering the panes.
+fn no_overlays(app: &mut MuxelApp, cx: &gpui::App) {
+    app.show_terms = false;
+    app.show_workspace_selector = false;
+    assert!(!app.any_overlay_open(cx), "an overlay is already open");
+}
+
+/// Move the fake clock on a second at a time.
+fn tick_seconds(cx: &mut TestAppContext, seconds: u64) {
+    for _ in 0..seconds {
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+    }
+}
+
+/// With every pane idle and no input pending, a Restart counts down instead
+/// of asking, its overlay hides the browser panes, and it goes when the
+/// countdown ends.
+#[test]
+fn an_idle_app_counts_down_and_then_goes() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.relaunch = started_quietly;
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(!app.show_quit_confirm, "an idle app asked");
+                assert!(app.exit_countdown.is_some(), "no countdown");
+                assert!(app.any_overlay_open(cx), "the countdown isn't an overlay");
+                assert_eq!(app.departing, None);
+            })
+            .unwrap();
+        tick_seconds(cx, 4);
+        window
+            .update(cx, |app, _, _| {
+                assert_eq!(app.exit_countdown.as_ref().map(|c| c.left), Some(1));
+                assert_eq!(app.departing, None, "it went before the countdown ended");
+                // The update check 2 s after launch has run and kept the plan.
+                assert!(
+                    matches!(app.update_state, UpdateState::Ready(_)),
+                    "an update check dropped the downloaded update"
+                );
+            })
+            .unwrap();
+        tick_seconds(cx, 1);
+        run_until(cx, window, "the Restart never ended", |app| {
+            app.restart_ended
+        });
+        window
+            .update(cx, |app, _, _| assert!(app.exit_countdown.is_none()))
+            .unwrap();
+    });
+}
+
+/// Cancel stops the countdown for good.
+#[test]
+fn a_cancelled_countdown_never_goes() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.relaunch = must_not_start;
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(app.exit_countdown.is_some(), "no countdown");
+                app.cancel_exit_countdown(cx);
+            })
+            .unwrap();
+        tick_seconds(cx, 6);
+        window
+            .update(cx, |app, _, cx| {
+                assert!(app.exit_countdown.is_none());
+                assert!(!app.show_quit_confirm);
+                assert_eq!(app.departing, None);
+                assert!(!app.any_overlay_open(cx));
+            })
+            .unwrap();
+    });
+}
+
+/// A pane that would ask when closed, here an unmarked cmd shell, makes the
+/// exit ask. So does pending input.
+#[test]
+fn a_busy_pane_or_pending_input_makes_the_exit_ask() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, window, cx| {
+                let sweep = app
+                    .pending_inputs
+                    .begin(PendingKind::WakeSweep, None)
+                    .unwrap();
+                app.ask_exit(ExitKind::Quit, cx);
+                assert!(app.show_quit_confirm && app.exit_countdown.is_none());
+                app.show_quit_confirm = false;
+                drop(sweep);
+
+                let (_, session) = add_shell(app, None, "exit-asks", window, cx);
+                app.ask_exit(ExitKind::Quit, cx);
+                assert!(app.show_quit_confirm && app.exit_countdown.is_none());
+                app.show_quit_confirm = false;
+                session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// Input that turns up during the countdown makes it ask when it ends, as an
+/// Undo expiry does, rather than go.
+#[test]
+fn a_countdown_that_finds_work_at_its_end_asks() {
+    with_app(|cx, window| {
+        let sweep = window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                app.relaunch = must_not_start;
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(app.exit_countdown.is_some(), "no countdown");
+                app.pending_inputs
+                    .begin(PendingKind::WakeSweep, None)
+                    .unwrap()
+            })
+            .unwrap();
+        tick_seconds(cx, 5);
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.exit_countdown.is_none());
+                assert!(app.show_quit_confirm, "it didn't ask");
+                assert_eq!(app.quit_confirm_kind, ExitKind::Restart);
+                assert_eq!(app.departing, None);
+                app.show_quit_confirm = false;
+            })
+            .unwrap();
+        drop(sweep);
+    });
+}

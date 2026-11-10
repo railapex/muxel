@@ -19,7 +19,9 @@ use super::recoverable_close::CloseDeparture;
 use super::{MuxelApp, NotifKind, PopOut, UpdateState, popout_terminal_views};
 use crate::i18n::{t, tf, tn};
 use crate::update::RelaunchPlan;
-use gpui::{App, AsyncApp, Context, WeakEntity};
+use gpui::{App, AsyncApp, Context, Task, WeakEntity};
+use muxel_core::InstanceKind;
+use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide, departure_finalizes};
 use muxel_terminal::{InputFence, TerminalSession};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -44,6 +46,20 @@ pub(super) enum Stage {
     /// The new version has started and this one is quitting. It starts the new
     /// version only from `Preparing`, so it does so once.
     Committed,
+}
+
+/// How long a Quit or Restart counts down when every pane looks idle.
+pub(super) const EXIT_COUNTDOWN: Duration = Duration::from_secs(5);
+
+/// A Quit or Restart counting down, which Cancel stops. It goes at the end
+/// only if nothing it checked at the start has changed.
+pub(super) struct ExitCountdown {
+    pub(super) kind: ExitKind,
+    /// Whole seconds left, for the overlay.
+    pub(super) left: u64,
+    /// Each terminal's close facts when it started.
+    facts: Vec<(Uuid, CloseFacts)>,
+    task: Task<()>,
 }
 
 /// The longest a Restart waits for launches and editor moves under way.
@@ -146,12 +162,29 @@ pub(super) fn loss_lines(
 }
 
 impl MuxelApp {
-    /// Ask before quitting or restarting. Nothing to ask while a Restart is
-    /// already under way.
+    /// Quit or restart after a short countdown when every pane looks idle and
+    /// no input is pending, and ask otherwise. Nothing to ask while a Restart
+    /// is already under way.
     pub(super) fn ask_exit(&mut self, kind: ExitKind, cx: &mut Context<Self>) {
         if self.departing.is_some() {
             return;
         }
+        if let Some(countdown) = &mut self.exit_countdown {
+            // A Restart asked for during a Quit's countdown takes it over.
+            if kind == ExitKind::Restart {
+                countdown.kind = kind;
+                cx.notify();
+            }
+            return;
+        }
+        match self.quiet_exit_facts(cx) {
+            Some(facts) => self.start_exit_countdown(kind, facts, cx),
+            None => self.show_exit_dialog(kind, cx),
+        }
+    }
+
+    /// The Quit or Restart confirmation.
+    fn show_exit_dialog(&mut self, kind: ExitKind, cx: &mut Context<Self>) {
         self.quit_kill_tmux_local = false;
         self.quit_kill_tmux_remote = false;
         self.quit_confirm_kind = kind;
@@ -159,8 +192,113 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Each terminal's close facts, if every pane would count down rather than
+    /// ask when closed, by the rule a pane close uses, and nothing else would
+    /// be cut short: no pending input, launch, editor move, open file dialog,
+    /// undecided close or unsaved editor. `None` means the exit asks.
+    fn quiet_exit_facts(&self, cx: &App) -> Option<Vec<(Uuid, CloseFacts)>> {
+        if !self.pending_inputs.pending().is_empty()
+            || !self.restart_settled()
+            || self.native_dialogs.get() > 0
+            || self
+                .close_groups
+                .iter()
+                .any(|group| !departure_finalizes(group.stage()))
+        {
+            return None;
+        }
+        let mut facts = Vec::new();
+        for inst in &self.workspace.instances {
+            if self.is_closing(inst.id) {
+                continue;
+            }
+            if inst.kind != InstanceKind::Terminal {
+                if self
+                    .close_editor(inst.id)
+                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                {
+                    return None;
+                }
+                continue;
+            }
+            let pane = self.close_facts(inst.id, cx);
+            if decide(pane, true) == CloseDecision::Ask {
+                return None;
+            }
+            facts.push((inst.id, pane));
+        }
+        facts.sort_by_key(|(iid, _)| *iid);
+        Some(facts)
+    }
+
+    fn start_exit_countdown(
+        &mut self,
+        kind: ExitKind,
+        facts: Vec<(Uuid, CloseFacts)>,
+        cx: &mut Context<Self>,
+    ) {
+        let seconds = EXIT_COUNTDOWN.as_secs();
+        let task = cx.spawn(async move |this, cx| {
+            for left in (0..seconds).rev() {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let going = this.update(cx, |app, cx| {
+                    let Some(countdown) = &mut app.exit_countdown else {
+                        return false;
+                    };
+                    countdown.left = left;
+                    if left == 0 {
+                        app.expire_exit_countdown(cx);
+                    }
+                    cx.notify();
+                    true
+                });
+                if !going.unwrap_or(false) {
+                    return;
+                }
+            }
+        });
+        self.exit_countdown = Some(ExitCountdown {
+            kind,
+            left: seconds,
+            facts,
+            task,
+        });
+        cx.notify();
+    }
+
+    /// The countdown ran out. Like an Undo expiry, it checks again: if any
+    /// pane's facts changed, a pane was added or removed, or input is now
+    /// pending, it asks instead.
+    fn expire_exit_countdown(&mut self, cx: &mut Context<Self>) {
+        let Some(countdown) = self.exit_countdown.take() else {
+            return;
+        };
+        countdown.task.detach();
+        if self.quiet_exit_facts(cx).as_ref() == Some(&countdown.facts) {
+            self.confirm_exit(countdown.kind, cx);
+        } else {
+            self.show_exit_dialog(countdown.kind, cx);
+        }
+    }
+
+    /// The countdown's Cancel.
+    pub(super) fn cancel_exit_countdown(&mut self, cx: &mut Context<Self>) {
+        self.exit_countdown = None;
+        cx.notify();
+    }
+
+    /// The countdown's Quit now or Restart now, or a second Quit asked for
+    /// during it.
+    pub(super) fn exit_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(countdown) = self.exit_countdown.take() {
+            countdown.task.detach();
+            self.confirm_exit(countdown.kind, cx);
+        }
+    }
+
     /// Every confirmed Quit and Restart comes through here.
     pub(super) fn confirm_exit(&mut self, kind: ExitKind, cx: &mut Context<Self>) {
+        self.exit_countdown = None;
         match kind {
             ExitKind::Quit => self.confirm_quit_exit(cx),
             ExitKind::Restart => self.begin_restart(cx),

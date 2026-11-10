@@ -3458,9 +3458,11 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| {
-                // A second Cmd+Q while the confirm modal is up is the same as
-                // clicking its button, Quit or Restart.
-                if this.show_quit_confirm {
+                // A second Cmd+Q while the confirm modal or the countdown is
+                // up is the same as clicking its button, Quit or Restart.
+                if this.exit_countdown.is_some() {
+                    this.exit_now(cx);
+                } else if this.show_quit_confirm {
                     let kind = this.quit_confirm_kind;
                     if kind == departure::ExitKind::Quit {
                         this.kill_checked_tmux_sessions();
@@ -6111,6 +6113,8 @@ pub struct MuxelApp {
     /// Set where a committed Restart would quit: tests never quit the app.
     #[cfg(test)]
     restart_ended: bool,
+    /// A Quit or Restart counting down because every pane looked idle.
+    exit_countdown: Option<departure::ExitCountdown>,
     /// Where tests save the workspace document instead of the data dir.
     #[cfg(test)]
     test_doc_path: Option<PathBuf>,
@@ -8346,6 +8350,7 @@ impl MuxelApp {
             },
             #[cfg(test)]
             restart_ended: false,
+            exit_countdown: None,
             #[cfg(test)]
             test_doc_path: None,
             #[cfg(test)]
@@ -13300,9 +13305,11 @@ impl MuxelApp {
     /// Query GitHub for a newer release (off the UI thread). Fires a desktop
     /// notification when one is found.
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        // An update downloaded and waiting for its Restart keeps its plan; a
+        // check would replace it and leave Restart with nothing to start.
         if matches!(
             self.update_state,
-            UpdateState::Checking | UpdateState::Downloading
+            UpdateState::Checking | UpdateState::Downloading | UpdateState::Ready(_)
         ) {
             return;
         }
@@ -16282,6 +16289,7 @@ impl MuxelApp {
             || self.show_find_panel
             || self.show_update_modal
             || self.show_quit_confirm
+            || self.exit_countdown.is_some()
             || self.show_keys
             || self.show_terms
             || self.show_workspace_selector
@@ -32204,6 +32212,89 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// A Quit or Restart counting down, with Cancel and Quit now or Restart now.
+    fn render_exit_countdown(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let countdown = self.exit_countdown.as_ref()?;
+        let restart = countdown.kind == departure::ExitKind::Restart;
+        let left = countdown.left.to_string();
+        let args = [("n", left.as_str())];
+        let (title, body, now) = if restart {
+            (
+                t("Restarting muxel"),
+                tn(
+                    "Every terminal is idle. Restarting in {n} second.",
+                    "Every terminal is idle. Restarting in {n} seconds.",
+                    countdown.left as usize,
+                    &args,
+                ),
+                t("Restart now"),
+            )
+        } else {
+            (
+                t("Quitting muxel"),
+                tn(
+                    "Every terminal is idle. Quitting in {n} second.",
+                    "Every terminal is idle. Quitting in {n} seconds.",
+                    countdown.left as usize,
+                    &args,
+                ),
+                t("Quit now"),
+            )
+        };
+        Some(
+            modal_backdrop()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _w, cx| this.cancel_exit_countdown(cx)),
+                )
+                .child(
+                    div()
+                        .w(px(360.0))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_5()
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius_lg)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                        .child(div().text_lg().font_semibold().child(title))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(body),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .pt_2()
+                                .child(
+                                    Button::new("exit-countdown-cancel")
+                                        .ghost()
+                                        .label(t("Cancel"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.cancel_exit_countdown(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("exit-countdown-now")
+                                        .danger()
+                                        .label(now)
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.exit_now(cx)),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The floating terminal-search bar (shown while `term_search` is Some).
     fn render_term_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let count = match &self.term_search {
@@ -35525,6 +35616,7 @@ impl Render for MuxelApp {
                     .then(|| self.render_tmux_install(window, cx)),
             )
             .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx)))
+            .children(self.render_exit_countdown(cx))
             .children(self.git_modal.is_some().then(|| self.render_git_modal(cx)))
             .children(
                 self.show_new_remote

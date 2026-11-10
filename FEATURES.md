@@ -1691,7 +1691,11 @@ feature is added or changed, update the matching entry here in the same change**
   **cleanly** (an abnormal exit always leaves a tombstone pane instead). The quit
   confirmation names input still being typed that quitting cancels: a ctl send
   waiting for its Enter or keys mid-sequence (what was already typed stays),
-  dictation, an upload not yet pasted, a wake sweep.
+  dictation, an upload not yet pasted, a wake sweep. When every terminal would
+  close into Undo rather than ask and nothing is pending, Quit and Restart count
+  down 5 s instead, with Cancel and **Quit now** (or **Restart now**). If
+  anything turned busy by the end, they ask. The tray's Quit and the first-run
+  screens' Quit still quit at once.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
@@ -1822,8 +1826,9 @@ feature is added or changed, update the matching entry here in the same change**
   portable binary, the Windows `.exe`, or the macOS `.app`), then relaunches;
   package-managed installs get the right upgrade command instead. The update
   dialog shows the release's full changelog rendered as markdown, and is
-  resizable. **Restart now** asks first, naming input it would cancel as Quit
-  does. Confirming stops new launches and input, lets launches already under way
+  resizable. **Restart now** asks first, naming input it would cancel, or counts
+  down when everything is idle, as Quit does. A downloaded update waits for
+  it; later update checks leave it alone. Confirming stops new launches and input, lets launches already under way
   finish, waits for input already sent, saves the workspace, starts the new
   version and quits. If a launch is still going at 5 s, sent input isn't written
   within 2 s, the save fails or the new version doesn't start, muxel stays
