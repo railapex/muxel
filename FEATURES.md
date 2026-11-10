@@ -563,36 +563,20 @@ feature is added or changed, update the matching entry here in the same change**
   pushing status out of the sidebar. Title-derived lifecycle and automatic-name
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
-  Provider-owned screen rows can add precise state that titles omit. Claude
-  permission forms report **blocked**. Claude's footer and Grok's panel list
-  background work in supported layouts and wording; Codex's terminal badge and
-  Muse's terminal tree add live shell counts. The screen readers cover tmux and
-  SSH panes too. Only subagents hold a finished foreground turn at **working**,
-  for at most three hours. A held turn doesn't alert or move in Recent; it reads
-  **done** once when its hold ends and the agent has had a moment to wake. Shell
-  and monitor counts remain visible beside the activity label without delaying
-  Done, notifications, Recent work or plain `ctl wait`. An authoritative foreground
-  **working** report still wins, including Codex's report while a background
-  terminal runs. Neither plain wait nor `--turn` can override it. Interruptible
-  legacy command rows remain foreground work; unknown task kinds are not counted.
-  Local Codex panes also read direct child-turn lifecycle records for turns started
-  during the current pane launch; their normal composer has no live child count.
-  Panes identified later also pick up qualifying children already running beside
-  them. Copied history and children left by an earlier launch do not count.
-  Catch-up and incomplete records stay pending under a shared worker read budget,
-  separately from a confirmed result with no active children. Excluded paths advance
-  traversal, so unrelated rollouts do not starve a matching child's catch-up.
-  Unreadable terminal chrome can preserve a known shell count without establishing
-  a subagent hold. A released foreground turn stays released through redraws or
-  stale evidence until new foreground work runs. Codex screen checks exclude the
-  live composer and reconstruct wrapped badges. Provider layout or wording changes
-  can require new fixtures. Muse's completion hook can retire a leftover spinner
-  title after five seconds without output or a title update; redraws do not revive
-  it. New titles and Working hooks remain valid work signals. Closing a pane asks
-  while anything is listed as running; `ctl status` reports counts as `background`.
-  A background-only held turn leaves its composer available to `ctl send`. Plain
-  wait follows a subagent hold; `--turn` stops at an observable foreground turn end.
-  Both return the available background metadata. Claude's
+  Provider-owned screen rows can add precise state that titles omit: Claude
+  permission forms report **blocked**. Subagents listed by Claude's footer or
+  Grok's panel hold a finished turn at **working** (`working · subagents`) for up
+  to three hours, with no done alert or Recent move until the listing clears; a
+  released turn isn't held again until new foreground work runs. Shell and monitor
+  listings show beside the status (`done · 3m · 1 shell`) without delaying
+  completion. Codex's terminal badge and Muse's terminal tree also supply shell
+  counts. Local Codex panes read direct child-turn records from the current pane
+  launch; incomplete reads stay separate from a current result with no active
+  children. Older Claude's `command still running` row reads **working** unless
+  a current empty footer is drawn below it. Closing a pane asks while anything is
+  listed, `ctl status` and `ctl wait` report it as `background`, plain `ctl wait`
+  waits out subagent holds (`--turn` doesn't), and `ctl send` still delivers to a
+  held pane once its status belongs to the current conversation. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity
@@ -1129,7 +1113,7 @@ feature is added or changed, update the matching entry here in the same change**
   literal text keeps those words as prompt text. Unknown verbs suggest a nearby
   command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
-  ten seconds (three more after a retry) and report `submission_confirmed` and
+  sixty seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
   `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
   `retry_unanswered` when tmux didn't answer for the retry Enter); once
@@ -1142,10 +1126,50 @@ feature is added or changed, update the matching entry here in the same change**
   and input guards and an exact fully visible ASCII prose draft in its idle
   composer. A compact composer frame captured before paste and an added blank
   cursor line must prove that its first Enter was consumed, with no resize or
-  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  later title change. Learning the first provider thread does not cancel the
+  confirmation. Switch and input protection covers muxel-observed changes;
+  another tmux client's input is untracked. Wrapped prose is supported;
+  clipped, multiline, Unicode,
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
+- **Delivery outcomes and next commands** — `send` and `new --prompt` report
+  `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
+  `next` command when more action is needed. Existing receipt fields remain.
+  All unsubmitted outcomes recommend read-only screen inspection. A pending
+  receipt describes the draft observed at that time and cannot guard a later
+  Enter; never paste the task again after uncertain delivery. Startup pending
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
+  `send` or `new --prompt` is `not_delivered` only when a coded refusal came
+  before any input; other commands' failures carry no outcome. A send watches
+  for its receipt for ten seconds, a second longer for each thousand characters
+  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
+  spelling when no agent has that name.
+- **Startup input waits for the provider** — a `new --prompt` task waits for a
+  real editable composer and provider acceptance. The reply comes once the pane
+  exists, with the task submitted, refused, or `prompt_pending` and a `status`
+  command to follow; `--wait-delivery` reads until it settles, for up to 90
+  seconds. Known folder trust, update and login menus stop delivery as soon as
+  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
+  never answered automatically. `--no-wait` returns before approval with a
+  polling command. Status exposes the same delivery facts.
+  Codex launches carrying a startup task suppress its startup update menu.
+- **Windows Codex multiline control** — native presets disable heuristic paste
+  bursts only after a version probe verifies the matching input codec. The
+  probe runs once per Codex executable (again after it changes) on its own
+  thread; a launch waits for it at most two seconds, and a slower probe still
+  answers later launches. Older versions and failed probes receive no automatic
+  paste-burst override. With verified, configured
+  Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
+  blank lines and Unicode; CRLF becomes one newline. Clipboard and startup text
+  turn tabs into spaces to the next four-column stop. Other control characters,
+  and tabs in ctl input, refuse the whole paste before any write.
+  Clipboard refusals appear in the error feed; ordinary clipboard ESC
+  sanitization remains. Saved snippets and dictated transcripts also report
+  paste failures and cancel automatic submission. Unverified
+  multiline controller input reports `unsupported_input`; explicitly disabled
+  bursts without a verified codec also
+  refuse advanced clipboard text. Literal argv is never changed.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -1480,7 +1504,11 @@ feature is added or changed, update the matching entry here in the same change**
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
-  branch icon (refreshed live).
+  branch icon (refreshed live), including a new repo's branch before its first
+  commit, spelled as the switch-branch menu spells it. A local repo's branch
+  comes from the git run that lists its branches, which runs when its HEAD or
+  branch files change and otherwise every five minutes (every minute where
+  those files can't show what git reads, as with `GIT_DIR` set).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its
@@ -1909,12 +1937,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
   session lookup hits, outcome changes and slow calls, with per-minute counts
   and maximum durations for all discovery polls. Launch-time resume lookups
-  always log. Both profiler logs keep stable live paths and dated history
+  always log. Local `git` runs get a record (which poll ran it, the
+  subcommand, its time, and whether it printed the same as last time), except
+  team-library jobs, and records a saturated queue drops are only counted.
+  Both profiler logs keep stable live paths and dated history
   (14 local dates and 256 MiB per family by default, tunable with
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
   labels, timings and short pane ids, with no
-  terminal content, session ids, titles or paths.
+  terminal content, session ids, titles or paths. A git record carries unsalted
+  64-bit FNV-1a hashes of its folder and its whole command line instead, so a
+  guessed path can be checked against them.
 - **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
   process that enabled them. Panes, runners and helper commands start without
   those settings; a nested muxel can enable its own profiler independently.

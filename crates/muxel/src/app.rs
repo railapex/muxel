@@ -78,6 +78,8 @@ mod hotbar;
 mod libraries_ui;
 mod pane_grid;
 #[cfg(all(test, windows))]
+mod paste_submission_tests;
+#[cfg(all(test, windows))]
 mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
@@ -2523,10 +2525,6 @@ fn program_stamp(presets: &[AgentPreset]) -> ProgramStamp {
     (programs, dirs)
 }
 
-/// How long an unchanged project's branch waits before git is asked anyway, for
-/// what [`integrations::GitRefStamp`] can't see (git config, `safe.directory`,
-/// git installed later).
-const BRANCH_BACKSTOP: Duration = Duration::from_secs(60);
 /// How often worktrees' uncommitted changes are recounted (a `git status` each;
 /// nothing cheaper sees a file edit). Adding or removing a worktree, or a git
 /// action run from muxel, recounts at once.
@@ -2545,7 +2543,8 @@ struct StatusPolls {
 impl Default for StatusPolls {
     fn default() -> Self {
         Self {
-            branches: RefreshGate::new(BRANCH_BACKSTOP),
+            // An unchanged project's branches wait for the stamp's own backstop.
+            branches: RefreshGate::per_stamp(integrations::GitRefStamp::backstop),
             worktrees: RefreshGate::new(WORKTREE_CHANGES_EVERY),
             programs: RefreshGate::new(PROGRAM_SCAN_BACKSTOP),
         }
@@ -2695,6 +2694,7 @@ fn path_paste_error(error: muxel_core::path_paste::PastePathError) -> SharedStri
         PastePathError::NonUnicode => {
             t("A filename cannot be represented as Unicode without changing it.")
         }
+        PastePathError::InputRefused => t("The terminal refused this paste. Nothing was pasted."),
     }
 }
 
@@ -7988,6 +7988,7 @@ impl MuxelApp {
                 let results = cx
                     .background_executor()
                     .spawn(async move {
+                        let _git = ui_profile::git_caller("diff-pane");
                         jobs.into_iter()
                             .map(|(iid, dir)| (iid, crate::integrations::git_diff(&dir)))
                             .collect::<Vec<(Uuid, String)>>()
@@ -10473,6 +10474,20 @@ impl MuxelApp {
                 .session()
                 .set_path_paste_error_handler(Some(handler));
         }
+        let app = cx.weak_entity();
+        let handler: muxel_terminal::TextPasteErrorHandler = Arc::new(move |error, cx: &App| {
+            let app = app.clone();
+            cx.spawn(async move |cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.add_event(NotifKind::Error, t("Couldn't paste this text"), error);
+                    cx.notify();
+                });
+            })
+            .detach();
+        });
+        view.read(cx)
+            .session()
+            .set_text_paste_error_handler(Some(handler));
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
@@ -13059,7 +13074,10 @@ impl MuxelApp {
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { integrations::git_status_files(&loc) })
+                .spawn(async move {
+                    let _git = ui_profile::git_caller("git-panel");
+                    integrations::git_status_files(&loc)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_loading = false;
@@ -13282,6 +13300,7 @@ impl MuxelApp {
             let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
                 .background_executor()
                 .spawn(async move {
+                    let _git = ui_profile::git_caller("git-panel-worktrees");
                     let files = paths
                         .into_iter()
                         .map(|(wid, path)| {
@@ -13658,6 +13677,7 @@ impl MuxelApp {
                     });
                     // Only projects whose HEAD or branches moved (or whose backstop
                     // passed) run git; the rest keep their cached branch.
+                    let git_caller = ui_profile::git_caller("branch-poll");
                     let local_ids: HashSet<Uuid> = locals.iter().map(|(id, _)| *id).collect();
                     polls.branches.retain(|id| local_ids.contains(id));
                     let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
@@ -13669,15 +13689,20 @@ impl MuxelApp {
                             }
                             polls.branches.record(id, stamp, now);
                             let loc = integrations::RepoLoc::Local(root);
-                            Some((
-                                id,
-                                integrations::repo_current_branch(&loc),
-                                integrations::list_branches(&loc),
-                            ))
+                            let (branch, branches) = match integrations::read_branches(&loc) {
+                                integrations::BranchRead::Read(branch, branches) => {
+                                    (branch, branches)
+                                }
+                                // Only a remote read comes back without one.
+                                _ => (None, Vec::new()),
+                            };
+                            Some((id, branch, branches))
                         })
                         .collect();
+                    drop(git_caller);
                     let changes = (recount_worktrees || polls.worktrees.due(&(), &worktrees, now))
                         .then(|| {
+                            let _git = ui_profile::git_caller("worktree-changes");
                             let counts: Vec<(Uuid, usize)> = worktrees
                                 .iter()
                                 .map(|(id, path)| (*id, integrations::worktree_change_count(path)))
@@ -22945,7 +22970,7 @@ impl MuxelApp {
 
     /// Type saved snippet `idx` into pane `iid` (an already-running terminal),
     /// pressing Enter afterward when the snippet auto-submits. Text goes in via
-    /// `paste` (bracketed-paste-aware) so a multi-line snippet doesn't submit on
+    /// `try_paste` (bracketed-paste-aware) so a multi-line snippet doesn't submit on
     /// its own internal newlines. Focuses the pane so the result is visible.
     fn send_snippet_to(
         &mut self,
@@ -22981,8 +23006,16 @@ impl MuxelApp {
         for step in steps {
             match step {
                 SnippetStep::Paste(text) => {
+                    if let Err(error) = session.try_paste(text) {
+                        self.add_event(
+                            NotifKind::Error,
+                            t("Couldn't paste this text"),
+                            error.to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
                     supplied_prompt |= !text.is_empty();
-                    session.paste(text);
                 }
                 SnippetStep::Write(bytes) => {
                     if bytes.ends_with(b"\r") {
@@ -23771,7 +23804,15 @@ impl MuxelApp {
         let Some(session) = self.admitted_terminal(&target, cx) else {
             return;
         };
-        session.paste(text);
+        if let Err(error) = session.try_paste(text) {
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't paste this text"),
+                error.to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if submit {
             session.mark_prompt_submitted();
             session.write_input(b"\r");
@@ -24633,6 +24674,7 @@ impl MuxelApp {
                     let Some(loc) = git_loc else {
                         return HashMap::new();
                     };
+                    let _git = ui_profile::git_caller("file-browser");
                     let changes: Vec<(PathBuf, String)> = integrations::git_status_files(&loc)
                         .into_iter()
                         .map(|c| (status_root.join(&c.path), c.status))
