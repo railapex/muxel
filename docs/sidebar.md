@@ -59,7 +59,10 @@ was submitted) is stamped no earlier than that sample, and a new conversation's
 first status no earlier than the switch. A row sits where the work its terminal
 shows puts it before the status tick has recorded that work, and focusing the
 pane records exactly that, so clicking a row that has just finished moves
-nothing.
+nothing. The tick then samples that same work again; what the focus recorded
+(the conversation switch, the completion by its revision) isn't recorded twice
+or notified, so the finish the click read stays read. Auto-read and the
+accomplishment log still take it.
 
 A clock correction rewrites nothing already recorded. A time the clock reads as
 in the future after it steps back is kept as stamped; only ages and the order
@@ -80,11 +83,13 @@ there is no failed badge. That notification is the job's first exit's, whatever
 the pane notified before and whether or not you're watching it: a job that
 announced a finish and then exited has that notice replaced.
 
-Only the command's own exit counts. Behind tmux, or behind ssh run through
-`sshpass`, the pane's process is a client whose exit a lost server or
-connection, a detach and the session ending all cause alike, so a job there
-finishes only when its provider reports it. ssh alone exits with the command's
-code, or 255 for its own failures, which count as no exit.
+Only the command's own exit counts. Behind tmux the pane's process is a client
+whose exit a lost server or connection, a detach and the session ending all
+cause alike, so a job there finishes only when its provider reports it. ssh
+alone exits with the command's code, or 255 for its own failures, which count
+as no exit. ssh run through `sshpass` exits 0 only when the command did, which
+finishes the job; any other code may be sshpass's own (1 to 6) or ssh's, so it
+counts as no exit, and a failing job there finishes only by its provider.
 
 An interactive session (an agent conversation or a shell) finishes turns while
 it runs, so its exit (`/exit`, a kill, a crash, `exit` typed in a shell) records
@@ -105,7 +110,12 @@ a session unless it was started to run a command or a script and exit: `-c`,
 `cmd /c`, PowerShell's `-Command` or `-File`, or a script's path (`bash
 build.sh`, `pwsh build.ps1`). A shell's options end where its command begins, so
 `cmd /k` and PowerShell's `-NoExit` keep the prompt only before the command;
-after it they are the command's. fish, nu, xonsh and csh are read by their
+after it they are the command's. pwsh and Windows PowerShell are read by their
+own options: Windows PowerShell's `-PSConsoleFile` and `-Version` take a value
+(`powershell -PSConsoleFile sqlsnapin.psc1` is a session), pwsh's `-Version`
+doesn't. After an option neither knows, a word that may be its value reads as a
+session, whose exit records nothing, as every exit did on `master`; an explicit
+`-Command` or `-File` still runs. fish, nu, xonsh and csh are read by their
 command flag alone, so a script they run by path stays a session. Any other
 program, an agent muxel doesn't know included, is a command, and so is a
 wrapper (`npx`, `uvx`, `wsl`, `ssh host`): the program it starts isn't looked
@@ -150,8 +160,10 @@ read or unread while the row shows Done. The mark also flags a finish whose
 agent has started again, and tells an unseen question from a seen one, which
 the blocked pill shows alike.
 
-Agent events are omitted from the Recent work notification feed because the
-session's own row carries the event and its unread mark. App messages such as git results,
-SSH errors and save failures remain in NOTIFICATIONS. This is a presentation
+A session's finishes and questions are omitted from the Recent work
+notification feed because the session's own row carries the event and its
+unread mark. What a row can't show stays: a job's "exited with code N", whose
+row shows Done. App messages such as git results, SSH errors and save failures
+remain in NOTIFICATIONS. This is a presentation
 filter over the notification collection; tray and desktop delivery are
 unchanged. Switching back to Layout reveals the ordinary agent feed rows.

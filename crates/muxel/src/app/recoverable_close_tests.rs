@@ -3499,6 +3499,8 @@ fn a_jobs_failing_exit_is_reported_after_a_sampled_finish_and_while_watched() {
                 // `watched` is the focused pane of the active window.
                 app.window_active = true;
                 app.active_instance = Some(watched);
+                // Recent work's feed leaves out what a row shows.
+                app.settings.sidebar_sort = muxel_core::sidebar::SidebarSort::RecentWork;
                 app.tick(window, cx);
 
                 for (iid, code) in [(sampled, 3), (watched, 4)] {
@@ -3511,6 +3513,16 @@ fn a_jobs_failing_exit_is_reported_after_a_sampled_finish_and_while_watched() {
                         mine[0].1
                     );
                     assert!(unexpected.is_empty(), "{unexpected:?}");
+                    // The row shows Done; the sidebar's feed shows the code.
+                    assert!(
+                        app.feed_notifications().any(|notice| {
+                            notice.instance == Some(iid)
+                                && notice
+                                    .subtitle
+                                    .starts_with(&format!("exited with code {code}"))
+                        }),
+                        "the feed hides exit code {code}"
+                    );
                 }
             })
             .unwrap();
@@ -3606,6 +3618,86 @@ fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
                     recorded
                 );
                 assert_eq!(app.sidebar_entries_now(pid, cx), before);
+            })
+            .unwrap();
+    });
+}
+
+/// A finish the tick hasn't recorded, in a conversation the pane switched to
+/// since its last sample, read by a click: render and the next tick sample
+/// it again behind the tick's record, and must not record it again after the
+/// look. A protocol completion takes the same path (its revision ahead of the
+/// record); the reducer test `a_sample_a_focus_recorded_is_not_recorded_again`
+/// drives that one, which a PTY here can't raise.
+#[test]
+fn a_finish_read_by_a_click_stays_read_through_the_next_tick() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // B's previous conversation was working when the tick last
+                // sampled it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev.wrapping_add(1),
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        sampled_at: now - 120_000,
+                    },
+                );
+                app.focus_instance_from_pointer(b, window, cx);
+                let read = app.workspace.instance(b).unwrap().activity.clone();
+                assert_eq!(read.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(&read), "the click read the finish");
+                let order = app.sidebar_entries_now(pid, cx);
+
+                // Then the user looks at A, and the tick samples B.
+                app.window_active = true;
+                app.active_instance = Some(a);
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+                app.tick(window, cx);
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity, &read, "the tick recorded the finish again");
+                assert!(!is_unread(activity));
+                assert!(
+                    app.notifications
+                        .iter()
+                        .all(|notice| notice.instance != Some(b)),
+                    "the finish that was read notified"
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+
+                // The tick has caught up: the pane's next finish is new.
+                assert!(!app.recorded_ahead.contains_key(&b));
             })
             .unwrap();
     });
