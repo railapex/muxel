@@ -37698,7 +37698,10 @@ impl Render for MuxelApp {
                 self.show_quit_confirm
                     .then(|| ov(|| self.render_quit_modal(cx))),
             )
-            .children(self.render_exit_countdown(cx).map(|countdown| ov(|| countdown)))
+            .children(
+                self.render_exit_countdown(cx)
+                    .map(|countdown| ov(|| countdown)),
+            )
             .children(
                 self.git_modal
                     .is_some()

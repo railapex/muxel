@@ -221,7 +221,7 @@ impl MuxelApp {
             if inst.kind != InstanceKind::Terminal {
                 if self
                     .close_editor(inst.id)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
                     return None;
                 }
