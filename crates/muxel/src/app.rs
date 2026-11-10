@@ -6776,6 +6776,10 @@ impl Render for WorkspaceWindow {
             let focus = self.focus_handle.clone();
             let shown = self.shown.clone();
             app.update(cx, |app, cx| {
+                // Here as well as in the main window's render: a minimized main
+                // window draws nothing, and a diff pane this window shows
+                // still refreshes as it comes into view.
+                app.sync_diff_visibility(cx);
                 app.render_secondary_content(pid, &focus, &shown, window, cx)
             })
         } else {

@@ -2,12 +2,12 @@
 //! PTY. Each window is a gpui-component `Root`, as muxel opens it, since an
 //! editor needs one to paint; on macOS that `Root` asks gpui's test window for
 //! an NSView it can't give, so these run on Windows and Linux.
-use super::{MuxelApp, Project, ResourceOrigin};
+use super::{MuxelApp, Project, ResourceOrigin, SecondaryWindow, WorkspaceWindow};
 use crate::editor::TEST_RENDERS;
 use crate::integrations::git_launches;
 use crate::test_support::TestRepo;
 use crate::theme;
-use gpui::{AppContext, Context, Entity, TestAppContext, Window, WindowHandle};
+use gpui::{AnyWindowHandle, AppContext, Context, Entity, TestAppContext, Window, WindowHandle};
 use gpui_component::Root;
 use std::time::Duration;
 use uuid::Uuid;
@@ -169,6 +169,31 @@ fn tick(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+/// A second window showing `pid`, as a monitor's window does.
+fn secondary_window(cx: &mut TestAppContext, main: &Main, pid: Uuid) -> WindowHandle<Root> {
+    let weak = main.app.downgrade();
+    let display_uuid = Uuid::new_v4();
+    let mut view = None;
+    let secondary = cx.add_window(|window, cx| {
+        let workspace = cx.new(|cx| WorkspaceWindow::new(weak, pid, display_uuid, window, cx));
+        view = Some(workspace.clone());
+        Root::new(workspace, window, cx)
+    });
+    let view = view.unwrap();
+    let handle: AnyWindowHandle = secondary.into();
+    main.app.update(cx, |app, _| {
+        app.secondary_windows.push(SecondaryWindow {
+            pid,
+            display_uuid,
+            window_id: handle.window_id(),
+            handle,
+            view,
+            active: true,
+        });
+    });
+    secondary
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",
@@ -249,6 +274,53 @@ fn a_diff_pane_under_the_workspace_selector_or_terms_starts_no_git() {
             );
         });
     }
+}
+
+/// A diff pane a secondary window brings into view refreshes at once, even
+/// while the main window draws nothing, as when it's minimized.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_secondary_window_refreshes_the_diff_it_shows_without_the_main_window() {
+    with_app(|cx, main, fx| {
+        let (a, _) = hidden_and_shown(cx, main, fx);
+        // The fixture project moves to its own window; the main window shows
+        // another.
+        main.update(cx, |app, _, cx| {
+            let other = app
+                .workspace
+                .add_project(Project::new("other", fx.b.path().to_path_buf()));
+            app.workspace.active_project = Some(other);
+            cx.notify();
+        });
+        let secondary = secondary_window(cx, main, fx.pid);
+        cx.run_until_parked();
+        add_line(&fx.a);
+        // Bring A forward in the secondary window without notifying the app,
+        // which would draw the main window too, then draw that window alone.
+        main.update(cx, |app, _, _| {
+            app.active_instance = Some(a);
+            let project = app.workspace.project_mut(fx.pid).unwrap();
+            muxel_core::set_active_tab(&mut project.layout, a);
+        });
+        let main_renders = super::MAIN_TEST_RENDERS.with(|count| count.get());
+        secondary
+            .update(cx, |_, window, _| window.refresh())
+            .unwrap();
+        // Frames only: the timer doesn't tick.
+        cx.run_until_parked();
+        assert_eq!(
+            super::MAIN_TEST_RENDERS.with(|count| count.get()),
+            main_renders,
+            "the main window drew nothing"
+        );
+        assert!(
+            diff_text(cx, main, a).contains("+second"),
+            "the secondary window's own frame refreshed it"
+        );
+    });
 }
 
 #[test]
