@@ -16,6 +16,7 @@ mod keymap;
 mod links;
 mod listener;
 mod pane_job;
+mod pending_ops;
 mod present_flag;
 #[cfg(unix)]
 mod process_tree_unix;
@@ -27,6 +28,8 @@ mod replies;
 mod search;
 mod session;
 mod startup;
+#[cfg(test)]
+mod test_wait;
 mod view;
 
 pub use colors::TerminalPalette;
@@ -39,9 +42,9 @@ pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{
-    CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
-    PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource,
-    literal_program_for_spawn, muse_config_supported,
+    CommandSpec, FenceUnknown, InputFence, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+    PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk, PtyOutputQueueStats, PtyReceiver, Submission,
+    TerminalSession, TitleSource, literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
     AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,

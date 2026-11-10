@@ -2947,7 +2947,8 @@ trait QuietStartupTarget {
     fn idle_for(&self) -> Duration;
     fn write_input(&self, data: &[u8]);
     fn paste(&self, text: &str) -> std::io::Result<()>;
-    fn mark_turn_submitted(&self);
+    /// Submit the prompt automation pasted.
+    fn submit_prompt(&self, data: &[u8]);
 }
 
 impl QuietStartupTarget for TerminalSession {
@@ -2966,8 +2967,8 @@ impl QuietStartupTarget for TerminalSession {
     fn paste(&self, text: &str) -> std::io::Result<()> {
         TerminalSession::try_paste(self, text)
     }
-    fn mark_turn_submitted(&self) {
-        TerminalSession::mark_prompt_submitted(self)
+    fn submit_prompt(&self, data: &[u8]) {
+        TerminalSession::write_submission(self, data, crate::Submission::Prompt)
     }
 }
 
@@ -2989,21 +2990,27 @@ struct QuietStartup {
 /// mistaken for ready. Capped by MAX_WAIT in case a UI never goes quiet: the
 /// input is still typed at the cap. No provider title or composer is required,
 /// so this works the same under tmux, for any agent and any Codex footer.
+///
+/// It stops at its next wait once the terminal has been held for closing
+/// since `input_epoch`, or a departure has set `interrupt`, which stays set
+/// even if the departure gives up.
 async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Output = ()>>(
     target: &T,
     input_epoch: u64,
+    interrupt: &crate::pending_ops::Interrupt,
     mut timer: impl FnMut(u64) -> F,
     plan: QuietStartup,
     mut event: impl FnMut(&'static str, usize),
 ) {
-    if !target.accepts_input_epoch(input_epoch) {
+    let stopped = || !target.accepts_input_epoch(input_epoch) || interrupt.is_set();
+    if stopped() {
         return;
     }
     // Wait for the agent's first output (it has started up).
     let mut waited = 0u64;
     while !target.has_output() && waited < STARTUP_MAX_WAIT_MS {
         timer(STARTUP_POLL_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
         waited += STARTUP_POLL_MS;
@@ -3013,14 +3020,14 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
         // Preset-configured fixed delay after first output — for agents that
         // keep loading well past their first draw (e.g. opencode).
         timer(plan.startup_delay_ms as u64).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     } else {
         // Auto: wait until output goes quiet (UI finished drawing).
         while waited < STARTUP_MAX_WAIT_MS && target.idle_for().as_millis() < STARTUP_SETTLE_MS {
             timer(STARTUP_POLL_MS).await;
-            if !target.accepts_input_epoch(input_epoch) {
+            if stopped() {
                 return;
             }
             waited += STARTUP_POLL_MS;
@@ -3030,7 +3037,7 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
     for _ in 0..plan.auto_mode_presses {
         target.write_input(SHIFT_TAB);
         timer(STARTUP_KEY_GAP_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     }
@@ -3038,13 +3045,13 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
     if plan.auto_mode_presses > 0 {
         target.write_input(b"\r");
         timer(STARTUP_KEY_GAP_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
     }
     if let Some(input) = plan.input {
         timer(STARTUP_PRE_TYPE_MS).await;
-        if !target.accepts_input_epoch(input_epoch) {
+        if stopped() {
             return;
         }
         if let Err(error) = target.paste(&input) {
@@ -3056,11 +3063,10 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
         // On restore, leave the prompt typed but unsubmitted.
         if plan.submit {
             timer(STARTUP_SUBMIT_DELAY_MS).await;
-            if !target.accepts_input_epoch(input_epoch) {
+            if stopped() {
                 return;
             }
-            target.mark_turn_submitted();
-            target.write_input(b"\r");
+            target.submit_prompt(b"\r");
             event("automation-submitted", 1);
         }
     }
@@ -3542,9 +3548,12 @@ impl TerminalView {
                 matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
             let armed_at = Instant::now();
             let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
+            // Counted from before the task is queued until it has stopped; a
+            // departure's interrupt stops it at its next check.
             let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
                 .with_control_turn(Some(owner))
-                .with_launch(session.id);
+                .with_launch(session.id)
+                .with_pending(session.begin_pending_op());
             // Only a task that is still waiting pays for reading the title
             // through tmux, and only until its startup settles either way.
             let probe = title_source.map(|source| {
@@ -3759,11 +3768,14 @@ impl TerminalView {
                 startup_delay_ms,
                 submit,
             };
+            // Counted from before the task is queued until it has stopped.
+            let pending = session.begin_pending_op();
             cx.spawn(async move |_view: WeakEntity<Self>, cx| {
                 let executor = cx.background_executor().clone();
                 quiet_startup(
                     &*session,
                     input_epoch,
+                    &pending.interrupt(),
                     |ms| executor.timer(Duration::from_millis(ms)),
                     plan,
                     |phase, bytes| {
@@ -3777,6 +3789,7 @@ impl TerminalView {
                     },
                 )
                 .await;
+                drop(pending);
             })
             .detach();
         }
@@ -4525,11 +4538,13 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if is_submission_input(&bytes) {
-                self.session.mark_turn_submitted();
-            }
+            let submission = if is_submission_input(&bytes) {
+                crate::Submission::Turn
+            } else {
+                crate::Submission::None
+            };
             profile::key_started(self.instance_id, t0);
-            self.session.write_user_input(&bytes);
+            self.session.write_user_submission(&bytes, submission);
             if cleared {
                 cx.notify();
             }
@@ -5097,7 +5112,9 @@ mod startup_readiness_tests {
         startup_pending_draft_matches, startup_provider_accepted, startup_ready,
         startup_retry_allowed,
     };
+    use crate::pending_ops::{Interrupt, PendingOps};
     use crate::startup::Screen;
+    use std::sync::Arc;
 
     fn codex_screen(draft: &str) -> Screen {
         Screen {
@@ -5152,8 +5169,9 @@ mod startup_readiness_tests {
             self.write_input(text.as_bytes());
             Ok(())
         }
-        fn mark_turn_submitted(&self) {
+        fn submit_prompt(&self, data: &[u8]) {
             self.submitted.set(true);
+            self.write_input(data);
         }
     }
 
@@ -5184,6 +5202,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             0,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -5229,6 +5248,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             admitted_epoch,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 if ms == STARTUP_SUBMIT_DELAY_MS {
@@ -5257,6 +5277,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             session.input_epoch(),
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -5283,6 +5304,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &ui,
             queued_epoch,
+            &Interrupt::default(),
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -5304,6 +5326,7 @@ mod startup_readiness_tests {
             run_now(quiet_startup(
                 &ui,
                 session.input_epoch(),
+                &Interrupt::default(),
                 |ms| {
                     clock.set(clock.get() + ms);
                     waits += 1;
@@ -5336,6 +5359,76 @@ mod startup_readiness_tests {
         session.kill();
     }
 
+    /// A departure that holds the terminal and gives up inside one of the
+    /// startup's waits leaves the input epoch where it was. Its interrupt
+    /// still stops the automation at that wait, and for good.
+    #[test]
+    fn an_interrupted_quiet_startup_stops_even_after_the_departure_gives_up() {
+        #[cfg(windows)]
+        let spec = crate::session::CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = crate::session::CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = crate::session::TerminalSession::spawn(spec, 80, 24).unwrap();
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ui = FakeUi {
+            clock: clock.clone(),
+            epoch_session: Some(session.clone()),
+            output_at: Some(0),
+            never_quiet: false,
+            writes: Default::default(),
+            submitted: Default::default(),
+        };
+        let full_sequence = [SHIFT_TAB, SHIFT_TAB, b"\r", b"review the diff", b"\r"];
+        for (interrupt_at, expected_writes) in [(1, 1), (2, 2), (3, 3), (4, 3), (5, 4)] {
+            clock.set(100_000);
+            ui.writes.borrow_mut().clear();
+            ui.submitted.set(false);
+            let ops = Arc::<PendingOps>::default();
+            let startup = ops.begin();
+            let mut waits = 0;
+            run_now(quiet_startup(
+                &ui,
+                session.input_epoch(),
+                &startup.interrupt(),
+                |ms| {
+                    clock.set(clock.get() + ms);
+                    waits += 1;
+                    if waits == interrupt_at {
+                        let _fence = session.hold_for_departure();
+                        assert_eq!(ops.interrupt_all(), 1);
+                        session.release_departure();
+                    }
+                    std::future::ready(())
+                },
+                QuietStartup {
+                    input: Some("review the diff".into()),
+                    auto_mode_presses: 2,
+                    startup_delay_ms: 0,
+                    submit: true,
+                },
+                |_, _| {},
+            ));
+            assert_eq!(
+                ui.writes
+                    .borrow()
+                    .iter()
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect::<Vec<_>>(),
+                full_sequence[..expected_writes]
+                    .iter()
+                    .map(|bytes| bytes.to_vec())
+                    .collect::<Vec<_>>(),
+                "interrupted at wait {interrupt_at}",
+            );
+            assert!(!ui.submitted.get());
+            assert!(startup.interrupted());
+        }
+        session.kill();
+    }
+
     #[test]
     fn refused_startup_paste_never_submits() {
         struct Refused;
@@ -5355,7 +5448,7 @@ mod startup_readiness_tests {
             fn paste(&self, _: &str) -> std::io::Result<()> {
                 Err(std::io::Error::other("refused"))
             }
-            fn mark_turn_submitted(&self) {
+            fn submit_prompt(&self, _: &[u8]) {
                 panic!("a refused paste must not submit a turn");
             }
         }
@@ -5363,6 +5456,7 @@ mod startup_readiness_tests {
         run_now(quiet_startup(
             &Refused,
             0,
+            &Interrupt::default(),
             |_| std::future::ready(()),
             QuietStartup {
                 input: Some("task".into()),
@@ -6989,8 +7083,7 @@ mod tests {
         let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
 
         // Enter picks a conversation in Codex's `/resume` list, in the old binding.
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         // The resumed conversation boots: Starting then Ready, in one drained batch.
         let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
         session.process_probe_output(
@@ -8643,7 +8736,7 @@ mod provider_switch_tests {
         runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
         assert_eq!(runtime.snapshot(&session).status, AgentStatus::Idle);
 
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
         runtime.reconcile(
             &session,
@@ -8673,7 +8766,7 @@ mod provider_switch_tests {
         assert!(runtime.snapshot(&session).attributable);
 
         session.process_drained(&drained(&[("fresh", SystemTime::now())]));
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.test_program_status(b"\x1b]7501;state=working\x07");
         runtime.reconcile(
             &session,
@@ -8713,7 +8806,7 @@ mod provider_switch_tests {
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
         session.paste("A real prompt");
-        session.mark_prompt_submitted();
+        session.write_submission(b"\r", crate::Submission::Prompt);
         session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0011 | Ready\x07");
         assert_eq!(session.binding_revision(), 1);
         assert!(!session.runtime_evidence(None).submitted);
@@ -8744,7 +8837,7 @@ mod provider_switch_tests {
 
         let (selector, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
-        selector.mark_turn_submitted(); // Bare Enter selecting a resumed session.
+        selector.write_submission(b"\r", crate::Submission::Turn); // Bare Enter selecting a resumed session.
         selector.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0013 | Ready\x07");
         selector.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
         runtime.reconcile(&selector, TitleProvider::Codex, &[], &[], false, now);
@@ -8755,7 +8848,7 @@ mod provider_switch_tests {
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         navigation.write_input(b"\x1b[B"); // Down in the resume picker.
         assert!(navigation.input_snapshot().1);
-        navigation.mark_turn_submitted();
+        navigation.write_submission(b"\r", crate::Submission::Turn);
         navigation.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0014 | Ready\x07");
         navigation.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
         runtime.reconcile(&navigation, TitleProvider::Codex, &[], &[], false, now);
@@ -8775,7 +8868,7 @@ mod provider_switch_tests {
                     let mut runtime =
                         RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
                     session.paste("A real prompt");
-                    session.mark_prompt_submitted();
+                    session.write_submission(b"\r", crate::Submission::Prompt);
                     let working = "\x1b]7501;state=working\x07";
                     let title_frame = format!("\x1b]0;{title} | Ready\x07");
                     let idle = "\x1b]7501;state=idle\x07";
@@ -8822,7 +8915,7 @@ mod provider_switch_tests {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
         runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, now);
         let cancelled = runtime.snapshot(&session);
@@ -8851,7 +8944,7 @@ mod provider_switch_tests {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         for expected in [1, 2] {
             session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
             runtime.reconcile(
@@ -8874,7 +8967,7 @@ mod provider_switch_tests {
         for reset in [b"\x1b]7501;state=clear\x07".as_slice(), b"\x1bc".as_slice()] {
             let (session, _receiver) = fixture();
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
             runtime.reconcile(
                 &session,
@@ -8908,7 +9001,7 @@ mod provider_switch_tests {
         for completion in ["idle", "done"] {
             let (session, _receiver) = fixture();
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             let wire = format!(
                 "\x1b]7501;state=working\x07\x1b]7501;state={completion}\x07\x1b]7501;state=working\x07"
             );
@@ -8968,7 +9061,7 @@ mod provider_switch_tests {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         for (wire, status, completion_revision) in [
             (
                 b"\x1b]7501;state=working\x07".as_slice(),
@@ -9199,7 +9292,7 @@ mod provider_switch_tests {
             draw(&samples["idle"]);
             runtime.reconcile(&session, provider_kind, &working, &blocked, false, now);
             if state != "idle" {
-                session.mark_turn_submitted();
+                session.write_submission(b"\r", crate::Submission::Turn);
                 draw(&samples[if state == "done" { "working" } else { state }]);
                 runtime.reconcile(
                     &session,
@@ -9363,7 +9456,7 @@ mod provider_switch_tests {
             let mut seen = Vec::new();
             for (index, (title, screen)) in steps.iter().enumerate() {
                 if index == 1 {
-                    session.mark_turn_submitted();
+                    session.write_submission(b"\r", crate::Submission::Turn);
                 }
                 draw(&session, *title, screen);
                 runtime.reconcile(
@@ -9608,7 +9701,7 @@ mod provider_switch_tests {
             );
             assert!(!during.attributable);
 
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             sample(1, Some(b"\x1b]7501;state=working\x07"));
             let held = sample(2, Some(b"\x1b]7501;state=done\x07"));
             assert_eq!(held.status, AgentStatus::Working);
@@ -9719,7 +9812,7 @@ mod provider_switch_tests {
             session.provider_switched_at(hook, hook, hook);
             // A title read inside the window can't end the settle.
             draw(&session, Some("Sure"), &screen);
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             let mut report = |state: &str, after_ms: u64| {
                 let mut output = PtyOutput::default();
                 output.push(
@@ -9759,7 +9852,7 @@ mod provider_switch_tests {
                 rule(),
                 rule()
             );
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             let mut sample = |at: Duration, title: &str| {
                 draw(&session, Some(title), &screen);
                 runtime.reconcile(
@@ -10101,7 +10194,7 @@ mod provider_switch_tests {
             let mut seen = Vec::new();
             for (index, (ms, screen, bell)) in steps.iter().enumerate() {
                 if index == 1 {
-                    session.mark_turn_submitted();
+                    session.write_submission(b"\r", crate::Submission::Turn);
                 }
                 let mut wire = String::new();
                 if !screen.is_empty() {
@@ -10500,7 +10593,7 @@ mod provider_switch_tests {
         let clock = Instant::now();
         let hook = SystemTime::now() - Duration::from_secs(1);
         let learned = SystemTime::now() + Duration::from_secs(1);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.provider_switched_at(hook, hook, learned);
         assert_eq!(session.first_submission_binding(), None);
         session.process_drained(&drained(&[
@@ -10562,7 +10655,7 @@ mod provider_switch_tests {
         }
         // A later turn in the new conversation completes as usual.
         let later = settles + Duration::from_secs(1);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.process_drained(&drained(&[("\x1b]0;\u{25d0} Next\x07", later)]));
         runtime.reconcile(
             &session,
@@ -10595,7 +10688,7 @@ mod provider_switch_tests {
     fn a_silent_switch_retires_an_old_working_title_without_completing() {
         let (session, _receiver) = fixture();
         let mut viewer = Viewer::new(TitleProvider::Claude);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.process_output("\x1b]0;\u{25d0} Old task\x07".as_bytes());
         assert_eq!(viewer.sample(&session).0, AgentStatus::Working);
 
@@ -10651,7 +10744,7 @@ mod provider_switch_tests {
             let switched_at = viewer.clock;
             viewer.sample_at(&session, switched_at);
             if submitted {
-                session.mark_turn_submitted();
+                session.write_submission(b"\r", crate::Submission::Turn);
             } else {
                 session.process_drained(&drained(&[(
                     "\x1b]0;\u{25d0} New task\x07",
@@ -11080,7 +11173,7 @@ mod provider_switch_tests {
         let clock = Instant::now();
         let read_at = SystemTime::now();
         let first = uuid::Uuid::new_v4();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.process_drained(&drained(&[(
             &format!("\x1b]0;{first} | Working\x07"),
             read_at,
@@ -11133,7 +11226,7 @@ mod provider_switch_tests {
             false,
             clock + Duration::from_millis(60),
         );
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         let fresh = hook + SWITCH_SLACK + Duration::from_millis(1);
         session.process_drained(&drained(&[("\r\nfresh bytes", fresh)]));
         runtime.reconcile(
@@ -11210,7 +11303,7 @@ mod provider_switch_tests {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = SystemTime::now();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.process_drained(&drained(&[(
             "\x1b]0;\u{280b} Old\x07\x1b]0;\u{2733} Old\x07",
             now,
@@ -11250,7 +11343,7 @@ mod provider_switch_tests {
         assert!(!snapshot.attributable);
         assert_eq!(viewer.runtime.grok_screen_working_at, None);
 
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
         session.process_drained(&drained(&[("\x1b]0;New - grok\x07", fresh)]));
         let (snapshot, _) = viewer.sample_at(&session, clock + Duration::from_millis(60));
@@ -11324,7 +11417,7 @@ mod provider_switch_tests {
         let mut viewer = Viewer::new(TitleProvider::Grok);
         let clock = viewer.clock;
         let at = SystemTime::now();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         session.process_drained(&drained(&[
             ("\x1b]0;⠙ - New - grok\x07", at),
             (
@@ -11435,7 +11528,7 @@ mod provider_switch_tests {
             assert_eq!(viewer.sample(&session), (AgentStatus::Idle, true));
             assert_eq!(viewer.runtime.semantic_title_status, None);
             assert!(!viewer.runtime.provider_settled);
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
             session.process_drained(&drained(&[(
                 "\x1b]0;\u{2733} New\x07",
                 fresh + Duration::from_millis(1),
@@ -11624,8 +11717,7 @@ mod provider_switch_tests {
         session.write_input(b"please continue the remaining work");
         assert!(session.input_snapshot().1);
         assert!(!session.runtime_evidence(None).submitted);
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         assert!(!session.input_snapshot().1);
         assert_eq!(session.last_user_input(), None);
         session.process_drained(&drained(&[(idle, SystemTime::now())]));
@@ -11636,8 +11728,7 @@ mod provider_switch_tests {
         // repeated Idle after it remains the same completion.
         session.write_input(b"continue");
         assert!(session.input_snapshot().1);
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         assert!(!session.input_snapshot().1);
         session.process_drained(&drained(&[(working, SystemTime::now())]));
         assert_eq!(sample(), (AgentStatus::Working, 1));
@@ -11933,7 +12024,7 @@ mod provider_switch_tests {
         // `second` and wrote that second whole; it switched later in it. The
         // old conversation's Enter came before the switch.
         let second = SystemTime::now() - Duration::from_millis(300);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", crate::Submission::Turn);
         // muxel reports the switch as that whole second, up to its last instant.
         session.provider_switched_at(second, second + Duration::from_secs(1), SystemTime::now());
         assert!(
@@ -12020,8 +12111,7 @@ mod provider_switch_tests {
         assert_eq!((status, prev_raw, armed), (AgentStatus::Idle, None, false));
 
         // A turn submitted after the switch, its frames read after the window.
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
         session.process_drained(&drained(&[
             ("\x1b]0;\u{25d0} New topic\x07", fresh),
