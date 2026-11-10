@@ -25,6 +25,7 @@ mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod remote_paste;
+mod restart_handoff;
 mod secrets;
 mod session_binding;
 mod settings_view;
@@ -242,6 +243,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let (args, after_restart) = restart_handoff::take(args);
     let identity = match muxel_core::build_identity::parse_identity_args(&args) {
         Ok(command) => command,
         Err(error) => {
@@ -252,7 +254,7 @@ fn main() {
         }
     };
     // Validate identity arguments before version/help returns, after consuming
-    // isolation flags and before any endpoint or GUI initialization.
+    // isolation and restart flags and before any endpoint or GUI initialization.
     if let Some(text) = cli_info(args.first().and_then(|arg| arg.to_str())) {
         #[cfg(windows)]
         control::attach_parent_console();
@@ -314,6 +316,11 @@ fn main() {
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Started by a Restart: the version this one replaces releases its
+    // workspace first, before any window opens or outside control starts.
+    if let Some(workspace) = after_restart {
+        restart_handoff::wait(workspace);
+    }
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what

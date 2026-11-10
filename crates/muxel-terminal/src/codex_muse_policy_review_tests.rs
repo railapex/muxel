@@ -147,7 +147,9 @@ fn bghold_b_terminal_only_population_finishes_current_and_later_turns() {
         let listed = screen(name, fixture);
         for turn in 0..2 {
             let at = Duration::from_secs(turn * 10);
-            probe.session.mark_turn_submitted();
+            probe
+                .session
+                .write_submission(b"\r", crate::Submission::Turn);
             assert_eq!(
                 probe.sample(at, &listed, WORKING).status,
                 AgentStatus::Working
@@ -185,7 +187,9 @@ fn bghold_b_codex_title_and_muse_hook_finish_with_terminal_metadata() {
     let mut codex = Probe::new(TitleProvider::Codex);
     let listed = screen("codex", "one");
     codex.sample(Duration::ZERO, &listed, b"");
-    codex.session.mark_turn_submitted();
+    codex
+        .session
+        .write_submission(b"\r", crate::Submission::Turn);
     assert_eq!(
         codex
             .sample_title(Duration::from_secs(1), &listed, b"", "Review | Working")
@@ -295,7 +299,9 @@ fn bghold_b_known_children_and_mixed_shells_hold_three_hours_then_release_once()
             );
         }
         let next = end + CAP + Duration::from_secs(10);
-        probe.session.mark_turn_submitted();
+        probe
+            .session
+            .write_submission(b"\r", crate::Submission::Turn);
         assert_eq!(
             probe.sample(next, &listed, WORKING).status,
             AgentStatus::Working
@@ -325,7 +331,9 @@ fn bghold_b_pending_child_with_or_without_shells_cannot_fabricate_activity() {
         let mut probe = Probe::new(TitleProvider::Codex);
         let listed = screen("codex", fixture);
         probe.child(None);
-        probe.session.mark_turn_submitted();
+        probe
+            .session
+            .write_submission(b"\r", crate::Submission::Turn);
         probe.sample(Duration::ZERO, &listed, WORKING);
         let pending = probe.sample(Duration::from_secs(1), &listed, DONE);
         assert_eq!(

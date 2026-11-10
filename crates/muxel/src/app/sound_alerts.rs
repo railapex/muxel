@@ -48,12 +48,12 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
+        let receiver = self.native_dialog(cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some(t("Choose sound")),
-        });
+        }));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
                 && let Some(path) = paths.pop()

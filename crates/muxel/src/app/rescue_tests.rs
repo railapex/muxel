@@ -99,7 +99,9 @@ fn inert() -> CommandSpec {
             "/d".into(),
             "/q".into(),
             "/c".into(),
-            "echo ready&more".into(),
+            // Never reads its input: a test's Enter mustn't echo over the
+            // box it painted.
+            "echo ready&ping -n 86400 127.0.0.1 >nul".into(),
         ],
     )
 }
@@ -338,7 +340,7 @@ fn a_submitted_prompt_is_cleared_and_a_closed_panes_prompt_is_kept() {
         assert_eq!(dir.draft(iid).unwrap().text, "ship it");
 
         // Enter: the file goes at once, before the box is read again.
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         cx.run_until_parked();
         assert!(dir.draft(iid).is_none(), "submission clears the draft");
         paint_claude(&session, "");
@@ -873,7 +875,7 @@ fn a_submission_during_the_debounce_clears_the_draft_at_once() {
         paint_claude(&session, "first, then more");
         session.mark_user_input();
         cx.run_until_parked();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         cx.run_until_parked();
         assert!(
             dir.draft(iid).is_none(),
@@ -884,7 +886,7 @@ fn a_submission_during_the_debounce_clears_the_draft_at_once() {
         paint_claude(&session, "sent just before closing");
         session.mark_user_input();
         cx.run_until_parked();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         paint_claude(&session, "");
         window
             .update(cx, |app, _, cx| {
@@ -1318,7 +1320,7 @@ fn a_sent_prompt_the_screen_still_shows_is_never_saved_again() {
 
         // Enter; the watcher deletes the file before the program redraws its
         // box, and the pane is closed.
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         cx.run_until_parked();
         assert!(dir.draft(iid).is_none(), "submission clears the draft");
         window
@@ -1337,7 +1339,7 @@ fn a_sent_prompt_the_screen_still_shows_is_never_saved_again() {
         paint_claude(&session, "also sent");
         session.mark_user_input();
         after_debounce(cx);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         cx.run_until_parked();
         after_debounce(cx);
         assert!(
@@ -1504,7 +1506,7 @@ fn a_sent_prompt_is_not_kept_when_the_pane_closes_on_a_draft_too_tall_to_save() 
         // the pane fills the box, and the pane is closed.
         window
             .update(cx, |app, _, cx| {
-                session.mark_turn_submitted();
+                session.write_submission(b"\r", muxel_terminal::Submission::Turn);
                 paint_claude_too_tall(&session);
                 app.close_instance_inner(iid, "close (test)", cx);
             })
@@ -1531,8 +1533,7 @@ fn a_command_sent_just_before_its_pane_closes_is_not_kept() {
         // file.
         window
             .update(cx, |app, _, cx| {
-                session.mark_turn_submitted();
-                session.write_input(b"\r");
+                session.write_submission(b"\r", muxel_terminal::Submission::Turn);
                 app.close_instance_inner(iid, "close (test)", cx);
             })
             .unwrap();
