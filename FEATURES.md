@@ -926,8 +926,10 @@ feature is added or changed, update the matching entry here in the same change**
   the pane already announced or while you watch it, and Recent work's feed
   lists it, as the row shows only Done. Only the command's own exit counts:
   behind tmux a client's exit finishes nothing, ssh's own failures (code 255)
-  don't either, and through `sshpass` only exit 0 does. A literal `claude`,
-  `codex` or shell is an interactive session, whose exit is no finish: it
+  don't either, and through `sshpass` only exit 0 does. PowerShell (`pwsh`,
+  `powershell.exe`) is a session whatever it's started with, as before: a
+  pane running a PowerShell command doesn't finish when it exits. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish: it
   keeps the state it had, unless its agent reported a finish first, whose
   chime then still rings. The purpose comes from the pane's program and
   arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a

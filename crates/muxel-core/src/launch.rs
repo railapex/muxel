@@ -117,18 +117,12 @@ enum ShellFamily {
     CommandFlag,
     /// elvish, whose options are single-dash words (`-norc`): `-c` alone.
     Elvish,
-    PowerShell(PowerShellHost),
+    /// pwsh and Windows PowerShell: always a session, as on master. Their
+    /// command lines (two hosts with different options, prefixes and
+    /// stdin rules) kept turning up cases read the wrong way, and a
+    /// session read as a job finishes falsely when it quits.
+    PowerShell,
     Cmd,
-}
-
-/// The two PowerShell hosts, whose options differ: Windows PowerShell's
-/// `-PSConsoleFile` and `-Version` take values, and pwsh's `-Version` doesn't.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PowerShellHost {
-    /// PowerShell 7 and later (`pwsh`).
-    Pwsh,
-    /// Windows PowerShell 5.1 and earlier (`powershell.exe`).
-    Windows,
 }
 
 fn shell_of(name: &str) -> Option<ShellFamily> {
@@ -136,8 +130,7 @@ fn shell_of(name: &str) -> Option<ShellFamily> {
         "sh" | "bash" | "zsh" | "dash" | "ksh" => Some(ShellFamily::Sh),
         "fish" | "nu" | "xonsh" | "tcsh" | "csh" => Some(ShellFamily::CommandFlag),
         "elvish" => Some(ShellFamily::Elvish),
-        "pwsh" => Some(ShellFamily::PowerShell(PowerShellHost::Pwsh)),
-        "powershell" => Some(ShellFamily::PowerShell(PowerShellHost::Windows)),
+        "pwsh" | "powershell" => Some(ShellFamily::PowerShell),
         "cmd" => Some(ShellFamily::Cmd),
         _ => None,
     }
@@ -146,7 +139,7 @@ fn shell_of(name: &str) -> Option<ShellFamily> {
 impl ShellFamily {
     /// Whether these arguments start the shell to run a command or a script
     /// and exit. Each shell reads its own options only up to the command, so
-    /// a word after it (`-NoExit`, `/c`) is the command's.
+    /// a word after it (`/c` after `cmd /k`) is the command's.
     fn runs_a_command(self, args: &[String]) -> bool {
         match self {
             Self::Sh => sh_runs_a_command(args),
@@ -157,7 +150,7 @@ impl ShellFamily {
                         .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
             }),
             Self::Elvish => args.iter().any(|arg| arg == "-c"),
-            Self::PowerShell(host) => powershell_runs_a_command(host, args),
+            Self::PowerShell => false,
             Self::Cmd => cmd_runs_a_command(args),
         }
     }
@@ -199,203 +192,6 @@ fn sh_runs_a_command(args: &[String]) -> bool {
         }
     }
     command
-}
-
-/// What a PowerShell host option does to the command line.
-#[derive(Clone, Copy)]
-enum PwshSwitch {
-    /// `-NoExit`: stay at the prompt after the command.
-    NoExit,
-    /// `-Command`, `-CommandWithArgs` or `-File`: the rest of the line is
-    /// the command's, and it runs.
-    Command,
-    /// `-EncodedCommand <base64>`: runs its command.
-    Encoded,
-    /// An option that takes a value (`-ExecutionPolicy Bypass`).
-    Value,
-    /// An option without one (`-NoProfile`).
-    Flag,
-    /// An option neither host's table knows, which may take a value.
-    Unknown,
-}
-
-/// One row of [`POWERSHELL_SWITCHES`].
-type PowerShellOption = (
-    &'static str,
-    &'static str,
-    &'static str,
-    PwshSwitch,
-    Option<PowerShellHost>,
-);
-
-/// The PowerShell hosts' options as they match them: the name, the shortest
-/// prefix of it accepted, any other alias, what it does, and the one host
-/// that takes it (`None`: both). Every option is checked against both hosts'
-/// pages, about_Pwsh (7.5) and about_PowerShell_exe (5.1). The prefixes and
-/// aliases are pwsh's documented ones; the 5.1 page lists none.
-/// `-EncodedArguments` is on the 5.1 page, and pwsh's own parser takes it too
-/// (`-encodeda`, `-ea`), though about_Pwsh doesn't list it.
-const POWERSHELL_SWITCHES: &[PowerShellOption] = &[
-    ("noexit", "noe", "", PwshSwitch::NoExit, None),
-    ("command", "c", "", PwshSwitch::Command, None),
-    ("file", "f", "", PwshSwitch::Command, None),
-    ("encodedcommand", "e", "ec", PwshSwitch::Encoded, None),
-    (
-        "encodedarguments",
-        "encodeda",
-        "ea",
-        PwshSwitch::Value,
-        None,
-    ),
-    ("configurationname", "config", "", PwshSwitch::Value, None),
-    ("executionpolicy", "ex", "ep", PwshSwitch::Value, None),
-    ("inputformat", "inp", "if", PwshSwitch::Value, None),
-    ("outputformat", "o", "of", PwshSwitch::Value, None),
-    ("windowstyle", "w", "", PwshSwitch::Value, None),
-    ("nologo", "nol", "", PwshSwitch::Flag, None),
-    ("noninteractive", "noni", "", PwshSwitch::Flag, None),
-    ("noprofile", "nop", "", PwshSwitch::Flag, None),
-    ("sta", "sta", "", PwshSwitch::Flag, None),
-    ("mta", "mta", "", PwshSwitch::Flag, None),
-    ("help", "h", "?", PwshSwitch::Flag, None),
-    (
-        "commandwithargs",
-        "commandwithargs",
-        "cwa",
-        PwshSwitch::Command,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "configurationfile",
-        "configurationfile",
-        "",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "custompipename",
-        "cus",
-        "",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "settingsfile",
-        "settings",
-        "",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "workingdirectory",
-        "wo",
-        "wd",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "interactive",
-        "i",
-        "",
-        PwshSwitch::Flag,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "login",
-        "l",
-        "",
-        PwshSwitch::Flag,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "noprofileloadtime",
-        "noprofileloadtime",
-        "",
-        PwshSwitch::Flag,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "sshservermode",
-        "sshs",
-        "",
-        PwshSwitch::Flag,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "version",
-        "v",
-        "",
-        PwshSwitch::Flag,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "psconsolefile",
-        "psc",
-        "",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Windows),
-    ),
-    (
-        "version",
-        "v",
-        "",
-        PwshSwitch::Value,
-        Some(PowerShellHost::Windows),
-    ),
-];
-
-/// `arg` as one of `host`'s options: `-Name`, `--Name` or `/Name`, any case,
-/// abbreviated as far as PowerShell allows. `None` for a value, like a
-/// script's path; an unknown `/word` is a path too.
-fn powershell_switch(host: PowerShellHost, arg: &str) -> Option<PwshSwitch> {
-    let (name, slash) = match arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) {
-        Some(name) => (name, false),
-        None => (arg.strip_prefix('/')?, true),
-    };
-    let name = name.to_ascii_lowercase();
-    let known = POWERSHELL_SWITCHES
-        .iter()
-        .filter(|(.., only)| only.is_none_or(|only| only == host))
-        .find(|(full, shortest, alias, ..)| {
-            (full.starts_with(name.as_str()) && name.starts_with(shortest))
-                || (!alias.is_empty() && name == *alias)
-        })
-        .map(|(_, _, _, switch, _)| *switch);
-    match known {
-        Some(switch) => Some(switch),
-        None if slash => None,
-        None => Some(PwshSwitch::Unknown),
-    }
-}
-
-/// PowerShell reads host options up to `-Command`, `-CommandWithArgs`,
-/// `-File` or a bare word (pwsh's default parameter is `-File`, a script's
-/// path; Windows PowerShell's is `-Command`), and passes everything after to
-/// the command. So a `-NoExit` only counts before them. After an option
-/// neither table knows, a bare word may be its value, so the read stops
-/// there as a session, whose exit finishes nothing, rather than a job whose
-/// exit would; a `-Command` later on the line isn't reached. A command
-/// switch straight after the unknown option is reached, and runs.
-fn powershell_runs_a_command(host: PowerShellHost, args: &[String]) -> bool {
-    let (mut no_exit, mut encoded, mut guessing) = (false, false, false);
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match powershell_switch(host, arg) {
-            Some(PwshSwitch::Command) => return !no_exit,
-            None => return !no_exit && !guessing,
-            Some(PwshSwitch::NoExit) => no_exit = true,
-            Some(PwshSwitch::Encoded) => {
-                encoded = true;
-                args.next();
-            }
-            Some(PwshSwitch::Value) => {
-                args.next();
-            }
-            Some(PwshSwitch::Flag) => {}
-            Some(PwshSwitch::Unknown) => guessing = true,
-        }
-    }
-    encoded && !no_exit
 }
 
 /// cmd reads its switches up to the first `/c` or `/r` (run the command and
@@ -682,20 +478,6 @@ mod tests {
             // `-c` exits after its command, interactive or not.
             (Some("bash"), &["-i", "-c", "make"], LaunchPurpose::Job),
             (Some("fish"), &["--command", "make"], LaunchPurpose::Job),
-            (Some("pwsh.exe"), &["-NoLogo"], LaunchPurpose::Session),
-            (Some("pwsh"), &["-Command", "make"], LaunchPurpose::Job),
-            (Some("powershell"), &["-File", "x.ps1"], LaunchPurpose::Job),
-            // `-NoExit` keeps the prompt after the command.
-            (
-                Some("pwsh"),
-                &["-NoExit", "-Command", "Import-Module x"],
-                LaunchPurpose::Session,
-            ),
-            (
-                Some("powershell.exe"),
-                &["-noe", "-File", "profile.ps1"],
-                LaunchPurpose::Session,
-            ),
             (Some("cmd.exe"), &[], LaunchPurpose::Session),
             (
                 Some("cmd.exe"),
@@ -754,102 +536,30 @@ mod tests {
         }
     }
 
-    /// PowerShell's options end at the command or the script, whose own
-    /// arguments follow. `pwsh -NoProfile -CommandWithArgs '...' -NoExit`
-    /// exits (probed with PowerShell 7).
+    /// PowerShell is a session whatever it's started with, as on master: a
+    /// pane running a PowerShell command doesn't finish when it exits.
     #[test]
-    fn powershell_options_end_at_the_command() {
-        for (program, args, expected) in [
-            ("pwsh", &["build.ps1"][..], LaunchPurpose::Job),
-            (
-                "pwsh",
-                &["-NoProfile", "build.ps1", "-NoExit"],
-                LaunchPurpose::Job,
-            ),
-            (
-                "pwsh",
-                &[
-                    "-NoProfile",
-                    "-CommandWithArgs",
-                    "Write-Output $args.Count",
-                    "-NoExit",
-                ],
-                LaunchPurpose::Job,
-            ),
-            ("pwsh", &["-File", "x.ps1", "-NoExit"], LaunchPurpose::Job),
-            (
-                "pwsh",
-                &["-ExecutionPolicy", "Bypass", "-File", "x.ps1"],
-                LaunchPurpose::Job,
-            ),
-            // Windows PowerShell's default parameter is `-Command`.
-            ("powershell.exe", &["Get-Date"], LaunchPurpose::Job),
-            ("pwsh", &["-ec", "ZQB4AGkAdAA="], LaunchPurpose::Job),
-            // An option's value is not a script.
-            (
-                "pwsh",
-                &["-WorkingDirectory", "C:\\src", "-NoLogo"],
-                LaunchPurpose::Session,
-            ),
-            ("pwsh", &["-wd", "src"], LaunchPurpose::Session),
-            // `-NoExit` before the command, abbreviated or not.
-            ("pwsh", &["-noex", "build.ps1"], LaunchPurpose::Session),
-            (
-                "powershell",
-                &["/NoExit", "-ec", "ZQB4AGkAdAA="],
-                LaunchPurpose::Session,
-            ),
-            ("pwsh", &["-nop", "-noe"], LaunchPurpose::Session),
-            // Windows PowerShell's own options take values; pwsh's
-            // `-Version` doesn't.
-            (
-                "powershell.exe",
-                &["-PSConsoleFile", "sqlsnapin.psc1"],
-                LaunchPurpose::Session,
-            ),
-            ("powershell", &["-Version", "2.0"], LaunchPurpose::Session),
-            (
-                "powershell",
-                &["-Version", "2.0", "Get-Date"],
-                LaunchPurpose::Job,
-            ),
-            ("pwsh", &["-Version"], LaunchPurpose::Session),
-            // Both hosts take `-EncodedArguments` and its value.
-            (
-                "powershell.exe",
-                &["-EncodedArguments", "JABhAA==", "-Command", "Get-Date"],
-                LaunchPurpose::Job,
-            ),
-            (
-                "pwsh",
-                &["-ea", "JABhAA==", "-Command", "Get-Date"],
-                LaunchPurpose::Job,
-            ),
-            ("pwsh", &["-NoLogo", "build.ps1"], LaunchPurpose::Job),
-            // After an option it doesn't know, a word may be its value: a
-            // session, as every exit was before. An explicit command runs.
-            (
-                "pwsh",
-                &["-SomeFutureOption", "value"],
-                LaunchPurpose::Session,
-            ),
-            (
-                "pwsh",
-                &["-SomeFutureOption", "-Command", "Get-Date"],
-                LaunchPurpose::Job,
-            ),
-            // A word after it ends the read, before a later command.
-            (
-                "pwsh",
-                &["-SomeFutureOption", "value", "-Command", "Get-Date"],
-                LaunchPurpose::Session,
-            ),
+    fn powershell_is_always_a_session() {
+        for (program, args) in [
+            ("pwsh", &[][..]),
+            ("pwsh.exe", &["-NoLogo"]),
+            ("pwsh", &["-Command", "make"]),
+            ("pwsh", &["build.ps1"]),
+            ("pwsh", &["-File", "-"]),
+            ("powershell", &["-File", "x.ps1"]),
+            ("powershell.exe", &["Get-Date"]),
+            ("powershell.exe", &["-i", "Text", "-Command", "Get-Date"]),
+            ("pwsh", &["-ec", "ZQB4AGkAdAA="]),
         ] {
-            assert_eq!(purpose(Some(program), args), expected, "{program} {args:?}");
+            assert_eq!(
+                purpose(Some(program), args),
+                LaunchPurpose::Session,
+                "{program} {args:?}"
+            );
         }
     }
 
-    /// A POSIX shell runs a script given by path, as PowerShell does, and
+    /// A POSIX shell runs a script given by path, and
     /// each shell's options end where its command begins.
     #[test]
     fn a_shell_runs_a_script_and_its_options_end_at_the_command() {

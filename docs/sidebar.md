@@ -64,7 +64,9 @@ conversation switch, the completion by its revision) isn't recorded twice or
 notified, so the finish the click read stays read. That holds when the click
 left the stored values as they were, too (a completion the floor dates to the
 stored time after a clock correction). Auto-read and the accomplishment log
-still take it.
+still take it. A click while the restore guard holds a restored pane's sample
+records nothing, and leaves the tick to record that sample as it would without
+the click.
 
 A clock correction rewrites nothing already recorded. A time the clock reads as
 in the future after it steps back is kept as stamped; only ages and the order
@@ -109,17 +111,14 @@ its arguments, so a literal `claude` is still a session. A one-shot subcommand
 is the agent's first operand (`codex exec`, `codex review`, `opencode run`), so
 a prompt after another subcommand (`codex resume <id> e`) isn't one. A shell is
 a session unless it was started to run a command or a script and exit: `-c`,
-`cmd /c`, PowerShell's `-Command` or `-File`, or a script's path (`bash
-build.sh`, `pwsh build.ps1`). A shell's options end where its command begins, so
-`cmd /k` and PowerShell's `-NoExit` keep the prompt only before the command;
-after it they are the command's. pwsh and Windows PowerShell are read by their
-own options: Windows PowerShell's `-PSConsoleFile` and `-Version` take a value
-(`powershell -PSConsoleFile sqlsnapin.psc1` is a session), pwsh's `-Version`
-doesn't; `-EncodedArguments` takes one on both. After an option neither knows, a
-word that may be its value ends the read as a session, whose exit records
-nothing, as every exit did on `master`, even with a `-Command` later on the
-line. A `-Command` or `-File` straight after the unknown option still runs.
-fish, nu, xonsh and csh are read by their
+`cmd /c`, or a script's path (`bash build.sh`). A shell's options end where its
+command begins, so `cmd /k` keeps the prompt only before the command; after it
+it is the command's. PowerShell (`pwsh`, `powershell.exe`) is always a session,
+as on `master`, so a pane running `pwsh -Command make` doesn't finish when it
+exits. Its two hosts take different options, prefixes and values, and `-File -`
+reads commands from the terminal; reading those lines kept finding cases a
+session was read as a job, and a session read as a job finishes falsely when you
+quit it. fish, nu, xonsh and csh are read by their
 command flag alone, so a script they run by path stays a session. Any other
 program, an agent muxel doesn't know included, is a command, and so is a
 wrapper (`npx`, `uvx`, `wsl`, `ssh host`): the program it starts isn't looked
