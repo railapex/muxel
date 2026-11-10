@@ -339,3 +339,28 @@ fn a_popped_out_diff_pane_keeps_refreshing() {
         assert!(diff_text(cx, main, a).contains("+second"));
     });
 }
+
+/// Docking a diff back builds it anew in the main window, from the text it
+/// had in its pop-out; it refreshes in the frame that builds it.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_diff_pane_docked_back_refreshes_at_once() {
+    with_app(|cx, main, fx| {
+        let a = open_diff(cx, main, fx, &fx.a);
+        main.update(cx, |app, window, cx| app.pop_out_instance(a, window, cx));
+        cx.run_until_parked();
+        add_line(&fx.a);
+        // As the pop-out's Dock button does.
+        main.update(cx, |app, _, cx| app.redock_popout(a, cx));
+        // Frames only: the timer doesn't tick.
+        cx.run_until_parked();
+        main.update(cx, |app, _, _| {
+            assert!(!app.popouts.contains_key(&a));
+            assert!(app.editors.contains_key(&a), "rebuilt in the main window");
+        });
+        assert!(diff_text(cx, main, a).contains("+second"));
+    });
+}
