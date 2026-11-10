@@ -138,6 +138,8 @@ feature is added or changed, update the matching entry here in the same change**
   - for a key handler that works before it accepts the line;
   - for a script that calls `prompt` and runs on;
   - for .NET work started directly, such as `[Task]::Run` or a timer;
+  - for a process left running by a launcher that has exited, such as
+    `cmd /c start /b …`, since only the shell's own children are checked;
   - for a line sent the instant a prompt appears.
 
   A module that keeps an idle runspace or event subscriber, as current
