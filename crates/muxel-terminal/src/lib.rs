@@ -18,6 +18,8 @@ mod pane_job;
 mod present_flag;
 #[cfg(windows)]
 mod process_tree;
+#[cfg(unix)]
+mod process_tree_unix;
 mod profile;
 mod profile_idle;
 pub mod profile_log;
@@ -49,5 +51,5 @@ pub use view::{
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    clean_agent_title, pane_grid, paste_clipboard_into_session,
 };
