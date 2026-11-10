@@ -1,7 +1,7 @@
 //! Diff panes run `git diff` only while on screen, and a watched one only
 //! when its files change. Draws real frames with no PTY, so it runs on every
 //! desktop test host.
-use super::{MuxelApp, Project};
+use super::{MuxelApp, Project, ResourceOrigin};
 use crate::file_watch::FileWatch;
 use crate::file_watch::test_backend::TestBackend;
 use crate::test_support::TestRepo;
@@ -79,8 +79,11 @@ fn open_diff(
 ) -> Uuid {
     let iid = window
         .update(cx, |app, window, cx| {
-            let anchor = app.active_instance;
-            app.open_diff_for_dir(fx.pid, repo.path().to_path_buf(), anchor, window, cx);
+            // As the project menu opens it: into the nearest diff pane's group.
+            let origin = ResourceOrigin::Chrome {
+                near: app.active_instance,
+            };
+            app.open_diff_for_dir(fx.pid, repo.path().to_path_buf(), origin, window, cx);
             app.active_instance.expect("the new diff pane is focused")
         })
         .unwrap();
