@@ -779,6 +779,20 @@ impl Screen {
         Some(self.context_without_rows(composer))
     }
 
+    /// Claude's input box rows, from its `❯` row to the row above its bottom
+    /// rule, wherever a repaint left the cursor. Used to read a draft.
+    pub(crate) fn claude_box_rows(&self) -> Option<std::ops::Range<usize>> {
+        self.composer_rows_inner(None)
+    }
+
+    /// Codex's live editor, from its `›` row to the row above its footer,
+    /// holding a draft or empty.
+    pub(crate) fn codex_editor_rows(&self) -> Option<std::ops::Range<usize>> {
+        let rows: Vec<_> = self.text.lines().collect();
+        self.codex_composer_rows(&rows, false)
+            .or_else(|| self.codex_composer_rows(&rows, true))
+    }
+
     fn context_without_rows(&self, composer: std::ops::Range<usize>) -> String {
         self.text
             .lines()

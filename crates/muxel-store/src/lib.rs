@@ -11,6 +11,7 @@ use directories::ProjectDirs;
 use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
+pub mod rescue;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
@@ -172,7 +173,7 @@ const RENAME_RETRIES: u32 = 3;
 /// Pause between those retries.
 const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut retries = 0;
     loop {
         match std::fs::rename(from, to) {
@@ -209,17 +210,47 @@ pub fn workspace_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspace.json"))
 }
 
-/// Try to take the single-instance lock for one **workspace** (keyed by its id).
-/// Returns the locked file on success — **keep it alive while that workspace is
-/// open** (the OS releases the advisory lock when the file is dropped or the
-/// process exits, even on a crash, so no stale lock survives). `None` means
-/// another muxel already has *this* workspace open, so the caller should refuse
-/// to open it and not clobber its `workspace.json`. Locking is per-workspace, so
-/// two muxel processes can run side by side on different workspaces. A lock the
-/// platform can't support is treated as "available" rather than blocking the user.
-pub fn try_lock_workspace(id: Uuid) -> Option<std::fs::File> {
-    let dir = workspaces_dir()?.join(id.to_string());
-    try_lock_dir(&dir)
+/// What came of trying to lock a workspace to open it.
+#[derive(Debug)]
+pub enum WorkspaceLock {
+    /// Locked. **Keep the file alive while the workspace is open**: the OS
+    /// releases the advisory lock when the file is dropped or the process
+    /// exits, even on a crash, so no stale lock survives.
+    Held(std::fs::File),
+    /// Another muxel already has this workspace open: refuse to open it, and
+    /// don't clobber its `workspace.json`.
+    Busy,
+    /// The workspace was deleted, in another window after this one listed
+    /// it: it must not open again.
+    Deleted,
+}
+
+/// Try to take the single-instance lock for one **workspace** (keyed by its
+/// id). Locking is per-workspace, so two muxel processes can run side by side
+/// on different workspaces. A lock the platform can't support is treated as
+/// "available" rather than blocking the user.
+pub fn try_lock_workspace(id: Uuid) -> WorkspaceLock {
+    match workspaces_dir() {
+        Some(root) => lock_to_open(&root, id),
+        None => WorkspaceLock::Busy,
+    }
+}
+
+fn lock_to_open(root: &Path, id: Uuid) -> WorkspaceLock {
+    let dir = root.join(id.to_string());
+    let Some(lock) = try_lock_dir(&dir) else {
+        return WorkspaceLock::Busy;
+    };
+    // A deletion marks the workspace while holding this lock, so now that it
+    // is held here, either the marker is already there or no deletion
+    // can start until this window lets go.
+    if rescue::marked_deleted_in(root, id) {
+        drop(lock);
+        // Locking recreated the directory the deletion removed.
+        rescue::remove_tree(&dir);
+        return WorkspaceLock::Deleted;
+    }
+    WorkspaceLock::Held(lock)
 }
 
 /// Lock core, parameterized by the workspace dir for testability. Creates the dir
@@ -432,7 +463,9 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let index_path = base.join("workspaces.json");
     if index_path.exists() {
-        return load_workspaces_index_from(&index_path);
+        let mut index = load_workspaces_index_from(&index_path);
+        forget_deleted(&mut index, &base.join("workspaces"));
+        return index;
     }
     let id = Uuid::new_v4();
     let index = WorkspacesIndex {
@@ -459,6 +492,21 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let _ = save_workspaces_index_to(&index_path, &index);
     index
+}
+
+/// Leave out workspaces marked deleted: muxel stopped after marking one and
+/// before saving the index without it. What it kept goes with the next
+/// sweep (see [`rescue::sweep_deleted_workspaces`]).
+fn forget_deleted(index: &mut WorkspacesIndex, workspaces: &Path) {
+    index
+        .workspaces
+        .retain(|meta| !rescue::marked_deleted_in(workspaces, meta.id));
+    if index
+        .current
+        .is_some_and(|id| !index.workspaces.iter().any(|meta| meta.id == id))
+    {
+        index.current = index.workspaces.first().map(|meta| meta.id);
+    }
 }
 
 #[cfg(test)]
@@ -826,6 +874,40 @@ mod tests {
 
         // Re-running is idempotent (index already exists).
         assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_workspace_marked_deleted_is_not_listed_again() {
+        let base = std::env::temp_dir().join(format!("muxel-store-test-marked-{}", Uuid::new_v4()));
+        let kept = Uuid::new_v4();
+        let doomed = Uuid::new_v4();
+        let index = WorkspacesIndex {
+            workspaces: vec![
+                WorkspaceMeta {
+                    id: kept,
+                    name: "kept".into(),
+                },
+                WorkspaceMeta {
+                    id: doomed,
+                    name: "doomed".into(),
+                },
+            ],
+            current: Some(doomed),
+        };
+        save_workspaces_index_to(&base.join("workspaces.json"), &index).unwrap();
+        // Deleting it got as far as its marker before muxel stopped.
+        std::fs::create_dir_all(base.join("workspaces").join(doomed.to_string())).unwrap();
+        std::fs::write(
+            base.join("workspaces").join(format!("{doomed}.deleted")),
+            "",
+        )
+        .unwrap();
+
+        let index = migrate_workspaces_at(&base);
+        let listed: Vec<Uuid> = index.workspaces.iter().map(|w| w.id).collect();
+        assert_eq!(listed, vec![kept], "the deleted workspace stays deleted");
+        assert_eq!(index.current, Some(kept));
         let _ = std::fs::remove_dir_all(&base);
     }
 
