@@ -211,6 +211,46 @@ fn a_diff_pane_shown_after_a_change_refreshes_at_once() {
     });
 }
 
+/// The workspace selector and the terms screen take the place of the main
+/// window's panes, so a diff pane under either runs no git, and refreshes as
+/// soon as it's back.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_diff_pane_under_the_workspace_selector_or_terms_starts_no_git() {
+    type Cover = fn(&mut MuxelApp, bool);
+    let covers: [(&str, Cover); 2] = [
+        ("workspace selector", |app, on| {
+            app.show_workspace_selector = on
+        }),
+        ("terms", |app, on| app.show_terms = on),
+    ];
+    for (name, cover) in covers {
+        with_app(|cx, main, fx| {
+            let b = open_diff(cx, main, fx, &fx.b);
+            let set = |cx: &mut TestAppContext, on| {
+                main.update(cx, |app, _, cx| {
+                    cover(app, on);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            };
+            set(cx, true);
+            add_line(&fx.b);
+            assert_eq!(launches_while(|| tick(cx)), 0, "{name}: no git");
+            assert!(!diff_text(cx, main, b).contains("+second"), "{name}");
+            // Frames only: the timer doesn't tick.
+            set(cx, false);
+            assert!(
+                diff_text(cx, main, b).contains("+second"),
+                "{name}: back on screen, it refreshes at once"
+            );
+        });
+    }
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",

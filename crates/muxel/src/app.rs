@@ -16487,15 +16487,22 @@ impl MuxelApp {
             || cx.has_active_drag()
     }
 
+    /// Whether the main window draws none of its panes: a hotbar view, the
+    /// workspace selector or the terms screen takes their place.
+    fn main_panes_covered(&self) -> bool {
+        self.main_view_replaced() || self.show_workspace_selector || self.show_terms
+    }
+
     /// The instances whose pane content is on screen in a pane layout: the shown
-    /// tab of each tab group in the main window's active project (unless a full
-    /// view replaces its panes) and in each secondary (per-monitor) window's
-    /// project, respecting maximize as render does. Pop-outs aren't included.
+    /// tab of each tab group in the main window's active project (unless
+    /// [`Self::main_panes_covered`]) and in each secondary (per-monitor)
+    /// window's project, respecting maximize as render does. Pop-outs aren't
+    /// included.
     fn shown_layout_tabs(&self) -> Vec<Uuid> {
         let main = self
             .workspace
             .active()
-            .filter(|_| !self.main_view_replaced());
+            .filter(|_| !self.main_panes_covered());
         main.into_iter()
             .chain(
                 self.secondary_windows
@@ -16507,8 +16514,9 @@ impl MuxelApp {
             .collect()
     }
 
-    /// Browser instances whose pane content is actually on screen: the shown tab
-    /// of each leaf in the active project (respecting maximize + dashboard).
+    /// Browser instances whose pane content is actually on screen: those among
+    /// [`Self::shown_layout_tabs`], in the main window and in secondary windows
+    /// alike. None while a hotbar view replaces the main window's panes.
     fn visible_browser_ids(&self) -> Vec<Uuid> {
         if self.browsers.is_empty() || self.main_view_replaced() {
             return Vec::new();
