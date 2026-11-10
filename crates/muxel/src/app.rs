@@ -21447,21 +21447,18 @@ impl MuxelApp {
     }
 
     /// Rebuild any editors awaiting re-dock into the main window. Called from
-    /// `render`, which holds the main window.
-    fn drain_editor_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Editors whose project moved back to this window: rebuild the view only
-        // (the instance never left its layout).
-        if !self.pending_editor_rebuild.is_empty() {
-            let config = self.editor_config();
-            for (iid, snap) in std::mem::take(&mut self.pending_editor_rebuild) {
-                let ed = snap.build(config.clone(), window, cx);
-                self.editors.insert(iid, ed);
-            }
-        }
-        if self.pending_editor_redock.is_empty() {
-            return;
+    /// `render`, which holds the main window. Returns whether it built any.
+    fn drain_editor_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.pending_editor_rebuild.is_empty() && self.pending_editor_redock.is_empty() {
+            return false;
         }
         let config = self.editor_config();
+        // Editors whose project moved back to this window: rebuild the view only
+        // (the instance never left its layout).
+        for (iid, snap) in std::mem::take(&mut self.pending_editor_rebuild) {
+            let ed = snap.build(config.clone(), window, cx);
+            self.editors.insert(iid, ed);
+        }
         for (iid, snap, redock) in std::mem::take(&mut self.pending_editor_redock) {
             let ed = snap.build(config.clone(), window, cx);
             self.editors.insert(iid, ed);
@@ -21469,6 +21466,7 @@ impl MuxelApp {
                 self.redock_into_layout(iid, pid, redock, cx);
             }
         }
+        true
     }
 
     /// Rebuild any browsers awaiting re-dock into the main window. Called from
@@ -35507,8 +35505,14 @@ impl Render for MuxelApp {
         }
         // Rebuild any editors/browsers awaiting re-dock (needs the main window).
         let prep = ui_profile::region_scope(ui_profile::Region::Prep);
-        self.drain_editor_redocks(window, cx);
+        let rebuilt_editors = self.drain_editor_redocks(window, cx);
         self.drain_browser_redocks(window, cx);
+        // The check above ran before these editors existed, and their notify
+        // while drawing brings no next frame. Without a second look, a diff
+        // docked back shows its old text until the timer.
+        if rebuilt_editors {
+            self.sync_diff_visibility(cx);
+        }
         drop(prep);
 
         // The title bar shows the active *workspace* name (next to "muxel"), not
