@@ -1761,7 +1761,9 @@ feature is added or changed, update the matching entry here in the same change**
   leaves the list, then deletes what it kept; a rescue write still on its way
   deletes what it wrote once it lands. Whatever a crash or a failed delete
   leaves behind is deleted the next time muxel opens a workspace. A workspace
-  open in another muxel window isn't deleted and stays listed. Settings →
+  open in another muxel window isn't deleted and stays listed. One another
+  window deleted never opens from a list shown before then: the feed says it
+  was deleted, and it leaves the list. Settings →
   **Keep unsent prompts and unsaved editor changes** (on by default) turns it
   off and deletes what every workspace kept, reporting any folder it couldn't
   read; other muxel windows on the same data stop saving too, and while it is

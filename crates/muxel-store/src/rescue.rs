@@ -142,7 +142,7 @@ pub(crate) fn marked_deleted_in(workspaces: &Path, workspace: Uuid) -> bool {
     deleted_marker(&workspaces.join(workspace.to_string())).exists()
 }
 
-fn remove_tree(dir: &Path) {
+pub(crate) fn remove_tree(dir: &Path) {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -712,12 +712,14 @@ fn read_backup(path: &Path) -> Option<EditorBackup> {
 #[derive(Debug)]
 pub struct WorkspaceDeletion {
     dir: PathBuf,
-    lock: Option<std::fs::File>,
+    lock: std::fs::File,
 }
 
 /// Hold workspace `workspace` for deleting. `held` is the lock this window
 /// already holds on it (its current workspace); otherwise the lock is taken
 /// here, and refused while another muxel window has the workspace open.
+/// Even a workspace never opened is locked: a window opening it at the same
+/// moment then either finds it marked or keeps the deletion from starting.
 pub fn hold_workspace_for_deletion(
     workspace: Uuid,
     held: Option<std::fs::File>,
@@ -729,28 +731,26 @@ pub fn hold_workspace_for_deletion(
 fn hold_in(root: &Path, workspace: Uuid, held: Option<std::fs::File>) -> Result<WorkspaceDeletion> {
     let dir = root.join(workspace.to_string());
     let lock = match held {
-        Some(lock) => Some(lock),
-        None if dir.exists() => {
-            Some(crate::try_lock_dir(&dir).context("it is open in another muxel window")?)
-        }
-        None => None,
+        Some(lock) => lock,
+        None => crate::try_lock_dir(&dir).context("it is open in another muxel window")?,
     };
     Ok(WorkspaceDeletion { dir, lock })
 }
 
 impl WorkspaceDeletion {
     /// Record that the workspace is being deleted, before anything else about
-    /// it changes. From here on it is never listed again, a rescue write
-    /// still on its way deletes what it lands, and the sweep when a
-    /// workspace next opens deletes whatever is left, so a crash before
-    /// [`Self::delete`] finishes strands nothing.
+    /// it changes. From here on muxel never lists it when it starts, a
+    /// window that still lists it can't open it, a rescue write still on its
+    /// way deletes what it lands, and the sweep when a workspace next opens
+    /// deletes whatever is left, so a crash before [`Self::delete`] finishes
+    /// strands nothing.
     pub fn mark(&self) -> Result<()> {
         write_private(&deleted_marker(&self.dir), b"", 0, &Stops::default())
             .context("marking the workspace deleted")
     }
 
     /// Give back the lock this held, deleting nothing: marking it failed.
-    pub fn release(self) -> Option<std::fs::File> {
+    pub fn release(self) -> std::fs::File {
         self.lock
     }
 

@@ -11938,11 +11938,21 @@ impl MuxelApp {
             let _phase = ui_profile::phase("workspace", "lock", None);
             muxel_store::try_lock_workspace(id)
         };
-        let Some(lock) = lock else {
-            self.workspace_busy = Some(id);
-            self.show_workspace_selector = true;
-            cx.notify();
-            return;
+        let lock = match lock {
+            muxel_store::WorkspaceLock::Held(lock) => lock,
+            muxel_store::WorkspaceLock::Busy => {
+                self.workspace_busy = Some(id);
+                self.show_workspace_selector = true;
+                cx.notify();
+                return;
+            }
+            // Another window deleted it after this one listed it.
+            muxel_store::WorkspaceLock::Deleted => {
+                self.forget_deleted_workspace(id);
+                self.show_workspace_selector = true;
+                cx.notify();
+                return;
+            }
         };
         self.workspace_busy = None;
         self.finalize_all_closes(cx);
@@ -22076,6 +22086,30 @@ impl MuxelApp {
         true
     }
 
+    /// Workspace `id` was deleted in another muxel window after this one
+    /// listed it: drop it from this window's list and say why it didn't open.
+    fn forget_deleted_workspace(&mut self, id: Uuid) {
+        let name = self
+            .workspaces
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        self.workspaces.workspaces.retain(|w| w.id != id);
+        if self.workspaces.current == Some(id) {
+            self.workspaces.current = self.workspaces.workspaces.first().map(|w| w.id);
+        }
+        if self.workspace_busy == Some(id) {
+            self.workspace_busy = None;
+        }
+        self.add_event(
+            NotifKind::Error,
+            tf("Workspace “{name}” was deleted", &[("name", &name)]),
+            t("Another muxel window deleted it, so it can't be opened.").to_string(),
+        );
+    }
+
     /// Delete a workspace: remove it from the index + delete its workspace file.
     /// Never deletes the last remaining workspace, nor one open in another
     /// muxel window: that one stays listed, to delete once it's closed.
@@ -22098,7 +22132,7 @@ impl MuxelApp {
                     Ok(()) => Ok(deletion),
                     Err(e) => {
                         if current {
-                            self.workspace_lock = deletion.release();
+                            self.workspace_lock = Some(deletion.release());
                         }
                         Err(e)
                     }

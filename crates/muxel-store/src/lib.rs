@@ -210,17 +210,47 @@ pub fn workspace_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspace.json"))
 }
 
-/// Try to take the single-instance lock for one **workspace** (keyed by its id).
-/// Returns the locked file on success — **keep it alive while that workspace is
-/// open** (the OS releases the advisory lock when the file is dropped or the
-/// process exits, even on a crash, so no stale lock survives). `None` means
-/// another muxel already has *this* workspace open, so the caller should refuse
-/// to open it and not clobber its `workspace.json`. Locking is per-workspace, so
-/// two muxel processes can run side by side on different workspaces. A lock the
-/// platform can't support is treated as "available" rather than blocking the user.
-pub fn try_lock_workspace(id: Uuid) -> Option<std::fs::File> {
-    let dir = workspaces_dir()?.join(id.to_string());
-    try_lock_dir(&dir)
+/// What came of trying to lock a workspace to open it.
+#[derive(Debug)]
+pub enum WorkspaceLock {
+    /// Locked. **Keep the file alive while the workspace is open**: the OS
+    /// releases the advisory lock when the file is dropped or the process
+    /// exits, even on a crash, so no stale lock survives.
+    Held(std::fs::File),
+    /// Another muxel already has this workspace open: refuse to open it, and
+    /// don't clobber its `workspace.json`.
+    Busy,
+    /// The workspace was deleted, in another window after this one listed
+    /// it: it must not open again.
+    Deleted,
+}
+
+/// Try to take the single-instance lock for one **workspace** (keyed by its
+/// id). Locking is per-workspace, so two muxel processes can run side by side
+/// on different workspaces. A lock the platform can't support is treated as
+/// "available" rather than blocking the user.
+pub fn try_lock_workspace(id: Uuid) -> WorkspaceLock {
+    match workspaces_dir() {
+        Some(root) => lock_to_open(&root, id),
+        None => WorkspaceLock::Busy,
+    }
+}
+
+fn lock_to_open(root: &Path, id: Uuid) -> WorkspaceLock {
+    let dir = root.join(id.to_string());
+    let Some(lock) = try_lock_dir(&dir) else {
+        return WorkspaceLock::Busy;
+    };
+    // A deletion marks the workspace while holding this lock, so now that it
+    // is held here, either the marker is already there or no deletion
+    // can start until this window lets go.
+    if rescue::marked_deleted_in(root, id) {
+        drop(lock);
+        // Locking recreated the directory the deletion removed.
+        rescue::remove_tree(&dir);
+        return WorkspaceLock::Deleted;
+    }
+    WorkspaceLock::Held(lock)
 }
 
 /// Lock core, parameterized by the workspace dir for testability. Creates the dir

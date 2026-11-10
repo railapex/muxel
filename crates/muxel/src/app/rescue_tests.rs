@@ -1366,7 +1366,10 @@ fn deleting_a_workspace_open_in_another_window_leaves_it_listed() {
             .unwrap();
         let workspace_dir = dir.path().parent().unwrap().to_path_buf();
         // Another muxel window has it open.
-        let elsewhere = muxel_store::try_lock_workspace(busy).expect("lock the workspace");
+        let muxel_store::WorkspaceLock::Held(elsewhere) = muxel_store::try_lock_workspace(busy)
+        else {
+            panic!("lock the workspace");
+        };
         let listed = |app: &MuxelApp| app.workspaces.workspaces.iter().any(|w| w.id == busy);
         window
             .update(cx, |app, _, cx| {
@@ -1394,3 +1397,56 @@ fn deleting_a_workspace_open_in_another_window_leaves_it_listed() {
         assert!(!workspace_dir.exists());
     });
 }
+
+#[test]
+fn a_workspace_another_window_deleted_does_not_open_from_this_ones_list() {
+    with_app(|cx, window| {
+        let gone = saved_workspace("gone");
+        let workspace_dir = muxel_store::rescue::rescue_dir(gone)
+            .unwrap()
+            .path()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let listed = |app: &MuxelApp| app.workspaces.workspaces.iter().any(|w| w.id == gone);
+        let current = window
+            .update(cx, |app, _, _| {
+                app.use_tmux = false;
+                let current = *app.current_workspace.get_or_insert_with(Uuid::new_v4);
+                app.workspaces.workspaces.push(muxel_core::WorkspaceMeta {
+                    id: current,
+                    name: "this one".into(),
+                });
+                app.workspaces.workspaces.push(muxel_core::WorkspaceMeta {
+                    id: gone,
+                    name: "Deleted elsewhere".into(),
+                });
+                current
+            })
+            .unwrap();
+        // Another muxel window deletes it; this one still lists it, and
+        // it is picked from that list.
+        muxel_store::rescue::delete_workspace_dir(gone).unwrap();
+        window
+            .update(cx, |app, window, cx| app.enter_workspace(gone, window, cx))
+            .unwrap();
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(
+                    app.current_workspace,
+                    Some(current),
+                    "this window stays where it was"
+                );
+                assert!(!listed(app), "the deleted workspace leaves the list");
+                assert!(
+                    app.notifications
+                        .iter()
+                        .any(|n| n.title.contains("Deleted elsewhere")),
+                    "the feed says why it didn't open"
+                );
+            })
+            .unwrap();
+        assert!(!workspace_dir.exists(), "nothing of it comes back");
+    });
+}
+
