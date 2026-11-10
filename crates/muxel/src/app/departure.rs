@@ -194,10 +194,16 @@ impl MuxelApp {
 
     /// Each terminal's close facts, if every pane would count down rather than
     /// ask when closed, by the rule a pane close uses, and nothing else would
-    /// be cut short: no pending input, launch, editor move, open file dialog,
-    /// undecided close or unsaved editor. `None` means the exit asks.
+    /// be cut short: no pending input, the app's or any terminal's own (such
+    /// as a preset's instructions waiting out their startup delay), launch,
+    /// editor move, open file dialog, undecided close or unsaved editor.
+    /// `None` means the exit asks.
     fn quiet_exit_facts(&self, cx: &App) -> Option<Vec<(Uuid, CloseFacts)>> {
         if !self.pending_inputs.pending().is_empty()
+            || self
+                .live_sessions(cx)
+                .iter()
+                .any(|(_, session)| session.pending_input_ops() != 0)
             || !self.restart_settled()
             || self.native_dialogs.get() > 0
             || self
@@ -273,6 +279,8 @@ impl MuxelApp {
         let Some(countdown) = self.exit_countdown.take() else {
             return;
         };
+        // This runs inside the countdown's own timer task, which ends once it
+        // returns; dropping the task here would cancel the running code.
         countdown.task.detach();
         if self.quiet_exit_facts(cx).as_ref() == Some(&countdown.facts) {
             self.confirm_exit(countdown.kind, cx);
@@ -290,10 +298,14 @@ impl MuxelApp {
     /// The countdown's Quit now or Restart now, or a second Quit asked for
     /// during it.
     pub(super) fn exit_now(&mut self, cx: &mut Context<Self>) {
-        if let Some(countdown) = self.exit_countdown.take() {
-            countdown.task.detach();
-            self.confirm_exit(countdown.kind, cx);
-        }
+        let Some(countdown) = self.exit_countdown.take() else {
+            return;
+        };
+        // Dropping it cancels its timer. Left running, the timer would tick a
+        // countdown started after this exit gave up, and end it early.
+        let kind = countdown.kind;
+        drop(countdown);
+        self.confirm_exit(kind, cx);
     }
 
     /// Every confirmed Quit and Restart comes through here.
@@ -524,34 +536,17 @@ impl MuxelApp {
         }
     }
 
-    /// The Restart's one save, and its last write. It writes the workspace's
-    /// bytes, then checks that the workspace still serializes to them, so the
-    /// new version loads what this one holds.
+    /// The Restart's one save, and its last write, so the new version loads
+    /// what this one holds.
     fn save_for_departure(&mut self) -> Result<(), Abort> {
         let failed = || Abort::Failed(t("The workspace couldn't be saved.").to_string());
         let Some(id) = self.current_workspace else {
             return Ok(());
         };
         let path = self.workspace_doc_path(id).ok_or_else(failed)?;
-        let json = match muxel_store::workspace_json(&self.workspace) {
-            Ok(json) => json,
-            Err(error) => {
-                self.note_workspace_save(&path, Err(error));
-                return Err(failed());
-            }
-        };
-        let written = muxel_store::write_workspace_json(&path, &json);
+        let written = muxel_store::save_workspace_to(&path, &self.workspace);
         if !self.note_workspace_save(&path, written) {
             return Err(failed());
-        }
-        #[cfg(test)]
-        if let Some(hook) = self.after_departure_save {
-            hook(self);
-        }
-        if muxel_store::workspace_json(&self.workspace).ok().as_ref() != Some(&json) {
-            return Err(Abort::Failed(
-                t("The workspace changed as it was saved.").to_string(),
-            ));
         }
         Ok(())
     }

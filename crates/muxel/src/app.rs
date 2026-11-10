@@ -3469,9 +3469,7 @@ pub fn register_actions(cx: &mut App) {
                     }
                     this.confirm_exit(kind, cx);
                 } else if this.show_terms || this.show_workspace_selector {
-                    // Quit outright when there's nothing to confirm: the
-                    // first-run screens (nothing running yet).
-                    this.confirm_exit(departure::ExitKind::Quit, cx);
+                    this.quit_from_entry_screen(cx);
                 } else {
                     this.ask_exit(departure::ExitKind::Quit, cx);
                     // The confirmation renders in the main window, which may be
@@ -6118,9 +6116,6 @@ pub struct MuxelApp {
     /// Where tests save the workspace document instead of the data dir.
     #[cfg(test)]
     test_doc_path: Option<PathBuf>,
-    /// Runs between a Restart's save and its check of what it saved.
-    #[cfg(test)]
-    after_departure_save: Option<fn(&mut MuxelApp)>,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
     /// reset each time the dialog opens).
     quit_kill_tmux_local: bool,
@@ -8353,8 +8348,6 @@ impl MuxelApp {
             exit_countdown: None,
             #[cfg(test)]
             test_doc_path: None,
-            #[cfg(test)]
-            after_departure_save: None,
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
             show_keys: false,
@@ -25991,7 +25984,7 @@ impl MuxelApp {
                     .border_color(cx.theme().border)
                     .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
                         cx.listener(|this, _e, _w, cx| {
-                            this.confirm_exit(departure::ExitKind::Quit, cx);
+                            this.quit_from_entry_screen(cx);
                         }),
                     ))
                     .child(
@@ -26163,7 +26156,7 @@ impl MuxelApp {
                         .ghost()
                         .label(t("Quit"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.confirm_exit(departure::ExitKind::Quit, cx);
+                            this.quit_from_entry_screen(cx);
                         })),
                 )
                 .children(self.current_workspace.is_some().then(|| {
@@ -26171,10 +26164,7 @@ impl MuxelApp {
                         .ghost()
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.workspace_busy = None;
-                            this.cancel_close_departure();
-                            this.show_workspace_selector = false;
-                            cx.notify();
+                            this.leave_workspace_selector(cx);
                         }))
                 })),
         );
@@ -28492,9 +28482,32 @@ impl MuxelApp {
     /// [`Self::render_secondary_titlebar`] instead.
     fn render_minimal_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Self::minimal_titlebar().on_close_window(cx.listener(|this, _ev, _window, cx| {
-            // Nothing is running yet — quit directly (no confirm needed).
-            this.confirm_exit(departure::ExitKind::Quit, cx);
+            this.quit_from_entry_screen(cx);
         }))
+    }
+
+    /// Quit from the terms or workspace-selector screen. With no workspace
+    /// loaded nothing runs yet, so it quits at once. Over a loaded workspace,
+    /// as when switching workspaces, the selector closes and the Quit counts
+    /// down or asks like any other.
+    pub(super) fn quit_from_entry_screen(&mut self, cx: &mut Context<Self>) {
+        if self.current_workspace.is_none() {
+            self.confirm_exit(departure::ExitKind::Quit, cx);
+            return;
+        }
+        if self.show_workspace_selector {
+            self.leave_workspace_selector(cx);
+        }
+        self.ask_exit(departure::ExitKind::Quit, cx);
+    }
+
+    /// Close the workspace selector opened over a loaded workspace, as its
+    /// Cancel does.
+    fn leave_workspace_selector(&mut self, cx: &mut Context<Self>) {
+        self.workspace_busy = None;
+        self.cancel_close_departure();
+        self.show_workspace_selector = false;
+        cx.notify();
     }
 
     /// The title bar for a popped-out project window: a sidebar toggle plus the app

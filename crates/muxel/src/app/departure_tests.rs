@@ -13,8 +13,10 @@ use super::pending_input::PendingKind;
 use super::popout_lifecycle_tests::with_app;
 use super::recoverable_close::CloseDeparture;
 use crate::update::RelaunchPlan;
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{AppContext, TestAppContext, WindowHandle};
 use muxel_core::control::ErrorCode;
+use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -96,7 +98,8 @@ fn send_waiting_for_enter(
 
 /// v8's first case. A Restart whose new version fails to start gives up: every
 /// hold goes and the app takes input again. The send it interrupted while it
-/// waited for its Enter wakes after that, and still never presses Enter.
+/// waited for its Enter never presses Enter, whether it answers before the
+/// Restart gives up or after.
 #[test]
 fn a_restart_that_fails_to_start_leaves_its_interrupted_send_cancelled() {
     with_app(|cx, window| {
@@ -121,10 +124,6 @@ fn a_restart_that_fails_to_start_leaves_its_interrupted_send_cancelled() {
         assert!(event.contains("Restart failed"), "{event}");
         assert!(event.contains("no such program"), "{event}");
         assert!(event.contains("won't resume"), "{event}");
-        assert!(
-            first.try_recv().is_err(),
-            "the send answered before the Restart gave up"
-        );
         // The holds are gone.
         assert!(session.accepts_input_epoch(session.input_epoch()));
 
@@ -580,41 +579,39 @@ fn a_restart_saves_last_and_writes_nothing_once_the_new_version_starts() {
     });
 }
 
-const CHANGED: Uuid = Uuid::from_u128(0x5b);
-
-/// The Restart checks that it saved the workspace it holds. A change between
-/// its save and that check makes it give up, and the saves it held then run.
+/// A Restart that gives up before its own save, here at its settling wait,
+/// writes the saves it held while it prepared.
 #[test]
-fn a_restart_whose_workspace_changes_as_it_saves_gives_up() {
+fn a_restart_that_gives_up_writes_the_saves_it_held() {
     with_app(|cx, window| {
-        let doc = TestDoc::new("changed");
+        let doc = TestDoc::new("held");
+        let during = Uuid::new_v4();
         window
             .update(cx, |app, _, cx| {
                 ready(app);
+                stuck_launch(app);
                 app.relaunch = must_not_start;
                 app.test_doc_path = Some(doc.0.clone());
                 app.current_workspace = Some(Uuid::new_v4());
-                app.after_departure_save = Some(|app| mark(app, CHANGED));
                 app.confirm_exit(ExitKind::Restart, cx);
+                mark(app, during);
+                app.persist();
             })
             .unwrap();
+        assert!(
+            doc.read().is_none(),
+            "a save ran while the Restart prepared"
+        );
         run_until(cx, window, "the Restart never gave up", |app| {
             app.departing.is_none()
         });
         window
-            .update(cx, |app, _, _| {
-                assert!(
-                    last_event(app).contains("changed as it was saved"),
-                    "{}",
-                    last_event(app)
-                );
-                app.current_workspace = None;
-            })
+            .update(cx, |app, _, _| app.current_workspace = None)
             .unwrap();
-        let saved = doc.read().expect("the workspace was saved");
+        let saved = doc.read().expect("the held save didn't run");
         assert!(
-            saved.project_windows.contains_key(&CHANGED),
-            "the held save didn't run after the Restart gave up"
+            saved.project_windows.contains_key(&during),
+            "the held save lost a change made while the Restart prepared"
         );
     });
 }
@@ -753,5 +750,163 @@ fn a_countdown_that_finds_work_at_its_end_asks() {
             })
             .unwrap();
         drop(sweep);
+    });
+}
+
+/// A terminal whose preset instructions wait out a long startup delay. It
+/// isn't one of the workspace's panes, so only its pending input, not its
+/// own close facts, can make an exit ask.
+fn waiting_startup(
+    app: &mut MuxelApp,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<MuxelApp>,
+) -> Arc<TerminalSession> {
+    let spec = CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        .with_startup_input("rem instructions")
+        .with_startup_delay(600_000);
+    let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+    let pane = Uuid::new_v4();
+    let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+    let session = view.read(cx).session().clone();
+    app.terminals.insert(pane, view);
+    session
+}
+
+/// Instructions a preset or runner holds through its startup delay are
+/// pending input too: one that turns up during the countdown makes it ask.
+#[test]
+fn startup_input_still_waiting_makes_the_countdown_ask() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.relaunch = must_not_start;
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(app.exit_countdown.is_some(), "no countdown");
+            })
+            .unwrap();
+        let session = window.update(cx, waiting_startup).unwrap();
+        cx.run_until_parked();
+        assert_ne!(session.pending_input_ops(), 0, "nothing is waiting");
+        tick_seconds(cx, 5);
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.show_quit_confirm, "it went with startup input waiting");
+                assert_eq!(app.departing, None);
+                app.show_quit_confirm = false;
+            })
+            .unwrap();
+        session.kill();
+    });
+}
+
+/// Quit from the workspace selector opened over a loaded workspace, as when
+/// switching, leaves the selector and asks for a busy pane. It doesn't quit
+/// at once as it does before any workspace is loaded.
+#[test]
+fn quitting_from_the_selector_over_live_work_asks() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, window, cx| {
+                let (_, session) = add_shell(app, None, "selector-quit", window, cx);
+                // Held, so a Quit that went at once can't end the test app.
+                app.close_tmux_kills
+                    .push(cx.background_executor().spawn(std::future::pending::<()>()));
+                app.current_workspace = Some(Uuid::new_v4());
+                app.show_workspace_selector = true;
+                app.quit_from_entry_screen(cx);
+                assert!(!app.show_workspace_selector, "the selector stayed up");
+                assert!(app.show_quit_confirm, "it quit without asking");
+                app.show_quit_confirm = false;
+                session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// Restart now (what a second Quit does too) goes at once and ends the
+/// countdown's timer, so a countdown started after that Restart gave up
+/// keeps its full time.
+#[test]
+fn going_now_ends_the_countdown_and_its_timer() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.relaunch = failing;
+                app.ask_exit(ExitKind::Restart, cx);
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        window
+            .update(cx, |app, _, cx| {
+                app.exit_now(cx);
+                assert!(app.exit_countdown.is_none());
+                assert_eq!(
+                    app.departing,
+                    Some(Stage::Preparing),
+                    "it didn't go at once"
+                );
+            })
+            .unwrap();
+        run_until(cx, window, "the Restart never gave up", |app| {
+            app.departing.is_none()
+        });
+        window
+            .update(cx, |app, _, cx| {
+                app.ask_exit(ExitKind::Restart, cx);
+                assert_eq!(app.exit_countdown.as_ref().map(|c| c.left), Some(5));
+            })
+            .unwrap();
+        // Past the first countdown's next tick, short of the second's.
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        window
+            .update(cx, |app, _, cx| {
+                assert_eq!(
+                    app.exit_countdown.as_ref().map(|c| c.left),
+                    Some(5),
+                    "the first countdown's timer ticked the second"
+                );
+                app.cancel_exit_countdown(cx);
+            })
+            .unwrap();
+    });
+}
+
+/// A Restart asked for during a Quit's countdown takes it over and keeps its
+/// time.
+#[test]
+fn a_restart_takes_over_a_quits_countdown() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.ask_exit(ExitKind::Quit, cx);
+                assert_eq!(
+                    app.exit_countdown.as_ref().map(|c| c.kind),
+                    Some(ExitKind::Quit)
+                );
+            })
+            .unwrap();
+        tick_seconds(cx, 2);
+        window
+            .update(cx, |app, _, cx| {
+                app.ask_exit(ExitKind::Restart, cx);
+                let countdown = app.exit_countdown.as_ref().expect("the countdown ended");
+                assert_eq!(
+                    countdown.kind,
+                    ExitKind::Restart,
+                    "the Restart didn't take over"
+                );
+                assert_eq!(countdown.left, 3, "taking over reset the countdown");
+                // Cancelled before its end: a Quit would end the test app.
+                app.cancel_exit_countdown(cx);
+            })
+            .unwrap();
     });
 }

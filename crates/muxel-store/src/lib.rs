@@ -291,22 +291,13 @@ pub fn load_workspace_from(path: &Path) -> Option<Workspace> {
 
 /// Save a workspace to an explicit path, atomically (temp file + rename).
 pub fn save_workspace_to(path: &Path, workspace: &Workspace) -> Result<()> {
-    write_workspace_json(path, &workspace_json(workspace)?)
-}
-
-/// The bytes [`save_workspace_to`] writes for `workspace`.
-pub fn workspace_json(workspace: &Workspace) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(workspace).context("serializing workspace")
-}
-
-/// Write serialized workspace `json` to `path`, atomically (temp file + rename).
-pub fn write_workspace_json(path: &Path, json: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating data dir {}", parent.display()))?;
     }
+    let json = serde_json::to_string_pretty(workspace).context("serializing workspace")?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }

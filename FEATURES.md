@@ -1694,8 +1694,8 @@ feature is added or changed, update the matching entry here in the same change**
   dictation, an upload not yet pasted, a wake sweep. When every terminal would
   close into Undo rather than ask and nothing is pending, Quit and Restart count
   down 5 s instead, with Cancel and **Quit now** (or **Restart now**). If
-  anything turned busy by the end, they ask. The tray's Quit and the first-run
-  screens' Quit still quit at once.
+  anything turned busy by the end, they ask. The tray's Quit, and Quit before a
+  workspace is loaded, still quit at once.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
