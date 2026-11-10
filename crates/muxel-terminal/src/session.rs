@@ -14,7 +14,7 @@ use crate::profile;
 use crate::program_status::{
     Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
 };
-use crate::replies::{ImmediateReplies, Replies};
+use crate::replies::{GridSize, ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{
@@ -39,6 +39,10 @@ use uuid::Uuid;
 mod input_hold;
 pub(crate) use input_hold::InputGate;
 use input_hold::{ShellMarks, ShellPrompt};
+
+#[cfg(all(test, unix))]
+#[path = "unix_shell_idle_tests.rs"]
+mod unix_shell_idle_tests;
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -727,6 +731,9 @@ pub struct CommandSpec {
     pub binding: LaunchBinding,
     /// Whether the command actually resumes an existing provider conversation.
     pub launch_resumed: bool,
+    /// Most memory, in bytes, each process in the pane's local tree may
+    /// commit (Windows; see [`crate::pane_job`]). `None` = no limit.
+    pub memory_limit: Option<u64>,
 }
 
 impl CommandSpec {
@@ -758,6 +765,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -785,6 +793,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -865,6 +874,11 @@ impl CommandSpec {
 
     pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
         self.tmux_input = Some(route);
+        self
+    }
+
+    pub fn with_memory_limit(mut self, bytes: Option<u64>) -> Self {
+        self.memory_limit = bytes;
         self
     }
 }
@@ -1251,6 +1265,9 @@ pub struct TerminalSession {
     /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
+    /// `exec` can replace the shell without changing its pid or foreground group.
+    #[cfg(unix)]
+    child_identity: Option<crate::process_tree_unix::ProcessIdentity>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
     /// Current root OSC 7501 report from this PTY launch. Child-id records do
@@ -1279,6 +1296,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// What the reader thread reports for `CSI 18 t`; see [`GridSize`].
+    grid_size: Arc<GridSize>,
     /// A resize away and back still invalidates a controller's input-frame proof.
     resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
@@ -1340,6 +1359,11 @@ pub struct TerminalSession {
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    /// The job this pane's local process tree runs in, when it has a memory
+    /// limit (see [`crate::pane_job`]). Dropped after the child is killed;
+    /// processes still in it keep running.
+    #[cfg(windows)]
+    pane_job: Option<crate::pane_job::PaneJob>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1581,8 +1605,45 @@ impl TerminalSession {
         // program or argv that Muxel resolved.
         apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
+        // Use the PTY's PATH/cwd resolution before a startup command can exec
+        // something else; that replacement must not become the trusted image.
+        #[cfg(unix)]
+        let expected_executable = builder
+            .as_command()
+            .ok()
+            .and_then(|command| std::fs::canonicalize(command.get_program()).ok());
+        // The job is created before the child so the child starts inside it.
+        #[cfg(windows)]
+        let pane_job = spec
+            .memory_limit
+            .and_then(|limit| match crate::pane_job::PaneJob::create(limit) {
+                Ok(job) => Some(job),
+                Err(err) => {
+                    log::warn!(
+                        "pane memory limit: couldn't create the job object, starting `{program_name}` without a limit: {err}"
+                    );
+                    None
+                }
+            });
+        #[cfg(windows)]
+        if let Some(job) = &pane_job {
+            builder.set_job_object(job.spawn_handle());
+        }
+
         let phase = std::time::Instant::now();
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        // portable-pty retries without a job Windows refused; only a child
+        // really inside it is limited.
+        #[cfg(windows)]
+        let pane_job = pane_job.filter(|job| {
+            let inside = child.as_raw_handle().is_some_and(|process| job.contains(process));
+            if !inside {
+                log::warn!(
+                    "pane memory limit: Windows refused the job object, `{program_name}` runs without a limit"
+                );
+            }
+            inside
+        });
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1594,6 +1655,13 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
+        #[cfg(unix)]
+        let child_identity =
+            child_pid
+                .zip(expected_executable.as_deref())
+                .and_then(|(pid, expected)| {
+                    crate::process_tree_unix::ProcessIdentity::capture(pid, expected)
+                });
         let killer = Arc::new(Mutex::new(child.clone_killer()));
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let reader_wake = ReaderWake::new(&*pair.master, &tx.queue_state())?;
@@ -1694,8 +1762,13 @@ impl TerminalSession {
         if matches!(&spec.binding, LaunchBinding::Known(_)) {
             program_status.lock().adopt_binding(1);
         }
-        let immediate_replies =
-            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
+        let grid_size = Arc::new(GridSize::new(cols, rows));
+        let immediate_replies = ImmediateReplies::new(
+            replies.clone(),
+            palette.clone(),
+            grid_size.clone(),
+            &term_config,
+        );
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1801,6 +1874,8 @@ impl TerminalSession {
             shell_prompt,
             input_stop: write_tx,
             child_pid,
+            #[cfg(unix)]
+            child_identity,
             title,
             evidence,
             program_status,
@@ -1814,6 +1889,7 @@ impl TerminalSession {
             mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
+            grid_size,
             resize: Mutex::new(ResizeState {
                 applied: (cols, rows),
                 target: (cols, rows),
@@ -1845,6 +1921,8 @@ impl TerminalSession {
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            #[cfg(windows)]
+            pane_job,
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2181,6 +2259,17 @@ impl TerminalSession {
         } else {
             false
         }
+    }
+
+    /// Whether the latest paint drew the screen as it is now. For app tests,
+    /// which can't see the generation the paint path checks.
+    #[doc(hidden)]
+    pub fn painted_current_screen(&self) -> bool {
+        let current = self.content_generation();
+        self.paint_list
+            .lock()
+            .as_ref()
+            .is_some_and(|list| list.content_gen == current)
     }
 
     /// Whether the child has produced any output yet.
@@ -2704,6 +2793,7 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
+        self.grid_size.set(cols, rows);
         if let Some(master) = self.master.inner.lock().as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -3203,6 +3293,42 @@ impl TerminalSession {
         self.child_pid
     }
 
+    /// The per-process memory limit, in bytes, this pane's local processes
+    /// actually run under. `None` when the pane has none: none was asked for,
+    /// or Windows couldn't apply it (logged at launch), or not on Windows.
+    #[cfg(windows)]
+    pub fn memory_limit(&self) -> Option<u64> {
+        self.pane_job
+            .as_ref()
+            .map(crate::pane_job::PaneJob::limit_bytes)
+    }
+
+    #[cfg(not(windows))]
+    pub fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Processes in this pane that reached its memory limit since the last
+    /// call, once each is ready to report (see [`crate::MemoryLimitHit`]).
+    /// Windows reports these on a best-effort basis, so one can be missing.
+    #[cfg(windows)]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        self.pane_job
+            .as_ref()
+            .map(|job| job.take_hits(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(windows))]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        Vec::new()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn pane_job(&self) -> Option<&crate::pane_job::PaneJob> {
+        self.pane_job.as_ref()
+    }
+
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
     /// on the system clipboard (this crate has no gpui context of its own here).
     pub(crate) fn take_clipboard_stores(&self) -> Vec<(ClipboardType, String)> {
@@ -3243,15 +3369,17 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child is sitting idle at its prompt with no foreground command
-    /// running — i.e. the terminal's foreground process group *is* the child
-    /// itself. A shell that's running `vim`/`make`/etc. puts that command in a new
-    /// foreground group, so this returns `false`. Used to skip the close
-    /// confirmation for an untouched shell pane.
+    /// Whether the child owns the foreground group, has no children in its own
+    /// session and still runs its original executable or another interactive
+    /// shell it exec'd into. Background jobs and other
+    /// executable changes keep the pane busy even if its prompt marks remain.
+    /// A child in a session of its own, on a terminal of its own, such as
+    /// zsh's zpty worker, doesn't count. Used to skip the close confirmation
+    /// for an untouched shell pane.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown child
-    /// pid, or a platform without `tcgetpgrp` (Windows) — so callers stay safe and
-    /// confirm as usual.
+    /// pid, an unverified executable, a failed child lookup, or no `tcgetpgrp`
+    /// — so callers stay safe and confirm as usual.
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
         {
@@ -3263,7 +3391,14 @@ impl TerminalSession {
                     .and_then(|master| master.process_group_leader()),
                 self.child_pid,
             ) {
-                (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
+                (Some(fg), Some(pid)) => {
+                    fg == pid as libc::pid_t
+                        && crate::process_tree_unix::shell_has_no_session_children(pid)
+                        && self
+                            .child_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.still_matches(pid))
+                }
                 _ => false,
             }
         }
@@ -3271,6 +3406,13 @@ impl TerminalSession {
         {
             false
         }
+    }
+
+    /// [`Self::is_idle_foreground`] where the platform can check it; None on
+    /// Windows, which has no foreground group to ask. The close policy
+    /// (`shell_close_evidence`) decides what each means.
+    pub fn foreground_idle(&self) -> Option<bool> {
+        cfg!(unix).then(|| self.is_idle_foreground())
     }
 
     /// Kill the child process. On Unix this sends SIGHUP, at most once per

@@ -111,7 +111,8 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
-    /// Open a terminal in a project's active tab group.
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
     New {
         project: String,
         #[serde(flatten)]
@@ -494,8 +495,9 @@ pub struct AgentInfo {
     /// What the agent's own screen says is still running beside its turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<BackgroundWork>,
-    /// The turn is over and only `background` keeps the pane Working. `wait --turn`
-    /// stops here.
+    /// The foreground turn is over with background work still listed. Only
+    /// subagents hold the pane Working; shells and monitors remain metadata.
+    /// `wait --turn` stops here even during a subagent hold.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_over: bool,
     /// A startup task that failed before provider acceptance. The terminal itself
@@ -1361,7 +1363,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1379,7 +1381,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result. --turn stops at an observable turn end even if background work remains; it cannot override a provider still reporting Working."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
@@ -1740,8 +1742,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
-  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
@@ -1883,11 +1887,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   a pending Enter never authorizes another.
   An unconfirmed receipt requires inspecting `screen` before more input.
 - `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
-  turn and any background work it left have finished (or it blocks on a question,
-  or exits), then print what `show` prints. A turn that ends beside a running shell
-  or subagent usually wakes when that work ends, so plain `wait` returns the reply
-  after it. `--turn` stops at the turn's end instead. Either way `wait.background`
-  lists anything still running.
+  turn and any subagent hold have finished (or it blocks on a question, or exits),
+  then print what `show` prints. Shell and monitor listings do not delay completion;
+  they remain visible in `wait.background`. Subagents hold a finished turn for at
+  most three hours. `--turn` stops at an observable foreground turn end instead,
+  even during a subagent hold; it cannot override a provider still reporting
+  Working. Either way `wait.background` lists anything still running.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
   our Enter. Codex may receive one extra Enter only while its exact task remains
   on one exact ASCII row in its live idle editor, with no new user row. Wrapped

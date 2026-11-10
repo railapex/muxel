@@ -149,18 +149,47 @@ fn status_paint_defer(held: Option<Instant>, now: Instant) -> Duration {
 /// jamming against it.
 const TERM_INSET: Pixels = px(6.0);
 
+/// The grid, `(cols, rows)`, a terminal view gets when it fills a pane of
+/// `size`, drawn in `font_family` at `font_size` as [`TerminalView::set_config`]
+/// takes them: whole cells inside the [`TERM_INSET`] margin. Lets a launch open
+/// its PTY at the size the terminal will paint at, before any view exists.
+pub fn pane_grid(
+    window: &Window,
+    font_family: &SharedString,
+    font_size: f32,
+    pane: Size<Pixels>,
+) -> (u16, u16) {
+    let font = crate::element::terminal_font(font_family);
+    let (cell_width, line_height) = crate::element::cell_size(window, &font, px(font_size));
+    let margin = TERM_INSET * 2.0;
+    crate::element::grid_in(
+        size(pane.width - margin, pane.height - margin),
+        cell_width,
+        line_height,
+    )
+}
+
 /// Open a link the user ctrl+clicked in a terminal — an `http(s)://` URL or a
 /// `file://` URI for an existing local file. Dispatched by the terminal element
 /// and handled by the app, which routes URLs to the built-in browser (when
 /// enabled) or the OS.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLink(pub String);
+pub struct OpenLink {
+    pub url: String,
+    /// The terminal's instance id. The click that raises the link hasn't
+    /// moved focus to its pane yet, so the focused pane can't stand in for it.
+    pub pane: Uuid,
+}
 
 /// Open a terminal link without moving focus away from the terminal.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLinkBackground(pub String);
+pub struct OpenLinkBackground {
+    pub url: String,
+    /// The terminal's instance id, as in [`OpenLink`].
+    pub pane: Uuid,
+}
 
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
@@ -630,6 +659,12 @@ impl RuntimeStatusState {
             activity_fallback,
             idle,
         );
+        let new_explicit = program_status
+            .explicit_completions
+            .saturating_sub(self.program_explicit_completions);
+        let new_idle = program_status
+            .idle_completions
+            .saturating_sub(self.program_idle_completions);
         let turn_over = match program_root {
             Some(root) => matches!(root.state, ProgramState::Done | ProgramState::Idle),
             None => {
@@ -790,12 +825,6 @@ impl RuntimeStatusState {
                 combine_title_status(exited, base, title, screen_working)
             }
         });
-        let new_explicit = program_status
-            .explicit_completions
-            .saturating_sub(self.program_explicit_completions);
-        let new_idle = program_status
-            .idle_completions
-            .saturating_sub(self.program_idle_completions);
         self.program_explicit_completions = program_status.explicit_completions;
         self.program_idle_completions = program_status.idle_completions;
         // Codex can receive an automated startup prompt before its first UUID
@@ -1356,10 +1385,7 @@ fn provider_screen_read(
             };
             (status, work.background)
         }
-        TitleProvider::Grok => (
-            is_grok_question(screen).then_some(AgentStatus::Blocked),
-            grok_background(screen),
-        ),
+        TitleProvider::Grok => grok_screen_read(screen),
         TitleProvider::Codex => (None, codex_background(screen).0),
         TitleProvider::Muse => (None, muse_background(screen)),
         _ => (None, None),
@@ -1543,7 +1569,7 @@ fn grok_panel_background(screen: &str) -> BackgroundWork {
         }
         match group {
             "Tasks" => work.shells += count,
-            "Subagents" => work.subagents = true,
+            "Subagents" => work.subagents |= count > 0,
             "Watchers" => {
                 work.monitors += items
                     .iter()
@@ -1557,11 +1583,10 @@ fn grok_panel_background(screen: &str) -> BackgroundWork {
     work
 }
 
-fn grok_background(screen: &str) -> Option<BackgroundWork> {
-    let mut work = grok_panel_background(screen);
-    if !work.is_empty() {
-        return Some(work);
-    }
+fn grok_screen_read(screen: &str) -> (Option<AgentStatus>, Option<BackgroundWork>) {
+    let panel = grok_panel_background(screen);
+    let mut work = BackgroundWork::default();
+    let mut foreground = false;
     // Older Grok draws counted rows instead of the panel.
     for line in screen.lines() {
         let counts = live_background_counts(
@@ -1572,13 +1597,22 @@ fn grok_background(screen: &str) -> Option<BackgroundWork> {
         );
         for (count, kind) in counts.into_iter().flatten() {
             match kind.trim_end_matches('s') {
-                "command" => work.shells += count,
+                "command" => {
+                    foreground = true;
+                    work.shells += count;
+                }
                 "monitor" | "loop" => work.monitors += count,
                 _ => work.subagents = true,
             }
         }
     }
-    (!work.is_empty()).then_some(work)
+    let background = if !panel.is_empty() { panel } else { work };
+    let status = if is_grok_question(screen) {
+        Some(AgentStatus::Blocked)
+    } else {
+        foreground.then_some(AgentStatus::Working)
+    };
+    (status, (!background.is_empty()).then_some(background))
 }
 
 /// Grok's unanswered question card, read only while the card's own footer is
@@ -1630,27 +1664,32 @@ struct ClaudeScreenWork {
 fn claude_screen_work(screen: &str) -> ClaudeScreenWork {
     let mut newer_rows = [None, None];
     let mut footer_read = false;
+    let mut footer_proves_empty = false;
     let mut background = None;
     for line in screen.lines().rev() {
         if !footer_read && let Some(listed) = claude_mode_footer(line) {
             footer_read = true;
+            footer_proves_empty = listed.is_none();
             background = listed;
         }
-        if is_claude_live_foreground_row(line) {
+        if is_claude_live_foreground_row(line)
+            || (!footer_proves_empty
+                && live_background_counts(line, &["·"], &["command"], true).is_some())
+        {
             return ClaudeScreenWork {
                 foreground: true,
                 background,
             };
         }
         if !footer_read {
-            let found = claude_live_task_footer(line, newer_rows)
-                .as_deref()
-                .map(claude_task_footer_work)
-                .or_else(|| claude_background_row_work(line));
-            if found.is_some() {
+            if let Some(footer) = claude_live_task_footer(line, newer_rows) {
+                let listed = claude_task_footer_work(&footer);
+                footer_read = true;
+                background = (!listed.is_empty()).then_some(listed);
+            } else if let Some(listed) = claude_background_row_work(line) {
                 return ClaudeScreenWork {
                     foreground: false,
-                    background: found,
+                    background: Some(listed),
                 };
             }
         }
@@ -1706,7 +1745,7 @@ fn claude_task_footer_work(footer: &str) -> BackgroundWork {
             match kind {
                 "shell" | "shells" => work.shells += count,
                 "monitor" | "monitors" => work.monitors += count,
-                _ => work.subagents = true,
+                _ => {}
             }
         }
     }
@@ -1897,18 +1936,14 @@ fn is_claude_elapsed(value: &str) -> bool {
 }
 
 fn claude_background_row_work(line: &str) -> Option<BackgroundWork> {
-    fn total(counts: Vec<(u32, &str)>) -> u32 {
-        counts.into_iter().map(|(count, _)| count).sum()
+    let (activity, summary) = line.trim().rsplit_once(" · ")?;
+    if !activity.trim().starts_with("✻ ") {
+        return None;
     }
-    let shells = live_background_counts(line, &["·"], &["command"], true)
-        .map(total)
-        .or_else(|| {
-            let (activity, summary) = line.trim().rsplit_once(" · ")?;
-            if !activity.trim().starts_with("✻ ") {
-                return None;
-            }
-            live_background_counts(&format!("· {summary}"), &["·"], &["shell"], false).map(total)
-        })?;
+    let shells = live_background_counts(&format!("· {summary}"), &["·"], &["shell"], false)?
+        .into_iter()
+        .map(|(count, _)| count)
+        .sum();
     Some(BackgroundWork {
         shells,
         ..BackgroundWork::default()
@@ -2519,6 +2554,10 @@ pub struct TerminalView {
     /// ([`CURSOR_HIDE_HOLD`]) set, while it is pending. A status repaint from
     /// any path waits for it too, so it can't draw the frame the hold skips.
     paint_hold_until: std::cell::Cell<Option<std::time::Instant>>,
+    /// Which windows display this terminal. See [`DisplayEpoch`].
+    displayed_in: std::cell::RefCell<DisplayStamps>,
+    /// While no window displays it: the facts its last repaint carried.
+    hidden_facts: Option<RenderFacts>,
     _drain: Task<()>,
     _runtime_events: Task<()>,
 }
@@ -3215,6 +3254,64 @@ pub struct TerminalFocusProfile {
     pub notify_pending: bool,
 }
 
+/// A window's render count, for telling which terminals it still displays.
+///
+/// The window advances it at the start of each render, and every terminal that
+/// render displays records the new count ([`TerminalView::mark_displayed`]). A
+/// window that never advances keeps its terminals displayed.
+#[derive(Clone, Default)]
+pub struct DisplayEpoch(std::rc::Rc<std::cell::Cell<u64>>);
+
+impl DisplayEpoch {
+    /// Call at the start of the window's render, before it displays anything.
+    pub fn advance(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+}
+
+/// The windows that displayed a terminal, each with its render count then.
+#[derive(Default)]
+struct DisplayStamps(Vec<(std::rc::Weak<std::cell::Cell<u64>>, u64)>);
+
+impl DisplayStamps {
+    fn record(&mut self, epoch: &DisplayEpoch) {
+        self.0.retain(|(window, _)| window.strong_count() > 0);
+        let count = epoch.0.get();
+        let window = std::rc::Rc::as_ptr(&epoch.0);
+        match self.0.iter_mut().find(|(seen, _)| seen.as_ptr() == window) {
+            Some((_, seen)) => *seen = count,
+            None => self.0.push((std::rc::Rc::downgrade(&epoch.0), count)),
+        }
+    }
+
+    /// Some open window displayed the terminal in its latest render, or hasn't
+    /// rendered since. One that never did counts as not displaying it.
+    fn displayed(&self) -> bool {
+        self.0.iter().any(|(window, count)| {
+            window
+                .upgrade()
+                .is_some_and(|current| current.get() == *count)
+        })
+    }
+}
+
+/// What the app reads from a terminal while rendering its sidebar rows, tab
+/// pills and dashboard, apart from the screen itself. A terminal no window
+/// displays still repaints when one of these changes.
+#[derive(Debug, PartialEq, Eq)]
+struct RenderFacts {
+    /// Advances with every public runtime change (status, reason, completion).
+    /// Input revisions aren't rendered, so typing alone isn't a change.
+    status_seq: u64,
+    submitted_turn: bool,
+    /// The title as the app names a pane by it: an agent's title without its
+    /// lifecycle glyph, so a spinner frame alone isn't a change.
+    title_name: Option<String>,
+    program_name: Option<String>,
+    has_visible_content: bool,
+    exited: bool,
+}
+
 impl Drop for TerminalView {
     fn drop(&mut self) {
         if let Some(startup) = &self.startup_turn {
@@ -3292,9 +3389,12 @@ impl TerminalLaunch {
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
                 let detail = launch_error.replace(['\'', '"', '\n', '\r'], " ");
-                let mut shell = fallback.with_startup_input(format!(
-                    "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
-                ));
+                let mut shell = fallback
+                    .with_startup_input(format!(
+                        "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
+                    ))
+                    // The fallback runs locally in the same pane, under its limit.
+                    .with_memory_limit(spec.memory_limit);
                 if let Some(instance_id) = instance_id {
                     // The fallback is a local program even when the failed command
                     // was ssh or tmux. Give it only its own id, not transport env.
@@ -3857,6 +3957,14 @@ impl TerminalView {
                             view.exit_read_error = info.read_error;
                         }
                         let runtime_changed = view.update_runtime(cx);
+                        // A screen no window shows needs no repaint, unless the
+                        // app's rows, pills or badges read something that changed.
+                        // A window that shows it again draws the current screen:
+                        // GPUI keeps no cached paint for a view its last frame
+                        // didn't draw.
+                        if !stop && view.skip_hidden_repaint() {
+                            return stop;
+                        }
                         // Priority scheduler (see docs/terminal-paint-architecture.md):
                         // Recent input ≫ stream; every throttled batch gets one
                         // trailing-edge notify if no later output arrives.
@@ -3931,6 +4039,8 @@ impl TerminalView {
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
             paint_hold_until: std::cell::Cell::new(None),
+            displayed_in: Default::default(),
+            hidden_facts: None,
             _drain: drain,
             _runtime_events: runtime_event_task,
         };
@@ -4084,6 +4194,48 @@ impl TerminalView {
         self.has_visible_content
     }
 
+    /// Record that the window behind `epoch` displays this terminal in the
+    /// render now running. Every render that displays it must call this.
+    pub fn mark_displayed(&self, epoch: &DisplayEpoch) {
+        self.displayed_in.borrow_mut().record(epoch);
+    }
+
+    /// Whether some window still displays this terminal (see [`DisplayEpoch`]).
+    pub fn is_displayed(&self) -> bool {
+        self.displayed_in.borrow().displayed()
+    }
+
+    /// Whether an output batch can skip its repaint: no window displays the
+    /// terminal, and nothing the app renders from it changed since its last.
+    fn skip_hidden_repaint(&mut self) -> bool {
+        if self.is_displayed() {
+            self.hidden_facts = None;
+            return false;
+        }
+        let facts = self.render_facts();
+        if self.hidden_facts.as_ref() == Some(&facts) {
+            return true;
+        }
+        self.hidden_facts = Some(facts);
+        false
+    }
+
+    fn render_facts(&self) -> RenderFacts {
+        let title = self.session.title();
+        let title_name = match self.title_provider {
+            TitleProvider::Other => title,
+            provider => title.and_then(|title| parse_agent_title(provider, Some(&title))?.name),
+        };
+        RenderFacts {
+            status_seq: self.runtime.snapshot_seq,
+            submitted_turn: self.session.has_submitted_turn(),
+            title_name,
+            program_name: self.program_auto_title(),
+            has_visible_content: self.has_visible_content,
+            exited: self.exited,
+        }
+    }
+
     /// The child's exit code if it has exited and the OS reported one. `None`
     /// while running or when the code is unknown (e.g. a bare PTY close).
     pub fn exit_code(&self) -> Option<i32> {
@@ -4224,6 +4376,13 @@ impl TerminalView {
         }
     }
 
+    /// Current-binding background metadata, without capturing the input state.
+    pub fn background_work(&self) -> Option<BackgroundWork> {
+        self.runtime
+            .background
+            .filter(|_| self.runtime.binding_rev == self.session.binding_revision())
+    }
+
     /// Fresh completion edges observed in this PTY launch. Cached reads do
     /// not advance it; provider binding changes preserve the launch history.
     pub fn launch_completion_revision(&self) -> u64 {
@@ -4326,6 +4485,11 @@ impl TerminalView {
     /// The active mouse copy/paste mode.
     pub fn mouse_mode(&self) -> TerminalMouseMode {
         self.mouse_mode
+    }
+
+    /// The pane (instance) this terminal belongs to.
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Link under the last pointer position, if the terminal grid can resolve one.
@@ -6086,6 +6250,13 @@ mod startup_readiness_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "background_hold_review_tests.rs"]
+mod background_hold_review_tests;
+#[cfg(test)]
+#[path = "background_parser_review_tests.rs"]
+mod background_parser_review_tests;
 
 #[cfg(test)]
 mod tests {
@@ -8946,7 +9117,7 @@ mod provider_switch_tests {
         }
 
         /// Claude reports `done` when a turn ends, whatever the turn left running.
-        /// A Done here would alert and float the pane while it waits on a shell. The
+        /// A Done here would alert and float the pane while it waits on subagents. The
         /// rows are real ones captured from Claude 2.1.318.
         #[test]
         fn a_finished_turn_holds_at_working_beside_background_work() {
@@ -8982,11 +9153,12 @@ mod provider_switch_tests {
             const DONE: &[u8] = b"\x1b]7501;state=done\x07";
             const BUSY: &str = "✻ Brewing… (27m 39s · 12.3k tokens)";
             const RUNNING: &str = "✻ Brewed for 27m 40s · done 5:42 AM · 1 shell still running";
-            const ONE_SHELL: &str = "⏵⏵ auto mode on · 1 shell · ← 4 agents";
+            const BACKGROUND: &str =
+                "⏵⏵ auto mode on · 1 shell · /tasks to see subagents · ← 4 agents";
             const NOTHING: &str = "⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents";
 
-            report(0, BUSY, ONE_SHELL, Some(WORKING));
-            let (held, deadline, now) = report(1, RUNNING, ONE_SHELL, Some(DONE));
+            report(0, BUSY, BACKGROUND, Some(WORKING));
+            let (held, deadline, now) = report(1, RUNNING, BACKGROUND, Some(DONE));
             assert_eq!(held.status, AgentStatus::Working);
             assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
             assert_eq!(held.coverage, TerminalStatusCoverage::ProgramStatus);
@@ -8995,6 +9167,7 @@ mod provider_switch_tests {
                 held.background,
                 Some(BackgroundWork {
                     shells: 1,
+                    subagents: true,
                     ..Default::default()
                 })
             );
@@ -9004,7 +9177,7 @@ mod provider_switch_tests {
                 "the limit needs a wake"
             );
 
-            // The shell ends. The agent gets a moment to wake before this reads done.
+            // The listed work ends. The agent gets a moment to wake before this reads done.
             let (waiting, deadline, now) = report(60, "● Done.", NOTHING, None);
             assert_eq!(waiting.status, AgentStatus::Working);
             assert_eq!(waiting.background, None);
@@ -9021,8 +9194,8 @@ mod provider_switch_tests {
             assert_eq!(finished.completion_revision, 1);
 
             // No wake comes: the release itself is the change of status.
-            report(70, BUSY, ONE_SHELL, Some(WORKING));
-            report(71, RUNNING, ONE_SHELL, Some(DONE));
+            report(70, BUSY, BACKGROUND, Some(WORKING));
+            report(71, RUNNING, BACKGROUND, Some(DONE));
             report(90, "● Done.", NOTHING, None);
             let (released, _, _) = report(96, "● Done.", NOTHING, None);
             assert_eq!(released.status, AgentStatus::Done);
@@ -9034,24 +9207,27 @@ mod provider_switch_tests {
             assert_eq!(stale.background, None);
 
             // A failed turn needs looking at, whatever it left behind.
-            report(110, BUSY, ONE_SHELL, Some(WORKING));
+            report(110, BUSY, BACKGROUND, Some(WORKING));
             let (failed, _, _) =
-                report(111, RUNNING, ONE_SHELL, Some(b"\x1b]7501;state=error\x07"));
+                report(111, RUNNING, BACKGROUND, Some(b"\x1b]7501;state=error\x07"));
             assert_eq!(failed.status, AgentStatus::Done);
             assert_eq!(failed.reason, TerminalStatusReason::ProgramStatusError);
             session.kill();
         }
 
-        /// Every listed kind obeys the cap, including a subagent with no end record.
+        /// Shell and monitor listings finish normally; only subagents get a hold.
         #[test]
-        fn all_listed_background_work_obeys_the_limit() {
+        fn only_subagents_hold_a_finished_turn() {
             use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
             use std::time::Duration;
             let (working, blocked) = builtin();
-            for footer in [
-                "⏵⏵ auto mode on · 1 shell · ← 4 agents",
-                "⏵⏵ auto mode on · 1 monitor · ← 4 agents",
-                "⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · ← 4 agents",
+            for (footer, limited) in [
+                ("⏵⏵ auto mode on · 1 shell · ← 4 agents", true),
+                ("⏵⏵ auto mode on · 1 monitor · ← 4 agents", true),
+                (
+                    "⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · ← 4 agents",
+                    false,
+                ),
             ] {
                 let (session, _receiver) = fixture();
                 let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
@@ -9079,9 +9255,19 @@ mod provider_switch_tests {
                 sample(Duration::ZERO, Some(b"\x1b]7501;state=working\x07"));
                 let ended = Duration::from_secs(1);
                 let held = sample(ended, Some(b"\x1b]7501;state=done\x07"));
-                assert_eq!(held.status, AgentStatus::Working, "{footer}");
+                let status = if limited {
+                    AgentStatus::Done
+                } else {
+                    AgentStatus::Working
+                };
+                assert_eq!(held.status, status, "{footer}");
+                assert_eq!(held.completion_revision, u64::from(limited));
+                assert!(
+                    held.background.is_some(),
+                    "counts remain after foreground completion"
+                );
                 let near = sample(ended + BACKGROUND_HOLD - Duration::from_secs(1), None);
-                assert_eq!(near.status, AgentStatus::Working, "{footer}");
+                assert_eq!(near.status, status, "{footer}");
                 let past = sample(ended + BACKGROUND_HOLD, None);
                 assert_eq!(past.status, AgentStatus::Done, "{footer}");
                 assert_eq!(past.reason, TerminalStatusReason::ProgramStatus(None));
@@ -9090,7 +9276,7 @@ mod provider_switch_tests {
             }
         }
 
-        /// `/clear` and `/resume` switch the conversation while a shell lives on. The
+        /// `/clear` and `/resume` switch the conversation while subagents live on. The
         /// next turn's own report decides. Between turns no title reads Working, the only
         /// thing that would confirm the footer, so nothing else can release the guard.
         #[test]
@@ -9102,7 +9288,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -9178,10 +9364,10 @@ mod provider_switch_tests {
 
         /// A switch leaves no report until the next turn, and between turns no title reads
         /// Working, the only thing that would confirm a footer. So the footer alone must
-        /// not pin the pane busy: its composer is free and the limit still runs.
+        /// not pin the pane busy: shell metadata leaves its composer free immediately.
         #[test]
         fn listed_work_after_a_switch_leaves_the_composer_free() {
-            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use crate::view::BACKGROUND_HOLD;
             use std::time::{Duration, SystemTime};
             let (working, blocked) = builtin();
             let (session, _receiver) = fixture();
@@ -9207,13 +9393,12 @@ mod provider_switch_tests {
                 runtime.snapshot(&session)
             };
             let cleared = sample(Duration::ZERO);
-            assert_eq!(cleared.status, AgentStatus::Working);
-            assert_eq!(
-                cleared.reason,
-                TerminalStatusReason::BackgroundWork,
-                "a send admits on this reason"
+            assert_eq!(cleared.status, AgentStatus::Idle);
+            assert!(
+                cleared.background.is_some(),
+                "current metadata keeps the composer free"
             );
-            assert!(!cleared.attributable);
+            assert_eq!(cleared.completion_revision, 0, "no turn ran");
             let past = sample(BACKGROUND_HOLD + Duration::from_secs(1));
             assert_ne!(past.status, AgentStatus::Working, "a dev server isn't work");
             assert!(past.background.is_some());
@@ -9234,7 +9419,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -9278,7 +9463,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -10067,7 +10252,7 @@ mod provider_switch_tests {
 
         /// The agent's prompt is free once its turn is over, whatever runs beside it.
         #[test]
-        fn background_hold_schedules_the_limit_for_every_work_kind() {
+        fn subagent_hold_wakes_at_its_safety_limit() {
             use crate::view::{BACKGROUND_HOLD, BackgroundHold};
             use muxel_core::control::BackgroundWork;
             use std::time::Duration;
@@ -10081,27 +10266,24 @@ mod provider_switch_tests {
                 ..Default::default()
             };
             let mut hold = BackgroundHold::default();
-            assert_eq!(
-                hold.observe(Some(shell), false, now),
-                (true, Some(now + BACKGROUND_HOLD))
-            );
+            assert_eq!(hold.observe(Some(shell), false, now), (false, None));
             let mut hold = BackgroundHold::default();
             assert_eq!(
                 hold.observe(Some(subagents), false, now),
-                (true, Some(now + BACKGROUND_HOLD))
+                (true, Some(now + BACKGROUND_HOLD)),
             );
             // A new turn restarts the clock: the limit counts from the last finish.
             let mut hold = BackgroundHold::default();
-            hold.observe(Some(shell), false, now);
+            hold.observe(Some(subagents), false, now);
             let later = now + Duration::from_secs(600);
-            assert_eq!(hold.observe(Some(shell), true, later), (false, None));
+            assert_eq!(hold.observe(Some(subagents), true, later), (false, None));
             assert_eq!(
-                hold.observe(Some(shell), false, later),
+                hold.observe(Some(subagents), false, later),
                 (true, Some(later + BACKGROUND_HOLD))
             );
-            // Past the limit nothing is held, so the shell ending changes nothing.
+            // Past the limit nothing is held, so the listing ending changes nothing.
             let past = later + BACKGROUND_HOLD;
-            assert_eq!(hold.observe(Some(shell), false, past), (false, None));
+            assert_eq!(hold.observe(Some(subagents), false, past), (false, None));
             assert_eq!(hold.observe(None, false, past), (false, None));
         }
 
@@ -11390,7 +11572,7 @@ mod provider_switch_tests {
         let mut viewer = Viewer::new(TitleProvider::Grok);
         let clock = viewer.clock;
         let hook = SystemTime::now() - Duration::from_secs(10);
-        let row = "◎ 1 command still running · send a message to interrupt";
+        let row = "v Subagents 1\r\n. Subagent Build\r\n╭─────────────╮\r\n│ >           │\r\n╰─────────────╯\r\nShift+Tab:mode  │  Ctrl+x:shortcuts";
         session.process_drained(&drained(&[(row, hook - Duration::from_secs(3))]));
         session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
         let (snapshot, _) = viewer.sample_at(&session, clock);
@@ -11435,10 +11617,16 @@ mod provider_switch_tests {
             "no old hold expires into Done"
         );
 
-        // A newly drawn row is attributable, so this finished turn holds for it.
-        // Once it goes the agent gets a moment to wake, and its absence may then
-        // complete this submitted turn.
-        session.process_drained(&drained(&[(row, fresh + Duration::from_millis(2))]));
+        // A new turn, retained even when its titles share a read, can hold for
+        // attributable subagents. A redraw alone cannot reopen the released turn.
+        // Once the listing goes the agent gets a moment to wake.
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;⠙ - New - grok\x07\x1b]0;New - grok\x07",
+                fresh + Duration::from_millis(2),
+            ),
+            (row, fresh + Duration::from_millis(3)),
+        ]));
         let seen_at = clock + Duration::from_secs(4);
         let (snapshot, _) = viewer.sample_at(&session, seen_at);
         assert_eq!(snapshot.status, AgentStatus::Working);
@@ -11449,7 +11637,7 @@ mod provider_switch_tests {
         assert!(snapshot.attributable);
         session.process_drained(&drained(&[(
             "\x1b[2J\x1b[H",
-            fresh + Duration::from_millis(3),
+            fresh + Duration::from_millis(4),
         )]));
         let cleared_at = seen_at + Duration::from_millis(60);
         let (snapshot, deadline) = viewer.sample_at(&session, cleared_at);
@@ -12223,5 +12411,39 @@ mod provider_switch_tests {
         assert_eq!(status, AgentStatus::Idle, "no fabricated completion");
         assert_eq!((prev_raw, armed), (None, false));
         session.kill();
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{DisplayEpoch, DisplayStamps};
+
+    #[test]
+    fn a_terminal_is_displayed_until_its_window_renders_without_it() {
+        let mut stamps = DisplayStamps::default();
+        assert!(!stamps.displayed(), "never shown");
+
+        let main = DisplayEpoch::default();
+        main.advance();
+        stamps.record(&main);
+        assert!(
+            stamps.displayed(),
+            "shown until its window renders again, so never if it doesn't"
+        );
+        main.advance();
+        assert!(!stamps.displayed(), "the next render left it out");
+
+        // Hidden in one window, shown in another.
+        let popout = DisplayEpoch::default();
+        popout.advance();
+        stamps.record(&popout);
+        main.advance();
+        assert!(stamps.displayed());
+        drop(popout);
+        assert!(!stamps.displayed(), "a closed window shows nothing");
+
+        main.advance();
+        stamps.record(&main);
+        assert!(stamps.displayed(), "shown again");
     }
 }
