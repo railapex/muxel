@@ -610,8 +610,8 @@ impl MuxelApp {
         source.learned.extend(result.ignored);
         let Some(files) = result.files else {
             // git ignores all the news: the backstop still counts from the
-            // last `git status`, or new ignored files coming more often than
-            // that would put it off for good.
+            // last `git status`. Counting it from this check would put it off
+            // by up to 30 s.
             self.status_targets.schedule.skipped(key);
             return;
         };
