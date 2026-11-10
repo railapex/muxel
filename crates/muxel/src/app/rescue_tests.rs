@@ -89,7 +89,11 @@ fn launch(
     window: WindowHandle<MuxelApp>,
     iid: Uuid,
 ) -> Arc<TerminalSession> {
-    let inert = CommandSpec::program(
+    launch_child(cx, window, iid, inert())
+}
+
+fn inert() -> CommandSpec {
+    CommandSpec::program(
         "cmd.exe",
         vec![
             "/d".into(),
@@ -97,8 +101,7 @@ fn launch(
             "/c".into(),
             "echo ready&more".into(),
         ],
-    );
-    launch_child(cx, window, iid, inert)
+    )
 }
 
 /// [`launch`] with `child` as the pane's program.
@@ -108,12 +111,34 @@ fn launch_child(
     iid: Uuid,
     child: CommandSpec,
 ) -> Arc<TerminalSession> {
+    launch_as(
+        cx,
+        window,
+        iid,
+        child.with_status_program(Some("claude".into())),
+    )
+}
+
+/// [`launch`], read as a shell: the test then paints its prompt.
+fn launch_shell(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    iid: Uuid,
+) -> Arc<TerminalSession> {
+    launch_as(cx, window, iid, inert())
+}
+
+fn launch_as(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    iid: Uuid,
+    spec: CommandSpec,
+) -> Arc<TerminalSession> {
     window
         .update(cx, |app, window, cx| {
             if let Some(old) = app.terminals.remove(&iid) {
                 old.read(cx).session().kill();
             }
-            let spec = child.with_status_program(Some("claude".into()));
             let meta = TerminalSpawnMeta {
                 instance_id: iid,
                 token: 0,
@@ -1450,3 +1475,123 @@ fn a_workspace_another_window_deleted_does_not_open_from_this_ones_list() {
     });
 }
 
+/// Claude's screen with a draft taller than the pane: its box fills the
+/// pane down to the bottom rule and footer, and the top has scrolled off.
+fn paint_claude_too_tall(session: &TerminalSession) {
+    let mut screen = String::from("\x1b[2J\x1b[H");
+    let last = "  line 22 of a long draft";
+    for n in 1..=22 {
+        screen.push_str(&format!("  line {n} of a long draft\r\n"));
+    }
+    screen.push_str(RULE);
+    screen.push_str("\r\n  ? for shortcuts");
+    // Cursor at the end of the last line, on row 22 of the pane's 24.
+    screen.push_str(&format!("\x1b[22;{}H", last.chars().count() + 1));
+    session.process_probe_output(screen.as_bytes());
+}
+
+#[test]
+fn a_sent_prompt_is_not_kept_when_the_pane_closes_on_a_draft_too_tall_to_save() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "sent before the long draft");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert!(dir.draft(iid).is_some());
+
+        // Enter; before the watcher deletes the file, a draft taller than
+        // the pane fills the box, and the pane is closed.
+        window
+            .update(cx, |app, _, cx| {
+                session.mark_turn_submitted();
+                paint_claude_too_tall(&session);
+                app.close_instance_inner(iid, "close (test)", cx);
+            })
+            .unwrap();
+        assert!(dir.closed_drafts().is_empty(), "the sent prompt isn't kept");
+    });
+}
+
+#[test]
+fn a_command_sent_just_before_its_pane_closes_is_not_kept() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch_shell(cx, window, iid);
+        session.process_probe_shell_output(b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert_eq!(
+            dir.draft(iid).map(|d| d.text).as_deref(),
+            Some("cargo test")
+        );
+
+        // Enter, as a pane's key handler sends it: the shell runs the
+        // command, and the pane is closed before the watcher deletes the
+        // file.
+        window
+            .update(cx, |app, _, cx| {
+                session.mark_turn_submitted();
+                session.write_input(b"\r");
+                app.close_instance_inner(iid, "close (test)", cx);
+            })
+            .unwrap();
+        assert!(
+            dir.closed_drafts().is_empty(),
+            "the sent command isn't kept"
+        );
+    });
+}
+
+#[test]
+fn reload_to_the_text_an_input_method_is_composing_keeps_no_backup() {
+    with_app(|cx, window| {
+        let file = muxel_store::data_dir()
+            .unwrap()
+            .join("project")
+            .join("reload.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "text\n").unwrap();
+        let (iid, dir) = editor_pane(cx, window, &file);
+        type_into(cx, window, iid, "a");
+        // The file changes on disk; the edited buffer offers their version.
+        std::fs::write(&file, "aにほtext\n").unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| {
+                    let change = read_disk_change(&file, editor.disk_stamp())
+                        .expect("the poll sees their version");
+                    editor.apply_disk_change(change, window, cx);
+                    // An input method then composes the same text.
+                    editor.compose_text("にほ", window, cx);
+                    assert_eq!(editor.text(cx), "aにほtext\n");
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text).as_deref(),
+            Some("aにほtext\n")
+        );
+
+        // Reload: the buffer holds the disk version, nothing unsaved.
+        window
+            .update(cx, |app, window, cx| {
+                let editor = app.editors[&iid].clone();
+                editor.update(cx, |editor, cx| editor.reload_external_change(window, cx));
+                assert!(!editor.read(cx).is_dirty(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        after_debounce(cx);
+        assert_eq!(
+            dir.editor_backup(iid).map(|b| b.text),
+            None,
+            "a clean buffer keeps no backup"
+        );
+        reopen_editor(cx, window, iid);
+        assert!(dir.editor_offer(iid).is_none(), "nothing is offered");
+    });
+}

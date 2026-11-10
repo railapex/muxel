@@ -721,7 +721,7 @@ impl EditorView {
     }
 
     /// Explicit Reload discards all local text, including an active composition.
-    fn reload_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reload_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ExternalChange::Modified(content)) = self.external_change.take() else {
             return;
         };
@@ -873,11 +873,11 @@ impl EditorView {
     }
 
     /// Whether the buffer holds changes a backup must keep. Backups ask this
-    /// and nothing else about dirtiness.
+    /// and nothing else about dirtiness. An input method's uncommitted text
+    /// counts once it changes the buffer; a backup can't bring back the
+    /// composition itself.
     fn needs_backup(&self, cx: &App) -> bool {
-        self.diff_dir.is_none()
-            && !self.is_image
-            && (self.is_dirty(cx) || self.rescue.composing.is_some())
+        self.diff_dir.is_none() && !self.is_image && self.is_dirty(cx)
     }
 
     /// The input notified: an input method's uncommitted text may have

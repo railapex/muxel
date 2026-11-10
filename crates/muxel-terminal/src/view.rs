@@ -3600,14 +3600,18 @@ impl TerminalView {
     /// What the pane's saved draft should become now, as the pane goes away
     /// (close, Restart, quit). An empty box clears it, and so does a box
     /// still showing the prompt just sent; text read whole replaces it.
-    /// After a submission no read has seen redrawn, a box muxel can't read
-    /// (a shell running the command, a covered box) clears it too: what is
-    /// saved was sent. Otherwise `None` keeps what was saved: a box muxel
-    /// can't read whole, or one it can't read at all.
+    /// After a submission no read has seen redrawn, a box muxel can't save
+    /// (a shell running the command, a covered box, one taller than the
+    /// pane) clears it too: what is saved was sent. Otherwise `None` keeps
+    /// what was saved: a box muxel can't read whole, or one it can't read at
+    /// all.
     pub fn settle_draft(&self) -> Option<crate::DraftUpdate> {
         if !crate::draft::readable(self.title_provider) {
             return None;
         }
+        // Taken before the read: a redrawn box ends the hold even when its
+        // text can't be saved here.
+        let sent = self.session.draft_sent();
         match self.session.read_draft(self.title_provider) {
             muxel_core::rescue::DraftRead::Text {
                 text,
@@ -3621,7 +3625,7 @@ impl TerminalView {
                 pane: None,
             })),
             muxel_core::rescue::DraftRead::Empty => Some(crate::DraftUpdate::Clear),
-            _ if self.session.draft_sent() => Some(crate::DraftUpdate::Clear),
+            _ if sent => Some(crate::DraftUpdate::Clear),
             _ => None,
         }
     }

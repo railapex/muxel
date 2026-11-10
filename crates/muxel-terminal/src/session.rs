@@ -2419,8 +2419,9 @@ impl TerminalSession {
     fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
         self.check_input_gate()?;
         self.scroll_input_to_bottom();
-        // Copied before the writer is locked: the reader thread holds the
-        // terminal while it writes replies.
+        // Copied before the writer is locked: the terminal parser holds the
+        // terminal lock while its listener sends replies, which takes the
+        // reply-order lock and then the writer.
         let sent = self.draft_screen();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
@@ -3394,6 +3395,14 @@ impl TerminalSession {
     /// probe. Product code should let `TerminalView` drain output instead.
     #[doc(hidden)]
     pub fn process_probe_output(&self, data: &[u8]) {
+        self.process_output(data);
+    }
+
+    /// [`Self::process_probe_output`] for a shell's output: the PTY reader's
+    /// prompt tracking sees the bytes first, as it does for real output.
+    #[doc(hidden)]
+    pub fn process_probe_shell_output(&self, data: &[u8]) {
+        ShellMarks::default().advance(data, &self.shell_prompt);
         self.process_output(data);
     }
 
@@ -8410,7 +8419,7 @@ mod throughput_bench {
 /// Reading a shell's command line after its OSC 133 B mark.
 #[cfg(test)]
 mod shell_draft_tests {
-    use super::{CommandSpec, ShellMarks, TerminalSession};
+    use super::{CommandSpec, TerminalSession};
     use crate::view::TitleProvider;
     use muxel_core::rescue::DraftRead;
     use std::sync::Arc;
@@ -8450,8 +8459,7 @@ mod shell_draft_tests {
     /// `bytes` as the shell's output: the PTY reader's prompt tracking sees
     /// them first, as it does for real output, then the parser draws them.
     fn shell_output(session: &TerminalSession, bytes: &[u8]) {
-        ShellMarks::default().advance(bytes, &session.shell_prompt);
-        session.process_probe_output(bytes);
+        session.process_probe_shell_output(bytes);
         assert!(session.shell_at_prompt(), "the shell is at its prompt");
     }
 
