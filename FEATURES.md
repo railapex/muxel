@@ -651,9 +651,12 @@ feature is added or changed, update the matching entry here in the same change**
   Claude pane, built-in and edited lists alike match outside its input box,
   alongside Claude's own status-row and permission-form parsers.
 - **Heuristic fallback** — agents without markers fall back to bell + output
-  activity. They reach **done** only from the bell or process exit, never from a
-  quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
-  pane) can't fake a finished turn.
+  activity. They reach **done** only from the bell, never from a quiet spell — so
+  an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
+  finished turn. An interactive session's process exit isn't a finish either
+  (`/exit`, a kill, a crash, `exit` typed in a shell): the pane keeps the state
+  it had, with no unread mark or Done notification. A command job's exit is its
+  finish (see Literal launches).
 - **Event-driven status snapshots** — terminal output, semantic titles, bells,
   process exit, resize invalidation, and exact quiet/debounce deadlines update one
   per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
@@ -1043,8 +1046,24 @@ feature is added or changed, update the matching entry here in the same change**
   modifying the command or injecting startup input.
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
-  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
-  exited terminals keep their **done** badge and completion age.
+  The sidebar labels an unspawned restored literal pane as **stopped**. A pane
+  started to run a command (a literal command, a custom command preset, a
+  shell given a command or a script's path, an agent's one-shot run such as
+  `claude -p`, `codex exec` or `codex review`) finishes when it exits,
+  whatever its code: **done** with its completion age, an unread mark and a
+  Done notification. A non-zero exit's notification gives the code (**exited
+  with code 3**) in place of the unexpected-exit report, even after a finish
+  the pane already announced or while you watch it, and Recent work's feed
+  lists it, as the row shows only Done. Only the command's own exit counts:
+  behind tmux a client's exit finishes nothing, ssh's own failures (code 255)
+  don't either, and through `sshpass` only exit 0 does. PowerShell (`pwsh`,
+  `powershell.exe`) is a session whatever it's started with, as before: a
+  pane running a PowerShell command doesn't finish when it exits. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish: it
+  keeps the state it had, unless its agent reported a finish first, whose
+  chime then still rings. The purpose comes from the pane's program and
+  arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a
+  wrapper such as `npx` or `wsl` counts as a command whatever it starts.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1626,15 +1645,19 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then the rest in Today (under 24 hours), This week (under seven
-  days), and Older bands. Within a band, sessions that need you (unread, or
-  asking for something) come first, newest first; then working sessions in the
-  order each started, so one that starts a turn joins the bottom of them; then
-  the rest, newest finish first. A working session counts as Today however long
-  ago it last finished. The focused session keeps its place until focus moves
-  on, so reading it doesn't move it, unless it starts working.
-  Sessions without work follow in layout order; project order and keyboard
-  navigation stay the same. Live popped-out sessions remain in Recent work;
+  each project, then the rest in Today (since midnight), This week (the six days
+  before), and Older bands, by each session's latest start, finish or question.
+  Within a band, sessions asking a question come first; then the ones that have
+  worked and aren't running, newest first, read or not; then working sessions in
+  the order each started, so one that starts a turn joins the bottom of them;
+  then sessions never used, newest open first. A working session counts as Today
+  however long its turn has run. Reading, focusing or clicking a session never
+  moves its row; only a change in its work or a new day does. A command job's
+  exit is its finish; an interactive session's isn't, though an agent that
+  reported its finish before exiting is finished and notifies. Pinned sessions
+  follow the same order. Project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work, and
+  popping one out or docking it back never moves its row;
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
   recent rows can still be dragged onto panes.
@@ -1643,7 +1666,8 @@ feature is added or changed, update the matching entry here in the same change**
   opened) shows indented under that session's row and moves with it, newest
   first. Opening it again from another session moves it there; the file
   browser and palette leave it where it is. Once that session closes, or if it's
-  in another project, the resource is an ordinary row again. A pinned file stays
+  in another project, the resource is an ordinary row again, with the
+  never-used rows by when it was last opened. A pinned file stays
   with the pins unless its session is pinned too.
 - **Files close with their session** — in Recent work, closing a session (its
   tab, its pane, or Close terminals) also closes the files, diffs and pages it
@@ -1658,9 +1682,14 @@ feature is added or changed, update the matching entry here in the same change**
   mark, even if another turn starts; Done persists. The mark and a read done's
   outline pill follow the same rule, so a done row's pill and mark always agree;
   the mark also keeps an unseen finish or question visible after the agent moves
-  on. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
-  instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
-  and tray notifications keep their usual behavior.
+  on. A clock that steps back can't mark a seen event unread or a new one read:
+  attendance covers everything recorded before it, and a later event is stamped
+  after it. A finish read by clicking its row before the status tick recorded
+  it stays read when the tick catches up. Project rows show the unread count
+  even when collapsed. Agent finishes and questions appear on these session
+  rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
+  a row can't show, stays in the feed. App messages, desktop alerts, and tray
+  notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live), including a new repo's branch before its first
   commit, spelled as the switch-branch menu spells it. A local repo's branch

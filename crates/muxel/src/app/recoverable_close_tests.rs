@@ -7,7 +7,7 @@ use super::{
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
+use muxel_core::sidebar::{BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
 use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
@@ -3597,8 +3597,7 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
                     &project.instances(),
                     &instances_by_id(&app.workspace),
                     &|_| None,
-                    None,
-                    chrono::Utc::now().timestamp_millis(),
+                    BandClock::at(&chrono::Local::now()),
                     SidebarSort::RecentWork,
                 );
                 assert!(rows.contains(&SidebarEntry::Pane(draft)), "{rows:?}");
@@ -4237,5 +4236,457 @@ fn undo_after_the_row_changed_keeps_every_pane_once_and_the_width() {
                 (false, vec![('X', 500), ('B', 250), ('C', 250)]),
             ]
         );
+    });
+}
+
+/// A plain shell pane whose command prints a line and rings the bell, then
+/// waits: a finish its terminal shows (Done, from the bell) with no provider.
+fn bell_terminal(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+) -> (Uuid, Entity<TerminalView>, OwnedChild) {
+    window
+        .update(cx, |app, window, cx| {
+            let root = app.workspace.project(pid).unwrap().root_path.clone();
+            let filename = format!("bell-{}.cmd", Uuid::new_v4());
+            std::fs::write(root.join(&filename), "@echo finished\x07\r\n@more\r\n").unwrap();
+            // As `title_terminal`: a plain cwd and a `.\` local filename.
+            let directory = root.to_string_lossy();
+            let directory = directory
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&directory)
+                .to_string();
+            let args = vec![
+                "/d".into(),
+                "/q".into(),
+                "/c".into(),
+                format!(r".\{filename}"),
+            ];
+            let mut instance = Instance::shell(pid);
+            instance.program = Some("cmd.exe".into());
+            let iid = instance.id;
+            let launch = TerminalLaunch::spawn(
+                CommandSpec::program("cmd.exe", args).with_cwd(directory),
+                (80, 24),
+            )
+            .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            let child = OwnedChild::new(view.read(cx).session().clone());
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view, child)
+        })
+        .unwrap()
+}
+
+/// A pane named `name` running `cmd /d /c "exit <code>"`, as a literal
+/// command job, or (`job` false) as the default shell, standing for
+/// `exit <code>` typed into it.
+fn spawn_exit_fixture(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    name: &str,
+    code: i32,
+    job: bool,
+) -> (Uuid, Entity<TerminalView>) {
+    use muxel_core::LaunchPurpose;
+    let exit_args = || -> Vec<String> { vec!["/d".into(), "/c".into(), format!("exit {code}")] };
+    window
+        .update(cx, |app, window, cx| {
+            let mut instance = Instance::shell(pid);
+            instance.custom_name = Some(name.into());
+            if job {
+                instance.program = Some("cmd.exe".into());
+                instance.args = exit_args();
+                instance.literal_argv = true;
+            }
+            let expected = if job {
+                LaunchPurpose::Job
+            } else {
+                LaunchPurpose::Session
+            };
+            assert_eq!(instance.launch_purpose(), expected, "{name}");
+            let iid = instance.id;
+            let launch =
+                TerminalLaunch::spawn(CommandSpec::program("cmd.exe", exit_args()), (80, 24))
+                    .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view)
+        })
+        .unwrap()
+}
+
+/// `iid`'s notifications, and every unexpected-exit report's title.
+fn exit_notices(app: &MuxelApp, iid: Uuid) -> (Vec<(NotifKind, String)>, Vec<String>) {
+    let mine = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.instance == Some(iid))
+        .map(|notice| (notice.kind, notice.subtitle.clone()))
+        .collect();
+    let unexpected = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.title.contains("exited unexpectedly"))
+        .map(|notice| notice.title.clone())
+        .collect();
+    (mine, unexpected)
+}
+
+/// Both exit 3 through `cmd /c`. The job's instance runs that command; the
+/// session's is the default shell, standing for `exit 3` typed into it.
+#[test]
+fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
+    use muxel_core::AgentActivityState;
+    use muxel_core::sidebar::is_unread;
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                // Unattended, without desktop toasts from the test.
+                app.window_active = false;
+                app.notifications_enabled = false;
+            })
+            .unwrap();
+        let (job, job_view) = spawn_exit_fixture(cx, window, pid, "job fixture", 3, true);
+        let (shell, shell_view) = spawn_exit_fixture(cx, window, pid, "shell fixture", 3, false);
+        for view in [&job_view, &shell_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                assert_eq!(job_view.read(cx).exit_code(), Some(3));
+                app.tick(window, cx);
+                let job_activity = &app.workspace.instance(job).unwrap().activity;
+                assert_eq!(job_activity.current_state(), Some(AgentActivityState::Done));
+                assert!(job_activity.completed_at.is_some());
+                assert!(is_unread(job_activity));
+                let job_notices: Vec<_> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.instance == Some(job))
+                    .collect();
+                assert_eq!(job_notices.len(), 1, "one notice for the job");
+                assert!(matches!(job_notices[0].kind, NotifKind::Error));
+                assert!(
+                    job_notices[0].subtitle.starts_with("exited with code 3"),
+                    "{}",
+                    job_notices[0].subtitle
+                );
+
+                let shell_activity = &app.workspace.instance(shell).unwrap().activity;
+                assert_eq!(shell_activity.completed_at, None);
+                assert!(!is_unread(shell_activity));
+                assert!(
+                    !app.notifications
+                        .iter()
+                        .any(|notice| notice.instance == Some(shell))
+                );
+                // The unexpected-exit report is the shell's alone: the job's
+                // failure is its own notice.
+                let unexpected: Vec<&str> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.title.contains("exited unexpectedly"))
+                    .map(|notice| notice.title.as_str())
+                    .collect();
+                assert_eq!(unexpected, ["shell fixture: process exited unexpectedly"]);
+            })
+            .unwrap();
+    });
+}
+
+/// A job's failing exit is reported on its own: after a Done the tick already
+/// sampled (no transition left for the exit), and while the pane is watched
+/// (no notification for a finish the user sees).
+#[test]
+fn a_jobs_failing_exit_is_reported_after_a_sampled_finish_and_while_watched() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::AgentActivityState;
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| app.notifications_enabled = false)
+            .unwrap();
+        let (sampled, sampled_view) = spawn_exit_fixture(cx, window, pid, "sampled job", 3, true);
+        let (watched, watched_view) = spawn_exit_fixture(cx, window, pid, "watched job", 4, true);
+        for view in [&sampled_view, &watched_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                // `sampled` already reported Done and the tick sampled and
+                // announced it, as its badge still shows.
+                let runtime = sampled_view.read(cx).runtime_snapshot();
+                assert_eq!(runtime.status, AgentStatus::Done);
+                app.last_status.insert(
+                    sampled,
+                    SeenStatus {
+                        status: AgentStatus::Done,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        held: false,
+                        sampled_at: chrono::Utc::now().timestamp_millis(),
+                    },
+                );
+                let activity = &mut app.workspace.instance_mut(sampled).unwrap().activity;
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    200,
+                );
+                app.add_notification(sampled, NotifKind::Done, "sampled job", "fixture");
+                // `watched` is the focused pane of the active window.
+                app.window_active = true;
+                app.active_instance = Some(watched);
+                // Recent work's feed leaves out what a row shows.
+                app.settings.sidebar_sort = muxel_core::sidebar::SidebarSort::RecentWork;
+                app.tick(window, cx);
+
+                for (iid, code) in [(sampled, 3), (watched, 4)] {
+                    let (mine, unexpected) = exit_notices(app, iid);
+                    assert_eq!(mine.len(), 1, "{code}: {mine:?}");
+                    assert!(matches!(mine[0].0, NotifKind::Error), "{code}");
+                    assert!(
+                        mine[0].1.starts_with(&format!("exited with code {code}")),
+                        "{}",
+                        mine[0].1
+                    );
+                    assert!(unexpected.is_empty(), "{unexpected:?}");
+                    // The row shows Done; the sidebar's feed shows the code.
+                    assert!(
+                        app.feed_notifications().any(|notice| {
+                            notice.instance == Some(iid)
+                                && notice
+                                    .subtitle
+                                    .starts_with(&format!("exited with code {code}"))
+                        }),
+                        "the feed hides exit code {code}"
+                    );
+                }
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarEntry, SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        // A has no live terminal (a pane not reopened since a restart), so it
+        // shows what it saved and its place can't change under the test.
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // A finished a minute ago, and it has been read.
+                let mut finished = AgentActivity::default();
+                finished.observe(None, AgentActivityState::Working, now - 90_000);
+                finished.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    now - 60_000,
+                );
+                finished.attend(now - 60_000);
+                app.workspace.instance_mut(a).unwrap().activity = finished;
+                // B started a turn two minutes ago, which the tick recorded.
+                // Its bell has rung since; no tick has read it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: 0,
+                        held: false,
+                        sampled_at: now - 120_000,
+                    },
+                );
+                let panes = |entries: &[SidebarEntry]| -> Vec<Uuid> {
+                    entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            SidebarEntry::Pane(iid) => Some(*iid),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // B's row already sits by its finish, newer than A's.
+                let before = app.sidebar_entries_now(pid, cx);
+                assert_eq!(panes(&before), [b, a]);
+
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.sidebar_entries_now(pid, cx),
+                    before,
+                    "the click moved a row"
+                );
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(activity), "the click read the finish");
+                let recorded = activity.completed_at;
+                assert!(recorded.is_some_and(|at| at > now - 120_000 && at <= now));
+
+                // Focusing it again records nothing new and moves nothing.
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.workspace.instance(b).unwrap().activity.completed_at,
+                    recorded
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), before);
+            })
+            .unwrap();
+    });
+}
+
+/// A finish the tick hasn't recorded, in a conversation the pane switched to
+/// since its last sample, read by a click: render and the next tick sample
+/// it again behind the tick's record, and must not record it again after the
+/// look. This drives the focus marker's plumbing (kept by the click, read by
+/// render, taken by the tick) through the switch branch (`record_switch`). A
+/// protocol completion's replay is the completion branch
+/// (`record_completion`), which a PTY here can't raise; the reducer test
+/// `a_sample_a_focus_recorded_is_not_recorded_again` drives that.
+#[test]
+fn a_finish_read_by_a_click_stays_read_through_the_next_tick() {
+    click_a_finish_then_tick(false);
+}
+
+/// As above, when the activity already holds exactly what the sample would
+/// record: a completion whose time the floor makes equal to the stored one
+/// after a clock correction, say. The click changes no stored value, and
+/// must still keep the sample's identity for the tick.
+#[test]
+fn a_finish_read_by_a_click_stays_read_when_it_left_the_activity_as_it_was() {
+    click_a_finish_then_tick(true);
+}
+
+fn click_a_finish_then_tick(already_stored: bool) {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // B's previous conversation was working when the tick last
+                // sampled it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev.wrapping_add(1),
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        held: false,
+                        sampled_at: now - 120_000,
+                    },
+                );
+                if already_stored {
+                    let instance = app.workspace.instance(b).unwrap();
+                    let stored = app.pending_activity(instance, now, cx).unwrap();
+                    app.workspace.instance_mut(b).unwrap().activity = stored;
+                    let instance = app.workspace.instance(b).unwrap();
+                    assert!(
+                        app.pending_activity(instance, now, cx).is_none(),
+                        "the sample still changes the activity"
+                    );
+                }
+                app.focus_instance_from_pointer(b, window, cx);
+                let read = app.workspace.instance(b).unwrap().activity.clone();
+                assert_eq!(read.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(&read), "the click read the finish");
+                let order = app.sidebar_entries_now(pid, cx);
+
+                // Then the user looks at A, and the tick samples B.
+                app.window_active = true;
+                app.active_instance = Some(a);
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+                app.tick(window, cx);
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity, &read, "the tick recorded the finish again");
+                assert!(!is_unread(activity));
+                assert!(
+                    app.notifications
+                        .iter()
+                        .all(|notice| notice.instance != Some(b)),
+                    "the finish that was read notified"
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+
+                // The tick has caught up: the pane's next finish is new.
+                assert!(!app.recorded_ahead.contains_key(&b));
+            })
+            .unwrap();
     });
 }

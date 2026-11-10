@@ -2,7 +2,7 @@
 
 use super::popout_lifecycle_tests::with_app;
 use super::{Instance, MuxelApp, OpenFocus, Project, ResourceOrigin};
-use muxel_core::sidebar::{SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
+use muxel_core::sidebar::{BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
 use muxel_core::{PaneNode, add_tab};
 use uuid::Uuid;
 
@@ -92,8 +92,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                     &project.instances(),
                     &instances_by_id(&app.workspace),
                     &|_| None,
-                    None,
-                    chrono::Utc::now().timestamp_millis(),
+                    BandClock::at(&chrono::Local::now()),
                     SidebarSort::RecentWork,
                 );
                 let at = |entry| rows.iter().position(|row| *row == entry).unwrap();

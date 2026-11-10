@@ -293,6 +293,35 @@ final class InteropTests: XCTestCase {
         XCTAssertNil(older.sessionPath)
     }
 
+    func testInstanceOpenTimeSurvivesWriteBackAndIsNewForAPaneIOSOpens() throws {
+        // Desktop Recent work places a never-used pane by when it was opened, so
+        // an iOS write-back must not strip it from the peer.
+        let json = """
+        { "id": "aaaa", "project_id": "p", "title": "Codex", "created_at": 1762600000123 }
+        """
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.createdAt, 1_762_600_000_123)
+        let data = try MuxelJSON.encoder.encode(decoded)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((object["created_at"] as? NSNumber)?.int64Value, 1_762_600_000_123)
+
+        // A desktop that predates the field writes none, and neither does iOS.
+        let older = try MuxelJSON.decoder.decode(
+            Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Codex" }"#.utf8))
+        XCTAssertNil(older.createdAt)
+        let olderObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: MuxelJSON.encoder.encode(older)) as? [String: Any])
+        XCTAssertNil(olderObject["created_at"])
+
+        // A pane iOS opens records when; a copy isn't as old as its source.
+        let before = Instance.openedNow()
+        let fresh = Instance(id: "cccc", projectId: "p", title: "Claude", program: "claude", args: [])
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(fresh.createdAt), before)
+        var copy = decoded
+        copy.resetConversationForDuplicate()
+        XCTAssertNil(copy.createdAt)
+    }
+
     func testDuplicateResetClearsConversationStateAndAutoName() {
         var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
         instance.sessionId = "session"
