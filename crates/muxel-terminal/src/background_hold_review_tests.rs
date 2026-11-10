@@ -23,38 +23,52 @@ const SUBAGENTS: BackgroundWork = BackgroundWork {
 fn pr136_shared_expired_hold_cannot_restart_without_a_new_turn() {
     let now = Instant::now();
     let mut hold = BackgroundHold::default();
-    hold.observe(Some(SUBAGENTS), true, now);
-    assert!(hold.observe(Some(SUBAGENTS), false, now).0);
+    hold.observe(Some(SUBAGENTS), false, true, now);
+    assert!(hold.observe(Some(SUBAGENTS), false, false, now).0);
     let expired = now + SUBAGENT_CAP;
-    assert!(!hold.observe(Some(SUBAGENTS), false, expired).0);
+    assert!(!hold.observe(Some(SUBAGENTS), false, false, expired).0);
     assert!(
         !hold
-            .observe(None, false, expired + Duration::from_secs(1))
+            .observe(None, false, false, expired + Duration::from_secs(1))
             .0
     );
     assert!(
         !hold
-            .observe(Some(SUBAGENTS), false, expired + Duration::from_secs(2))
+            .observe(
+                Some(SUBAGENTS),
+                false,
+                false,
+                expired + Duration::from_secs(2)
+            )
             .0,
         "a redraw cannot start another hold for an already released turn",
     );
     let next = expired + Duration::from_secs(3);
-    hold.observe(Some(SUBAGENTS), true, next);
-    assert!(hold.observe(Some(SUBAGENTS), false, next).0);
+    hold.observe(Some(SUBAGENTS), false, true, next);
+    assert!(hold.observe(Some(SUBAGENTS), false, false, next).0);
 }
 
 #[test]
 fn pr136_shared_footer_return_cannot_rehold_a_released_turn() {
     let now = Instant::now();
     let mut hold = BackgroundHold::default();
-    hold.observe(Some(SUBAGENTS), true, now);
-    assert!(hold.observe(Some(SUBAGENTS), false, now).0);
+    hold.observe(Some(SUBAGENTS), false, true, now);
+    assert!(hold.observe(Some(SUBAGENTS), false, false, now).0);
     let hidden = now + Duration::from_secs(1);
-    assert!(hold.observe(None, false, hidden).0);
-    assert!(!hold.observe(None, false, hidden + BACKGROUND_WAKE_GRACE).0);
+    assert!(hold.observe(None, false, false, hidden).0);
     assert!(
         !hold
-            .observe(Some(SUBAGENTS), false, hidden + BACKGROUND_WAKE_GRACE)
+            .observe(None, false, false, hidden + BACKGROUND_WAKE_GRACE)
+            .0
+    );
+    assert!(
+        !hold
+            .observe(
+                Some(SUBAGENTS),
+                false,
+                false,
+                hidden + BACKGROUND_WAKE_GRACE
+            )
             .0,
         "the same turn stays released when its footer returns",
     );
@@ -64,20 +78,25 @@ fn pr136_shared_footer_return_cannot_rehold_a_released_turn() {
 fn pr136_shared_subagent_hints_have_a_three_hour_safety_cap() {
     let now = Instant::now();
     let mut hold = BackgroundHold::default();
-    hold.observe(Some(SUBAGENTS), true, now);
+    hold.observe(Some(SUBAGENTS), false, true, now);
     assert_eq!(
-        hold.observe(Some(SUBAGENTS), false, now),
+        hold.observe(Some(SUBAGENTS), false, false, now),
         (true, Some(now + SUBAGENT_CAP)),
     );
     assert!(
         hold.observe(
             Some(SUBAGENTS),
             false,
+            false,
             now + SUBAGENT_CAP - Duration::from_secs(1)
         )
         .0
     );
-    assert!(!hold.observe(Some(SUBAGENTS), false, now + SUBAGENT_CAP).0);
+    assert!(
+        !hold
+            .observe(Some(SUBAGENTS), false, false, now + SUBAGENT_CAP)
+            .0
+    );
 }
 
 #[test]
@@ -85,9 +104,9 @@ fn pr136_shared_released_pane_cannot_hold_a_late_listing() {
     for work in [SHELL, SUBAGENTS] {
         let now = Instant::now();
         let mut hold = BackgroundHold::default();
-        assert_eq!(hold.observe(None, false, now), (false, None));
+        assert_eq!(hold.observe(None, false, false, now), (false, None));
         assert_eq!(
-            hold.observe(Some(work), false, now + Duration::from_secs(1)),
+            hold.observe(Some(work), false, false, now + Duration::from_secs(1)),
             (false, None),
             "a late listing cannot undo an already published finish",
         );

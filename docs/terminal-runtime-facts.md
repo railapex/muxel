@@ -456,7 +456,8 @@ a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
 
-Background work is read from the same screen. Claude 2.1.318's footer lists it live
+Background work is read from the same screen. Claude and Grok detection depends
+on the supported footer/panel layouts and wording. Claude 2.1.318's footer lists it live
 in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
 clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
 a finished turn's `1 shell still running` row stays on screen after the shell ends, so
@@ -470,7 +471,8 @@ recognized model/shortcut footer, even when the cursor is hidden. Indented paste
 screens stay inside that draft. Terminal soft-wrap flags and up to nine contiguous
 provider word-wrapped rows reconstruct the badge. A missing composer or incomplete
 badge is unreadable, not a confirmed empty footer; once chrome has been recognized,
-unreadable frames retain the last confirmed count and withhold completion. Unsupported
+unreadable frames retain the last confirmed shell count without establishing a
+subagent hold. Provider-owned foreground Working remains authoritative. Unsupported
 footer/composer layouts, wording or locale changes can require new fixtures.
 Muse 1.4.14 lists running terminals in the tree below the lower composer rule.
 Its earlier `Backgrounded` message remains after a task ends and is not live work.
@@ -491,9 +493,10 @@ Rollout reads share a 2 MiB allowance and a cooperative 50 ms deadline across al
 stores in one worker refresh, checked between chunks of at most 256 KiB. Each pending
 record is capped at 1 MiB. Catch-up, a partial JSONL record or an I/O error reports
 uncertainty separately from a current result with no active child. The first request
-is pending until its worker returns. Pending evidence holds a finished turn without
-inventing a running count; later refreshes continue from the cached byte offset.
-Unconfirmed holds are not new activity or completion edges. Plain `ctl wait`
+is pending until its worker returns. Guarded pending child evidence can withhold
+completion without inventing a running count; later refreshes continue from the
+cached byte offset. Shell-chrome uncertainty is separate and cannot confirm child
+work. Unconfirmed holds are not new activity or completion edges. Plain `ctl wait`
 follows the hold until the evidence is current or the cap expires. A current-binding
 background-only hold leaves the foreground composer available to send and `--turn`,
 even while completion attribution is suppressed. Foreground working/blocked markers
@@ -508,29 +511,32 @@ this source; terminal footer layout changes can disable the screen sources. Only
 local direct children are aggregated. Remote and deeper descendants, compressed
 rollouts and metadata/lifecycle records over 1 MiB are outside this reader's coverage.
 
-Every background hold has a 30-minute cap, including
-subagents with missing end records and uncertain lifecycle reads. Listed work can
-remain after expiry and still makes close busy. A new foreground turn restarts the
-clock when that turn is observed ending. A replacement conversation starts its own
-hold. A readable empty footer or current child result releases
-the hold after the five-second wake grace once all relevant sources are current
-and no work remains listed.
+Only subagents hold an observably finished foreground turn, for at most three
+hours, including guarded uncertainty while child records catch up. Shell and monitor
+listings remain metadata and do not delay Done. Listed work can remain after expiry
+and still makes close busy. A turn released by its cap or missing-listing grace
+cannot be held again by redraws or stale evidence without fresh foreground work.
+A new foreground turn starts its own clock when observed ending, including a turn
+whose Working and completion arrive in one batch. A replacement conversation owns
+a separate binding. Once all relevant subagent sources are current and clear, the
+hold releases after the five-second wake grace, bounded by the same three-hour cap.
 
-Plain `ctl wait` now follows the background hold rather than returning at the
-foreground turn's end. `ctl wait --turn` stops at an observable turn end with
+Plain `ctl wait` follows a subagent hold rather than returning at the foreground
+turn's end. Shell and monitor metadata do not delay it. `ctl wait --turn` stops at
+an observable turn end with
 background work still listed. It cannot override a provider's continuing Working
 report. Send admission and the background turn-end decision require the hold's
 binding revision to match the current conversation. Completion attribution stays
-separate: a surviving footer after `/clear` can still leave the current composer
-free without updating activity. Foreground working/blocked markers prevent that
+separate. A surviving current-binding subagent hold after `/clear` can leave the
+current composer free without updating activity. Foreground working/blocked markers prevent that
 background-only exception. Cached holds from before reconciliation cannot authorize
 input or finish a wait.
 
-A held turn takes no completion: the report that started the hold would otherwise stamp
-the pane as finished. The release is its own status change. A switch reads the same way:
-`/clear` beside a running shell leaves no report until the next turn, and only a title
-reading Working would end the screen hold, which no title does between turns. So the pane
-holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+A held turn publishes no completion. The report that started the hold would otherwise
+stamp the pane as finished. The release is its own status change. A surviving shell listing
+after `/clear` is metadata and creates no foreground turn or completion. A current
+subagent hold can leave the composer available while completion attribution is
+suppressed by the conversation switch. Both Windows
 paths need a real run: a plain build uses the system console, where Claude sends no
 reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
 A hook would add exact kinds
