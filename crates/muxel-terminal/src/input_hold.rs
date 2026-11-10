@@ -1,6 +1,8 @@
 //! Launch-local input cancellation and bounded OSC 133 shell evidence.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use muxel_core::prompt_marks::BUSY_MARK;
+use muxel_core::recoverable_close::ShellReading;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 pub(crate) struct InputGate(AtomicU64);
@@ -27,17 +29,80 @@ impl InputGate {
     }
 }
 
+/// What the shell's marks and the pane's input say about its prompt. The
+/// reader thread applies marks and the input path applies writes, so the
+/// fields change together under one lock.
 #[derive(Default)]
-pub(super) struct ShellPrompt(AtomicBool);
+pub(super) struct ShellPrompt(parking_lot::Mutex<PromptState>);
+
+#[derive(Default)]
+struct PromptState {
+    /// The last OSC 133 mark was A or B, with no Enter written since.
+    at_prompt: bool,
+    /// That mark was [`BUSY_MARK`]: muxel's PowerShell wrapper found work
+    /// running inside the shell when it drew this prompt, or couldn't check.
+    busy: bool,
+    /// Input that may still be waiting on a prompt: a draft, a recalled
+    /// command, an unsent last line of a paste, or keys typed ahead while a
+    /// command ran. Marks don't clear it, since a redraw (PSReadLine's Ctrl+L)
+    /// keeps the line, and typeahead lands after the prompt is drawn. Only
+    /// input that ends with Enter clears it, or a prompt drawn after Ctrl+C.
+    typed: bool,
+    /// The last input ended with Ctrl+C, so the line is being discarded. The
+    /// next prompt the shell draws completes that.
+    cancel: bool,
+    /// Every OSC 133 mark the shell has printed, counted, whatever it changed.
+    marks: u64,
+}
 
 impl ShellPrompt {
     pub fn at_prompt(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.lock().at_prompt
+    }
+
+    /// Whether the shell sits at a prompt not marked busy, with nothing typed
+    /// since that could still run, and how many marks it has printed.
+    pub fn reading(&self) -> ShellReading {
+        let state = self.0.lock();
+        ShellReading {
+            idle: state.at_prompt && !state.busy && !state.typed,
+            marks: state.marks,
+        }
+    }
+
+    #[cfg(test)]
+    fn idle_prompt(&self) -> bool {
+        self.reading().idle
     }
 
     pub fn submitted(&self, bytes: &[u8]) {
-        if bytes.iter().any(|&byte| matches!(byte, b'\r' | b'\n')) {
-            self.0.store(false, Ordering::Release);
+        if bytes.is_empty() {
+            return;
+        }
+        let mut state = self.0.lock();
+        let line_end = bytes
+            .iter()
+            .rposition(|&byte| matches!(byte, b'\r' | b'\n'));
+        if line_end.is_some() {
+            state.at_prompt = false;
+        }
+        // Anything after the last Enter may still run: text, an arrow or
+        // history recall, Esc (a mode switch in PSReadLine's vi mode, not a
+        // clear), Ctrl+L. Ctrl+C at the end discards the line, but only once
+        // the shell draws its next prompt.
+        let last_line = &bytes[line_end.map_or(0, |end| end + 1)..];
+        state.typed = !last_line.is_empty();
+        state.cancel = last_line.last() == Some(&0x03);
+    }
+
+    fn mark(&self, at_prompt: bool, busy: bool) {
+        let mut state = self.0.lock();
+        state.marks = state.marks.wrapping_add(1);
+        state.at_prompt = at_prompt;
+        state.busy = busy;
+        if at_prompt && state.cancel {
+            state.typed = false;
+            state.cancel = false;
         }
     }
 }
@@ -48,7 +113,9 @@ enum State {
     Ground,
     Escape,
     Osc {
-        prefix: [u8; 6],
+        /// The payload's first bytes, enough to match [`BUSY_MARK`].
+        prefix: [u8; BUSY_MARK.len()],
+        /// The payload's whole length so far.
         len: usize,
         escaped: bool,
     },
@@ -57,7 +124,7 @@ enum State {
     },
 }
 
-/// Retains at most six bytes, regardless of the size of an OSC payload.
+/// Retains at most 16 bytes, regardless of the size of an OSC payload.
 #[derive(Default)]
 pub(super) struct ShellMarks {
     state: State,
@@ -95,9 +162,9 @@ impl ShellMarks {
                     } else if (!escaped && byte == 0x07) || (escaped && byte == b'\\') {
                         if len >= 5 && &prefix[..4] == b"133;" {
                             let valid = len == 5 || prefix[5] == b';';
-                            prompt.0.store(
+                            prompt.mark(
                                 valid && matches!(prefix[4], b'A' | b'B'),
-                                Ordering::Release,
+                                len == BUSY_MARK.len() && prefix == BUSY_MARK.as_bytes(),
                             );
                         }
                         State::Ground
@@ -112,8 +179,8 @@ impl ShellMarks {
                     } else {
                         if len < prefix.len() {
                             prefix[len] = byte;
-                            len += 1;
                         }
+                        len = len.saturating_add(1);
                         State::Osc {
                             prefix,
                             len,
@@ -128,7 +195,7 @@ impl ShellMarks {
     fn escape(byte: u8) -> State {
         match byte {
             b']' => State::Osc {
-                prefix: [0; 6],
+                prefix: [0; BUSY_MARK.len()],
                 len: 0,
                 escaped: false,
             },
@@ -186,6 +253,135 @@ mod tests {
                 assert!(!prompt.at_prompt());
             }
         }
+    }
+
+    /// A prompt as muxel's PowerShell wrapper draws it when the shell found
+    /// nothing running, around a user prompt that prints its own marks.
+    const IDLE: &[u8] = b"\x1b]133;A\x1b\\\x1b]133;A\x07PS> \x1b]133;B\x07\x1b]133;B\x1b\\";
+    /// The same prompt when the shell found work running inside itself.
+    const BUSY: &[u8] =
+        b"\x1b]133;A\x1b\\\x1b]133;A\x07PS> \x1b]133;B\x07\x1b]133;B;muxel=busy\x1b\\";
+
+    #[test]
+    fn the_wrappers_closing_mark_decides_whether_the_prompt_is_busy() {
+        for split in 0..=BUSY.len() {
+            let prompt = ShellPrompt::default();
+            let mut marks = ShellMarks::default();
+            marks.advance(&BUSY[..split], &prompt);
+            marks.advance(&BUSY[split..], &prompt);
+            assert!(prompt.at_prompt(), "split {split}");
+            assert!(!prompt.idle_prompt(), "split {split}");
+            marks.advance(IDLE, &prompt);
+            assert!(prompt.idle_prompt(), "split {split}, then an idle prompt");
+        }
+        // Only the wrapper's exact payload is busy; a B with other options is
+        // a plain prompt mark, as from a prompt that prints its own.
+        for plain in [
+            b"\x1b]133;B;muxel=busy2\x07".as_slice(),
+            b"\x1b]133;B;muxel=bus\x07",
+            b"\x1b]133;B;aid=1\x07",
+        ] {
+            let prompt = ShellPrompt::default();
+            let mut marks = ShellMarks::default();
+            marks.advance(BUSY, &prompt);
+            marks.advance(plain, &prompt);
+            assert!(prompt.idle_prompt(), "{plain:?}");
+        }
+        // A command start, as a prompt module prints it and as muxel's line
+        // editor wrap does, ends the prompt.
+        for start in [b"\x1b]133;C\x07".as_slice(), b"\x1b]133;C\x1b\\"] {
+            let prompt = ShellPrompt::default();
+            let mut marks = ShellMarks::default();
+            marks.advance(IDLE, &prompt);
+            marks.advance(start, &prompt);
+            assert!(!prompt.idle_prompt(), "a command started: {start:?}");
+        }
+    }
+
+    #[test]
+    fn every_mark_the_shell_prints_counts_even_one_that_changes_nothing() {
+        let prompt = ShellPrompt::default();
+        let mut marks = ShellMarks::default();
+        marks.advance(IDLE, &prompt);
+        let drawn = prompt.reading();
+        assert!(drawn.idle);
+        // The same idle prompt drawn again.
+        marks.advance(IDLE, &prompt);
+        let again = prompt.reading();
+        assert!(again.idle);
+        assert_ne!(again, drawn);
+        // A mark that leaves the prompt's state as it was.
+        marks.advance(b"\x1b]133;A\x07", &prompt);
+        let unchanged = prompt.reading();
+        assert!(unchanged.idle);
+        assert_ne!(unchanged, again);
+        // A command that started and ended between two readings.
+        marks.advance(b"\x1b]133;C\x07", &prompt);
+        marks.advance(IDLE, &prompt);
+        assert_ne!(prompt.reading(), unchanged);
+        // Other strings aren't marks.
+        let settled = prompt.reading();
+        marks.advance(b"\x1b]0;title\x07\x1b]1333;A\x07\x1b]2;133;A\x07", &prompt);
+        assert_eq!(prompt.reading(), settled);
+    }
+
+    #[test]
+    fn input_that_may_still_run_outlasts_every_prompt_redraw() {
+        let drawn = |prompt: &ShellPrompt| ShellMarks::default().advance(IDLE, prompt);
+        for pending in [
+            b"Remove-Item *".as_slice(),
+            // Ctrl+L redraws the prompt and keeps the line.
+            b"Remove-Item *\x0c",
+            // Up arrow recalls a command onto the line.
+            b"\x1b[A",
+            // A paste whose first line runs and whose last line waits.
+            b"'FIRST'\rUNSENT",
+            b"'FIRST'\r\nUNSENT",
+            // Esc is a mode switch in PSReadLine's vi mode, not a clear.
+            b"Remove-Item *\x1b",
+            // Ctrl+C with input after it.
+            b"\x03Remove-Item *",
+        ] {
+            let prompt = ShellPrompt::default();
+            drawn(&prompt);
+            prompt.submitted(pending);
+            for _ in 0..3 {
+                drawn(&prompt);
+                assert!(!prompt.idle_prompt(), "{pending:?}");
+            }
+            // Enter sends it; the next idle prompt is idle.
+            prompt.submitted(b"\r");
+            assert!(!prompt.idle_prompt(), "{pending:?} sent");
+            drawn(&prompt);
+            assert!(prompt.idle_prompt(), "{pending:?} ran");
+        }
+        // Typed ahead while a command runs: the prompt it finishes with drew
+        // before the shell read the keys.
+        let prompt = ShellPrompt::default();
+        drawn(&prompt);
+        prompt.submitted(b"Start-Sleep 5\r");
+        prompt.submitted(b"Remove-Item *");
+        drawn(&prompt);
+        assert!(!prompt.idle_prompt(), "typed ahead");
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_line_once_the_shell_draws_a_fresh_prompt() {
+        let prompt = ShellPrompt::default();
+        let mut marks = ShellMarks::default();
+        marks.advance(IDLE, &prompt);
+        prompt.submitted(b"Remove-Item *");
+        prompt.submitted(b"\x03");
+        assert!(!prompt.idle_prompt(), "before the shell redraws");
+        marks.advance(IDLE, &prompt);
+        assert!(prompt.idle_prompt(), "the fresh prompt");
+        // Ctrl+C at an idle prompt is busy only until the redraw.
+        prompt.submitted(b"\x03");
+        assert!(!prompt.idle_prompt());
+        marks.advance(BUSY, &prompt);
+        assert!(prompt.at_prompt() && !prompt.idle_prompt(), "a busy redraw");
+        marks.advance(IDLE, &prompt);
+        assert!(prompt.idle_prompt());
     }
 
     #[test]

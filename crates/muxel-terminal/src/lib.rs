@@ -18,6 +18,8 @@ mod links;
 mod listener;
 mod pane_job;
 mod present_flag;
+#[cfg(windows)]
+mod process_tree;
 #[cfg(unix)]
 mod process_tree_unix;
 mod profile;
@@ -38,6 +40,8 @@ pub use draft::{DraftSink, DraftUpdate};
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};
+#[cfg(windows)]
+pub use process_tree::process_parent_map;
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{

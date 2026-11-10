@@ -4250,40 +4250,6 @@ fn process_descends_from(parents: &HashMap<u32, u32>, mut process: u32, root: u3
     false
 }
 
-#[cfg(windows)]
-fn process_parent_map() -> HashMap<u32, u32> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return HashMap::new();
-    };
-    let mut parents = HashMap::new();
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
-        loop {
-            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
-                break;
-            }
-        }
-    }
-    let _ = unsafe { CloseHandle(snapshot) };
-    parents
-}
-
-#[cfg(all(not(windows), test))]
-#[allow(dead_code)]
-fn process_parent_map() -> HashMap<u32, u32> {
-    HashMap::new()
-}
-
 #[cfg(any(windows, test))]
 fn active_grok_session_for_process<'a>(
     root_pid: u32,

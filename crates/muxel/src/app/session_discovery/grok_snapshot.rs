@@ -98,7 +98,7 @@ pub(super) fn process_snapshot(
             active,
             Instant::now(),
             if watched { WATCHED_MAX_AGE } else { MAX_AGE },
-            super::super::process_parent_map,
+            muxel_terminal::process_parent_map,
         )
 }
 
