@@ -1819,6 +1819,14 @@ impl StatusSample {
     }
 }
 
+/// A pane's live sample as the tick would apply it ([`MuxelApp::pending_sample`]).
+struct PendingSample {
+    /// The activity it leaves, when that changed.
+    activity: Option<AgentActivity>,
+    /// The record it leaves.
+    record: SeenStatus,
+}
+
 /// What applying one status sample did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SampleEffect {
@@ -6646,9 +6654,9 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
-    /// The record a focus left when it recorded a pane's live sample into its
-    /// activity ahead of the tick, which `last_status` doesn't take: the
-    /// tick still owes that sample's notifications, auto-read and log entry.
+    /// The record a focus left when it read a pane's live sample ahead of the
+    /// tick, whether or not that changed the activity. `last_status` doesn't
+    /// take it: the tick still owes that sample's auto-read and log entry.
     /// Sampling skips recording what it holds again, and the tick drops it
     /// once its record has caught up.
     recorded_ahead: HashMap<Uuid, SeenStatus>,
@@ -13334,13 +13342,18 @@ impl MuxelApp {
             let pending = self
                 .workspace
                 .instance(iid)
-                .and_then(|instance| self.pending_activity(instance, now, cx));
+                .and_then(|instance| self.pending_sample(instance, now, cx));
             if let Some(instance) = self.workspace.instance_mut(iid) {
-                let recorded = pending.is_some();
-                if let Some((activity, record)) = pending {
-                    instance.activity = activity;
-                    // The tick samples this again behind its own record, and
-                    // mustn't record it twice.
+                let mut recorded = false;
+                if let Some(PendingSample { activity, record }) = pending {
+                    if let Some(activity) = activity {
+                        instance.activity = activity;
+                        recorded = true;
+                    }
+                    // The tick samples what the click read again behind its
+                    // own record, and mustn't record it twice. That holds
+                    // even when the sample left the stored values as they
+                    // were: the tick would date it after this look.
                     self.recorded_ahead.insert(iid, record);
                 }
                 if instance.activity.attend(now) || recorded {
@@ -23584,17 +23597,22 @@ impl MuxelApp {
 
     /// `iid`'s activity with its live terminal's current sample applied as the
     /// status tick would apply it, recording nothing. The sidebar places rows
-    /// by it and focusing a pane records it, so a row sits where the next tick
-    /// leaves it and a click never moves it. `None` when the sample changes
-    /// nothing, or `iid` has no live terminal or is held for Undo, which the
-    /// tick doesn't sample. With it, the record the sample leaves, which a
-    /// focus that records the activity keeps ([`Self::recorded_ahead`]).
-    fn pending_activity(
-        &self,
-        instance: &Instance,
-        now: i64,
-        cx: &App,
-    ) -> Option<(AgentActivity, SeenStatus)> {
+    /// by it, so a row sits where the next tick leaves it. `None` when the
+    /// sample changes nothing ([`Self::pending_sample`]).
+    fn pending_activity(&self, instance: &Instance, now: i64, cx: &App) -> Option<AgentActivity> {
+        self.pending_sample(instance, now, cx)?.activity
+    }
+
+    /// `iid`'s live terminal's current sample applied as the status tick
+    /// would apply it, recording nothing: the activity it leaves when that
+    /// changed, and the record it leaves, which names the events it holds
+    /// (binding, completion revision). Focusing a pane records both, the
+    /// record whether or not the activity changed: a completion can leave the
+    /// stored values as they were (after a clock correction) and still be
+    /// one the tick hasn't recorded. `None` when `iid` has no live terminal,
+    /// is held for Undo, which the tick doesn't sample, or the sample isn't
+    /// attributable.
+    fn pending_sample(&self, instance: &Instance, now: i64, cx: &App) -> Option<PendingSample> {
         let iid = instance.id;
         if self.is_closing(iid) {
             return None;
@@ -23614,15 +23632,18 @@ impl MuxelApp {
         )
         .times(sample.times)
         .recorded(self.recorded_ahead.get(&iid).copied());
+        if !sample.attributable {
+            return None;
+        }
         let effect = if self.popouts.contains_key(&iid) {
             apply_popout_status_sample(&mut record, Some(&mut activity), sample, now)
         } else {
             apply_status_sample(&mut record, Some(&mut activity), sample, now)
         };
-        if !effect.activity_changed {
-            return None;
-        }
-        Some((activity, record?))
+        Some(PendingSample {
+            activity: effect.activity_changed.then_some(activity),
+            record: record?,
+        })
     }
 
     /// Copies of the terminal panes whose live sample would change their
@@ -23638,7 +23659,7 @@ impl MuxelApp {
             .iter()
             .filter(|instance| instance.kind == InstanceKind::Terminal)
             .filter_map(|instance| {
-                let (activity, _) = self.pending_activity(instance, now, cx)?;
+                let activity = self.pending_activity(instance, now, cx)?;
                 Some(Instance {
                     activity,
                     ..instance.clone()

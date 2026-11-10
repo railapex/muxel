@@ -230,13 +230,23 @@ type PowerShellOption = (
 
 /// The PowerShell hosts' options as they match them: the name, the shortest
 /// prefix of it accepted, any other alias, what it does, and the one host
-/// that takes it (`None`: both). From `pwsh -?` (7.5) and Windows
-/// PowerShell's about_PowerShell_exe (5.1).
+/// that takes it (`None`: both). Every option is checked against both hosts'
+/// pages, about_Pwsh (7.5) and about_PowerShell_exe (5.1). The prefixes and
+/// aliases are pwsh's documented ones; the 5.1 page lists none.
+/// `-EncodedArguments` is on the 5.1 page, and pwsh's own parser takes it too
+/// (`-encodeda`, `-ea`), though about_Pwsh doesn't list it.
 const POWERSHELL_SWITCHES: &[PowerShellOption] = &[
     ("noexit", "noe", "", PwshSwitch::NoExit, None),
     ("command", "c", "", PwshSwitch::Command, None),
     ("file", "f", "", PwshSwitch::Command, None),
     ("encodedcommand", "e", "ec", PwshSwitch::Encoded, None),
+    (
+        "encodedarguments",
+        "encodeda",
+        "ea",
+        PwshSwitch::Value,
+        None,
+    ),
     ("configurationname", "config", "", PwshSwitch::Value, None),
     ("executionpolicy", "ex", "ep", PwshSwitch::Value, None),
     ("inputformat", "inp", "if", PwshSwitch::Value, None),
@@ -253,13 +263,6 @@ const POWERSHELL_SWITCHES: &[PowerShellOption] = &[
         "commandwithargs",
         "cwa",
         PwshSwitch::Command,
-        Some(PowerShellHost::Pwsh),
-    ),
-    (
-        "encodedarguments",
-        "encodeda",
-        "ea",
-        PwshSwitch::Value,
         Some(PowerShellHost::Pwsh),
     ),
     (
@@ -369,8 +372,10 @@ fn powershell_switch(host: PowerShellHost, arg: &str) -> Option<PwshSwitch> {
 /// `-File` or a bare word (pwsh's default parameter is `-File`, a script's
 /// path; Windows PowerShell's is `-Command`), and passes everything after to
 /// the command. So a `-NoExit` only counts before them. After an option
-/// neither table knows, a bare word may be its value: that reads as a
-/// session, whose exit finishes nothing, rather than a job whose exit would.
+/// neither table knows, a bare word may be its value, so the read stops
+/// there as a session, whose exit finishes nothing, rather than a job whose
+/// exit would; a `-Command` later on the line isn't reached. A command
+/// switch straight after the unknown option is reached, and runs.
 fn powershell_runs_a_command(host: PowerShellHost, args: &[String]) -> bool {
     let (mut no_exit, mut encoded, mut guessing) = (false, false, false);
     let mut args = args.iter();
@@ -809,6 +814,17 @@ mod tests {
                 LaunchPurpose::Job,
             ),
             ("pwsh", &["-Version"], LaunchPurpose::Session),
+            // Both hosts take `-EncodedArguments` and its value.
+            (
+                "powershell.exe",
+                &["-EncodedArguments", "JABhAA==", "-Command", "Get-Date"],
+                LaunchPurpose::Job,
+            ),
+            (
+                "pwsh",
+                &["-ea", "JABhAA==", "-Command", "Get-Date"],
+                LaunchPurpose::Job,
+            ),
             ("pwsh", &["-NoLogo", "build.ps1"], LaunchPurpose::Job),
             // After an option it doesn't know, a word may be its value: a
             // session, as every exit was before. An explicit command runs.
@@ -821,6 +837,12 @@ mod tests {
                 "pwsh",
                 &["-SomeFutureOption", "-Command", "Get-Date"],
                 LaunchPurpose::Job,
+            ),
+            // A word after it ends the read, before a later command.
+            (
+                "pwsh",
+                &["-SomeFutureOption", "value", "-Command", "Get-Date"],
+                LaunchPurpose::Session,
             ),
         ] {
             assert_eq!(purpose(Some(program), args), expected, "{program} {args:?}");

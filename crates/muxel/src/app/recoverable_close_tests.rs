@@ -3626,11 +3626,26 @@ fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
 /// A finish the tick hasn't recorded, in a conversation the pane switched to
 /// since its last sample, read by a click: render and the next tick sample
 /// it again behind the tick's record, and must not record it again after the
-/// look. A protocol completion takes the same path (its revision ahead of the
-/// record); the reducer test `a_sample_a_focus_recorded_is_not_recorded_again`
-/// drives that one, which a PTY here can't raise.
+/// look. This drives the focus marker's plumbing (kept by the click, read by
+/// render, taken by the tick) through the switch branch (`record_switch`). A
+/// protocol completion's replay is the completion branch
+/// (`record_completion`), which a PTY here can't raise; the reducer test
+/// `a_sample_a_focus_recorded_is_not_recorded_again` drives that.
 #[test]
 fn a_finish_read_by_a_click_stays_read_through_the_next_tick() {
+    click_a_finish_then_tick(false);
+}
+
+/// As above, when the activity already holds exactly what the sample would
+/// record: a completion whose time the floor makes equal to the stored one
+/// after a clock correction, say. The click changes no stored value, and
+/// must still keep the sample's identity for the tick.
+#[test]
+fn a_finish_read_by_a_click_stays_read_when_it_left_the_activity_as_it_was() {
+    click_a_finish_then_tick(true);
+}
+
+fn click_a_finish_then_tick(already_stored: bool) {
     use super::{SeenStatus, StatusBinding};
     use muxel_core::sidebar::{SidebarSort, is_unread};
     use muxel_core::{AgentActivity, AgentActivityState};
@@ -3674,6 +3689,16 @@ fn a_finish_read_by_a_click_stays_read_through_the_next_tick() {
                         sampled_at: now - 120_000,
                     },
                 );
+                if already_stored {
+                    let instance = app.workspace.instance(b).unwrap();
+                    let stored = app.pending_activity(instance, now, cx).unwrap();
+                    app.workspace.instance_mut(b).unwrap().activity = stored;
+                    let instance = app.workspace.instance(b).unwrap();
+                    assert!(
+                        app.pending_activity(instance, now, cx).is_none(),
+                        "the sample still changes the activity"
+                    );
+                }
                 app.focus_instance_from_pointer(b, window, cx);
                 let read = app.workspace.instance(b).unwrap().activity.clone();
                 assert_eq!(read.current_state(), Some(AgentActivityState::Done));

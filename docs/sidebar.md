@@ -59,10 +59,12 @@ was submitted) is stamped no earlier than that sample, and a new conversation's
 first status no earlier than the switch. A row sits where the work its terminal
 shows puts it before the status tick has recorded that work, and focusing the
 pane records exactly that, so clicking a row that has just finished moves
-nothing. The tick then samples that same work again; what the focus recorded
-(the conversation switch, the completion by its revision) isn't recorded twice
-or notified, so the finish the click read stays read. Auto-read and the
-accomplishment log still take it.
+nothing. The tick then samples that same work again; what the focus read (the
+conversation switch, the completion by its revision) isn't recorded twice or
+notified, so the finish the click read stays read. That holds when the click
+left the stored values as they were, too (a completion the floor dates to the
+stored time after a clock correction). Auto-read and the accomplishment log
+still take it.
 
 A clock correction rewrites nothing already recorded. A time the clock reads as
 in the future after it steps back is kept as stamped; only ages and the order
@@ -113,9 +115,11 @@ build.sh`, `pwsh build.ps1`). A shell's options end where its command begins, so
 after it they are the command's. pwsh and Windows PowerShell are read by their
 own options: Windows PowerShell's `-PSConsoleFile` and `-Version` take a value
 (`powershell -PSConsoleFile sqlsnapin.psc1` is a session), pwsh's `-Version`
-doesn't. After an option neither knows, a word that may be its value reads as a
-session, whose exit records nothing, as every exit did on `master`; an explicit
-`-Command` or `-File` still runs. fish, nu, xonsh and csh are read by their
+doesn't; `-EncodedArguments` takes one on both. After an option neither knows, a
+word that may be its value ends the read as a session, whose exit records
+nothing, as every exit did on `master`, even with a `-Command` later on the
+line. A `-Command` or `-File` straight after the unknown option still runs.
+fish, nu, xonsh and csh are read by their
 command flag alone, so a script they run by path stays a session. Any other
 program, an agent muxel doesn't know included, is a command, and so is a
 wrapper (`npx`, `uvx`, `wsl`, `ssh host`): the program it starts isn't looked
