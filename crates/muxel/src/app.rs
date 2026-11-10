@@ -104,6 +104,16 @@ mod recoverable_layout;
 mod recoverable_layout_tests;
 #[cfg(all(test, windows))]
 mod remote_reconnect_tests;
+mod rescue;
+#[cfg(all(test, windows))]
+mod rescue_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: deleting a workspace stops once the index is saved, as
+    /// a crash there would.
+    static STOP_AFTER_INDEX_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 #[cfg(all(test, windows))]
 mod restart_completion_tests;
 mod restart_guard;
@@ -6381,6 +6391,8 @@ pub struct MuxelApp {
     /// Keeps two muxel processes from opening the same workspace and clobbering
     /// its `workspace.json`; different workspaces lock independently.
     workspace_lock: Option<std::fs::File>,
+    /// Unsent drafts offered on restarted panes and kept from closed ones.
+    rescue: rescue::Rescue,
     /// A workspace the user tried to enter that another muxel process already
     /// holds open — surfaced as an inline note in the selector. Cleared on a
     /// successful entry or when the selector is dismissed.
@@ -6654,6 +6666,9 @@ struct EditorSnapshot {
     show_rendered: bool,
     /// Set when the snapshot is of a diff pane (rebuilds via `EditorView::diff`).
     diff_dir: Option<PathBuf>,
+    /// Where the editor backs up its unsaved changes, the disk version they
+    /// started from, the offer it was still showing, and its write order.
+    backup: crate::editor::BackupState,
 }
 
 impl EditorSnapshot {
@@ -6669,6 +6684,7 @@ impl EditorSnapshot {
             disk_stamp: e.disk_stamp(),
             show_rendered: e.show_rendered(),
             diff_dir: e.diff_dir().map(|p| p.to_path_buf()),
+            backup: e.backup_state(),
         }
     }
     fn build(self, config: EditorConfig, window: &mut Window, cx: &mut App) -> Entity<EditorView> {
@@ -6677,7 +6693,7 @@ impl EditorSnapshot {
             return cx.new(|cx| EditorView::diff(dir, self.text, config, window, cx));
         }
         cx.new(|cx| {
-            EditorView::from_state(
+            let mut editor = EditorView::from_state(
                 self.text,
                 self.path,
                 self.language,
@@ -6689,7 +6705,9 @@ impl EditorSnapshot {
                 config,
                 window,
                 cx,
-            )
+            );
+            editor.adopt_backup_state(self.backup, cx);
+            editor
         })
     }
 }
@@ -6698,7 +6716,8 @@ impl EditorSnapshot {
 /// window, and restored if the window fails to open).
 enum PopoutContent {
     Terminal(Entity<TerminalView>),
-    Editor(EditorSnapshot),
+    /// Boxed: the snapshot carries the buffer's text and its backup state.
+    Editor(Box<EditorSnapshot>),
     /// Just the URL: the native webview child belongs to the window that built
     /// it, so the pane is re-created in its new window rather than moved.
     Browser(String),
@@ -8634,6 +8653,7 @@ impl MuxelApp {
             workspaces,
             show_workspace_selector: true,
             workspace_lock: None,
+            rescue: rescue::Rescue::default(),
             workspace_busy: None,
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
@@ -8783,7 +8803,11 @@ impl MuxelApp {
         // hands tmux's exit policy back so it exits with its last session.
         cx.on_app_quit(|this, cx| {
             this.finalize_all_closes(cx);
+            this.flush_rescue(cx);
             this.persist();
+            if let Some(id) = this.current_workspace {
+                muxel_store::rescue::mark_workspace_stopped(id);
+            }
             this.close_departure = None;
             this.close_departure_task = None;
             let kills = std::mem::take(&mut this.close_tmux_kills);
@@ -10668,7 +10692,9 @@ impl MuxelApp {
         view.read(cx)
             .session()
             .set_text_paste_error_handler(Some(handler));
+        let rescue_view = view.clone();
         self.terminals.insert(instance_id, view);
+        self.attach_draft_rescue(instance_id, &rescue_view, cx);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
@@ -12286,6 +12312,7 @@ impl MuxelApp {
                         .and_then(|i| i.editor_path.clone());
                     let config = self.editor_config();
                     let ed = cx.new(|cx| EditorView::open(path, config, window, cx));
+                    self.attach_editor_rescue(iid, &ed, true, cx);
                     self.editors.insert(iid, ed);
                 }
             }
@@ -12384,11 +12411,21 @@ impl MuxelApp {
             let _phase = ui_profile::phase("workspace", "lock", None);
             muxel_store::try_lock_workspace(id)
         };
-        let Some(lock) = lock else {
-            self.workspace_busy = Some(id);
-            self.show_workspace_selector = true;
-            cx.notify();
-            return;
+        let lock = match lock {
+            muxel_store::WorkspaceLock::Held(lock) => lock,
+            muxel_store::WorkspaceLock::Busy => {
+                self.workspace_busy = Some(id);
+                self.show_workspace_selector = true;
+                cx.notify();
+                return;
+            }
+            // Another window deleted it after this one listed it.
+            muxel_store::WorkspaceLock::Deleted => {
+                self.forget_deleted_workspace(id);
+                self.show_workspace_selector = true;
+                cx.notify();
+                return;
+            }
         };
         self.workspace_busy = None;
         self.finalize_all_closes(cx);
@@ -12424,6 +12461,11 @@ impl MuxelApp {
             drop(lock);
             self.begin_close_departure(CloseDeparture::Workspace(id), cx);
             return;
+        }
+        // The old workspace's panes go away below; save what they hold first.
+        self.flush_rescue(cx);
+        if let Some(old) = self.current_workspace {
+            muxel_store::rescue::mark_workspace_stopped(old);
         }
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
@@ -12520,9 +12562,13 @@ impl MuxelApp {
                 .and_then(|p| muxel_store::load_workspace_from(&p))
                 .filter(|w| !w.projects.is_empty())
         };
+        self.rescue = rescue::Rescue::default();
+        self.prepare_workspace_rescue(id);
+        let crash = self.note_workspace_running(id, loaded.as_ref());
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
         }
+        self.load_workspace_rescue(crash);
         // Reopen per-monitor project windows for saved assignments whose display
         // is currently connected (a missing monitor keeps the pin for later).
         let assignments: Vec<(Uuid, Uuid)> = self
@@ -14091,6 +14137,8 @@ impl MuxelApp {
         // already tore down its tmux session and worktree.
         self.release_maximize(&closed);
         for &iid in &closed {
+            self.keep_closed_draft(iid, cx);
+            self.drop_editor_backup(iid, cx);
             ui_profile::unregister_focus_pane(iid);
             self.terminal_launching.remove(&iid);
             self.clear_notifications_for(iid);
@@ -16956,6 +17004,7 @@ impl MuxelApp {
         }
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::open(path.clone(), config, window, cx));
+        self.attach_editor_rescue(iid, &ed, false, cx);
         self.editors.insert(iid, ed.clone());
         // Remote project: the local read in `EditorView::open` finds nothing, so
         // fetch the file's contents over SSH (background) and fill the editor.
@@ -18905,6 +18954,11 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        // Settle rescued text before the view goes. An unsent prompt outlives
+        // its pane; an editor's backup goes, since its changes were saved or
+        // given up when it closed.
+        self.keep_closed_draft(iid, cx);
+        self.drop_editor_backup(iid, cx);
         // Files held to ride with this session finish with it.
         let followers: Vec<Uuid> = self
             .closing
@@ -21898,7 +21952,7 @@ impl MuxelApp {
         let content = if let Some(view) = self.terminals.remove(&iid) {
             PopoutContent::Terminal(view)
         } else if let Some(ed) = self.editors.remove(&iid) {
-            PopoutContent::Editor(EditorSnapshot::capture(&ed, cx))
+            PopoutContent::Editor(Box::new(EditorSnapshot::capture(&ed, cx)))
         } else if let Some(bv) = self.browsers.remove(&iid) {
             PopoutContent::Browser(bv.read(cx).url().to_string())
         } else {
@@ -21946,7 +22000,7 @@ impl MuxelApp {
                         match content {
                             PopoutContent::Terminal(view) => PaneView::Terminal(view),
                             PopoutContent::Editor(snap) => {
-                                PaneView::Editor(snap.build(config, window, cx))
+                                PaneView::Editor((*snap).build(config, window, cx))
                             }
                             PopoutContent::Browser(url) => PaneView::Browser(cx.new(|cx| {
                                 crate::browser::BrowserView::new(iid, pid, url, window, cx)
@@ -21990,7 +22044,7 @@ impl MuxelApp {
                         self.terminals.insert(iid, view);
                     }
                     PopoutContent::Editor(snap) => {
-                        let ed = snap.build(config, window, cx);
+                        let ed = (*snap).build(config, window, cx);
                         self.editors.insert(iid, ed);
                     }
                     PopoutContent::Browser(url) => {
@@ -22548,20 +22602,80 @@ impl MuxelApp {
         true
     }
 
+    /// Workspace `id` was deleted in another muxel window after this one
+    /// listed it: drop it from this window's list and say why it didn't open.
+    fn forget_deleted_workspace(&mut self, id: Uuid) {
+        let name = self
+            .workspaces
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        self.workspaces.workspaces.retain(|w| w.id != id);
+        if self.workspaces.current == Some(id) {
+            self.workspaces.current = self.workspaces.workspaces.first().map(|w| w.id);
+        }
+        if self.workspace_busy == Some(id) {
+            self.workspace_busy = None;
+        }
+        self.add_event(
+            NotifKind::Error,
+            tf("Workspace “{name}” was deleted", &[("name", &name)]),
+            t("Another muxel window deleted it, so it can't be opened.").to_string(),
+        );
+    }
+
     /// Delete a workspace: remove it from the index + delete its workspace file.
-    /// Never deletes the last remaining workspace.
+    /// Never deletes the last remaining workspace, nor one open in another
+    /// muxel window: that one stays listed, to delete once it's closed.
     fn delete_workspace(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if self.workspaces.workspaces.len() <= 1 {
             return;
         }
+        // Its lock first: nothing about it changes unless deleting can go on.
+        let current = self.current_workspace == Some(id);
+        let held = if current {
+            self.workspace_lock.take()
+        } else {
+            None
+        };
+        // Then its deletion is recorded, before the index forgets it: a crash
+        // from here on leaves nothing it kept once muxel starts again.
+        let marked =
+            muxel_store::rescue::hold_workspace_for_deletion(id, held).and_then(|deletion| {
+                match deletion.mark() {
+                    Ok(()) => Ok(deletion),
+                    Err(e) => {
+                        if current {
+                            self.workspace_lock = Some(deletion.release());
+                        }
+                        Err(e)
+                    }
+                }
+            });
+        let deletion = match marked {
+            Ok(deletion) => deletion,
+            Err(e) => {
+                log::warn!("couldn't delete workspace {id}: {e:#}");
+                self.add_event(
+                    NotifKind::Error,
+                    t("Couldn't delete the workspace"),
+                    format!("{e:#}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
         self.workspaces.workspaces.retain(|p| p.id != id);
         if self.workspaces.current == Some(id) {
             self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
         }
-        if self.current_workspace == Some(id) {
+        if current {
+            // Its panes stop saving into the directory about to go.
+            self.point_rescue_writers(None, cx);
+            self.rescue = rescue::Rescue::default();
             self.current_workspace = None;
-            // Release the lock so the now-deleted workspace's id is free.
-            self.workspace_lock = None;
         }
         if self.workspace_busy == Some(id) {
             self.workspace_busy = None;
@@ -22570,11 +22684,19 @@ impl MuxelApp {
             Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
             Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
         }
-        if let Some(path) = muxel_store::workspace_doc_path(id) {
-            let _ = std::fs::remove_file(&path);
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::remove_dir(dir);
-            }
+        #[cfg(test)]
+        if STOP_AFTER_INDEX_SAVE.with(std::cell::Cell::get) {
+            return;
+        }
+        // Its document, the unsent prompts and unsaved changes it kept, and
+        // its lock file. A rescue write still on its way leaves nothing.
+        if let Err(e) = deletion.delete() {
+            log::warn!("couldn't delete workspace {id}'s files: {e:#}");
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't delete all of the workspace's files"),
+                format!("{e:#}"),
+            );
         }
         cx.notify();
     }
@@ -22651,6 +22773,9 @@ impl MuxelApp {
         self.redock_for_restart(iid, cx);
         self.terminal_launching.remove(&iid);
         self.failed_launches.remove(&iid);
+        // A prompt typed within the watcher's debounce is saved before the
+        // view goes, so the relaunch offers it.
+        self.flush_draft(iid, cx);
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
@@ -25780,6 +25905,11 @@ impl MuxelApp {
                     tabs[leaf_active]
                 };
                 let is_active = pane_has_focus;
+                let draft_offer = self
+                    .terminals
+                    .contains_key(&iid)
+                    .then(|| self.render_draft_offer(iid, cx))
+                    .flatten();
                 // Frame attribution: the group's card (`Body`) encloses its
                 // strip and content regions, which are subtracted from it.
                 let group = ui_profile::frame_group(tabs.len());
@@ -25877,6 +26007,19 @@ impl MuxelApp {
                         // it gets the sidebar's startup window: a program that
                         // never prints shows its blank screen after that.
                         self.terminal_starting(iid, cx)
+                    } else if let Some(offer) = draft_offer {
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(terminal_pane_element(view, !is_active, shown, cx)),
+                            )
+                            .child(offer)
+                            .into_any_element()
                     } else {
                         terminal_pane_element(view, !is_active, shown, cx)
                     }
@@ -35040,6 +35183,16 @@ impl MuxelApp {
             .children(cfg!(windows).then(|| self.render_pane_memory_limit(cx)))
             .child(
                 self.check_row(
+                    Checkbox::new("b-rescue-unsent")
+                        .checked(self.settings.rescue_unsent_text)
+                        .on_click(
+                            cx.listener(|this, c: &bool, _w, cx| this.set_rescue_enabled(*c, cx)),
+                        ),
+                    &t("Keep unsent prompts and unsaved editor changes through a crash, a restart or an accidental close"),
+                ),
+            )
+            .child(
+                self.check_row(
                     Checkbox::new("b-dev-console")
                         .checked(self.settings.dev_console_enabled)
                         .on_click(cx.listener(|this, c: &bool, _w, cx| {
@@ -37380,6 +37533,7 @@ impl Render for MuxelApp {
             .child(ui_profile::region(ui_profile::Region::Titlebar, || {
                 self.render_titlebar(active_name, cx)
             }))
+            .children(self.render_rescue_strip(cx))
             .child(ui_profile::wrap_region(
                 ui_profile::Region::Shell,
                 div().flex_1().min_h_0().flex().child(outer),

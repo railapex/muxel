@@ -1061,7 +1061,7 @@ fn program_status_reason(root: &RootStatus) -> TerminalStatusReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TitleProvider {
+pub(crate) enum TitleProvider {
     Claude,
     Codex,
     Grok,
@@ -2333,6 +2333,17 @@ fn is_submission_input(bytes: &[u8]) -> bool {
     bytes == b"\r"
 }
 
+/// Whether `bytes`, typed into a pane running `provider`, sends what is in
+/// its input box. Claude Code turns Enter after a backslash into a new line.
+pub(crate) fn submits_turn(
+    bytes: &[u8],
+    provider: TitleProvider,
+    session: &TerminalSession,
+) -> bool {
+    is_submission_input(bytes)
+        && !(provider == TitleProvider::Claude && session.backslash_before_cursor())
+}
+
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
 /// `Settings.terminal_mouse`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2457,6 +2468,8 @@ pub struct TerminalView {
     hidden_facts: Option<RenderFacts>,
     _drain: Task<()>,
     _runtime_events: Task<()>,
+    /// Keeps the pane's unsent draft saved while set; see [`Self::set_draft_sink`].
+    draft_watch: Option<Task<()>>,
 }
 
 /// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
@@ -3982,6 +3995,7 @@ impl TerminalView {
             hidden_facts: None,
             _drain: drain,
             _runtime_events: runtime_event_task,
+            draft_watch: None,
         };
         view.refresh_runtime(cx);
         view
@@ -3989,6 +4003,85 @@ impl TerminalView {
 
     pub fn session(&self) -> &Arc<TerminalSession> {
         &self.session
+    }
+
+    /// Keep this pane's unsent draft saved through `sink`, about a second
+    /// after the user stops typing and only when it changed; `None` stops.
+    /// Reads and writes happen on a background thread. A provider whose input
+    /// box muxel can't read (Grok, Muse) gets no watcher.
+    pub fn set_draft_sink(&mut self, sink: Option<crate::DraftSink>, cx: &mut Context<Self>) {
+        self.draft_watch = sink
+            .filter(|_| crate::draft::readable(self.title_provider))
+            .map(|sink| {
+                let executor = cx.background_executor().clone();
+                cx.background_executor().spawn(crate::draft::watch(
+                    self.session.clone(),
+                    self.title_provider,
+                    executor,
+                    sink,
+                ))
+            });
+    }
+
+    /// Whether this pane's draft is being kept.
+    pub fn draft_watched(&self) -> bool {
+        self.draft_watch.is_some()
+    }
+
+    /// The draft in this pane's input box right now, if muxel can read it
+    /// whole. A box taller than the pane reads as `None`: only the watcher,
+    /// which saw its earlier lines, can save it.
+    pub fn current_draft(&self) -> Option<muxel_core::rescue::PromptDraft> {
+        if !crate::draft::readable(self.title_provider) {
+            return None;
+        }
+        match self.session.read_draft(self.title_provider) {
+            muxel_core::rescue::DraftRead::Text {
+                text,
+                partial,
+                clipped: false,
+            } => Some(muxel_core::rescue::PromptDraft {
+                text,
+                partial,
+                saved_at_ms: crate::draft::now_ms(),
+                source: crate::draft::source(self.title_provider),
+                pane: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// What the pane's saved draft should become now, as the pane goes away
+    /// (close, Restart, quit). An empty box clears it, and so does a box
+    /// still showing the prompt just sent; text read whole replaces it.
+    /// After a submission no read has seen redrawn, a box muxel can't save
+    /// (a shell running the command, a covered box, one taller than the
+    /// pane) clears it too: what is saved was sent. Otherwise `None` keeps
+    /// what was saved: a box muxel can't read whole, or one it can't read at
+    /// all.
+    pub fn settle_draft(&self) -> Option<crate::DraftUpdate> {
+        if !crate::draft::readable(self.title_provider) {
+            return None;
+        }
+        // Taken before the read: a redrawn box ends the hold even when its
+        // text can't be saved here.
+        let sent = self.session.draft_sent();
+        match self.session.read_draft(self.title_provider) {
+            muxel_core::rescue::DraftRead::Text {
+                text,
+                partial,
+                clipped: false,
+            } => Some(crate::DraftUpdate::Save(muxel_core::rescue::PromptDraft {
+                text,
+                partial,
+                saved_at_ms: crate::draft::now_ms(),
+                source: crate::draft::source(self.title_provider),
+                pane: None,
+            })),
+            muxel_core::rescue::DraftRead::Empty => Some(crate::DraftUpdate::Clear),
+            _ if sent => Some(crate::DraftUpdate::Clear),
+            _ => None,
+        }
     }
 
     /// Snapshot evidence before the caller pastes. This never marks a turn as
@@ -4525,7 +4618,7 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if is_submission_input(&bytes) {
+            if submits_turn(&bytes, self.title_provider, &self.session) {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);

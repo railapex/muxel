@@ -1132,7 +1132,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             let path = app.workspace.project(pid).unwrap().root_path.clone();
             let instance = Instance::editor(pid, Some(path.clone()));
             let iid = instance.id;
-            let snapshot = EditorSnapshot { text: "unsaved draft".into(), path: Some(path), language: "text".into(), cursor: None, dirty: true, external_change: None, disk_stamp: None, show_rendered: false, diff_dir: None };
+            let snapshot = EditorSnapshot { text: "unsaved draft".into(), path: Some(path), language: "text".into(), cursor: None, dirty: true, external_change: None, disk_stamp: None, show_rendered: false, diff_dir: None, backup: Default::default() };
             let editor = snapshot.build(app.editor_config(), window, cx);
             app.workspace.add_instance(instance);
             app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
@@ -3428,6 +3428,7 @@ fn opened_file(
                 disk_stamp: None,
                 show_rendered: false,
                 diff_dir: None,
+                backup: Default::default(),
             };
             let editor = snapshot.build(app.editor_config(), window, cx);
             app.workspace.add_instance(instance);
@@ -3744,6 +3745,7 @@ fn cancel_on_a_riding_file_keeps_the_worktree_answer_its_session_has() {
                     disk_stamp: None,
                     show_rendered: false,
                     diff_dir: None,
+                    backup: Default::default(),
                 }
                 .build(app.editor_config(), window, cx);
                 app.editors.insert(plan, edited);
