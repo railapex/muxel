@@ -13,7 +13,7 @@ use super::pending_input::PendingKind;
 use super::popout_lifecycle_tests::with_app;
 use super::recoverable_close::CloseDeparture;
 use crate::update::RelaunchPlan;
-use gpui::{AppContext, TestAppContext, WindowHandle};
+use gpui::{AppContext, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
 use std::sync::Arc;
@@ -820,6 +820,72 @@ fn quitting_from_the_selector_over_live_work_asks() {
                 assert!(app.show_quit_confirm, "it quit without asking");
                 app.show_quit_confirm = false;
                 session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// Close the main window as its own close button or Alt+F4 does. A close
+/// muxel lets through would end the test app, so it must never be one.
+fn close_main_window(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    window
+        .update(cx, |app, _, cx| {
+            assert!(!app.minimize_to_tray_active());
+            // Held, so a Quit that went at once can't end the test app.
+            app.close_tmux_kills
+                .push(cx.background_executor().spawn(std::future::pending::<()>()));
+        })
+        .unwrap();
+    let closed = VisualTestContext::from_window(window.into(), cx).simulate_close();
+    assert!(!closed, "the window closed without asking muxel");
+}
+
+/// The window's own close from the selector over live work leaves the
+/// selector, which would draw over the question, and asks for a busy pane.
+#[test]
+fn closing_the_window_from_the_selector_over_live_work_asks() {
+    with_app(|cx, window| {
+        let session = window
+            .update(cx, |app, window, cx| {
+                let (_, session) = add_shell(app, None, "selector-close", window, cx);
+                app.current_workspace = Some(Uuid::new_v4());
+                app.show_workspace_selector = true;
+                session
+            })
+            .unwrap();
+        close_main_window(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                assert!(!app.show_workspace_selector, "the selector stayed up");
+                assert!(app.show_quit_confirm, "it didn't ask");
+                app.show_quit_confirm = false;
+                session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// Before any workspace is loaded, the window's own close quits at once, as
+/// the selector's Quit does.
+#[test]
+fn closing_the_window_before_a_workspace_loads_quits_at_once() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, _, _| {
+                app.current_workspace = None;
+                app.show_workspace_selector = true;
+            })
+            .unwrap();
+        close_main_window(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                let quitting =
+                    app.confirm_quit && matches!(app.close_departure, Some(CloseDeparture::Quit));
+                // Clear the queued Quit before any assertion: even a failing
+                // test must never quit the real app.
+                app.close_departure = None;
+                app.close_departure_task = None;
+                assert!(quitting, "it didn't quit at once");
             })
             .unwrap();
     });

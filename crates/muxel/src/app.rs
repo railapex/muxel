@@ -8903,7 +8903,13 @@ impl MuxelApp {
                             window.minimize_window();
                             return false;
                         }
-                        this.ask_exit(departure::ExitKind::Quit, cx);
+                        // The terms and the selector draw over the exit's
+                        // question and countdown, so they quit their own way.
+                        if this.show_terms || this.show_workspace_selector {
+                            this.quit_from_entry_screen(cx);
+                        } else {
+                            this.ask_exit(departure::ExitKind::Quit, cx);
+                        }
                         false
                     })
                 })
