@@ -270,6 +270,9 @@ pub(super) struct Typing {
     force: bool,
     /// `send --launch-id`: checked again immediately before the paste.
     launch_id: Option<Uuid>,
+    /// `send --session-id`, or the conversation a waiting send queued in:
+    /// checked again immediately before the paste.
+    session_id: Option<String>,
     /// A prompt holds its pane from admission until its Enter is in: admitted,
     /// or through tmux, taken by tmux.
     in_flight: Option<SendInFlight>,
@@ -281,6 +284,14 @@ pub(super) struct Typing {
     /// paste; once the paste is in, the send finishes.
     cancelled: Option<Arc<AtomicBool>>,
     reply: Value,
+}
+
+/// The terminal binding a pane's stored conversation id was adopted in (see
+/// [`MuxelApp::control_conversation`]).
+pub(in crate::app) struct AdoptedConversation {
+    launch: Uuid,
+    binding: u64,
+    id: String,
 }
 
 /// A `send` from this process between its admission and its Enter. While one
@@ -1064,21 +1075,24 @@ impl MuxelApp {
             Command::New { project, options } => Answer::Open { project, options },
             Command::NewStatus { .. } => unreachable!("handled before workspace lookup"),
             Command::Projects => Answer::Now(Ok(self.control_projects(cx))),
-            Command::Panes { project } => {
-                Answer::Now(self.control_panes(project.as_deref(), now, cx))
-            }
+            // A client learns from these, without sending anything, which
+            // options this muxel takes.
+            Command::Panes { project } => Answer::Now(
+                self.control_panes(project.as_deref(), now, cx)
+                    .map(with_protocol),
+            ),
             Command::Status { agent: None } => {
                 let agents: Vec<AgentInfo> = self
                     .control_instances()
                     .into_iter()
                     .map(|inst| self.control_info(inst, now, cx))
                     .collect();
-                Answer::Now(Ok(json!({ "agents": agents })))
+                Answer::Now(Ok(with_protocol(json!({ "agents": agents }))))
             }
             Command::Status { agent: Some(agent) } => Answer::Now(
                 self.control_resolve(&agent)
                     .and_then(|iid| self.control_info_of(iid, now, cx))
-                    .map(|info| json!(info)),
+                    .map(|info| with_protocol(json!(info))),
             ),
             Command::Show { agent, full } => match self.control_resolve(&agent) {
                 Ok(iid) => self.control_show(iid, full, now, cx),
@@ -1093,6 +1107,7 @@ impl MuxelApp {
                 text,
                 force,
                 launch_id,
+                session_id,
                 once,
                 when_idle,
                 timeout_secs,
@@ -1117,11 +1132,13 @@ impl MuxelApp {
                                 iid,
                                 text,
                                 launch_id,
+                                session_id,
                                 once: once.clone(),
                                 timeout_secs,
                             }));
                         }
-                        let mut typing = self.control_send(iid, text, force, launch_id, cx)?;
+                        let mut typing =
+                            self.control_send(iid, text, force, launch_id, session_id, cx)?;
                         typing.once = once.clone();
                         Ok(Answer::Type(Box::new(typing)))
                     });
@@ -1298,6 +1315,65 @@ impl MuxelApp {
         self.control_info_in(inst, pane, now, cx)
     }
 
+    /// What muxel can vouch for about the conversation `iid` is in, as
+    /// `status` reports it and a `--session-id` pin is checked against. A
+    /// running terminal's stored id counts only while its live binding
+    /// confirms it: muxel adopted it in this binding, or the terminal's own
+    /// evidence names it (its launch opened it, or the provider's current
+    /// title). Codex names a new thread in its title before muxel has
+    /// validated and stored it; until then the pane is unconfirmed. A pane
+    /// with nothing running has the id it will resume, which locates it; the
+    /// check runs again once it does.
+    pub(in crate::app) fn control_conversation(&self, iid: Uuid, cx: &App) -> ctl::Conversation {
+        let Some(stored) = self
+            .workspace
+            .instance(iid)
+            .and_then(|inst| inst.session_id.as_deref())
+        else {
+            return ctl::Conversation::Unconfirmed;
+        };
+        let Some(view) = self.terminal_view(iid).map(|view| view.read(cx)) else {
+            return ctl::Conversation::Known(stored.to_owned());
+        };
+        if view.exited() {
+            return ctl::Conversation::Known(stored.to_owned());
+        }
+        let session = view.session();
+        let adopted = self.control_conversations.get(&iid).is_some_and(|adopted| {
+            adopted.launch == session.id
+                && adopted.binding == session.binding_revision()
+                && adopted.id == stored
+        });
+        if adopted || session.binding_names(stored) {
+            ctl::Conversation::Known(stored.to_owned())
+        } else {
+            ctl::Conversation::Unconfirmed
+        }
+    }
+
+    /// `iid`'s stored conversation id was just adopted for its running
+    /// terminal, after any switch the adoption reported: it names the
+    /// terminal's current binding until that binding changes.
+    pub(in crate::app) fn note_adopted_conversation(&mut self, iid: Uuid, cx: &App) {
+        let adopted = self
+            .terminal_view(iid)
+            .map(|view| view.read(cx).session())
+            .zip(
+                self.workspace
+                    .instance(iid)
+                    .and_then(|inst| inst.session_id.as_deref()),
+            )
+            .map(|(session, id)| AdoptedConversation {
+                launch: session.id,
+                binding: session.binding_revision(),
+                id: id.to_owned(),
+            });
+        match adopted {
+            Some(adopted) => self.control_conversations.insert(iid, adopted),
+            None => self.control_conversations.remove(&iid),
+        };
+    }
+
     fn control_info_in(
         &self,
         inst: &Instance,
@@ -1342,6 +1418,7 @@ impl MuxelApp {
                     .get(&inst.id)
                     .map(|view| view.read(cx).session().id),
             ),
+            session_id: self.control_conversation(inst.id, cx).into_id(),
             awaiting_reply: self
                 .control_turns
                 .get(&inst.id)
@@ -1635,6 +1712,7 @@ impl MuxelApp {
             activity: inst.activity.clone(),
             force,
             launch_id: None,
+            session_id: None,
             in_flight: None,
             once: None,
             waited_ms: None,
@@ -1695,10 +1773,12 @@ impl MuxelApp {
         text: String,
         force: bool,
         launch_id: Option<Uuid>,
+        session_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> CtlResult<Typing> {
         let session = self.control_writable(iid, cx)?;
         ctl::check_launch_id(launch_id, Some(session.id))?;
+        ctl::check_session_id(session_id.as_deref(), &self.control_conversation(iid, cx))?;
         if text.trim().is_empty() {
             return Err("nothing to send".into());
         }
@@ -1716,6 +1796,7 @@ impl MuxelApp {
             self.control_typing(iid, Input::Prompt(text), Some(turn), force, Value::Null, cx)?;
         Ok(Typing {
             launch_id,
+            session_id,
             in_flight: Some(in_flight),
             ..typing
         })
@@ -1845,6 +1926,7 @@ impl MuxelApp {
             turn,
             reply,
             launch_id,
+            session_id,
             force,
             in_flight,
             once,
@@ -1879,8 +1961,13 @@ impl MuxelApp {
                 let attempt = self
                     .terminal_view(iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
+                let pinned = Pins {
+                    launch: launch_id,
+                    conversation: session_id.as_deref(),
+                };
+                let current = self.control_conversation(iid, cx);
                 let (mut reply, paste) =
-                    match paste_prompt(&session, iid, &text, launch_id, admission) {
+                    match paste_prompt(&session, iid, &text, pinned, &current, admission) {
                         Ok(pasted) => pasted,
                         Err(error) => return Task::ready(Err(error)),
                     };
@@ -2289,19 +2376,40 @@ fn enter_verdict<T>(
     Ok(())
 }
 
+/// `status` and `panes` replies carry the newest protocol this muxel accepts.
+fn with_protocol(mut reply: Value) -> Value {
+    reply["protocol"] = json!(ctl::NEWEST_VERSION);
+    reply
+}
+
+/// What a send was pinned to, checked again immediately before its paste.
+#[derive(Clone, Copy)]
+struct Pins<'a> {
+    /// `send --launch-id`.
+    launch: Option<Uuid>,
+    /// `send --session-id`, or the conversation a waiting send queued in.
+    conversation: Option<&'a str>,
+}
+
 /// Paste `text` through the terminal's outside-control input. The receipt
 /// belongs to the returned write: a direct paste is already admitted, while a
 /// paste through tmux has run only once [`ControlWrite::finish`] succeeds, and
-/// the receipt must not be sent before then.
+/// the receipt must not be sent before then. `conversation` is what muxel can
+/// vouch for about the pane's conversation now.
 fn paste_prompt(
     session: &Arc<TerminalSession>,
     pane: Uuid,
     text: &str,
-    expected_launch: Option<Uuid>,
+    pinned: Pins<'_>,
+    conversation: &ctl::Conversation,
     admission: SendAdmission,
 ) -> CtlResult<(Value, ControlWrite)> {
     check_send_state(admission)?;
-    ctl::check_launch_id(expected_launch, Some(session.id))?;
+    ctl::check_launch_id(pinned.launch, Some(session.id))?;
+    // A `/clear`, `/resume` or new Codex thread after admission moves the
+    // pane to another conversation in the same terminal, which the launch
+    // check can't see.
+    ctl::check_session_id(pinned.conversation, conversation)?;
     let paste = session.control_write(ControlInput::Paste(text.to_string()));
     if let Some(Err(error)) = paste.ready() {
         return Err(paste_failed(error));
@@ -2887,7 +2995,7 @@ fn show_value(
 mod prompt_submission_tests {
     use super::{
         ClaimAttempt, PromptConfirmation, PromptConfirmationAction, SendAdmission, SendInFlight,
-        Unconfirmed, claim_agent_with, confirmation_verdict, deferred_claim, enter_verdict,
+        Unconfirmed, claim_agent_with, confirmation_verdict, ctl, deferred_claim, enter_verdict,
         just_submitted_turn, now_ms, owner_id, paste_prompt, press_prompt_enter,
         publish_deferred_claim_with, read_claim_for_admission_with, restore_claim_with,
         submission_receipt,
@@ -3012,16 +3120,34 @@ mod prompt_submission_tests {
             draft_present: false,
             force: false,
         };
-        let refusal =
-            paste_prompt(&session, pane, "prompt", Some(Uuid::new_v4()), admission).unwrap_err();
+        let launch = |launch| super::Pins {
+            launch,
+            conversation: None,
+        };
+        let refusal = paste_prompt(
+            &session,
+            pane,
+            "prompt",
+            launch(Some(Uuid::new_v4())),
+            &ctl::Conversation::Unconfirmed,
+            admission,
+        )
+        .unwrap_err();
         assert_eq!(refusal.code, Some(ErrorCode::LaunchMismatch));
         assert_eq!(
             session.input_rev(),
             before,
             "a refused launch must type nothing"
         );
-        let (receipt, paste) =
-            paste_prompt(&session, pane, "prompt", Some(session.id), admission).unwrap();
+        let (receipt, paste) = paste_prompt(
+            &session,
+            pane,
+            "prompt",
+            launch(Some(session.id)),
+            &ctl::Conversation::Unconfirmed,
+            admission,
+        )
+        .unwrap();
         let revision = session.input_rev();
         session.kill();
         assert_eq!(
@@ -3032,6 +3158,49 @@ mod prompt_submission_tests {
         assert_ne!(revision, before);
         assert_eq!(receipt["pasted"], true);
         assert_eq!(receipt["launch_id"], session.id.to_string());
+    }
+
+    /// A `/clear` or `/resume` keeps the terminal, so only the conversation
+    /// check stops a send pinned to the old conversation at the paste.
+    #[test]
+    fn a_conversation_pin_refuses_before_pasting_into_another_conversation() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let pane = Uuid::new_v4();
+        let before = session.input_rev();
+        let admission = SendAdmission {
+            state: Some(super::AgentState::Idle),
+            just_submitted: false,
+            draft_present: false,
+            force: true,
+        };
+        let pinned = super::Pins {
+            launch: Some(session.id),
+            conversation: Some("conversation-a"),
+        };
+        for (now, reason) in [
+            (
+                ctl::Conversation::Known("conversation-b".into()),
+                "conversation_changed",
+            ),
+            (ctl::Conversation::Unconfirmed, "conversation_unconfirmed"),
+        ] {
+            let refusal =
+                paste_prompt(&session, pane, "prompt", pinned, &now, admission).unwrap_err();
+            assert_eq!(refusal.code, Some(ErrorCode::LaunchMismatch), "{now:?}");
+            assert_eq!(refusal.reason.as_deref(), Some(reason));
+            assert_eq!(refusal.pasted, None);
+            assert_eq!(session.input_rev(), before, "{now:?} was typed into");
+        }
+        let now = ctl::Conversation::Known("conversation-a".into());
+        let (receipt, _paste) =
+            paste_prompt(&session, pane, "prompt", pinned, &now, admission).unwrap();
+        session.kill();
+        assert_eq!(receipt["pasted"], true);
     }
 
     /// A failed tmux step is an error, never a `"pasted": true` receipt, and
@@ -3371,7 +3540,11 @@ mod prompt_submission_tests {
             &session,
             Uuid::new_v4(),
             "late prompt",
-            None,
+            super::Pins {
+                launch: None,
+                conversation: None,
+            },
+            &ctl::Conversation::Unconfirmed,
             SendAdmission {
                 state: Some(super::AgentState::Working),
                 just_submitted: false,
@@ -3536,7 +3709,7 @@ mod prompt_submission_tests {
                     // A fresh shell pane can report Working, which only
                     // `--force` passes. A forced send still takes the marker.
                     let first = app
-                        .control_send(pane, "first".into(), true, None, cx)
+                        .control_send(pane, "first".into(), true, None, None, cx)
                         .unwrap();
                     let second = SendInFlight::begin(pane, false).unwrap_err();
                     assert_eq!(second.code, Some(ErrorCode::ClaimedElsewhere));

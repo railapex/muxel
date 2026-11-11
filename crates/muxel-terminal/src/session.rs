@@ -3303,6 +3303,17 @@ impl TerminalSession {
         self.session_id_hint.lock().clone()
     }
 
+    /// Whether this launch's own evidence names conversation `id` as its live
+    /// binding: it opened `id` (a pinned `--session-id` or `--resume`) and
+    /// nothing has switched since, or the provider's latest session-hint
+    /// title, recorded in the current binding, names it. The app's stored id
+    /// for the pane can lag behind a switch the terminal already saw.
+    pub fn binding_names(&self, id: &str) -> bool {
+        // The listener's lock order: hint, then evidence.
+        let hint = self.session_id_hint.lock();
+        self.evidence.lock().binding_names(id, hint.as_deref())
+    }
+
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()

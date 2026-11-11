@@ -6428,6 +6428,9 @@ pub struct MuxelApp {
     control_once: control_api::OnceKeys,
     /// `send --when-idle` calls waiting for their pane, one per pane.
     control_queue: HashMap<Uuid, control_api::QueuedSend>,
+    /// The terminal binding each pane's stored conversation id was adopted
+    /// in, so `ctl` vouches for that id only while the binding lasts.
+    control_conversations: HashMap<Uuid, control_api::AdoptedConversation>,
     /// Runtime-only click approvals; no connection waits for the human.
     control_approvals: muxel_core::control::ApprovalQueue<control_api::PreparedCreation>,
     control_approval_notified: Option<Uuid>,
@@ -8685,6 +8688,7 @@ impl MuxelApp {
             control_turns: HashMap::new(),
             control_once: Default::default(),
             control_queue: HashMap::new(),
+            control_conversations: HashMap::new(),
             control_approvals: Default::default(),
             control_approval_notified: None,
         };
@@ -12305,6 +12309,7 @@ impl MuxelApp {
         self.control_turns.clear();
         self.refuse_control_queue();
         self.control_once.clear();
+        self.control_conversations.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();

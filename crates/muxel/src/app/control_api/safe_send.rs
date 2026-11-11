@@ -148,7 +148,8 @@ pub(in crate::app) struct QueuedSend {
     /// The terminal launch it types into: `--launch-id`, else the first one
     /// it sees.
     launch: Option<Uuid>,
-    /// The provider conversation the pane had when this was queued.
+    /// The provider conversation it types into: `--session-id`, else the one
+    /// muxel could vouch for when it was queued.
     conversation: Option<String>,
     queued_at: Instant,
     deadline: Instant,
@@ -178,8 +179,9 @@ enum Verdict {
 struct PaneFacts {
     cancelled: bool,
     expired: bool,
-    /// `control_writable`: the launch and conversation it may type into.
-    writable: CtlResult<(Uuid, Option<String>)>,
+    /// `control_writable`: the launch it may type into, and what muxel can
+    /// vouch for about its conversation.
+    writable: CtlResult<(Uuid, ctl::Conversation)>,
     /// What an ordinary send would refuse with now, if anything.
     refusal: Option<ctl::Error>,
     send_in_flight: bool,
@@ -213,15 +215,13 @@ fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
     if let Err(error) = ctl::check_launch_id(queued.launch, Some(launch)) {
         return Verdict::Refuse(error);
     }
-    if queued.conversation.is_some() && conversation != queued.conversation {
-        return Verdict::Refuse(
-            ctl::Error::new(
-                ErrorCode::LaunchMismatch,
-                "the agent's pane switched to another conversation while the send waited: \
-                 nothing was typed",
-            )
-            .with_reason("conversation_changed"),
-        );
+    match ctl::check_session_id(queued.conversation.as_deref(), &conversation) {
+        Ok(()) => {}
+        // A pane muxel can't vouch for yet may settle back into this one.
+        Err(error) if error.reason.as_deref() == Some("conversation_unconfirmed") => {
+            return Verdict::Wait("conversation_unconfirmed");
+        }
+        Err(error) => return Verdict::Refuse(error),
     }
     if facts.send_in_flight {
         return Verdict::Wait("send_in_flight");
@@ -242,6 +242,7 @@ pub(in crate::app) struct QueueRequest {
     pub(super) iid: Uuid,
     pub(super) text: String,
     pub(super) launch_id: Option<Uuid>,
+    pub(super) session_id: Option<String>,
     pub(super) once: Option<String>,
     pub(super) timeout_secs: Option<u64>,
 }
@@ -259,6 +260,7 @@ impl MuxelApp {
             iid,
             text,
             launch_id,
+            session_id,
             once,
             timeout_secs,
         } = request;
@@ -293,6 +295,15 @@ impl MuxelApp {
                 .with_reason("queue_full"),
             );
         }
+        // Another conversation refuses at once, even while the pane starts,
+        // when it is matched on the id it will resume. One muxel can't vouch
+        // for yet is waited out like any other busy state.
+        let current = self.control_conversation(iid, cx);
+        if let Err(error) = ctl::check_session_id(session_id.as_deref(), &current)
+            && error.reason.as_deref() != Some("conversation_unconfirmed")
+        {
+            return refuse(self, error);
+        }
         // A pane still starting has no launch to check yet; the first one
         // seen is the one it types into.
         let launch = match self.control_writable(iid, cx) {
@@ -307,10 +318,7 @@ impl MuxelApp {
         };
         let queued_at = Instant::now();
         let wait = Duration::from_secs(timeout_secs.unwrap_or(ctl::WHEN_IDLE_TIMEOUT_SECS));
-        let conversation = self
-            .workspace
-            .instance(iid)
-            .and_then(|inst| inst.session_id.clone());
+        let conversation = session_id.or_else(|| current.into_id());
         self.control_queue.insert(
             iid,
             QueuedSend {
@@ -331,13 +339,9 @@ impl MuxelApp {
     }
 
     fn queued_send_facts(&self, iid: Uuid, queued: &QueuedSend, cx: &App) -> PaneFacts {
-        let writable = self.control_writable(iid, cx).map(|session| {
-            let conversation = self
-                .workspace
-                .instance(iid)
-                .and_then(|inst| inst.session_id.clone());
-            (session.id, conversation)
-        });
+        let writable = self
+            .control_writable(iid, cx)
+            .map(|session| (session.id, self.control_conversation(iid, cx)));
         let refusal = writable
             .as_ref()
             .ok()
@@ -442,7 +446,10 @@ impl MuxelApp {
             }
             Verdict::Refuse(error) => return self.finish_queued_send(iid, queued, Err(error)),
         }
-        match self.control_send(iid, queued.text.clone(), false, queued.launch, cx) {
+        // The conversation it queued in rides along to the paste, which
+        // checks it once more.
+        let pinned = queued.conversation.clone();
+        match self.control_send(iid, queued.text.clone(), false, queued.launch, pinned, cx) {
             Ok(mut typing) => {
                 typing.once = queued.once;
                 typing.waited_ms =
@@ -594,7 +601,7 @@ mod tests {
         PaneFacts {
             cancelled: false,
             expired: false,
-            writable: Ok((launch, Some("conversation".into()))),
+            writable: Ok((launch, ctl::Conversation::Known("conversation".into()))),
             refusal: None,
             send_in_flight: false,
         }
@@ -633,6 +640,16 @@ mod tests {
             ..ready(launch)
         };
         assert_eq!(verdict(&send, starting), Verdict::Wait("starting"));
+        // The agent is naming a conversation muxel hasn't confirmed: it may
+        // be this one again, so the send waits to see.
+        let unconfirmed = PaneFacts {
+            writable: Ok((launch, ctl::Conversation::Unconfirmed)),
+            ..ready(launch)
+        };
+        assert_eq!(
+            verdict(&send, unconfirmed),
+            Verdict::Wait("conversation_unconfirmed")
+        );
     }
 
     #[test]
@@ -662,7 +679,7 @@ mod tests {
         let replaced = refused(ready(Uuid::new_v4()));
         assert_eq!(replaced.code, Some(ErrorCode::LaunchMismatch));
         let switched = refused(PaneFacts {
-            writable: Ok((launch, Some("another".into()))),
+            writable: Ok((launch, ctl::Conversation::Known("another".into()))),
             ..ready(launch)
         });
         assert_eq!(switched.code, Some(ErrorCode::LaunchMismatch));
