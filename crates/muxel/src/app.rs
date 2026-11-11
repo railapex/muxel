@@ -80,6 +80,8 @@ mod hotbar;
 mod libraries_ui;
 mod pane_grid;
 #[cfg(all(test, windows))]
+mod paste_submission_tests;
+#[cfg(all(test, windows))]
 mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
@@ -1173,6 +1175,7 @@ mod restored_activity_tests {
         };
         let done = attended_completion();
         let mut runtime = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Working,
             attributable: true,
             reason: TerminalStatusReason::ProgramStatus(None),
@@ -1525,6 +1528,7 @@ struct SeenStatus {
     binding: StatusBinding,
     coverage: muxel_terminal::TerminalStatusCoverage,
     completion_revision: u64,
+    held: bool,
 }
 
 /// What one status sample does on the app's attention path: the last status
@@ -1594,6 +1598,8 @@ struct StatusSample {
     attributable: bool,
     /// The pane is focused in its active window.
     attended: bool,
+    /// A finished turn read as Working for its background work.
+    held: bool,
     /// The restore guard holds the pane's durable state through this sample.
     preserve_restored: bool,
 }
@@ -1616,6 +1622,7 @@ impl StatusSample {
             completion_revision: runtime.completion_revision,
             attributable: runtime.is_attributable_to(binding_rev),
             attended,
+            held: runtime.reason == muxel_terminal::TerminalStatusReason::BackgroundWork,
             preserve_restored,
         }
     }
@@ -1653,6 +1660,7 @@ fn apply_status_sample(
         completion_revision,
         attributable,
         attended,
+        held,
         preserve_restored,
     } = sample;
     let (changed, notify, new_binding) =
@@ -1670,11 +1678,17 @@ fn apply_status_sample(
         .map_or(completion_revision > 0, |seen| {
             completion_revision > seen.completion_revision
         });
+    // A new turn on a held pane stays Working, so the hold ending is the only sign
+    // that it began.
+    let resumed = status == AgentStatus::Working
+        && !held
+        && record.is_some_and(|seen| seen.held && seen.binding == binding);
     *record = Some(SeenStatus {
         status,
         binding,
         coverage,
         completion_revision,
+        held,
     });
     let mut effect = SampleEffect {
         changed,
@@ -1685,6 +1699,7 @@ fn apply_status_sample(
         && let Some(activity) = activity
         && (new_binding
             || completion_pulse
+            || resumed
             || activity_needs_observation(previous, status, activity))
     {
         // A new binding's first status is a new event. Its previous state is
@@ -1694,6 +1709,8 @@ fn apply_status_sample(
             Some(AgentActivityState::Idle)
         } else if completion_pulse {
             Some(AgentActivityState::Working)
+        } else if resumed {
+            Some(AgentActivityState::Idle)
         } else {
             activity
                 .current_state()
@@ -1790,7 +1807,46 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            held: false,
         })
+    }
+
+    /// A new turn on a held pane reads Working from start to end, so without this
+    /// nothing records that it began, and `ctl wait --turn` would take the previous
+    /// turn's reply for this one's.
+    #[test]
+    fn a_new_turn_on_a_held_pane_records_its_start() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let sample = |held| StatusSample {
+            status: AgentStatus::Working,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 0,
+            attributable: true,
+            attended: false,
+            held,
+            preserve_restored: false,
+        };
+        let mut record = seen(AgentStatus::Working, binding);
+        let mut activity = muxel_core::AgentActivity::default();
+        apply_status_sample(&mut record, Some(&mut activity), sample(false), 100);
+        assert_eq!(
+            activity.work_started_at, None,
+            "already Working: no new event"
+        );
+        apply_status_sample(&mut record, Some(&mut activity), sample(true), 200);
+        assert_eq!(activity.work_started_at, None, "the hold starts no work");
+        apply_status_sample(&mut record, Some(&mut activity), sample(false), 300);
+        assert_eq!(activity.work_started_at, Some(300));
+        apply_status_sample(&mut record, Some(&mut activity), sample(false), 400);
+        assert_eq!(
+            activity.work_started_at,
+            Some(300),
+            "only the first sample of it"
+        );
     }
 
     #[test]
@@ -1828,6 +1884,7 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProgramStatus,
             completion_revision: 1,
+            held: false,
         });
         let mut activity = AgentActivity::default();
         activity.observe(
@@ -1842,6 +1899,7 @@ mod status_attention_tests {
             completion_revision: 2,
             attributable: true,
             attended: false,
+            held: false,
             preserve_restored: false,
         };
         let previous = record;
@@ -1876,6 +1934,7 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProgramStatus,
             completion_revision: 0,
+            held: false,
         });
         let mut activity = AgentActivity::default();
         activity.observe(
@@ -1890,6 +1949,7 @@ mod status_attention_tests {
             completion_revision: 1,
             attributable: true,
             attended: false,
+            held: false,
             preserve_restored: false,
         };
         let previous = record;
@@ -1934,6 +1994,7 @@ mod status_attention_tests {
                 binding,
                 coverage: TerminalStatusCoverage::ProgramStatus,
                 completion_revision: 0,
+                held: false,
             });
             let mut activity = AgentActivity::default();
             activity.observe(
@@ -1948,6 +2009,7 @@ mod status_attention_tests {
                 completion_revision: 1,
                 attributable: true,
                 attended: false,
+                held: false,
                 preserve_restored: false,
             };
             let previous = record;
@@ -1985,6 +2047,7 @@ mod status_attention_tests {
             completion_revision,
             attributable: true,
             attended: false,
+            held: false,
             preserve_restored: false,
         };
         for (status, revision, should_refresh) in [
@@ -2032,6 +2095,7 @@ mod status_attention_tests {
             rev: session.binding_revision(),
         };
         let cached = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Done,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -2185,6 +2249,7 @@ mod status_attention_tests {
                     completion_revision: 0,
                     attributable,
                     attended,
+                    held: false,
                     preserve_restored: false,
                 },
                 now,
@@ -2279,11 +2344,35 @@ fn reattach_backoff(attempts: Option<u32>) -> Duration {
         .min(REATTACH_BACKOFF_MAX)
 }
 
-fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: i64) -> String {
+/// What runs beside a turn, for a person. Counted by what the agent's screen lists.
+fn background_label(work: muxel_core::control::BackgroundWork) -> String {
+    let count = |n: u32, one, other| tn(one, other, n as usize, &[("count", &n.to_string())]);
+    let mut parts = Vec::new();
+    if work.shells > 0 {
+        parts.push(count(work.shells, "{count} shell", "{count} shells"));
+    }
+    if work.monitors > 0 {
+        parts.push(count(work.monitors, "{count} monitor", "{count} monitors"));
+    }
+    if work.subagents {
+        parts.push(t("subagents").to_string());
+    }
+    parts.join(", ")
+}
+
+fn localized_activity_label(
+    status: AgentStatus,
+    activity: &AgentActivity,
+    background: Option<muxel_core::control::BackgroundWork>,
+    now: i64,
+) -> String {
     let label = agent_activity_label(activity_state(status), activity, now);
     let (word, age) = label
         .split_once(" · ")
         .map_or((label.as_str(), None), |(word, age)| (word, Some(age)));
+    let beside = background
+        .filter(|_| status != AgentStatus::Blocked)
+        .map(background_label);
     let word = match word {
         "working" => t("working").to_string(),
         "idle" => t("idle").to_string(),
@@ -2293,7 +2382,56 @@ fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: 
         "stale" => t("stale").to_string(),
         _ => word.to_string(),
     };
-    age.map_or(word.clone(), |age| format!("{word} · {age}"))
+    match (age, beside.as_deref()) {
+        (Some(age), Some(beside)) => format!("{word} · {age} · {beside}"),
+        (Some(detail), None) | (None, Some(detail)) => format!("{word} · {detail}"),
+        (None, None) => word,
+    }
+}
+
+#[cfg(test)]
+mod activity_label_tests {
+    use super::localized_activity_label;
+    use muxel_core::{AgentActivity, control::BackgroundWork};
+    use muxel_terminal::AgentStatus;
+
+    #[test]
+    fn pr136_shared_background_label_retains_activity_age() {
+        let activity = AgentActivity {
+            work_started_at: Some(60_000),
+            completed_at: Some(60_000),
+            blocked_at: Some(60_000),
+            ..AgentActivity::default()
+        };
+        let background = Some(BackgroundWork {
+            shells: 1,
+            ..BackgroundWork::default()
+        });
+        for (status, expected) in [
+            (AgentStatus::Working, "working · 1 shell"),
+            (AgentStatus::Idle, "idle · 3m · 1 shell"),
+            (AgentStatus::Done, "done · 3m · 1 shell"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, background, 240_000),
+                expected,
+                "{status:?} must retain its age beside background work"
+            );
+        }
+        for (status, expected) in [
+            (AgentStatus::Working, "working"),
+            (AgentStatus::Idle, "idle · 3m"),
+            (AgentStatus::Done, "done · 3m"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, None, 240_000),
+                expected,
+                "{status:?} without background work must retain its label"
+            );
+        }
+    }
 }
 
 /// Asset path for an agent's icon, chosen from its program name.
@@ -2559,6 +2697,7 @@ fn path_paste_error(error: muxel_core::path_paste::PastePathError) -> SharedStri
         PastePathError::NonUnicode => {
             t("A filename cannot be represented as Unicode without changing it.")
         }
+        PastePathError::InputRefused => t("The terminal refused this paste. Nothing was pasted."),
     }
 }
 
@@ -3499,6 +3638,20 @@ pub fn register_actions(cx: &mut App) {
             app.update(cx, |this, cx| this.set_language(a.0.clone(), cx));
         }
     });
+    // New Window comes from a shortcut in any muxel window, the palette, or the
+    // macOS menu bar and Dock menu, which work with no window focused.
+    cx.on_action(|_: &NewWindow, cx| match cx.try_global::<MuxelHandle>() {
+        Some(handle) => {
+            if let Some(app) = handle.0.upgrade() {
+                app.update(cx, |this, _| this.open_new_window(None));
+            }
+        }
+        None => {
+            if let Err(error) = crate::new_window::open(None) {
+                log::warn!("couldn't open a new window: {error:#}");
+            }
+        }
+    });
     // Cmd+Q (macOS) / Ctrl+Q: route to the same confirm flow as the title-bar
     // close button. Registered globally (not on the main view) so it also fires
     // on the first-run screens, whose render path omits the main element.
@@ -3555,15 +3708,20 @@ actions!(muxel, [HideApp, HideOtherApps, ShowAllApps]);
 /// labels are translated when set.
 #[cfg(target_os = "macos")]
 pub fn install_app_menu(cx: &mut App) {
-    cx.set_menus([gpui::Menu::new("muxel").items([
-        gpui::MenuItem::os_submenu(t("Services"), gpui::SystemMenuType::Services),
-        gpui::MenuItem::separator(),
-        gpui::MenuItem::action(t("Hide muxel"), HideApp),
-        gpui::MenuItem::action(t("Hide Others"), HideOtherApps),
-        gpui::MenuItem::action(t("Show All"), ShowAllApps),
-        gpui::MenuItem::separator(),
-        gpui::MenuItem::action(t("Quit muxel"), Quit),
-    ])]);
+    cx.set_menus([
+        gpui::Menu::new("muxel").items([
+            gpui::MenuItem::os_submenu(t("Services"), gpui::SystemMenuType::Services),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action(t("Hide muxel"), HideApp),
+            gpui::MenuItem::action(t("Hide Others"), HideOtherApps),
+            gpui::MenuItem::action(t("Show All"), ShowAllApps),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action(t("Quit muxel"), Quit),
+        ]),
+        gpui::Menu::new(t("File")).items([gpui::MenuItem::action(t("New Window"), NewWindow)]),
+    ]);
+    // Right-clicking the Dock icon offers it too.
+    cx.set_dock_menu(vec![gpui::MenuItem::action(t("New Window"), NewWindow)]);
 }
 
 // Keyboard-driven actions, handled by the root view (so they have `&mut Window`)
@@ -3623,6 +3781,8 @@ actions!(
         ToggleFullScreen,
         // Toggle the developer console (error log) — only when enabled in settings.
         ToggleDevConsole,
+        // Open another muxel window (a new process) on the workspace selector.
+        NewWindow,
         // Search the active terminal's scrollback (Terminal context only).
         SearchTerminal,
         // Tab / Shift+Tab while a terminal is focused: send to the PTY instead
@@ -3688,6 +3848,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
+        "NewWindow" => KeyBinding::new(keystroke, NewWindow, context),
         // NewAgent1..9 — the trailing digit is the 1-based preset index.
         a if a.starts_with("NewAgent") => {
             match a
@@ -3769,6 +3930,8 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     #[cfg(target_os = "macos")]
     {
         bindings.push(KeyBinding::new("cmd-h", HideApp, None));
+        // The Mac's standard New Window chord, beside the rebindable one.
+        bindings.push(KeyBinding::new("cmd-n", NewWindow, None));
         bindings.push(KeyBinding::new("alt-cmd-h", HideOtherApps, None));
     }
     cx.bind_keys(bindings);
@@ -4593,6 +4756,7 @@ mod loop_cleanup_tests {
 
     fn snapshot(launch: Uuid, rev: u64, status: AgentStatus) -> TerminalRuntimeSnapshot {
         TerminalRuntimeSnapshot {
+            background: None,
             status,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -4880,6 +5044,7 @@ mod loop_cleanup_tests {
         assert!(run.seen_working);
         let done = snapshot(session.id, a, AgentStatus::Done);
         let mut attention = Some(SeenStatus {
+            held: false,
             status: AgentStatus::Done,
             binding: StatusBinding {
                 launch: session.id,
@@ -5968,6 +6133,11 @@ pub struct MuxelApp {
     /// window size; it claims it once someone is at this machine. Cleared on every
     /// (re)spawn. Runtime-only.
     size_claimed: HashSet<Uuid>,
+    /// Panes whose size claim couldn't reach their host: how many tries in a row
+    /// failed, and when the last one did. A failed claim is retried after
+    /// [`reattach_backoff`]. Cleared on success and on every (re)spawn.
+    /// Runtime-only.
+    size_claim_failures: HashMap<Uuid, (u32, Instant)>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -6089,6 +6259,14 @@ pub struct MuxelApp {
     /// holds open — surfaced as an inline note in the selector. Cleared on a
     /// successful entry or when the selector is dismissed.
     workspace_busy: Option<Uuid>,
+    /// Workspaces another muxel window had open when the selector last looked,
+    /// marked "in use" there. A snapshot: entering one still checks its lock.
+    workspaces_in_use: HashSet<Uuid>,
+    /// Linux: what each pane's systemd scopes last said about running out of
+    /// memory, so each new kill is reported once (see `check_pane_memory_kills`).
+    pane_oom_seen: HashMap<Uuid, muxel_core::pane_scope::OomCounts>,
+    /// When the pane scopes were last checked for kills.
+    pane_oom_checked_at: Option<Instant>,
     /// "New workspace" name editor used in the selector.
     workspace_name_input: Entity<InputState>,
     /// Settings modal size (resizable via the bottom-right corner).
@@ -6320,6 +6498,7 @@ enum PaletteCommand {
     ReadAloudRestart,
     ReadAloudStop,
     CopyRichText,
+    NewWindow,
     RunRunner(usize),
     SendSnippet(usize),
 }
@@ -8349,6 +8528,9 @@ impl MuxelApp {
             show_workspace_selector: true,
             workspace_lock: None,
             workspace_busy: None,
+            workspaces_in_use: HashSet::new(),
+            pane_oom_seen: HashMap::new(),
+            pane_oom_checked_at: None,
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
@@ -8438,6 +8620,7 @@ impl MuxelApp {
             reconnecting: HashMap::new(),
             host_outages: HostOutages::default(),
             size_claimed: HashSet::new(),
+            size_claim_failures: HashMap::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -8578,6 +8761,18 @@ impl MuxelApp {
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
+        this.refresh_workspace_selector();
+        // New Window asked for one workspace: open it, unless it's gone from the
+        // index (then the selector shows). One open elsewhere meanwhile is
+        // refused by its lock and marked in the selector, like a click would be.
+        if let Some(id) = crate::new_window::launch_request()
+            .workspace
+            .filter(|id| this.workspaces.workspaces.iter().any(|w| w.id == *id))
+        {
+            cx.defer_in(window, move |this, window, cx| {
+                this.enter_workspace(id, window, cx)
+            });
+        }
         this
     }
 
@@ -8797,17 +8992,28 @@ impl MuxelApp {
             .iter()
             .filter(|(iid, _)| !self.is_closing(**iid))
             .filter(|(iid, view)| {
-                let session = view.read(cx).session();
+                let view = view.read(cx);
+                let session = view.session();
                 !self.size_claimed.contains(iid)
+                    // A dropped pane has no client to claim for; its reattach does.
+                    && !view.exited()
                     // Attached by now: its client has drawn, so it recorded itself.
                     && session.has_output()
                     && self
                         .terminal_launches
                         .get(iid)
                         .is_some_and(|&(launched, _)| present_at > launched)
+                    && self
+                        .size_claim_failures
+                        .get(iid)
+                        .is_none_or(|&(failures, at)| {
+                            at.elapsed() >= reattach_backoff(Some(failures.saturating_sub(1)))
+                        })
             })
             .map(|(iid, _)| *iid)
             .collect();
+        // One ssh per host: see `ssh::claim_window_sizes_command`.
+        let mut by_host: HashMap<Uuid, (RemoteHost, Vec<(Uuid, SessionTarget)>)> = HashMap::new();
         for iid in due {
             self.size_claimed.insert(iid);
             let Some(host) = self.remote_host_for_instance(iid) else {
@@ -8820,24 +9026,60 @@ impl MuxelApp {
                 continue;
             }
             let session = inst.tmux_target(&host.name);
+            by_host
+                .entry(host.id)
+                .or_insert_with(|| (host, Vec::new()))
+                .1
+                .push((iid, session));
+        }
+        for (host, claims) in by_host.into_values() {
             let tag = Self::tmux_client_tag(&host);
             let control_path = Self::commands_control_path(host.id);
             let password = self.remote_password(&host);
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(e) = integrations::claim_tmux_window_size(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                        &tag,
-                    ) {
-                        muxel_store::append_event_log(&format!(
-                            "window size claim failed for [{session}]: {e:#}"
-                        ));
+            cx.spawn(async move |this, cx| {
+                let sessions: Vec<SessionTarget> =
+                    claims.iter().map(|(_, session)| session.clone()).collect();
+                let claimed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        integrations::claim_tmux_window_sizes(
+                            &host,
+                            &control_path,
+                            password.as_deref(),
+                            &sessions,
+                            &tag,
+                        )
+                    })
+                    .await;
+                let _ = this.update(cx, |this, _| {
+                    for (iid, session) in claims {
+                        match &claimed {
+                            Ok(()) => {
+                                this.size_claim_failures.remove(&iid);
+                            }
+                            // Left unclaimed, the client sits out the size until it
+                            // next reattaches, and tmux keeps drawing the window at
+                            // another client's size. Try again after a backoff.
+                            Err(e) => {
+                                muxel_store::append_event_log(&format!(
+                                    "window size claim failed for [{session}]: {e:#}"
+                                ));
+                                if !this.terminals.contains_key(&iid) {
+                                    continue;
+                                }
+                                this.size_claimed.remove(&iid);
+                                let failures = this
+                                    .size_claim_failures
+                                    .get(&iid)
+                                    .map_or(1, |&(failures, _)| failures.saturating_add(1));
+                                this.size_claim_failures
+                                    .insert(iid, (failures, Instant::now()));
+                            }
+                        }
                     }
-                })
-                .detach();
+                });
+            })
+            .detach();
         }
     }
 
@@ -9218,7 +9460,9 @@ impl MuxelApp {
             )
         }) {
             create_missing_cwd(&spec)?;
-            return Ok(spec.with_memory_limit(self.settings.pane_memory_limit_bytes()));
+            return Ok(spec
+                .with_memory_limit(self.settings.pane_memory_limit_bytes())
+                .with_launch_prefix(self.pane_scope_prefix(instance_id)));
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -9400,11 +9644,27 @@ impl MuxelApp {
                             ))
                         },
                     );
+                    // Linux: the program tmux starts runs in a scope of its own,
+                    // so a process killed for memory there doesn't stop the
+                    // agent with it (see `muxel_core::pane_scope`).
+                    let scope = self.pane_scope_prefix(instance_id);
+                    let (scoped_program, scoped_args) = if scope.is_empty() {
+                        (resolved.program.clone(), resolved.args.clone())
+                    } else {
+                        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                        let (program, args) = muxel_core::pane_scope::wrap_tmux_program(
+                            &scope,
+                            resolved.program.as_deref(),
+                            &resolved.args,
+                            &shell,
+                        );
+                        (Some(program), args)
+                    };
                     let launch = crate::session_binding::tmux_pane_args(
                         socket.clone(),
                         &session.name,
-                        resolved.program.as_deref(),
-                        &resolved.args,
+                        scoped_program.as_deref(),
+                        &scoped_args,
                         instance_id,
                         integrations::tmux_session_env_supported(),
                         root.as_deref(),
@@ -9448,7 +9708,8 @@ impl MuxelApp {
                     match resolved.program.clone() {
                         Some(program) => CommandSpec::program(program, resolved.args.clone()),
                         None => CommandSpec::shell(),
-                    },
+                    }
+                    .with_launch_prefix(self.pane_scope_prefix(instance_id)),
                     Vec::new(),
                 ),
             };
@@ -9551,6 +9812,13 @@ impl MuxelApp {
         ))
     }
 
+    /// Linux: the argv that starts a local pane's program in a systemd scope of
+    /// its own, with the pane memory limit; empty where that isn't available.
+    fn pane_scope_prefix(&self, instance_id: Uuid) -> Vec<String> {
+        crate::pane_scope::prefix(instance_id, self.settings.pane_memory_limit_bytes())
+            .unwrap_or_default()
+    }
+
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
     fn refuse_terminal_launch(&mut self, iid: Uuid, error: String, cx: &mut Context<Self>) {
         // Immediate launches may fail preparation before claiming their task.
@@ -9577,6 +9845,7 @@ impl MuxelApp {
         self.exit_logged.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
         self.size_claimed.remove(&iid);
+        self.size_claim_failures.remove(&iid);
         // Re-baseline auto-continue against the new screen (keeping its Auto toggle):
         // otherwise a reattach's replayed scrollback is compared to the old
         // fingerprint/cooldown and can fire `continue` again for already-done work.
@@ -10315,6 +10584,20 @@ impl MuxelApp {
                 .session()
                 .set_path_paste_error_handler(Some(handler));
         }
+        let app = cx.weak_entity();
+        let handler: muxel_terminal::TextPasteErrorHandler = Arc::new(move |error, cx: &App| {
+            let app = app.clone();
+            cx.spawn(async move |cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.add_event(NotifKind::Error, t("Couldn't paste this text"), error);
+                    cx.notify();
+                });
+            })
+            .detach();
+        });
+        view.read(cx)
+            .session()
+            .set_text_paste_error_handler(Some(handler));
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
@@ -11982,6 +12265,7 @@ impl MuxelApp {
         };
         let Some(lock) = lock else {
             self.workspace_busy = Some(id);
+            self.workspaces_in_use.insert(id);
             self.show_workspace_selector = true;
             cx.notify();
             return;
@@ -12100,15 +12384,11 @@ impl MuxelApp {
         self.active_instance = None;
 
         self.current_workspace = Some(id);
-        self.workspaces.current = Some(id);
-        let save_index = {
+        {
             let _phase = ui_profile::phase("workspace", "save-index", None);
-            muxel_store::save_workspaces_index(&self.workspaces)
-        };
-        match save_index {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+            self.update_workspaces_index(|index| index.current = Some(id));
         }
+        self.workspaces_in_use.remove(&id);
 
         let loaded = {
             let _phase = ui_profile::phase("workspace", "load-document", None);
@@ -12149,11 +12429,12 @@ impl MuxelApp {
     /// Create a new (empty) workspace and enter it.
     fn create_workspace(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let id = Uuid::new_v4();
-        self.workspaces.workspaces.push(WorkspaceMeta { id, name });
-        match muxel_store::save_workspaces_index(&self.workspaces) {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
-        }
+        self.update_workspaces_index(|index| {
+            index.workspaces.push(WorkspaceMeta {
+                id,
+                name: name.clone(),
+            })
+        });
         self.enter_workspace(id, window, cx);
     }
 
@@ -12175,10 +12456,60 @@ impl MuxelApp {
 
     /// Reopen the selector to switch workspaces (pre-selects the current one).
     fn open_workspace_selector(&mut self, cx: &mut Context<Self>) {
+        self.refresh_workspace_selector();
         self.workspaces.current = self.current_workspace;
         self.workspace_busy = None;
         self.show_workspace_selector = true;
         cx.notify();
+    }
+
+    /// Start another muxel window: on the workspace selector, or straight into
+    /// `workspace`. A failure to start it is reported in the feed.
+    fn open_new_window(&mut self, workspace: Option<Uuid>) {
+        if let Err(error) = crate::new_window::open(workspace) {
+            log::warn!("couldn't open a new window: {error:#}");
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't open a new window"),
+                format!("{error:#}"),
+            );
+        }
+    }
+
+    /// Re-read the shared workspaces index, so workspaces made in another muxel
+    /// window are listed, and note which ones another window has open.
+    fn refresh_workspace_selector(&mut self) {
+        let path = muxel_store::workspaces_index_path();
+        if let Some(index) = path
+            .filter(|p| p.exists())
+            .map(|p| muxel_store::load_workspaces_index_from(&p))
+            .filter(|index| !index.workspaces.is_empty())
+        {
+            self.workspaces = index;
+        }
+        let current = self.current_workspace;
+        self.workspaces_in_use = self
+            .workspaces
+            .workspaces
+            .iter()
+            .map(|w| w.id)
+            .filter(|&id| Some(id) != current && muxel_store::workspace_in_use(id))
+            .collect();
+    }
+
+    /// Apply `change` to the workspaces index other muxel windows share, then
+    /// adopt the merged result. On a failed save the change still applies here.
+    fn update_workspaces_index(&mut self, change: impl Fn(&mut WorkspacesIndex)) {
+        match muxel_store::update_workspaces_index(&self.workspaces, &change) {
+            Ok(index) => {
+                self.workspaces = index;
+                self.clear_save_error(SaveTarget::WorkspaceIndex);
+            }
+            Err(e) => {
+                change(&mut self.workspaces);
+                self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}"));
+            }
+        }
     }
 
     /// Derive a project name from a folder path.
@@ -14148,6 +14479,9 @@ impl MuxelApp {
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.expire_closes(Instant::now(), cx);
+        if self.check_pane_memory_kills() {
+            cx.notify();
+        }
         // Remember the grid each pane settled at, so a restart respawns its program
         // already at the right size instead of resizing it after its first paint —
         // which a re-attached tmux session shows as visibly wrong spacing until the
@@ -14470,8 +14804,12 @@ impl MuxelApp {
                 }
             }
             if let Some(instance) = self.workspace.instance(iid) {
-                let label =
-                    agent_activity_label(activity_state(status), &instance.activity, now_epoch);
+                // The key redraws the row when what runs beside the turn changes.
+                let label = format!(
+                    "{}{:?}",
+                    agent_activity_label(activity_state(status), &instance.activity, now_epoch),
+                    runtime.background
+                );
                 let previous_label = self.last_activity_labels.insert(iid, label.clone());
                 dirty |= previous_label.as_ref() != Some(&label);
             }
@@ -15280,6 +15618,65 @@ impl MuxelApp {
         });
     }
 
+    /// Linux: report processes the kernel killed for memory in a pane's scope,
+    /// every few seconds. The pane's agent keeps running (the scope's
+    /// `OOMPolicy=continue`), so without this the kill would go unexplained.
+    /// Counts a scope had before this muxel first saw it aren't reported.
+    /// Returns whether anything was added to the feed.
+    fn check_pane_memory_kills(&mut self) -> bool {
+        const EVERY: Duration = Duration::from_secs(5);
+        if self
+            .pane_oom_checked_at
+            .is_some_and(|at| at.elapsed() < EVERY)
+        {
+            return false;
+        }
+        self.pane_oom_checked_at = Some(Instant::now());
+        let mut reported = false;
+        for (iid, now) in crate::pane_scope::oom_counts() {
+            let Some(before) = self.pane_oom_seen.insert(iid, now) else {
+                continue;
+            };
+            let killed = now.killed.saturating_sub(before.killed);
+            if killed == 0 {
+                continue;
+            }
+            let limit_reached = now.limit_reached > before.limit_reached;
+            let inst = self.workspace.instance(iid);
+            let title = inst
+                .map(|i| i.display_name().to_string())
+                .unwrap_or_else(|| t("A closed pane").to_string());
+            let project = inst
+                .and_then(|i| self.workspace.project(i.project_id))
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            let limit = self.settings.pane_memory_limit_gb.to_string();
+            let body = if limit_reached {
+                tf(
+                    "The pane's processes reached its {limit} GB memory limit, so Linux stopped the largest one. The rest of the pane kept running. Settings → Behavior sets the limit.",
+                    &[("limit", &limit)],
+                )
+            } else {
+                t("The computer ran out of memory, so Linux stopped a process in this pane. The rest of the pane kept running.").to_string()
+            };
+            muxel_store::append_event_log(&format!(
+                "memory-limit: \"{title}\" [{project}] killed={killed} cause={}",
+                if limit_reached {
+                    "pane-limit"
+                } else {
+                    "out-of-memory"
+                }
+            ));
+            self.add_event(
+                NotifKind::Error,
+                tf("{title}: a process ran out of memory", &[("title", &title)]),
+                body,
+            );
+            reported = true;
+        }
+        reported
+    }
+
     /// Tell the user a process in pane `title` reached the pane's memory limit:
     /// the feed (and developer console) now, the durable event log for later.
     fn report_memory_limit_hit(
@@ -15502,6 +15899,13 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Collapse or expand the sidebar's NOTIFICATIONS section (persisted).
+    fn toggle_notifications_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.workspace.notifications_collapsed = !self.workspace.notifications_collapsed;
+        self.persist();
+        cx.notify();
+    }
+
     /// Create a git worktree for `instance`, filling in its worktree fields. On
     /// any problem the worktree option is turned off for this instance.
     fn setup_worktree(&self, pid: Uuid, instance: &mut Instance) {
@@ -15559,14 +15963,39 @@ impl MuxelApp {
         );
     }
 
-    /// Open preset number `n` (1-based, in the preset list order) as a new tab
-    /// in the active pane, like the toolbar's agent button (bound to
+    /// Open preset number `n` (1-based, in the preset list order) where the
+    /// setting puts new agents, like the toolbar's agent button (bound to
     /// Ctrl+Alt+1..9). Out-of-range `n` is ignored.
     fn new_agent_preset(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = n.checked_sub(1).filter(|i| *i < self.presets.len()) else {
             return;
         };
-        self.place_with_preset(self.active_instance, PlacementMode::Tab, idx, window, cx);
+        let placement = self.new_agent_placement();
+        self.place_with_preset(self.active_instance, placement, idx, window, cx);
+    }
+
+    /// The toolbar's agent button: the current preset, where the setting puts
+    /// new agents.
+    fn new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placement = self.new_agent_placement();
+        self.place_with_preset(
+            self.active_instance,
+            placement,
+            self.current_preset,
+            window,
+            cx,
+        );
+    }
+
+    /// Settings → Behavior → "New agents open": a tab in the focused pane, or a
+    /// pane of their own to its right. An empty project gets its first pane
+    /// either way.
+    fn new_agent_placement(&self) -> PlacementMode {
+        if self.settings.new_agents_open_as_panes() {
+            PlacementMode::Split(SplitDirection::Horizontal)
+        } else {
+            PlacementMode::Tab
+        }
     }
 
     /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
@@ -17029,6 +17458,7 @@ impl MuxelApp {
             ToggleSidebar,
             ToggleDashboard,
             OpenSettings,
+            NewWindow,
             ReadAloud,
         ];
         // Start over / stop only mean something once there is a reading.
@@ -17094,6 +17524,7 @@ impl MuxelApp {
             PaletteCommand::ReadAloudRestart => t("Start reading aloud over").into(),
             PaletteCommand::ReadAloudStop => t("Stop reading aloud").into(),
             PaletteCommand::CopyRichText => t("Copy as rich text").into(),
+            PaletteCommand::NewWindow => t("New window").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -17150,6 +17581,7 @@ impl MuxelApp {
                     self.copy_rich_text(iid, cx);
                 }
             }
+            PaletteCommand::NewWindow => self.open_new_window(None),
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
             PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
@@ -22064,10 +22496,28 @@ impl MuxelApp {
         if self.workspaces.workspaces.len() <= 1 {
             return;
         }
-        self.workspaces.workspaces.retain(|p| p.id != id);
-        if self.workspaces.current == Some(id) {
-            self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
-        }
+        // Another muxel window has it open: deleting its files under it would
+        // leave that window saving a workspace no longer listed. The lock is held
+        // until the files are gone, so no window can open it meanwhile.
+        let _held = if self.current_workspace == Some(id) {
+            None
+        } else {
+            match muxel_store::try_lock_workspace(id) {
+                Some(lock) => Some(lock),
+                None => {
+                    self.workspace_busy = Some(id);
+                    self.workspaces_in_use.insert(id);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        self.update_workspaces_index(|index| {
+            index.workspaces.retain(|p| p.id != id);
+            if index.current == Some(id) {
+                index.current = index.workspaces.first().map(|p| p.id);
+            }
+        });
         if self.current_workspace == Some(id) {
             self.current_workspace = None;
             // Release the lock so the now-deleted workspace's id is free.
@@ -22075,10 +22525,6 @@ impl MuxelApp {
         }
         if self.workspace_busy == Some(id) {
             self.workspace_busy = None;
-        }
-        match muxel_store::save_workspaces_index(&self.workspaces) {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
         }
         if let Some(path) = muxel_store::workspace_doc_path(id) {
             let _ = std::fs::remove_file(&path);
@@ -22738,7 +23184,7 @@ impl MuxelApp {
 
     /// Type saved snippet `idx` into pane `iid` (an already-running terminal),
     /// pressing Enter afterward when the snippet auto-submits. Text goes in via
-    /// `paste` (bracketed-paste-aware) so a multi-line snippet doesn't submit on
+    /// `try_paste` (bracketed-paste-aware) so a multi-line snippet doesn't submit on
     /// its own internal newlines. Focuses the pane so the result is visible.
     fn send_snippet_to(
         &mut self,
@@ -22774,8 +23220,16 @@ impl MuxelApp {
         for step in steps {
             match step {
                 SnippetStep::Paste(text) => {
+                    if let Err(error) = session.try_paste(text) {
+                        self.add_event(
+                            NotifKind::Error,
+                            t("Couldn't paste this text"),
+                            error.to_string(),
+                        );
+                        cx.notify();
+                        return;
+                    }
                     supplied_prompt |= !text.is_empty();
-                    session.paste(text);
                 }
                 SnippetStep::Write(bytes) => {
                     if bytes.ends_with(b"\r") {
@@ -23194,8 +23648,12 @@ impl MuxelApp {
             }
             updates.persist |= effect.activity_changed;
             if let Some(instance) = self.workspace.instance(iid) {
-                let label =
-                    agent_activity_label(activity_state(sample.status), &instance.activity, now);
+                // The key redraws the row when what runs beside the turn changes.
+                let label = format!(
+                    "{}{:?}",
+                    agent_activity_label(activity_state(sample.status), &instance.activity, now),
+                    sample.runtime.background
+                );
                 let previous_label = self.last_activity_labels.insert(iid, label.clone());
                 updates.redraw |= previous_label.as_ref() != Some(&label);
             }
@@ -23560,7 +24018,15 @@ impl MuxelApp {
         let Some(session) = self.admitted_terminal(&target, cx) else {
             return;
         };
-        session.paste(text);
+        if let Err(error) = session.try_paste(text) {
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't paste this text"),
+                error.to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if submit {
             session.mark_prompt_submitted();
             session.write_input(b"\r");
@@ -26393,6 +26859,10 @@ impl MuxelApp {
             let id = meta.id;
             let name = meta.name.clone();
             let selected = current == Some(id);
+            let in_use = self.workspace_busy == Some(id) || self.workspaces_in_use.contains(&id);
+            // From a window that already has a workspace, a free one can open
+            // beside it instead of replacing it.
+            let can_open_beside = self.current_workspace.is_some_and(|c| c != id) && !in_use;
             list =
                 list.child(
                     div()
@@ -26423,13 +26893,34 @@ impl MuxelApp {
                         )
                         .child(Icon::new(IconName::Folder).small())
                         .child(div().flex_1().text_sm().child(meta.name.clone()))
-                        .children((self.workspace_busy == Some(id)).then(|| {
+                        .children(in_use.then(|| {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().warning)
                                 .child(t("in use"))
                         }))
-                        .children(can_delete.then(|| {
+                        .children(can_open_beside.then(|| {
+                            // stop_propagation so the click doesn't also enter it here.
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "window-workspace-{}",
+                                        id.simple()
+                                    )))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip(t("Open in new window"))
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.open_new_window(Some(id));
+                                        this.workspace_busy = None;
+                                        this.show_workspace_selector = false;
+                                        cx.notify();
+                                    })),
+                                )
+                        }))
+                        .children((can_delete && !in_use).then(|| {
                             let label = name.clone();
                             // stop_propagation so the click doesn't also enter the workspace.
                             div()
@@ -26531,13 +27022,27 @@ impl MuxelApp {
                 .items_center()
                 .justify_between()
                 .child(
-                    Button::new("quit-selector")
-                        .ghost()
-                        .label(t("Quit"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.confirm_quit = true;
-                            this.quit_after_closes(cx);
-                        })),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("quit-selector")
+                                .ghost()
+                                .label(t("Quit"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.confirm_quit = true;
+                                    this.quit_after_closes(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("new-window-selector")
+                                .ghost()
+                                .icon(IconName::ExternalLink)
+                                .label(t("New window"))
+                                .tooltip(t("Open another muxel window, to work in a second workspace at the same time"))
+                                .on_click(cx.listener(|this, _e, _w, _cx| {
+                                    this.open_new_window(None)
+                                })),
+                        ),
                 )
                 .children(self.current_workspace.is_some().then(|| {
                     Button::new("cancel-selector")
@@ -26637,6 +27142,9 @@ impl MuxelApp {
                                             localized_activity_label(
                                                 status,
                                                 &instance.activity,
+                                                self.terminal_view(iid).and_then(|view| {
+                                                    view.read(cx).background_work()
+                                                }),
                                                 chrono::Utc::now().timestamp_millis(),
                                             )
                                         })
@@ -26862,14 +27370,26 @@ impl MuxelApp {
         let radius = cx.theme().radius;
         let hover_col = cx.theme().sidebar_accent.opacity(0.45);
         let has = !self.notifications.is_empty();
+        let collapsed = self.workspace.notifications_collapsed;
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
 
+        // Clicking the header collapses the section to this one line, so new
+        // notifications no longer shift the PROJECTS list below it.
         let header = div()
+            .id("notif-header")
             .px_3()
             .pt_3()
             .pb_1()
             .flex()
             .items_center()
             .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _e, _w, cx| this.toggle_notifications_collapsed(cx)))
+            .child(Icon::new(chevron).small().text_color(muted))
             .child(
                 div()
                     .flex_1()
@@ -26878,6 +27398,12 @@ impl MuxelApp {
                     .text_color(muted)
                     .child(t("NOTIFICATIONS")),
             )
+            .children((collapsed && has).then(|| {
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(self.notifications.len().to_string())
+            }))
             .children(has.then(|| {
                 // stop_propagation so the clear-all click isn't anything else.
                 div()
@@ -26893,6 +27419,10 @@ impl MuxelApp {
             }));
 
         let mut section = div().flex().flex_col().child(header);
+
+        if collapsed {
+            return section;
+        }
 
         if !has {
             return section.child(
@@ -28263,6 +28793,8 @@ impl MuxelApp {
                                         localized_activity_label(
                                             status,
                                             &instance.activity,
+                                            self.terminal_view(iid)
+                                                .and_then(|view| view.read(cx).background_work()),
                                             chrono::Utc::now().timestamp_millis(),
                                         )
                                     })
@@ -28422,8 +28954,12 @@ impl MuxelApp {
                         .small()
                         .icon(current_icon)
                         .label(current_name.clone())
-                        .tooltip(t("New tab with the current preset"))
-                        .on_click(cx.listener(|this, _ev, window, cx| this.new_tab(window, cx))),
+                        .tooltip(if self.settings.new_agents_open_as_panes() {
+                            t("New pane with the current preset")
+                        } else {
+                            t("New tab with the current preset")
+                        })
+                        .on_click(cx.listener(|this, _ev, window, cx| this.new_agent(window, cx))),
                 )
                 .dropdown_menu(move |mut menu, _window, _cx| {
                     for (id, name, is_default, icon_path) in preset_items.iter() {
@@ -30257,15 +30793,32 @@ impl MuxelApp {
                 move |s| s.pane_memory_limit_gb = gb,
             ));
         }
+        // Windows limits each process (a job object); Linux limits the pane's
+        // processes together (a cgroup), which is all a cgroup can do.
+        let (label, description) = if cfg!(windows) {
+            (
+                t("Memory limit for each process in a pane"),
+                t(
+                    "Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.",
+                ),
+            )
+        } else {
+            (
+                t("Memory limit for each pane"),
+                t(
+                    "Limits how much memory a local pane's processes can use together, plus up to a quarter of that in swap. When they reach it, Linux stops the largest of them and the rest of the pane, its agent included, keeps running; the notifications feed says so. Each local pane runs in a systemd scope of its own, so even with the limit off, a process stopped because the computer ran out of memory takes nothing else with it. The 16 GB default fits typical developer tools; large builds, links and local model runners can need more. Applies to panes started after a change. Needs a systemd user session. Panes on a remote host get a scope of their own there, but no limit.",
+                ),
+            )
+        };
         v_flex()
             .gap_1()
-            .child(self.settings_label(&t("Memory limit for each process in a pane"), cx))
+            .child(self.settings_label(&label, cx))
             .child(row)
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t("Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
+                    .child(description),
             )
             .into_any_element()
     }
@@ -30306,6 +30859,29 @@ impl MuxelApp {
             self.settings.diff_split_view = split;
             self.persist_settings();
         }
+    }
+
+    fn new_agent_placement_btn(
+        &self,
+        value: &'static str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let selected = if value == muxel_core::NEW_AGENT_PANE {
+            self.settings.new_agents_open_as_panes()
+        } else {
+            !self.settings.new_agents_open_as_panes()
+        };
+        Button::new(SharedString::from(format!("nap-{value}")))
+            .ghost()
+            .small()
+            .selected(selected)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.settings.new_agent_placement = value.to_string();
+                this.persist_settings();
+                cx.notify();
+            }))
     }
 
     fn terminal_mouse_btn(
@@ -33752,7 +34328,10 @@ impl MuxelApp {
                 ),
             )
             // Job objects are Windows-only; elsewhere the setting does nothing.
-            .children(cfg!(windows).then(|| self.render_pane_memory_limit(cx)))
+            .children(
+                cfg!(any(windows, target_os = "linux"))
+                    .then(|| self.render_pane_memory_limit(cx)),
+            )
             .child(
                 self.check_row(
                     Checkbox::new("b-dev-console")
@@ -33774,6 +34353,31 @@ impl MuxelApp {
                     .child(self.terminal_mouse_btn("copy_paste", &t("Right-click copy/paste"), cx))
                     .child(self.terminal_mouse_btn("menu", &t("Right-click menu"), cx))
                     .child(self.terminal_mouse_btn("copy_on_select", &t("Copy on select"), cx)),
+            )
+            .child(self.settings_label(&t("New agents open"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_TAB,
+                        &t("In a new tab"),
+                        cx,
+                    ))
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_PANE,
+                        &t("In a new pane"),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "For the toolbar's agent button and Ctrl+Alt+1–9. A new tab joins the focused pane; a new pane opens to its right.",
+                    )),
             )
             .child(
                 self.check_row(
@@ -37741,6 +38345,7 @@ mod popout_activity_tests {
             binding,
             coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            held: false,
         });
         let before_record = record;
         let mut activity = AgentActivity::default();
@@ -37755,6 +38360,7 @@ mod popout_activity_tests {
             &mut record,
             Some(&mut activity),
             StatusSample {
+                held: false,
                 status: AgentStatus::Done,
                 binding: StatusBinding { rev: 2, ..binding },
                 coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
@@ -37782,6 +38388,7 @@ mod popout_activity_tests {
             binding,
             coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            held: false,
         });
         let mut activity = AgentActivity::default();
         activity.observe(None, AgentActivityState::Working, 100);
@@ -37791,6 +38398,7 @@ mod popout_activity_tests {
             200,
         );
         let sample = StatusSample {
+            held: false,
             status: AgentStatus::Done,
             binding: StatusBinding { rev: 2, ..binding },
             coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
