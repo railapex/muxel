@@ -245,9 +245,12 @@ pub fn closes_with(
         .collect()
 }
 
-/// A presentation filter only; callers retain the events for desktop/tray use.
-pub fn notification_in_feed(sort: SidebarSort, agent_event: bool) -> bool {
-    sort == SidebarSort::Layout || !agent_event
+/// Whether the sidebar's feed lists a notification. Recent work leaves out a
+/// pane's event its row already shows (`row_shows_it`: a finish or a
+/// question). A presentation filter only; callers retain the events for
+/// desktop/tray use.
+pub fn notification_in_feed(sort: SidebarSort, row_shows_it: bool) -> bool {
+    sort == SidebarSort::Layout || !row_shows_it
 }
 
 /// The rows `project` lists in the sidebar, in the order [`sidebar_order`]
@@ -1381,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_work_folds_agent_events_only() {
+    fn recent_work_folds_what_rows_show_only() {
         assert!(!notification_in_feed(SidebarSort::RecentWork, true));
         assert!(notification_in_feed(SidebarSort::RecentWork, false));
         assert!(notification_in_feed(SidebarSort::Layout, true));

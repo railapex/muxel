@@ -940,10 +940,13 @@ feature is added or changed, update the matching entry here in the same change**
   whatever its code: **done** with its completion age, an unread mark and a
   Done notification. A non-zero exit's notification gives the code (**exited
   with code 3**) in place of the unexpected-exit report, even after a finish
-  the pane already announced or while you watch it. Only the command's own exit
-  counts: behind tmux, or ssh through `sshpass`, a client's exit finishes
-  nothing, and ssh's own failures (code 255) don't either. A literal `claude`,
-  `codex` or shell is an interactive session, whose exit is no finish: it
+  the pane already announced or while you watch it, and Recent work's feed
+  lists it, as the row shows only Done. Only the command's own exit counts:
+  behind tmux a client's exit finishes nothing, ssh's own failures (code 255)
+  don't either, and through `sshpass` only exit 0 does. PowerShell (`pwsh`,
+  `powershell.exe`) is a session whatever it's started with, as before: a
+  pane running a PowerShell command doesn't finish when it exits. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish: it
   keeps the state it had, unless its agent reported a finish first, whose
   chime then still rings. The purpose comes from the pane's program and
   arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a
@@ -1460,9 +1463,12 @@ feature is added or changed, update the matching entry here in the same change**
   the mark also keeps an unseen finish or question visible after the agent moves
   on. A clock that steps back can't mark a seen event unread or a new one read:
   attendance covers everything recorded before it, and a later event is stamped
-  after it. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
-  instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
-  and tray notifications keep their usual behavior.
+  after it. A finish read by clicking its row before the status tick recorded
+  it stays read when the tick catches up. Project rows show the unread count
+  even when collapsed. Agent finishes and questions appear on these session
+  rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
+  a row can't show, stays in the feed. App messages, desktop alerts, and tray
+  notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
