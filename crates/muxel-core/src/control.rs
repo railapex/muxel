@@ -500,14 +500,7 @@ pub fn short_id(id: Uuid) -> String {
 
 /// The latest lifecycle transition an agent has recorded (unix ms).
 pub fn status_since(activity: &AgentActivity) -> Option<i64> {
-    [
-        activity.work_started_at,
-        activity.completed_at,
-        activity.blocked_at,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    activity.last_work_at()
 }
 
 /// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has

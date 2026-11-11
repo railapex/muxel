@@ -279,6 +279,28 @@ struct RuntimeStatusState {
     /// Working title has had enough quiet time to retire.
     silent_switch_until: Option<Instant>,
     timer_generation: u64,
+    /// When `status` last changed: the time of the event it reports, however
+    /// late the app samples it. Each time is read off the wall clock when its
+    /// event happens, so a later clock correction moves none of them.
+    status_at: SystemTime,
+    /// When `completion_revision` last advanced. Two turns can end at the same
+    /// Done badge, so the status time alone can't date the second.
+    completion_at: Option<SystemTime>,
+    /// When `binding_rev` last changed: a new conversation's first status
+    /// happened no earlier.
+    binding_at: Option<SystemTime>,
+}
+
+/// When a terminal's lifecycle events happened, on the wall clock as each was
+/// recorded. See [`TerminalView::lifecycle_times`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleTimes {
+    /// The current status began.
+    pub status: SystemTime,
+    /// The latest provider completion counted in `completion_revision`.
+    pub completion: Option<SystemTime>,
+    /// The provider binding last changed in this launch.
+    pub binding: Option<SystemTime>,
 }
 
 impl RuntimeStatusState {
@@ -318,6 +340,9 @@ impl RuntimeStatusState {
             deadline: None,
             silent_switch_until: None,
             timer_generation: 0,
+            status_at: SystemTime::now(),
+            completion_at: None,
+            binding_at: None,
         }
     }
 
@@ -364,6 +389,8 @@ impl RuntimeStatusState {
         };
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
+        // Whatever this reconcile records happened at `now`.
+        let wall_now = wall_time_at(now);
         let program_root = (!exited).then_some(program_status.root.as_ref()).flatten();
         let program_status_cleared = program_status.clear_revision > self.program_status_revision;
         let program_status_changed_source =
@@ -388,6 +415,8 @@ impl RuntimeStatusState {
             self.program_explicit_completions = 0;
             self.program_idle_completions = 0;
             self.completion_revision = 0;
+            self.completion_at = None;
+            self.binding_at = Some(wall_now);
             self.codex_idle_done = false;
             // Read the new binding's title edges from its start: from the
             // title that began it, or after everything recorded before a
@@ -681,6 +710,9 @@ impl RuntimeStatusState {
         let new_completions = new_explicit + codex_idle_completions;
         let previous_completion_revision = self.completion_revision;
         self.completion_revision = self.completion_revision.wrapping_add(new_completions);
+        if new_completions > 0 {
+            self.completion_at = Some(wall_now);
+        }
         let masked_blocked = program_root
             .filter(|root| root.state == ProgramState::Working)
             .and(visible_blocked);
@@ -818,6 +850,9 @@ impl RuntimeStatusState {
             || self.completion_revision != previous_completion_revision;
         if public_changed {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
+        }
+        if status != self.status {
+            self.status_at = wall_now;
         }
         self.status = status;
         self.reason = reason;
@@ -3821,6 +3856,19 @@ impl TerminalView {
     /// Pure immutable projection used by render/sidebar callers.
     pub fn status(&self) -> AgentStatus {
         self.runtime.status
+    }
+
+    /// When [`Self::status`] took its current value, when the latest provider
+    /// completion in [`TerminalRuntimeSnapshot::completion_revision`] happened,
+    /// and when the provider binding last changed. Reads the times recorded
+    /// with those events and computes nothing, so they agree with the snapshot
+    /// read beside them.
+    pub fn lifecycle_times(&self) -> LifecycleTimes {
+        LifecycleTimes {
+            status: self.runtime.status_at,
+            completion: self.runtime.completion_at,
+            binding: self.runtime.binding_at,
+        }
     }
 
     /// Whether [`Self::status`] can be attributed to the current provider
@@ -7418,6 +7466,38 @@ mod provider_switch_tests {
         session.kill();
     }
 
+    /// Milliseconds from `earlier` to `later`, both wall-clock readings taken
+    /// moments apart, so within a few milliseconds of their monotonic gap.
+    fn wall_gap_ms(later: SystemTime, earlier: SystemTime) -> u128 {
+        later.duration_since(earlier).unwrap().as_millis()
+    }
+
+    #[test]
+    fn status_time_is_when_the_status_changed_not_when_it_was_read() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        let mut sample = |wire: &[u8], offset_ms| {
+            session.test_program_status(wire);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(offset_ms),
+            );
+            runtime.status_at
+        };
+        let started = sample(b"\x1b]7501;state=working\x07", 10);
+        // The same state reported again later is the same event, at exactly
+        // the time recorded with it.
+        assert_eq!(sample(b"\x1b]7501;state=working\x07", 500), started);
+        let finished = sample(b"\x1b]7501;state=done\x07", 900);
+        assert!((885..=895).contains(&wall_gap_ms(finished, started)));
+        session.kill();
+    }
+
     #[test]
     fn program_status_root_overrides_visible_fallback_until_clear_or_exit() {
         let (session, _receiver) = fixture();
@@ -7812,6 +7892,8 @@ mod provider_switch_tests {
         assert_eq!(first.status, AgentStatus::Done);
         assert_eq!(first.completion_revision, 1);
         assert_eq!(session.first_submission_binding(), None);
+        let (first_switch, first_done) = (runtime.binding_at, runtime.completion_at);
+        assert!(first_switch.is_some() && first_done.is_some());
 
         session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0012 | Ready\x07");
         session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
@@ -7826,6 +7908,10 @@ mod provider_switch_tests {
         let switched = runtime.snapshot(&session);
         assert_eq!(switched.status, AgentStatus::Idle);
         assert_eq!(switched.completion_revision, 0);
+        // The switch is dated, and the old conversation's completion time
+        // leaves with its revision.
+        assert!(runtime.binding_at > first_switch);
+        assert_eq!(runtime.completion_at, None);
         session.kill();
 
         let (selector, _receiver) = fixture();
@@ -7938,7 +8024,8 @@ mod provider_switch_tests {
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let now = Instant::now();
         session.mark_turn_submitted();
-        for expected in [1, 2] {
+        let mut times = Vec::new();
+        for (expected, offset_ms) in [(1, 100), (2, 600)] {
             session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
             runtime.reconcile(
                 &session,
@@ -7946,12 +8033,20 @@ mod provider_switch_tests {
                 &[],
                 &[],
                 false,
-                now + Duration::from_millis(expected),
+                now + Duration::from_millis(offset_ms),
             );
             let snapshot = runtime.snapshot(&session);
             assert_eq!(snapshot.status, AgentStatus::Done);
             assert_eq!(snapshot.completion_revision, expected);
+            times.push((runtime.status_at, runtime.completion_at.unwrap()));
         }
+        // The badge stayed Done, so its time is the first finish's; the second
+        // completion carries its own.
+        let [(first_status, first_done), (second_status, second_done)] = times[..] else {
+            unreachable!()
+        };
+        assert_eq!(second_status, first_status);
+        assert!((495..=505).contains(&wall_gap_ms(second_done, first_done)));
         session.kill();
     }
 

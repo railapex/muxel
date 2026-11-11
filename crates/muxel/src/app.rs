@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -32,15 +33,19 @@ use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::refresh_gate::RefreshGate;
+use muxel_core::sidebar::{
+    ActivityBand, BandClock, InstancesById, SidebarEntry, SidebarSort, instances_by_id, is_unread,
+    notification_in_feed, sidebar_order, sidebar_rows_each, unread_count,
+};
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
-    InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode,
-    PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner,
-    SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
-    WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
+    InjectionMode, Instance, InstanceKind, LaunchPurpose, Loop, LoopSchedule, MEMORY_DIR,
+    MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef,
+    ResolvedLaunch, Runner, SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
+    WorkspaceMeta, WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
     agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
     file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
     migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to,
@@ -982,9 +987,9 @@ fn observe_popout_activity(
     now: i64,
 ) -> bool {
     let mut changed = observe_terminal_activity(activity, previous, status, attended, now);
-    // A popout has no main-pane focus callback. Record later attendance once,
-    // rather than rewriting the workspace every tick while Done stays visible.
-    if attended && status == AgentStatus::Done && activity.has_unattended_completion() {
+    // A popout has no main-pane focus callback. Attend unseen events even when
+    // the state has moved on, once rather than rewriting on every status tick.
+    if attended && is_unread(activity) {
         changed |= activity.attend(now);
     }
     changed
@@ -997,6 +1002,43 @@ struct TerminalActivitySample {
     restoring: bool,
     runtime: muxel_terminal::TerminalRuntimeSnapshot,
     binding_rev: u64,
+    times: EventTimes,
+}
+
+/// When a terminal's lifecycle events happened, in Unix milliseconds, as the
+/// terminal recorded them ([`muxel_terminal::LifecycleTimes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EventTimes {
+    /// Its current status began.
+    status: i64,
+    /// Its latest provider completion.
+    completion: Option<i64>,
+    /// Its provider binding last changed.
+    binding: Option<i64>,
+}
+
+impl EventTimes {
+    fn of(times: muxel_terminal::LifecycleTimes) -> Self {
+        Self {
+            status: epoch_millis(times.status),
+            completion: times.completion.map(epoch_millis),
+            binding: times.binding.map(epoch_millis),
+        }
+    }
+}
+
+/// `instances` with each of `pending`'s copies in place of its instance.
+fn with_pending<'a>(instances: &InstancesById<'a>, pending: &'a [Instance]) -> InstancesById<'a> {
+    let mut placing = instances.clone();
+    placing.extend(pending.iter().map(|instance| (instance.id, instance)));
+    placing
+}
+
+/// `at` in Unix milliseconds.
+fn epoch_millis(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH).map_or(0, |since| {
+        i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+    })
 }
 
 #[derive(Default)]
@@ -1005,36 +1047,157 @@ struct ActivityUpdates {
     redraw: bool,
 }
 
-/// Record a visible runtime completion before marking its notification read.
-/// This ordering keeps bell-derived Done as lifecycle state after focus clears
-/// the bell that supplied the live signal.
-fn attend_agent_activity(
-    activity: &mut AgentActivity,
-    previous: Option<AgentStatus>,
-    runtime_completion: bool,
-    now: i64,
-) -> bool {
-    let mut changed = false;
-    if runtime_completion && activity.current_state() != Some(AgentActivityState::Done) {
-        let previous = activity
-            .current_state()
-            .or_else(|| previous.map(activity_state));
-        changed |= activity.observe(previous, AgentActivityState::Done, now);
-    }
-    changed |= activity.attend(now);
-    changed
-}
-
 #[cfg(test)]
 mod restored_activity_tests {
     use super::{
-        AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
-        persisted_status, restore_activity_guard_active, restored_activity_sample,
+        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose,
+        activity_needs_observation, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample, sample_status,
         unprompted_report_working,
     };
+    use muxel_terminal::{TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason};
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn runtime(status: AgentStatus, reason: TerminalStatusReason) -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            status,
+            attributable: true,
+            reason,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            launch_id: Uuid::new_v4(),
+            binding_rev: 0,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: false,
+            completion_revision: 0,
+        }
+    }
+
+    /// A pane whose last turn was interrupted: it worked, never finished.
+    fn interrupted() -> Instance {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance
+            .activity
+            .observe(None, AgentActivityState::Working, 100);
+        instance.activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Idle,
+            150,
+        );
+        instance
+    }
+
+    #[test]
+    fn a_sessions_exit_is_not_a_finish_and_a_jobs_is() {
+        let exit = runtime(AgentStatus::Done, TerminalStatusReason::ProcessExit);
+        let mut working = interrupted();
+        working.activity.observe(
+            Some(AgentActivityState::Idle),
+            AgentActivityState::Working,
+            200,
+        );
+        let running = |program: Option<&str>, args: &[&str], literal| {
+            let mut pane = working.clone();
+            pane.program = program.map(str::to_string);
+            pane.args = args.iter().map(|arg| arg.to_string()).collect();
+            pane.literal_argv = literal;
+            pane
+        };
+        for (pane, shown, what) in [
+            (working.clone(), AgentStatus::Idle, "an agent session"),
+            (
+                running(Some("claude"), &[], true),
+                AgentStatus::Idle,
+                "a literal claude",
+            ),
+            (running(None, &[], false), AgentStatus::Idle, "a shell"),
+            (
+                running(Some("cargo"), &["test"], true),
+                AgentStatus::Done,
+                "a literal command",
+            ),
+            (
+                running(Some("npm"), &["run", "build"], false),
+                AgentStatus::Done,
+                "a custom command preset",
+            ),
+            (
+                running(Some("claude"), &["-p", "fix it"], false),
+                AgentStatus::Done,
+                "a one-shot agent run",
+            ),
+        ] {
+            assert_eq!(
+                sample_status(&exit, Some(&pane), false, true, true),
+                shown,
+                "{what}"
+            );
+        }
+        // A turn that finished before the process exited stays finished.
+        assert_eq!(
+            sample_status(&exit, Some(&attended_completion()), false, true, true),
+            AgentStatus::Done
+        );
+    }
+
+    /// A tmux client or ssh connection ending is the transport's exit, not
+    /// the job's: the job may still be running behind it.
+    #[test]
+    fn a_transports_exit_does_not_finish_the_job_behind_it() {
+        let exit = runtime(AgentStatus::Done, TerminalStatusReason::ProcessExit);
+        let mut job = interrupted();
+        job.program = Some("cargo".into());
+        job.args = vec!["test".into()];
+        job.activity.observe(
+            Some(AgentActivityState::Idle),
+            AgentActivityState::Working,
+            200,
+        );
+        assert_eq!(job.launch_purpose(), LaunchPurpose::Job);
+        assert_eq!(
+            sample_status(&exit, Some(&job), false, true, false),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            sample_status(&exit, Some(&job), false, true, true),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn a_relaunch_records_a_start_only_when_a_turn_starts() {
+        let saved = interrupted();
+        let booting = runtime(
+            AgentStatus::Working,
+            TerminalStatusReason::ProgramStatus(None),
+        );
+        // Codex reports Working while it boots, before any turn is submitted.
+        assert_eq!(
+            sample_status(&booting, Some(&saved), false, false, true),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            sample_status(&booting, Some(&attended_completion()), false, false, true),
+            AgentStatus::Done
+        );
+        // Startup output while the relaunch settles is not a turn either.
+        let noise = runtime(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
+        assert_eq!(
+            sample_status(&noise, Some(&saved), true, false, true),
+            AgentStatus::Idle
+        );
+        // A submitted turn is, and so is visible work once the relaunch settles.
+        assert_eq!(
+            sample_status(&booting, Some(&saved), false, true, true),
+            AgentStatus::Working
+        );
+        assert_eq!(
+            sample_status(&noise, Some(&saved), false, false, true),
+            AgentStatus::Working
+        );
+    }
 
     fn attended_completion() -> Instance {
         let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
@@ -1154,9 +1317,6 @@ mod restored_activity_tests {
 
     #[test]
     fn a_report_working_before_any_turn_keeps_restored_done() {
-        use muxel_terminal::{
-            TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
-        };
         let done = attended_completion();
         let mut runtime = TerminalRuntimeSnapshot {
             status: AgentStatus::Working,
@@ -1201,50 +1361,6 @@ mod restored_activity_tests {
         assert_eq!(
             persisted_status(AgentStatus::Idle, Some(&instance), false),
             AgentStatus::Done
-        );
-    }
-
-    #[test]
-    fn bell_completion_is_recorded_before_focus_marks_it_attended() {
-        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
-        instance
-            .activity
-            .observe(None, AgentActivityState::Working, 100);
-
-        assert!(attend_agent_activity(
-            &mut instance.activity,
-            Some(AgentStatus::Working),
-            true,
-            200,
-        ));
-        assert_eq!(
-            instance.activity.current_state(),
-            Some(AgentActivityState::Done)
-        );
-        assert_eq!(instance.activity.completed_at, Some(200));
-        assert_eq!(instance.activity.last_attended_at, Some(200));
-        assert!(!instance.activity.has_unattended_completion());
-        assert_eq!(
-            persisted_status(AgentStatus::Idle, Some(&instance), false),
-            AgentStatus::Done
-        );
-    }
-
-    #[test]
-    fn refocusing_attended_done_does_not_retimestamp_completion() {
-        let mut instance = attended_completion();
-
-        assert!(attend_agent_activity(
-            &mut instance.activity,
-            Some(AgentStatus::Idle),
-            true,
-            400,
-        ));
-        assert_eq!(instance.activity.completed_at, Some(200));
-        assert_eq!(instance.activity.last_attended_at, Some(400));
-        assert_eq!(
-            instance.activity.current_state(),
-            Some(AgentActivityState::Done)
         );
     }
 
@@ -1429,7 +1545,7 @@ fn persisted_status(
 /// Whether the provider's own report is all that says Working: no turn has
 /// been submitted in this launch. Codex reports Working while it boots a
 /// resumed session, before any prompt and after its first Ready title. Like
-/// startup noise during restore, that cannot replace a durable Done.
+/// startup noise during restore, that is not a turn.
 fn unprompted_report_working(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     submitted_turn: bool,
@@ -1442,16 +1558,67 @@ fn unprompted_report_working(
         && !submitted_turn
 }
 
-/// What a terminal pane shows: its live status, with durable Done kept while
-/// it restores (`restoring`) and through a report's Working before any turn.
+/// Whether this status is a process exit that finishes nothing. An
+/// interactive agent or shell finishes turns while it runs, so `/exit`, a
+/// kill, a crash or `exit` typed in a shell finishes nothing. A command job's
+/// own exit is its finish, failing or not ([`LaunchPurpose`]), but not a
+/// transport's (`own_exit` false: a tmux client or a lost ssh connection,
+/// [`muxel_core::PaneTransport`]), which says nothing about the job behind
+/// it. Either way a provider's own completion before the exit counts
+/// ([`apply_status_sample`]).
+fn exit_finishes_nothing(
+    runtime: &muxel_terminal::TerminalRuntimeSnapshot,
+    instance: Option<&Instance>,
+    own_exit: bool,
+) -> bool {
+    runtime.reason == muxel_terminal::TerminalStatusReason::ProcessExit
+        && (!own_exit
+            || instance.is_none_or(|instance| instance.launch_purpose() == LaunchPurpose::Session))
+}
+
+/// Whether `view`'s child exited as its command ([`muxel_core::PaneTransport`]).
+fn own_exit(view: &TerminalView) -> bool {
+    view.session()
+        .transport()
+        .exit_is_the_commands(view.exit_code(), view.exit_signal().is_some())
+}
+
+/// The lifecycle status one terminal sample stands for. Some runtime states
+/// are not work: an exit that finishes nothing ([`exit_finishes_nothing`]); a
+/// provider's Working before any turn in this launch (a relaunch booting); and
+/// Working while a restore settles (`restoring`). They read as idle, so none
+/// records a start or a finish, and durable Done stays.
+fn sample_status(
+    runtime: &muxel_terminal::TerminalRuntimeSnapshot,
+    instance: Option<&Instance>,
+    restoring: bool,
+    submitted_turn: bool,
+    own_exit: bool,
+) -> AgentStatus {
+    let status = if exit_finishes_nothing(runtime, instance, own_exit)
+        || unprompted_report_working(runtime, submitted_turn)
+        || (restoring && runtime.status == AgentStatus::Working)
+    {
+        AgentStatus::Idle
+    } else {
+        runtime.status
+    };
+    persisted_status(status, instance, restoring)
+}
+
+/// What a terminal pane shows: [`sample_status`] of its live runtime.
 fn shown_terminal_status(
     view: &TerminalView,
     instance: Option<&Instance>,
     restoring: bool,
 ) -> AgentStatus {
-    let runtime = view.runtime_snapshot();
-    let unprompted = unprompted_report_working(&runtime, view.session().has_submitted_turn());
-    persisted_status(runtime.status, instance, restoring || unprompted)
+    sample_status(
+        &view.runtime_snapshot(),
+        instance,
+        restoring,
+        view.session().has_submitted_turn(),
+        own_exit(view),
+    )
 }
 
 /// The chime for an agent notification (Done/Blocked); other kinds have none.
@@ -1469,6 +1636,28 @@ fn status_alert_sound(status: AgentStatus) -> Option<AlertSound> {
         AgentStatus::Done => Some(AlertSound::Done),
         AgentStatus::Blocked => Some(AlertSound::Blocked),
         AgentStatus::Working | AgentStatus::Idle => None,
+    }
+}
+
+/// The alert a pane showing `status` is in ([`status_alert_sound`]). An
+/// exited pane does no more work, so a finish nobody has seen keeps its
+/// chime through the exit, which shows a session as Idle, until it's
+/// attended.
+fn pane_alert_sound(
+    status: AgentStatus,
+    exited: bool,
+    activity: Option<&AgentActivity>,
+) -> Option<AlertSound> {
+    let unseen_finish = exited
+        && activity.is_some_and(|activity| {
+            activity
+                .completed_at
+                .is_some_and(|done| activity.last_attended_at.is_none_or(|seen| done > seen))
+        });
+    if unseen_finish {
+        Some(AlertSound::Done)
+    } else {
+        status_alert_sound(status)
     }
 }
 
@@ -1511,6 +1700,9 @@ struct SeenStatus {
     binding: StatusBinding,
     coverage: muxel_terminal::TerminalStatusCoverage,
     completion_revision: u64,
+    /// When the pane was last sampled, in Unix milliseconds. A change the next
+    /// sample finds happened after it.
+    sampled_at: i64,
 }
 
 /// What one status sample does on the app's attention path: the last status
@@ -1582,6 +1774,13 @@ struct StatusSample {
     attended: bool,
     /// The restore guard holds the pane's durable state through this sample.
     preserve_restored: bool,
+    /// When the terminal's events happened, if known. A transition is
+    /// recorded at its event's time, not when the tick read it.
+    times: Option<EventTimes>,
+    /// The record a focus left when it recorded the pane's live sample
+    /// before the tick ([`MuxelApp::recorded_ahead`]). Its events are in the
+    /// activity already, and were seen.
+    recorded: Option<SeenStatus>,
 }
 
 impl StatusSample {
@@ -1603,8 +1802,32 @@ impl StatusSample {
             attributable: runtime.is_attributable_to(binding_rev),
             attended,
             preserve_restored,
+            times: None,
+            recorded: None,
         }
     }
+
+    fn times(self, times: EventTimes) -> Self {
+        Self {
+            times: Some(times),
+            ..self
+        }
+    }
+
+    fn recorded(self, recorded: Option<SeenStatus>) -> Self {
+        Self { recorded, ..self }
+    }
+}
+
+/// A pane's live sample as the tick would apply it ([`pending_status_sample`]).
+struct PendingSample {
+    /// The activity it leaves, when that changed.
+    activity: Option<AgentActivity>,
+    /// The record it leaves, naming the events it put in the activity
+    /// (binding, completion revision). `None` when the restore guard held the
+    /// sample: its events aren't in the activity, and the tick records them
+    /// once the guard lets go.
+    committed: Option<SeenStatus>,
 }
 
 /// What applying one status sample did.
@@ -1628,7 +1851,7 @@ struct SampleEffect {
 /// its durable activity (completion and unread state), and the notification.
 fn apply_status_sample(
     record: &mut Option<SeenStatus>,
-    activity: Option<&mut AgentActivity>,
+    mut activity: Option<&mut AgentActivity>,
     sample: StatusSample,
     now: i64,
 ) -> SampleEffect {
@@ -1640,6 +1863,8 @@ fn apply_status_sample(
         attributable,
         attended,
         preserve_restored,
+        times,
+        recorded,
     } = sample;
     let (changed, notify, new_binding) =
         match status_attention(*record, binding, status, attributable) {
@@ -1650,17 +1875,49 @@ fn apply_status_sample(
                 new_binding,
             } => (true, notify, new_binding),
         };
+    // Each event is recorded when it happened, as the terminal recorded it,
+    // however late it is sampled (a pane held for Undo, say). A provider
+    // completion has its own time: two turns can end at the same Done badge,
+    // whose time is the first finish's. A new conversation's first status
+    // came no earlier than the switch. A status the last sample couldn't show
+    // (held back while a restore settled, or before any turn was submitted)
+    // appeared after that sample, which showed something else. Without times,
+    // everything happened now. A time the clock now reads as in the future is
+    // kept: the clock stepped back after the event, and clamping it to `now`
+    // could put it before an attendance it followed. Only labels clamp it
+    // ([`muxel_core::agent_activity_label`]).
+    let (status_at, completion_at) = times.map_or((now, now), |times| {
+        let mut status_at = times
+            .status
+            .max(record.map_or(i64::MIN, |seen| seen.sampled_at));
+        if new_binding && let Some(switched) = times.binding {
+            status_at = status_at.max(switched);
+        }
+        (status_at, times.completion.unwrap_or(now))
+    });
     let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
     let completion_pulse = record
         .filter(|seen| seen.binding == binding)
         .map_or(completion_revision > 0, |seen| {
             completion_revision > seen.completion_revision
         });
+    // A focus records the live sample into the activity before the tick does
+    // and leaves the record behind, so this sample can repeat a switch or a
+    // completion already recorded. Recording it again would date it after
+    // the look that read it (the floor in `AgentActivity::observe`) and make
+    // it unread. A later completion or status is new.
+    let ahead = recorded.filter(|ahead| {
+        ahead.binding == binding && completion_revision <= ahead.completion_revision
+    });
+    let seen_status = ahead.is_some_and(|ahead| ahead.status == status);
+    let record_switch = new_binding && ahead.is_none();
+    let record_completion = completion_pulse && ahead.is_none();
     *record = Some(SeenStatus {
         status,
         binding,
         coverage,
         completion_revision,
+        sampled_at: now,
     });
     let mut effect = SampleEffect {
         changed,
@@ -1668,37 +1925,49 @@ fn apply_status_sample(
     };
     let restored_state = activity.as_deref().and_then(AgentActivity::current_state);
     if !preserve_restored
-        && let Some(activity) = activity
-        && (new_binding
-            || completion_pulse
+        && let Some(activity) = activity.as_deref_mut()
+        && (record_switch
+            || record_completion
             || activity_needs_observation(previous, status, activity))
     {
         // A new binding's first status is a new event. Its previous state is
         // none of the old conversation's: a durable Done there would swallow
         // this conversation's completion.
-        let previous_activity = if new_binding {
+        let previous_activity = if record_switch {
             Some(AgentActivityState::Idle)
-        } else if completion_pulse {
+        } else if record_completion {
             Some(AgentActivityState::Working)
         } else {
             activity
                 .current_state()
                 .or_else(|| previous.map(activity_state))
         };
-        if completion_pulse && status != AgentStatus::Done {
-            // Two protocol turns can fit in one PTY drain. Keep the current
-            // badge Working/Blocked while recording the intervening finish.
+        if record_completion {
             effect.activity_changed |=
-                activity.observe(previous_activity, AgentActivityState::Done, now);
-            effect.activity_changed |=
-                activity.observe(Some(AgentActivityState::Done), activity_state(status), now);
+                activity.observe(previous_activity, AgentActivityState::Done, completion_at);
+            if status != AgentStatus::Done {
+                // Two protocol turns can fit in one PTY drain, and a finish
+                // can be followed by an exit or a clear. Keep the current
+                // badge while recording the intervening finish.
+                effect.activity_changed |= activity.observe(
+                    Some(AgentActivityState::Done),
+                    activity_state(status),
+                    status_at.max(completion_at),
+                );
+            }
         } else {
             effect.activity_changed |=
-                activity.observe(previous_activity, activity_state(status), now);
+                activity.observe(previous_activity, activity_state(status), status_at);
         }
-        if attended && status == AgentStatus::Done {
-            effect.activity_changed |= activity.attend(now);
-        }
+    }
+    // Reading an event is independent of the current lifecycle state. The
+    // unread guard records attendance once, including after a new turn starts.
+    if !preserve_restored
+        && attended
+        && let Some(activity) = activity
+        && is_unread(activity)
+    {
+        effect.activity_changed |= activity.attend(now);
     }
     // The first live sample after restore describes durable state, not a new
     // event; a new binding's never does.
@@ -1708,12 +1977,518 @@ fn apply_status_sample(
             && is_restored_transition(false, status, restored_state));
     effect.program_completion = completion_pulse && !restored;
     effect.completed = (changed && status == AgentStatus::Done || completion_pulse) && !restored;
-    effect.notify = if completion_pulse && status == AgentStatus::Done && !attended && !restored {
+    // A provider's finish notifies even when the pane exited or was cleared
+    // to idle before this sample: the completion is the evidence, not the
+    // badge. A session's exit on its own is no finish ([`session_exit`]).
+    // A finish whose agent is already working or asking again doesn't.
+    // What a focus recorded was seen then: it doesn't notify, but it's still
+    // the finish auto-read and the accomplishment log take (`completed`).
+    effect.notify = if record_completion
+        && matches!(status, AgentStatus::Done | AgentStatus::Idle)
+        && !attended
+        && !restored
+    {
         Some(NotifKind::Done)
     } else {
-        notify.filter(|_| !attended && !restored)
+        notify.filter(|_| !attended && !restored && !seen_status)
     };
     effect
+}
+
+#[cfg(test)]
+mod sidebar_attendance_tests {
+    use super::{
+        AgentStatus, EventTimes, NotifKind, SeenStatus, StatusBinding, StatusSample,
+        activity_state, apply_status_sample, observe_popout_activity, pane_alert_sound,
+        pending_status_sample,
+    };
+    use muxel_core::sidebar::is_unread;
+    use muxel_core::sound_alert::{AlertGate, AlertSound, SETTLE};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    use muxel_terminal::TerminalStatusCoverage;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    fn sample(status: AgentStatus, launch: Uuid) -> StatusSample {
+        StatusSample {
+            status,
+            binding: StatusBinding { launch, rev: 0 },
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 0,
+            attributable: true,
+            attended: true,
+            preserve_restored: false,
+            times: None,
+            recorded: None,
+        }
+    }
+
+    fn record(status: AgentStatus, launch: Uuid) -> SeenStatus {
+        let sample = sample(status, launch);
+        SeenStatus {
+            status,
+            binding: sample.binding,
+            coverage: sample.coverage,
+            completion_revision: 0,
+            sampled_at: 0,
+        }
+    }
+
+    #[test]
+    fn watched_blocked_event_is_already_attended() {
+        let launch = Uuid::new_v4();
+        let mut record = Some(record(AgentStatus::Working, launch));
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        apply_status_sample(
+            &mut record,
+            Some(&mut activity),
+            sample(AgentStatus::Blocked, launch),
+            200,
+        );
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Blocked));
+        assert_eq!(activity.blocked_at, Some(200));
+        assert!(!is_unread(&activity));
+    }
+
+    #[test]
+    fn a_finish_sampled_late_is_recorded_when_it_happened() {
+        // Sampled working at 100, then held for Undo: the tick skips held
+        // panes. It finished at 250; Undo brings it back and the tick reads it
+        // at 900.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(SeenStatus {
+            sampled_at: 100,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 90);
+        let late = StatusSample {
+            attended: false,
+            ..sample(AgentStatus::Done, launch)
+        }
+        .times(EventTimes {
+            status: 250,
+            ..EventTimes::default()
+        });
+        apply_status_sample(&mut seen, Some(&mut activity), late, 900);
+        assert_eq!(activity.completed_at, Some(250));
+        assert!(is_unread(&activity));
+        // A status the terminal held from before the last sample, which showed
+        // something else then (a restore guard releasing), began after it.
+        let mut activity = AgentActivity::default();
+        let mut seen = Some(SeenStatus {
+            sampled_at: 800,
+            ..record(AgentStatus::Idle, launch)
+        });
+        let released = sample(AgentStatus::Working, launch).times(EventTimes {
+            status: 50,
+            ..EventTimes::default()
+        });
+        apply_status_sample(&mut seen, Some(&mut activity), released, 900);
+        assert_eq!(activity.work_started_at, Some(800));
+    }
+
+    #[test]
+    fn a_second_finish_at_the_same_done_badge_is_recorded_at_its_own_time() {
+        // Finished at 150, sampled at 200, looked at at 250, then finished
+        // another turn at 400 without the badge ever leaving Done.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(SeenStatus {
+            completion_revision: 1,
+            sampled_at: 200,
+            ..record(AgentStatus::Done, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            150,
+        );
+        activity.attend(250);
+        let again = StatusSample {
+            attended: false,
+            completion_revision: 2,
+            ..sample(AgentStatus::Done, launch)
+        }
+        .times(EventTimes {
+            status: 150,
+            completion: Some(400),
+            binding: None,
+        });
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), again, 450);
+        assert_eq!(activity.completed_at, Some(400));
+        assert!(is_unread(&activity), "the new finish came after the look");
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+    }
+
+    #[test]
+    fn a_finish_sampled_after_the_clock_steps_back_stays_after_the_look() {
+        // Looked at at 250, finished at 400, then the clock stepped back: the
+        // tick reads the finish at 200.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(SeenStatus {
+            completion_revision: 1,
+            sampled_at: 240,
+            ..record(AgentStatus::Done, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            150,
+        );
+        activity.attend(250);
+        let finished = |revision, completion| {
+            StatusSample {
+                attended: false,
+                completion_revision: revision,
+                ..sample(AgentStatus::Done, launch)
+            }
+            .times(EventTimes {
+                status: 150,
+                completion: Some(completion),
+                binding: None,
+            })
+        };
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), finished(2, 400), 200);
+        assert_eq!(activity.completed_at, Some(400), "kept as it happened");
+        assert!(is_unread(&activity), "the finish came after the look");
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        // Looking at it now, at 210 by the clock, covers it.
+        activity.attend(210);
+        assert!(!is_unread(&activity));
+        // A finish after that look is new, though the clock reads 260.
+        apply_status_sample(&mut seen, Some(&mut activity), finished(3, 260), 270);
+        assert!(is_unread(&activity), "the next finish came after the look");
+    }
+
+    #[test]
+    fn a_sample_a_focus_recorded_is_not_recorded_again() {
+        // The tick recorded a turn working at 300. The provider finished at
+        // 400 (completion revision 1), and a click at 500 recorded and read
+        // the finish before any tick: the sample applied to a copy of the
+        // tick's record, then attendance. The user looks elsewhere; render
+        // and the tick sample the same finish behind the tick's record.
+        let launch = Uuid::new_v4();
+        let tick_record = Some(SeenStatus {
+            sampled_at: 300,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 300);
+        let finished = StatusSample {
+            attended: false,
+            completion_revision: 1,
+            ..sample(AgentStatus::Done, launch)
+        }
+        .times(EventTimes {
+            status: 400,
+            completion: Some(400),
+            binding: None,
+        });
+        let mut focus_record = tick_record;
+        apply_status_sample(&mut focus_record, Some(&mut activity), finished, 500);
+        activity.attend(500);
+        assert_eq!(activity.completed_at, Some(400));
+        assert!(!is_unread(&activity));
+        let read = activity.clone();
+        let mut seen = tick_record;
+        let effect = apply_status_sample(
+            &mut seen,
+            Some(&mut activity),
+            finished.recorded(focus_record),
+            600,
+        );
+        assert_eq!(activity, read, "the finish was recorded again");
+        assert_eq!(effect.notify, None, "the finish was read");
+        assert!(effect.completed, "auto-read and the log still take it");
+        // A later finish is new.
+        let again = StatusSample {
+            completion_revision: 2,
+            ..finished
+        }
+        .times(EventTimes {
+            status: 400,
+            completion: Some(700),
+            binding: None,
+        });
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), again, 800);
+        assert_eq!(activity.completed_at, Some(700));
+        assert!(is_unread(&activity));
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+
+        // A conversation switch whose first status, Done, a click at 900
+        // recorded and read before the tick.
+        activity.attend(850);
+        let switched = StatusSample {
+            attended: false,
+            binding: StatusBinding { launch, rev: 1 },
+            ..sample(AgentStatus::Done, launch)
+        }
+        .times(EventTimes {
+            status: 880,
+            completion: None,
+            binding: Some(870),
+        });
+        let mut focus_record = seen;
+        apply_status_sample(&mut focus_record, Some(&mut activity), switched, 900);
+        activity.attend(900);
+        let read = activity.clone();
+        assert!(!is_unread(&read));
+        let effect = apply_status_sample(
+            &mut seen,
+            Some(&mut activity),
+            switched.recorded(focus_record),
+            1000,
+        );
+        assert_eq!(activity, read, "the switch was recorded again");
+        assert_eq!(effect.notify, None);
+    }
+
+    #[test]
+    fn a_finish_the_restore_guard_held_is_recorded_when_it_lets_go() {
+        // A restored pane, before any turn was submitted, that the tick
+        // recorded working at 300. The provider's output coalesces Working,
+        // Done (completion revision 1, at 400) and Working again: it's still
+        // working, so the restore guard holds the sample, and a click at 500
+        // reads it before any tick. Then the provider reports Idle, which
+        // lets the guard go, with no newer completion; the tick reads that at
+        // 600 while the user looks elsewhere.
+        let launch = Uuid::new_v4();
+        let tick_record = Some(SeenStatus {
+            sampled_at: 300,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 300);
+        let held = StatusSample {
+            attended: false,
+            completion_revision: 1,
+            preserve_restored: true,
+            ..sample(AgentStatus::Working, launch)
+        }
+        .times(EventTimes {
+            status: 400,
+            completion: Some(400),
+            binding: None,
+        });
+        let click = pending_status_sample(tick_record, &activity, held, false, 500)
+            .expect("the sample is attributable");
+        assert_eq!(click.activity, None, "the guard let the click record it");
+        activity.attend(500);
+        let idle = StatusSample {
+            status: AgentStatus::Idle,
+            preserve_restored: false,
+            ..held
+        }
+        .times(EventTimes {
+            status: 550,
+            completion: Some(400),
+            binding: None,
+        })
+        .recorded(click.committed);
+        let mut seen = tick_record;
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), idle, 600);
+        assert!(
+            activity.completed_at.is_some(),
+            "the finish the guard held was lost"
+        );
+        assert!(is_unread(&activity), "the click saw it working");
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+    }
+
+    #[test]
+    fn a_finish_sampled_with_its_sessions_exit_keeps_its_chime() {
+        // The provider finished and the session exited before the tick, which
+        // shows the exited session as idle.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(record(AgentStatus::Working, launch));
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        let effect = apply_status_sample(
+            &mut seen,
+            Some(&mut activity),
+            StatusSample {
+                attended: false,
+                completion_revision: 1,
+                ..sample(AgentStatus::Idle, launch)
+            },
+            200,
+        );
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        let (pane, armed) = (Uuid::new_v4(), Instant::now());
+        let mut gate = AlertGate::default();
+        gate.arm(pane, AlertSound::Done, armed);
+        let shown = pane_alert_sound(AgentStatus::Idle, true, Some(&activity));
+        assert_eq!(gate.due(|_| shown, armed + SETTLE), Some(AlertSound::Done));
+        // Seen, it has nothing more to ring for; a live idle pane never had.
+        activity.attend(300);
+        assert_eq!(
+            pane_alert_sound(AgentStatus::Idle, true, Some(&activity)),
+            None
+        );
+        let unseen = AgentActivity {
+            completed_at: Some(200),
+            ..AgentActivity::default()
+        };
+        assert_eq!(
+            pane_alert_sound(AgentStatus::Idle, false, Some(&unseen)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_finish_followed_by_an_exit_before_the_sample_still_notifies() {
+        // The provider finished at 300 and the process exited at 320. The
+        // tick reads it at 900, the exit's status masked to idle.
+        let launch = Uuid::new_v4();
+        let working = || {
+            let mut activity = AgentActivity::default();
+            activity.observe(None, AgentActivityState::Working, 90);
+            activity
+        };
+        let exited_at = |completion| EventTimes {
+            status: 320,
+            completion,
+            binding: None,
+        };
+        let mut seen = Some(SeenStatus {
+            sampled_at: 100,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = working();
+        let finished = StatusSample {
+            attended: false,
+            completion_revision: 1,
+            ..sample(AgentStatus::Idle, launch)
+        }
+        .times(exited_at(Some(300)));
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), finished, 900);
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        assert!(effect.completed);
+        assert_eq!(activity.completed_at, Some(300));
+        assert!(is_unread(&activity));
+
+        // An exit with no finish from the provider is no finish.
+        let mut seen = Some(SeenStatus {
+            sampled_at: 100,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = working();
+        let quit = StatusSample {
+            attended: false,
+            ..sample(AgentStatus::Idle, launch)
+        }
+        .times(exited_at(None));
+        let effect = apply_status_sample(&mut seen, Some(&mut activity), quit, 900);
+        assert_eq!(effect.notify, None);
+        assert!(!effect.completed);
+        assert_eq!(activity.completed_at, None);
+    }
+
+    #[test]
+    fn a_new_conversations_first_status_is_dated_by_the_switch() {
+        // Working since 100 and sampled at 200; the provider switched
+        // conversations at 300, still working, and the tick reads it at 900.
+        let launch = Uuid::new_v4();
+        let mut seen = Some(SeenStatus {
+            sampled_at: 200,
+            ..record(AgentStatus::Working, launch)
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        let switched = StatusSample {
+            binding: StatusBinding { launch, rev: 1 },
+            ..sample(AgentStatus::Working, launch)
+        }
+        .times(EventTimes {
+            status: 100,
+            completion: None,
+            binding: Some(300),
+        });
+        apply_status_sample(&mut seen, Some(&mut activity), switched, 900);
+        assert_eq!(activity.work_started_at, Some(300));
+    }
+
+    #[test]
+    fn attendance_clears_older_events_even_while_working() {
+        for event in [AgentStatus::Done, AgentStatus::Blocked] {
+            let launch = Uuid::new_v4();
+            let mut record = Some(record(AgentStatus::Working, launch));
+            let mut activity = AgentActivity::default();
+            activity.observe(None, AgentActivityState::Working, 100);
+            activity.observe(
+                Some(AgentActivityState::Working),
+                activity_state(event),
+                200,
+            );
+            activity.observe(
+                Some(activity_state(event)),
+                AgentActivityState::Working,
+                300,
+            );
+            let sample = sample(AgentStatus::Working, launch);
+            let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 400);
+            assert!(!is_unread(&activity));
+            assert!(effect.activity_changed);
+            assert!(!effect.changed);
+            assert_eq!(activity.work_started_at, Some(300));
+            assert_eq!(activity.current_state(), Some(AgentActivityState::Working));
+            assert_eq!(
+                activity.completed_at,
+                (event == AgentStatus::Done).then_some(200)
+            );
+            assert_eq!(
+                activity.blocked_at,
+                (event == AgentStatus::Blocked).then_some(200)
+            );
+            assert!(
+                !apply_status_sample(&mut record, Some(&mut activity), sample, 500)
+                    .activity_changed
+            );
+        }
+    }
+
+    #[test]
+    fn popout_attendance_clears_unread_in_every_lifecycle_state() {
+        for event in [AgentStatus::Done, AgentStatus::Blocked] {
+            for status in [event, AgentStatus::Working, AgentStatus::Idle] {
+                let mut activity = AgentActivity::default();
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    activity_state(event),
+                    200,
+                );
+                if status != event {
+                    activity.observe(Some(activity_state(event)), activity_state(status), 300);
+                }
+                let before = activity.clone();
+                assert!(is_unread(&activity));
+                assert!(observe_popout_activity(
+                    &mut activity,
+                    Some(status),
+                    status,
+                    true,
+                    400
+                ));
+                assert!(!is_unread(&activity));
+                assert_eq!(activity.current_state(), before.current_state());
+                assert_eq!(activity.completed_at, before.completed_at);
+                assert_eq!(activity.blocked_at, before.blocked_at);
+                assert!(!observe_popout_activity(
+                    &mut activity,
+                    Some(status),
+                    status,
+                    true,
+                    500
+                ));
+            }
+        }
+    }
 }
 
 fn should_refresh_accomplishments_after_status(
@@ -1760,6 +2535,31 @@ fn apply_popout_status_sample(
     effect
 }
 
+/// A pane's live sample applied to copies of its record and activity, as the
+/// tick (or a popout's sync) would apply it. `None` when the sample isn't
+/// attributable, which records nothing.
+fn pending_status_sample(
+    record: Option<SeenStatus>,
+    activity: &AgentActivity,
+    sample: StatusSample,
+    popout: bool,
+    now: i64,
+) -> Option<PendingSample> {
+    if !sample.attributable {
+        return None;
+    }
+    let (mut record, mut activity) = (record, activity.clone());
+    let effect = if popout {
+        apply_popout_status_sample(&mut record, Some(&mut activity), sample, now)
+    } else {
+        apply_status_sample(&mut record, Some(&mut activity), sample, now)
+    };
+    Some(PendingSample {
+        activity: effect.activity_changed.then_some(activity),
+        committed: record.filter(|_| !sample.preserve_restored),
+    })
+}
+
 #[cfg(test)]
 mod status_attention_tests {
     use super::{
@@ -1776,6 +2576,7 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            sampled_at: 0,
         })
     }
 
@@ -1814,6 +2615,7 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProgramStatus,
             completion_revision: 1,
+            sampled_at: 0,
         });
         let mut activity = AgentActivity::default();
         activity.observe(
@@ -1829,6 +2631,8 @@ mod status_attention_tests {
             attributable: true,
             attended: false,
             preserve_restored: false,
+            times: None,
+            recorded: None,
         };
         let previous = record;
         let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
@@ -1862,6 +2666,7 @@ mod status_attention_tests {
             binding,
             coverage: TerminalStatusCoverage::ProgramStatus,
             completion_revision: 0,
+            sampled_at: 0,
         });
         let mut activity = AgentActivity::default();
         activity.observe(
@@ -1877,6 +2682,8 @@ mod status_attention_tests {
             attributable: true,
             attended: false,
             preserve_restored: false,
+            times: None,
+            recorded: None,
         };
         let previous = record;
         let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
@@ -1920,6 +2727,7 @@ mod status_attention_tests {
                 binding,
                 coverage: TerminalStatusCoverage::ProgramStatus,
                 completion_revision: 0,
+                sampled_at: 0,
             });
             let mut activity = AgentActivity::default();
             activity.observe(
@@ -1935,6 +2743,8 @@ mod status_attention_tests {
                 attributable: true,
                 attended: false,
                 preserve_restored: false,
+                times: None,
+                recorded: None,
             };
             let previous = record;
             let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
@@ -1972,6 +2782,8 @@ mod status_attention_tests {
             attributable: true,
             attended: false,
             preserve_restored: false,
+            times: None,
+            recorded: None,
         };
         for (status, revision, should_refresh) in [
             (AgentStatus::Working, 0, false),
@@ -2172,6 +2984,8 @@ mod status_attention_tests {
                     attributable,
                     attended,
                     preserve_restored: false,
+                    times: None,
+                    recorded: None,
                 },
                 now,
             )
@@ -4843,6 +5657,7 @@ mod loop_cleanup_tests {
             },
             coverage: TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            sampled_at: 0,
         });
         // A completes between loop heartbeats. B is adopted before the next
         // heartbeat, and the runtime has not refreshed its cached A snapshot.
@@ -5920,11 +6735,22 @@ pub struct MuxelApp {
     /// Last attributable status per instance and the provider binding it was
     /// seen in, to fire notifications on transitions.
     last_status: HashMap<Uuid, SeenStatus>,
+    /// The record a focus left when it recorded a pane's live sample ahead of
+    /// the tick, whether or not that changed the activity, and never for a
+    /// sample the restore guard held, which recorded nothing. `last_status`
+    /// doesn't take it: the tick still owes that sample's auto-read and log
+    /// entry.
+    /// Sampling skips recording what it holds again, and the tick drops it
+    /// once its record has caught up.
+    recorded_ahead: HashMap<Uuid, SeenStatus>,
     /// Last rendered lifecycle copy per instance. Age labels change at coarse
     /// minute/hour/day boundaries without changing the underlying status.
     last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
+    /// Local midnight when the sidebar last checked its bands, in Unix
+    /// milliseconds. When the day changes, Recent work redraws.
+    band_day: i64,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -7044,6 +7870,13 @@ impl SaveTarget {
 }
 
 impl NotifKind {
+    /// Whether a pane's row shows this kind of event itself: a finish (its
+    /// unread mark) or a question (Blocked). Its errors, like a job's exit
+    /// code, it doesn't.
+    fn row_shows(self) -> bool {
+        matches!(self, NotifKind::Done | NotifKind::Blocked)
+    }
+
     /// The colored dot shown beside the notification.
     fn dot(self, cx: &App) -> Hsla {
         match self {
@@ -8390,8 +9223,10 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
+            recorded_ahead: HashMap::new(),
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
+            band_day: 0,
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -9310,7 +10145,13 @@ impl MuxelApp {
             });
             let (program, args, env) =
                 self.remote_program_args(inst, &host, &control_path, &remote_cwd, &resolved);
-            let mut spec = CommandSpec::program(program, args);
+            // ssh exits with the command's status, and sshpass with its 0; a
+            // tmux client in front of it doesn't (`PaneTransport`).
+            let transport = muxel_core::PaneTransport::remote(
+                host.use_tmux(inst.is_some_and(|i| i.use_tmux)),
+                program == "sshpass",
+            );
+            let mut spec = CommandSpec::program(program, args).with_transport(transport);
             // The same gate and session `remote_program_args` launched the
             // client with. Its ctl input runs tmux on that host over the host's
             // commands master, as the shared claim does.
@@ -9399,7 +10240,8 @@ impl MuxelApp {
                     (
                         CommandSpec::program("tmux", launch.args)
                             .with_title_source(title)
-                            .with_tmux_input(input),
+                            .with_tmux_input(input)
+                            .with_transport(muxel_core::PaneTransport::Client),
                         launch.env,
                     )
                 }
@@ -11962,6 +12804,7 @@ impl MuxelApp {
             }
         }
         self.last_status.clear();
+        self.recorded_ahead.clear();
         // The log cache is per project; open overviews reload for the new set.
         self.accomplishment_logs.clear();
         self.memory_upkeep = upkeep::Upkeep::default();
@@ -12175,7 +13018,7 @@ impl MuxelApp {
         let iid = instance.id;
         project.layout = Some(PaneNode::leaf(iid));
 
-        self.workspace.add_instance(instance);
+        self.add_opened_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
         self.start_new_project_logs(pid, cx);
@@ -12565,10 +13408,6 @@ impl MuxelApp {
         if self.maximized.is_some_and(|m| m != iid) && self.maximized_group().contains(&iid) {
             self.maximized = Some(iid);
         }
-        let runtime_completion = self.terminals.get(&iid).is_some_and(|view| {
-            let view = view.read(cx);
-            view.status() == AgentStatus::Done && view.status_attributable()
-        });
         let can_attend = self
             .workspace
             .instance(iid)
@@ -12577,18 +13416,40 @@ impl MuxelApp {
                 .terminals
                 .get(&iid)
                 .is_some_and(|view| view.read(cx).has_visible_content());
-        if attend
-            && can_attend
-            && let Some(instance) = self.workspace.instance_mut(iid)
-        {
+        if attend && can_attend {
+            // What the terminal shows that the tick hasn't recorded yet is
+            // recorded first, as the tick will and as the sidebar already
+            // places it, so the click moves no row. That keeps a finish the
+            // bell supplied after the click clears the bell below.
             let now = chrono::Utc::now().timestamp_millis();
-            if attend_agent_activity(
-                &mut instance.activity,
-                self.last_status.get(&iid).map(|seen| seen.status),
-                runtime_completion,
-                now,
-            ) {
-                self.persist();
+            let pending = self
+                .workspace
+                .instance(iid)
+                .and_then(|instance| self.pending_sample(instance, now, cx));
+            if let Some(instance) = self.workspace.instance_mut(iid) {
+                let mut recorded = false;
+                if let Some(PendingSample {
+                    activity,
+                    committed,
+                }) = pending
+                {
+                    if let Some(activity) = activity {
+                        instance.activity = activity;
+                        recorded = true;
+                    }
+                    // The tick samples what the click recorded again behind
+                    // its own record, and mustn't record it twice. That holds
+                    // even when the sample left the stored values as they
+                    // were: the tick would date it after this look. What the
+                    // restore guard held wasn't recorded, and the tick still
+                    // owes it.
+                    if let Some(committed) = committed {
+                        self.recorded_ahead.insert(iid, committed);
+                    }
+                }
+                if instance.activity.attend(now) || recorded {
+                    self.persist();
+                }
             }
         }
         if let Some(view) = self.terminals.get(&iid) {
@@ -13701,6 +14562,7 @@ impl MuxelApp {
             self.editors.remove(&iid);
             self.browsers.remove(&iid);
             self.last_status.remove(&iid);
+            self.recorded_ahead.remove(&iid);
             self.failed_launches.remove(&iid);
             if let Some(data_dir) = muxel_store::data_dir() {
                 crate::session_binding::clear_muse_binding(&data_dir, iid);
@@ -14152,6 +15014,9 @@ impl MuxelApp {
             /// killed pane from one that genuinely called `exit(1)`.
             exit_signal: Option<String>,
             read_error: Option<String>,
+            /// The exit is the command's own, not a transport's
+            /// ([`muxel_core::PaneTransport`]).
+            exit_is_own: bool,
             title: String,
             project: String,
             resume_error: bool,
@@ -14159,6 +15024,7 @@ impl MuxelApp {
             restoring: bool,
             runtime: muxel_terminal::TerminalRuntimeSnapshot,
             binding_rev: u64,
+            times: EventTimes,
             memory_hits: Vec<muxel_terminal::MemoryLimitHit>,
         }
         let snapshot: Vec<Snap> = self
@@ -14167,6 +15033,7 @@ impl MuxelApp {
             .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| {
                 let v = view.read(cx);
+                let inst = self.workspace.instance(*iid);
                 let TerminalActivitySample {
                     status,
                     raw_status,
@@ -14174,13 +15041,14 @@ impl MuxelApp {
                     restoring,
                     runtime,
                     binding_rev,
-                } = self.terminal_activity_sample(*iid, v);
+                    times,
+                } = self.terminal_activity_sample(*iid, inst, v);
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
+                let exit_is_own = own_exit(v);
                 let memory_hits = v.session().take_memory_limit_hits();
-                let inst = self.workspace.instance(*iid);
                 // Some providers hang after reporting a missing conversation.
                 // The Codex message names the exact saved ID; a generic failure
                 // or unrelated screen text cannot erase its binding.
@@ -14210,6 +15078,7 @@ impl MuxelApp {
                     exit_code,
                     exit_signal,
                     read_error,
+                    exit_is_own,
                     title,
                     project,
                     resume_error,
@@ -14217,6 +15086,7 @@ impl MuxelApp {
                     restoring,
                     runtime,
                     binding_rev,
+                    times,
                     memory_hits,
                 }
             })
@@ -14236,6 +15106,13 @@ impl MuxelApp {
         // (rather than a respawn that's about to fail again on a still-down host).
         const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
+        // Recent work's bands are calendar days: at midnight a row can change
+        // band with nothing else changing.
+        let today = BandClock::at(&chrono::Local::now()).today();
+        if today != self.band_day {
+            self.band_day = today;
+            dirty |= self.settings.sidebar_sort == SidebarSort::RecentWork;
+        }
         let mut status_notify_generation = None;
         let mut status_transition_count = 0;
         let mut activity_changed = false;
@@ -14254,6 +15131,7 @@ impl MuxelApp {
             exit_code,
             exit_signal,
             read_error,
+            exit_is_own,
             title,
             project,
             resume_error,
@@ -14261,6 +15139,7 @@ impl MuxelApp {
             restoring,
             runtime,
             binding_rev,
+            times,
             memory_hits,
         } in snapshot
         {
@@ -14282,22 +15161,33 @@ impl MuxelApp {
             let mut record = self.last_status.get(&iid).copied();
             let previous_record = record;
             let previous = record.map(|seen| seen.status);
+            let ahead = self.recorded_ahead.remove(&iid);
+            let sample = StatusSample::from_runtime(
+                runtime,
+                binding_rev,
+                status,
+                attended,
+                preserve_restored,
+            )
+            .times(times)
+            .recorded(ahead);
             let effect = apply_status_sample(
                 &mut record,
                 self.workspace
                     .instance_mut(iid)
                     .map(|instance| &mut instance.activity),
-                StatusSample::from_runtime(
-                    runtime,
-                    binding_rev,
-                    status,
-                    attended,
-                    preserve_restored,
-                ),
+                sample,
                 now_epoch,
             );
             if let Some(record) = record {
                 self.last_status.insert(iid, record);
+            }
+            // A sample the tick can't attribute records nothing, so the record
+            // is still behind what the focus recorded.
+            if !sample.attributable
+                && let Some(ahead) = ahead
+            {
+                self.recorded_ahead.insert(iid, ahead);
             }
             activity_changed |= effect.activity_changed;
             let changed = effect.changed;
@@ -14332,7 +15222,10 @@ impl MuxelApp {
                 let previous_label = self.last_activity_labels.insert(iid, label.clone());
                 dirty |= previous_label.as_ref() != Some(&label);
             }
-            dirty |= changed;
+            // Attendance can clear unread without changing the displayed status.
+            dirty |= changed
+                || (self.settings.sidebar_sort == SidebarSort::RecentWork
+                    && effect.activity_changed);
             if changed {
                 dirty |= clear_stale_agent_notification(&mut self.notifications, iid, status);
             }
@@ -14394,9 +15287,29 @@ impl MuxelApp {
                 if let Some(sound) = chime {
                     self.alert_gate.arm(iid, sound, alert_now);
                 }
-                alert_states.insert(iid, status_alert_sound(status));
+                alert_states.insert(
+                    iid,
+                    pane_alert_sound(
+                        status,
+                        exited,
+                        self.workspace.instance(iid).map(|i| &i.activity),
+                    ),
+                );
             }
-            if let Some(kind) = effect.notify {
+            // A command job's own exit with a non-zero code finished it all the
+            // same. Its first is reported once, as the pane's notification,
+            // whatever this sample notified and whether or not the pane is
+            // watched (below), in place of a "finished" and of the
+            // unexpected-exit report.
+            let failed_job = newly_exited
+                && exit_is_own
+                && exit_code != Some(0)
+                && self
+                    .workspace
+                    .instance(iid)
+                    .is_some_and(|i| i.launch_purpose() == LaunchPurpose::Job);
+            let notice = effect.notify.filter(|_| !failed_job);
+            if let Some(kind) = notice {
                 // Collect the in-app entry regardless of the desktop toggle;
                 // only the OS popup respects `notifications_enabled`.
                 self.add_notification(iid, kind, &title, &project);
@@ -14507,25 +15420,53 @@ impl MuxelApp {
                 // the outage is already reported once as "connection lost —
                 // reconnecting…". Announcing every failed retry would ring the
                 // desktop once a half-minute for as long as the host is down.
-                let detail = match (&read_error, &exit_signal, exit_code) {
-                    (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
-                    (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
-                    (None, None, Some(code)) => {
-                        tf("exit code {code}", &[("code", &code.to_string())])
-                    }
-                    (None, None, None) => t("exit code unknown").to_string(),
-                };
-                self.add_event(
-                    NotifKind::Error,
-                    tf("{title}: process exited unexpectedly", &[("title", &title)]),
-                    detail,
-                );
-                if self.notifications_enabled && !self.window_active {
-                    notify(
-                        tf("{title} exited unexpectedly", &[("title", &title)]),
-                        project,
-                        Some(iid),
+                if failed_job {
+                    // A job's code is its result, not necessarily a failure
+                    // (grep exits 1 when nothing matches), so the notice says
+                    // the code.
+                    let detail = match (&read_error, &exit_signal, exit_code) {
+                        (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
+                        (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
+                        (None, None, Some(code)) => {
+                            tf("exited with code {code}", &[("code", &code.to_string())])
+                        }
+                        (None, None, None) => t("exited, code unknown").to_string(),
+                    };
+                    self.put_pane_notification(
+                        iid,
+                        NotifKind::Error,
+                        &title,
+                        format!("{detail} · {project}"),
                     );
+                    if self.notifications_enabled && !self.window_active {
+                        notify_with(
+                            format!("{title} {detail}"),
+                            project,
+                            Some(iid),
+                            chime.is_some(),
+                        );
+                    }
+                } else {
+                    let detail = match (&read_error, &exit_signal, exit_code) {
+                        (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
+                        (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
+                        (None, None, Some(code)) => {
+                            tf("exit code {code}", &[("code", &code.to_string())])
+                        }
+                        (None, None, None) => t("exit code unknown").to_string(),
+                    };
+                    self.add_event(
+                        NotifKind::Error,
+                        tf("{title}: process exited unexpectedly", &[("title", &title)]),
+                        detail,
+                    );
+                    if self.notifications_enabled && !self.window_active {
+                        notify(
+                            tf("{title} exited unexpectedly", &[("title", &title)]),
+                            project,
+                            Some(iid),
+                        );
+                    }
                 }
                 dirty = true;
             }
@@ -14670,6 +15611,9 @@ impl MuxelApp {
         let docked = &self.terminals;
         let popouts = &self.popouts;
         self.last_status.retain(|iid, _| {
+            terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
+        });
+        self.recorded_ahead.retain(|iid, _| {
             terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
         });
         self.last_activity_labels.retain(|iid, _| {
@@ -15103,7 +16047,7 @@ impl MuxelApp {
                 None => p.layout = Some(PaneNode::leaf(iid)),
             }
         }
-        self.workspace.add_instance(instance);
+        self.add_opened_instance(instance);
         // `spawn_terminal` does NOT focus (focus is a separate step we skip here).
         self.spawn_terminal(iid, window, cx);
         self.persist();
@@ -15127,13 +16071,18 @@ impl MuxelApp {
     /// Add an in-app notification for `iid`, replacing any existing one for that
     /// pane so notifications don't pile up.
     fn add_notification(&mut self, iid: Uuid, kind: NotifKind, title: &str, project: &str) {
+        self.put_pane_notification(iid, kind, title, format!("{} · {}", kind.label(), project));
+    }
+
+    /// Show `iid`'s notification, replacing any earlier one for that pane.
+    fn put_pane_notification(&mut self, iid: Uuid, kind: NotifKind, title: &str, subtitle: String) {
         self.notifications.retain(|n| n.instance != Some(iid));
         self.notifications.push(Notification {
             id: Uuid::new_v4(),
             instance: Some(iid),
             kind,
             title: title.to_string(),
-            subtitle: format!("{} · {}", kind.label(), project),
+            subtitle,
         });
     }
 
@@ -15718,7 +16667,7 @@ impl MuxelApp {
         }) {
             return;
         }
-        self.workspace.add_instance(instance);
+        self.add_opened_instance(instance);
         // Build the right live view for the pane's kind (mirrors the restore
         // dispatch in `spawn_project_terminals_now`).
         match kind {
@@ -16551,7 +17500,7 @@ impl MuxelApp {
             return false;
         };
         if project.is_empty() {
-            self.workspace.add_instance(instance);
+            self.add_opened_instance(instance);
             if let Some(project) = self.workspace.project_mut(pid) {
                 project.layout = Some(PaneNode::leaf(iid));
             }
@@ -16584,7 +17533,7 @@ impl MuxelApp {
             }
         });
         if placed {
-            self.workspace.add_instance(instance);
+            self.add_opened_instance(instance);
         }
         placed
     }
@@ -18182,6 +19131,7 @@ impl MuxelApp {
             );
         }
         self.last_status.remove(&iid);
+        self.recorded_ahead.remove(&iid);
         self.failed_launches.remove(&iid);
 
         // If the closed tab was active, retarget to its pane's surviving tab if
@@ -19318,6 +20268,7 @@ impl MuxelApp {
             self.editors.remove(&iid);
             self.browsers.remove(&iid);
             self.last_status.remove(&iid);
+            self.recorded_ahead.remove(&iid);
             self.workspace.remove_instance_meta(iid);
         }
 
@@ -21160,7 +22111,8 @@ impl MuxelApp {
         };
         match popout.view {
             PaneView::Terminal(view) => {
-                let sample = self.terminal_activity_sample(iid, view.read(cx));
+                let sample =
+                    self.terminal_activity_sample(iid, self.workspace.instance(iid), view.read(cx));
                 let status = sample
                     .runtime
                     .is_attributable_to(sample.binding_rev)
@@ -21283,6 +22235,7 @@ impl MuxelApp {
             );
         }
         self.last_status.remove(&iid);
+        self.recorded_ahead.remove(&iid);
         self.persist();
         cx.notify();
     }
@@ -22134,7 +23087,7 @@ impl MuxelApp {
         if !ok {
             return;
         }
-        self.workspace.add_instance(inst);
+        self.add_opened_instance(inst);
         self.spawn_terminal(new_iid, window, cx);
         self.focus_instance(new_iid, window, cx);
         self.persist();
@@ -22718,21 +23671,150 @@ impl MuxelApp {
         self.begin_read_aloud(None, cx, move || Utterance::Notice(notice));
     }
 
+    /// Add a pane opened here and now. Recent work places a pane that has
+    /// never worked by its open time. Panes from a peer's layout carry the
+    /// time they were opened there.
+    fn add_opened_instance(&mut self, mut instance: Instance) {
+        instance
+            .created_at
+            .get_or_insert_with(|| chrono::Utc::now().timestamp_millis());
+        self.workspace.add_instance(instance);
+    }
+
     /// The live terminal view, regardless of which window owns it.
     fn terminal_view(&self, iid: Uuid) -> Option<&Entity<TerminalView>> {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
+    /// `iid`'s activity with its live terminal's current sample applied as the
+    /// status tick would apply it, recording nothing. The sidebar places rows
+    /// by it, so a row sits where the next tick leaves it. `None` when the
+    /// sample changes nothing ([`Self::pending_sample`]).
+    fn pending_activity(&self, instance: &Instance, now: i64, cx: &App) -> Option<AgentActivity> {
+        self.pending_sample(instance, now, cx)?.activity
+    }
+
+    /// `iid`'s live terminal's current sample applied as the status tick
+    /// would apply it, recording nothing ([`pending_status_sample`]): the
+    /// activity it leaves when that changed, and the record of what it put
+    /// in the activity. Focusing a pane records both, the record whether or
+    /// not the activity changed: a completion can leave the stored values as
+    /// they were (after a clock correction) and still be one the tick hasn't
+    /// recorded. `None` when `iid` has no live terminal, is held for Undo,
+    /// which the tick doesn't sample, or the sample isn't attributable.
+    fn pending_sample(&self, instance: &Instance, now: i64, cx: &App) -> Option<PendingSample> {
+        let iid = instance.id;
+        if self.is_closing(iid) {
+            return None;
+        }
+        let terminal = self.terminal_view(iid)?.read(cx);
+        let sample = self.terminal_activity_sample(iid, Some(instance), terminal);
+        let (preserve, _) =
+            restored_activity_sample(sample.restoring, sample.submitted_turn, sample.raw_status);
+        let sample = StatusSample::from_runtime(
+            sample.runtime,
+            sample.binding_rev,
+            sample.status,
+            false,
+            preserve,
+        )
+        .times(sample.times)
+        .recorded(self.recorded_ahead.get(&iid).copied());
+        pending_status_sample(
+            self.last_status.get(&iid).copied(),
+            &instance.activity,
+            sample,
+            self.popouts.contains_key(&iid),
+            now,
+        )
+    }
+
+    /// Copies of the terminal panes whose live sample would change their
+    /// activity, with it applied ([`Self::pending_activity`]). Recent work
+    /// places rows by them; Layout doesn't place by activity.
+    fn pending_instances(&self, cx: &App) -> Vec<Instance> {
+        if self.settings.sidebar_sort != SidebarSort::RecentWork {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        self.workspace
+            .instances
+            .iter()
+            .filter(|instance| instance.kind == InstanceKind::Terminal)
+            .filter_map(|instance| {
+                let activity = self.pending_activity(instance, now, cx)?;
+                Some(Instance {
+                    activity,
+                    ..instance.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// The rows each project lists in the sidebar ([`sidebar_rows_each`]), by
+    /// project id.
+    fn sidebar_rows_each(&self) -> HashMap<Uuid, Vec<Uuid>> {
+        sidebar_rows_each(
+            &self.workspace.projects,
+            &self.workspace,
+            &|iid| self.popouts.contains_key(&iid),
+            self.settings.sidebar_sort,
+        )
+    }
+
+    /// `pane_ids` ([`Self::sidebar_rows_each`]) as the sidebar lists them, placed
+    /// by `placing` ([`with_pending`]) and by the status each row shows, like
+    /// its badge.
+    fn sidebar_entries(
+        &self,
+        pane_ids: &[Uuid],
+        placing: &InstancesById,
+        bands: BandClock,
+        cx: &App,
+    ) -> Vec<SidebarEntry> {
+        let shown = |iid: Uuid| {
+            let instance = placing.get(&iid).copied();
+            Some(activity_state(self.sidebar_status(iid, instance, cx)))
+        };
+        sidebar_order(pane_ids, placing, &shown, bands, self.settings.sidebar_sort)
+    }
+
+    /// `pid`'s sidebar entries as the sidebar draws them now, for the Windows
+    /// app tests that click rows.
+    #[cfg(all(test, windows))]
+    fn sidebar_entries_now(&self, pid: Uuid, cx: &App) -> Vec<SidebarEntry> {
+        let instances = instances_by_id(&self.workspace);
+        let pending = self.pending_instances(cx);
+        self.sidebar_entries(
+            &self.sidebar_rows_each().remove(&pid).expect("project"),
+            &with_pending(&instances, &pending),
+            BandClock::at(&chrono::Local::now()),
+            cx,
+        )
+    }
+
+    /// The status a sidebar row shows. A pane without a live terminal shows
+    /// Idle, or Done once it has finished a turn, whatever state it was saved in.
+    fn sidebar_status(&self, iid: Uuid, instance: Option<&Instance>, cx: &App) -> AgentStatus {
+        let restoring = self.restoring_activity.contains(&iid);
+        let status = self.terminal_view(iid).map_or(AgentStatus::Idle, |view| {
+            shown_terminal_status(view.read(cx), instance, restoring)
+        });
+        persisted_status(status, instance, restoring)
+    }
+
+    /// `terminal`'s sample for pane `iid`, whose instance the caller has
+    /// already found (`None`: none).
     fn terminal_activity_sample(
         &self,
         iid: Uuid,
+        instance: Option<&Instance>,
         terminal: &TerminalView,
     ) -> TerminalActivitySample {
         let runtime = terminal.runtime_snapshot();
         let binding_rev = terminal.session().binding_revision();
         let raw_status = runtime.status;
         let submitted_turn = terminal.session().has_submitted_turn();
-        let instance = self.workspace.instance(iid);
         let startup_delay_ms = instance
             .and_then(|instance| {
                 instance
@@ -22754,14 +23836,20 @@ impl MuxelApp {
                 .map(|&(at, _)| at.elapsed()),
             startup_delay_ms,
         );
-        let unprompted = unprompted_report_working(&runtime, submitted_turn);
         TerminalActivitySample {
-            status: persisted_status(raw_status, instance, restoring || unprompted),
+            status: sample_status(
+                &runtime,
+                instance,
+                restoring,
+                submitted_turn,
+                own_exit(terminal),
+            ),
             raw_status,
             submitted_turn,
             restoring,
             runtime,
             binding_rev,
+            times: EventTimes::of(terminal.lifecycle_times()),
         }
     }
 
@@ -22773,7 +23861,11 @@ impl MuxelApp {
                 .map(|(iid, popout, view)| {
                     (
                         *iid,
-                        self.terminal_activity_sample(*iid, view.read(cx)),
+                        self.terminal_activity_sample(
+                            *iid,
+                            self.workspace.instance(*iid),
+                            view.read(cx),
+                        ),
                         popout.window,
                     )
                 })
@@ -22792,22 +23884,31 @@ impl MuxelApp {
             if !keep_guard {
                 self.restoring_activity.remove(&iid);
             }
+            let ahead = self.recorded_ahead.remove(&iid);
+            let status_sample = StatusSample::from_runtime(
+                sample.runtime,
+                sample.binding_rev,
+                sample.status,
+                attended,
+                preserve,
+            )
+            .times(sample.times)
+            .recorded(ahead);
             let effect = apply_popout_status_sample(
                 &mut record,
                 self.workspace
                     .instance_mut(iid)
                     .map(|instance| &mut instance.activity),
-                StatusSample::from_runtime(
-                    sample.runtime,
-                    sample.binding_rev,
-                    sample.status,
-                    attended,
-                    preserve,
-                ),
+                status_sample,
                 now,
             );
             if let Some(record) = record {
                 self.last_status.insert(iid, record);
+            }
+            if !status_sample.attributable
+                && let Some(ahead) = ahead
+            {
+                self.recorded_ahead.insert(iid, ahead);
             }
             updates.persist |= effect.activity_changed;
             if let Some(instance) = self.workspace.instance(iid) {
@@ -26420,13 +27521,26 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The notifications the sidebar's feed lists, newest first
+    /// ([`notification_in_feed`]). The shared collection stays intact: the
+    /// tray still shows every agent event.
+    fn feed_notifications(&self) -> impl Iterator<Item = &Notification> {
+        self.notifications.iter().rev().filter(|n| {
+            notification_in_feed(
+                self.settings.sidebar_sort,
+                n.instance.is_some() && n.kind.row_shows(),
+            )
+        })
+    }
+
     /// The NOTIFICATIONS category at the top of the sidebar: a header (with a
     /// clear-all) and one click-to-navigate, dismissable row per notification.
     fn render_notifications_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let radius = cx.theme().radius;
         let hover_col = cx.theme().sidebar_accent.opacity(0.45);
-        let has = !self.notifications.is_empty();
+        let visible = || self.feed_notifications();
+        let has = visible().next().is_some();
 
         let header = div()
             .px_3()
@@ -26473,7 +27587,7 @@ impl MuxelApp {
         }
 
         // Newest first.
-        for n in self.notifications.iter().rev() {
+        for n in visible() {
             let nid = n.id;
             let dot = n.kind.dot(cx);
             let title: SharedString = n.title.clone().into();
@@ -27009,6 +28123,12 @@ impl MuxelApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pid = self.workspace.active_project;
         let project_count = self.workspace.projects.len();
+        let instances = instances_by_id(&self.workspace);
+        let pending = self.pending_instances(cx);
+        let placing = with_pending(&instances, &pending);
+        let mut rows = self.sidebar_rows_each();
+        let bands = BandClock::at(&chrono::Local::now());
+        let sort = self.settings.sidebar_sort;
         let entity = cx.entity();
         let mut list = div()
             .id("sidebar-scroll")
@@ -27036,6 +28156,14 @@ impl MuxelApp {
             let is_first = ix == 0;
             let is_last = ix + 1 == project_count;
             let collapsed = self.collapsed.contains(&pid);
+            // Popouts leave the layout but keep their session row in Recent
+            // work, where their feed entry is folded away.
+            let pane_ids = rows.remove(&pid).unwrap_or_default();
+            let unread = if sort == SidebarSort::RecentWork {
+                unread_count(&pane_ids, &instances)
+            } else {
+                0
+            };
             let renaming = self.rename == Some(RenameTarget::Project(pid))
                 && self.rename_origin == Some(RenameOrigin::ProjectSidebar);
             let name: SharedString = project.name.clone().into();
@@ -27166,6 +28294,14 @@ impl MuxelApp {
                                 },
                             )),
                     )
+                    .children((unread > 0).then(|| {
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().primary)
+                            .child(format!("{unread} {}", t("unread")))
+                    }))
                     .children(memory_on.then(|| {
                         div()
                             .flex_none()
@@ -27637,41 +28773,42 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
+                let entries = self.sidebar_entries(&pane_ids, &placing, bands, cx);
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
-                if !project.instances().is_empty() {
+                if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                // Group instances by worktree: plain (no-worktree) panes first,
-                // then a subcategory per worktree (a colored subheader followed by
-                // its instances).
-                let mut ungrouped: Vec<Uuid> = Vec::new();
-                let mut groups: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
-                for iid in project.instances() {
-                    match self.workspace.instance(iid).and_then(|i| i.worktree_id) {
-                        Some(wid) => match groups.iter_mut().find(|(w, _)| *w == wid) {
-                            Some(g) => g.1.push(iid),
-                            None => groups.push((wid, vec![iid])),
-                        },
-                        None => ungrouped.push(iid),
-                    }
-                }
-                let mut ordered: Vec<(Option<Uuid>, Uuid)> =
-                    ungrouped.into_iter().map(|i| (None, i)).collect();
-                for (wid, members) in groups {
-                    for iid in members {
-                        ordered.push((Some(wid), iid));
-                    }
-                }
-                let mut shown_wt: HashSet<Uuid> = HashSet::new();
-                for (wid_opt, iid) in ordered {
-                    // Emit the worktree subheader before its first instance.
-                    if let Some(wid) = wid_opt
-                        && shown_wt.insert(wid)
-                    {
-                        list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
-                    }
-                    let inst = self.workspace.instance(iid);
+                for entry in entries {
+                    let iid = match entry {
+                        SidebarEntry::Worktree(wid) => {
+                            list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
+                            continue;
+                        }
+                        SidebarEntry::Band(band) => {
+                            let label = match band {
+                                ActivityBand::Today => t("Today"),
+                                ActivityBand::ThisWeek => t("This week"),
+                                ActivityBand::Older => t("Older"),
+                            };
+                            list = list.child(
+                                div()
+                                    .ml_4()
+                                    .px_2()
+                                    .pt_2()
+                                    .pb_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(label),
+                            );
+                            continue;
+                        }
+                        SidebarEntry::Pane(iid) => iid,
+                    };
+                    let inst = instances.get(&iid).copied();
+                    let popped_out = self.popouts.contains_key(&iid);
+                    let unread = sort == SidebarSort::RecentWork
+                        && inst.is_some_and(|i| is_unread(&i.activity));
                     let program = inst.and_then(|i| i.program.clone());
                     let custom = inst
                         .and_then(|i| i.custom_name.clone())
@@ -27682,46 +28819,38 @@ impl MuxelApp {
                     let loading = self.terminal_is_loading(iid, cx);
                     let stopped = inst.is_some_and(|instance| {
                         instance.is_stopped_literal(
-                            self.terminals.contains_key(&iid),
+                            self.terminal_view(iid).is_some(),
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
+                    let app_title = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
-                        (
-                            inst.and_then(|instance| {
-                                let remote = self
-                                    .workspace
-                                    .project(instance.project_id)
-                                    .is_some_and(Project::is_remote);
-                                let live_title = view.title();
-                                let program_name = view.program_auto_title();
-                                authoritative_terminal_auto_title(
-                                    instance,
-                                    &self.codex_session_names,
-                                    remote,
-                                    live_title.as_deref(),
-                                    program_name.as_deref(),
-                                )
-                            })
-                            .unwrap_or(meta),
-                            shown_terminal_status(
-                                view,
-                                inst,
-                                self.restoring_activity.contains(&iid),
-                            ),
-                        )
+                        inst.and_then(|instance| {
+                            let remote = self
+                                .workspace
+                                .project(instance.project_id)
+                                .is_some_and(Project::is_remote);
+                            let live_title = view.title();
+                            let program_name = view.program_auto_title();
+                            authoritative_terminal_auto_title(
+                                instance,
+                                &self.codex_session_names,
+                                remote,
+                                live_title.as_deref(),
+                                program_name.as_deref(),
+                            )
+                        })
+                        .unwrap_or(meta)
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (ed.read(cx).title(), AgentStatus::Idle)
+                        ed.read(cx).title()
                     } else if let Some(bv) = self.browsers.get(&iid) {
-                        (bv.read(cx).tab_title(), AgentStatus::Idle)
+                        bv.read(cx).tab_title()
                     } else {
-                        (meta, AgentStatus::Idle)
+                        meta
                     };
-                    let status =
-                        persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let status = self.sidebar_status(iid, inst, cx);
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
@@ -27763,6 +28892,22 @@ impl MuxelApp {
                                 cx,
                             ),
                         ))
+                        .children(
+                            (sort == SidebarSort::RecentWork && inst.is_some_and(|i| i.pinned))
+                                .then(|| {
+                                    svg()
+                                        .path("icons/pin.svg")
+                                        .size(px(10.0))
+                                        .flex_none()
+                                        .text_color(cx.theme().muted_foreground)
+                                }),
+                        )
+                        .children(popped_out.then(|| {
+                            Icon::new(IconName::ExternalLink)
+                                .small()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                        }))
                         // Worktree dot (matches the pane outline color).
                         .children(
                             self.instance_worktree_color(iid)
@@ -27785,7 +28930,8 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
-                        base.cursor_pointer()
+                        let row = base
+                            .cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
                             // reset by the drag/release handling, so the pane would
@@ -27799,6 +28945,10 @@ impl MuxelApp {
                                         window,
                                         cx,
                                     );
+                                } else if let Some(popout) = this.popouts.get(&iid) {
+                                    let _ = popout
+                                        .window
+                                        .update(cx, |_, window, _| window.activate_window());
                                 } else {
                                     this.select_instance(iid, window, cx);
                                 }
@@ -27812,8 +28962,16 @@ impl MuxelApp {
                                     .text_ellipsis()
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground)
+                                    .when(unread, |s| s.font_semibold())
                                     .child(display),
                             )
+                            .children(unread.then(|| {
+                                div()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(cx.theme().primary)
+                            }))
                             .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
@@ -27834,58 +28992,66 @@ impl MuxelApp {
                                 // the label stays legible on the sidebar.
                                 if read_done { tag.outline() } else { tag }
                             }))
-                            .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
-                                let label = ghost_label.clone();
-                                cx.new(move |_| DragGhost { label, offset })
-                            })
-                            .on_drop::<DragInstance>(cx.listener(
+                            .when(!popped_out, |row| {
+                                row.on_drag(DragInstance { iid }, move |_, offset, _, cx| {
+                                    let label = ghost_label.clone();
+                                    cx.new(move |_| DragGhost { label, offset })
+                                })
+                            });
+                        // Recent order is independent of layout positions. Accept
+                        // row swaps only when their result can be seen in the list.
+                        let row = if sort == SidebarSort::Layout {
+                            row.on_drop::<DragInstance>(cx.listener(
                                 move |this, p: &DragInstance, _w, cx| {
                                     this.swap_terminals(p.iid, iid, cx)
                                 },
                             ))
                             .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
-                            .context_menu({
-                                let entity = entity.clone();
-                                move |menu, window, _cx| {
-                                    menu.item(
-                                        PopupMenuItem::new(t("Rename"))
-                                            .icon(Icon::empty().path("icons/pencil.svg"))
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.start_rename_instance(
-                                                        iid,
-                                                        RenameOrigin::InstanceSidebar,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            )),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t("Duplicate"))
-                                            .icon(IconName::Copy)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.duplicate_instance(iid, window, cx)
-                                                },
-                                            )),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t("Kill"))
-                                            .icon(IconName::CircleX)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, _window, cx| {
-                                                    this.request_close_instance(iid, cx)
-                                                },
-                                            )),
-                                    )
-                                }
-                            })
-                            .into_any_element()
+                        } else {
+                            row
+                        };
+                        row.context_menu({
+                            let entity = entity.clone();
+                            move |menu, window, _cx| {
+                                menu.item(
+                                    PopupMenuItem::new(t("Rename"))
+                                        .icon(Icon::empty().path("icons/pencil.svg"))
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.start_rename_instance(
+                                                    iid,
+                                                    RenameOrigin::InstanceSidebar,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t("Duplicate"))
+                                        .icon(IconName::Copy)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.duplicate_instance(iid, window, cx)
+                                            },
+                                        )),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(t("Kill"))
+                                        .icon(IconName::CircleX)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.request_close_instance(iid, cx)
+                                            },
+                                        )),
+                                )
+                            }
+                        })
+                        .into_any_element()
                     };
                     list = list.child(row);
                 }
@@ -33173,6 +34339,26 @@ impl MuxelApp {
                     .child(self.pane_border_btn("subtle", &t("Subtle"), cx))
                     .child(self.pane_border_btn("bold", &t("Bold"), cx)),
             )
+            .child(self.settings_label(&t("Sidebar order"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(self.option_btn(
+                        "sidebar-sort-layout",
+                        t("Layout"),
+                        self.settings.sidebar_sort == SidebarSort::Layout,
+                        cx,
+                        |s| s.sidebar_sort = SidebarSort::Layout,
+                    ))
+                    .child(self.option_btn(
+                        "sidebar-sort-work",
+                        t("Recent work"),
+                        self.settings.sidebar_sort == SidebarSort::RecentWork,
+                        cx,
+                        |s| s.sidebar_sort = SidebarSort::RecentWork,
+                    )),
+            )
             .into_any_element()
     }
 
@@ -37121,6 +38307,7 @@ mod popout_activity_tests {
             binding,
             coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            sampled_at: 0,
         });
         let before_record = record;
         let mut activity = AgentActivity::default();
@@ -37142,6 +38329,8 @@ mod popout_activity_tests {
                 attributable: false,
                 attended: true,
                 preserve_restored: false,
+                times: None,
+                recorded: None,
             },
             300,
         );
@@ -37162,6 +38351,7 @@ mod popout_activity_tests {
             binding,
             coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
             completion_revision: 0,
+            sampled_at: 0,
         });
         let mut activity = AgentActivity::default();
         activity.observe(None, AgentActivityState::Working, 100);
@@ -37178,6 +38368,8 @@ mod popout_activity_tests {
             attributable: true,
             attended: false,
             preserve_restored: false,
+            times: None,
+            recorded: None,
         };
         let completed = apply_popout_status_sample(&mut record, Some(&mut activity), sample, 300);
         assert!(completed.changed && completed.activity_changed);

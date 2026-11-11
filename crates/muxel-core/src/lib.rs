@@ -15,6 +15,7 @@ pub mod geometry;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
+mod launch;
 pub mod library;
 pub mod locale;
 pub mod memory;
@@ -28,6 +29,7 @@ pub mod refresh_gate;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
+pub mod sidebar;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -55,6 +57,7 @@ pub use agent::{
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
+pub use launch::{LaunchPurpose, PaneTransport};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
@@ -122,7 +125,7 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
@@ -146,17 +149,22 @@ impl AgentActivity {
         })
     }
 
-    /// Whether a completed turn is newer than the last time the pane was
-    /// attended. A missing attendance timestamp means the completion is unseen.
+    /// Whether the pane is Done and unread. Unread is [`sidebar::is_unread`], the
+    /// one read rule shared by the read pill and the unread mark. Recent work's
+    /// order never reads it. A missing attendance timestamp means the
+    /// completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
-        self.current_state() == Some(AgentActivityState::Done)
-            && self
-                .completed_at
-                .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
+        self.current_state() == Some(AgentActivityState::Done) && sidebar::is_unread(self)
     }
 
-    /// Apply one displayed-status transition. Returns whether durable state
-    /// changed, so callers can avoid rewriting the workspace on idle ticks.
+    /// Apply one displayed-status transition, which happened at `now`.
+    /// Returns whether durable state changed, so callers can avoid rewriting
+    /// the workspace on idle ticks.
+    ///
+    /// Attendance is recorded only after what it saw ([`Self::attend`]), so
+    /// a new finish or question happened after the last attendance. If the
+    /// clock has stepped back behind that attendance, the event is recorded
+    /// just after it instead, so it still reads as unseen.
     pub fn observe(
         &mut self,
         previous: Option<AgentActivityState>,
@@ -164,6 +172,7 @@ impl AgentActivity {
         now: i64,
     ) -> bool {
         let now = now.max(0);
+        let event_at = self.last_attended_at.map_or(now, |seen| now.max(seen + 1));
         let before = self.clone();
         let previous_persisted = self.current_state();
         match status {
@@ -171,13 +180,13 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Working) {
                     self.work_started_at = Some(now);
                 }
-                self.blocked_at = None;
             }
             AgentActivityState::Blocked => {
                 if previous != Some(AgentActivityState::Blocked)
-                    && !(previous.is_none() && self.blocked_at.is_some())
+                    && !(previous.is_none()
+                        && previous_persisted == Some(AgentActivityState::Blocked))
                 {
-                    self.blocked_at = Some(now);
+                    self.blocked_at = Some(event_at);
                 }
             }
             AgentActivityState::Done => {
@@ -187,15 +196,10 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Done)
                     && !(previous.is_none() && previous_persisted == Some(AgentActivityState::Done))
                 {
-                    self.completed_at = Some(now);
-                }
-                self.blocked_at = None;
-            }
-            AgentActivityState::Idle => {
-                if previous == Some(AgentActivityState::Blocked) {
-                    self.blocked_at = None;
+                    self.completed_at = Some(event_at);
                 }
             }
+            AgentActivityState::Idle => {}
         }
         if self.last_state.is_some() || previous_persisted != Some(status) {
             self.last_state = Some(status);
@@ -203,14 +207,25 @@ impl AgentActivity {
         *self != before
     }
 
-    /// Record deliberate attendance. This clears unattended completion by
-    /// ordering rather than by maintaining a second persisted boolean.
+    /// Record deliberate attendance at `now`: everything recorded so far has
+    /// been seen. This clears unattended completion by ordering rather than
+    /// by maintaining a second persisted boolean. It covers every recorded
+    /// event, even one the clock now reads as in the future, and never moves
+    /// back, so a seen event can't turn unread when the clock steps back.
     pub fn attend(&mut self, now: i64) -> bool {
-        let now = now.max(0);
-        if self.last_attended_at == Some(now) {
+        let seen = [
+            Some(now.max(0)),
+            self.last_attended_at,
+            self.completed_at,
+            self.blocked_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if self.last_attended_at == seen {
             return false;
         }
-        self.last_attended_at = Some(now);
+        self.last_attended_at = seen;
         true
     }
 }
@@ -226,7 +241,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -376,6 +391,32 @@ mod agent_activity_tests {
             100_001
         ));
         assert!(activity.has_unattended_completion());
+    }
+
+    /// When the clock steps back, attendance still covers what it saw, and
+    /// what happens after it still comes after it.
+    #[test]
+    fn attendance_covers_what_it_saw_whatever_the_clock_reads() {
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        // Finished at 400 by a clock that then stepped back to 200.
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            400,
+        );
+        assert!(activity.attend(200));
+        assert!(!activity.has_unattended_completion(), "seen at 200");
+        assert!(!activity.attend(150), "attendance never moves back");
+        assert_eq!(activity.last_attended_at, Some(400));
+        // Asked at 300 by the clock, after that look.
+        activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Blocked,
+            300,
+        );
+        assert_eq!(activity.blocked_at, Some(401));
+        assert!(crate::sidebar::is_unread(&activity));
     }
 
     #[test]
@@ -621,6 +662,11 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// When this pane was opened, in Unix milliseconds. Recent work places a
+    /// pane that has never worked by it. `None` for panes saved before muxel
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,6 +716,13 @@ impl Instance {
 
     pub fn working_directory(&self) -> Option<&std::path::Path> {
         self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// What this pane was started to do, from the program and arguments it
+    /// runs ([`LaunchPurpose::of`]). Saved panes get the same answer as new
+    /// ones, so nothing is stored for it.
+    pub fn launch_purpose(&self) -> LaunchPurpose {
+        LaunchPurpose::of(self.program.as_deref(), &self.args)
     }
 
     /// An unspawned saved literal command is stopped, rather than an idle agent.
@@ -725,13 +778,17 @@ impl Instance {
         true
     }
 
-    /// A duplicated pane copies launch settings, not the source conversation.
+    /// A duplicated pane copies launch settings, not the source conversation or
+    /// its activity. The copy has done no work and has nothing unread of its own.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        self.activity = AgentActivity::default();
+        // The copy is opened when it is added, not when its source was.
+        self.created_at = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -796,6 +853,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            created_at: None,
         }
     }
 
@@ -865,6 +923,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            created_at: None,
         }
     }
 }
@@ -1661,6 +1720,8 @@ impl RemoteLayout {
                 instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                // Set once, and dropped by older peers: never a layout change.
+                instance.created_at = None;
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
@@ -1871,6 +1932,8 @@ pub fn merge_peer_instances(
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                // An older peer doesn't write the open time.
+                instance.created_at = mine.created_at.or(instance.created_at);
                 // Older peers cannot write socket ownership. Preserve an already
                 // resolved binding when their layout still describes that pane.
                 if instance.tmux_socket.is_none()
@@ -1901,6 +1964,10 @@ pub fn merge_peer_instances(
                 if instance.instruction_injection.is_none() {
                     instance.instruction_injection = mine.instruction_injection.clone();
                 }
+            } else {
+                // Work and attendance are observations on this machine. A new
+                // peer pane starts fresh; its own runtime samples record them.
+                instance.activity = AgentActivity::default();
             }
             instance
         })
@@ -2641,6 +2708,9 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Sidebar presentation only; navigation and pane layout keep their order.
+    #[serde(default)]
+    pub sidebar_sort: sidebar::SidebarSort,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3183,6 +3253,7 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            sidebar_sort: sidebar::SidebarSort::default(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,

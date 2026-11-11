@@ -709,6 +709,9 @@ pub struct CommandSpec {
     /// to its tmux pane through tmux, never through the client. See
     /// [`crate::control_input`].
     pub tmux_input: Option<crate::TmuxInputRoute>,
+    /// What the child is to the pane's command: the command itself, or a
+    /// transport whose exit may not be the command's.
+    pub transport: muxel_core::PaneTransport,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -755,6 +758,7 @@ impl CommandSpec {
             startup_turn: None,
             title_source: None,
             tmux_input: None,
+            transport: muxel_core::PaneTransport::Direct,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -783,6 +787,7 @@ impl CommandSpec {
             startup_turn: None,
             title_source: None,
             tmux_input: None,
+            transport: muxel_core::PaneTransport::Direct,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -870,6 +875,11 @@ impl CommandSpec {
 
     pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
         self.tmux_input = Some(route);
+        self
+    }
+
+    pub fn with_transport(mut self, transport: muxel_core::PaneTransport) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -1350,6 +1360,7 @@ pub struct TerminalSession {
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    transport: muxel_core::PaneTransport,
     /// The job this pane's local process tree runs in, when it has a memory
     /// limit (see [`crate::pane_job`]). Dropped after the child is killed;
     /// processes still in it keep running.
@@ -1890,6 +1901,7 @@ impl TerminalSession {
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            transport: spec.transport,
             #[cfg(windows)]
             pane_job,
             _reader: reader_handle,
@@ -2400,6 +2412,11 @@ impl TerminalSession {
     /// Whether outside-control input reaches this terminal through tmux.
     pub fn delivers_through_tmux(&self) -> bool {
         self.tmux_input.is_some()
+    }
+
+    /// What the child is to the pane's command ([`CommandSpec::transport`]).
+    pub fn transport(&self) -> muxel_core::PaneTransport {
+        self.transport
     }
 
     /// The tmux pane id outside-control input goes to, once found.
