@@ -99,10 +99,12 @@ feature is added or changed, update the matching entry here in the same change**
   active pane.
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
-  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
-  split buttons and dragging a tab to an edge still make a new pane. In a
-  per-monitor project window, the toolbar and shortcuts act on that window's
-  project.
+  a column. Settings → Behavior → **New agents open** switches them to **In a new
+  pane** instead, which opens each one in a pane of its own to the right of the
+  focused pane. An empty project gets its first pane either way. New Tab, New
+  Pane, Split Right/Down, the split buttons and dragging a tab to an edge keep
+  doing what they say, whatever the setting. In a per-monitor project window,
+  the toolbar and shortcuts act on that window's project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -564,8 +566,16 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Claude's
+  permission forms report **blocked**. Subagents listed by Claude's footer or
+  Grok's panel hold a finished turn at **working** (`working · subagents`) for up
+  to three hours, with no done alert or Recent move until the listing clears; a
+  released turn isn't held again until new foreground work runs. Shell and monitor
+  listings show beside the status (`done · 3m · 1 shell`) without delaying
+  completion. Older Claude's `command still running` row reads **working** unless
+  a current empty footer is drawn below it. Closing a pane asks while anything is
+  listed, `ctl status` and `ctl wait` report it as `background`, plain `ctl wait`
+  waits out subagent holds (`--turn` doesn't), and `ctl send` still delivers to a
+  held pane once its status belongs to the current conversation. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity
@@ -581,7 +591,9 @@ feature is added or changed, update the matching entry here in the same change**
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**. On a
   Claude pane, built-in and edited lists alike match outside its input box,
-  alongside Claude's own status-row and permission-form parsers.
+  alongside Claude's own status-row and permission-form parsers. The status row
+  reads Working on every frame of its spinner, with or without an arrow before the
+  token count, so a remote Claude pane doesn't flash Done between frames.
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
@@ -854,6 +866,9 @@ feature is added or changed, update the matching entry here in the same change**
   failures report once per cause, not on every autosave). Agent rows are
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
+  Click the NOTIFICATIONS header to collapse the section to one line showing how
+  many notifications it holds, so incoming notifications stop pushing PROJECTS
+  down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
 - **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
@@ -1102,7 +1117,7 @@ feature is added or changed, update the matching entry here in the same change**
   literal text keeps those words as prompt text. Unknown verbs suggest a nearby
   command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
-  ten seconds (three more after a retry) and report `submission_confirmed` and
+  sixty seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
   `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
   `retry_unanswered` when tmux didn't answer for the retry Enter); once
@@ -1115,10 +1130,50 @@ feature is added or changed, update the matching entry here in the same change**
   and input guards and an exact fully visible ASCII prose draft in its idle
   composer. A compact composer frame captured before paste and an added blank
   cursor line must prove that its first Enter was consumed, with no resize or
-  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  later title change. Learning the first provider thread does not cancel the
+  confirmation. Switch and input protection covers muxel-observed changes;
+  another tmux client's input is untracked. Wrapped prose is supported;
+  clipped, multiline, Unicode,
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
+- **Delivery outcomes and next commands** — `send` and `new --prompt` report
+  `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
+  `next` command when more action is needed. Existing receipt fields remain.
+  All unsubmitted outcomes recommend read-only screen inspection. A pending
+  receipt describes the draft observed at that time and cannot guard a later
+  Enter; never paste the task again after uncertain delivery. Startup pending
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
+  `send` or `new --prompt` is `not_delivered` only when a coded refusal came
+  before any input; other commands' failures carry no outcome. A send watches
+  for its receipt for ten seconds, a second longer for each thousand characters
+  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
+  spelling when no agent has that name.
+- **Startup input waits for the provider** — a `new --prompt` task waits for a
+  real editable composer and provider acceptance. The reply comes once the pane
+  exists, with the task submitted, refused, or `prompt_pending` and a `status`
+  command to follow; `--wait-delivery` reads until it settles, for up to 90
+  seconds. Known folder trust, update and login menus stop delivery as soon as
+  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
+  never answered automatically. `--no-wait` returns before approval with a
+  polling command. Status exposes the same delivery facts.
+  Codex launches carrying a startup task suppress its startup update menu.
+- **Windows Codex multiline control** — native presets disable heuristic paste
+  bursts only after a version probe verifies the matching input codec. The
+  probe runs once per Codex executable (again after it changes) on its own
+  thread; a launch waits for it at most two seconds, and a slower probe still
+  answers later launches. Older versions and failed probes receive no automatic
+  paste-burst override. With verified, configured
+  Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
+  blank lines and Unicode; CRLF becomes one newline. Clipboard and startup text
+  turn tabs into spaces to the next four-column stop. Other control characters,
+  and tabs in ctl input, refuse the whole paste before any write.
+  Clipboard refusals appear in the error feed; ordinary clipboard ESC
+  sanitization remains. Saved snippets and dictated transcripts also report
+  paste failures and cancel automatic submission. Unverified
+  multiline controller input reports `unsupported_input`; explicitly disabled
+  bursts without a verified codec also
+  refuse advanced clipboard text. Literal argv is never changed.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -1151,6 +1206,12 @@ feature is added or changed, update the matching entry here in the same change**
   trusted. The check goes by process id alone, so if that id has since gone to
   another process, the file still passes. On Linux and macOS that is any process;
   on Windows it is one the user may open, such as one of their own.
+- **With several windows open** — each muxel window also writes its endpoint
+  into the folder of the workspace it has open, so `muxel ctl` run in a pane
+  reaches the window holding that pane, not whichever window started last.
+  Outside tools reach the window that wrote `control.json` most recently while
+  it has a workspace open; otherwise (it's still on the workspace selector, or
+  it has closed) they reach the window with a workspace that published last.
 - **Settings → Outside control** — a setup page that walks through connecting
   another agent in four steps: turn on outside control (with a live status: on and
   listening, starting, or off), let the agent run commands on this computer (with
@@ -1236,6 +1297,22 @@ feature is added or changed, update the matching entry here in the same change**
   under its limit. A child that asks to break away from the job, and processes a
   remote host or tmux server runs, aren't covered. If Windows can't apply the
   limit, the pane starts without one and the reason is logged.
+- **Per-pane memory limit (Linux)** — each local pane runs in a systemd scope of
+  its own, and the same Settings → Behavior choice (16 GB by default) limits how
+  much memory the pane's processes use together, plus up to a quarter of that in
+  swap. When they reach it, Linux stops the largest of them and the rest of the
+  pane, its agent included, keeps running. Even with the limit off, a process
+  stopped because the whole computer ran out of memory takes nothing else with
+  it: previously systemd could stop everything sharing its group, such as the
+  tmux server's scope or the desktop session muxel was started from. The
+  notifications feed reports each such stop and whether the pane's limit or the
+  computer ran out. A change applies to panes started after it. It needs a
+  systemd user session; without one (or with `MUXEL_PANE_SCOPE=0`) panes start
+  as before. A pane on a remote Linux host (from the desktop or the iOS app)
+  also runs in a scope of its own there when the host has a systemd user
+  session, so a process killed there for memory no longer takes the agent and
+  its tmux session with it; the limit and the feed report apply only to local
+  panes.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -1676,6 +1753,8 @@ feature is added or changed, update the matching entry here in the same change**
   unattended can't resize a session you're using from another computer. Once you
   type, paste, click or scroll in a terminal on that machine, its panes take part in
   the size again, and the window follows whoever used it last, as tmux always does.
+  A host's panes take the size back together in one ssh, and one that can't reach
+  its host tries again shortly instead of staying cropped to another client's size.
   A pane alone in its session attaches normally and always follows its own size;
   with tmux older than 3.2 on the host, panes attach the old way.
 - **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
@@ -1743,12 +1822,23 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Workspaces** — multiple workspaces, each with its own projects + layout; a startup workspace
   selector.
+- **Multiple windows** — **New Window** (`Ctrl+Shift+N`, rebindable; also `Cmd+N`
+  on macOS, the macOS **File** and Dock menus, the command palette and the
+  workspace selector) opens another muxel window, so two workspaces can be worked
+  in at once on macOS, Windows and Linux. It opens on the workspace selector, a
+  little offset from the window that opened it. In a window that already has a
+  workspace, the selector's ↗ button beside another workspace opens that one in a
+  new window instead of switching. Each window is its own muxel process with the
+  same `--user-data-dir`, so closing or quitting one leaves the others running,
+  and each keeps its own tray icon.
 - **Single instance per workspace** — each workspace is locked while open, so two
   muxel windows can run side by side on **different** workspaces but never the same
-  one (which would clobber its layout). Picking a workspace another window already
-  holds is refused in the selector with an inline "in use" note; pick a different one
-  or close the other window. The lock releases when you switch workspaces or on exit
-  (even a crash), so no stale lock blocks the next launch.
+  one (which would clobber its layout). The selector marks workspaces another
+  window has open as "in use" and won't delete them; picking one is refused with an
+  inline note, so pick a different one or close the other window. Workspaces
+  created in one window are listed in the others, and changes to the workspace
+  list never drop one another window just made. The lock releases when you switch
+  workspaces or on exit (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
