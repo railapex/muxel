@@ -99,11 +99,16 @@ impl BandClock {
 pub enum RecentGroup {
     /// Asking for something now: newest question first.
     Asking,
-    /// Has worked and isn't running a turn: finished, stopped, exited or
-    /// interrupted. Newest event first.
+    /// Has worked and isn't running a turn (finished, stopped, exited or
+    /// interrupted), last at or after the start of the oldest turn still
+    /// running in the project, or with none running. Newest event first.
     Recent,
     /// Running a turn: oldest start first, so a new turn joins the bottom.
     Working,
+    /// Has worked and isn't running a turn, last before the oldest turn
+    /// still running began: older news than anything working. Newest event
+    /// first.
+    Earlier,
     /// Has never worked: newest open first.
     Unused,
 }
@@ -169,6 +174,31 @@ impl RecentPlace {
     pub fn group(self) -> RecentGroup {
         self.group
     }
+
+    /// This place once a turn that started at `oldest_turn`, the oldest still
+    /// running in the project, is taken into account: a row that last worked
+    /// before it began sits below the working rows ([`RecentGroup::Earlier`]).
+    /// With no turn running, nothing moves.
+    fn behind(self, oldest_turn: Option<i64>) -> Self {
+        match (self.group, self.at, oldest_turn) {
+            (RecentGroup::Recent, Some(at), Some(started)) if at < started => Self {
+                group: RecentGroup::Earlier,
+                ..self
+            },
+            _ => self,
+        }
+    }
+}
+
+/// When the oldest turn still running among `instances` began, from each
+/// row's recorded lifecycle rather than the status it shows, so a status that
+/// flickers without the reducer recording a change moves no row.
+fn oldest_running_turn<'a>(instances: impl IntoIterator<Item = &'a Instance>) -> Option<i64> {
+    instances
+        .into_iter()
+        .filter(|instance| instance.activity.current_state() == Some(AgentActivityState::Working))
+        .filter_map(|instance| instance.activity.work_started_at)
+        .min()
 }
 
 impl Ord for RecentPlace {
@@ -177,9 +207,10 @@ impl Ord for RecentPlace {
             .cmp(&(other.band, other.group))
             .then_with(|| match self.group {
                 RecentGroup::Working => self.at.cmp(&other.at),
-                RecentGroup::Asking | RecentGroup::Recent | RecentGroup::Unused => {
-                    other.at.cmp(&self.at)
-                }
+                RecentGroup::Asking
+                | RecentGroup::Recent
+                | RecentGroup::Earlier
+                | RecentGroup::Unused => other.at.cmp(&self.at),
             })
     }
 }
@@ -334,7 +365,9 @@ pub fn sidebar_rows_each<'a>(
 /// open first.
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
-/// state each row shows (`shown`). Nothing about reading or focus is an input.
+/// state each row shows (`shown`), with the rows that last worked before the
+/// project's oldest running turn began below the working ones. Nothing about
+/// reading or focus is an input.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
     instances: &InstancesById,
@@ -397,13 +430,17 @@ pub fn sidebar_order(
         group: RecentGroup::Unused,
         at: None,
     };
+    // Future times count as now, here as in each row's own place.
+    let oldest_turn =
+        oldest_running_turn(pane_ids.iter().filter_map(|id| instances.get(id).copied()))
+            .map(|started| started.min(clock.now));
     let placed = |ids: Vec<Uuid>| {
         let mut rows: Vec<_> = ids
             .into_iter()
             .map(|id| {
-                let place = instances
-                    .get(&id)
-                    .map_or(unknown, |i| RecentPlace::of(i, shown(id), clock));
+                let place = instances.get(&id).map_or(unknown, |i| {
+                    RecentPlace::of(i, shown(id), clock).behind(oldest_turn)
+                });
                 (id, place)
             })
             .collect();
@@ -901,11 +938,92 @@ mod tests {
         }
     }
 
+    /// A finish from before every turn still running is older news than that
+    /// work, so it sits below the working rows; a finish since the oldest of
+    /// them began stays above. While anything works the oldest start only
+    /// moves forward (a new turn starts now), so a row that dropped comes
+    /// back up when the work ends: with nothing working, every finish is
+    /// newest first, as before.
+    #[test]
+    fn a_finish_from_before_every_running_turn_sits_below_the_working_rows() {
+        use AgentActivityState::{Blocked, Done, Working};
+        let (project, mut workspace, ids) = fixture(vec![
+            worked(NOW - 3 * HOUR),
+            worked(NOW - 4 * HOUR),
+            worked(NOW - 5 * HOUR),
+            worked(NOW - 6 * HOUR),
+        ]);
+        let (old, first, second, third) = (ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![old, first, second, third]
+        );
+
+        // A turn starts after `old` finished: `old` drops below it, read or not.
+        change(&mut workspace, first, Working, NOW - 2 * HOUR);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![first, old, second, third]
+        );
+        attend(&mut workspace, old, NOW - 2 * HOUR + MINUTE);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![first, old, second, third]
+        );
+
+        // A finish since that turn began is news: it stays above the work.
+        change(&mut workspace, second, Working, NOW - 100 * MINUTE);
+        change(&mut workspace, second, Done, NOW - 90 * MINUTE);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![second, first, old, third]
+        );
+
+        // The oldest turn asks: a question isn't work, so only `third`'s
+        // newer turn is running, and `second` finished before it began.
+        change(&mut workspace, third, Working, NOW - 80 * MINUTE);
+        change(&mut workspace, first, Blocked, NOW - 70 * MINUTE);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![first, third, second, old]
+        );
+
+        // Both turns end: nothing works, so every finish is newest first.
+        change(&mut workspace, first, Done, NOW - 20 * MINUTE);
+        change(&mut workspace, third, Done, NOW - 10 * MINUTE);
+        assert_eq!(
+            pane_order(&project, &workspace),
+            vec![third, first, second, old]
+        );
+    }
+
+    /// The working rows' oldest start comes from what the reducer recorded,
+    /// not from what a row shows, so a status the reducer hasn't recorded (a
+    /// flicker, a turn not yet sampled) drops no finish below it. The row
+    /// showing it still sits with the working rows, as it always has.
+    #[test]
+    fn a_status_the_reducer_has_not_recorded_drops_no_finish_below_it() {
+        let (project, workspace, ids) = fixture(vec![worked(NOW - 3 * HOUR), worked(NOW - HOUR)]);
+        let (done, flicker) = (ids[0], ids[1]);
+        assert_eq!(pane_order(&project, &workspace), vec![flicker, done]);
+        let shows_working = |instance: &Instance| {
+            if instance.id == flicker {
+                Some(AgentActivityState::Working)
+            } else {
+                live(instance)
+            }
+        };
+        assert_eq!(
+            panes(order_at(&project, &workspace, &shows_working, clock())),
+            vec![done, flicker]
+        );
+    }
+
     #[test]
     fn starting_a_turn_joins_the_bottom_of_the_working_rows() {
         let (project, mut workspace, ids) = fixture(vec![
             worked(NOW - 30 * MINUTE),
-            unread(NOW - 3 * HOUR),
+            unread(NOW - 90 * MINUTE),
             worked(NOW - 5 * HOUR),
             worked(NOW - 4 * HOUR),
         ]);
@@ -1067,7 +1185,8 @@ mod tests {
             AgentActivityState::Working,
             NOW - 10 * MINUTE,
         );
-        assert_eq!(pane_order(&project, &workspace), vec![read, flicker]);
+        // `read` finished before that turn began, so it sits below it.
+        assert_eq!(pane_order(&project, &workspace), vec![flicker, read]);
         // Idle for a moment: still today's work, the newest event in the band.
         change(
             &mut workspace,
@@ -1085,7 +1204,7 @@ mod tests {
             AgentActivityState::Working,
             NOW - 8 * MINUTE,
         );
-        assert_eq!(pane_order(&project, &workspace), vec![read, flicker]);
+        assert_eq!(pane_order(&project, &workspace), vec![flicker, read]);
     }
 
     #[test]
@@ -1136,8 +1255,9 @@ mod tests {
             order_at(&project, &workspace, &no_terminal, clock()),
             vec![SidebarEntry::Pane(saved), SidebarEntry::Pane(read)]
         );
-        // Its terminal comes up still working.
-        assert_eq!(pane_order(&project, &workspace), vec![read, saved]);
+        // Its terminal comes up still working. `read` finished before that
+        // turn began, so it stays below it and nothing moves.
+        assert_eq!(pane_order(&project, &workspace), vec![saved, read]);
     }
 
     #[test]
@@ -1254,10 +1374,11 @@ mod tests {
     }
 
     #[test]
-    fn working_rows_sit_together_in_start_order_under_the_finishes() {
+    fn working_rows_sit_together_in_start_order_above_older_finishes() {
         // Chris's screenshot: three working sessions, two read finishes from
         // 11 h ago, and a session that last finished 13 h ago, yesterday, and
-        // has been working for 2 h.
+        // has been working for 2 h. The finishes came before the oldest turn
+        // still running began, so they sit under the working rows.
         let (project, mut workspace, ids) = fixture(vec![
             worked(NOW - HOUR),
             worked(NOW - 3 * HOUR),
@@ -1281,7 +1402,7 @@ mod tests {
         }
         assert_eq!(
             recent(&project, &workspace),
-            [ids[3], ids[4], ids[2], ids[1], ids[5], ids[0]]
+            [ids[2], ids[1], ids[5], ids[0], ids[3], ids[4]]
                 .map(SidebarEntry::Pane)
                 .to_vec()
         );
@@ -1305,8 +1426,8 @@ mod tests {
             recent(&project, &workspace),
             vec![
                 Band(ActivityBand::Today),
-                Pane(ids[0]),
                 Pane(ids[1]),
+                Pane(ids[0]),
                 Band(ActivityBand::Older),
                 Pane(ids[2]),
             ]

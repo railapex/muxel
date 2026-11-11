@@ -12,10 +12,12 @@ The saved `config.toml` setting is `sidebar_sort = "Layout"` or
 
 Recent work follows two rules. Looking at a session never moves its row:
 reading, focusing and clicking change no position, and read state drives only
-the unread mark and the Done pill. A row moves only when its work changes (a
-turn starts, finishes or stops, including when its process exits; a question is
-asked or answered) or when the clock crosses into another band. A file, diff or
-page also moves when a session opens it, as described below.
+the unread mark and the Done pill. A row moves only when work in its project
+changes (a turn starts, finishes or stops, including when its process exits; a
+question is asked or answered) or when the clock crosses into another band.
+Mostly that is the row's own work; another session's turn can move a finished
+row across the working rows, as below. A file, diff or page also moves when a
+session opens it, as described below.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A row's band comes from its
@@ -27,17 +29,33 @@ work, not in the band of its start. A row that has never worked goes by when
 it was opened (`created_at` on its instance); a pane saved before muxel
 recorded that sits with Older. The sidebar
 redraws at midnight, when rows change band. A block spanning only one band
-needs no band label. Within each band, `sidebar::RecentPlace` puts rows in four
+needs no band label. Within each band, `sidebar::RecentPlace` puts rows in five
 groups:
 
 1. **Asking**: sessions showing a question now. Newest question first, whether
    or not you have seen it.
-2. **Recent**: sessions that have worked and aren't running a turn: finished,
-   idle after work, interrupted, exited, or not running since a restart. Read
-   or not. Newest event first.
+2. **Newly done**: sessions that have worked and aren't running a turn
+   (finished, idle after work, interrupted, exited, or not running since a
+   restart) whose latest event is at or after the start of the oldest turn
+   still running in the project. Read or not. Newest event first.
 3. **Working**: sessions running a turn, in the order each started it, so a
    session that starts a turn joins the bottom.
-4. **Never used**: newest open first.
+4. **Old done**: sessions that have worked and aren't running a turn whose
+   latest event came before that oldest running turn began. Newest event
+   first.
+5. **Never used**: newest open first.
+
+A finish older than every turn still running is older news than that work, so
+it goes below it. With nothing running, every finished row is newly done, and
+the order is newest event first. While anything runs, the oldest start only
+moves forward (a turn starts now; a question takes its turn out of the running
+until it is answered, which starts a new one), so a row that dropped comes back
+up once the work it fell behind ends. That is a change of work, like any other
+move. The oldest start comes from each row's recorded state
+(`AgentActivity::current_state`, `work_started_at`), not the status it shows,
+so a status the reducer hasn't recorded, such as a flicker or a turn the tick
+hasn't sampled yet, drops nothing. It covers the project's rows, the pinned
+block included.
 
 Pinned sessions form a block at the top of their project, ordered by the same
 rule, without band labels.
@@ -46,7 +64,7 @@ Groups go by the status the row shows. A dormant session
 ([dormant-restore.md](dormant-restore.md)) shows the state it was saved in and
 sorts by it. Any other session with no live terminal (in a project not opened
 since a restart, say) shows idle, or Done if its last turn finished, and sorts
-with the recent rows by its latest event. Timestamps are
+with the done rows by its latest event. Timestamps are
 Unix milliseconds; future ones count as now. Ties keep the order the panes were
 opened in, so popping a row out into its own window or docking it back never
 moves it.
@@ -82,7 +100,7 @@ by what the clock read, not by which came first.
 A process exiting is a finish only for a pane started to run a command
 (`muxel_core::LaunchPurpose::Job`): a literal command, a custom command preset,
 or an agent's one-shot run (`claude -p`, `codex exec`). Its exit marks it
-unread, notifies Done, and moves the row to the top of the recent rows like any
+unread, notifies Done, and moves the row to the top of the done rows like any
 finish. A non-zero exit counts too. Its notification gives the code ("exited
 with code 3"), since a code isn't always a failure (`grep` exits 1 when nothing
 matches), in place of the unexpected-exit report, and the row shows Done, as
@@ -101,7 +119,7 @@ counts as no exit, and a failing job there finishes only by its provider.
 An interactive session (an agent conversation or a shell) finishes turns while
 it runs, so its exit (`/exit`, a kill, a crash, `exit` typed in a shell) records
 no finish, marks nothing unread and doesn't notify: a working row stops and
-joins the recent rows by when its turn started. A provider that reported its own
+joins the done rows by when its turn started. A provider that reported its own
 finish before exiting is finished all the same, notifies, and keeps its chime
 through the exit until you look at the pane. A finish that only a bell or the
 title showed is lost if the process exits before the status tick reads it.

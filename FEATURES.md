@@ -1696,12 +1696,14 @@ feature is added or changed, update the matching entry here in the same change**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
   each project, then the rest in Today (since midnight), This week (the six days
   before), and Older bands, by each session's latest start, finish or question.
-  Within a band, sessions asking a question come first; then the ones that have
-  worked and aren't running, newest first, read or not; then working sessions in
-  the order each started, so one that starts a turn joins the bottom of them;
-  then sessions never used, newest open first. A working session counts as Today
-  however long its turn has run. Reading, focusing or clicking a session never
-  moves its row; only a change in its work or a new day does. A command job's
+  Within a band, sessions asking a question come first; then the ones newly
+  done (finished since the oldest turn still running in the project began, or
+  any finish while nothing runs), newest first, read or not; then working
+  sessions in the order each started, so one that starts a turn joins the
+  bottom of them; then the ones done before that oldest turn began, newest
+  first; then sessions never used, newest open first. A working session counts
+  as Today however long its turn has run. Reading, focusing or clicking a
+  session never moves its row; only a change in work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that
   reported its finish before exiting is finished and notifies. Pinned sessions
   follow the same order. Project order and keyboard
