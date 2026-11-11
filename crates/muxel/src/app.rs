@@ -83,7 +83,9 @@ mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
-#[cfg(test)]
+// On macOS gpui-component's Root asks for a native window handle, which a test
+// window doesn't have.
+#[cfg(all(test, not(target_os = "macos")))]
 mod project_session_tests;
 mod recoverable_close;
 #[cfg(all(test, windows))]
