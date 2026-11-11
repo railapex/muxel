@@ -20,7 +20,15 @@ feature is added or changed, update the matching entry here in the same change**
   and clicking the button again returns to the panes.
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
+- **Closing gives space back** — a new pane takes half of the pane it was split
+  from, and when it goes (closed, its last tab closed, or dragged elsewhere) that
+  space returns to the pane it came from, so every other pane is left exactly as
+  it was. A pane dragged next to another pane takes half of that pane the same way.
+  A pane from a layout saved before this existed gives its space to the pane before
+  it (or after it, if it was first).
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
+  When the pane you're shrinking reaches its minimum, the drag keeps going and
+  shrinks the next pane along, until every pane on that side is at its minimum.
   Cached terminals receive the final size after the drag, so responsive TUIs redraw
   without requiring a keypress or scroll.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
@@ -65,7 +73,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane maximized, as does closing or popping out the tab being shown while others
   remain. While a pane is maximized, selecting another agent (sidebar,
   notification, tray) moves the maximize to it, so that agent comes up full-size
-  instead of hiding behind.
+  instead of hiding behind. A file, diff or page that opens in another pane ends
+  the maximize, so it shows beside the pane that opened it.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 
@@ -73,6 +82,12 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
+  add the new agent as a tab in the focused pane, so starting an agent never adds
+  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
+  split buttons and dragging a tab to an edge still make a new pane. In a
+  per-monitor project window, the toolbar and shortcuts act on that window's
+  project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -544,9 +559,12 @@ feature is added or changed, update the matching entry here in the same change**
   Claude pane, built-in and edited lists alike match outside its input box,
   alongside Claude's own status-row and permission-form parsers.
 - **Heuristic fallback** — agents without markers fall back to bell + output
-  activity. They reach **done** only from the bell or process exit, never from a
-  quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
-  pane) can't fake a finished turn.
+  activity. They reach **done** only from the bell, never from a quiet spell — so
+  an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
+  finished turn. An interactive session's process exit isn't a finish either
+  (`/exit`, a kill, a crash, `exit` typed in a shell): the pane keeps the state
+  it had, with no unread mark or Done notification. A command job's exit is its
+  finish (see Literal launches).
 - **Event-driven status snapshots** — terminal output, semantic titles, bells,
   process exit, resize invalidation, and exact quiet/debounce deadlines update one
   per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
@@ -611,7 +629,7 @@ feature is added or changed, update the matching entry here in the same change**
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name
   badge on a uniform pane, a per-tab color dot, and a matching dot in the sidebar.
-- **Sidebar grouping** — panes are grouped under colored worktree subheaders;
+- **Sidebar grouping** — in Layout order, panes are grouped under colored worktree subheaders;
   rename a worktree inline or from the context menu.
 - **Dispose flow** — when a worktree's last pane closes (or its agent exits), a
   clean worktree is removed silently; otherwise a modal offers **Commit & close**,
@@ -768,7 +786,7 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  tab beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
@@ -781,7 +799,7 @@ feature is added or changed, update the matching entry here in the same change**
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
 - **Browser as a preset** — the built-in **Browser** preset opens a web-browser
-  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  pane; pick it anywhere you pick an agent (the toolbar's agent dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
@@ -808,8 +826,9 @@ feature is added or changed, update the matching entry here in the same change**
   you've looked at it (or five minutes pass) however often it flips between working
   and done, and alerts that land together play as one chime. The desktop toast for
   the same event stays silent so the two never double up.
-- **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
-  events **and** all app messages (git results, SSH connections, and save errors —
+- **In-app NOTIFICATIONS sidebar** — in Layout order, a category above PROJECTS
+  collecting agent events **and** all app messages (git results, SSH connections,
+  and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
   everything that used to be a pop-up toast goes here instead; persistent save
   failures report once per cause, not on every autosave). Agent rows are
@@ -841,8 +860,12 @@ feature is added or changed, update the matching entry here in the same change**
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
-  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
-  plain and prompt launches, retained on restart. The preset needs Model flag /
+  that project's toolbar preset. Run from one of that project's panes, the tab
+  joins the caller's own group; otherwise it joins the focused group. Run from
+  a pane, the new session also nests under the caller's session in Recent
+  work; `--top-level` opens it as a session of its own.
+  `--model M` and `--effort E` select per-pane values for plain and prompt
+  launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
@@ -912,8 +935,24 @@ feature is added or changed, update the matching entry here in the same change**
   modifying the command or injecting startup input.
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
-  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
-  exited terminals keep their **done** badge and completion age.
+  The sidebar labels an unspawned restored literal pane as **stopped**. A pane
+  started to run a command (a literal command, a custom command preset, a
+  shell given a command or a script's path, an agent's one-shot run such as
+  `claude -p`, `codex exec` or `codex review`) finishes when it exits,
+  whatever its code: **done** with its completion age, an unread mark and a
+  Done notification. A non-zero exit's notification gives the code (**exited
+  with code 3**) in place of the unexpected-exit report, even after a finish
+  the pane already announced or while you watch it, and Recent work's feed
+  lists it, as the row shows only Done. Only the command's own exit counts:
+  behind tmux a client's exit finishes nothing, ssh's own failures (code 255)
+  don't either, and through `sshpass` only exit 0 does. PowerShell (`pwsh`,
+  `powershell.exe`) is a session whatever it's started with, as before: a
+  pane running a PowerShell command doesn't finish when it exits. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish: it
+  keeps the state it had, unless its agent reported a finish first, whose
+  chime then still rings. The purpose comes from the pane's program and
+  arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a
+  wrapper such as `npx` or `wsl` counts as a command whatever it starts.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1337,10 +1376,17 @@ feature is added or changed, update the matching entry here in the same change**
   doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
-- **Resource tab grouping** — files, diffs, and browser pages opened by default join
-  the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement. Opening another resource as a tab
-  preserves the surrounding split geometry, including narrow resource columns.
+- **Resources open beside their pane** — a file, diff or web page opened from a
+  pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
+  new-window link) opens as a tab in the pane next to it: the one on its right,
+  or on its left when it sits at the right edge. A link goes beside the pane it
+  was clicked in, even one that didn't have focus. A pane with no neighbour in
+  its row splits once, and its later opens join that new column. Files opened
+  from the file browser, palette, find panel, sidebar or git panel join the
+  nearest pane of the same type instead. An already-open file or page is focused
+  and refreshed wherever it is, and explicit New Tab and New Pane commands still
+  use the requested placement. Opening a resource as a tab preserves the
+  surrounding split geometry, including narrow resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
@@ -1364,8 +1410,9 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
-  changes", the project menu, or a worktree) rather than splitting off a new pane.
+  directory. From a pane's diff button it opens as a tab beside that pane; from
+  the project menu or a worktree's **View changes** it joins the nearest diff
+  tab, if there is one.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
@@ -1377,6 +1424,65 @@ feature is added or changed, update the matching entry here in the same change**
   project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
+- **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
+  (the default) or **Recent work**. Recent work lists pinned sessions first in
+  each project, then the rest in Today (since midnight), This week (the six days
+  before), and Older bands, by each session's latest start, finish or question.
+  Within a band, sessions asking a question come first; then the ones newly
+  done (finished since the oldest turn still running in the project began, or
+  any finish while nothing runs), newest first, read or not; then working
+  sessions in the order each started, so one that starts a turn joins the
+  bottom of them; then the ones done before that oldest turn began, newest
+  first; then sessions never used, newest open first. A working session counts
+  as Today however long its turn has run. Reading, focusing or clicking a
+  session never moves its row; only a change in work or a new day does. A command job's
+  exit is its finish; an interactive session's isn't, though an agent that
+  reported its finish before exiting is finished and notifies. Pinned sessions
+  follow the same order. Project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work, and
+  popping one out or docking it back never moves its row;
+  their external-window icon marks rows that raise an existing window on click.
+  Layout retains worktree subheaders and row swapping;
+  recent rows can still be dragged onto panes.
+- **Files nest under their session** — in Recent work, a file, diff or page a
+  session opened (a terminal link, its diff button, or a link in a file it
+  opened) shows indented under that session's row and moves with it, newest
+  first. Opening it again from another session moves it there; the file
+  browser and palette leave it where it is. Once that session closes, or if it's
+  in another project, the resource is an ordinary row again, with the
+  never-used rows by when it was last opened. A pinned file stays
+  with the pins unless its session is pinned too.
+- **Sessions nest under the session that spawned them** — in Recent work, a
+  session started by `muxel ctl new` from another session's pane shows indented
+  under that session's row, and the family moves as one. A session spawned by a
+  nested one nests under the same top session, so there are two levels at most:
+  a session, its child sessions, and each one's files. While any child asks a
+  question, the whole family sorts as asking and the top row shows **N asking**,
+  so nothing that needs you is buried. Drag a session onto another session's
+  row to nest it there, or onto its project's header to make it a row of its
+  own. Children never close with their parent; once the parent closes they are
+  ordinary rows. A pinned session nests only under a pinned one.
+- **Files close with their session** — in Recent work, closing a session (its
+  tab, its pane, or Close terminals) also closes the files, diffs and pages it
+  last opened. They join the session's countdown, so one Undo brings them all
+  back. An unsaved file asks first, naming the file and the session taking it:
+  Cancel keeps it open as an ordinary row while the session still closes. A
+  file another session reopened stays, and so does a popped-out one or the tab
+  you chose Close other tabs from. An agent exiting on its own never takes its
+  files.
+- **Unread sessions** — in Recent work, a dot and bold name mark a completion or
+  blocked event since the session was last attended. Only attendance clears the
+  mark, even if another turn starts; Done persists. The mark and a read done's
+  outline pill follow the same rule, so a done row's pill and mark always agree;
+  the mark also keeps an unseen finish or question visible after the agent moves
+  on. A clock that steps back can't mark a seen event unread or a new one read:
+  attendance covers everything recorded before it, and a later event is stamped
+  after it. A finish read by clicking its row before the status tick recorded
+  it stays read when the tick catches up. Project rows show the unread count
+  even when collapsed. Agent finishes and questions appear on these session
+  rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
+  a row can't show, stays in the feed. App messages, desktop alerts, and tray
+  notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
@@ -1704,10 +1810,10 @@ feature is added or changed, update the matching entry here in the same change**
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
-  `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
-  to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
+  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+  switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
+  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
