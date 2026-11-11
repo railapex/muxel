@@ -41,9 +41,9 @@ pub use session::{
     literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
-    AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
-    PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
-    TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
-    TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    AgentStatus, DisplayEpoch, LifecycleTimes, LocalPaste, LocalPasteHandler, OpenLink,
+    OpenLinkBackground, PathPasteErrorHandler, PromptSubmission, PromptSubmissionState,
+    TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch, TerminalMouseMode,
+    TerminalNotifyCause, TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+    TerminalView, clean_agent_title, paste_clipboard_into_session,
 };
