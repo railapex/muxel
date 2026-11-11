@@ -720,6 +720,31 @@ impl Screen {
         Some(top..bottom)
     }
 
+    /// Whether Codex's live editor holds text, when it is drawn: the cursor at
+    /// the prompt's start means empty (a placeholder suggestion may show there),
+    /// anywhere else in the editor means a draft. `None` when no editor is found.
+    pub(crate) fn codex_composer_draft(&self) -> Option<bool> {
+        let rows: Vec<_> = self.text.lines().collect();
+        if self.codex_composer_rows(&rows, true).is_some() {
+            Some(false)
+        } else if self.codex_composer_rows(&rows, false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::codex_composer_draft`] for Claude's framed input box.
+    pub(crate) fn claude_composer_draft(&self) -> Option<bool> {
+        if self.composer_rows(true).is_some() {
+            Some(false)
+        } else if self.composer_rows(false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
         if input.len() > self.text.len() {
             return false;
@@ -1203,6 +1228,45 @@ mod tests {
 
     fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
         ctl_screen_with_width(draft, consumed, 41)
+    }
+
+    /// `ctl send` refuses a pane whose composer holds text. A placeholder
+    /// suggestion drawn in an empty composer must not read as one.
+    #[test]
+    fn a_drawn_composer_says_whether_it_holds_a_draft() {
+        for placeholder in ["", "Ask Codex to do anything", "Write tests for @filename"] {
+            assert_eq!(
+                ctl_origin(placeholder).codex_composer_draft(),
+                Some(false),
+                "{placeholder:?}"
+            );
+        }
+        assert_eq!(
+            ctl_screen(&["half typed"], false).codex_composer_draft(),
+            Some(true)
+        );
+        assert_eq!(
+            ctl_screen(&["first line", "second"], false).codex_composer_draft(),
+            Some(true)
+        );
+        let mut hidden = ctl_screen(&["half typed"], false);
+        hidden.cursor_visible = false;
+        assert_eq!(hidden.codex_composer_draft(), None);
+
+        let rule = "─".repeat(12);
+        let claude = |prompt: &str, column| {
+            screen(&format!("header\n{rule}\n❯ {prompt}\n{rule}"), 2, column)
+        };
+        assert_eq!(claude("", 2).claude_composer_draft(), Some(false));
+        assert_eq!(
+            claude("Try \"refactor app.rs\"", 2).claude_composer_draft(),
+            Some(false)
+        );
+        assert_eq!(claude("half typed", 12).claude_composer_draft(), Some(true));
+        assert_eq!(
+            screen("a permission dialog, no input box", 0, 0).claude_composer_draft(),
+            None
+        );
     }
 
     fn ctl_origin(text: &str) -> Screen {

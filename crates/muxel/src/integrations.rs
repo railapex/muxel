@@ -4082,6 +4082,21 @@ pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Opti
     option_value(&out)
 }
 
+/// How many clients are attached to `session`: muxel's own and any other
+/// (a phone, another computer's muxel), whose typing no check here sees.
+/// `None` when tmux couldn't answer.
+pub fn tmux_attached_clients(loc: &RepoLoc, session: &SessionTarget) -> Option<u32> {
+    let out = tmux_at(
+        loc,
+        session,
+        &muxel_core::tmux::attached_clients_args(&session.name),
+    )?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+        .flatten()
+}
+
 /// A `show-options -qv` reply's value: `None` when the option is unset or the
 /// command failed.
 fn option_value(out: &std::process::Output) -> Option<String> {

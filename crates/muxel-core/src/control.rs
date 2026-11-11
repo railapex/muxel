@@ -54,6 +54,48 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const GUARDED_SEND_VERSION: u32 = 2;
 /// Model/effort fields must never be silently ignored by older creation hosts.
 pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
+/// `send --once` and `send --when-idle` must be refused by hosts that would
+/// ignore them and type at once, or type a repeat again.
+pub const SAFE_SEND_VERSION: u32 = 4;
+/// How long `send --when-idle` waits for a safe moment by default, and at most.
+pub const WHEN_IDLE_TIMEOUT_SECS: u64 = 600;
+pub const WHEN_IDLE_TIMEOUT_MAX_SECS: u64 = 3600;
+
+/// A `--once` key: 1–128 bytes, not blank, no control characters.
+pub fn valid_once_key(key: &str) -> bool {
+    !key.trim().is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
+}
+
+/// The checks a `send` carrying `--once`, `--when-idle` or `--timeout` must
+/// pass before it reaches the app. The CLI applies them too; a raw client gets
+/// them here, from the host.
+pub fn check_safe_send(command: &Command) -> Result<(), String> {
+    let Command::Send {
+        force,
+        once,
+        when_idle,
+        timeout_secs,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    if once.as_deref().is_some_and(|key| !valid_once_key(key)) {
+        return Err("--once KEY must be 1-128 bytes without control characters".into());
+    }
+    if timeout_secs.is_some() && !when_idle {
+        return Err("send --timeout requires --when-idle".into());
+    }
+    if timeout_secs.is_some_and(|secs| secs == 0 || secs > WHEN_IDLE_TIMEOUT_MAX_SECS) {
+        return Err(format!(
+            "send --timeout must be 1-{WHEN_IDLE_TIMEOUT_MAX_SECS} seconds"
+        ));
+    }
+    if *when_idle && *force {
+        return Err("--when-idle waits for the checks --force skips: pass one or the other".into());
+    }
+    Ok(())
+}
 
 /// The file, in muxel's data directory, where the running app says how to reach
 /// it. Owner-only: the token in it is the whole of the authorization.
@@ -154,7 +196,19 @@ pub enum Command {
         /// Refuse if the pane no longer has this terminal launch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_id: Option<Uuid>,
+        /// Type this text into this pane at most once: a repeat with the same
+        /// key returns the first attempt's result and types nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        once: Option<String>,
+        /// Wait in muxel until the pane is safe to type into, then send.
+        #[serde(default, skip_serializing_if = "is_false")]
+        when_idle: bool,
+        /// How long `when_idle` waits, in seconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
     },
+    /// What became of a `send --once KEY` to this agent, without typing.
+    OnceStatus { agent: String, key: String },
     /// Pick a numbered option of the question the agent is blocked on.
     Answer {
         agent: String,
@@ -179,6 +233,19 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if let Command::Send {
+        once,
+        when_idle,
+        timeout_secs,
+        ..
+    } = command
+        && (once.is_some() || *when_idle || timeout_secs.is_some())
+    {
+        return SAFE_SEND_VERSION;
+    }
+    if matches!(command, Command::OnceStatus { .. }) {
+        return SAFE_SEND_VERSION;
+    }
     if matches!(command, Command::New { options, .. } if options.model.is_some() || options.effort.is_some())
     {
         return PARAMETERIZED_NEW_VERSION;
@@ -223,6 +290,9 @@ pub struct Response {
     /// Deadline (unix ms) until which the user can undo this pane's close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_until: Option<i64>,
+    /// With `duplicate`: the first attempt's failure, as its own reply body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<Value>,
 }
 
 impl Response {
@@ -235,6 +305,7 @@ impl Response {
             pasted: None,
             error: None,
             undo_until: None,
+            original: None,
         }
     }
 
@@ -248,6 +319,7 @@ impl Response {
             pasted: error.pasted,
             error: Some(error.message),
             undo_until: error.undo_until,
+            original: error.original.map(|original| *original),
         }
     }
 
@@ -264,6 +336,7 @@ impl Response {
                 .error
                 .unwrap_or_else(|| "muxel refused the request".into()),
             undo_until: self.undo_until,
+            original: self.original.map(Box::new),
         })
     }
 }
@@ -336,6 +409,21 @@ pub enum ErrorCode {
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
     SelfTarget,
+    /// The pane's composer holds text: a person's half-typed prompt, or one an
+    /// earlier send pasted without pressing Enter. Nothing was typed.
+    DraftPresent,
+    /// Something is already in progress for this pane: `reason` is `queued`
+    /// (another `send --when-idle` waits for it), `queue_full` (this muxel has
+    /// as many waiting as it takes) or `once_pending` (the first send with this
+    /// `--once` key hasn't finished; `pasted` says whether it has typed).
+    /// This request typed nothing.
+    Busy,
+    /// A repeat of a `--once` key whose first send failed after it typed.
+    /// `original` holds that failure; nothing was typed this time.
+    Duplicate,
+    /// `send --when-idle` saw no safe moment before its timeout. `reason` names
+    /// what it was still waiting on. Nothing was typed.
+    TimedOut,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
     /// off, its `control.json` can't be read or reached, or a read-only creation
     /// status cannot be answered.
@@ -352,6 +440,8 @@ pub struct Error {
     pub pasted: Option<bool>,
     pub message: String,
     pub undo_until: Option<i64>,
+    /// See [`Response::original`].
+    pub original: Option<Box<Value>>,
 }
 
 impl Error {
@@ -362,6 +452,7 @@ impl Error {
             pasted: None,
             message: message.into(),
             undo_until: None,
+            original: None,
         }
     }
 
@@ -373,6 +464,25 @@ impl Error {
             message: "the pane is closing: undo the close in muxel before sending more input"
                 .into(),
             undo_until: Some(undo_until),
+            original: None,
+        }
+    }
+
+    /// The reply a repeated `--once` key gets when its first send failed
+    /// after typing: `duplicate`, with that failure as `original`, and
+    /// `pasted` as it was, since the first send's text may be in the pane.
+    pub fn duplicate_of(original: &Error) -> Self {
+        Self {
+            code: Some(ErrorCode::Duplicate),
+            reason: None,
+            pasted: original.pasted,
+            message: "this --once key was already used and its send failed after typing; \
+                      nothing was typed now: check the agent's `screen`"
+                .into(),
+            undo_until: None,
+            original: serde_json::to_value(Response::err(original.clone()))
+                .ok()
+                .map(Box::new),
         }
     }
 
@@ -395,6 +505,7 @@ impl From<String> for Error {
             pasted: None,
             message,
             undo_until: None,
+            original: None,
         }
     }
 }
@@ -1391,9 +1502,12 @@ usage: muxel ctl <command> [args]
   wake AGENT                     start a sleeping or dormant pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
-  send AGENT TEXT [--force] [--launch-id ID]
+  send AGENT TEXT [--force] [--launch-id ID] [--once KEY] [--when-idle [--timeout SECS]]
                                  type TEXT and press Enter ('-' reads stdin);
-                                 --launch-id refuses a replaced terminal
+                                 --launch-id refuses a replaced terminal;
+                                 --once never types the same KEY twice;
+                                 --when-idle waits until the agent can take it
+  once-status AGENT KEY          what became of a send --once KEY
   wait AGENT [--timeout SECS] [--full] [--turn]
                                  wait for the agent to finish, then show it;
                                  --turn stops at an observable turn end, even
@@ -1473,7 +1587,10 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides busy and own-pane refusal, but never a launch mismatch."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--once KEY] [--when-idle [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed."
+        }
+        "once-status" => {
+            "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, typing, or done with the first reply as result."
         }
         "wait" => {
             "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
@@ -1507,6 +1624,7 @@ fn unknown_command_error(command: &str) -> String {
             "show",
             "screen",
             "send",
+            "once-status",
             "wait",
             "answer",
             "keys",
@@ -1585,6 +1703,8 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
+    let mut once: Option<String> = None;
+    let mut when_idle = false;
     let mut lines: Option<usize> = None;
     let mut timeout: Option<u64> = None;
     let mut it = rest.iter();
@@ -1597,6 +1717,13 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             "--full" => full = true,
             "--turn" => turn = true,
             "--force" => force = true,
+            "--when-idle" => when_idle = true,
+            "--once" => {
+                let key = it.next().ok_or("--once needs a KEY")?;
+                if once.replace(key.clone()).is_some() {
+                    return Err("--once can be given only once".into());
+                }
+            }
             "--launch-id" => {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
                 launch_id = Some(Uuid::parse_str(value).map_err(|_| "--launch-id needs a UUID")?);
@@ -1611,6 +1738,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     if launch_id.is_some() && cmd != "send" {
         return Err("--launch-id is only valid with send".into());
+    }
+    if (once.is_some() || when_idle) && cmd != "send" {
+        return Err("--once and --when-idle are only valid with send".into());
     }
     let agent = |words: &[String]| -> Result<String, String> {
         words
@@ -1674,12 +1804,29 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             if text.is_empty() {
                 return Err("`send` needs the TEXT to type ('-' reads it from stdin)".into());
             }
-            Command::Send {
+            let send = Command::Send {
                 agent,
                 text,
                 force,
                 launch_id,
+                once,
+                when_idle,
+                timeout_secs: timeout,
+            };
+            check_safe_send(&send)?;
+            send
+        }
+        "once-status" => {
+            at_most(2)?;
+            let agent = agent(&words)?;
+            let key = words
+                .get(1)
+                .cloned()
+                .ok_or("`once-status` needs the KEY a `send --once` used")?;
+            if !valid_once_key(&key) {
+                return Err("--once KEY must be 1-128 bytes without control characters".into());
             }
+            Command::OnceStatus { agent, key }
         }
         "answer" => {
             at_most(2)?;
@@ -2028,6 +2175,42 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   line breaks and Unicode; CRLF becomes one newline. Unsupported controller
   characters, including tabs, are refused before typing. Its clipboard encoder
   also refuses unsupported controls before writing and reports the refusal.
+  Text in the agent's composer refuses `send` with `draft_present` and nothing
+  is typed: a person's half-typed prompt, or a prompt an earlier send left
+  there. Claude and Codex are judged by their drawn composer (placeholder
+  suggestions don't count); other agents by whether text was typed into the
+  pane since its last Enter. Escape, arrows, ctrl keys and `answer` don't count.
+  `--force` types anyway.
+  For automation, use `send AGENT TEXT --when-idle --once KEY --launch-id ID`.
+  `--once KEY` (1-128 bytes) types TEXT into this pane at most once. A repeat
+  whose first send went in returns that first receipt with `duplicate: true`
+  and types nothing. A repeat whose first send failed after typing fails with
+  `duplicate`, the first failure under `original`, and its `pasted`. A first
+  send refused before typing leaves the key unused, so the same key can try
+  again. A repeat while the first is still going fails with `busy`, `reason:
+  once_pending` (and `pasted: true` once it has started typing). A repeat is
+  answered before anything about the pane is checked (closing, own pane,
+  `--launch-id`, status, draft). Each pane keeps its last 64 keys while muxel
+  runs; a restart forgets them.
+  `--when-idle` waits in muxel until the agent can take the prompt: not
+  working, blocked or starting, no reply due to a control turn, no other send
+  in flight, no draft, and for an agent kept in tmux no other attached tmux
+  client. Then it sends with every check above, and the reply adds
+  `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
+  then fails with `timed_out` and `reason` naming what it was still waiting on
+  (`working`, `blocked`, `starting`, `just_submitted`, `send_in_flight`,
+  `draft_present` or `tmux_clients`). The agent exiting, closing or being
+  replaced ends the wait with that refusal; a conversation change fails with
+  `launch_mismatch`, `reason: conversation_changed`. One send waits per pane
+  (`busy`, `reason: queued`), and at most eight per muxel (`reason:
+  queue_full`). Closing the connection cancels a waiting send before it types;
+  once typing starts the send finishes, and its `--once` key records the result.
+  `--when-idle` and `--force` don't combine. These options need protocol v4.
+- `muxel ctl once-status AGENT KEY` - what became of `send --once KEY` to the
+  agent, typing nothing: `state` is `unused` (no send with it typed, so it can
+  be sent), `pending` (waiting or about to type), `typing` (it may have typed
+  and hasn't finished), or `done`, with `result` holding its first reply
+  exactly as `send` gave it. Use it to settle a send whose reply was lost.
 - `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
   turn and any subagent hold have finished (or it blocks on a question, or exits),
   then print what `show` prints. Shell and monitor listings do not delay completion;
@@ -2144,6 +2327,14 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   typed. Check `screen` before retrying.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
+- `draft_present` - the agent's composer holds text; nothing was typed. Leave
+  it to the user, or pass `--force` deliberately.
+- `busy` - something is already in progress for this pane (`reason` `queued`,
+  `queue_full` or `once_pending`); this request typed nothing.
+- `duplicate` - this `--once` key's first send failed after typing; `original`
+  holds that failure. Nothing was typed now; inspect `screen`.
+- `timed_out` - `send --when-idle` saw no safe moment in time; `reason` says
+  what it waited on. Nothing was typed.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
@@ -2325,11 +2516,17 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: None,
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             }
         );
         // No launch guard: older requests retain their original shape.
         let line = serde_json::to_string(&defaults).unwrap();
         assert!(!line.contains("launch_id"), "{line}");
+        assert!(!line.contains("once"), "{line}");
+        assert!(!line.contains("when_idle"), "{line}");
+        assert!(!line.contains("timeout_secs"), "{line}");
         assert!(!line.contains("caller_instance_id"), "{line}");
         let caller = Request {
             caller_instance_id: Some(id(7)),
@@ -2445,6 +2642,10 @@ mod tests {
             (ErrorCode::TmuxRefused, "tmux_refused"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
+            (ErrorCode::DraftPresent, "draft_present"),
+            (ErrorCode::Busy, "busy"),
+            (ErrorCode::Duplicate, "duplicate"),
+            (ErrorCode::TimedOut, "timed_out"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
         ] {
@@ -2464,12 +2665,72 @@ mod tests {
             text: "hi".into(),
             force: false,
             launch_id: None,
+            once: None,
+            when_idle: false,
+            timeout_secs: None,
         };
         assert_eq!(super::request_version(&send), 1);
         if let Command::Send { launch_id, .. } = &mut send {
             *launch_id = Some(id(42));
         }
         assert_eq!(super::request_version(&send), 2);
+    }
+
+    /// A host that doesn't know `once` or `when_idle` ignores unknown fields,
+    /// so it would type at once, or type a repeat again. Only the version
+    /// makes it refuse.
+    #[test]
+    fn once_and_when_idle_need_protocol_v4() {
+        let parsed = parse_cli(&words(&[
+            "send",
+            "a",
+            "hi",
+            "--once",
+            "d-9f2a",
+            "--when-idle",
+            "--timeout",
+            "47",
+        ]))
+        .unwrap();
+        let CliCommand::Request(send) = parsed else {
+            panic!("expected a request")
+        };
+        assert_eq!(
+            send,
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                once: Some("d-9f2a".into()),
+                when_idle: true,
+                timeout_secs: Some(47),
+            }
+        );
+        assert_eq!(super::request_version(&send), super::SAFE_SEND_VERSION);
+        for args in [&["--once", "k"][..], &["--when-idle"]] {
+            let mut line = vec!["send", "a", "hi"];
+            line.extend_from_slice(args);
+            let Ok(CliCommand::Request(send)) = parse_cli(&words(&line)) else {
+                panic!("{line:?}")
+            };
+            assert_eq!(super::request_version(&send), 4, "{line:?}");
+        }
+        for args in [
+            words(&["send", "a", "hi", "--once"]),
+            words(&["send", "a", "hi", "--once", ""]),
+            words(&["send", "a", "hi", "--once", "a\tb"]),
+            words(&["send", "a", "hi", "--once", &"k".repeat(129)]),
+            words(&["send", "a", "hi", "--once", "a", "--once", "b"]),
+            words(&["send", "a", "hi", "--timeout", "5"]),
+            words(&["send", "a", "hi", "--when-idle", "--timeout", "0"]),
+            words(&["send", "a", "hi", "--when-idle", "--timeout", "3601"]),
+            words(&["send", "a", "hi", "--when-idle", "--force"]),
+            words(&["status", "a", "--once", "k"]),
+            words(&["keys", "a", "enter", "--when-idle"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -2509,25 +2770,37 @@ mod tests {
                 agent: "a".into(),
                 text: "hi".into(),
                 force: true,
-                launch_id: Some(id(42))
+                launch_id: Some(id(42)),
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             }))
         );
         for args in [
             words(&["send", "a", "hi", "--launch-id"]),
             words(&["send", "a", "hi", "--launch-id", "invalid"]),
             words(&["status", "a", "--launch-id", &launch]),
-            words(&["send", "a", "hi", "--once", "key"]),
         ] {
             assert!(parse_cli(&args).is_err(), "{args:?}");
         }
         // A literal flag belongs to the prompt and does not set a guard.
         assert_eq!(
-            parse_cli(&words(&["send", "a", "--", "--launch-id", "text"])),
+            parse_cli(&words(&[
+                "send",
+                "a",
+                "--",
+                "--launch-id",
+                "--once",
+                "text"
+            ])),
             Ok(CliCommand::Request(Command::Send {
                 agent: "a".into(),
-                text: "--launch-id text".into(),
+                text: "--launch-id --once text".into(),
                 force: false,
-                launch_id: None
+                launch_id: None,
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             }))
         );
     }
@@ -2661,6 +2934,10 @@ mod tests {
             ErrorCode::InputChanged,
             ErrorCode::TmuxPaneUnresolved,
             ErrorCode::KeysPartlyPressed,
+            ErrorCode::DraftPresent,
+            ErrorCode::Busy,
+            ErrorCode::Duplicate,
+            ErrorCode::TimedOut,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
         ] {
@@ -2670,8 +2947,24 @@ mod tests {
         }
         assert!(text.contains("--launch-id ID"));
         assert!(text.contains("\"pasted\": true"));
-        assert!(!text.contains("--once"));
+        assert!(text.contains("--when-idle --once KEY --launch-id ID"));
         assert!(text.contains("launch_id"));
+    }
+
+    #[test]
+    fn a_duplicate_carries_the_first_failure_and_whether_it_typed() {
+        let first = Error::new(ErrorCode::InputChanged, "Enter was withheld").after_paste();
+        let repeat = Error::duplicate_of(&first);
+        assert_eq!(repeat.code, Some(ErrorCode::Duplicate));
+        assert_eq!(repeat.pasted, Some(true));
+        let wire = serde_json::to_value(Response::err(repeat.clone())).unwrap();
+        assert_eq!(wire["code"], "duplicate");
+        assert_eq!(wire["pasted"], true);
+        assert_eq!(wire["original"]["code"], "input_changed");
+        assert_eq!(wire["original"]["pasted"], true);
+        assert_eq!(wire["original"]["error"], "Enter was withheld");
+        let back: Response = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.into_result(), Err(repeat));
     }
 
     #[test]
@@ -3102,6 +3395,9 @@ Steps:
                 text: "fix the tests".into(),
                 force: false,
                 launch_id: None,
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             }))
         );
         assert_eq!(
@@ -3111,6 +3407,9 @@ Steps:
                 text: "--help --force".into(),
                 force: false,
                 launch_id: None,
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
             }))
         );
         assert_eq!(

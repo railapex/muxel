@@ -1247,6 +1247,25 @@ feature is added or changed, update the matching entry here in the same change**
   for its receipt for ten seconds, a second longer for each thousand characters
   past the first, up to a minute. Agent IDs also accept the `pane<ID>`
   spelling when no agent has that name.
+- **Safe automated sends** — `send` refuses with `draft_present` when the
+  agent's composer already holds text, so a prompt never merges into a message
+  the user is writing; `--force` types anyway. Claude and Codex composers are
+  read from the screen (a placeholder suggestion is not a draft); other panes
+  count text typed since the last Enter, and arrows, Escape and `answer` digits
+  don't count. `send --once KEY` types a given key at most once per pane: a
+  repeat returns the first receipt with `duplicate: true`, a `duplicate` error
+  carrying the first failure when that one may have typed, or `busy` while it
+  runs; a send refused before typing leaves the key free for a retry.
+  `ctl once-status AGENT KEY` reads what became of a key without typing. Keys
+  live in memory, 64 per pane. `send --when-idle [--timeout SECS]` waits in
+  muxel (ten minutes by default, at most an hour) while the agent is working,
+  starting, asking a question, holding a draft, taking another send, or has
+  another tmux client attached, then types with every ordinary check; the
+  receipt adds `waited_ms`. It ends `timed_out` with the condition it was
+  still waiting on, or with the refusal the pane now gives (exited, replaced
+  launch, `conversation_changed`); a caller that disconnects before typing
+  cancels it. Each pane holds one waiting send (`busy`, `queued`) and muxel at
+  most eight (`queue_full`). Every refusal says whether anything was pasted.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`

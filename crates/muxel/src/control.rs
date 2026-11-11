@@ -56,6 +56,26 @@ pub struct Incoming {
     pub command: Command,
     pub caller_instance_id: Option<Uuid>,
     pub reply: std::sync::mpsc::Sender<Response>,
+    /// Set once nobody waits for the reply any more: the caller hung up, or
+    /// the connection's wait ran out. A `send --when-idle` checks it before
+    /// typing.
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// How long a connection waits for the app to answer `command`. A `send
+/// --when-idle` first waits for its pane, then has the usual time to send.
+fn reply_timeout(command: &Command) -> Duration {
+    match command {
+        Command::Send {
+            when_idle: true,
+            timeout_secs,
+            ..
+        } => {
+            Duration::from_secs(timeout_secs.unwrap_or(control::WHEN_IDLE_TIMEOUT_SECS))
+                + REPLY_TIMEOUT
+        }
+        _ => REPLY_TIMEOUT,
+    }
 }
 
 /// The listening side, alive while outside control is on. Dropping it stops
@@ -202,7 +222,7 @@ fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let response = match read_request(&stream) {
-        Ok(request) => dispatch(request, token, tx),
+        Ok(request) => dispatch_on(request, token, tx, Some(&stream)),
         Err(error) => Response::err(error),
     };
     let mut line = serde_json::to_string(&response)
@@ -219,7 +239,20 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     serde_json::from_str(&line).map_err(|e| format!("not a muxel ctl request: {e}"))
 }
 
+#[cfg(test)]
 fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>) -> Response {
+    dispatch_on(request, token, tx, None)
+}
+
+/// Hand `request` to the app and wait for its reply. A `send --when-idle` can
+/// wait many minutes, so while it does the `connection` is watched: once its
+/// caller hangs up, the send is cancelled before it types.
+fn dispatch_on(
+    request: Request,
+    token: &str,
+    tx: &async_channel::Sender<Incoming>,
+    connection: Option<&TcpStream>,
+) -> Response {
     if !same_secret(request.token.as_bytes(), token.as_bytes()) {
         return Response::err("wrong token: run `muxel ctl` as the user running muxel");
     }
@@ -231,6 +264,17 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
             request.version
         ));
     }
+    if let Err(error) = control::check_safe_send(&request.command) {
+        return Response::err(error);
+    }
+    let queued = matches!(
+        &request.command,
+        Command::Send {
+            when_idle: true,
+            ..
+        }
+    );
+    let timeout = reply_timeout(&request.command);
     let status_poll = matches!(&request.command, Command::NewStatus { .. });
     let unavailable = |message: &str| {
         if status_poll {
@@ -240,17 +284,51 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
         }
     };
     let (reply, answer) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let incoming = Incoming {
         command: request.command,
         caller_instance_id: request.caller_instance_id,
         reply,
+        cancelled: cancelled.clone(),
     };
     if tx.send_blocking(incoming).is_err() {
         return unavailable("muxel is shutting down");
     }
-    answer
-        .recv_timeout(REPLY_TIMEOUT)
-        .unwrap_or_else(|_| unavailable("muxel didn't answer in time"))
+    let (Some(connection), true) = (connection, queued) else {
+        return answer.recv_timeout(timeout).unwrap_or_else(|_| {
+            cancelled.store(true, Ordering::Release);
+            unavailable("muxel didn't answer in time")
+        });
+    };
+    let deadline = Instant::now() + timeout;
+    let _ = connection.set_read_timeout(Some(Duration::from_millis(1)));
+    loop {
+        match answer.recv_timeout(Duration::from_millis(100)) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return unavailable("muxel stopped answering the waiting send");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline || caller_gone(connection) {
+            cancelled.store(true, Ordering::Release);
+            return unavailable("the waiting send ended without an answer");
+        }
+    }
+}
+
+/// Whether the caller closed its end of `connection`, read with the short
+/// timeout the waiting loop sets. Stray bytes after the request line are
+/// read and dropped, so they can't hide a later end of stream.
+fn caller_gone(mut connection: &TcpStream) -> bool {
+    match connection.read(&mut [0_u8; 64]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    }
 }
 
 /// Compare secrets without leaking, through timing, how much of a guess was right.
@@ -313,6 +391,9 @@ pub fn run_cli(args: &[String]) -> i32 {
             text,
             force,
             launch_id,
+            once,
+            when_idle,
+            timeout_secs,
         }) if text == "-" => {
             let mut text = String::new();
             match std::io::stdin().read_to_string(&mut text) {
@@ -321,6 +402,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                     text: text.trim_end_matches(['\r', '\n']).to_string(),
                     force,
                     launch_id,
+                    once,
+                    when_idle,
+                    timeout_secs,
                 }),
                 Ok(_) => {
                     return fail(
@@ -505,6 +589,9 @@ pub(crate) fn failure_body(error: control::Error, task: Task) -> Value {
             (_, None) => false,
             // A lost poll says nothing of the creation it was asking after.
             (Task::Admitted, Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)) => false,
+            // The first send with this `--once` key is still running and may
+            // yet deliver the task.
+            (_, Some(ErrorCode::Busy)) if error.reason.as_deref() == Some("once_pending") => false,
             (_, Some(_)) => true,
         };
     let mut reply = serde_json::to_value(control::Response::err(error))
@@ -836,7 +923,7 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| unavailable(NOT_RUNNING))?;
-    let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(reply_timeout(&command) + IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut line = serde_json::to_string(&Request {
         version: control::request_version(&command),
@@ -915,15 +1002,17 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
 mod tests {
     use super::{
         DELIVERY_WAIT, Server, Task, choose_endpoint, create, dispatch, failure_body,
-        process_alive, read_endpoint, request_at, same_secret, task_of, wait_creation_with,
-        wait_prompt_delivery_with, write_endpoint,
+        process_alive, read_endpoint, reply_timeout, request_at, same_secret, task_of,
+        wait_creation_with, wait_prompt_delivery_with, write_endpoint,
     };
     use muxel_core::control::{
         self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
     };
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     /// `muxel ctl new ARGS`, run against a muxel that answers each request
     /// with `answer`: the reply, or the failure as the CLI prints it.
@@ -974,6 +1063,34 @@ mod tests {
             let reply = first_request_failure(args, lost());
             assert_eq!(reply["outcome"], "not_delivered", "{args:?}");
             assert_eq!(reply["code"], "host_unavailable", "{args:?}");
+        }
+    }
+
+    /// A repeated `--once` key types nothing itself, but the first send with
+    /// that key may still deliver: the task isn't known to be undelivered.
+    #[test]
+    fn a_repeat_of_a_running_once_send_is_unconfirmed_not_undelivered() {
+        let send = ["send", "claude", "hi", "--once", "d-1"];
+        let running =
+            control::Error::new(ErrorCode::Busy, "first still running").with_reason("once_pending");
+        assert_eq!(
+            first_request_failure(&send, running.clone())["outcome"],
+            "unconfirmed"
+        );
+        assert_eq!(
+            first_request_failure(&send, running.after_paste())["outcome"],
+            "unconfirmed"
+        );
+        for refused in [
+            control::Error::new(ErrorCode::Busy, "queued").with_reason("queued"),
+            control::Error::new(ErrorCode::DraftPresent, "draft"),
+            control::Error::new(ErrorCode::TimedOut, "late").with_reason("working"),
+        ] {
+            assert_eq!(
+                first_request_failure(&send, refused.clone())["outcome"],
+                "not_delivered",
+                "{refused:?}"
+            );
         }
     }
 
@@ -1494,6 +1611,9 @@ mod tests {
             text: "hi".into(),
             force: false,
             launch_id: Some(uuid::Uuid::from_u128(42)),
+            once: None,
+            when_idle: false,
+            timeout_secs: None,
         };
         let refused = request_at(&path, send()).unwrap_err();
         assert_eq!(refused.code, Some(ErrorCode::Working));
@@ -1510,6 +1630,105 @@ mod tests {
         let gone = request_at(&path, Command::Projects).unwrap_err();
         assert_eq!(gone.code, Some(ErrorCode::HostUnavailable));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `send --when-idle` whose caller hangs up must not type later: the
+    /// connection notices, and tells the app before it can.
+    #[test]
+    fn a_waiting_send_is_cancelled_when_its_caller_hangs_up() {
+        use std::net::Shutdown;
+        let dir = scratch("queued-hangup");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        let mut stream =
+            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, server.port))).unwrap();
+        let command = Command::Send {
+            agent: "agent".into(),
+            text: "[wire v1 d-9f2a] unread mail".into(),
+            force: false,
+            launch_id: None,
+            once: Some("d-9f2a".into()),
+            when_idle: true,
+            timeout_secs: Some(30),
+        };
+        let request = control::Request {
+            version: control::request_version(&command),
+            token: server.token.clone(),
+            caller_instance_id: None,
+            command,
+        };
+        writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        let incoming = rx.recv_blocking().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!incoming.cancelled.load(Ordering::Acquire));
+        stream.shutdown(Shutdown::Both).unwrap();
+        drop(stream);
+        let start = Instant::now();
+        while !incoming.cancelled.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the hang-up didn't cancel the waiting send"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The caller's read and the connection's wait both outlast the time a
+    /// `send --when-idle` may wait, so a send that waited long is never lost.
+    #[test]
+    fn a_waiting_send_has_its_wait_on_top_of_the_reply_window() {
+        let send = |when_idle, timeout_secs| Command::Send {
+            agent: "a".into(),
+            text: "hi".into(),
+            force: false,
+            launch_id: None,
+            once: None,
+            when_idle,
+            timeout_secs,
+        };
+        assert_eq!(reply_timeout(&send(false, None)), super::REPLY_TIMEOUT);
+        assert_eq!(
+            reply_timeout(&send(true, None)),
+            Duration::from_secs(control::WHEN_IDLE_TIMEOUT_SECS) + super::REPLY_TIMEOUT
+        );
+        assert_eq!(
+            reply_timeout(&send(true, Some(45))),
+            Duration::from_secs(45) + super::REPLY_TIMEOUT
+        );
+        assert_eq!(reply_timeout(&Command::Projects), super::REPLY_TIMEOUT);
+    }
+
+    /// A raw JSON client gets the same option checks as the CLI.
+    #[test]
+    fn the_host_refuses_bad_once_and_when_idle_options_before_the_app() {
+        let (tx, rx) = async_channel::unbounded();
+        for (once, when_idle, force, timeout_secs) in [
+            (Some(String::new()), false, false, None),
+            (Some("k".repeat(129)), false, false, None),
+            (None, false, false, Some(5)),
+            (None, true, false, Some(0)),
+            (None, true, true, None),
+        ] {
+            let command = Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force,
+                launch_id: None,
+                once,
+                when_idle,
+                timeout_secs,
+            };
+            let request = control::Request {
+                version: control::request_version(&command),
+                token: "test".into(),
+                caller_instance_id: None,
+                command,
+            };
+            assert!(!dispatch(request, "test", &tx).ok);
+        }
+        assert!(rx.try_recv().is_err(), "a refused option reached the app");
     }
 
     #[test]
@@ -1631,6 +1850,22 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: Some(uuid::Uuid::from_u128(42)),
+                once: None,
+                when_idle: false,
+                timeout_secs: None,
+            },
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                once: Some("d-9f2a".into()),
+                when_idle: true,
+                timeout_secs: None,
+            },
+            Command::OnceStatus {
+                agent: "a".into(),
+                key: "d-9f2a".into(),
             },
             Command::New {
                 project: "repo".into(),
@@ -1654,7 +1889,16 @@ mod tests {
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line).unwrap();
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["version"], 2);
+                // Every one of them needs more than a v1 host can honor.
+                let version = request["version"].as_u64().unwrap();
+                let expected = if request["command"]["cmd"] == "once_status"
+                    || request["command"]["once"].is_string()
+                {
+                    4
+                } else {
+                    2
+                };
+                assert_eq!(version, expected, "{request}");
                 stream
                     .write_all(b"{\"ok\":false,\"error\":\"legacy host rejects request v2\"}\n")
                     .unwrap();

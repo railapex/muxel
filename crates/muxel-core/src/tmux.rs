@@ -1106,6 +1106,18 @@ fn version_at_least(version: &str, minimum: (u32, u32)) -> bool {
 /// Arguments for `tmux …` to read a session's user option (`@name`), printing its
 /// value alone — or nothing when it is unset or the session is gone (`-q`).
 /// Options take a pane target, so the exact-match session is `=name:`.
+/// Arguments for `tmux …` printing how many clients are attached to `session`
+/// (exact match).
+pub fn attached_clients_args(session: &str) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        "#{session_attached}".to_string(),
+    ]
+}
+
 pub fn show_option_args(session: &str, option: &str) -> Vec<String> {
     vec![
         "show-options".to_string(),

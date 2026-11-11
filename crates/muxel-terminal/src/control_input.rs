@@ -75,6 +75,10 @@ pub enum ControlInput {
     /// written terminal's arrow bytes are encoded for; tmux encodes keys for its
     /// own pane's modes.
     Keys { keys: Vec<Key>, app_cursor: bool },
+    /// Keys that answer the question an agent is blocked on (`ctl answer`).
+    /// They go as [`Self::Keys`] do, but pick an option rather than type into
+    /// the composer, so they leave the draft bit as it was.
+    Answer(Vec<Key>),
     /// The Enter that submits a pasted prompt or task. Its lifecycle facts are
     /// recorded only once the Enter is admitted, as a prompt submission.
     Submit,
@@ -559,7 +563,7 @@ fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput, atomic: bool
         ControlInput::Paste(text) => {
             paste(run, pane, &tmux::control_paste_input(text), true, atomic)
         }
-        ControlInput::Keys { keys, .. } => {
+        ControlInput::Keys { keys, .. } | ControlInput::Answer(keys) => {
             for (i, key_step) in tmux::control_key_steps(keys).into_iter().enumerate() {
                 let pressed = match key_step {
                     tmux::KeyStep::Send(keys) => step(
