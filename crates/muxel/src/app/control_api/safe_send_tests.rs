@@ -17,6 +17,59 @@ fn shell_pane(
     window: WindowHandle<MuxelApp>,
     name: &str,
 ) -> (Uuid, Entity<TerminalView>, Arc<TerminalSession>) {
+    pane_with(cx, window, name, std::convert::identity)
+}
+
+/// A cmd.exe pane whose ctl input goes through tmux, to a fake tmux server
+/// that takes everything. The flag says whether anything was typed.
+fn tmux_pane(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+) -> (Uuid, Arc<TerminalSession>, Arc<AtomicBool>) {
+    let typed = Arc::new(AtomicBool::new(false));
+    let saw = typed.clone();
+    let route = muxel_terminal::TmuxInputRoute::new(
+        "muxel_p_1",
+        true,
+        move |args: &[String], _: Option<&[u8]>| {
+            let command = if args[0] == "if-shell" {
+                args.last()
+                    .and_then(|script| script.split_whitespace().next())
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                args[0].clone()
+            };
+            if matches!(command.as_str(), "load-buffer" | "send-keys") {
+                saw.store(true, Ordering::Release);
+            }
+            let stdout = match command.as_str() {
+                "list-panes" => "muxel_p_1:%7:1::3.4\n",
+                "display-message" => "%7\n",
+                _ => "",
+            };
+            Ok(std::process::Output {
+                status:
+                    <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(
+                        0,
+                    ),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        },
+    );
+    let (pane, _view, session) = pane_with(cx, window, name, |spec| spec.with_tmux_input(route));
+    assert!(session.delivers_through_tmux());
+    (pane, session, typed)
+}
+
+fn pane_with(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+    wrap: impl FnOnce(CommandSpec) -> CommandSpec,
+) -> (Uuid, Entity<TerminalView>, Arc<TerminalSession>) {
     window
         .update(cx, |app, window, cx| {
             let root = muxel_store::data_dir().unwrap().join(name);
@@ -26,7 +79,7 @@ fn shell_pane(
             instance.program = Some("cmd.exe".into());
             instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
             let pane = instance.id;
-            let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+            let spec = wrap(CommandSpec::program("cmd.exe", instance.args.clone()));
             app.workspace.add_instance(instance);
             // ctl answers nothing until a workspace is open, and sees only
             // the panes in its layouts.
@@ -413,6 +466,120 @@ fn a_pin_to_the_old_thread_types_nothing_while_codex_names_a_new_one() {
         assert_eq!(changed.reason.as_deref(), Some("conversation_changed"));
         assert_eq!(changed.pasted, None);
         assert_eq!(session.input_rev(), before, "A's prompt typed into B");
+        session.kill();
+    });
+}
+
+/// Inside an unfinished synchronized update, Codex can name thread B while
+/// the terminal's binding, which VTE updates only when the update ends, still
+/// says A. Neither muxel's adoption of A nor A's title vouches for A then.
+#[test]
+fn a_pin_types_nothing_while_a_synchronized_update_holds_a_new_thread() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-session-sync");
+        codex_titles(&session, CONVERSATION_A);
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        let before = session.input_rev();
+        // One update, so no PTY drain runs between the frame and the checks.
+        let (status, refused) = window
+            .update(cx, |app, _, cx| {
+                session.process_probe_output(
+                    format!("\x1b[?2026h\x1b]0;{CONVERSATION_B} | Ready\x07").as_bytes(),
+                );
+                let status = app.control_command(
+                    Command::Status {
+                        agent: Some(pane.to_string()),
+                    },
+                    None,
+                    cx,
+                );
+                let refused = app.control_command(
+                    pinned(
+                        send(pane, "echo old", Some("d-9"), false, true),
+                        CONVERSATION_A,
+                    ),
+                    None,
+                    cx,
+                );
+                (status, refused)
+            })
+            .unwrap();
+        let Answer::Now(Ok(status)) = status else {
+            panic!("a read answers at once");
+        };
+        assert!(status.get("session_id").is_none(), "{status}");
+        let Answer::Now(Err(refused)) = refused else {
+            panic!("A's pin was admitted while B's title waited in the frame");
+        };
+        assert_eq!(refused.code, Some(ErrorCode::LaunchMismatch));
+        assert_eq!(refused.reason.as_deref(), Some("conversation_unconfirmed"));
+        assert_eq!(refused.pasted, None);
+        assert_eq!(session.input_rev(), before, "A's prompt typed into B");
+        session.kill();
+    });
+}
+
+/// Through tmux the paste waits in tmux's input queue after the last check,
+/// where nothing checks the conversation again. A send pinned to one is
+/// refused, waiting or not, and types nothing; a waiting one is refused
+/// before it waits on anything. A waiting send the caller didn't pin holds
+/// its conversation only while it waits, and still types.
+#[test]
+fn a_pinned_send_to_a_pane_behind_tmux_types_nothing() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session, typed) = tmux_pane(cx, window, "control-session-tmux");
+        codex_titles(&session, CONVERSATION_A);
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        let tmux_refusal = |refused: ctl::Error| {
+            assert_eq!(
+                refused.code,
+                Some(ErrorCode::ParameterUnsupported),
+                "{refused:?}"
+            );
+            assert_eq!(refused.reason.as_deref(), Some("tmux_delivery"));
+            assert_eq!(refused.pasted, None);
+        };
+        let pinned_send = |when_idle: bool| {
+            pinned(
+                send(pane, "echo pinned", Some("d-10"), when_idle, !when_idle),
+                CONVERSATION_A,
+            )
+        };
+        let (refused, _) = window
+            .update(cx, |app, _, cx| ask(app, pinned_send(false), cx))
+            .unwrap();
+        tmux_refusal(reply(cx, &refused).into_result().unwrap_err());
+        assert!(
+            !typed.load(Ordering::Acquire),
+            "a pinned send typed through tmux"
+        );
+        let status = window
+            .update(cx, |app, _, _| app.control_once.status(pane, "d-10"))
+            .unwrap();
+        assert_eq!(status["state"], "unused");
+        let (_unpinned, _) = window
+            .update(cx, |app, _, cx| {
+                ask(app, send(pane, "echo unpinned", None, true, false), cx)
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !typed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the unpinned send never typed");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A pane a waiting send would wait on (here, a draft) still refuses
+        // the pin at once, not when the pane frees up.
+        session.write_input(b"half typed");
+        let (refused, _) = window
+            .update(cx, |app, _, cx| ask(app, pinned_send(true), cx))
+            .unwrap();
+        cx.run_until_parked();
+        let refused = refused
+            .try_recv()
+            .expect("the pinned send waited instead of refusing");
+        tmux_refusal(refused.into_result().unwrap_err());
         session.kill();
     });
 }

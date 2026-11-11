@@ -1321,7 +1321,8 @@ impl MuxelApp {
     /// confirms it: muxel adopted it in this binding, or the terminal's own
     /// evidence names it (its launch opened it, or the provider's current
     /// title). Codex names a new thread in its title before muxel has
-    /// validated and stored it; until then the pane is unconfirmed. A pane
+    /// validated and stored it; until then the pane is unconfirmed, as it is
+    /// while a synchronized update holds a title the binding hasn't taken. A pane
     /// with nothing running has the id it will resume, which locates it; the
     /// check runs again once it does.
     pub(in crate::app) fn control_conversation(&self, iid: Uuid, cx: &App) -> ctl::Conversation {
@@ -1339,6 +1340,13 @@ impl MuxelApp {
             return ctl::Conversation::Known(stored.to_owned());
         }
         let session = view.session();
+        // Inside a synchronized update the provider can already have named
+        // another conversation while the binding still describes this one.
+        // Neither the adoption stamp nor the binding's own evidence vouches
+        // until the update ends.
+        if session.binding_pending() {
+            return ctl::Conversation::Unconfirmed;
+        }
         let adopted = self.control_conversations.get(&iid).is_some_and(|adopted| {
             adopted.launch == session.id
                 && adopted.binding == session.binding_revision()
@@ -1778,6 +1786,7 @@ impl MuxelApp {
     ) -> CtlResult<Typing> {
         let session = self.control_writable(iid, cx)?;
         ctl::check_launch_id(launch_id, Some(session.id))?;
+        check_pin_deliverable(&session, session_id.as_deref())?;
         ctl::check_session_id(session_id.as_deref(), &self.control_conversation(iid, cx))?;
         if text.trim().is_empty() {
             return Err("nothing to send".into());
@@ -2380,6 +2389,23 @@ fn enter_verdict<T>(
 fn with_protocol(mut reply: Value) -> Value {
     reply["protocol"] = json!(ctl::NEWEST_VERSION);
     reply
+}
+
+/// A conversation pin is checked last immediately before the paste. Through
+/// tmux the paste then waits in tmux's input queue, where nothing checks the
+/// conversation again, so muxel can't hold a pin to delivery there and
+/// refuses it. The pane is still in that conversation as far as muxel knows;
+/// it is the send that can't be held to it.
+fn check_pin_deliverable(session: &TerminalSession, pin: Option<&str>) -> CtlResult<()> {
+    if pin.is_some() && session.delivers_through_tmux() {
+        return Err(ctl::Error::new(
+            ErrorCode::ParameterUnsupported,
+            "this agent takes ctl input through tmux, where muxel can't hold a send to its \
+             conversation: nothing was typed. Send without --session-id, or to another agent",
+        )
+        .with_reason("tmux_delivery"));
+    }
+    Ok(())
 }
 
 /// What a send was pinned to, checked again immediately before its paste.

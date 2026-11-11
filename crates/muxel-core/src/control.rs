@@ -390,7 +390,10 @@ pub enum ErrorCode {
     ApprovalTimeout,
     /// Only configured non-shell terminal presets accept user tasks.
     PromptUnsupported,
-    /// A preset cannot safely express the requested model or effort override.
+    /// A preset cannot safely express the requested model or effort override,
+    /// or a `send --session-id` targets a pane that takes ctl input through
+    /// tmux, where muxel can't hold the paste to a conversation (`reason:
+    /// tmux_delivery`; nothing was typed).
     ParameterUnsupported,
     /// The agent is working: `wait` for it (or `send --force`).
     Working,
@@ -2197,7 +2200,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   once it runs. muxel learns of a Claude `/clear` or `/resume` from its hook a
   moment after it happens, so the pin holds against muxel's latest
   knowledge. `--force` never overrides it. It needs protocol v5: check
-  `protocol` in `status` first.
+  `protocol` in `status` first. An agent muxel types into through tmux
+  refuses it with `parameter_unsupported`, `reason: tmux_delivery`, and types
+  nothing: there the paste waits in tmux's input queue after the last check,
+  so muxel can't hold it to a conversation. Send to that agent without it.
   `--once KEY` (1-128 bytes) types TEXT into this pane at most once. A repeat
   whose first send went in returns that first receipt with `duplicate: true`
   and types nothing. A repeat whose first send failed after typing fails with
@@ -2366,7 +2372,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `approval_denied` - the user clicked Deny; nothing was created.
 - `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
 - `prompt_unsupported` - prompts require a configured non-shell terminal preset.
-- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
+- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them. Also `send --session-id` to an agent behind tmux (`reason: tmux_delivery`); nothing was typed.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing
@@ -3009,6 +3015,7 @@ mod tests {
         assert!(text.contains("`protocol`"));
         assert!(text.contains("conversation_changed"));
         assert!(text.contains("conversation_unconfirmed"));
+        assert!(text.contains("tmux_delivery"));
     }
 
     #[test]

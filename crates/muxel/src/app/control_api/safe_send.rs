@@ -151,6 +151,9 @@ pub(in crate::app) struct QueuedSend {
     /// The provider conversation it types into: `--session-id`, else the one
     /// muxel could vouch for when it was queued.
     conversation: Option<String>,
+    /// `conversation` is the caller's `--session-id`, which must hold to the
+    /// paste or not type at all.
+    pinned: bool,
     queued_at: Instant,
     deadline: Instant,
     /// What it is waiting on, for its `timed_out` reason.
@@ -295,6 +298,13 @@ impl MuxelApp {
                 .with_reason("queue_full"),
             );
         }
+        // A pin muxel can never hold refuses before anything is waited on.
+        if let Some(view) = self.terminal_view(iid)
+            && let Err(error) =
+                super::check_pin_deliverable(view.read(cx).session(), session_id.as_deref())
+        {
+            return refuse(self, error);
+        }
         // Another conversation refuses at once, even while the pane starts,
         // when it is matched on the id it will resume. One muxel can't vouch
         // for yet is waited out like any other busy state.
@@ -318,6 +328,7 @@ impl MuxelApp {
         };
         let queued_at = Instant::now();
         let wait = Duration::from_secs(timeout_secs.unwrap_or(ctl::WHEN_IDLE_TIMEOUT_SECS));
+        let pinned = session_id.is_some();
         let conversation = session_id.or_else(|| current.into_id());
         self.control_queue.insert(
             iid,
@@ -326,6 +337,7 @@ impl MuxelApp {
                 once,
                 launch,
                 conversation,
+                pinned,
                 queued_at,
                 deadline: queued_at + wait,
                 waiting_on: "working",
@@ -447,8 +459,16 @@ impl MuxelApp {
             Verdict::Refuse(error) => return self.finish_queued_send(iid, queued, Err(error)),
         }
         // The conversation it queued in rides along to the paste, which
-        // checks it once more.
-        let pinned = queued.conversation.clone();
+        // checks it once more. Through tmux the paste can't be held to one,
+        // so a conversation the caller didn't pin was held only while
+        // waiting; the caller's own pin goes on, to be refused.
+        let through_tmux = self
+            .terminal_view(iid)
+            .is_some_and(|view| view.read(cx).session().delivers_through_tmux());
+        let pinned = queued
+            .conversation
+            .clone()
+            .filter(|_| queued.pinned || !through_tmux);
         match self.control_send(iid, queued.text.clone(), false, queued.launch, pinned, cx) {
             Ok(mut typing) => {
                 typing.once = queued.once;
@@ -587,6 +607,7 @@ mod tests {
             once: Some("d-9f2a".into()),
             launch,
             conversation: conversation.map(str::to_owned),
+            pinned: false,
             queued_at: now,
             deadline: now + Duration::from_secs(600),
             waiting_on: "draft_present",
