@@ -778,6 +778,13 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     Some(vec![id_flag.to_string(), id.to_string()])
 }
 
+/// Whether a restart would resume this pane's conversation rather than start
+/// a new one: it has launched, its conversation id has been captured, and its
+/// preset resumes by id. What sleep relies on to bring the same work back.
+pub fn resume_trusted(preset: &AgentPreset, instance: &Instance) -> bool {
+    instance.session_started && session_resume_args(preset, instance).is_some()
+}
+
 /// Path to Claude's on-disk session transcript for an agent running in `cwd`:
 /// `<home>/.claude/projects/<slug>/<session_id>.jsonl`, where `slug` is `cwd` with
 /// every non-ASCII-alphanumeric character replaced by `-` — Claude's project-dir
@@ -1953,6 +1960,37 @@ mod tests {
         s.session_id = Some("abc".to_string());
         s.session_started = true;
         assert_eq!(session_resume_args(&shell, &s), None);
+    }
+
+    #[test]
+    fn only_a_launched_pane_with_a_captured_id_trusts_its_resume() {
+        // Sleep ends the program on this answer, so a pane that would start a
+        // new conversation instead (Claude's first launch passes --session-id,
+        // which resume args alone can't tell apart) must never pass.
+        for preset in AgentPreset::builtin_agents()
+            .into_iter()
+            .chain([AgentPreset::shell()])
+        {
+            let mut inst = instance(&preset, None);
+            inst.session_id = Some("abc".to_string());
+            assert!(!resume_trusted(&preset, &inst), "{} unstarted", preset.name);
+            inst.session_started = true;
+            assert_eq!(
+                resume_trusted(&preset, &inst),
+                preset.effective_resume_flag().is_some(),
+                "{} started",
+                preset.name
+            );
+            inst.session_id = None;
+            assert!(
+                !resume_trusted(&preset, &inst),
+                "{} without an id",
+                preset.name
+            );
+            inst.session_id = Some("abc".to_string());
+            inst.literal_argv = true;
+            assert!(!resume_trusted(&preset, &inst), "{} literal", preset.name);
+        }
     }
 
     #[test]
