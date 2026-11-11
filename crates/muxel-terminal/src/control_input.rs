@@ -75,6 +75,10 @@ pub enum ControlInput {
     /// written terminal's arrow bytes are encoded for; tmux encodes keys for its
     /// own pane's modes.
     Keys { keys: Vec<Key>, app_cursor: bool },
+    /// Keys that answer the question an agent is blocked on (`ctl answer`).
+    /// They go as [`Self::Keys`] do, but pick an option rather than type into
+    /// the composer, so they leave the draft bit as it was.
+    Answer(Vec<Key>),
     /// The Enter that submits a pasted prompt or task. Its lifecycle facts are
     /// recorded only once the Enter is admitted, as a prompt submission.
     Submit,
@@ -128,6 +132,8 @@ impl std::fmt::Debug for TmuxInputRoute {
 /// Why a ctl write wasn't delivered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlWriteError {
+    /// The complete payload was refused before any input was written.
+    InvalidInput(String),
     /// The terminal's PTY writer is gone.
     Closed(String),
     /// The agent's tmux pane couldn't be found, or has gone. Nothing was typed.
@@ -154,6 +160,7 @@ impl ControlWriteError {
 impl std::fmt::Display for ControlWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidInput(why) => write!(f, "{why}"),
             Self::Closed(why) => write!(f, "the terminal's input is closed ({why})"),
             Self::Unresolved(why) => write!(f, "{why}"),
             Self::InMode(why) => write!(f, "{why}"),
@@ -441,7 +448,7 @@ fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput, atomic: bool
         ControlInput::Paste(text) => {
             paste(run, pane, &tmux::control_paste_input(text), true, atomic)
         }
-        ControlInput::Keys { keys, .. } => {
+        ControlInput::Keys { keys, .. } | ControlInput::Answer(keys) => {
             for (i, key_step) in tmux::control_key_steps(keys).into_iter().enumerate() {
                 let pressed = match key_step {
                     tmux::KeyStep::Send(keys) => step(
@@ -481,7 +488,9 @@ fn partial(error: ControlWriteError) -> ControlWriteError {
             format!("tmux refused the rest ({why})")
         }
         ControlWriteError::Unknown(why) => format!("tmux didn't answer for the rest ({why})"),
-        ControlWriteError::Closed(why) | ControlWriteError::Partial(why) => why,
+        ControlWriteError::Closed(why)
+        | ControlWriteError::Partial(why)
+        | ControlWriteError::InvalidInput(why) => why,
     })
 }
 

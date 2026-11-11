@@ -1448,6 +1448,10 @@ impl MuxelApp {
                 {
                     view.update(cx, |view, cx| view.set_muse_hook_state(&metadata, cx));
                 }
+                // After the switch: the adopted id names the binding the
+                // terminal is in now. Codex's title began that binding
+                // already, and this result was checked against it.
+                self.note_adopted_conversation(update.pane, cx);
             }
             cx.notify();
             true
@@ -2231,6 +2235,7 @@ mod grok_regressions {
                     session.mark_turn_submitted();
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
+                        background: None,
                         status: AgentStatus::Done,
                         attributable: true,
                         reason: TerminalStatusReason::Quiet,
