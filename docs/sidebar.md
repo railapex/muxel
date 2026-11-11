@@ -190,9 +190,10 @@ placed by its top session, except that while any child shows a question the
 whole family sorts as Asking, in the latest band among those asking, by its
 newest question. The top row then shows an **N asking** tag, since the
 child's own row may be far below where you'd look. Viewing still moves
-nothing. Children never close with their parent: closing a session takes its
-files, not its child sessions, which become ordinary rows once it's gone. A
-pinned session nests only under a pinned one.
+nothing. Children don't close with their parent: closing a session takes its
+files, not its child sessions, which become ordinary rows once it's gone,
+unless you choose Close with everything under it (below). A pinned session
+nests only under a pinned one.
 
 In Recent work, dragging a session onto another session's row nests it under
 that row's top-level session (`sidebar::nest_on_drop`), as if it had spawned
@@ -224,6 +225,25 @@ chosen from: if its owner is among the tabs closing, the owner is cleared
 first. Popped-out resources stay open, since their views belong to their own
 windows. An agent exiting on its own, Layout order, and closes from other
 machines leave resources alone.
+
+In Recent work, a session row with anything nested under it offers **Close
+with everything under it (N)** on right-click. It closes the session and the
+sessions nested under it (`sidebar::sessions_under`) as one close request, and
+their resources go with them by the rule above, so a busy session among them
+asks once and the held ones share one Undo. N counts every pane it closes,
+read when the menu opens; a popped-out resource, which stays open, isn't
+counted. A nested session has only its own resources under it.
+
+Ctrl-click (Cmd-click on macOS) toggles a row in a selection, in either
+order, and Shift-click selects every row from the last one Ctrl-clicked, or
+first Shift-clicked, to this one, along the rows as drawn
+(`sidebar::select_rows`). Picked rows are tinted, and a plain click clears the
+selection. Right-clicking a picked row, with more than one picked, offers
+**Close selected (N)**, which closes the picked rows still open as one close
+request: the same questions, the same rule for resources in Recent work, and
+one Undo for the sessions it holds. A file closed this way on its own, with no
+picked session taking it, closes at once, since an ordinary file close has no
+Undo. The selection is not saved.
 
 Recent work includes live popped-out sessions even though they are outside the
 pane layout. Their rows carry an external-window icon; clicking raises that

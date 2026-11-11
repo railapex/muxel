@@ -35,9 +35,9 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, InstancesById, SidebarEntry, SidebarSort, instances_by_id, is_unread,
-    nest_on_drop, nested_asking, notification_in_feed, sidebar_order, sidebar_rows_each,
-    unread_count,
+    ActivityBand, BandClock, InstancesById, SelectClick, SidebarEntry, SidebarSort,
+    instances_by_id, is_unread, nest_on_drop, nested_asking, notification_in_feed, select_rows,
+    sessions_under, sidebar_order, sidebar_rows_each, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -6468,6 +6468,10 @@ pub struct MuxelApp {
     closing: HashMap<Uuid, HeldClose>,
     close_groups: Vec<CloseGroup>,
     close_requests: HashMap<Uuid, Uuid>,
+    /// Sidebar rows picked with Ctrl- or Shift-click, for Close selected, and
+    /// the row a Shift-click selects from. Runtime only; a plain click clears it.
+    sidebar_selection: Vec<Uuid>,
+    sidebar_anchor: Option<Uuid>,
     close_client_counts: HashMap<Uuid, ClientCount>,
     show_close_list: bool,
     preserve_close_worktrees: bool,
@@ -9002,6 +9006,8 @@ impl MuxelApp {
             closing: HashMap::new(),
             close_groups: Vec::new(),
             close_requests: HashMap::new(),
+            sidebar_selection: Vec::new(),
+            sidebar_anchor: None,
             close_client_counts: HashMap::new(),
             show_close_list: false,
             preserve_close_worktrees: false,
@@ -23898,6 +23904,98 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// The sessions that closing `iid` with everything under it closes: it and
+    /// the sessions nested under it in Recent work ([`sessions_under`]). Their
+    /// files, diffs and pages go with them by the usual close rule.
+    fn sessions_with_everything_under(&self, iid: Uuid) -> Vec<Uuid> {
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return Vec::new();
+        };
+        let listed = self.sidebar_rows_each().remove(&pid).unwrap_or_default();
+        let instances = instances_by_id(&self.workspace);
+        std::iter::once(iid)
+            .chain(sessions_under(iid, &listed, &instances))
+            .collect()
+    }
+
+    /// How many panes closing session `iid` with everything under it would
+    /// close: it, the sessions nested under it, and the files, diffs and pages
+    /// that go with them ([`Self::close_dependents`]). `None` outside Recent
+    /// work, where nothing nests, and when nothing is under it.
+    fn close_with_everything_under_count(&self, iid: Uuid) -> Option<usize> {
+        if self.settings.sidebar_sort != SidebarSort::RecentWork
+            || self
+                .workspace
+                .instance(iid)
+                .is_none_or(|i| i.kind != InstanceKind::Terminal)
+        {
+            return None;
+        }
+        let sessions = self.sessions_with_everything_under(iid);
+        let count = sessions.len() + self.close_dependents(&sessions).len();
+        (count > 1).then_some(count)
+    }
+
+    /// Close session `iid` and everything under it as one request: a busy
+    /// session among them asks once, and what's held comes back with one Undo.
+    fn close_with_everything_under(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let sessions = self.sessions_with_everything_under(iid);
+        self.request_recoverable_close(sessions, cx);
+    }
+
+    /// A Ctrl- or Shift-click on sidebar row `iid`: change the selection that
+    /// Close selected acts on, along `order` (that project's rows as drawn).
+    fn select_sidebar_row(
+        &mut self,
+        iid: Uuid,
+        click: SelectClick,
+        order: &[Uuid],
+        cx: &mut Context<Self>,
+    ) {
+        let (selected, anchor) = select_rows(
+            &self.sidebar_selection,
+            self.sidebar_anchor,
+            iid,
+            click,
+            order,
+        );
+        self.sidebar_selection = selected;
+        self.sidebar_anchor = anchor;
+        cx.notify();
+    }
+
+    fn clear_sidebar_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_selection.is_empty() || self.sidebar_anchor.is_some() {
+            self.sidebar_selection.clear();
+            self.sidebar_anchor = None;
+            cx.notify();
+        }
+    }
+
+    /// The selected rows still open, when right-clicking row `iid` should offer
+    /// to close them: it is one of them, and there's more than one.
+    fn sidebar_selection_to_close(&self, iid: Uuid) -> Option<Vec<Uuid>> {
+        let open: Vec<Uuid> = self
+            .sidebar_selection
+            .iter()
+            .copied()
+            .filter(|&id| self.workspace.instance(id).is_some() && !self.is_closing(id))
+            .collect();
+        (open.len() > 1 && open.contains(&iid)).then_some(open)
+    }
+
+    /// Close every selected row still open as one request, by the usual rules:
+    /// a busy session asks, a session takes its files in Recent work, and
+    /// what's held comes back with one Undo.
+    fn close_sidebar_selection(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let Some(ids) = self.sidebar_selection_to_close(iid) else {
+            return;
+        };
+        self.sidebar_selection.clear();
+        self.sidebar_anchor = None;
+        self.request_recoverable_close(ids, cx);
+    }
+
     /// For each of `entries` ([`Self::sidebar_entries`]), how many sessions
     /// nested under it are asking: what a family's top row tells, since its
     /// children sit below it. Zero for any other row.
@@ -28942,6 +29040,16 @@ impl MuxelApp {
             if !collapsed {
                 let entries = self.sidebar_entries(&pane_ids, &placing, bands, cx);
                 let asking_below = self.sidebar_family_asking(&entries, &placing, cx);
+                // The rows as drawn, which a Shift-click selects along.
+                let row_order: std::rc::Rc<[Uuid]> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        SidebarEntry::Pane(id)
+                        | SidebarEntry::Nested(id)
+                        | SidebarEntry::NestedTwice(id) => Some(*id),
+                        SidebarEntry::Worktree(_) | SidebarEntry::Band(_) => None,
+                    })
+                    .collect();
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
@@ -29032,6 +29140,7 @@ impl MuxelApp {
                     };
                     let ghost_label: SharedString = display.clone().into();
                     let is_sel = self.active_instance == Some(iid);
+                    let picked = self.sidebar_selection.contains(&iid);
                     let renaming = self.rename == Some(RenameTarget::Instance(iid))
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
                     let hover_col = cx.theme().sidebar_accent.opacity(0.45);
@@ -29046,7 +29155,11 @@ impl MuxelApp {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .bg(if is_sel {
+                        // A row picked for Close selected keeps its tint even
+                        // when it's also the focused pane.
+                        .bg(if picked {
+                            cx.theme().primary.opacity(0.22)
+                        } else if is_sel {
                             cx.theme().sidebar_accent
                         } else {
                             cx.theme().sidebar
@@ -29085,7 +29198,7 @@ impl MuxelApp {
                             self.instance_worktree_color(iid)
                                 .map(|c| div().size(px(8.0)).rounded_full().flex_none().bg(c)),
                         );
-                    if !is_sel {
+                    if !is_sel && !picked {
                         base = base.hover(move |s| s.bg(hover_col));
                     }
                     let row = if renaming {
@@ -29102,14 +29215,28 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
+                        let order = row_order.clone();
                         let row = base
                             .cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
                             // reset by the drag/release handling, so the pane would
                             // only highlight and you couldn't type. Double-click
-                            // renames (like before).
+                            // renames (like before). Ctrl- and Shift-click pick
+                            // rows for Close selected instead; a plain click
+                            // drops the pick.
                             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                                let modifiers = ev.modifiers();
+                                if modifiers.shift || modifiers.secondary() {
+                                    let click = if modifiers.shift {
+                                        SelectClick::Range
+                                    } else {
+                                        SelectClick::Toggle
+                                    };
+                                    this.select_sidebar_row(iid, click, &order, cx);
+                                    return;
+                                }
+                                this.clear_sidebar_selection(cx);
                                 if matches!(ev, ClickEvent::Mouse(e) if e.up.click_count >= 2) {
                                     this.start_rename_instance(
                                         iid,
@@ -29201,34 +29328,78 @@ impl MuxelApp {
                         };
                         row.context_menu({
                             let entity = entity.clone();
-                            move |menu, window, _cx| {
+                            move |menu, window, cx| {
+                                // Counted as the menu opens, so each item says
+                                // how many panes its click closes.
+                                let (selected, under) = {
+                                    let app = entity.read(cx);
+                                    (
+                                        app.sidebar_selection_to_close(iid).map(|ids| ids.len()),
+                                        app.close_with_everything_under_count(iid),
+                                    )
+                                };
+                                let menu = menu
+                                    .item(
+                                        PopupMenuItem::new(t("Rename"))
+                                            .icon(Icon::empty().path("icons/pencil.svg"))
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.start_rename_instance(
+                                                        iid,
+                                                        RenameOrigin::InstanceSidebar,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(t("Duplicate"))
+                                            .icon(IconName::Copy)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.duplicate_instance(iid, window, cx)
+                                                },
+                                            )),
+                                    )
+                                    .separator();
+                                let menu =
+                                    match under {
+                                        Some(n) => menu.item(
+                                            PopupMenuItem::new(tf(
+                                                "Close with everything under it ({n})",
+                                                &[("n", &n.to_string())],
+                                            ))
+                                            .icon(IconName::CircleX)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, _window, cx| {
+                                                    this.close_with_everything_under(iid, cx)
+                                                },
+                                            )),
+                                        ),
+                                        None => menu,
+                                    };
+                                let menu =
+                                    match selected {
+                                        Some(n) => menu.item(
+                                            PopupMenuItem::new(tf(
+                                                "Close selected ({n})",
+                                                &[("n", &n.to_string())],
+                                            ))
+                                            .icon(IconName::CircleX)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, _window, cx| {
+                                                    this.close_sidebar_selection(iid, cx)
+                                                },
+                                            )),
+                                        ),
+                                        None => menu,
+                                    };
                                 menu.item(
-                                    PopupMenuItem::new(t("Rename"))
-                                        .icon(Icon::empty().path("icons/pencil.svg"))
-                                        .on_click(window.listener_for(
-                                            &entity,
-                                            move |this, _, window, cx| {
-                                                this.start_rename_instance(
-                                                    iid,
-                                                    RenameOrigin::InstanceSidebar,
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
-                                )
-                                .item(
-                                    PopupMenuItem::new(t("Duplicate"))
-                                        .icon(IconName::Copy)
-                                        .on_click(window.listener_for(
-                                            &entity,
-                                            move |this, _, window, cx| {
-                                                this.duplicate_instance(iid, window, cx)
-                                            },
-                                        )),
-                                )
-                                .separator()
-                                .item(
                                     PopupMenuItem::new(t("Kill"))
                                         .icon(IconName::CircleX)
                                         .on_click(window.listener_for(

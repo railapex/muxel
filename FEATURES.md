@@ -1460,8 +1460,21 @@ feature is added or changed, update the matching entry here in the same change**
   question, the whole family sorts as asking and the top row shows **N asking**,
   so nothing that needs you is buried. Drag a session onto another session's
   row to nest it there, or onto its project's header to make it a row of its
-  own. Children never close with their parent; once the parent closes they are
-  ordinary rows. A pinned session nests only under a pinned one.
+  own. Closing a parent leaves its children open as ordinary rows, unless you
+  choose Close with everything under it. A pinned session nests only under a
+  pinned one.
+- **Close a session with everything under it** — in Recent work, right-click a
+  session with sessions or files nested under it for **Close with everything
+  under it (N)**. It closes the session, the sessions it spawned, and the
+  files, diffs and pages any of them owns as one close: a busy session asks
+  once, and one Undo brings the held ones back. N is how many panes it closes.
+- **Close several rows at once** — Ctrl-click (Cmd-click on macOS) sidebar rows
+  to pick them, or Shift-click to pick every row from the last one Ctrl-clicked
+  to this one; a plain click drops the pick. Right-click a picked row for **Close
+  selected (N)**: the picked rows close as one request under the usual rules,
+  so a busy session asks, a session takes its files in Recent work, and the
+  held sessions come back with one Undo. A file picked on its own closes at
+  once, as closing a file always does.
 - **Files close with their session** — in Recent work, closing a session (its
   tab, its pane, or Close terminals) also closes the files, diffs and pages it
   last opened. They join the session's countdown, so one Undo brings them all

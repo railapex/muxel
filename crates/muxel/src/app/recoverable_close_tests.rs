@@ -7,7 +7,9 @@ use super::{
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::sidebar::{BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order};
+use muxel_core::sidebar::{
+    BandClock, SelectClick, SidebarEntry, SidebarSort, instances_by_id, sidebar_order,
+};
 use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
@@ -3390,6 +3392,108 @@ fn closing_a_session_in_recent_work_takes_its_files_into_one_undo() {
             })
             .unwrap();
         wait_for_exit(cx, &child);
+    });
+}
+
+/// Close with everything under it: a session, the sessions it spawned and the
+/// files any of them owns go as one request, so one Undo brings them all back.
+/// The menu's count is what the click closes.
+#[test]
+fn closing_a_session_with_everything_under_it_takes_its_children_into_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (parent, _, _parent_child) = terminal(cx, window, pid);
+        let (spawned, _, _spawned_child) = terminal(cx, window, pid);
+        let (other, _, _other_child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(parent), false);
+        let (notes, _) = opened_file(cx, window, pid, Some(spawned), false);
+        window
+            .update(cx, |app, window, cx| {
+                app.workspace
+                    .instance_mut(spawned)
+                    .unwrap()
+                    .record_opener(Some(parent), chrono::Utc::now().timestamp_millis());
+                // Busy closes count down without asking, so no prompt intervenes.
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                assert_eq!(app.close_with_everything_under_count(parent), Some(4));
+                // A nested session has only its files under it; a session with
+                // nothing under it gets no such item.
+                assert_eq!(app.close_with_everything_under_count(spawned), Some(2));
+                assert_eq!(app.close_with_everything_under_count(other), None);
+
+                app.close_with_everything_under(parent, cx);
+                assert_eq!(app.close_groups.len(), 1);
+                let mut members = app.close_groups[0].members.clone();
+                members.sort();
+                let mut family = vec![parent, spawned, plan, notes];
+                family.sort();
+                assert_eq!(members, family);
+                assert!(!app.is_closing(other));
+
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(app.close_groups.is_empty());
+
+                // Layout order nests nothing, so there's nothing under it.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                assert_eq!(app.close_with_everything_under_count(parent), None);
+            })
+            .unwrap();
+    });
+}
+
+/// Rows picked with Ctrl- and Shift-click close as one request, so what's
+/// held comes back with one Undo. Only a picked row offers Close selected.
+#[test]
+fn closing_selected_rows_holds_them_in_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let _children: Vec<_> = (0..4).map(|_| terminal(cx, window, pid).2).collect();
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                let order: Vec<Uuid> = app
+                    .sidebar_entries_now(pid, cx)
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        SidebarEntry::Pane(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(order.len(), 4);
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                // Ctrl-click the first row, Shift-click the third, and Ctrl-
+                // click the fourth on and off again: the first three.
+                app.select_sidebar_row(order[0], SelectClick::Toggle, &order, cx);
+                app.select_sidebar_row(order[2], SelectClick::Range, &order, cx);
+                app.select_sidebar_row(order[3], SelectClick::Toggle, &order, cx);
+                app.select_sidebar_row(order[3], SelectClick::Toggle, &order, cx);
+                assert_eq!(app.sidebar_selection_to_close(order[3]), None);
+                assert_eq!(
+                    app.sidebar_selection_to_close(order[1]),
+                    Some(order[..3].to_vec())
+                );
+
+                app.close_sidebar_selection(order[1], cx);
+                assert_eq!(app.close_groups.len(), 1);
+                let mut members = app.close_groups[0].members.clone();
+                members.sort();
+                let mut picked = order[..3].to_vec();
+                picked.sort();
+                assert_eq!(members, picked);
+                assert!(!app.is_closing(order[3]));
+                assert!(app.sidebar_selection.is_empty());
+
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
     });
 }
 

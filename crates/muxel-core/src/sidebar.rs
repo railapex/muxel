@@ -308,6 +308,69 @@ pub fn nest_on_drop(
         .then_some(top)
 }
 
+/// The sessions nested under session `top` in Recent work, in `listed` order:
+/// its child sessions, including the ones they spawned, which nest under `top`
+/// too. A nested session has none under it. Closing `top` with everything
+/// under it closes these, and the files each of them would take
+/// ([`closes_with`]).
+pub fn sessions_under(top: Uuid, listed: &[Uuid], instances: &InstancesById) -> Vec<Uuid> {
+    let set: HashSet<Uuid> = listed.iter().copied().collect();
+    listed
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id != top
+                && instances
+                    .get(&id)
+                    .is_some_and(|i| i.kind == InstanceKind::Terminal)
+                && nests_under(id, instances, &set) == Some(top)
+        })
+        .collect()
+}
+
+/// How a click with a modifier changes the sidebar's row selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectClick {
+    /// Ctrl (Cmd on macOS): add the row, or take it out if it's in.
+    Toggle,
+    /// Shift: select every row from the anchor to this one.
+    Range,
+}
+
+/// The selection and its anchor after a modified click on row `clicked`.
+/// `order` is the rows as the sidebar draws them. A toggle makes `clicked` the
+/// anchor; a range keeps the anchor and replaces the selection with the rows
+/// from it to `clicked`, either way along `order`, or just `clicked` when the
+/// anchor isn't among them (another project's row, or none yet).
+pub fn select_rows(
+    selected: &[Uuid],
+    anchor: Option<Uuid>,
+    clicked: Uuid,
+    click: SelectClick,
+    order: &[Uuid],
+) -> (Vec<Uuid>, Option<Uuid>) {
+    match click {
+        SelectClick::Toggle => {
+            let mut next: Vec<Uuid> = selected
+                .iter()
+                .copied()
+                .filter(|&id| id != clicked)
+                .collect();
+            if next.len() == selected.len() {
+                next.push(clicked);
+            }
+            (next, Some(clicked))
+        }
+        SelectClick::Range => {
+            let at = |id: Uuid| order.iter().position(|&row| row == id);
+            match (anchor.and_then(at), at(clicked)) {
+                (Some(from), Some(to)) => (order[from.min(to)..=from.max(to)].to_vec(), anchor),
+                _ => (vec![clicked], Some(clicked)),
+            }
+        }
+    }
+}
+
 /// How many sessions nested under the row at `entries[at]` show a question,
 /// so that row can say so: its whole family sorts as Asking meanwhile.
 pub fn nested_asking(
@@ -1084,6 +1147,94 @@ mod tests {
             recent(&project, &workspace),
             vec![Pane(b), Nested(child), Pane(a)]
         );
+    }
+
+    /// Everything under a session is exactly what Recent work draws under
+    /// its row: the sessions it spawned and theirs, never its files (they
+    /// close by `closes_with`), another family's sessions, or one whose
+    /// spawner has closed.
+    #[test]
+    fn the_sessions_under_a_session_are_the_ones_its_row_draws_under_it() {
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, b) = (ids[0], ids[1]);
+        let child = session(&mut workspace, &mut project, Some(a), worked(NOW - 3_000));
+        let grandchild = session(
+            &mut workspace,
+            &mut project,
+            Some(child),
+            worked(NOW - 4_000),
+        );
+        let theirs = session(&mut workspace, &mut project, Some(b), worked(NOW - 5_000));
+        let _plan = file(&mut workspace, &mut project, Some(a), 10);
+        let gone = Instance::shell(project.id);
+        let orphan = session(
+            &mut workspace,
+            &mut project,
+            Some(gone.id),
+            worked(NOW - 6_000),
+        );
+        workspace.add_instance(gone);
+
+        let index = instances_by_id(&workspace);
+        let listed = project.instances();
+        let under = |top| sessions_under(top, &listed, &index);
+        assert_eq!(under(a), vec![child, grandchild]);
+        assert_eq!(under(b), vec![theirs]);
+        // A nested session and a top session with nothing under it: none.
+        assert_eq!(under(child), Vec::<Uuid>::new());
+        assert_eq!(under(orphan), Vec::<Uuid>::new());
+        // The same rows the sidebar draws nested under each top row.
+        let drawn = recent(&project, &workspace);
+        for top in [a, b] {
+            let at = drawn
+                .iter()
+                .position(|e| *e == SidebarEntry::Pane(top))
+                .unwrap();
+            let nested_sessions: Vec<Uuid> = drawn[at + 1..]
+                .iter()
+                .map_while(|entry| match entry {
+                    SidebarEntry::Nested(id) | SidebarEntry::NestedTwice(id) => Some(*id),
+                    _ => None,
+                })
+                .filter(|id| index[id].kind == InstanceKind::Terminal)
+                .collect();
+            let mut expected = under(top);
+            expected.sort();
+            let mut nested_sessions = nested_sessions;
+            nested_sessions.sort();
+            assert_eq!(nested_sessions, expected, "{drawn:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_toggles_a_row_and_shift_selects_from_the_anchor() {
+        use SelectClick::{Range, Toggle};
+        let rows: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let r = |i: usize| rows[i];
+
+        // Ctrl adds a row and anchors there; again takes it out.
+        let (selected, anchor) = select_rows(&[], None, r(1), Toggle, &rows);
+        assert_eq!((selected.clone(), anchor), (vec![r(1)], Some(r(1))));
+        let (selected, anchor) = select_rows(&selected, anchor, r(3), Toggle, &rows);
+        assert_eq!(selected, vec![r(1), r(3)]);
+        let (selected, anchor) = select_rows(&selected, anchor, r(1), Toggle, &rows);
+        assert_eq!((selected.clone(), anchor), (vec![r(3)], Some(r(1))));
+
+        // Shift selects from the anchor to the row, either way, keeping it.
+        let (selected, anchor) = select_rows(&selected, Some(r(1)), r(4), Range, &rows);
+        assert_eq!((selected, anchor), (rows[1..=4].to_vec(), Some(r(1))));
+        let (selected, anchor) = select_rows(&[], Some(r(3)), r(0), Range, &rows);
+        assert_eq!((selected, anchor), (rows[0..=3].to_vec(), Some(r(3))));
+
+        // With no anchor among the rows, Shift selects just the row.
+        let elsewhere = Uuid::new_v4();
+        for anchor in [None, Some(elsewhere)] {
+            assert_eq!(
+                select_rows(&[r(0)], anchor, r(2), Range, &rows),
+                (vec![r(2)], Some(r(2)))
+            );
+        }
     }
 
     #[test]
