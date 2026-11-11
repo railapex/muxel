@@ -75,6 +75,8 @@ mod first_prompt_size_tests;
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+#[cfg(all(test, not(target_os = "macos")))]
+mod markdown_copy_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
@@ -5293,6 +5295,17 @@ fn selected_copy_text(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Ctrl+C / Ctrl+Insert outside a terminal: the window's text selection, or
+/// else whatever the focused input has selected.
+fn copy_selection(window: &mut Window, cx: &mut App) {
+    use gpui_component::WindowExt as _;
+    if let Some(text) = selected_copy_text(window.selected_text(cx)) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    } else {
+        window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+    }
+}
+
 #[cfg(test)]
 mod copy_selection_tests {
     use super::selected_copy_text;
@@ -7368,6 +7381,9 @@ impl Render for PopoutView {
             .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
                 MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Focus, cx);
             }))
+            // The copy chords are bound for every window, so a popped-out
+            // editor needs their handler too.
+            .on_action(|_: &CopySelection, window, cx| copy_selection(window, cx))
             .on_action(
                 cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
                     MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Background, cx);
@@ -13033,8 +13049,13 @@ impl MuxelApp {
             let handle = view.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         } else if let Some(ed) = self.editors.get(&iid) {
+            // A press in the pane may have focused something inside the editor
+            // already, as a double-click in rendered Markdown focuses its text.
+            // Copy goes where that focus is, so leave it there.
             let handle = ed.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
+            if !handle.contains_focused(window, cx) {
+                window.focus(&handle, cx);
+            }
         } else if let Some(bv) = self.browsers.get(&iid) {
             let handle = bv.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -21647,14 +21668,7 @@ impl MuxelApp {
             // A ctrl+clicked terminal link opens beside the pane it was clicked
             // in: URLs in the built-in browser when enabled, files in an editor.
             .on_action(cx.listener(Self::on_open_link))
-            .on_action(cx.listener(|_this, _: &CopySelection, window, cx| {
-                use gpui_component::WindowExt as _;
-                if let Some(text) = selected_copy_text(window.selected_text(cx)) {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                } else {
-                    window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
-                }
-            }))
+            .on_action(|_: &CopySelection, window, cx| copy_selection(window, cx))
             .on_action(cx.listener(Self::on_open_link_background))
     }
 
@@ -25917,9 +25931,9 @@ impl MuxelApp {
                                     } else {
                                         t("Show rendered markdown")
                                     })
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
                                         if let Some(ed) = this.editors.get(&iid).cloned() {
-                                            ed.update(cx, |e, cx| e.toggle_rendered(cx));
+                                            ed.update(cx, |e, cx| e.toggle_rendered(window, cx));
                                         }
                                     }))
                             }),
