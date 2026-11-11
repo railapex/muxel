@@ -18,8 +18,9 @@ const OFFER_PROBE_QUIET: Duration = Duration::from_millis(1500);
 const OFFER_PROBE_POLL: Duration = Duration::from_millis(300);
 /// Stop looking after this long; the offer stays.
 const OFFER_PROBE_LIMIT: Duration = Duration::from_secs(30);
-/// Closed panes' drafts the strip lists before "and N more".
-const STRIP_ROWS: usize = 3;
+/// Rows of a closed pane's prompt the open list shows before it clips the
+/// rest.
+const PREVIEW_ROWS: usize = 3;
 
 /// What the app holds of the workspace's rescued text.
 #[derive(Default)]
@@ -30,6 +31,10 @@ pub(super) struct Rescue {
     pub(super) closed: Vec<DraftOffer>,
     /// The strip was hidden; it shows again when another pane's draft is kept.
     pub(super) closed_hidden: bool,
+    /// The list under the strip's one line is open.
+    pub(super) closed_open: bool,
+    /// Closed panes' drafts the open list shows whole, by file.
+    pub(super) closed_whole: HashSet<std::path::PathBuf>,
     /// What muxel kept when this workspace last stopped without closing
     /// cleanly, until dismissed.
     pub(super) crash: Option<CrashNotice>,
@@ -525,7 +530,77 @@ impl MuxelApp {
             dir.delete_offer(path);
         }
         self.rescue.closed.retain(|c| c.path != path);
+        self.rescue.closed_whole.remove(path);
         cx.notify();
+    }
+
+    /// Discard all: delete every closed pane's draft the strip lists.
+    pub(super) fn discard_all_closed_drafts(&mut self, cx: &mut Context<Self>) {
+        let dir = self.rescue_dir_any();
+        for closed in std::mem::take(&mut self.rescue.closed) {
+            if let Some(dir) = &dir {
+                dir.delete_offer(&closed.path);
+            }
+        }
+        self.rescue.closed_whole.clear();
+        self.rescue.closed_open = false;
+        cx.notify();
+    }
+
+    /// Whether `text` takes more than [`PREVIEW_ROWS`] rows `width` wide in
+    /// `style` at `size`, so the open list clips it. A row holds at most
+    /// `row_chars` characters.
+    fn preview_clips(
+        text: &str,
+        width: Pixels,
+        row_chars: usize,
+        style: &TextStyle,
+        size: Pixels,
+        window: &Window,
+    ) -> bool {
+        let mut lines = text.split('\n');
+        let head: Vec<&str> = lines.by_ref().take(PREVIEW_ROWS).collect();
+        if lines.next().is_some() {
+            return true;
+        }
+        // A longer line can't fit, and shaping it would only cost.
+        let mut rows = 0;
+        for line in head {
+            if line.chars().count() > PREVIEW_ROWS * row_chars {
+                return true;
+            }
+            let run = style.to_run(line.len());
+            rows += window
+                .text_system()
+                .shape_text(line.to_string().into(), size, &[run], Some(width), None)
+                .map_or(PREVIEW_ROWS + 1, |shaped| {
+                    shaped
+                        .iter()
+                        .map(|line| line.wrap_boundaries().len() + 1)
+                        .sum()
+                });
+            if rows > PREVIEW_ROWS {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The start of `text` a clipped preview lays out: one line more than it
+    /// shows, each cut one character past what [`PREVIEW_ROWS`] rows of
+    /// `row_chars` can hold. A long prompt (a draft can be 2 MB) isn't laid
+    /// out whole to show three rows of it, and what's left still overflows
+    /// where the text did, so the preview still ends in an ellipsis.
+    fn preview_head(text: &str, row_chars: usize) -> String {
+        let limit = PREVIEW_ROWS * row_chars + 1;
+        text.split('\n')
+            .take(PREVIEW_ROWS + 1)
+            .map(|line| match line.char_indices().nth(limit) {
+                Some((at, _)) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The row under a pane that offers its unsent draft.
@@ -650,9 +725,15 @@ impl MuxelApp {
         )
     }
 
-    /// The strip under the title bar: the crash notice, and closed panes'
-    /// drafts.
-    pub(super) fn render_rescue_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The strip under the title bar: the crash notice, and one line for
+    /// closed panes' drafts that opens a list of them, each with its text.
+    /// The open list pushes the panes down instead of drawing over them, so
+    /// browser panes need no overlay flag for it.
+    pub(super) fn render_rescue_strip(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let crash = self.render_crash_notice(cx);
         let closed = if self.rescue.closed_hidden {
             &[][..]
@@ -677,87 +758,169 @@ impl MuxelApp {
         if closed.is_empty() {
             return Some(strip.into_any_element());
         }
-        for (index, kept) in closed.iter().take(STRIP_ROWS).enumerate() {
-            let time = rescue_time(kept.draft.saved_at_ms);
-            let label = match (kept.draft.pane.as_deref(), kept.draft.partial) {
-                (Some(pane), false) => tf(
-                    "Unsent prompt from closed pane “{pane}”, {time}",
-                    &[("pane", pane), ("time", &time)],
-                ),
-                (Some(pane), true) => tf(
-                    "Unsent prompt from closed pane “{pane}”, {time} (partial)",
-                    &[("pane", pane), ("time", &time)],
-                ),
-                (None, false) => tf(
-                    "Unsent prompt from a closed pane, {time}",
-                    &[("time", &time)],
-                ),
-                (None, true) => tf(
-                    "Unsent prompt from a closed pane, {time} (partial)",
-                    &[("time", &time)],
-                ),
-            };
-            let copy_path = kept.path.clone();
-            let discard_path = kept.path.clone();
-            strip = strip.child(
+        let open = self.rescue.closed_open;
+        let count = closed.len();
+        strip =
+            strip.child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(div().truncate().child(label))
+                    .child(
+                        Button::new("rescue-closed-toggle")
+                            .ghost()
+                            .xsmall()
+                            .icon(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .label(tn(
+                                "{n} unsent prompt from a closed pane",
+                                "{n} unsent prompts from closed panes",
+                                count,
+                                &[("n", &count.to_string())],
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rescue.closed_open = !this.rescue.closed_open;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                Button::new(("rescue-copy", index))
-                                    .xsmall()
-                                    .label(t("Copy"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.copy_closed_draft(&copy_path, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new(("rescue-discard", index))
+                            .children(open.then(|| {
+                                Button::new("rescue-discard-all")
                                     .ghost()
                                     .xsmall()
-                                    .label(t("Discard"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.discard_closed_draft(&discard_path, cx)
+                                    .label(t("Discard all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_all_closed_drafts(cx)
+                                    }))
+                            }))
+                            .child(
+                                Button::new("rescue-hide")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(t("Hide"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rescue.closed_hidden = true;
+                                        this.rescue.closed_open = false;
+                                        cx.notify();
                                     })),
                             ),
                     ),
             );
+        if !open {
+            return Some(strip.into_any_element());
         }
-        let more = closed.len().saturating_sub(STRIP_ROWS);
-        strip = strip.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .text_color(cx.theme().muted_foreground)
-                .child(if more > 0 {
-                    tn(
-                        "and {n} more, kept for next time",
-                        "and {n} more, kept for next time",
-                        more,
-                        &[("n", &more.to_string())],
-                    )
-                } else {
-                    t("Kept until you copy or discard them.").to_string()
-                })
-                .child(
-                    Button::new("rescue-hide")
-                        .ghost()
-                        .xsmall()
-                        .label(t("Hide"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.rescue.closed_hidden = true;
-                            cx.notify();
-                        })),
+        // What a prompt's text is laid out in: the strip's font at its size,
+        // across the window less the strip's padding and the text's border
+        // and indent, with a few pixels to spare.
+        let rem = window.rem_size();
+        let size = rems(0.75).to_pixels(rem);
+        let mut style = window.text_style();
+        style.font_family = cx.theme().font_family.clone();
+        let width = window.viewport_size().width - rem * 2.0 - px(6.0);
+        // No glyph is narrower than a fifth of the font's size.
+        let row_chars = (width / (size * 0.2)).ceil().max(1.0) as usize;
+        let mut list = div()
+            .id("rescue-closed-list")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(window.viewport_size().height * 0.4)
+            .overflow_y_scroll();
+        for (index, kept) in closed.iter().enumerate() {
+            let time = rescue_time(kept.draft.saved_at_ms);
+            let label = match (kept.draft.pane.as_deref(), kept.draft.partial) {
+                (Some(pane), false) => tf("“{pane}”, {time}", &[("pane", pane), ("time", &time)]),
+                (Some(pane), true) => tf(
+                    "“{pane}”, {time} (partial)",
+                    &[("pane", pane), ("time", &time)],
                 ),
+                (None, false) => tf("A closed pane, {time}", &[("time", &time)]),
+                (None, true) => tf("A closed pane, {time} (partial)", &[("time", &time)]),
+            };
+            let whole = self.rescue.closed_whole.contains(&kept.path);
+            let clips = whole
+                || Self::preview_clips(&kept.draft.text, width, row_chars, &style, size, window);
+            let text = div()
+                .pl_2()
+                .border_l_2()
+                .border_color(cx.theme().border)
+                .text_color(cx.theme().foreground);
+            let text = if whole {
+                text.child(kept.draft.text.clone())
+            } else {
+                text.child(Self::preview_head(&kept.draft.text, row_chars))
+                    .line_clamp(PREVIEW_ROWS)
+                    .text_ellipsis()
+            };
+            let copy_path = kept.path.clone();
+            let discard_path = kept.path.clone();
+            let whole_path = kept.path.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(div().truncate().child(label))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(("rescue-copy", index))
+                                            .xsmall()
+                                            .label(t("Copy"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.copy_closed_draft(&copy_path, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("rescue-discard", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .label(t("Discard"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.discard_closed_draft(&discard_path, cx)
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(text)
+                    .children(clips.then(|| {
+                        div().child(
+                            Button::new(("rescue-whole", index))
+                                .ghost()
+                                .xsmall()
+                                .label(if whole { t("Show less") } else { t("Show all") })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.rescue.closed_whole.remove(&whole_path) {
+                                        this.rescue.closed_whole.insert(whole_path.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })),
+            );
+        }
+        strip = strip.child(list).child(
+            div()
+                .text_color(cx.theme().muted_foreground)
+                .child(t("Kept until you copy or discard them.")),
         );
         Some(strip.into_any_element())
     }

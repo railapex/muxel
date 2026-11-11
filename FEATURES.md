@@ -1726,7 +1726,10 @@ feature is added or changed, update the matching entry here in the same change**
   save it at once. When muxel sees the prompt submitted in that pane, the saved
   draft goes straight away, even within that second, and the sent prompt still
   on screen isn't saved again until the program redraws its box, even if keys
-  are typed first. Enter after a backslash in Claude starts a new line, so it
+  are typed first. Only the box's text counts, not a menu or footer changing
+  around it, and a program too slow to draw its keys before the Enter (a
+  machine short of memory) can draw the sent prompt after it without that
+  being saved. Enter after a backslash in Claude starts a new line, so it
   isn't taken as sending. What muxel saw typed into the box is kept as typed,
   spaces and line breaks included, when the screen shows that text. A draft
   read from the screen alone is labelled partial, because the screen can't show
@@ -1738,8 +1741,12 @@ feature is added or changed, update the matching entry here in the same change**
   text back into the box as it was saved, line breaks included, and never
   presses Enter, and a prompt with a line break goes to the clipboard instead
   when the program would read it as Enter. A pane closed for good keeps its
-  draft in a strip under the title bar with **Copy** and **Discard**. Grok,
-  Muse, opencode and Amp input boxes are not read yet.
+  draft under the title bar, where one line counts the closed panes' unsent
+  prompts and opens a list, newest first. Each entry shows the prompt's first
+  three lines (**Show all** for the rest), the pane, the time, and **Copy** and
+  **Discard**; **Discard all** sits on the line while the list is open, and
+  **Hide** puts the line away until another pane's draft is kept. Grok, Muse,
+  opencode and Amp input boxes are not read yet.
 - **Unsaved editor changes survive** — an editor with unsaved changes, or an
   input method's uncommitted text, backs them up about a second after edits
   stop; text an input method commits counts as an unsaved change. When it opens
