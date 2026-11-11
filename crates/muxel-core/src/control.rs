@@ -328,6 +328,8 @@ pub enum ErrorCode {
     TmuxPaneUnresolved,
     /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
     TmuxPaneInMode,
+    /// tmux refused the input, or couldn't be run. Nothing was typed.
+    TmuxRefused,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -664,9 +666,9 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits, optionally prefixed by `pane`), a display name or
-/// retained label, or `project/name` when names repeat. Each pane contributes at
-/// most one candidate.
+/// four or more hex digits), a display name or retained label, `project/name`
+/// when names repeat, or an id prefixed by `pane` that no agent's name or label
+/// matches. Each pane contributes at most one candidate.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -681,20 +683,21 @@ pub fn resolve_agent(
             .filter(|id| agents.iter().any(|a| a.id == *id))
             .ok_or_else(|| "no pane is focused".into());
     }
-    let id_query = query
-        .strip_prefix("pane")
-        .filter(|id| id_like(id))
-        .unwrap_or(query);
-    if id_like(id_query) {
+    let by_id = |id_query: &str| -> Option<Result<Uuid, String>> {
         let hits: Vec<&AgentEntry> = agents
             .iter()
             .filter(|a| id_matches(a.id, id_query))
             .collect();
         match hits.as_slice() {
-            [one] => return Ok(one.id),
-            [] => {}
-            many => return Err(ambiguous(query, many)),
+            [one] => Some(Ok(one.id)),
+            [] => None,
+            many => Some(Err(ambiguous(query, many))),
         }
+    };
+    if id_like(query)
+        && let Some(found) = by_id(query)
+    {
+        return found;
     }
     let (project, name) = match query.split_once('/') {
         Some((project, name)) => (Some(normalize(project)), normalize(name)),
@@ -711,9 +714,16 @@ pub fn resolve_agent(
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.id),
-        [] => Err(format!(
-            "no agent matches '{query}' — run `muxel ctl panes` to list them"
-        )),
+        // `pane<ID>` only once no agent has that name or label.
+        [] => query
+            .strip_prefix("pane")
+            .filter(|id| id_like(id))
+            .and_then(&by_id)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "no agent matches '{query}' — run `muxel ctl panes` to list them"
+                ))
+            }),
         many => Err(ambiguous(query, many)),
     }
 }
@@ -1369,7 +1379,7 @@ usage: muxel ctl <command> [args]
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
   new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
-              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
                                  --background is a compatibility no-op; --prompt - reads stdin
@@ -1412,6 +1422,8 @@ Ask returns a pending request id immediately; the CLI polls once per second unti
 Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
 Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
 `--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+With --prompt the reply comes once the pane exists: its task submitted, refused, or prompt_pending with `status` as next.
+`--wait-delivery` keeps reading until the task settles, for up to 90 seconds.
 `--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
 All three grants default off; upgrades do not infer creation permission from the older grants.
@@ -1439,8 +1451,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
-Open a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin and waits for its delivery outcome unless --no-wait. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -2109,6 +2120,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   `screen` before pressing any again.
 - `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
   copy mode before retrying. A failure after a paste instead has `pasted: true`.
+- `tmux_refused` - tmux refused the input or couldn't be run; nothing was
+  typed. Check `screen` before retrying.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2150,8 +2163,13 @@ also withhold Enter and return an error without a code; inspect the input first.
   describes an observed draft; it does not guard or authorize a later Enter.
   `not_delivered` means nothing was typed; resolve its refusal before
   sending the task. Never repeat `new`; use its existing pane. `new --prompt`
-  waits for provider input readiness and acceptance;
-  `--no-wait` returns `prompt_pending` and a read-only next command. `status` and
+  replies once the pane exists, with the task `submitted`, refused, or still
+  `prompt_pending` with `status` as `next`; `--wait-delivery` reads until it
+  settles, for up to 90 seconds. `--no-wait` replies before approval, with
+  `new-status` as `next`. A failed `send` or `new --prompt` has an `outcome`
+  too: `not_delivered` only for a coded refusal before any input, otherwise
+  `unconfirmed`, as when `new`'s approval poll is lost while the task can
+  still arrive. Other commands' failures carry no outcome. `status` and
   `show.agent` include `prompt_delivery`. A folder trust, update or login blocker
   reports `blocked_by` and `screen_excerpt`; leave trust decisions to the user.
 - Only type into shell panes (`"is_agent": false`) when the user asks; muxel
@@ -2404,6 +2422,7 @@ mod tests {
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
             (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
+            (ErrorCode::TmuxRefused, "tmux_refused"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
@@ -2704,6 +2723,28 @@ mod tests {
                 .contains("more than one")
         );
         assert_eq!(resolve_agent("panebench", &agents, None), Ok(a));
+    }
+
+    #[test]
+    fn a_name_spelled_like_a_pane_id_resolves_to_its_own_agent() {
+        let named = id(0x0000aaaa_0000_0000_0000_000000000001);
+        let other = id(0x12340000_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: named,
+                name: "pane1234",
+                label: None,
+                project: "sample",
+            },
+            AgentEntry {
+                id: other,
+                name: "other",
+                label: None,
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1234", &agents, None), Ok(named));
+        assert_eq!(resolve_agent("pane12340000", &agents, None), Ok(other));
     }
 
     #[test]

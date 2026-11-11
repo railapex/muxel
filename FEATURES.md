@@ -107,10 +107,12 @@ feature is added or changed, update the matching entry here in the same change**
   active pane.
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
-  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
-  split buttons and dragging a tab to an edge still make a new pane. In a
-  per-monitor project window, the toolbar and shortcuts act on that window's
-  project.
+  a column. Settings → Behavior → **New agents open** switches them to **In a new
+  pane** instead, which opens each one in a pane of its own to the right of the
+  focused pane. An empty project gets its first pane either way. New Tab, New
+  Pane, Split Right/Down, the split buttons and dragging a tab to an edge keep
+  doing what they say, whatever the setting. In a per-monitor project window,
+  the toolbar and shortcuts act on that window's project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -604,36 +606,20 @@ feature is added or changed, update the matching entry here in the same change**
   pushing status out of the sidebar. Title-derived lifecycle and automatic-name
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
-  Provider-owned screen rows can add precise state that titles omit. Claude
-  permission forms report **blocked**. Claude's footer and Grok's panel list
-  background work in supported layouts and wording; Codex's terminal badge and
-  Muse's terminal tree add live shell counts. The screen readers cover tmux and
-  SSH panes too. Only subagents hold a finished foreground turn at **working**,
-  for at most three hours. A held turn doesn't alert or move in Recent; it reads
-  **done** once when its hold ends and the agent has had a moment to wake. Shell
-  and monitor counts remain visible beside the activity label without delaying
-  Done, notifications, Recent work or plain `ctl wait`. An authoritative foreground
-  **working** report still wins, including Codex's report while a background
-  terminal runs. Neither plain wait nor `--turn` can override it. Interruptible
-  legacy command rows remain foreground work; unknown task kinds are not counted.
-  Local Codex panes also read direct child-turn lifecycle records for turns started
-  during the current pane launch; their normal composer has no live child count.
-  Panes identified later also pick up qualifying children already running beside
-  them. Copied history and children left by an earlier launch do not count.
-  Catch-up and incomplete records stay pending under a shared worker read budget,
-  separately from a confirmed result with no active children. Excluded paths advance
-  traversal, so unrelated rollouts do not starve a matching child's catch-up.
-  Unreadable terminal chrome can preserve a known shell count without establishing
-  a subagent hold. A released foreground turn stays released through redraws or
-  stale evidence until new foreground work runs. Codex screen checks exclude the
-  live composer and reconstruct wrapped badges. Provider layout or wording changes
-  can require new fixtures. Muse's completion hook can retire a leftover spinner
-  title after five seconds without output or a title update; redraws do not revive
-  it. New titles and Working hooks remain valid work signals. Closing a pane asks
-  while anything is listed as running; `ctl status` reports counts as `background`.
-  A background-only held turn leaves its composer available to `ctl send`. Plain
-  wait follows a subagent hold; `--turn` stops at an observable foreground turn end.
-  Both return the available background metadata. Claude's
+  Provider-owned screen rows can add precise state that titles omit: Claude
+  permission forms report **blocked**. Subagents listed by Claude's footer or
+  Grok's panel hold a finished turn at **working** (`working · subagents`) for up
+  to three hours, with no done alert or Recent move until the listing clears; a
+  released turn isn't held again until new foreground work runs. Shell and monitor
+  listings show beside the status (`done · 3m · 1 shell`) without delaying
+  completion. Codex's terminal badge and Muse's terminal tree also supply shell
+  counts. Local Codex panes read direct child-turn records from the current pane
+  launch; incomplete reads stay separate from a current result with no active
+  children. Older Claude's `command still running` row reads **working** unless
+  a current empty footer is drawn below it. Closing a pane asks while anything is
+  listed, `ctl status` and `ctl wait` report it as `background`, plain `ctl wait`
+  waits out subagent holds (`--turn` doesn't), and `ctl send` still delivers to a
+  held pane once its status belongs to the current conversation. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity
@@ -649,7 +635,9 @@ feature is added or changed, update the matching entry here in the same change**
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**. On a
   Claude pane, built-in and edited lists alike match outside its input box,
-  alongside Claude's own status-row and permission-form parsers.
+  alongside Claude's own status-row and permission-form parsers. The status row
+  reads Working on every frame of its spinner, with or without an arrow before the
+  token count, so a remote Claude pane doesn't flash Done between frames.
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell, never from a quiet spell — so
   an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
@@ -1242,22 +1230,31 @@ feature is added or changed, update the matching entry here in the same change**
   All unsubmitted outcomes recommend read-only screen inspection. A pending
   receipt describes the draft observed at that time and cannot guard a later
   Enter; never paste the task again after uncertain delivery. Startup pending
-  proof preserves exact whitespace; ambiguous layout stays unconfirmed. Agent
-  IDs also
-  accept the `pane<ID>` spelling.
-- **Startup input waits for the provider** — `new --prompt` waits for a real
-  editable composer and provider acceptance. Known folder trust, update and
-  login menus stop delivery with `blocked_by` and a short `screen_excerpt`;
-  trust prompts are never answered automatically. `--no-wait` returns
-  `prompt_pending` and a polling command. Status exposes the same delivery facts.
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
+  `send` or `new --prompt` is `not_delivered` only when a coded refusal came
+  before any input; other commands' failures carry no outcome. A send watches
+  for its receipt for ten seconds, a second longer for each thousand characters
+  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
+  spelling when no agent has that name.
+- **Startup input waits for the provider** — a `new --prompt` task waits for a
+  real editable composer and provider acceptance. The reply comes once the pane
+  exists, with the task submitted, refused, or `prompt_pending` and a `status`
+  command to follow; `--wait-delivery` reads until it settles, for up to 90
+  seconds. Known folder trust, update and login menus stop delivery as soon as
+  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
+  never answered automatically. `--no-wait` returns before approval with a
+  polling command. Status exposes the same delivery facts.
   Codex launches carrying a startup task suppress its startup update menu.
 - **Windows Codex multiline control** — native presets disable heuristic paste
-  bursts only after a version probe verifies the matching input codec. Older
-  versions and failed probes receive no automatic paste-burst override. With
-  verified, configured
+  bursts only after a version probe verifies the matching input codec. The
+  probe runs once per Codex executable (again after it changes) on its own
+  thread; a launch waits for it at most two seconds, and a slower probe still
+  answers later launches. Older versions and failed probes receive no automatic
+  paste-burst override. With verified, configured
   Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
-  blank lines and Unicode; CRLF becomes one newline. Unsupported control
-  characters, including tabs, refuse the whole paste before any write.
+  blank lines and Unicode; CRLF becomes one newline. Clipboard and startup text
+  turn tabs into spaces to the next four-column stop. Other control characters,
+  and tabs in ctl input, refuse the whole paste before any write.
   Clipboard refusals appear in the error feed; ordinary clipboard ESC
   sanitization remains. Saved snippets and dictated transcripts also report
   paste failures and cancel automatic submission. Unverified
@@ -1296,6 +1293,12 @@ feature is added or changed, update the matching entry here in the same change**
   trusted. The check goes by process id alone, so if that id has since gone to
   another process, the file still passes. On Linux and macOS that is any process;
   on Windows it is one the user may open, such as one of their own.
+- **With several windows open** — each muxel window also writes its endpoint
+  into the folder of the workspace it has open, so `muxel ctl` run in a pane
+  reaches the window holding that pane, not whichever window started last.
+  Outside tools reach the window that wrote `control.json` most recently while
+  it has a workspace open; otherwise (it's still on the workspace selector, or
+  it has closed) they reach the window with a workspace that published last.
 - **Settings → Outside control** — a setup page that walks through connecting
   another agent in four steps: turn on outside control (with a live status: on and
   listening, starting, or off), let the agent run commands on this computer (with
@@ -1924,6 +1927,8 @@ feature is added or changed, update the matching entry here in the same change**
   unattended can't resize a session you're using from another computer. Once you
   type, paste, click or scroll in a terminal on that machine, its panes take part in
   the size again, and the window follows whoever used it last, as tmux always does.
+  A host's panes take the size back together in one ssh, and one that can't reach
+  its host tries again shortly instead of staying cropped to another client's size.
   A pane alone in its session attaches normally and always follows its own size;
   with tmux older than 3.2 on the host, panes attach the old way.
 - **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
@@ -1991,12 +1996,23 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Workspaces** — multiple workspaces, each with its own projects + layout; a startup workspace
   selector.
+- **Multiple windows** — **New Window** (`Ctrl+Shift+N`, rebindable; also `Cmd+N`
+  on macOS, the macOS **File** and Dock menus, the command palette and the
+  workspace selector) opens another muxel window, so two workspaces can be worked
+  in at once on macOS, Windows and Linux. It opens on the workspace selector, a
+  little offset from the window that opened it. In a window that already has a
+  workspace, the selector's ↗ button beside another workspace opens that one in a
+  new window instead of switching. Each window is its own muxel process with the
+  same `--user-data-dir`, so closing or quitting one leaves the others running,
+  and each keeps its own tray icon.
 - **Single instance per workspace** — each workspace is locked while open, so two
   muxel windows can run side by side on **different** workspaces but never the same
-  one (which would clobber its layout). Picking a workspace another window already
-  holds is refused in the selector with an inline "in use" note; pick a different one
-  or close the other window. The lock releases when you switch workspaces or on exit
-  (even a crash), so no stale lock blocks the next launch.
+  one (which would clobber its layout). The selector marks workspaces another
+  window has open as "in use" and won't delete them; picking one is refused with an
+  inline note, so pick a different one or close the other window. Workspaces
+  created in one window are listed in the others, and changes to the workspace
+  list never drop one another window just made. The lock releases when you switch
+  workspaces or on exit (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
 - **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box,

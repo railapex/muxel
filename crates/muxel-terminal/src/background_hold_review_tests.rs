@@ -120,18 +120,26 @@ struct Probe {
     start: Instant,
 }
 
-impl Probe {
-    fn new() -> Self {
-        #[cfg(windows)]
-        let command = CommandSpec::program(
+/// A child that only waits for input, so the test alone writes the screen.
+fn inert_command() -> CommandSpec {
+    if cfg!(windows) {
+        CommandSpec::program(
             "cmd.exe",
             vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
-        );
-        #[cfg(unix)]
-        let command = CommandSpec::program("/bin/cat", vec![]);
-        let (session, receiver) =
-            TerminalSession::spawn(command.with_binding(LaunchBinding::Known(None)), 100, 24)
-                .expect("spawn inert review fixture");
+        )
+    } else {
+        CommandSpec::program("/bin/cat", vec![])
+    }
+}
+
+impl Probe {
+    fn new() -> Self {
+        let (session, receiver) = TerminalSession::spawn(
+            inert_command().with_binding(LaunchBinding::Known(None)),
+            100,
+            24,
+        )
+        .expect("spawn inert review fixture");
         Self {
             session,
             _receiver: receiver,
@@ -530,4 +538,65 @@ fn pr136_shared_hidden_footer_releases_once_in_the_runtime() {
     );
     assert_eq!(returned.completion_revision, released.completion_revision);
     assert_eq!(probe.runtime.launch_completion_revision, 1);
+}
+
+/// A tmux pane forwards neither Claude's title nor its 7501 reports, so its
+/// spinner row is the turn's only evidence, and Claude redraws that row with a
+/// new glyph every frame. Each frame must read Working: one that doesn't is a
+/// Working→Idle edge, which latches Done, and the pane flashes Done/Working.
+#[test]
+fn every_claude_spinner_frame_reads_working_without_a_title() {
+    let rule = "─".repeat(100);
+    let screen = |row: &str| {
+        format!(
+            "Claude Code v2.1.318\n❯ Run the tests.\n● Running the suite.\n\n{row}\n\n{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents"
+        )
+    };
+    let (session, _receiver) =
+        TerminalSession::spawn(inert_command(), 100, 24).expect("spawn inert fixture");
+    let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+    let working = vec!["esc to interrupt".to_string()];
+    let start = Instant::now();
+    let mut seen = Vec::new();
+    let frames = ["✻", "✶", "✽", "✢", "·", "✳"];
+    for (index, row) in std::iter::once(String::new())
+        .chain(
+            frames
+                .iter()
+                .map(|g| format!("{g} Brewing… (5s · ↓ 120 tokens)")),
+        )
+        .chain(std::iter::once(
+            "✻ Brewing… (27m 39s · 12.3k tokens)".to_string(),
+        ))
+        .enumerate()
+    {
+        if index == 1 {
+            session
+                .try_write_submission(b"\r", crate::Submission::Turn)
+                .expect("submit the turn");
+        }
+        let mut wire = "\x1b[2J\x1b[H\x1b[?2004h".to_string();
+        for (line, text) in screen(&row).lines().enumerate() {
+            wire.push_str(&format!("\x1b[{};1H{text}", line + 1));
+        }
+        wire.push_str("\x1b[8;3H\x1b[?25h");
+        session.process_output(wire.as_bytes());
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &working,
+            &[],
+            false,
+            start + Duration::from_millis(100 * index as u64),
+        );
+        seen.push(runtime.snapshot(&session).status);
+    }
+    session.kill();
+    assert_eq!(seen[0], AgentStatus::Idle);
+    assert!(
+        seen[1..]
+            .iter()
+            .all(|status| *status == AgentStatus::Working),
+        "{seen:?}"
+    );
 }

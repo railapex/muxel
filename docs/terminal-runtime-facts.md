@@ -544,9 +544,10 @@ completion without inventing a running count; later refreshes continue from the
 cached byte offset. Shell-chrome uncertainty is separate and cannot confirm child
 work. Unconfirmed holds are not new activity or completion edges. Plain `ctl wait`
 follows the hold until the evidence is current or the cap expires. A current-binding
-background-only hold leaves the foreground composer available to send and `--turn`,
-even while completion attribution is suppressed. Foreground working/blocked markers
-prevent fallback evidence from becoming that background-only exception.
+background turn end remains observable to `--turn`. Ordinary sends additionally need
+an attributable status, so unconfirmed child catch-up does not free the composer.
+Foreground working/blocked markers prevent fallback evidence from becoming that
+background-only exception.
 Directory discovery, retained-file metadata checks and notification setup also cost
 work outside that read allowance, so it is not a hard wall-clock limit for the worker.
 Results are guarded by parent session, launch and binding. Only child turns
@@ -572,17 +573,19 @@ turn's end. Shell and monitor metadata do not delay it. `ctl wait --turn` stops 
 an observable turn end with
 background work still listed. It cannot override a provider's continuing Working
 report. Send admission and the background turn-end decision require the hold's
-binding revision to match the current conversation. Completion attribution stays
-separate. A surviving current-binding subagent hold after `/clear` can leave the
-current composer free without updating activity. Foreground working/blocked markers prevent that
-background-only exception. Cached holds from before reconciliation cannot authorize
-input or finish a wait.
+binding revision to match the current conversation. Send admission also requires
+an attributable status, so a listing never admits input while a switch settles or
+the screen is held after one, including unconfirmed child reads. Completion
+attribution remains separate from the turn end that `--turn` observes. Foreground
+working/blocked markers prevent the background-only send exception. Legacy
+foreground-command rows retain their Working refusal. Cached holds from before
+reconciliation or a previous binding cannot authorize input or finish a wait.
 
 A held turn publishes no completion. The report that started the hold would otherwise
 stamp the pane as finished. The release is its own status change. A surviving shell listing
-after `/clear` is metadata and creates no foreground turn or completion. A current
-subagent hold can leave the composer available while completion attribution is
-suppressed by the conversation switch. Both Windows
+after `/clear` is metadata and creates no foreground turn or completion. A surviving
+subagent hold after a conversation switch cannot admit sends until its status is
+attributable to the new binding. Both Windows
 paths need a real run: a plain build uses the system console, where Claude sends no
 reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
 A hook would add exact kinds

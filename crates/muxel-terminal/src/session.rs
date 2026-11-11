@@ -4491,41 +4491,15 @@ fn push_mouse_report(
     }
 }
 
+/// The `--version` output of the Codex a launch runs, from
+/// [`crate::codex_version`]: asked once per executable, on its own thread.
 #[cfg(windows)]
 fn codex_control_version(program: &str) -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let program = literal_program_for_spawn(program).ok()?;
-    let mut child = Command::new(program)
-        .arg("--version")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let mut output = String::new();
-    child
-        .stdout
-        .take()?
-        .take(4096)
-        .read_to_string(&mut output)
-        .ok()?;
-    Some(output)
+    crate::codex_version::version(
+        std::path::Path::new(&program),
+        crate::codex_version::LAUNCH_WAIT,
+    )
 }
 
 #[cfg(not(windows))]
@@ -9583,7 +9557,7 @@ mod clipboard_refusal_tests {
         })));
         let mut cx = TestAppContext::single();
         cx.skip_drawing();
-        for control in ['\t', '\0', '\u{8}', '\u{7f}', '\u{85}'] {
+        for control in ['\0', '\u{8}', '\u{7f}', '\u{85}'] {
             cx.update(|cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("prefix{control}suffix")));
                 crate::paste_clipboard_into_session(&session, cx);
@@ -9598,10 +9572,10 @@ mod clipboard_refusal_tests {
         );
         assert_eq!(
             refused.len(),
-            5,
+            4,
             "each refusal must reach the user-facing error handler"
         );
-        assert!(refused[0].contains("U+0009"));
+        assert!(refused[0].contains("U+0000"));
     }
 }
 

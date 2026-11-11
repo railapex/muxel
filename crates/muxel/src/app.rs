@@ -4521,6 +4521,20 @@ pub fn register_actions(cx: &mut App) {
             app.update(cx, |this, cx| this.set_language(a.0.clone(), cx));
         }
     });
+    // New Window comes from a shortcut in any muxel window, the palette, or the
+    // macOS menu bar and Dock menu, which work with no window focused.
+    cx.on_action(|_: &NewWindow, cx| match cx.try_global::<MuxelHandle>() {
+        Some(handle) => {
+            if let Some(app) = handle.0.upgrade() {
+                app.update(cx, |this, _| this.open_new_window(None));
+            }
+        }
+        None => {
+            if let Err(error) = crate::new_window::open(None) {
+                log::warn!("couldn't open a new window: {error:#}");
+            }
+        }
+    });
     // Cmd+Q (macOS) / Ctrl+Q: route to the same confirm flow as the title-bar
     // close button. Registered globally (not on the main view) so it also fires
     // on the first-run screens, whose render path omits the main element.
@@ -4578,15 +4592,20 @@ actions!(muxel, [HideApp, HideOtherApps, ShowAllApps]);
 /// labels are translated when set.
 #[cfg(target_os = "macos")]
 pub fn install_app_menu(cx: &mut App) {
-    cx.set_menus([gpui::Menu::new("muxel").items([
-        gpui::MenuItem::os_submenu(t("Services"), gpui::SystemMenuType::Services),
-        gpui::MenuItem::separator(),
-        gpui::MenuItem::action(t("Hide muxel"), HideApp),
-        gpui::MenuItem::action(t("Hide Others"), HideOtherApps),
-        gpui::MenuItem::action(t("Show All"), ShowAllApps),
-        gpui::MenuItem::separator(),
-        gpui::MenuItem::action(t("Quit muxel"), Quit),
-    ])]);
+    cx.set_menus([
+        gpui::Menu::new("muxel").items([
+            gpui::MenuItem::os_submenu(t("Services"), gpui::SystemMenuType::Services),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action(t("Hide muxel"), HideApp),
+            gpui::MenuItem::action(t("Hide Others"), HideOtherApps),
+            gpui::MenuItem::action(t("Show All"), ShowAllApps),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action(t("Quit muxel"), Quit),
+        ]),
+        gpui::Menu::new(t("File")).items([gpui::MenuItem::action(t("New Window"), NewWindow)]),
+    ]);
+    // Right-clicking the Dock icon offers it too.
+    cx.set_dock_menu(vec![gpui::MenuItem::action(t("New Window"), NewWindow)]);
 }
 
 // Keyboard-driven actions, handled by the root view (so they have `&mut Window`)
@@ -4646,6 +4665,8 @@ actions!(
         ToggleFullScreen,
         // Toggle the developer console (error log) — only when enabled in settings.
         ToggleDevConsole,
+        // Open another muxel window (a new process) on the workspace selector.
+        NewWindow,
         // Search the active terminal's scrollback (Terminal context only).
         SearchTerminal,
         // Tab / Shift+Tab while a terminal is focused: send to the PTY instead
@@ -4711,6 +4732,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
+        "NewWindow" => KeyBinding::new(keystroke, NewWindow, context),
         // NewAgent1..9 — the trailing digit is the 1-based preset index.
         a if a.starts_with("NewAgent") => {
             match a
@@ -4792,6 +4814,8 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     #[cfg(target_os = "macos")]
     {
         bindings.push(KeyBinding::new("cmd-h", HideApp, None));
+        // The Mac's standard New Window chord, beside the rebindable one.
+        bindings.push(KeyBinding::new("cmd-n", NewWindow, None));
         bindings.push(KeyBinding::new("alt-cmd-h", HideOtherApps, None));
     }
     cx.bind_keys(bindings);
@@ -7163,6 +7187,11 @@ pub struct MuxelApp {
     /// window size; it claims it once someone is at this machine. Cleared on every
     /// (re)spawn. Runtime-only.
     size_claimed: HashSet<Uuid>,
+    /// Panes whose size claim couldn't reach their host: how many tries in a row
+    /// failed, and when the last one did. A failed claim is retried after
+    /// [`reattach_backoff`]. Cleared on success and on every (re)spawn.
+    /// Runtime-only.
+    size_claim_failures: HashMap<Uuid, (u32, Instant)>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -7288,6 +7317,9 @@ pub struct MuxelApp {
     /// holds open — surfaced as an inline note in the selector. Cleared on a
     /// successful entry or when the selector is dismissed.
     workspace_busy: Option<Uuid>,
+    /// Workspaces another muxel window had open when the selector last looked,
+    /// marked "in use" there. A snapshot: entering one still checks its lock.
+    workspaces_in_use: HashSet<Uuid>,
     /// "New workspace" name editor used in the selector.
     workspace_name_input: Entity<InputState>,
     /// Settings modal size (resizable via the bottom-right corner).
@@ -7547,6 +7579,7 @@ enum PaletteCommand {
     ReadAloudRestart,
     ReadAloudStop,
     CopyRichText,
+    NewWindow,
     RunRunner(usize),
     SendSnippet(usize),
 }
@@ -9587,6 +9620,7 @@ impl MuxelApp {
             workspace_lock: None,
             rescue: rescue::Rescue::default(),
             workspace_busy: None,
+            workspaces_in_use: HashSet::new(),
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
@@ -9692,6 +9726,7 @@ impl MuxelApp {
             reconnecting: HashMap::new(),
             host_outages: HostOutages::default(),
             size_claimed: HashSet::new(),
+            size_claim_failures: HashMap::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -9859,11 +9894,22 @@ impl MuxelApp {
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
-        // A UAT run enters its seeded current workspace after first-run terms.
-        if !this.show_terms
+        this.refresh_workspace_selector();
+        // New Window asked for one workspace: open it, unless it's gone from the
+        // index (then the selector shows). One open elsewhere meanwhile is
+        // refused by its lock and marked in the selector, like a click would be.
+        if let Some(id) = crate::new_window::launch_request()
+            .workspace
+            .filter(|id| this.workspaces.workspaces.iter().any(|w| w.id == *id))
+        {
+            cx.defer_in(window, move |this, window, cx| {
+                this.enter_workspace(id, window, cx)
+            });
+        } else if !this.show_terms
             && crate::uat_root::active()
             && let Some(id) = this.workspaces.current
         {
+            // A UAT run enters its seeded current workspace after first-run terms.
             cx.defer_in(window, move |this, window, cx| {
                 this.enter_workspace(id, window, cx);
             });
@@ -10114,17 +10160,28 @@ impl MuxelApp {
             .iter()
             .filter(|(iid, _)| !self.is_closing(**iid))
             .filter(|(iid, view)| {
-                let session = view.read(cx).session();
+                let view = view.read(cx);
+                let session = view.session();
                 !self.size_claimed.contains(iid)
+                    // A dropped pane has no client to claim for; its reattach does.
+                    && !view.exited()
                     // Attached by now: its client has drawn, so it recorded itself.
                     && session.has_output()
                     && self
                         .terminal_launches
                         .get(iid)
                         .is_some_and(|&(launched, _)| present_at > launched)
+                    && self
+                        .size_claim_failures
+                        .get(iid)
+                        .is_none_or(|&(failures, at)| {
+                            at.elapsed() >= reattach_backoff(Some(failures.saturating_sub(1)))
+                        })
             })
             .map(|(iid, _)| *iid)
             .collect();
+        // One ssh per host: see `ssh::claim_window_sizes_command`.
+        let mut by_host: HashMap<Uuid, (RemoteHost, Vec<(Uuid, SessionTarget)>)> = HashMap::new();
         for iid in due {
             self.size_claimed.insert(iid);
             let Some(host) = self.remote_host_for_instance(iid) else {
@@ -10137,24 +10194,60 @@ impl MuxelApp {
                 continue;
             }
             let session = inst.tmux_target(&host.name);
+            by_host
+                .entry(host.id)
+                .or_insert_with(|| (host, Vec::new()))
+                .1
+                .push((iid, session));
+        }
+        for (host, claims) in by_host.into_values() {
             let tag = Self::tmux_client_tag(&host);
             let control_path = Self::commands_control_path(host.id);
             let password = self.remote_password(&host);
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(e) = integrations::claim_tmux_window_size(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                        &tag,
-                    ) {
-                        muxel_store::append_event_log(&format!(
-                            "window size claim failed for [{session}]: {e:#}"
-                        ));
+            cx.spawn(async move |this, cx| {
+                let sessions: Vec<SessionTarget> =
+                    claims.iter().map(|(_, session)| session.clone()).collect();
+                let claimed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        integrations::claim_tmux_window_sizes(
+                            &host,
+                            &control_path,
+                            password.as_deref(),
+                            &sessions,
+                            &tag,
+                        )
+                    })
+                    .await;
+                let _ = this.update(cx, |this, _| {
+                    for (iid, session) in claims {
+                        match &claimed {
+                            Ok(()) => {
+                                this.size_claim_failures.remove(&iid);
+                            }
+                            // Left unclaimed, the client sits out the size until it
+                            // next reattaches, and tmux keeps drawing the window at
+                            // another client's size. Try again after a backoff.
+                            Err(e) => {
+                                muxel_store::append_event_log(&format!(
+                                    "window size claim failed for [{session}]: {e:#}"
+                                ));
+                                if !this.terminals.contains_key(&iid) {
+                                    continue;
+                                }
+                                this.size_claimed.remove(&iid);
+                                let failures = this
+                                    .size_claim_failures
+                                    .get(&iid)
+                                    .map_or(1, |&(failures, _)| failures.saturating_add(1));
+                                this.size_claim_failures
+                                    .insert(iid, (failures, Instant::now()));
+                            }
+                        }
                     }
-                })
-                .detach();
+                });
+            })
+            .detach();
         }
     }
 
@@ -10906,6 +10999,7 @@ impl MuxelApp {
         self.exit_logged.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
         self.size_claimed.remove(&iid);
+        self.size_claim_failures.remove(&iid);
         // Re-baseline auto-continue against the new screen (keeping its Auto toggle):
         // otherwise a reattach's replayed scrollback is compared to the old
         // fingerprint/cooldown and can fire `continue` again for already-done work.
@@ -13471,6 +13565,7 @@ impl MuxelApp {
             muxel_store::WorkspaceLock::Held(lock) => lock,
             muxel_store::WorkspaceLock::Busy => {
                 self.workspace_busy = Some(id);
+                self.workspaces_in_use.insert(id);
                 self.show_workspace_selector = true;
                 cx.notify();
                 return;
@@ -13603,15 +13698,11 @@ impl MuxelApp {
         self.active_instance = None;
 
         self.current_workspace = Some(id);
-        self.workspaces.current = Some(id);
-        let save_index = {
+        {
             let _phase = ui_profile::phase("workspace", "save-index", None);
-            muxel_store::save_workspaces_index(&self.workspaces)
-        };
-        match save_index {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+            self.update_workspaces_index(|index| index.current = Some(id));
         }
+        self.workspaces_in_use.remove(&id);
 
         let loaded = {
             let _phase = ui_profile::phase("workspace", "load-document", None);
@@ -13656,11 +13747,12 @@ impl MuxelApp {
     /// Create a new (empty) workspace and enter it.
     fn create_workspace(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let id = Uuid::new_v4();
-        self.workspaces.workspaces.push(WorkspaceMeta { id, name });
-        match muxel_store::save_workspaces_index(&self.workspaces) {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
-        }
+        self.update_workspaces_index(|index| {
+            index.workspaces.push(WorkspaceMeta {
+                id,
+                name: name.clone(),
+            })
+        });
         self.enter_workspace(id, window, cx);
     }
 
@@ -13682,10 +13774,60 @@ impl MuxelApp {
 
     /// Reopen the selector to switch workspaces (pre-selects the current one).
     fn open_workspace_selector(&mut self, cx: &mut Context<Self>) {
+        self.refresh_workspace_selector();
         self.workspaces.current = self.current_workspace;
         self.workspace_busy = None;
         self.show_workspace_selector = true;
         cx.notify();
+    }
+
+    /// Start another muxel window: on the workspace selector, or straight into
+    /// `workspace`. A failure to start it is reported in the feed.
+    fn open_new_window(&mut self, workspace: Option<Uuid>) {
+        if let Err(error) = crate::new_window::open(workspace) {
+            log::warn!("couldn't open a new window: {error:#}");
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't open a new window"),
+                format!("{error:#}"),
+            );
+        }
+    }
+
+    /// Re-read the shared workspaces index, so workspaces made in another muxel
+    /// window are listed, and note which ones another window has open.
+    fn refresh_workspace_selector(&mut self) {
+        let path = muxel_store::workspaces_index_path();
+        if let Some(index) = path
+            .filter(|p| p.exists())
+            .map(|p| muxel_store::load_workspaces_index_from(&p))
+            .filter(|index| !index.workspaces.is_empty())
+        {
+            self.workspaces = index;
+        }
+        let current = self.current_workspace;
+        self.workspaces_in_use = self
+            .workspaces
+            .workspaces
+            .iter()
+            .map(|w| w.id)
+            .filter(|&id| Some(id) != current && muxel_store::workspace_in_use(id))
+            .collect();
+    }
+
+    /// Apply `change` to the workspaces index other muxel windows share, then
+    /// adopt the merged result. On a failed save the change still applies here.
+    fn update_workspaces_index(&mut self, change: impl Fn(&mut WorkspacesIndex)) {
+        match muxel_store::update_workspaces_index(&self.workspaces, &change) {
+            Ok(index) => {
+                self.workspaces = index;
+                self.clear_save_error(SaveTarget::WorkspaceIndex);
+            }
+            Err(e) => {
+                change(&mut self.workspaces);
+                self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}"));
+            }
+        }
     }
 
     /// Derive a project name from a folder path.
@@ -17090,14 +17232,39 @@ impl MuxelApp {
         );
     }
 
-    /// Open preset number `n` (1-based, in the preset list order) as a new tab
-    /// in the active pane, like the toolbar's agent button (bound to
+    /// Open preset number `n` (1-based, in the preset list order) where the
+    /// setting puts new agents, like the toolbar's agent button (bound to
     /// Ctrl+Alt+1..9). Out-of-range `n` is ignored.
     fn new_agent_preset(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = n.checked_sub(1).filter(|i| *i < self.presets.len()) else {
             return;
         };
-        self.place_with_preset(self.active_instance, PlacementMode::Tab, idx, window, cx);
+        let placement = self.new_agent_placement();
+        self.place_with_preset(self.active_instance, placement, idx, window, cx);
+    }
+
+    /// The toolbar's agent button: the current preset, where the setting puts
+    /// new agents.
+    fn new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placement = self.new_agent_placement();
+        self.place_with_preset(
+            self.active_instance,
+            placement,
+            self.current_preset,
+            window,
+            cx,
+        );
+    }
+
+    /// Settings → Behavior → "New agents open": a tab in the focused pane, or a
+    /// pane of their own to its right. An empty project gets its first pane
+    /// either way.
+    fn new_agent_placement(&self) -> PlacementMode {
+        if self.settings.new_agents_open_as_panes() {
+            PlacementMode::Split(SplitDirection::Horizontal)
+        } else {
+            PlacementMode::Tab
+        }
     }
 
     /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
@@ -18690,6 +18857,7 @@ impl MuxelApp {
             ToggleSidebar,
             ToggleDashboard,
             OpenSettings,
+            NewWindow,
             ReadAloud,
         ];
         // Start over / stop only mean something once there is a reading.
@@ -18755,6 +18923,7 @@ impl MuxelApp {
             PaletteCommand::ReadAloudRestart => t("Start reading aloud over").into(),
             PaletteCommand::ReadAloudStop => t("Stop reading aloud").into(),
             PaletteCommand::CopyRichText => t("Copy as rich text").into(),
+            PaletteCommand::NewWindow => t("New window").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -18811,6 +18980,7 @@ impl MuxelApp {
                     self.copy_rich_text(iid, cx);
                 }
             }
+            PaletteCommand::NewWindow => self.open_new_window(None),
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
             PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
@@ -23834,7 +24004,24 @@ impl MuxelApp {
         let held = if current {
             self.workspace_lock.take()
         } else {
-            None
+            // Another muxel window has it open: deleting its files under it
+            // would leave that window saving a workspace no longer listed. It
+            // stays listed, marked in use, to delete once that window lets go.
+            match muxel_store::try_lock_workspace(id) {
+                muxel_store::WorkspaceLock::Held(lock) => Some(lock),
+                muxel_store::WorkspaceLock::Busy => {
+                    self.workspace_busy = Some(id);
+                    self.workspaces_in_use.insert(id);
+                    cx.notify();
+                    return;
+                }
+                // Another window deleted it after this one listed it.
+                muxel_store::WorkspaceLock::Deleted => {
+                    self.forget_deleted_workspace(id);
+                    cx.notify();
+                    return;
+                }
+            }
         };
         // Then its deletion is recorded, before the index forgets it: a crash
         // from here on leaves nothing it kept once muxel starts again.
@@ -23863,10 +24050,13 @@ impl MuxelApp {
                 return;
             }
         };
-        self.workspaces.workspaces.retain(|p| p.id != id);
-        if self.workspaces.current == Some(id) {
-            self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
-        }
+        // Applied to the index as the other muxel windows last saved it.
+        self.update_workspaces_index(|index| {
+            index.workspaces.retain(|p| p.id != id);
+            if index.current == Some(id) {
+                index.current = index.workspaces.first().map(|p| p.id);
+            }
+        });
         if current {
             // Its panes stop saving into the directory about to go.
             self.point_rescue_writers(None, cx);
@@ -23875,10 +24065,6 @@ impl MuxelApp {
         }
         if self.workspace_busy == Some(id) {
             self.workspace_busy = None;
-        }
-        match muxel_store::save_workspaces_index(&self.workspaces) {
-            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
-            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
         }
         #[cfg(test)]
         if STOP_AFTER_INDEX_SAVE.with(std::cell::Cell::get) {
@@ -28624,6 +28810,10 @@ impl MuxelApp {
             let name = meta.name.clone();
             let selected = current == Some(id);
             let entity = cx.entity();
+            let in_use = self.workspace_busy == Some(id) || self.workspaces_in_use.contains(&id);
+            // From a window that already has a workspace, a free one can open
+            // beside it instead of replacing it.
+            let can_open_beside = self.current_workspace.is_some_and(|c| c != id) && !in_use;
             list =
                 list.child(
                     div()
@@ -28665,13 +28855,34 @@ impl MuxelApp {
                         )
                         .child(Icon::new(IconName::Folder).small())
                         .child(div().flex_1().text_sm().child(meta.name.clone()))
-                        .children((self.workspace_busy == Some(id)).then(|| {
+                        .children(in_use.then(|| {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().warning)
                                 .child(t("in use"))
                         }))
-                        .children(can_delete.then(|| {
+                        .children(can_open_beside.then(|| {
+                            // stop_propagation so the click doesn't also enter it here.
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "window-workspace-{}",
+                                        id.simple()
+                                    )))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip(t("Open in new window"))
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.open_new_window(Some(id));
+                                        this.workspace_busy = None;
+                                        this.show_workspace_selector = false;
+                                        cx.notify();
+                                    })),
+                                )
+                        }))
+                        .children((can_delete && !in_use).then(|| {
                             let label = name.clone();
                             // stop_propagation so the click doesn't also enter the workspace.
                             div()
@@ -28783,13 +28994,28 @@ impl MuxelApp {
                 .items_center()
                 .justify_between()
                 .child(
-                    Button::new("quit-selector")
-                        .accessibility_id("muxel.quit-selector")
-                        .ghost()
-                        .label(t("Quit"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.quit_from_entry_screen(cx);
-                        })),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("quit-selector")
+                                .accessibility_id("muxel.quit-selector")
+                                .ghost()
+                                .label(t("Quit"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.quit_from_entry_screen(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("new-window-selector")
+                                .accessibility_id("muxel.new-window-selector")
+                                .ghost()
+                                .icon(IconName::ExternalLink)
+                                .label(t("New window"))
+                                .tooltip(t("Open another muxel window, to work in a second workspace at the same time"))
+                                .on_click(cx.listener(|this, _e, _w, _cx| {
+                                    this.open_new_window(None)
+                                })),
+                        ),
                 )
                 .children(self.current_workspace.is_some().then(|| {
                     Button::new("cancel-selector")
@@ -30977,8 +31203,12 @@ impl MuxelApp {
                         .small()
                         .icon(current_icon)
                         .label(current_name.clone())
-                        .tooltip(t("New tab with the current preset"))
-                        .on_click(cx.listener(|this, _ev, window, cx| this.new_tab(window, cx))),
+                        .tooltip(if self.settings.new_agents_open_as_panes() {
+                            t("New pane with the current preset")
+                        } else {
+                            t("New tab with the current preset")
+                        })
+                        .on_click(cx.listener(|this, _ev, window, cx| this.new_agent(window, cx))),
                 )
                 .dropdown_menu(move |mut menu, _window, _cx| {
                     for (id, name, is_default, icon_path) in preset_items.iter() {
@@ -32954,6 +33184,29 @@ impl MuxelApp {
             self.settings.diff_split_view = split;
             self.persist_settings();
         }
+    }
+
+    fn new_agent_placement_btn(
+        &self,
+        value: &'static str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let selected = if value == muxel_core::NEW_AGENT_PANE {
+            self.settings.new_agents_open_as_panes()
+        } else {
+            !self.settings.new_agents_open_as_panes()
+        };
+        Button::new(SharedString::from(format!("nap-{value}")))
+            .ghost()
+            .small()
+            .selected(selected)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.settings.new_agent_placement = value.to_string();
+                this.persist_settings();
+                cx.notify();
+            }))
     }
 
     fn terminal_mouse_btn(
@@ -36656,6 +36909,31 @@ impl MuxelApp {
                     .child(self.terminal_mouse_btn("copy_paste", &t("Right-click copy/paste"), cx))
                     .child(self.terminal_mouse_btn("menu", &t("Right-click menu"), cx))
                     .child(self.terminal_mouse_btn("copy_on_select", &t("Copy on select"), cx)),
+            )
+            .child(self.settings_label(&t("New agents open"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_TAB,
+                        &t("In a new tab"),
+                        cx,
+                    ))
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_PANE,
+                        &t("In a new pane"),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "For the toolbar's agent button and Ctrl+Alt+1–9. A new tab joins the focused pane; a new pane opens to its right.",
+                    )),
             )
             .child(
                 self.check_row(
