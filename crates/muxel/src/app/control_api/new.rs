@@ -116,7 +116,7 @@ impl MuxelApp {
             .workspace
             .project(pid)
             .ok_or("the project has closed")?;
-        let cwd = instance.launch_dir.as_ref().expect("new always sets cwd");
+        let cwd = instance.launch_dir.clone().expect("new always sets cwd");
         if instance.literal_argv {
             let program = instance
                 .program
