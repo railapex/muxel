@@ -1463,7 +1463,7 @@ impl DraftSubmission {
     fn commit(&self, sent: crate::draft::DraftCapture) {
         self.paste_log.lock().clear();
         if !self.tmux {
-            *self.typed_draft.lock() = muxel_core::rescue::TypedDraft::default();
+            self.typed_draft.lock().submitted();
         }
         *self.sent_screen.lock() = Some(sent);
         self.sent.store(true, Ordering::Release);
@@ -1809,9 +1809,9 @@ pub struct TerminalSession {
     /// The screen when the last submission was admitted, to tell a redrawn
     /// box from the one that was sent.
     sent_screen: Arc<Mutex<Option<crate::draft::DraftCapture>>>,
-    /// What muxel typed into the box since it was last seen empty (see
-    /// [`muxel_core::rescue::TypedDraft`]). Never known in tmux, where
-    /// other clients type too.
+    /// What muxel typed into the box since it was last seen empty, and what
+    /// the last submission sent (see [`muxel_core::rescue::TypedDraft`]).
+    /// Never known in tmux, where other clients type too.
     typed_draft: Arc<Mutex<muxel_core::rescue::TypedDraft>>,
     /// Line breaks this terminal's input could have typed into a provider's
     /// input box, counted as input is written (see
@@ -2968,7 +2968,7 @@ impl TerminalSession {
         if self.tmux_input.is_none() {
             let mut typed = self.typed_draft.lock();
             if submitted {
-                *typed = muxel_core::rescue::TypedDraft::default();
+                typed.submitted();
             } else {
                 typed.feed(data);
             }
@@ -3229,6 +3229,25 @@ impl TerminalSession {
         self.draft_sent.load(Ordering::Acquire)
     }
 
+    /// Whether the box, showing `text` after a submission, still shows what
+    /// was sent (see [`muxel_core::rescue::still_shows_sent`]): what `parse`
+    /// reads in the screen copied as the submission was admitted, or what
+    /// muxel typed before its Enter, which a program slow to draw its keys
+    /// shows only after it. Through tmux no typed copy is kept.
+    fn shows_sent(
+        &self,
+        text: &str,
+        parse: impl Fn(&crate::draft::DraftCapture) -> muxel_core::rescue::DraftRead,
+    ) -> bool {
+        use muxel_core::rescue::DraftRead;
+        let on_screen = match self.sent_screen.lock().as_ref().map(parse) {
+            Some(DraftRead::Text { text, .. }) => Some(text),
+            _ => None,
+        };
+        let typed = self.typed_draft.lock().sent().map(str::to_string);
+        muxel_core::rescue::still_shows_sent(text, on_screen.as_deref(), typed.as_deref())
+    }
+
     /// The visible screen, as a draft read copies it. Never call it with the
     /// writer locked.
     pub(crate) fn draft_screen(&self) -> crate::draft::DraftCapture {
@@ -3320,15 +3339,15 @@ impl TerminalSession {
                 {
                     // After a submission the box shows what was sent until
                     // the program redraws it: with what was typed since, or
-                    // with anything other than what it showed then.
+                    // with other text than was sent. Only the box's text
+                    // counts: a menu closing around it, a footer changing or
+                    // where the cursor sits says nothing.
                     let typed_shown = !*partial
                         && typed
                             .as_deref()
                             .is_some_and(|typed| !typed.is_empty() && typed == text);
-                    let redrawn = typed_shown
-                        || self.sent_screen.lock().as_ref().is_none_or(|sent| {
-                            parse(sent, None, None) != parse(&capture, None, None)
-                        });
+                    let redrawn =
+                        typed_shown || !self.shows_sent(text, |sent| parse(sent, None, None));
                     if !redrawn {
                         return DraftRead::Empty;
                     }

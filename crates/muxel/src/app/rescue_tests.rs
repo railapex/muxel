@@ -1596,3 +1596,137 @@ fn reload_to_the_text_an_input_method_is_composing_keeps_no_backup() {
         assert!(dir.editor_offer(iid).is_none(), "nothing is offered");
     });
 }
+
+#[test]
+fn the_strip_starts_as_one_line_and_discard_all_deletes_every_closed_panes_draft() {
+    with_app(|cx, window| {
+        let (_, dir) = pane(cx, window);
+        for (n, text) in ["first thought", "second thought"].iter().enumerate() {
+            let closed = Uuid::new_v4();
+            dir.save_draft(closed, &draft(text)).unwrap();
+            assert_eq!(dir.keep_closed_drafts(closed, &format!("pane {n}")), 1);
+        }
+        window
+            .update(cx, |app, _, cx| {
+                app.load_workspace_rescue(None);
+                assert_eq!(app.rescue.closed.len(), 2);
+                assert!(!app.rescue.closed_open, "the list starts closed");
+                app.rescue.closed_open = true;
+                app.discard_all_closed_drafts(cx);
+                assert!(app.rescue.closed.is_empty());
+                assert!(!app.rescue.closed_open);
+            })
+            .unwrap();
+        assert!(
+            dir.closed_drafts().is_empty(),
+            "nothing comes back the next time the workspace opens"
+        );
+    });
+}
+
+/// A child that never reads its input, so nothing echoes what the test
+/// types: the test alone draws the screen.
+fn deaf() -> CommandSpec {
+    CommandSpec::program(
+        "cmd.exe",
+        vec![
+            "/d".into(),
+            "/q".into(),
+            "/c".into(),
+            "echo ready&ping -n 600 127.0.0.1>nul".into(),
+        ],
+    )
+}
+
+/// Claude's screen as it shows a slash command: its menu above the box
+/// (Claude Code 2.1.322), `draft` in the box.
+fn paint_claude_command(session: &TerminalSession, draft: &str, menu: &[&str]) {
+    let mut screen = String::from("\x1b[?2004h\x1b[2J\x1b[H");
+    for row in menu {
+        screen.push_str(row);
+        screen.push_str("\r\n");
+    }
+    screen.push_str(RULE);
+    screen.push_str("\r\n❯ ");
+    screen.push_str(draft);
+    screen.push_str("\r\n");
+    screen.push_str(RULE);
+    screen.push_str("\r\n  ? for shortcuts");
+    screen.push_str(&format!(
+        "\x1b[{};{}H",
+        menu.len() + 2,
+        3 + draft.chars().count()
+    ));
+    session.process_probe_output(screen.as_bytes());
+}
+
+/// `text` and Enter as a pane's keys send them, while the program is too
+/// slow to draw them (a machine short of memory): the box shows none of it
+/// when the Enter is admitted.
+fn type_and_send_unseen(session: &TerminalSession, text: &str) {
+    for key in text.bytes() {
+        session.write_user_input(&[key]);
+    }
+    session.write_user_submission(b"\r", muxel_terminal::Submission::Turn);
+}
+
+#[test]
+fn a_prompt_drawn_only_after_its_enter_is_never_kept_but_one_typed_after_it_is() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let session = launch_child(cx, window, iid, deaf());
+        paint_claude(&session, "");
+        type_and_send_unseen(&session, "/exit");
+        cx.run_until_parked();
+        // The program catches up: `/exit` in the box, its command menu open
+        // over it, and the watcher reads the box once input stops.
+        paint_claude_command(
+            &session,
+            "/exit",
+            &[
+                "  ❯ /exit      Exit the CLI",
+                "    /export    Export the conversation",
+            ],
+        );
+        after_debounce(cx);
+        assert!(
+            dir.draft(iid).is_none(),
+            "what was sent, drawn after its Enter, isn't saved"
+        );
+        // It runs the command: leaves its screen with bracketed paste off,
+        // and the pane closes.
+        session.process_probe_output(b"\x1b[?2004l\x1b[2J\x1b[H");
+        window
+            .update(cx, |app, _, cx| {
+                app.close_instance_inner(iid, "close (test)", cx)
+            })
+            .unwrap();
+        assert!(
+            dir.closed_drafts().is_empty(),
+            "the sent command isn't kept"
+        );
+
+        // A prompt sent the same way, then another typed after its Enter:
+        // that one wasn't sent, and is kept.
+        let (iid, dir) = pane(cx, window);
+        let session = launch_child(cx, window, iid, deaf());
+        paint_claude(&session, "");
+        type_and_send_unseen(&session, "ship it");
+        cx.run_until_parked();
+        paint_claude(&session, "ship it");
+        for key in "next step".bytes() {
+            session.write_user_input(&[key]);
+        }
+        paint_claude(&session, "next step");
+        after_debounce(cx);
+        window
+            .update(cx, |app, _, cx| {
+                app.close_instance_inner(iid, "close (test)", cx)
+            })
+            .unwrap();
+        let closed = dir.closed_drafts();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].draft.text, "next step");
+        assert!(!closed[0].draft.partial, "it is what muxel saw typed");
+    });
+}

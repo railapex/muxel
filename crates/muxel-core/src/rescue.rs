@@ -397,17 +397,38 @@ pub fn typed_matches(typed: &str, rows: &[&str], widths: RowWidths) -> bool {
     typed[at..].chars().all(blank)
 }
 
+/// Whether an input box showing `shown` after a submission still shows what
+/// was sent: the text the box showed as the submission was admitted
+/// (`on_screen`), or what muxel typed before it (`typed`), which a program
+/// slow to draw its keys shows only after the Enter. The start of either
+/// counts too, as such a program draws it. Whitespace is left out of the
+/// comparison, since a read from the screen can't show how much there was.
+pub fn still_shows_sent(shown: &str, on_screen: Option<&str>, typed: Option<&str>) -> bool {
+    let visible =
+        |text: &str| -> String { text.chars().filter(|ch| !ch.is_whitespace()).collect() };
+    let shown = visible(shown);
+    !shown.is_empty()
+        && [on_screen, typed]
+            .into_iter()
+            .flatten()
+            .any(|sent| visible(sent).starts_with(&shown))
+}
+
 /// The text muxel typed into a pane's input box since the box was last seen
 /// empty, while every key it sent typed or deleted at a cursor it can
 /// follow: text, Backspace, Delete, Left and Right inside the text,
 /// Shift+Enter, and bracketed pastes. Any other key (Enter, history,
 /// completion, Home and End, a word jump, Right at the end where it can take
 /// a suggestion) makes it unknown until the box is seen empty again.
+/// It also keeps what the last submission sent, as typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypedDraft {
     text: Option<String>,
     /// Byte offset of the cursor in `text`.
     cursor: usize,
+    /// What the box held when the last submission was admitted, when every
+    /// key before it was known.
+    sent: Option<String>,
 }
 
 impl Default for TypedDraft {
@@ -416,6 +437,7 @@ impl Default for TypedDraft {
         Self {
             text: Some(String::new()),
             cursor: 0,
+            sent: None,
         }
     }
 }
@@ -434,6 +456,7 @@ impl TypedDraft {
         Self {
             text: None,
             cursor: 0,
+            sent: None,
         }
     }
 
@@ -447,10 +470,29 @@ impl TypedDraft {
         self.text.as_deref().map(|text| &text[..self.cursor])
     }
 
+    /// A submission was admitted: what the box held was sent, and the box
+    /// is empty. A submission can be noted twice (a key's Enter is marked
+    /// before it is written), so an empty box keeps what was sent before;
+    /// Enter on an empty box does too.
+    pub fn submitted(&mut self) {
+        match self.text.take() {
+            Some(text) if text.is_empty() => {}
+            text => self.sent = text,
+        }
+        self.text = Some(String::new());
+        self.cursor = 0;
+    }
+
+    /// What the last submission sent, when muxel typed all of it.
+    pub fn sent(&self) -> Option<&str> {
+        self.sent.as_deref()
+    }
+
     /// `input` was written to the pane.
     pub fn feed(&mut self, input: &[u8]) {
         if self.apply(input).is_none() {
-            *self = Self::unknown();
+            self.text = None;
+            self.cursor = 0;
         }
     }
 
@@ -1064,9 +1106,30 @@ mod tests {
         BackupOffer, DRAFT_DEBOUNCE, DraftAction, DraftRead, DraftTracker, EditorBackup, FileStamp,
         Joined, MAX_RESCUE_BYTES, PASTE_LOG_BYTES, PASTE_LOG_ENTRIES, PasteLog, PromptDraft,
         RowWidths, TypedDraft, backup_offer, debounce_remaining, input_newlines, join_rows,
-        merge_clipped, substitute_pastes, typed_matches,
+        merge_clipped, still_shows_sent, substitute_pastes, typed_matches,
     };
     use std::time::Duration;
+
+    #[test]
+    fn a_box_still_shows_what_was_sent_until_it_shows_other_text() {
+        // A program slow to draw its keys shows them after the Enter, whole
+        // or part way.
+        assert!(still_shows_sent("/exit", None, Some("/exit")));
+        assert!(still_shows_sent("/ex", None, Some("/exit")));
+        // The screen wraps and spaces text its own way.
+        assert!(still_shows_sent(
+            "fix the\nflaky test",
+            Some("fix the flaky test"),
+            None
+        ));
+        assert!(!still_shows_sent("/exit now", Some("/exit"), Some("/exit")));
+        assert!(!still_shows_sent("a new thought", Some("/exit"), None));
+        assert!(
+            !still_shows_sent("anything", None, None),
+            "nothing known to have been sent"
+        );
+        assert!(!still_shows_sent(" ", Some("x"), Some("x")));
+    }
 
     fn text(t: &str) -> DraftRead {
         DraftRead::Text {
