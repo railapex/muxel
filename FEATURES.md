@@ -115,8 +115,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
-- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
-  add the new agent as a tab in the focused pane, so starting an agent never adds
+- **New agents open as tabs** — the toolbar's agent button, `Ctrl+Alt+1–9` and
+  a project's **New session** menu add the new agent as a tab in the focused
+  pane, so starting an agent never adds
   a column. Settings → Behavior → **New agents open** switches them to **In a new
   pane** instead, which opens each one in a pane of its own to the right of the
   focused pane. An empty project gets its first pane either way. New Tab, New
@@ -1743,6 +1744,10 @@ feature is added or changed, update the matching entry here in the same change**
   a checkbox (all checked by default); only the checked files are committed, so
   stray files are never swept in. The button shows the count (e.g. *Commit (3)*),
   and a clean tree just toasts “Nothing to commit”.
+- **New session in a project** — right-click a project → **New session** lists
+  the presets the toolbar's preset menu offers. Picking one starts it in that
+  project, wherever Settings → Behavior → **New agents open** puts new agents,
+  and shows the project; a project with no panes gets its first one.
 - **Reorder & rearrange** — reorder projects by dragging a row, or right-click a
   project → **Move up** / **Move down** (disabled at the ends) for an explicit,
   discoverable alternative; the order persists. Swap/move instances between panes

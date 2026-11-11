@@ -104,6 +104,10 @@ mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+// On macOS gpui-component's Root asks for a native window handle, which a test
+// window doesn't have.
+#[cfg(all(test, not(target_os = "macos")))]
+mod project_session_tests;
 mod recoverable_close;
 #[cfg(all(test, windows))]
 mod recoverable_close_tests;
@@ -17399,6 +17403,40 @@ impl MuxelApp {
         }
     }
 
+    /// A project's context menu → New session → `preset`: open it in project
+    /// `pid` where the setting puts new agents, like the toolbar's agent
+    /// button. The window showing the project opens it, or the main window,
+    /// which switches to the project first.
+    fn new_session_in_project(
+        &mut self,
+        pid: Uuid,
+        preset: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = self.project_window(pid)
+            && target.window_id() != window.window_handle().window_id()
+        {
+            // The pane's views belong to the window that shows them, and
+            // that window's update needs the app, which this one holds.
+            let app = cx.weak_entity();
+            cx.defer(move |cx| {
+                Self::update_in_window(&app, target, cx, |app, window, cx| {
+                    app.new_session_in_project(pid, preset, window, cx)
+                });
+            });
+            return;
+        }
+        let Some(preset_idx) = self.presets.iter().position(|p| p.id == preset) else {
+            return;
+        };
+        if self.window_showing(pid).is_none() {
+            self.select_project(pid, window, cx);
+        }
+        let placement = self.new_agent_placement();
+        self.place_with_preset_in(pid, self.active_instance, placement, preset_idx, window, cx);
+    }
+
     /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
     /// in the project `window` shows. The shared body behind every split /
     /// new-tab path.
@@ -17413,14 +17451,29 @@ impl MuxelApp {
         // A toolbar click or shortcut acts on the window it came from. The
         // focused pane may be in another window; then the new pane goes to
         // this window's project, at its last-focused pane.
-        let Some(project) = self
+        let Some(pid) = self
             .secondary_pid_for(window)
             .or(self.workspace.active_project)
-            .and_then(|pid| self.workspace.project(pid))
         else {
             return;
         };
-        let pid = project.id;
+        self.place_with_preset_in(pid, target, placement, preset_idx, window, cx);
+    }
+
+    /// [`Self::place_with_preset`] in project `pid`. A `target` outside that
+    /// project gives way to the project's last-focused pane.
+    fn place_with_preset_in(
+        &mut self,
+        pid: Uuid,
+        target: Option<Uuid>,
+        placement: PlacementMode,
+        preset_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
         let target = target
             .filter(|iid| {
                 project
@@ -30108,9 +30161,25 @@ impl MuxelApp {
                     .child(t("PROJECTS")),
             );
 
+        // Each project's New session submenu offers the toolbar preset menu's
+        // presets, in its order.
+        let session_presets: std::rc::Rc<[(Uuid, String, SharedString)]> = self
+            .presets
+            .iter()
+            .filter(|p| self.agent_runnable(p))
+            .map(|p| (p.id, p.name.clone(), preset_icon_path(p)))
+            .collect();
+        let global_default = self
+            .presets
+            .iter()
+            .find(|p| p.id.to_string() == self.settings.default_preset)
+            .map(|p| p.id);
+
         for (ix, project) in self.workspace.projects.iter().enumerate() {
             let pid = project.id;
             let active = Some(pid) == active_pid;
+            let default_preset = project.default_preset.or(global_default);
+            let session_presets = session_presets.clone();
             let is_first = ix == 0;
             let is_last = ix + 1 == project_count;
             let collapsed = self.collapsed.contains(&pid);
@@ -30173,6 +30242,7 @@ impl MuxelApp {
                         })
                     }
                 })
+                .debug_selector(|| format!("proj-row-{ix}"))
                 .mx_1()
                 .px_1()
                 .py_1()
@@ -30415,6 +30485,42 @@ impl MuxelApp {
                     .context_menu({
                         let entity = entity.clone();
                         move |menu, window, cx| {
+                            let presets = session_presets.clone();
+                            let entity_session = entity.clone();
+                            let menu = if presets.is_empty() {
+                                menu
+                            } else {
+                                menu.submenu_with_icon(
+                                    Some(Icon::new(IconName::Plus)),
+                                    t("New session"),
+                                    window,
+                                    cx,
+                                    move |mut sm, window, _cx| {
+                                        for (id, name, icon) in presets.iter() {
+                                            let id = *id;
+                                            let label = if Some(id) == default_preset {
+                                                format!("★ {name}")
+                                            } else {
+                                                name.clone()
+                                            };
+                                            sm = sm.item(
+                                                PopupMenuItem::new(label)
+                                                    .icon(Icon::empty().path(icon.clone()))
+                                                    .on_click(window.listener_for(
+                                                        &entity_session,
+                                                        move |this, _, window, cx| {
+                                                            this.new_session_in_project(
+                                                                pid, id, window, cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            );
+                                        }
+                                        sm
+                                    },
+                                )
+                                .separator()
+                            };
                             let mut menu = menu
                                 .item(
                                     PopupMenuItem::new(t("Rename"))
