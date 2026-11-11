@@ -57,6 +57,12 @@ pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
 /// `send --once` and `send --when-idle` must be refused by hosts that would
 /// ignore them and type at once, or type a repeat again.
 pub const SAFE_SEND_VERSION: u32 = 4;
+/// `send --session-id` must be refused by hosts that would ignore it and type
+/// into whatever conversation the pane has moved on to.
+pub const PINNED_SEND_VERSION: u32 = 5;
+/// The newest version this host accepts, which `status` and `panes` report as
+/// `protocol` so a client can learn it without sending anything.
+pub const NEWEST_VERSION: u32 = PINNED_SEND_VERSION;
 /// How long `send --when-idle` waits for a safe moment by default, and at most.
 pub const WHEN_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const WHEN_IDLE_TIMEOUT_MAX_SECS: u64 = 3600;
@@ -66,12 +72,13 @@ pub fn valid_once_key(key: &str) -> bool {
     !key.trim().is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
 }
 
-/// The checks a `send` carrying `--once`, `--when-idle` or `--timeout` must
-/// pass before it reaches the app. The CLI applies them too; a raw client gets
-/// them here, from the host.
+/// The checks a `send` carrying `--once`, `--when-idle`, `--timeout` or
+/// `--session-id` must pass before it reaches the app. The CLI applies them
+/// too; a raw client gets them here, from the host.
 pub fn check_safe_send(command: &Command) -> Result<(), String> {
     let Command::Send {
         force,
+        session_id,
         once,
         when_idle,
         timeout_secs,
@@ -82,6 +89,10 @@ pub fn check_safe_send(command: &Command) -> Result<(), String> {
     };
     if once.as_deref().is_some_and(|key| !valid_once_key(key)) {
         return Err("--once KEY must be 1-128 bytes without control characters".into());
+    }
+    // Every provider's conversation id fits a once key's shape.
+    if session_id.as_deref().is_some_and(|id| !valid_once_key(id)) {
+        return Err("--session-id ID must be 1-128 bytes without control characters".into());
     }
     if timeout_secs.is_some() && !when_idle {
         return Err("send --timeout requires --when-idle".into());
@@ -196,6 +207,10 @@ pub enum Command {
         /// Refuse if the pane no longer has this terminal launch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_id: Option<Uuid>,
+        /// Refuse unless the pane is in this provider conversation: its
+        /// `session_id` in `status`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         /// Type this text into this pane at most once: a repeat with the same
         /// key returns the first attempt's result and types nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +248,15 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(
+        command,
+        Command::Send {
+            session_id: Some(_),
+            ..
+        }
+    ) {
+        return PINNED_SEND_VERSION;
+    }
     if let Command::Send {
         once,
         when_idle,
@@ -370,7 +394,10 @@ pub enum ErrorCode {
     ApprovalTimeout,
     /// Only configured non-shell terminal presets accept user tasks.
     PromptUnsupported,
-    /// A preset cannot safely express the requested model or effort override.
+    /// A preset cannot safely express the requested model or effort override,
+    /// or a `send --session-id` targets a pane that takes ctl input through
+    /// tmux, where muxel can't hold the paste to a conversation (`reason:
+    /// tmux_delivery`; nothing was typed).
     ParameterUnsupported,
     /// The agent is working: `wait` for it (or `send --force`).
     Working,
@@ -538,6 +565,63 @@ pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<
     Ok(())
 }
 
+/// What muxel can vouch for about the provider conversation a pane is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Conversation {
+    /// The running terminal's live binding confirms this id or, with nothing
+    /// running, it is the id the pane will resume.
+    Known(String),
+    /// Nothing muxel can vouch for: the provider has named a conversation
+    /// muxel hasn't confirmed yet, or there is none.
+    Unconfirmed,
+}
+
+impl Conversation {
+    /// The pane's [`AgentInfo::session_id`].
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Known(id) => Some(id),
+            Self::Unconfirmed => None,
+        }
+    }
+
+    pub fn into_id(self) -> Option<String> {
+        match self {
+            Self::Known(id) => Some(id),
+            Self::Unconfirmed => None,
+        }
+    }
+}
+
+/// Checked beside [`check_launch_id`], and again immediately before pasting:
+/// a send pinned to a conversation (`--session-id`, or the one a waiting send
+/// queued in) types only while the pane is still in it. A pane muxel can't
+/// vouch for refuses too, with its own reason, since it may settle back into
+/// the pinned conversation. `--force` never overrides this.
+pub fn check_session_id(expected: Option<&str>, current: &Conversation) -> Result<(), Error> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let (message, reason) = match current {
+        Conversation::Known(current) if current == expected => return Ok(()),
+        Conversation::Known(current) => (
+            format!(
+                "the agent's pane is in conversation {current}, not {expected}: nothing was \
+                 typed. Check `status` before sending again"
+            ),
+            "conversation_changed",
+        ),
+        Conversation::Unconfirmed => (
+            format!(
+                "muxel can't yet confirm which conversation the agent's pane is in, so not \
+                 {expected} either: nothing was typed. Check `status` for its session_id"
+            ),
+            "conversation_unconfirmed",
+        ),
+    };
+    Err(Error::new(ErrorCode::LaunchMismatch, message).with_reason(reason))
+}
+
 /// A pane cannot direct input at itself by accident. This uses the caller's
 /// declared environment value for convenience, not as an authorization check.
 pub fn check_self_target(caller: Option<Uuid>, target: Uuid, force: bool) -> Result<(), Error> {
@@ -650,6 +734,16 @@ pub struct AgentInfo {
     /// isn't running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<Uuid>,
+    /// The provider conversation the pane is in, as the provider names it.
+    /// For a running agent, only once its live terminal binding confirms it:
+    /// the launch opened it, muxel adopted it in this binding, or the
+    /// provider's current title names it. It is `None` while the agent is
+    /// switching conversation (`/clear`, `/resume`, a new Codex thread) and
+    /// muxel hasn't confirmed the new one yet. For a pane that isn't running,
+    /// it is the id muxel will resume. `None` for shells and agents that
+    /// haven't named a conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
     /// What the agent's own screen says is still running beside its turn.
@@ -1504,9 +1598,11 @@ usage: muxel ctl <command> [args]
   wake AGENT                     start a sleeping or dormant pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
-  send AGENT TEXT [--force] [--launch-id ID] [--once KEY] [--when-idle [--timeout SECS]]
+  send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY]
+       [--when-idle [--timeout SECS]]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal;
+                                 --session-id refuses another conversation;
                                  --once never types the same KEY twice;
                                  --when-idle waits until the agent can take it
   once-status AGENT KEY          what became of a send --once KEY
@@ -1589,7 +1685,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--once KEY] [--when-idle [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed."
         }
         "once-status" => {
             "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, typing, or done with the first reply as result."
@@ -1705,6 +1801,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
+    let mut session_id: Option<String> = None;
     let mut once: Option<String> = None;
     let mut when_idle = false;
     let mut lines: Option<usize> = None;
@@ -1730,6 +1827,12 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
                 launch_id = Some(Uuid::parse_str(value).map_err(|_| "--launch-id needs a UUID")?);
             }
+            "--session-id" => {
+                let id = it.next().ok_or("--session-id needs an ID")?;
+                if session_id.replace(id.clone()).is_some() {
+                    return Err("--session-id can be given only once".into());
+                }
+            }
             "--lines" => lines = Some(number(it.next(), "--lines")?),
             "--timeout" => timeout = Some(number(it.next(), "--timeout")?),
             flag if flag.starts_with("--") && flag.len() > 2 => {
@@ -1740,6 +1843,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     if launch_id.is_some() && cmd != "send" {
         return Err("--launch-id is only valid with send".into());
+    }
+    if session_id.is_some() && cmd != "send" {
+        return Err("--session-id is only valid with send".into());
     }
     if (once.is_some() || when_idle) && cmd != "send" {
         return Err("--once and --when-idle are only valid with send".into());
@@ -1811,6 +1917,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 text,
                 force,
                 launch_id,
+                session_id,
                 once,
                 when_idle,
                 timeout_secs: timeout,
@@ -2187,7 +2294,24 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   suggestions don't count); other agents by whether text was typed into the
   pane since its last Enter. Escape, arrows, ctrl keys and `answer` don't count.
   `--force` types anyway.
-  For automation, use `send AGENT TEXT --when-idle --once KEY --launch-id ID`.
+  For automation, use `send AGENT TEXT --when-idle --once KEY --launch-id ID
+  --session-id SID`.
+  `--session-id SID` pins the send to a provider conversation: the agent's
+  `session_id` from `status`. It types only while the running terminal's live
+  binding confirms that conversation, checked when the send arrives,
+  throughout a `--when-idle` wait, and again immediately before the paste.
+  Another conversation fails with `launch_mismatch`, `reason:
+  conversation_changed`. A conversation muxel can't confirm yet (the agent
+  is switching, or names none) fails with `reason: conversation_unconfirmed`;
+  `--when-idle` waits through it instead. Either way nothing is typed. A pane
+  that isn't running is matched on the id it will resume, then checked again
+  once it runs. muxel learns of a Claude `/clear` or `/resume` from its hook a
+  moment after it happens, so the pin holds against muxel's latest
+  knowledge. `--force` never overrides it. It needs protocol v5: check
+  `protocol` in `status` first. An agent muxel types into through tmux
+  refuses it with `parameter_unsupported`, `reason: tmux_delivery`, and types
+  nothing: there the paste waits in tmux's input queue after the last check,
+  so muxel can't hold it to a conversation. Send to that agent without it.
   `--once KEY` (1-128 bytes) types TEXT into this pane at most once. A repeat
   whose first send went in returns that first receipt with `duplicate: true`
   and types nothing. A repeat whose first send failed after typing fails with
@@ -2205,9 +2329,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
   then fails with `timed_out` and `reason` naming what it was still waiting on
   (`working`, `blocked`, `starting`, `just_submitted`, `send_in_flight`,
-  `draft_present` or `tmux_clients`). The agent exiting, closing or being
-  replaced ends the wait with that refusal; a conversation change fails with
-  `launch_mismatch`, `reason: conversation_changed`. One send waits per pane
+  `draft_present`, `tmux_clients` or `conversation_unconfirmed`). The agent
+  exiting, closing or being replaced ends the wait with that refusal; a
+  conversation change fails with `launch_mismatch`, `reason:
+  conversation_changed`. One send waits per pane
   (`busy`, `reason: queued`), and at most eight per muxel (`reason:
   queue_full`). Closing the connection cancels a waiting send before it types;
   once typing starts the send finishes, and its `--once` key records the result.
@@ -2306,6 +2431,18 @@ same conversation), so check `show` before relying on what you saw. It stays the
 same when the agent switches conversation by itself, as with Claude's `/resume`,
 and is left out while the agent is starting and once it has exited.
 
+`session_id` is the provider's own id for the conversation the agent is in.
+For a running agent it appears only once the live terminal confirms it: the
+launch opened it, muxel adopted it since the last switch, or the provider's
+current title names it. While the agent switches conversation (`/clear`,
+`/resume`, a new Codex thread) it is left out until muxel confirms the new
+one. A pane that isn't running shows the id it will resume. Shells and agents
+that haven't named a conversation have none. Pass it to `send --session-id`
+to pin a send to that conversation.
+
+`status` and `panes` also report `protocol`, the newest control protocol
+version this muxel accepts. An older muxel leaves it out.
+
 ## Errors
 
 Creation permission/approval refusals, typing refusals from `send`, `answer` or
@@ -2317,7 +2454,11 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `claimed_elsewhere` - another request holds the shared tmux claim, or another
   `send` to the agent hasn't pressed Enter yet.
 - `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
-- `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
+- `launch_mismatch` - the terminal was replaced since the supplied `launch_id`,
+  or, with `reason: conversation_changed`, the pane isn't in the conversation
+  the send was pinned to, or, with `reason: conversation_unconfirmed`, muxel
+  can't confirm which conversation it is in yet. Nothing was typed; check
+  `status`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
 - `unsupported_input` - the native provider cannot insert the supplied control
@@ -2348,7 +2489,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `approval_denied` - the user clicked Deny; nothing was created.
 - `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
 - `prompt_unsupported` - prompts require a configured non-shell terminal preset.
-- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
+- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them. Also `send --session-id` to an agent behind tmux (`reason: tmux_delivery`); nothing was typed.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing
@@ -2522,6 +2663,7 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: None,
+                session_id: None,
                 once: None,
                 when_idle: false,
                 timeout_secs: None,
@@ -2671,6 +2813,7 @@ mod tests {
             text: "hi".into(),
             force: false,
             launch_id: None,
+            session_id: None,
             once: None,
             when_idle: false,
             timeout_secs: None,
@@ -2708,6 +2851,7 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: None,
+                session_id: None,
                 once: Some("d-9f2a".into()),
                 when_idle: true,
                 timeout_secs: Some(47),
@@ -2751,6 +2895,76 @@ mod tests {
         }
     }
 
+    /// Wire pins a doorbell to the conversation whose owner it checked. Any
+    /// other conversation, or one muxel can't vouch for, refuses before typing,
+    /// each with its own reason.
+    #[test]
+    fn a_conversation_pin_accepts_only_that_conversation() {
+        use super::Conversation::{Known, Unconfirmed};
+        let check = super::check_session_id;
+        assert_eq!(check(None, &Unconfirmed), Ok(()));
+        assert_eq!(check(None, &Known("a".into())), Ok(()));
+        assert_eq!(check(Some("a"), &Known("a".into())), Ok(()));
+        for (current, reason) in [
+            (Known("b".into()), "conversation_changed"),
+            (Unconfirmed, "conversation_unconfirmed"),
+        ] {
+            let error = check(Some("a"), &current).unwrap_err();
+            assert_eq!(error.code, Some(ErrorCode::LaunchMismatch), "{current:?}");
+            assert_eq!(error.reason.as_deref(), Some(reason));
+            assert_eq!(error.pasted, None, "a refused pin typed nothing");
+        }
+        assert_eq!(Known("a".into()).id(), Some("a"));
+        assert_eq!(Unconfirmed.id(), None);
+    }
+
+    /// A host that doesn't know `session_id` ignores it and would type into
+    /// whatever conversation the pane is in. Only the version makes it refuse.
+    #[test]
+    fn a_conversation_pinned_send_needs_protocol_v5() {
+        let sid = "01a1543c-9700-7000-8000-000000000001";
+        let Ok(CliCommand::Request(send)) = parse_cli(&words(&[
+            "send",
+            "a",
+            "hi",
+            "--session-id",
+            sid,
+            "--once",
+            "d-1",
+            "--when-idle",
+        ])) else {
+            panic!("--session-id parses");
+        };
+        assert!(matches!(
+            &send,
+            Command::Send { session_id: Some(pinned), once: Some(_), when_idle: true, .. }
+                if pinned == sid
+        ));
+        assert_eq!(super::request_version(&send), super::PINNED_SEND_VERSION);
+        assert_eq!(super::NEWEST_VERSION, super::PINNED_SEND_VERSION);
+        let line = serde_json::to_string(&send).unwrap();
+        assert!(
+            line.contains(&format!("\"session_id\":\"{sid}\"")),
+            "{line}"
+        );
+        for args in [
+            words(&["send", "a", "hi", "--session-id"]),
+            words(&["send", "a", "hi", "--session-id", ""]),
+            words(&["send", "a", "hi", "--session-id", "a\tb"]),
+            words(&["send", "a", "hi", "--session-id", "a", "--session-id", "b"]),
+            words(&["status", "a", "--session-id", sid]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
+        // A raw client gets the same check from the host.
+        assert_eq!(super::check_safe_send(&send), Ok(()));
+        let mut raw = send;
+        if let Command::Send { session_id, .. } = &mut raw {
+            *session_id = Some("a\nb".into());
+        }
+        assert!(super::check_safe_send(&raw).is_err());
+    }
+
     #[test]
     fn send_receipt_identifies_the_admitted_launch_and_paste() {
         let receipt = super::pasted_prompt_receipt(id(7), id(42));
@@ -2777,6 +2991,7 @@ mod tests {
                 text: "hi".into(),
                 force: true,
                 launch_id: Some(id(42)),
+                session_id: None,
                 once: None,
                 when_idle: false,
                 timeout_secs: None,
@@ -2804,6 +3019,7 @@ mod tests {
                 text: "--launch-id --once text".into(),
                 force: false,
                 launch_id: None,
+                session_id: None,
                 once: None,
                 when_idle: false,
                 timeout_secs: None,
@@ -2854,6 +3070,7 @@ mod tests {
             not_running_reason: None,
             status_since: None,
             launch_id: None,
+            session_id: None,
             awaiting_reply: false,
             background: None,
             turn_over: false,
@@ -2868,6 +3085,7 @@ mod tests {
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("launch_id").is_none(), "{json}");
+        assert!(json.get("session_id").is_none(), "{json}");
         for key in ["source", "activity", "blocked_on", "live_status"] {
             assert!(json.get(key).is_none(), "{json}");
         }
@@ -2879,8 +3097,10 @@ mod tests {
         info.label = Some("starting label".into());
         info.status = Some(AgentState::Idle);
         info.launch_id = Some(id(42));
+        info.session_id = Some("5a40c944-0000-4000-8000-000000000001".into());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["launch_id"], id(42).to_string());
+        assert_eq!(json["session_id"], "5a40c944-0000-4000-8000-000000000001");
         assert_eq!(json["label"], "starting label");
         assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
         info.status = Some(AgentState::Blocked);
@@ -2955,6 +3175,12 @@ mod tests {
         assert!(text.contains("\"pasted\": true"));
         assert!(text.contains("--when-idle --once KEY --launch-id ID"));
         assert!(text.contains("launch_id"));
+        assert!(text.contains("--session-id SID"));
+        assert!(text.contains("`session_id`"));
+        assert!(text.contains("`protocol`"));
+        assert!(text.contains("conversation_changed"));
+        assert!(text.contains("conversation_unconfirmed"));
+        assert!(text.contains("tmux_delivery"));
     }
 
     #[test]
@@ -3401,6 +3627,7 @@ Steps:
                 text: "fix the tests".into(),
                 force: false,
                 launch_id: None,
+                session_id: None,
                 once: None,
                 when_idle: false,
                 timeout_secs: None,
@@ -3413,6 +3640,7 @@ Steps:
                 text: "--help --force".into(),
                 force: false,
                 launch_id: None,
+                session_id: None,
                 once: None,
                 when_idle: false,
                 timeout_secs: None,

@@ -4206,6 +4206,27 @@ impl TerminalSession {
         self.session_id_hint.lock().clone()
     }
 
+    /// Whether this launch's own evidence names conversation `id` as its live
+    /// binding: it opened `id` (a pinned `--session-id` or `--resume`) and
+    /// nothing has switched since, or the provider's latest session-hint
+    /// title, recorded in the current binding, names it. The app's stored id
+    /// for the pane can lag behind a switch the terminal already saw.
+    pub fn binding_names(&self, id: &str) -> bool {
+        // The listener's lock order: hint, then evidence.
+        let hint = self.session_id_hint.lock();
+        self.evidence.lock().binding_names(id, hint.as_deref())
+    }
+
+    /// Whether the provider has named a conversation this terminal hasn't
+    /// bound yet: the program-status observer read its title inside a
+    /// synchronized update whose title callback VTE still holds. Until the
+    /// update ends, [`Self::binding_revision`] and [`Self::binding_names`]
+    /// still describe the conversation it replaced.
+    pub fn binding_pending(&self) -> bool {
+        let binding_rev = self.evidence.lock().binding_rev();
+        self.program_status.lock().binding_revision > binding_rev
+    }
+
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
@@ -8680,6 +8701,41 @@ mod runtime_fact_tests {
         // the program.
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_eq!(session.input_snapshot(), (typed + 2, true));
+        session.kill();
+    }
+
+    /// The program-status observer reads titles before VTE, so inside an
+    /// unfinished synchronized update it sees the provider name another
+    /// conversation while the binding still describes the old one. The
+    /// binding is pending until the update ends.
+    #[test]
+    fn a_title_held_by_a_synchronized_update_leaves_the_binding_pending() {
+        let a = "01a1543c-9700-7000-8000-00000000000a";
+        let b = "01a1543c-9700-7000-8000-00000000000b";
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let spec = spec.with_binding(super::LaunchBinding::Known(Some(a.into())));
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        session.process_output(format!("\x1b]0;{a} | Ready\x07").as_bytes());
+        assert!(!session.binding_pending());
+        assert!(session.binding_names(a));
+        session.process_output(format!("\x1b[?2026h\x1b]0;{b} | Ready\x07").as_bytes());
+        assert!(session.binding_pending(), "the observer has seen B");
+        assert_eq!(session.binding_revision(), 1);
+        assert!(
+            session.binding_names(a),
+            "the binding alone still names A, so its readers must ask"
+        );
+        session.process_output(b"\x1b[?2026l");
+        assert!(!session.binding_pending());
+        assert_eq!(session.binding_revision(), 2);
+        assert!(session.binding_names(b));
+        assert!(!session.binding_names(a));
         session.kill();
     }
 }

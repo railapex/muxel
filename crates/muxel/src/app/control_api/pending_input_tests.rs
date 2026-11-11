@@ -103,7 +103,7 @@ pub(in crate::app) fn press_send(
     text: &str,
     cx: &mut Context<MuxelApp>,
 ) -> Result<mpsc::Receiver<Result<serde_json::Value, ctl::Error>>, ctl::Error> {
-    let typing = app.control_send(pane, text.into(), true, None, cx)?;
+    let typing = app.control_send(pane, text.into(), true, None, None, cx)?;
     let pressed = app.control_press(typing, None, None, cx);
     let (tx, rx) = mpsc::channel();
     cx.spawn(async move |_, _| {
@@ -125,7 +125,7 @@ fn a_send_outlives_its_requester_and_stays_pending_until_its_enter_is_recorded()
                 let (pane, session) = add_shell(app, Some(route), "pending-unawaited", window, cx);
                 // A fresh shell can read as working, which only `--force` passes.
                 let typing = app
-                    .control_send(pane, "first".into(), true, None, cx)
+                    .control_send(pane, "first".into(), true, None, None, cx)
                     .unwrap();
                 // Whoever asked stops waiting at once.
                 drop(app.control_press(typing, None, None, cx));
@@ -193,7 +193,7 @@ fn a_refused_claimed_send_stays_pending_until_its_claim_is_given_back() {
             .update(cx, |app, window, cx| {
                 let (pane, session) = add_shell(app, None, "pending-claim", window, cx);
                 let typing = app
-                    .control_send(pane, "first".into(), true, None, cx)
+                    .control_send(pane, "first".into(), true, None, None, cx)
                     .unwrap();
                 // Closed since it was admitted, so it's refused before its paste.
                 session.hold_input();
@@ -269,7 +269,7 @@ fn an_interrupted_send_never_presses_its_enter_and_later_input_still_works() {
             .update(cx, |app, window, cx| {
                 let (pane, session) = add_shell(app, None, "pending-interrupted", window, cx);
                 let typing = app
-                    .control_send(pane, "first".into(), true, None, cx)
+                    .control_send(pane, "first".into(), true, None, None, cx)
                     .unwrap();
                 let pressed = app.control_press(typing, None, None, cx);
                 let (tx, rx) = mpsc::channel();
@@ -311,7 +311,7 @@ fn an_interrupted_send_never_presses_its_enter_and_later_input_still_works() {
         let second = window
             .update(cx, |app, _, cx| {
                 let typing = app
-                    .control_send(pane, "second".into(), true, None, cx)
+                    .control_send(pane, "second".into(), true, None, None, cx)
                     .unwrap();
                 let pressed = app.control_press(typing, None, None, cx);
                 let (tx, rx) = mpsc::channel();

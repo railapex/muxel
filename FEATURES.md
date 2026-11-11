@@ -1268,6 +1268,22 @@ feature is added or changed, update the matching entry here in the same change**
   launch, `conversation_changed`); a caller that disconnects before typing
   cancels it. Each pane holds one waiting send (`busy`, `queued`) and muxel at
   most eight (`queue_full`). Every refusal says whether anything was pasted.
+- **Conversation-pinned sends** — `status` and `panes` show each agent's
+  `session_id`, the provider's id for the conversation it is in, and
+  `protocol`, the newest control protocol the running muxel accepts. A running
+  agent's `session_id` appears only while its live terminal confirms it, so it
+  drops out while Codex names a new thread muxel hasn't validated yet, or
+  while a synchronized screen update holds a title the terminal hasn't
+  applied; a pane that isn't running shows the id it will resume.
+  `send --session-id ID` types only while the terminal confirms that
+  conversation, checked when the send
+  arrives, through a `--when-idle` wait, and again just before the paste, so a
+  `/clear`, `/resume` or new thread in between can't catch a prompt meant for
+  the old conversation. Another conversation refuses with `launch_mismatch`,
+  `reason: conversation_changed`; one muxel can't confirm yet refuses with
+  `conversation_unconfirmed` (a waiting send waits it out). Nothing is typed.
+  An agent behind tmux refuses the pin with `parameter_unsupported`, `reason:
+  tmux_delivery`, since its paste waits in tmux's queue after the last check.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
