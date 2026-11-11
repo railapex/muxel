@@ -1088,10 +1088,13 @@ fn windows_batch_arg_is_safe(value: &str) -> bool {
         .any(|ch| matches!(ch, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '\r' | '\n'))
 }
 
+/// Where the hook writes each pane's record (see [`claude_binding_path`]).
+pub(crate) fn claude_binding_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLAUDE_BINDING_DIR)
+}
+
 pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf {
-    data_dir
-        .join(CLAUDE_BINDING_DIR)
-        .join(format!("{instance_id}.json"))
+    claude_binding_dir(data_dir).join(format!("{instance_id}.json"))
 }
 
 pub(crate) fn write_claude_binding_from_reader(
@@ -1259,25 +1262,31 @@ pub(crate) struct ClaudeBindingSnapshot {
 }
 
 /// Validate a pending claim before a newer shared hook, without changing either.
-/// Read bytes and modification time from the same open file.
+/// Read bytes and modification time from the same open file. `Ok(None)` means
+/// neither name exists; an error means a record may exist but couldn't be read
+/// (on Windows, another process holding it open without sharing).
 pub(crate) fn read_pending_claude_binding(
     data_dir: &Path,
     instance_id: Uuid,
-) -> Option<ClaudeBindingSnapshot> {
-    let mut file = match std::fs::File::open(claude_claimed_binding_path(data_dir, instance_id)) {
-        Ok(file) => file,
+) -> std::io::Result<Option<ClaudeBindingSnapshot>> {
+    let opened = match std::fs::File::open(claude_claimed_binding_path(data_dir, instance_id)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::File::open(claude_binding_path(data_dir, instance_id)).ok()?
+            std::fs::File::open(claude_binding_path(data_dir, instance_id))
         }
-        Err(_) => return None,
+        claimed => claimed,
+    };
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
     let modified = file
         .metadata()
         .and_then(|metadata| metadata.modified())
         .ok();
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(ClaudeBindingSnapshot { bytes, modified })
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(ClaudeBindingSnapshot { bytes, modified }))
 }
 
 pub(crate) struct ClaimedClaudeRecord {
@@ -1997,7 +2006,11 @@ mod tests {
         // would make C's record validate. Nothing is left to adopt it.
         let transcript = muxel_core::claude_session_path(&pending.home, &cwd, &cleared);
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        assert!(read_pending_claude_binding(&pending.data, pending.instance_id).is_none());
+        assert!(
+            read_pending_claude_binding(&pending.data, pending.instance_id)
+                .unwrap()
+                .is_none()
+        );
 
         // `/resume X` while a sibling owns X: not adoptable yet, and gone once
         // the pane relaunches, so a later release of X never rebinds it.
@@ -2028,7 +2041,11 @@ mod tests {
             sibling_owns,
         )
         .unwrap();
-        assert!(read_pending_claude_binding(&pending.data, pending.instance_id).is_none());
+        assert!(
+            read_pending_claude_binding(&pending.data, pending.instance_id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(pending.saved_id(), Some(pending.new_id.clone()));
     }
 
@@ -2663,18 +2680,33 @@ mod tests {
         let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
         assert_eq!(
-            args[11..],
-            ["new-session", "-A", "-s", "s", "-e", &own, "--", "claude"]
+            args[new..],
+            [
+                "new-session",
+                "-A",
+                "-s",
+                "s",
+                "-e",
+                &own,
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -c \"$1\"",
+                "muxel-agent",
+                "claude"
+            ]
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
         let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
-        assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
+        assert_eq!(args[new..], ["new-session", "-A", "-s", "s"]);
     }
 
     /// muxel's own server is named ahead of everything else the client is told; a
@@ -2723,11 +2755,25 @@ mod tests {
         assert_eq!(launch.env.len(), 3);
         assert_eq!(
             &launch.args[new + 10..],
-            ["--", "agent", "two words", "", "--flag"]
+            [
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"",
+                "muxel-agent",
+                "agent",
+                "two words",
+                "",
+                "--flag"
+            ]
         );
         // No profile values are installed globally on this profile's server.
         assert_eq!(
-            &launch.args[2..new],
+            launch.args[2..8]
+                .iter()
+                .chain(launch.args[new - 5..new].iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             [
                 "-u",
                 "set",

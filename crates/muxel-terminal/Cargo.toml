@@ -24,12 +24,23 @@ anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
+
+# Memory-limit tests detach a probe from its console the way a GUI program is.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.57", features = ["Win32_System_Console"] }
 
 [target.'cfg(unix)'.dependencies]
 # The PTY reader waits on the master plus a wake pipe through epoll / kqueue;

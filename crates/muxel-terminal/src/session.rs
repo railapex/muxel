@@ -14,7 +14,7 @@ use crate::profile;
 use crate::program_status::{
     Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
 };
-use crate::replies::{ImmediateReplies, Replies};
+use crate::replies::{GridSize, ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{
@@ -39,6 +39,10 @@ use uuid::Uuid;
 mod input_hold;
 pub(crate) use input_hold::InputGate;
 use input_hold::{ShellMarks, ShellPrompt};
+
+#[cfg(all(test, unix))]
+#[path = "unix_shell_idle_tests.rs"]
+mod unix_shell_idle_tests;
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -727,6 +731,9 @@ pub struct CommandSpec {
     pub binding: LaunchBinding,
     /// Whether the command actually resumes an existing provider conversation.
     pub launch_resumed: bool,
+    /// Most memory, in bytes, each process in the pane's local tree may
+    /// commit (Windows; see [`crate::pane_job`]). `None` = no limit.
+    pub memory_limit: Option<u64>,
 }
 
 impl CommandSpec {
@@ -758,6 +765,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -785,6 +793,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -865,6 +874,11 @@ impl CommandSpec {
 
     pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
         self.tmux_input = Some(route);
+        self
+    }
+
+    pub fn with_memory_limit(mut self, bytes: Option<u64>) -> Self {
+        self.memory_limit = bytes;
         self
     }
 }
@@ -1251,6 +1265,9 @@ pub struct TerminalSession {
     /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
+    /// `exec` can replace the shell without changing its pid or foreground group.
+    #[cfg(unix)]
+    child_identity: Option<crate::process_tree_unix::ProcessIdentity>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
     /// Current root OSC 7501 report from this PTY launch. Child-id records do
@@ -1279,6 +1296,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// What the reader thread reports for `CSI 18 t`; see [`GridSize`].
+    grid_size: Arc<GridSize>,
     /// A resize away and back still invalidates a controller's input-frame proof.
     resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
@@ -1287,7 +1306,9 @@ pub struct TerminalSession {
     /// Remote handling for file/image uploads. See [`crate::LocalPaste`].
     local_paste: Mutex<Option<crate::LocalPasteHandler>>,
     path_paste_error: Mutex<Option<crate::PathPasteErrorHandler>>,
+    text_paste_error: Mutex<Option<crate::TextPasteErrorHandler>>,
     paste_shell: PasteShell,
+    control_paste: crate::control_paste::ControlPaste,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -1297,7 +1318,9 @@ pub struct TerminalSession {
     hovered_link: Mutex<Option<HoveredLink>>,
     /// Latest pointer position over this terminal (for Ctrl-down re-hit-test).
     pointer_hit: Mutex<Option<PointerHit>>,
-    /// When output was last processed (for idle/status detection).
+    /// When output was last processed (for idle/status detection). A batch
+    /// that only repainted a status bar (`redraws_only_a_status_bar`) doesn't
+    /// count.
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
     output_seen: AtomicBool,
@@ -1338,6 +1361,11 @@ pub struct TerminalSession {
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    /// The job this pane's local process tree runs in, when it has a memory
+    /// limit (see [`crate::pane_job`]). Dropped after the child is killed;
+    /// processes still in it keep running.
+    #[cfg(windows)]
+    pane_job: Option<crate::pane_job::PaneJob>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1505,7 +1533,7 @@ impl TerminalSession {
     }
 
     fn spawn_inner(
-        spec: CommandSpec,
+        mut spec: CommandSpec,
         cols: u16,
         rows: u16,
         instance_id: Option<uuid::Uuid>,
@@ -1547,6 +1575,26 @@ impl TerminalSession {
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
         let program = spec.program_for_spawn()?;
+        let control_paste = crate::control_paste::ControlPaste::for_launch(
+            &spec.program,
+            &spec.args,
+            cfg!(windows),
+        );
+        let version = if control_paste != crate::control_paste::ControlPaste::Terminal
+            && (!spec.literal_argv
+                || control_paste == crate::control_paste::ControlPaste::WindowsCodexUnverified)
+        {
+            codex_control_version(&program)
+        } else {
+            None
+        };
+        let control_paste = crate::control_paste::ControlPaste::configure_launch(
+            &spec.program,
+            &mut spec.args,
+            cfg!(windows),
+            spec.literal_argv,
+            version.as_deref().unwrap_or_default(),
+        );
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1572,15 +1620,52 @@ impl TerminalSession {
         ensure_utf8_locale(&mut builder);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
-        // Last, so anything the instance/preset sets wins over muxel's defaults.
+        // Apply preset overrides, then filter settings owned by the parent.
         apply_spec_env(&mut builder, &spec);
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
         // program or argv that Muxel resolved.
         apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
+        // Use the PTY's PATH/cwd resolution before a startup command can exec
+        // something else; that replacement must not become the trusted image.
+        #[cfg(unix)]
+        let expected_executable = builder
+            .as_command()
+            .ok()
+            .and_then(|command| std::fs::canonicalize(command.get_program()).ok());
+        // The job is created before the child so the child starts inside it.
+        #[cfg(windows)]
+        let pane_job = spec
+            .memory_limit
+            .and_then(|limit| match crate::pane_job::PaneJob::create(limit) {
+                Ok(job) => Some(job),
+                Err(err) => {
+                    log::warn!(
+                        "pane memory limit: couldn't create the job object, starting `{program_name}` without a limit: {err}"
+                    );
+                    None
+                }
+            });
+        #[cfg(windows)]
+        if let Some(job) = &pane_job {
+            builder.set_job_object(job.spawn_handle());
+        }
+
         let phase = std::time::Instant::now();
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        // portable-pty retries without a job Windows refused; only a child
+        // really inside it is limited.
+        #[cfg(windows)]
+        let pane_job = pane_job.filter(|job| {
+            let inside = child.as_raw_handle().is_some_and(|process| job.contains(process));
+            if !inside {
+                log::warn!(
+                    "pane memory limit: Windows refused the job object, `{program_name}` runs without a limit"
+                );
+            }
+            inside
+        });
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1592,6 +1677,13 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
+        #[cfg(unix)]
+        let child_identity =
+            child_pid
+                .zip(expected_executable.as_deref())
+                .and_then(|(pid, expected)| {
+                    crate::process_tree_unix::ProcessIdentity::capture(pid, expected)
+                });
         let killer = Arc::new(Mutex::new(child.clone_killer()));
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let reader_wake = ReaderWake::new(&*pair.master, &tx.queue_state())?;
@@ -1692,8 +1784,13 @@ impl TerminalSession {
         if matches!(&spec.binding, LaunchBinding::Known(_)) {
             program_status.lock().adopt_binding(1);
         }
-        let immediate_replies =
-            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
+        let grid_size = Arc::new(GridSize::new(cols, rows));
+        let immediate_replies = ImmediateReplies::new(
+            replies.clone(),
+            palette.clone(),
+            grid_size.clone(),
+            &term_config,
+        );
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1799,6 +1896,8 @@ impl TerminalSession {
             shell_prompt,
             input_stop: write_tx,
             child_pid,
+            #[cfg(unix)]
+            child_identity,
             title,
             evidence,
             program_status,
@@ -1812,6 +1911,7 @@ impl TerminalSession {
             mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
+            grid_size,
             resize: Mutex::new(ResizeState {
                 applied: (cols, rows),
                 target: (cols, rows),
@@ -1821,7 +1921,9 @@ impl TerminalSession {
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
+            text_paste_error: Mutex::new(None),
             paste_shell: spec.paste_shell,
+            control_paste,
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
@@ -1843,6 +1945,8 @@ impl TerminalSession {
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            #[cfg(windows)]
+            pane_job,
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -1985,6 +2089,8 @@ impl TerminalSession {
         let mut processor = self.processor.lock();
         let mut clock = self.read_clock.lock();
         let mut parsed = false;
+        let cursor = term.grid().cursor.point;
+        let cursor_row = term.grid()[cursor.line].clone();
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
@@ -2059,8 +2165,12 @@ impl TerminalSession {
         // Expiry without another read uses the same original frame time.
         parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
         self.evidence.lock().end_read();
+        let mut status_bar_only = false;
         if parsed {
             let screen = term.screen_lines() as i32;
+            let cursor_kept = term.grid().display_offset() == 0
+                && term.grid().cursor.point == cursor
+                && term.grid()[cursor.line] == cursor_row;
             let dmg = match term.damage() {
                 TermDamage::Full => ContentDamage::Full,
                 TermDamage::Partial(iter) => {
@@ -2080,12 +2190,19 @@ impl TerminalSession {
                 }
             };
             term.reset_damage();
+            if cursor_kept && let ContentDamage::Partial(lines) = &dmg {
+                status_bar_only = redraws_only_a_status_bar(lines, screen, cursor.line.0);
+            }
             // Do not call bump_content() here — it marks Full damage and would
             // erase the partial lines we just collected.
             self.pending_damage.lock().merge(dmg);
             self.content_gen.fetch_add(1, Ordering::Relaxed);
         }
-        *self.last_output.lock() = Instant::now();
+        // tmux redraws its status bar in every pane when its clock ticks;
+        // that's not the program doing anything, so an idle shell stays idle.
+        if !status_bar_only {
+            *self.last_output.lock() = Instant::now();
+        }
         self.output_seen.store(true, Ordering::Relaxed);
     }
 
@@ -2166,6 +2283,17 @@ impl TerminalSession {
         } else {
             false
         }
+    }
+
+    /// Whether the latest paint drew the screen as it is now. For app tests,
+    /// which can't see the generation the paint path checks.
+    #[doc(hidden)]
+    pub fn painted_current_screen(&self) -> bool {
+        let current = self.content_generation();
+        self.paint_list
+            .lock()
+            .as_ref()
+            .is_some_and(|list| list.content_gen == current)
     }
 
     /// Whether the child has produced any output yet.
@@ -2283,7 +2411,13 @@ impl TerminalSession {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
             let written = match &input {
-                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Paste(text) => match self.control_paste.encode(text) {
+                    Ok(Some(encoded)) => self.try_write_input(encoded.as_bytes()),
+                    Ok(None) => self.try_paste(text),
+                    Err(why) => {
+                        return ControlWrite::done(Err(ControlWriteError::InvalidInput(why)));
+                    }
+                },
                 ControlInput::Keys { keys, app_cursor } => self.try_write_input(
                     &keys
                         .iter()
@@ -2412,6 +2546,15 @@ impl TerminalSession {
         self.path_paste_error.lock().clone()
     }
 
+    /// Report a refused clipboard text paste on the UI thread.
+    pub fn set_text_paste_error_handler(&self, handler: Option<crate::TextPasteErrorHandler>) {
+        *self.text_paste_error.lock() = handler;
+    }
+
+    pub(crate) fn text_paste_error_handler(&self) -> Option<crate::TextPasteErrorHandler> {
+        self.text_paste_error.lock().clone()
+    }
+
     /// When the user last sent this terminal input themselves, if ever.
     pub fn last_user_input(&self) -> Option<Instant> {
         *self.last_user_input.lock()
@@ -2509,6 +2652,13 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        if let Some(encoded) = self
+            .control_paste
+            .clipboard(text)
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?
+        {
+            return self.try_write_input(encoded.as_bytes());
+        }
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
@@ -2533,7 +2683,8 @@ impl TerminalSession {
     pub fn paste_path_strings(&self, paths: &[&str]) -> Result<(), PastePathError> {
         let text = muxel_core::path_paste::format_paths(self.paste_shell, paths)?;
         if !text.is_empty() {
-            self.paste(&text);
+            self.try_paste(&text)
+                .map_err(|_| PastePathError::InputRefused)?;
         }
         Ok(())
     }
@@ -2689,6 +2840,7 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
+        self.grid_size.set(cols, rows);
         if let Some(master) = self.master.inner.lock().as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -3083,6 +3235,11 @@ impl TerminalSession {
         self.evidence.lock().binding_rev()
     }
 
+    /// Whether confirmation still observes the conversation that received its paste.
+    pub fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        self.evidence.lock().prompt_binding_is_current(captured)
+    }
+
     /// The embedder owns vte's synchronized-update timeout. The view uses this
     /// deadline to revisit a title/report held by a BSU without more PTY bytes.
     pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
@@ -3161,6 +3318,42 @@ impl TerminalSession {
         self.child_pid
     }
 
+    /// The per-process memory limit, in bytes, this pane's local processes
+    /// actually run under. `None` when the pane has none: none was asked for,
+    /// or Windows couldn't apply it (logged at launch), or not on Windows.
+    #[cfg(windows)]
+    pub fn memory_limit(&self) -> Option<u64> {
+        self.pane_job
+            .as_ref()
+            .map(crate::pane_job::PaneJob::limit_bytes)
+    }
+
+    #[cfg(not(windows))]
+    pub fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Processes in this pane that reached its memory limit since the last
+    /// call, once each is ready to report (see [`crate::MemoryLimitHit`]).
+    /// Windows reports these on a best-effort basis, so one can be missing.
+    #[cfg(windows)]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        self.pane_job
+            .as_ref()
+            .map(|job| job.take_hits(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(windows))]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        Vec::new()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn pane_job(&self) -> Option<&crate::pane_job::PaneJob> {
+        self.pane_job.as_ref()
+    }
+
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
     /// on the system clipboard (this crate has no gpui context of its own here).
     pub(crate) fn take_clipboard_stores(&self) -> Vec<(ClipboardType, String)> {
@@ -3195,20 +3388,23 @@ impl TerminalSession {
         *self.last_output.lock() = Instant::now() - idle;
     }
 
-    /// Time since output was last processed (for idle detection).
+    /// Time since output was last processed (for idle detection), not counting
+    /// status bar repaints.
     pub fn idle_for(&self) -> Duration {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child is sitting idle at its prompt with no foreground command
-    /// running — i.e. the terminal's foreground process group *is* the child
-    /// itself. A shell that's running `vim`/`make`/etc. puts that command in a new
-    /// foreground group, so this returns `false`. Used to skip the close
-    /// confirmation for an untouched shell pane.
+    /// Whether the child owns the foreground group, has no children in its own
+    /// session and still runs its original executable or another interactive
+    /// shell it exec'd into. Background jobs and other
+    /// executable changes keep the pane busy even if its prompt marks remain.
+    /// A child in a session of its own, on a terminal of its own, such as
+    /// zsh's zpty worker, doesn't count. Used to skip the close confirmation
+    /// for an untouched shell pane.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown child
-    /// pid, or a platform without `tcgetpgrp` (Windows) — so callers stay safe and
-    /// confirm as usual.
+    /// pid, an unverified executable, a failed child lookup, or no `tcgetpgrp`
+    /// — so callers stay safe and confirm as usual.
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
         {
@@ -3220,7 +3416,14 @@ impl TerminalSession {
                     .and_then(|master| master.process_group_leader()),
                 self.child_pid,
             ) {
-                (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
+                (Some(fg), Some(pid)) => {
+                    fg == pid as libc::pid_t
+                        && crate::process_tree_unix::shell_has_no_session_children(pid)
+                        && self
+                            .child_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.still_matches(pid))
+                }
                 _ => false,
             }
         }
@@ -3228,6 +3431,13 @@ impl TerminalSession {
         {
             false
         }
+    }
+
+    /// [`Self::is_idle_foreground`] where the platform can check it; None on
+    /// Windows, which has no foreground group to ask. The close policy
+    /// (`shell_close_evidence`) decides what each means.
+    pub fn foreground_idle(&self) -> Option<bool> {
+        cfg!(unix).then(|| self.is_idle_foreground())
     }
 
     /// Kill the child process. On Unix this sends SIGHUP, at most once per
@@ -3337,6 +3547,20 @@ impl TerminalSession {
     }
 }
 
+/// Whether a batch of output only redrew a status bar: it changed the screen's
+/// top or bottom row and nothing else, while the cursor and its own row were
+/// left as they were. `damaged` is the batch's damaged rows, which always
+/// include `cursor_line`. That is how tmux (or screen) repaints its status line
+/// when the clock moves, so the batch says nothing about the program running
+/// inside.
+fn redraws_only_a_status_bar(damaged: &[i32], screen_lines: i32, cursor_line: i32) -> bool {
+    let mut others = damaged
+        .iter()
+        .filter(|&&line| line != cursor_line)
+        .peekable();
+    others.peek().is_some() && others.all(|&line| line == 0 || line == screen_lines - 1)
+}
+
 /// Append one mouse-wheel report — button 64 (scroll up) / 65 (scroll down) — at
 /// the 0-based cell (`col`, `row`), in SGR (1006) or legacy X10 encoding. Wheel
 /// events are press-only (no release), so the SGR form always ends in `M`.
@@ -3365,6 +3589,22 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+/// The `--version` output of the Codex a launch runs, from
+/// [`crate::codex_version`]: asked once per executable, on its own thread.
+#[cfg(windows)]
+fn codex_control_version(program: &str) -> Option<String> {
+    let program = literal_program_for_spawn(program).ok()?;
+    crate::codex_version::version(
+        std::path::Path::new(&program),
+        crate::codex_version::LAUNCH_WAIT,
+    )
+}
+
+#[cfg(not(windows))]
+fn codex_control_version(_program: &str) -> Option<String> {
+    None
 }
 
 /// Resolve a literal launch without permitting a batch interpreter to reparse
@@ -3693,14 +3933,29 @@ fn ensure_utf8_locale(builder: &mut CommandBuilder) {
 fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 
 /// `spec`'s variables on top of what `builder` already has (muxel's own
-/// environment and its defaults), then without `spec.env_remove`, which covers
-/// both.
+/// environment and its defaults), then without `spec.env_remove` or the parent
+/// muxel's profiler settings. Removals cover both inherited and configured env.
 fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
     for (k, v) in &spec.env {
         builder.env(k, v);
     }
     for k in &spec.env_remove {
         builder.env_remove(k);
+    }
+    // Profiler settings belong to the parent muxel, even when a preset repeats
+    // them. Apply last so no configured override can leak them into a pane.
+    let keys = muxel_core::child_env::profiler_env_keys(
+        std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(
+                builder
+                    .iter_full_env_as_str()
+                    .map(|(key, _)| OsString::from(key)),
+            )
+            .chain(spec.env.iter().map(|(key, _)| OsString::from(key))),
+    );
+    for key in keys {
+        builder.env_remove(key);
     }
 }
 
@@ -4347,6 +4602,81 @@ mod content_damage_tests {
              {baseline} open before, {open} after"
         );
     }
+
+    /// tmux's status bar on row 24 with the clock at `time`, drawn the way
+    /// tmux 3.4 does: from the cursor's row by `\r\n` when it's just above,
+    /// else by position, then the cursor put back after the shell's prompt.
+    fn tmux_status(time: &str, via_newline: bool) -> String {
+        let to_bar = if via_newline { "\r\n" } else { "\x1b[24;1H" };
+        format!(
+            "\x1b[?25l\x1b[30m\x1b[42m{to_bar}[muxel_demo0:zsh* \"user@host:~\" {time} 03-Nov-26\x1b(B\x1b[m\x1b[?12l\x1b[?25h\x1b[23;14H"
+        )
+    }
+
+    /// A shell idle at its prompt on row 23, under tmux's bar.
+    fn idle_shell_under_tmux() -> std::sync::Arc<TerminalSession> {
+        let session = spawn_quiet();
+        session.process_output(b"\x1b[2J\x1b[23;1Huser@host:~$ ");
+        session.process_output(tmux_status("14:50", false).as_bytes());
+        session.set_idle_for_test(Duration::from_secs(6));
+        session
+    }
+
+    /// tmux repaints its status bar in every pane when the minute turns. That
+    /// isn't the shell producing output, so it stays idle (and so out of the
+    /// activity fallback's Working).
+    #[test]
+    fn a_tmux_clock_tick_leaves_an_idle_shell_idle() {
+        for via_newline in [false, true] {
+            let session = idle_shell_under_tmux();
+            let content = session.content_generation();
+            session.process_output(tmux_status("14:51", via_newline).as_bytes());
+            assert!(
+                session.idle_for() >= Duration::from_secs(5),
+                "via_newline={via_newline}: {:?}",
+                session.idle_for()
+            );
+            assert_ne!(session.content_generation(), content, "still repainted");
+        }
+    }
+
+    #[test]
+    fn output_from_the_shell_itself_still_counts() {
+        for output in [
+            // A command's output moves the cursor.
+            "ls\r\nCargo.toml\r\nuser@host:~$ ",
+            // A progress bar redrawn in place on the cursor's row.
+            "\r[#####     ] 50%",
+            // A row away from the edges, with the cursor put back.
+            "\x1b7\x1b[5;1Hhello\x1b8",
+        ] {
+            let session = idle_shell_under_tmux();
+            session.process_output(output.as_bytes());
+            assert!(
+                session.idle_for() < Duration::from_secs(1),
+                "{output:?}: {:?}",
+                session.idle_for()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod status_bar_redraw_tests {
+    use super::redraws_only_a_status_bar;
+
+    #[test]
+    fn only_an_edge_row_away_from_the_cursor_is_a_status_bar() {
+        // A bottom bar, or a top one, with the cursor's row untouched.
+        assert!(redraws_only_a_status_bar(&[22, 23], 24, 22));
+        assert!(redraws_only_a_status_bar(&[0, 22], 24, 22));
+        // Nothing but the cursor's own row.
+        assert!(!redraws_only_a_status_bar(&[22], 24, 22));
+        // A row in the middle changed too.
+        assert!(!redraws_only_a_status_bar(&[10, 22, 23], 24, 22));
+        // The bottom row is where the cursor is: that's the program's own line.
+        assert!(!redraws_only_a_status_bar(&[23], 24, 23));
+    }
 }
 
 #[cfg(test)]
@@ -4370,6 +4700,34 @@ mod wheel_report_tests {
         assert_eq!(builder.get_env("PATH"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_SET"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_KEEP"), Some("1".as_ref()));
+    }
+
+    #[test]
+    fn pane_environment_drops_parent_profiler_settings() {
+        let profilers = [
+            "MUXEL_PROFILE_FUTURE",
+            "MUXEL_PROFILE",
+            "MUXEL_PROFILE_TERMINAL",
+            "MUXEL_PROFILE_UI",
+            "MUXEL_PROFILE_LOG",
+            "MUXEL_PROFILE_UI_LOG",
+            "MUXEL_PROFILE_STDERR",
+            "MUXEL_PROFILE_CHAINS",
+        ];
+        let context = ["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"];
+        let mut builder = portable_pty::CommandBuilder::new("unused");
+        let mut spec = CommandSpec::program("unused", Vec::new());
+        for key in profilers.iter().chain(context.iter()) {
+            builder.env(key, "inherited");
+            spec.env.push((key.to_string(), "configured".to_string()));
+        }
+        apply_spec_env(&mut builder, &spec);
+        for key in profilers {
+            assert_eq!(builder.get_env(key), None, "profiler leaked: {key}");
+        }
+        for key in context {
+            assert_eq!(builder.get_env(key), Some("configured".as_ref()));
+        }
     }
 
     #[test]
@@ -7595,6 +7953,71 @@ mod startup_tests {
         assert!(session.try_submit_input(b"\r").is_err());
         assert!(!session.has_submitted_turn());
         session.kill();
+    }
+}
+
+#[cfg(test)]
+mod clipboard_refusal_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::control_paste::ControlPaste;
+    use gpui::{ClipboardItem, TestAppContext};
+    use parking_lot::Mutex;
+    use std::{
+        io::{self, Write},
+        sync::Arc,
+    };
+
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_refusal_reports_error_without_any_write() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(not(windows))]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (mut session, _output) = TerminalSession::spawn(spec, 80, 24).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::get_mut(&mut session).expect("fresh session is not shared yet");
+        inner.control_paste = ControlPaste::WindowsCodex;
+        inner.writer = Arc::new(Mutex::new(Box::new(RecordingWriter(bytes.clone()))));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured = errors.clone();
+        session.set_text_paste_error_handler(Some(Arc::new(move |error, _| {
+            captured.lock().push(error)
+        })));
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        for control in ['\0', '\u{8}', '\u{7f}', '\u{85}'] {
+            cx.update(|cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("prefix{control}suffix")));
+                crate::paste_clipboard_into_session(&session, cx);
+            });
+        }
+        let written = bytes.lock().clone();
+        let refused = errors.lock().clone();
+        session.kill();
+        assert!(
+            written.is_empty(),
+            "none of a refused clipboard paste may reach the writer"
+        );
+        assert_eq!(
+            refused.len(),
+            4,
+            "each refusal must reach the user-facing error handler"
+        );
+        assert!(refused[0].contains("U+0000"));
     }
 }
 

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 /// muxel polls git in the background. No-op off Windows.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    let mut cmd = muxel_core::child_env::command(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -166,16 +166,80 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     }
 }
 
+/// `Command::output` for git, also recorded by the UI profiler when it's on
+/// (`ui_profile::git_launched`; the caller label comes from
+/// `ui_profile::git_caller`).
+trait ProfiledOutput {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Commands this thread ran through [`ProfiledOutput`], for tests that
+    /// count git launches.
+    static LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl ProfiledOutput for Command {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        LAUNCHES.with(|n| n.set(n.get() + 1));
+        if !crate::ui_profile::is_enabled() {
+            return self.output();
+        }
+        let started = Instant::now();
+        let out = self.output();
+        crate::ui_profile::git_launched(self, started.elapsed(), &out);
+        out
+    }
+}
+
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, true).profiled_output()
+}
+
+/// Mutations deliberately keep git's normal locking behavior.
+fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, false).profiled_output()
+}
+
+const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
+
+fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
     match loc {
-        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
+        RepoLoc::Local(path) => {
+            let mut cmd = if read_only {
+                git_read_command()
+            } else {
+                command("git")
+            };
+            cmd.arg("-C").arg(path).args(args);
+            cmd
+        }
         RepoLoc::Remote(c) => {
-            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
-            remote_ssh_command(c, remote).output()
+            let remote = if read_only {
+                remote_ops::git_read_only(c.host.os, &c.remote_path, args)
+            } else {
+                remote_ops::git(c.host.os, &c.remote_path, args)
+            };
+            remote_ssh_command(c, remote)
         }
     }
+}
+
+/// Shared default for background/display git reads.
+fn git_read_command() -> Command {
+    read_only_git(command("git"))
+}
+
+fn read_only_git(mut cmd: Command) -> Command {
+    // Porcelain diff can run update-index --refresh even with optional locks
+    // disabled, so suppress its automatic refresh explicitly as well.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", READ_ONLY_GIT_CONFIG]);
+    cmd
 }
 
 /// Cap on the size of a remote file muxel will read into the editor (2 MB).
@@ -334,15 +398,16 @@ fn pipe_to_remote(
 }
 
 /// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare
-/// `MEMORY_DIR` form counts too). Idempotent; shared by the memory-file and
-/// layout-sync writers.
+/// `MEMORY_DIR` form counts too) and git does not already ignore it through
+/// another source, such as `.git/info/exclude` or `core.excludesFile`.
+/// Idempotent; shared by the memory-file and layout-sync writers.
 fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
     let ignored = current
         .lines()
         .any(|l| l.trim() == ignore_line || l.trim() == MEMORY_DIR);
-    if ignored {
+    if ignored || git_ignores(root, ignore_line) {
         return Ok(());
     }
     let mut next = current;
@@ -352,6 +417,17 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     next.push_str(ignore_line);
     next.push('\n');
     std::fs::write(&gitignore, next).with_context(|| format!("updating {}", gitignore.display()))
+}
+
+/// Whether git at `root` ignores `path` from any ignore source. `false` when
+/// git is missing or `root` is not in a repository.
+fn git_ignores(root: &Path, path: &str) -> bool {
+    git_read_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--", path])
+        .profiled_output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Ensure a project's shared memory file exists and is git-ignored, idempotently:
@@ -633,6 +709,25 @@ pub fn fetch_remote_layout(loc: &RepoLoc) -> Option<String> {
     }
 }
 
+/// A poll distinguishes a missing local layout from a failed/oversized read.
+/// Only a successful read (or confirmed absence) may release a pending close.
+pub fn fetch_layout_for_poll(loc: &RepoLoc) -> (bool, Option<String>) {
+    if let RepoLoc::Local(root) = loc {
+        let path = local_layout_abs(root);
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (true, None),
+            Ok(metadata) if metadata.len() <= MAX_REMOTE_BYTES => {}
+            _ => return (false, None),
+        }
+        return match std::fs::read_to_string(path) {
+            Ok(json) => (true, Some(json)),
+            Err(_) => (false, None),
+        };
+    }
+    let json = fetch_remote_layout(loc);
+    (json.is_some(), json)
+}
+
 /// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json`, backing up
 /// the previous copy to `workspace.bak.json` first and ensuring `.muxel/` is
 /// git-ignored — over SSH for a remote project, on the local filesystem for a local
@@ -670,7 +765,8 @@ fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
 
 /// `git <args>` at `loc`; `bail!`s with stderr (a useful toast) on failure.
 fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
-    let out = git_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let out =
+        git_write_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -947,11 +1043,11 @@ pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(Str
 
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
+        .profiled_output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -963,7 +1059,7 @@ pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Resul
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
         .arg(worktree_path)
-        .output()
+        .profiled_output()
         .context("running `git worktree add`")?;
     if !output.status.success() {
         bail!(
@@ -980,11 +1076,11 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -1002,20 +1098,372 @@ pub fn repo_head(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "HEAD"])
 }
 
-/// The repo's current branch name (e.g. `main`); `None` when detached (`"HEAD"`)
-/// or git fails. Used only for display. Works for local or remote repos.
+/// The repo's current branch, including before its first commit, spelled as
+/// [`list_branches`] spells it so the branch switcher can mark it. `None` when
+/// detached or git fails. Used only for display; works for local and remote
+/// repos. The branch poll reads a local project's branch with its branch list
+/// instead (see [`read_branches`]).
 pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
-    git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
+    // `rev-parse --abbrev-ref` shortens a name as `git branch` does
+    // (`heads/<name>` when a remote-tracking ref shares it, where
+    // `symbolic-ref --short` doesn't), but has no answer before the first
+    // commit, where it exits 128. Only then is `symbolic-ref` worth a second
+    // launch: ssh failing to connect exits 255.
+    let out = git_output(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        return (!head.is_empty() && head != "HEAD").then_some(head);
+    }
+    // Where there's no repository git exits 128 too, printing nothing.
+    if out.status.code() != Some(128) || head != "HEAD" {
+        return None;
+    }
+    git_line_loc(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+}
+
+/// Environment variables that choose the repository or change how git looks
+/// for it. Git children inherit muxel's environment, and [`git_ref_stamp`]
+/// doesn't follow these, so with any of them set the stamp is unsettled (see
+/// [`GitRefStamp`]). `GIT_CEILING_DIRECTORIES` needn't be: a ceiling can only
+/// stop git short of the repository the stamp watches.
+const GIT_DISCOVERY_ENV: [&str; 4] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// Whether git accepts a ref name, whole or the part after `refs/heads/`, by
+/// the rules of its `check_refname_format`: no empty component, none starting
+/// with `.` or ending in `.lock`, no `..` or `@{`, no trailing `.`, and no
+/// control character, DEL, space or any of `~ ^ : ? * [ \`. git reads a HEAD
+/// naming anything else as no ref at all.
+fn is_valid_ref_name(name: &str) -> bool {
+    !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || br" ~^:?*[\".contains(&b))
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// HEAD's contents in `git_dir`, when git's answer for the current branch rests
+/// only on files [`git_ref_stamp`] watches, so the stamp moves whenever that
+/// answer can: HEAD is a file, not a symlink, and the ref it names, if any,
+/// holds an object id itself (see [`ref_is_direct`]). `None` where git would
+/// follow HEAD on through a file the stamp doesn't read. That folder's stamp
+/// is then unsettled (see [`GitRefStamp`]).
+fn settled_head(git_dir: &Path, common: &Path) -> Option<Vec<u8>> {
+    let path = git_dir.join("HEAD");
+    if std::fs::symlink_metadata(&path).ok()?.is_symlink() {
+        return None;
+    }
+    let head = std::fs::read(&path).ok()?;
+    // git trims the end and skips whitespace after `ref:`. Anything else is an
+    // object id, a detached HEAD the stamp holds as it is.
+    if let Some(target) = trim_git_space_end(&head).strip_prefix(b"ref:") {
+        let at = target
+            .iter()
+            .position(|b| !is_git_space(b))
+            .unwrap_or(target.len());
+        let refname = std::str::from_utf8(&target[at..]).ok()?;
+        if !ref_is_direct(git_dir, common, refname) {
+            return None;
+        }
+    }
+    Some(head)
+}
+
+/// Whether `refname` holds an object id itself rather than naming another ref:
+/// a loose file of just an id, or no loose file (packed, where a ref can't name
+/// another, or not created yet). A name git rejects counts too, since git reads
+/// no file for it. Per-worktree refs (outside `refs/`, or under `refs/bisect/`,
+/// `refs/worktree/` or `refs/rewritten/`) live in the worktree's own git dir,
+/// the rest in the common one.
+fn ref_is_direct(git_dir: &Path, common: &Path, refname: &str) -> bool {
+    if !is_valid_ref_name(refname) {
+        return true;
+    }
+    let per_worktree = !refname.starts_with("refs/")
+        || ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter()
+            .any(|prefix| refname.starts_with(prefix));
+    let path = if per_worktree { git_dir } else { common }.join(refname);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            meta.is_file()
+                && std::fs::read(&path).is_ok_and(|bytes| {
+                    let id = trim_git_space_end(&bytes);
+                    matches!(id.len(), 40 | 64) && id.iter().all(u8::is_ascii_hexdigit)
+                })
+        }
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whitespace as git's `isspace` has it: space, tab, newline, carriage return.
+fn is_git_space(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// `bytes` without trailing git whitespace, as git's `strbuf_rtrim` leaves a ref.
+fn trim_git_space_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|b| !is_git_space(b))
+        .map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
+/// Where a git dir's shared refs live: the main repo's git dir for a linked
+/// worktree (its `commondir` file), else the git dir itself.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|_| git_dir.to_path_buf())
+}
+
+/// A cheap stamp of the git metadata [`read_branches`] reads for a local
+/// `dir`: the git dir found, HEAD's contents, the loose branch
+/// names, and the size/mtime of `packed-refs` and reftable's `tables.list` (a
+/// linked worktree's own as well, which holds its HEAD). It takes a few `stat`s
+/// and no `git` subprocess, so the status poll re-runs git only when this
+/// moves. Not a repo is a stamp too, so a `git init` there is noticed.
+///
+/// Where those files can't vouch for what git reads, the stamp is unsettled:
+/// that is with a variable from [`GIT_DISCOVERY_ENV`] set, a folder that can't
+/// be resolved, or a HEAD [`settled_head`] turns down. Unsettled is a state,
+/// not a change: such stamps all compare equal, so only a move into or out of
+/// it, or the shorter backstop [`GitRefStamp::backstop`] gives it, asks git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitRefStamp {
+    unsettled: bool,
+    git_dir: Option<PathBuf>,
+    head: Option<Vec<u8>>,
+    branches: Vec<PathBuf>,
+    packed_refs: Option<(std::time::SystemTime, u64)>,
+    reftable: Option<(std::time::SystemTime, u64)>,
+    worktree_reftable: Option<(std::time::SystemTime, u64)>,
+}
+
+impl GitRefStamp {
+    /// How long the branch poll lets this stamp stand before asking git
+    /// anyway. A settled stamp waits five minutes, for what it can't see (git
+    /// config, `safe.directory`, git installed later). An unsettled one can't
+    /// see the repository or ref git reads, so it gets the one minute the poll
+    /// waited before the stamp could vouch for anything: a label there is at
+    /// most that stale, at no more launches than then.
+    pub fn backstop(&self) -> Duration {
+        Duration::from_secs(if self.unsettled { 60 } else { 300 })
+    }
+}
+
+pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
+    git_ref_stamp_with(dir, |key| std::env::var_os(key))
+}
+
+/// [`git_ref_stamp`], reading git's environment from `env`.
+fn git_ref_stamp_with(dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> GitRefStamp {
+    let unsettled = || GitRefStamp {
+        unsettled: true,
+        ..GitRefStamp::default()
+    };
+    if GIT_DISCOVERY_ENV.iter().any(|key| env(key).is_some()) {
+        return unsettled();
+    }
+    // No ceilings: a ceiling can only stop git short of the repo this walk
+    // finds, so watching that repo may cost a launch but never misses a change.
+    let (git_dir, broken) = match find_git_dir(dir) {
+        Ok(None) => return GitRefStamp::default(),
+        Ok(Some(GitDir::Dot(git_dir) | GitDir::Bare(git_dir))) => (git_dir, false),
+        Ok(Some(GitDir::Broken(dot))) => (dot, true),
+        Err(_) => return unsettled(),
+    };
+    // A linked worktree's branches live in the main repo's git dir.
+    let common = common_git_dir(&git_dir);
+    // git stops at a broken `.git` with an error until the folder changes.
+    let head = if broken {
+        None
+    } else {
+        let Some(head) = settled_head(&git_dir, &common) else {
+            return unsettled();
+        };
+        Some(head)
+    };
+    let file_stamp = |path: PathBuf| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    let heads = common.join("refs").join("heads");
+    let mut branches = Vec::new();
+    let mut dirs = vec![heads.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+            } else if let Ok(name) = path.strip_prefix(&heads) {
+                branches.push(name.to_path_buf());
+            }
+        }
+    }
+    branches.sort();
+    let reftable = file_stamp(common.join("reftable").join("tables.list"));
+    // Switching branches in a linked reftable worktree rewrites only its own
+    // table: its HEAD file is the placeholder.
+    let worktree_reftable = (reftable.is_some() && git_dir != common)
+        .then(|| file_stamp(git_dir.join("reftable").join("tables.list")))
+        .flatten();
+    GitRefStamp {
+        unsettled: false,
+        head,
+        branches,
+        packed_refs: file_stamp(common.join("packed-refs")),
+        reftable,
+        worktree_reftable,
+        git_dir: Some(git_dir),
+    }
+}
+
+/// Where git finds the repository for a folder.
+#[derive(Debug, PartialEq, Eq)]
+enum GitDir {
+    /// A `.git` directory that is a repository, or the repository a `.git`
+    /// file's `gitdir:` names (a linked worktree, a submodule).
+    Dot(PathBuf),
+    /// A folder that is itself a repository: a bare repo, or the inside of a
+    /// `.git`.
+    Bare(PathBuf),
+    /// A `.git` file that doesn't name a repository. git stops there with an
+    /// error.
+    Broken(PathBuf),
+}
+
+/// The git dir for `dir`, found as git finds it. git starts from the folder's
+/// real path, since its `chdir` resolves symlinks and junctions, and walks up to
+/// the nearest folder with a `.git` file, a `.git` directory that is a
+/// repository, or that is a repository itself (see [`is_git_directory`]). On
+/// Linux and macOS it stops at a filesystem boundary. Ceilings aren't followed
+/// (see [`GIT_DISCOVERY_ENV`]). `Ok(None)` when there is none, or when `dir` is
+/// missing or not a folder, where git can't start. `Err` when `dir` can't be
+/// resolved or a `.git` file can't be read.
+fn find_git_dir(dir: &Path) -> std::io::Result<Option<GitDir>> {
+    let real = match real_dir(dir) {
+        Ok(real) if real.is_dir() => real,
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    let elsewhere = {
+        use std::os::unix::fs::MetadataExt as _;
+        let device = std::fs::metadata(&real)?.dev();
+        move |d: &Path| std::fs::metadata(d).map(|m| m.dev()).ok() != Some(device)
+    };
+    for d in real.ancestors() {
+        #[cfg(unix)]
+        if d != real && elsewhere(d) {
+            return Ok(None);
+        }
+        let dot = d.join(".git");
+        match std::fs::metadata(&dot) {
+            Ok(meta) if meta.is_file() => {
+                // git takes the rest of the file after `gitdir: `, less
+                // trailing newlines, relative to the folder holding it.
+                let text = String::from_utf8(std::fs::read(&dot)?)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let target = text
+                    .strip_prefix("gitdir: ")
+                    .map(|rest| rest.trim_end_matches(['\n', '\r']))
+                    .filter(|rest| !rest.is_empty())
+                    .map(|rest| d.join(rest))
+                    .filter(|target| is_git_directory(target));
+                return Ok(Some(target.map_or(GitDir::Broken(dot), GitDir::Dot)));
+            }
+            Ok(_) if is_git_directory(&dot) => return Ok(Some(GitDir::Dot(dot))),
+            // git passes over a `.git` directory that isn't a repository.
+            Ok(_) | Err(_) => {}
+        }
+        if is_git_directory(d) {
+            return Ok(Some(GitDir::Bare(d.to_path_buf())));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether git takes `dir` for a repository, by the test its discovery applies
+/// (`is_git_directory` in git's `setup.c`): a HEAD git's `validate_headref`
+/// accepts, and `objects` and `refs` in the common dir. On Linux and macOS git
+/// also needs to be able to enter those two, which this doesn't check.
+fn is_git_directory(dir: &Path) -> bool {
+    if !head_is_valid(&dir.join("HEAD")) {
+        return false;
+    }
+    let common = common_git_dir(dir);
+    ["objects", "refs"]
+        .iter()
+        .all(|part| std::fs::metadata(common.join(part)).is_ok())
+}
+
+/// Whether git's `validate_headref` accepts the HEAD at `path`: a symlink into
+/// `refs/`, or a file whose first 255 bytes are `ref:`, optional whitespace and
+/// `refs/…`, or begin with an object id.
+fn head_is_valid(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_symlink() {
+        return std::fs::read_link(path)
+            .is_ok_and(|target| target.as_os_str().as_encoded_bytes().starts_with(b"refs/"));
+    }
+    let mut start = Vec::with_capacity(255);
+    if std::fs::File::open(path)
+        .and_then(|file| file.take(255).read_to_end(&mut start))
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(rest) = start.strip_prefix(b"ref:") {
+        let at = rest
+            .iter()
+            .position(|b| !is_git_space(b))
+            .unwrap_or(rest.len());
+        if rest[at..].starts_with(b"refs/") {
+            return true;
+        }
+    }
+    start.len() >= 40 && start[..40].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// `dir` with symlinks and junctions resolved. On Windows, without the `\\?\`
+/// prefix on a drive path, so a relative `gitdir:` joined onto it still
+/// resolves `..`.
+fn real_dir(dir: &Path) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(dir)?;
+    #[cfg(windows)]
+    if let Some(rest) = real.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(PathBuf::from(rest));
+    }
+    Ok(real)
 }
 
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = command("git")
+    let out = git_read_command()
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1029,11 +1477,11 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -1048,7 +1496,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
-        .output()
+        .profiled_output()
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
@@ -1056,7 +1504,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
-            .output();
+            .profiled_output();
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
@@ -1069,7 +1517,7 @@ pub fn delete_branch(repo: &Path, branch: &str) {
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
-        .output();
+        .profiled_output();
 }
 
 /// Stage **all** changes (tracked, untracked, and deletions) and commit them at
@@ -1197,9 +1645,10 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
 /// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
 /// so the repo isn't left mid-merge.
 pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
-    let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
+    let out =
+        git_write_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
     if !out.status.success() {
-        let _ = git_output(loc, &["merge", "--abort"]);
+        let _ = git_write_output(loc, &["merge", "--abort"]);
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1208,7 +1657,7 @@ pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Remove the worktree at `worktree_path` (force) and prune stale entries, at
 /// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
 pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
-    let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
+    let out = git_write_output(loc, &["worktree", "remove", "--force", worktree_path])
         .context("running `git worktree remove`")?;
     if !out.status.success() {
         bail!(
@@ -1216,7 +1665,7 @@ pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let _ = git_output(loc, &["worktree", "prune"]);
+    let _ = git_write_output(loc, &["worktree", "prune"]);
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1253,7 +1702,7 @@ pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
-        .output()
+        .profiled_output()
         .context("running `git push`")?;
     if !out.status.success() {
         bail!("git push: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -1298,7 +1747,7 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
             .arg("-C")
             .arg(worktree_path)
             .args(args)
-            .output()
+            .profiled_output()
             .context("running git")
     };
     let reset = run(&["reset", "--hard", base_ref])?;
@@ -1320,12 +1769,12 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
-        .output();
+        .profiled_output();
     let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
-        .output();
+        .profiled_output();
 }
 
 /// Maximum diff text we load into the viewer (bytes), so a giant diff can't
@@ -1338,12 +1787,12 @@ const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
 pub fn git_diff(dir: &Path) -> String {
     let git = |args: &[&str]| {
-        command("git")
+        git_read_command()
             .arg("-C")
             .arg(dir)
             .arg("--no-pager")
             .args(args)
-            .output()
+            .profiled_output()
     };
 
     // Resolve the repo root (also our "is this a git repo?" check, in one call).
@@ -2339,6 +2788,8 @@ pub fn remote_tmux_launch_target(
         name: session.name.clone(),
         socket: session.socket.clone(),
         instance,
+        local_close_token: None,
+        worktree: Default::default(),
     }
     .resolve_owner(&sessions, profile_tmux_socket())
     .target();
@@ -3304,29 +3755,147 @@ fn run_tmux_until(
     Ok(status)
 }
 
+/// Resolve a local close's owner so the caller can save it before teardown.
+/// Run on a background executor, sharing its deadline with the later kill.
+pub fn resolve_local_tmux_close(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    resolve_tmux_owner_with(&session, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
+}
+
 /// Close a local tmux session on its recorded or confirmed legacy owner.
 /// Discovery, kill and absence confirmation share one deadline. Every child is
 /// supervised and reaped by the bounded runner; failure never authorizes a kill
 /// on another server or a migration to it. Run only on a background executor.
-pub fn close_local_tmux(session: &SessionTarget, deadline: Instant) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalTmuxClose {
+    Gone,
+    Preserved,
+}
+
+pub fn close_local_tmux(
+    session: &SessionTarget,
+    token: uuid::Uuid,
+    initialize: bool,
+    deadline: Instant,
+) -> Result<LocalTmuxClose> {
     let session = profile_tmux_target(session);
+    let socket = session
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if initialize {
+        let mut cmd = tmux_on(socket);
+        cmd.args(muxel_core::tmux::set_option_args(
+            &session.name,
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION,
+            &token.to_string(),
+        ));
+        let out = run_tmux_output_until(cmd, deadline)?;
+        if !out.status.success() {
+            if !local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+                return Ok(LocalTmuxClose::Gone);
+            }
+            bail!(
+                "couldn't bind tmux close generation: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let id = std::cell::RefCell::new(None::<String>);
     close_local_tmux_with(
         &session,
         deadline,
-        |socket, deadline| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+        |socket, deadline| {
+            let Some((observed_id, observed_token)) =
+                local_close_generation(socket, &session.name, deadline)?
+            else {
+                return Ok(false);
+            };
+            if observed_token != Some(token) {
+                return Ok(false);
+            }
+            let mut expected = id.borrow_mut();
+            if let Some(expected) = expected.as_ref() {
+                Ok(*expected == observed_id)
+            } else {
+                *expected = Some(observed_id);
+                Ok(true)
+            }
+        },
         |owner, deadline| {
             let socket = owner
                 .socket
                 .as_ref()
                 .context("tmux close owner is unknown")?;
             let mut cmd = tmux_on(socket);
-            cmd.args(muxel_core::tmux::kill_session_args(&owner.name));
-            // kill-session can fail because the session already exited. Only
-            // the checked absence probe below decides whether close succeeded.
+            let id = id.borrow();
+            let args = muxel_core::tmux::kill_local_generation_args(
+                &owner.name,
+                id.as_deref().context("tmux generation was not observed")?,
+                token,
+            )
+            .context("invalid tmux session id")?;
+            cmd.args(args);
+            // The server compares the token and id again in the same command
+            // queue as kill-session. A peer restart cannot transfer the kill.
             run_tmux_output_until(cmd, deadline)?;
             Ok(())
         },
-    )
+    )?;
+    if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+        Ok(LocalTmuxClose::Preserved)
+    } else {
+        Ok(LocalTmuxClose::Gone)
+    }
+}
+
+fn local_close_generation(
+    socket: &Socket,
+    session: &str,
+    deadline: Instant,
+) -> Result<Option<(String, Option<uuid::Uuid>)>> {
+    let mut cmd = tmux_on(socket);
+    // Keep imported Unicode names intact even with the runner's C locale.
+    cmd.arg("-u");
+    cmd.args([
+        "display-message".to_string(),
+        "-p".into(),
+        "-t".into(),
+        format!("={session}:"),
+        // tmux sanitizes control characters (including tabs) under the
+        // runner's LC_ALL=C. Colons remain printable; parse from the right
+        // so the session name cannot change the id/token boundaries.
+        format!(
+            "#{{session_name}}:#{{session_id}}:#{{{}}}",
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION
+        ),
+    ]);
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if out.status.success() {
+        let text = String::from_utf8(out.stdout).context("tmux generation is not UTF-8")?;
+        let line = text.strip_suffix('\n').unwrap_or(&text);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some((prefix, token)) = line.rsplit_once(':')
+            && let Some((name, id)) = prefix.rsplit_once(':')
+            && name == session
+            && id.strip_prefix('$').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        {
+            return Ok(Some((id.into(), uuid::Uuid::parse_str(token).ok())));
+        }
+    }
+    // display-message may succeed without a target. An invalid response is
+    // never proof of absence; only has-session can confirm that.
+    if !local_tmux_has_session_confirmed(socket, session, deadline)? {
+        return Ok(None);
+    }
+    bail!("couldn't read the generation of tmux session “{session}”")
 }
 
 fn close_local_tmux_with(
@@ -3336,6 +3905,13 @@ fn close_local_tmux_with(
     kill: impl FnOnce(&SessionTarget, Instant) -> Result<()>,
 ) -> Result<()> {
     let owner = resolve_tmux_owner_with(session, |socket| probe(socket, deadline))?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if !probe(socket, deadline)? {
+        return Ok(());
+    }
     kill(&owner, deadline)?;
     let socket = owner
         .socket
@@ -3605,23 +4181,23 @@ pub fn kill_remote_tmux(
     }
 }
 
-/// Give this machine's tmux client for `session` on `host` the window size again
-/// (see [`ssh::claim_window_size_command`]), over the host's ControlMaster. Only a
-/// failure to reach the host is an error: a client that never recorded itself, or
-/// has since gone, simply has nothing to claim.
-pub fn claim_tmux_window_size(
+/// Give this machine's tmux clients for `sessions` on `host` the window size again
+/// (see [`ssh::claim_window_sizes_command`]), in one ssh over the host's
+/// ControlMaster. Only a failure to reach the host is an error: a client that never
+/// recorded itself, or has since gone, simply has nothing to claim.
+pub fn claim_tmux_window_sizes(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &SessionTarget,
+    sessions: &[SessionTarget],
     tag: &str,
 ) -> Result<()> {
-    let session = profile_tmux_target(session);
+    let sessions: Vec<SessionTarget> = sessions.iter().map(profile_tmux_target).collect();
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::claim_window_size_command(&session, tag),
+        &ssh::claim_window_sizes_command(&sessions, tag),
     )?;
     // ssh reports its own failures as 255; anything else is the command's answer.
     if out.status.code() == Some(255) {
@@ -3726,19 +4302,122 @@ pub fn open_microphone_settings() {
         .output();
 }
 
-/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`.
+/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`. Read with
+/// `for-each-ref`, which lists branches only: `git branch` adds a line for a
+/// detached HEAD, a rebase or a bisect (`(HEAD detached at 1a2b3c4)`).
 pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
-    git_output(loc, &["branch", "--format=%(refname:short)"])
+    git_output(
+        loc,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// What a branch poll read at a repository.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BranchRead {
+    /// The branch HEAD names (`None` when it names none, or the folder holds
+    /// no repository), spelled as [`list_branches`] spells it, and the local
+    /// branches.
+    Read(Option<String>, Vec<String>),
+    /// Nothing came back: ssh or sshpass failed, couldn't start, or was
+    /// stopped.
+    Unknown,
+    /// git failed to list a remote repository's branches, saying this (or
+    /// nothing). A git older than 1.9 does, at `%(HEAD)`.
+    Failed(String),
+}
+
+/// What the branch poll shows for a project at `loc`. One git round, so one
+/// ssh for a remote one, where a [`repo_current_branch`] and a
+/// [`list_branches`] were two. A local failure reads as no branches.
+pub fn read_branches(loc: &RepoLoc) -> BranchRead {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    let out = match loc {
+        RepoLoc::Remote(c) => {
+            return remote_branch_read(
+                remote_ssh_command(c, remote_ops::branches(c.host.os, &c.remote_path))
+                    .profiled_output(),
+            );
+        }
+        // The same two reads, the second only where the first marks no branch.
+        RepoLoc::Local(_) => git_output(loc, LIST).and_then(|mut out| {
+            let marked = out
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"*"));
+            if out.status.success() && !marked {
+                let head = git_output(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+                out.stdout.extend_from_slice(&head.stdout);
+                out.status = head.status;
+            }
+            Ok(out)
+        }),
+    };
+    let (branch, branches) = out
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        // 1: HEAD names no branch.
+        .filter(|out| matches!(out.status.code(), Some(0 | 1)))
+        .map(|out| parse_branches(&out.stdout))
+        .unwrap_or_default();
+    BranchRead::Read(branch, branches)
+}
+
+/// How [`remote_ops::branches`]' ssh command ended: git's failure is told by
+/// the line it prints after one, since ssh (255) and sshpass (5 for a wrong
+/// password, 6 for an unknown host key) end with codes of their own.
+fn remote_branch_read(out: std::io::Result<std::process::Output>) -> BranchRead {
+    let Ok(out) = out else {
+        return BranchRead::Unknown;
+    };
+    let failed = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == remote_ops::BRANCHES_FAILED);
+    if failed {
+        return BranchRead::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    match out.status.code() {
+        // 1: HEAD names no branch.
+        Some(0 | 1) => {
+            let (branch, branches) = parse_branches(&out.stdout);
+            BranchRead::Read(branch, branches)
+        }
+        _ => BranchRead::Unknown,
+    }
+}
+
+/// [`read_branches`]' output: `*name` for HEAD's branch and ` name` for the
+/// others, then the branch HEAD names, if any, on a line of its own.
+fn parse_branches(stdout: &[u8]) -> (Option<String>, Vec<String>) {
+    let text = String::from_utf8_lossy(stdout);
+    let (mut marked, mut named, mut branches) = (None, None, Vec::new());
+    // A branch's name holds neither `*` nor a space.
+    for line in text.lines().map(|line| line.trim_end_matches('\r')) {
+        if let Some(name) = line.strip_prefix('*') {
+            marked = Some(name.to_string());
+            branches.push(name.to_string());
+        } else if let Some(name) = line.strip_prefix(' ') {
+            branches.push(name.to_string());
+        } else if !line.is_empty() {
+            named = Some(line.to_string());
+        }
+    }
+    // The list's spelling (`heads/main` where a tag shares the name), else the
+    // name of a branch with no commit yet.
+    (marked.or(named), branches)
 }
 
 /// Check out an existing branch.
@@ -3946,6 +4625,7 @@ impl GitEnv {
     }
 
     fn spawn(&self, command: &mut Command) -> std::io::Result<GitChild> {
+        muxel_core::child_env::remove_profiler_env(command);
         #[cfg(test)]
         let spawn_started = Instant::now();
         let child = command.spawn()?;
@@ -4028,9 +4708,13 @@ fn probe_ssh_command_config(
     ceiling: Option<&Path>,
     deadline: Instant,
 ) -> SshConfigProbe {
+    if Instant::now() >= deadline {
+        return SshConfigProbe::Failed;
+    }
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };
+    cmd = read_only_git(cmd);
     cmd.args(["config", "--get", "core.sshCommand"])
         .stderr(Stdio::null());
     let Ok(child) = env.spawn(&mut cmd) else {
@@ -4526,9 +5210,8 @@ fn check_git_output(
     if Instant::now() >= deadline {
         return None;
     }
-    let mut cmd = env.base_command(Some(clone), clone.parent())?;
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-c", "core.fsmonitor=false"]);
+    let mut cmd = read_only_git(env.base_command(Some(clone), clone.parent())?);
+    cmd.args(["-c", "core.fsmonitor=false"]);
     if let Some(opt) = LONG_PATHS {
         cmd.arg("-c").arg(opt);
     }
@@ -4599,6 +5282,176 @@ fn clear_read_only(path: &Path) {
 mod tests {
     use super::*;
 
+    /// What the branch poll reads: the branch HEAD names, and the local
+    /// branches. Detached, mid-bisect and mid-rebase, HEAD names none, and
+    /// `git branch` adds a line saying so (`(no branch, rebasing side)`),
+    /// which isn't a branch. Before the first commit HEAD's branch has no ref
+    /// to list, but is still named.
+    #[test]
+    fn branches_read_names_head_and_lists_only_branches() {
+        let repo = crate::test_support::TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let read = || match read_branches(&loc) {
+            BranchRead::Read(branch, branches) => (branch, branches),
+            other => panic!("unreadable: {other:?}"),
+        };
+        let main = || Some("main".to_string());
+        assert_eq!(read(), (main(), Vec::new()), "no commit yet");
+        repo.commit(&[("a.txt", "one\n")], "one");
+        repo.git(&["switch", "-q", "-c", "side"]);
+        repo.commit(&[("b.txt", "side\n")], "side");
+        repo.git(&["switch", "-q", "main"]);
+        repo.commit(&[("a.txt", "two\n")], "two");
+        repo.commit(&[("a.txt", "three\n")], "three");
+        let both = vec!["main".to_string(), "side".to_string()];
+        assert_eq!(read(), (main(), both.clone()));
+        let none_named = |what: &str| {
+            assert_eq!(read(), (None, both.clone()), "{what}");
+            assert_eq!(list_branches(&loc), both, "{what}");
+        };
+        repo.git(&["switch", "-q", "--detach", "HEAD"]);
+        none_named("detached");
+        repo.git(&["switch", "-q", "main"]);
+        repo.git(&["bisect", "start", "HEAD", "HEAD~2"]);
+        none_named("bisecting");
+        repo.git(&["bisect", "reset"]);
+        // `--exec false` stops the rebase after its one pick.
+        repo.git(&["switch", "-q", "side"]);
+        let stopped = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "-c",
+                "user.name=muxel-test",
+                "-c",
+                "user.email=muxel-test@example.invalid",
+            ])
+            .args(["rebase", "--exec", "false", "main"])
+            .output()
+            .unwrap();
+        assert!(!stopped.status.success(), "the rebase stopped");
+        none_named("rebasing");
+        repo.git(&["rebase", "--abort"]);
+        assert_eq!(read(), (Some("side".to_string()), both.clone()));
+    }
+
+    /// A Unix host's shell, to run its commands here. On Windows that's Git for
+    /// Windows' bash, found where the Git Bash preset finds it: a bare `sh` is
+    /// on PATH only in a shell that put Git's `bin` there, and without it every
+    /// spawn would fail and read as ssh's failure.
+    fn host_sh() -> Command {
+        if !cfg!(windows) {
+            return command("sh");
+        }
+        let bash = muxel_core::git_bash_program();
+        assert!(
+            Path::new(&bash).is_file(),
+            "no Git for Windows bash to run a Unix host's command (tried {bash}; \
+             MUXEL_GIT_BASH names another)"
+        );
+        command(bash)
+    }
+
+    /// [`remote_ops::branches`]' Unix command, run here by a Unix shell as ssh
+    /// runs it there, after `prelude` (a stand-in for that host's git).
+    fn remote_branches_here(dir: &Path, prelude: &str) -> std::io::Result<std::process::Output> {
+        let script = remote_ops::branches(
+            muxel_core::RemoteOs::Unix,
+            &dir.to_string_lossy().replace('\\', "/"),
+        );
+        host_sh()
+            .arg("-c")
+            .arg(format!("{prelude}{script}"))
+            // A folder outside any repository stays outside one.
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .stdin(Stdio::null())
+            .output()
+    }
+
+    /// git before 1.9 dies at `%(HEAD)` as today's does at a field it doesn't
+    /// know. That reads as git's failure, with what git said; a folder with no
+    /// repository reads as no branch, as it did before the listing could fail.
+    #[test]
+    fn a_remote_git_that_cant_list_branches_says_so() {
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "one");
+        let old_git = "git() { case \"$*\" in *'%(HEAD)'*) \
+                       echo 'fatal: unknown field name: HEAD' >&2; return 128;; esac; \
+                       command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), old_git)),
+            BranchRead::Failed("fatal: unknown field name: HEAD".into())
+        );
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), "")),
+            BranchRead::Read(Some("main".into()), vec!["main".into()])
+        );
+        // git before 1.8.5 has no `-C` either, so the listing fails before it
+        // reaches `%(HEAD)`; telling a repository apart mustn't need `-C`.
+        let older_git = "git() { case \" $* \" in *' -C '*) \
+                         echo 'Unknown option: -C' >&2; return 129;; esac; \
+                         command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), older_git)),
+            BranchRead::Failed("Unknown option: -C".into())
+        );
+        let plain = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&plain).unwrap();
+        let read = remote_branch_read(remote_branches_here(&plain, ""));
+        let older = remote_branch_read(remote_branches_here(&plain, older_git));
+        let _ = std::fs::remove_dir_all(&plain);
+        assert_eq!(read, BranchRead::Read(None, Vec::new()), "no repository");
+        assert_eq!(
+            older,
+            BranchRead::Read(None, Vec::new()),
+            "nor with that git"
+        );
+        // A folder that's gone is no repository either, wherever ssh starts.
+        let gone = remote_branch_read(remote_branches_here(&plain, older_git));
+        assert_eq!(
+            gone,
+            BranchRead::Read(None, Vec::new()),
+            "a folder that's gone"
+        );
+    }
+
+    /// ssh's own failure is 255; sshpass's wrong password is 5 and its unknown
+    /// host key 6. None of them is git's, whatever they printed.
+    #[test]
+    fn a_failure_before_git_ran_is_not_blamed_on_git() {
+        for code in [255, 5, 6] {
+            // The shell has to run, or this reads Unknown for the wrong reason.
+            let out = host_sh()
+                .arg("-c")
+                .arg(format!("echo 'Permission denied' >&2; exit {code}"))
+                .stdin(Stdio::null())
+                .output()
+                .expect("the host shell runs");
+            assert_eq!(out.status.code(), Some(code), "the host shell exits {code}");
+            assert_eq!(
+                remote_branch_read(Ok(out)),
+                BranchRead::Unknown,
+                "exit {code}"
+            );
+        }
+        let missing = command("muxel-no-such-ssh").output();
+        assert_eq!(remote_branch_read(missing), BranchRead::Unknown);
+    }
+
+    #[test]
+    fn review_close_retry_cannot_kill_when_the_original_generation_is_gone() {
+        let target = SessionTarget::new("same-name-replacement", Some(Socket::Private));
+        // The expected generation no longer exists. A name still present on
+        // that server can be a peer's replacement, never permission to kill it.
+        close_local_tmux_with(
+            &target,
+            Instant::now() + Duration::from_secs(2),
+            |_, _| Ok(false),
+            |_, _| panic!("kill reached the replacement after the original generation was gone"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4625,7 +5478,12 @@ mod tests {
         assert!(killed.get());
         assert_eq!(
             *probes.borrow(),
-            [Socket::Private, Socket::Default, Socket::Default]
+            [
+                Socket::Private,
+                Socket::Default,
+                Socket::Default,
+                Socket::Default
+            ]
         );
     }
 
@@ -4640,7 +5498,6 @@ mod tests {
                 deadline,
                 |socket, _| {
                     assert_eq!(Some(socket), target.socket.as_ref());
-                    assert!(killed.get(), "recorded owner needs no discovery probes");
                     Ok(true)
                 },
                 |owner, _| {
@@ -4665,7 +5522,10 @@ mod tests {
             close_local_tmux_with(
                 &target,
                 deadline,
-                |_, _| panic!("failed kill must not query another server"),
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    Ok(true)
+                },
                 |_, _| anyhow::bail!("kill timed out"),
             )
             .is_err()
@@ -4675,7 +5535,7 @@ mod tests {
     #[test]
     fn local_close_expired_deadline_refuses_before_running_a_command() {
         let target = SessionTarget::new("work", Some(Socket::Private));
-        assert!(close_local_tmux(&target, Instant::now()).is_err());
+        assert!(close_local_tmux(&target, uuid::Uuid::new_v4(), false, Instant::now()).is_err());
     }
 
     #[test]
@@ -5422,6 +6282,44 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that already ignores `.muxel/` through `.git/info/exclude` keeps its
+    /// tracked `.gitignore` unmodified; one that doesn't still gets the line.
+    #[test]
+    fn ensure_memory_file_respects_info_exclude() {
+        let root = std::env::temp_dir().join("muxel-it-memory-exclude");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = command("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init");
+        std::fs::write(root.join(".gitignore"), "target\n").unwrap();
+        let exclude = root.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".muxel/\n").unwrap();
+
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory");
+        assert!(root.join(MEMORY_DIR).join(MEMORY_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n",
+            ".gitignore untouched when info/exclude already ignores .muxel/"
+        );
+
+        std::fs::write(&exclude, "").unwrap();
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory again");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n.muxel/\n",
+            "appended once nothing else ignores .muxel/"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7159,6 +8057,58 @@ mod tests {
     }
 
     #[test]
+    fn display_git_reads_leave_index_untouched() {
+        let repo = check_remote();
+        let clone = repo.path();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(clone.join(LIB_FILE), FILE_V1).unwrap();
+        let index = index_state(clone);
+        let loc = RepoLoc::Local(clone.to_path_buf());
+
+        assert_eq!(worktree_change_count(clone), 0);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "worktree count refreshed the index"
+        );
+        assert!(git_status_files(&loc).is_empty());
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display status refreshed the index"
+        );
+        let _ = git_diff_for(&loc, LIB_FILE);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display diff refreshed the index"
+        );
+
+        // A stale optional lock must not obstruct reads, but mutations must
+        // still honor the index lock owned by another git process.
+        let lock = clone.join(".git/index.lock");
+        std::fs::write(&lock, "owned by another process").unwrap();
+        std::fs::write(clone.join("pending.txt"), "untracked").unwrap();
+        let status = git_status_files(&loc);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].path, "pending.txt");
+        assert_eq!(worktree_change_count(clone), 1);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "reads under lock refreshed the index"
+        );
+        assert!(git_stage_path(&loc, LIB_FILE).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"owned by another process");
+        std::fs::remove_file(lock).unwrap();
+        std::fs::remove_file(clone.join("pending.txt")).unwrap();
+
+        // Positive control: the same status without the read policy writes.
+        git_out(clone, &["status", "--porcelain"]);
+        assert_ne!(index_state(clone), index, "control: plain status");
+    }
+
+    #[test]
     fn library_check_is_read_only_and_offline() {
         let repo = check_remote();
         let (lib_dir, _, clone) = lib_cloned(&repo);
@@ -7219,5 +8169,334 @@ mod tests {
         assert!(!marker.exists());
         lib_cleanup(&lib_dir);
         lib_cleanup(&dir);
+    }
+
+    // ---- Branch-poll stamp ----
+
+    #[test]
+    fn git_ref_stamp_moves_with_head_and_branches() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let base = git_ref_stamp(repo.path());
+        assert_eq!(base, git_ref_stamp(repo.path()), "stable while untouched");
+        let deeper = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&deeper).unwrap();
+        assert_eq!(git_ref_stamp(&deeper), base, "found from a subdirectory");
+
+        repo.git(&["branch", "feature/x"]);
+        let created = git_ref_stamp(repo.path());
+        assert_ne!(created, base, "new nested branch");
+
+        repo.git(&["checkout", "-q", "feature/x"]);
+        let switched = git_ref_stamp(repo.path());
+        assert_ne!(switched, created, "checkout");
+
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["pack-refs", "--all"]);
+        let packed = git_ref_stamp(repo.path());
+        repo.git(&["branch", "-D", "feature/x"]);
+        assert_ne!(git_ref_stamp(repo.path()), packed, "packed branch deleted");
+    }
+
+    #[test]
+    fn git_ref_stamp_reads_a_linked_worktrees_branches_from_the_main_repo() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        let before = git_ref_stamp(&wt);
+        assert_ne!(before, git_ref_stamp(repo.path()), "its own HEAD");
+        repo.git(&["branch", "other"]);
+        assert_ne!(git_ref_stamp(&wt), before, "branch made in the main repo");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn git_ref_stamp_notices_git_init() {
+        let dir = lib_temp_dir();
+        let plain = git_ref_stamp(&dir);
+        assert_eq!(plain, git_ref_stamp(&dir));
+        git_out(&dir, &["init", "-q", "-b", "main"]);
+        assert_ne!(git_ref_stamp(&dir), plain);
+        lib_cleanup(&dir);
+    }
+
+    /// What `f` returned, and how many git launches it made on this thread.
+    fn launches<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = LAUNCHES.with(std::cell::Cell::get);
+        let out = f();
+        (out, LAUNCHES.with(std::cell::Cell::get) - before)
+    }
+
+    /// The branch poll's one launch lists the branches with HEAD's marked, as
+    /// git spells it; only a listing that marks none costs a second.
+    #[test]
+    fn the_branch_poll_reads_the_branch_with_the_list() {
+        let repo = TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let read = || launches(|| read_branches(&loc));
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let main = Some("main".to_string());
+        let unborn = BranchRead::Read(main.clone(), vec![]);
+        assert_eq!(read(), (unborn, 2), "before the first commit");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["branch", "other"]);
+        let on_main = BranchRead::Read(main, names(&["main", "other"]));
+        assert_eq!(read(), (on_main, 1), "on a branch");
+        // A tag with the branch's name: git calls the branch `heads/v1`.
+        repo.git(&["switch", "-q", "-c", "v1"]);
+        repo.git(&["tag", "v1"]);
+        let listed = names(&["main", "other", "heads/v1"]);
+        let on_v1 = BranchRead::Read(Some("heads/v1".to_string()), listed.clone());
+        assert_eq!(read(), (on_v1, 1), "a tag shares its name");
+        repo.git(&["switch", "-q", "--detach"]);
+        assert_eq!(read(), (BranchRead::Read(None, listed), 2), "detached");
+        let plain = lib_temp_dir();
+        let read_plain = launches(|| read_branches(&RepoLoc::Local(plain.clone())));
+        assert_eq!(
+            read_plain,
+            (BranchRead::Read(None, vec![]), 1),
+            "no repository"
+        );
+        lib_cleanup(&plain);
+    }
+
+    /// With `core.preferSymlinkRefs` git writes a symbolic ref as a symlink
+    /// holding the name of the ref it points at, which no file is at relative
+    /// to the link. git still reads it, so a branch named like the remote is
+    /// `heads/origin` to git.
+    #[test]
+    fn a_symlinked_remote_head_leaves_the_branch_spelled_as_git_spells_it() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        repo.git(&["switch", "-q", "-c", "origin"]);
+        let link = repo.path().join(".git/refs/remotes/origin/HEAD");
+        let target: PathBuf = ["refs", "remotes", "origin", "main"].iter().collect();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link);
+        if made.is_err() {
+            eprintln!("skipping: can't make a symlink here");
+            return;
+        }
+        let names = repo.git(&["symbolic-ref", "refs/remotes/origin/HEAD"]);
+        assert_eq!(
+            names.trim(),
+            "refs/remotes/origin/main",
+            "git reads the link"
+        );
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("heads/origin"));
+        let BranchRead::Read(branch, _) = read_branches(&loc) else {
+            panic!("a local read is always read");
+        };
+        assert_eq!(branch.as_deref(), Some("heads/origin"));
+    }
+
+    /// `rev-parse` exits 128 both before the first commit and where there's no
+    /// repository, over ssh too; only before the first commit is there a branch
+    /// for `symbolic-ref` to name.
+    #[test]
+    fn the_branch_read_asks_symbolic_ref_only_before_the_first_commit() {
+        let plain = lib_temp_dir();
+        let loc = RepoLoc::Local(plain.clone());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (None, 1), "no repository");
+        lib_cleanup(&plain);
+        let repo = TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let main = Some("main".to_string());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (main.clone(), 2), "before the first commit");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        assert_eq!(
+            launches(|| repo_current_branch(&loc)),
+            (main, 1),
+            "on a branch"
+        );
+    }
+
+    /// `git init` a reftable repository on `branch`; `false`, with a note, when
+    /// this git can't.
+    fn init_reftable(dir: &Path, branch: &str) -> bool {
+        let init = command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q", "--ref-format=reftable", "-b", branch])
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            eprintln!("skipping: this git has no reftable support");
+        }
+        init.status.success()
+    }
+
+    #[test]
+    fn git_ref_stamp_sees_a_switch_in_a_linked_reftable_worktree() {
+        let dir = lib_temp_dir();
+        if !init_reftable(&dir, "main") {
+            return lib_cleanup(&dir);
+        }
+        git_out(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_out(&dir, &["branch", "one"]);
+        git_out(&dir, &["branch", "two"]);
+        let wt = crate::test_support::short_temp_path();
+        git_out(
+            &dir,
+            &["worktree", "add", "-q", &wt.to_string_lossy(), "one"],
+        );
+        let before = git_ref_stamp(&wt);
+        git_out(&wt, &["switch", "-q", "two"]);
+        assert_ne!(
+            git_ref_stamp(&wt),
+            before,
+            "switched between existing branches"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        lib_cleanup(&dir);
+    }
+
+    /// Whether this process has a variable set that points git elsewhere, so
+    /// a check of the lookup itself would follow it.
+    fn discovery_env_set() -> bool {
+        let set = GIT_DISCOVERY_ENV
+            .iter()
+            .any(|key| std::env::var_os(key).is_some());
+        if set {
+            eprintln!("skipping a lookup check: a git discovery variable is set here");
+        }
+        set
+    }
+
+    /// Seconds after the first poll at which the gate checks below ask whether
+    /// git may run: the next tick, then either side of the unsettled backstop
+    /// and of the settled one.
+    const TICKS: [u64; 5] = [1, 59, 60, 299, 300];
+    /// Shut until the settled backstop: nothing git reads moved.
+    const SHUT: [bool; 5] = [false, false, false, false, true];
+    /// Open from the next tick: the stamp moved.
+    const OPEN: [bool; 5] = [true; 5];
+    /// Shut until the unsettled backstop, master's one minute.
+    const MINUTE: [bool; 5] = [false, false, true, true, true];
+
+    /// Whether the branch poll's gate, kept as the app keeps it, lets git run
+    /// at each of [`TICKS`] after `change`, with git's environment read from
+    /// `env`. Each tick takes a fresh stamp, as the poll does.
+    fn gate_opens(dir: &Path, env: &[(&str, &Path)], change: impl FnOnce()) -> [bool; 5] {
+        let lookup = |key: &str| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_os_str().to_owned())
+        };
+        let mut gate = muxel_core::refresh_gate::RefreshGate::per_stamp(GitRefStamp::backstop);
+        let start = Instant::now();
+        let first = git_ref_stamp_with(dir, lookup);
+        assert!(gate.due(&(), &first, start), "the first poll runs git");
+        gate.record((), first, start);
+        change();
+        TICKS.map(|secs| {
+            let stamp = git_ref_stamp_with(dir, lookup);
+            gate.due(&(), &stamp, start + Duration::from_secs(secs))
+        })
+    }
+
+    /// The gate must let git run on the next tick when the stamp sees git's
+    /// answer move, wait for master's one-minute backstop where the stamp
+    /// can't see what git reads, and otherwise wait for the five-minute one.
+    #[test]
+    fn the_branch_gate_reopens_whenever_gits_answer_can_move() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["branch", "other"]);
+        let switch = |branch: &str| {
+            repo.git(&["switch", "-q", branch]);
+        };
+        let mut wrong = Vec::new();
+        let mut expect = |case: &str, want: [bool; 5], got: [bool; 5]| {
+            if got != want {
+                wrong.push(format!(
+                    "{case}: due at {TICKS:?} s was {got:?}, want {want:?}"
+                ));
+            }
+        };
+        expect("untouched", SHUT, gate_opens(repo.path(), &[], || {}));
+        expect(
+            "a switch",
+            OPEN,
+            gate_opens(repo.path(), &[], || switch("other")),
+        );
+
+        // The stamp watches the folder shown; git reads the repo named.
+        let shown = TestRepo::init();
+        shown.commit(&[("b.txt", "two\n")], "init");
+        let chosen = repo.path().join(".git");
+        for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
+            let got = gate_opens(shown.path(), &[(key, &chosen)], || switch("main"));
+            expect(&format!("{key}: a switch there"), MINUTE, got);
+            switch("other");
+        }
+
+        // The stamp holds branch names, not what a symbolic one names.
+        repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
+        let onto_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        };
+        let got = gate_opens(repo.path(), &[], onto_alias);
+        expect("HEAD moved onto a symbolic branch", OPEN, got);
+        let retarget = || {
+            repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/other"]);
+        };
+        let got = gate_opens(repo.path(), &[], retarget);
+        expect("that branch retargeted", MINUTE, got);
+        if !discovery_env_set() {
+            let loc = RepoLoc::Local(repo.path().to_path_buf());
+            assert_eq!(repo_current_branch(&loc).as_deref(), Some("other"));
+        }
+        let off_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/other"]);
+        };
+        let got = gate_opens(repo.path(), &[], off_alias);
+        expect("HEAD back on a plain branch", OPEN, got);
+        repo.git(&["update-ref", "-d", "--no-deref", "refs/heads/alias"]);
+
+        // Folders git walks on past must not take the repo's place.
+        let fixture = repo.path().join("fixture");
+        for part in ["objects", "refs"] {
+            std::fs::create_dir_all(fixture.join(part)).unwrap();
+        }
+        std::fs::write(fixture.join("HEAD"), "fixture\n").unwrap();
+        let got = gate_opens(&fixture, &[], || switch("main"));
+        expect("objects, refs and a HEAD git rejects", OPEN, got);
+        let hollow = repo.path().join("hollow");
+        std::fs::create_dir_all(hollow.join(".git")).unwrap();
+        let got = gate_opens(&hollow, &[], || switch("other"));
+        expect("an empty .git folder", OPEN, got);
+        let got = gate_opens(&fixture, &[], || {});
+        expect("below them, untouched", SHUT, got);
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The switcher marks the current branch by finding it in the branch list,
+    /// which trims Unicode whitespace from its lines.
+    #[test]
+    fn a_name_with_unicode_whitespace_still_matches_the_branch_list() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        for name in ["topic\u{a0}", "\u{a0}topic"] {
+            repo.git(&["switch", "-q", "-c", name]);
+            if !discovery_env_set() {
+                let current = repo_current_branch(&loc);
+                let listed = list_branches(&loc);
+                assert!(
+                    current.as_ref().is_some_and(|c| listed.contains(c)),
+                    "{name:?}: {current:?} isn't in {listed:?}"
+                );
+            }
+            repo.git(&["switch", "-q", "main"]);
+        }
     }
 }

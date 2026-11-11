@@ -15,6 +15,14 @@
 //! 3. `$XDG_DATA_HOME/ui-prof.log`
 //! 4. `ui-prof.log` in cwd
 //!
+//! Both profilers share dated 2 MiB rolling logs. History defaults to 14 local
+//! dates and 256 MiB per family (`MUXEL_PROFILE_KEEP_DAYS` / `MUXEL_PROFILE_MAX_BYTES`).
+//! Steady discovery misses aggregate in per-minute summaries; hits, changes,
+//! calls of at least 5 ms, and every launch lookup retain individual records.
+//! Local `git` runs through the integrations helpers get a `ui-prof[git v1]`
+//! record (see `git.rs`); team-library jobs don't, and a record the full queue
+//! drops is only counted in `deferred_dropped`.
+//!
 //! When disabled: single OnceLock check, no flusher, no probe work.
 //!
 //! Render records distinguish `observation=callback` (an instrumented callback
@@ -24,9 +32,7 @@
 //! executing window after arbitrary native re-entry or display presentation.
 
 use std::cell::RefCell;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +45,12 @@ use gpui::{
 use uuid::Uuid;
 
 mod focus;
+mod frame;
+mod git;
+mod lookups;
+pub(crate) use frame::Region;
+pub use git::{git_caller, git_launched};
+use muxel_terminal::profile_log::{ProfileLog, ProfileLogLimits};
 
 #[cfg(target_os = "windows")]
 pub use focus::native_focus_edge_for_pane;
@@ -51,7 +63,7 @@ pub use focus::{focus_action_for_pane, register_focus_pane};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+static LOG_FILE: OnceLock<Mutex<ProfileLog>> = OnceLock::new();
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFERRED: OnceLock<SyncSender<DeferredRecord>> = OnceLock::new();
@@ -61,7 +73,6 @@ static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
 static RENDER_PUBLICATION: RenderPublication = RenderPublication::new();
 static NEXT_STATUS_NOTIFY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PENDING_RECORDS: usize = 4096;
 const SLOW_RENDER_US: u64 = 50_000;
 
@@ -71,7 +82,7 @@ pub(crate) enum SessionLookupKind {
     Launch,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLookupOutcome {
     Found,
     Unresolved,
@@ -141,6 +152,22 @@ pub(crate) fn session_lookup_finished(
     });
 }
 
+/// A provider's hook-directory watcher started (`watching`), stopped being
+/// trusted (`failed`), or reported lost events (`rescan`).
+pub(crate) fn session_watch(
+    provider: muxel_core::session_discovery::SessionProvider,
+    state: &'static str,
+) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    let provider = format!("{provider:?}").to_ascii_lowercase();
+    emit(&format!(
+        "ui-prof[session-watch v1] provider={provider} state={state}"
+    ));
+}
+
 enum DeferredRecord {
     SessionLookup {
         at: SystemTime,
@@ -153,6 +180,10 @@ enum DeferredRecord {
     StaticLine {
         at: SystemTime,
         line: &'static str,
+    },
+    GitLaunch {
+        at: SystemTime,
+        launch: Box<git::GitLaunch>,
     },
     Phase {
         at: SystemTime,
@@ -205,6 +236,14 @@ enum DeferredRecord {
         reason: &'static str,
         generation: u64,
         transitions: usize,
+    },
+    Frame {
+        at: SystemTime,
+        frame: Box<frame::FrameData>,
+    },
+    FrameSummary {
+        at: SystemTime,
+        summary: Box<frame::Summary>,
     },
 }
 
@@ -438,6 +477,8 @@ pub struct RenderWatch {
     view: RenderView,
     stage: RenderStage,
     started: Instant,
+    /// The frame a build watch opened (`frame.rs`); 0 for stage watches.
+    frame: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,6 +570,9 @@ struct ProfiledElement {
     inner: AnyElement,
     view: RenderView,
     frame: Option<RenderWatch>,
+    /// Frame attribution token (`frame.rs`); its close runs at arena clear.
+    frame_token: u64,
+    _close: frame::FrameClose,
 }
 
 impl Drop for PhaseSpan {
@@ -641,10 +685,12 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        frame::mark(self.frame_token, frame::Mark::LayoutStart);
         let layout = {
             let _watch = watch_render(self.view, RenderStage::RequestLayout);
             self.inner.request_layout(window, cx)
         };
+        frame::mark(self.frame_token, frame::Mark::LayoutEnd);
         if let Some(frame) = &self.frame {
             // gpui-component's thin Root still finishes its own request-layout
             // callback before GPUI computes the window layout. This stage names
@@ -663,10 +709,16 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        frame::mark(self.frame_token, frame::Mark::PrepaintStart);
+        frame::set_window(
+            self.frame_token,
+            window.window_handle().window_id().as_u64(),
+        );
         {
             let _watch = watch_render(self.view, RenderStage::Prepaint);
             self.inner.prepaint(window, cx);
         }
+        frame::mark(self.frame_token, frame::Mark::PrepaintEnd);
         if let Some(frame) = &self.frame {
             frame.mark_stage(RenderStage::Frame);
         }
@@ -682,10 +734,12 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        frame::mark(self.frame_token, frame::Mark::PaintStart);
         {
             let _watch = watch_render(self.view, RenderStage::Paint);
             self.inner.paint(window, cx);
         }
+        frame::mark(self.frame_token, frame::Mark::PaintEnd);
         if let Some(frame) = &self.frame {
             // gpui-component's Root may still paint after this child returns;
             // GPUI then finalizes the scene and presents before clearing the
@@ -776,76 +830,29 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
-fn open_log(path: &Path) -> Option<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if !prepare_log_path(path) {
-        return None;
-    }
-    OpenOptions::new().create(true).append(true).open(path).ok()
-}
-
-fn reopen_log(slot: &mut Option<std::fs::File>, path: &Path) {
-    *slot = None;
-    *slot = open_log(path);
-}
-
-fn rotated_log_path(path: &Path) -> PathBuf {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    PathBuf::from(rotated)
-}
-
-fn prepare_log_path(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return true;
-    };
-    if meta.len() < LOG_MAX_BYTES {
-        return true;
-    }
-    let rotated = rotated_log_path(path);
-    match std::fs::remove_file(&rotated) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
-    }
-    if std::fs::rename(path, &rotated).is_ok() {
-        return true;
-    }
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .is_ok()
-}
-
 fn emit_at(at: SystemTime, line: &str) {
     if !is_enabled() {
         return;
     }
     let now = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let line = format!("[{}.{:03}] {line}", now.as_secs(), now.subsec_millis());
-    let path = log_path();
-    let slot = LOG_FILE.get_or_init(|| Mutex::new(open_log(path)));
+    let slot = LOG_FILE.get_or_init(|| {
+        Mutex::new(ProfileLog::new(
+            log_path().clone(),
+            ProfileLogLimits::from_env(),
+        ))
+    });
     if let Ok(mut g) = slot.lock() {
-        let reopen = g.as_ref().is_none_or(|f| {
-            f.metadata()
-                .map(|m| m.len() >= LOG_MAX_BYTES)
-                .unwrap_or(false)
-        });
-        if reopen {
-            reopen_log(&mut g, path);
-        }
-        if let Some(f) = g.as_mut() {
-            let _ = writeln!(f, "{line}");
-            let _ = f.flush();
-        }
+        // The log names its first failure on stderr itself.
+        let _ = g.append(&line);
     }
 }
 
 fn emit(line: &str) {
-    emit_at(SystemTime::now(), line);
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: line.to_owned(),
+    });
 }
 
 fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
@@ -859,12 +866,31 @@ fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
 }
 
 fn deferred_writer(rx: Receiver<DeferredRecord>) {
-    while let Ok(record) = rx.recv() {
+    let mut lookups = lookups::Lookups::default();
+    let mut git_repeats = git::Repeats::default();
+    let mut last_summary = Instant::now();
+    loop {
+        // Check even during a sustained queue flood. All summary formatting and
+        // history maintenance stays here, away from UI and discovery callers.
+        if last_summary.elapsed() >= Duration::from_secs(60) {
+            for line in lookups.summaries(Instant::now()) {
+                emit_at(SystemTime::now(), &line);
+            }
+            last_summary = Instant::now();
+        }
+        let record = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(record) => record,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         match record {
             DeferredRecord::Line { at, line } => emit_at(at, &line),
             DeferredRecord::StaticLine { at, line } => emit_at(at, line),
+            DeferredRecord::GitLaunch { at, launch } => emit_at(at, &git_repeats.line(&launch)),
             DeferredRecord::SessionLookup { at, record } => {
-                emit_at(at, &session_lookup_line(record))
+                if lookups.observe(record, Instant::now()) {
+                    emit_at(at, &session_lookup_line(record));
+                }
             }
             DeferredRecord::Phase {
                 at,
@@ -938,8 +964,26 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
                     "ui-prof[root notify v1] reason={reason} generation={generation} transitions={transitions}"
                 ),
             ),
+            DeferredRecord::Frame { at, frame } => emit_at(at, &frame::frame_line(&frame)),
+            DeferredRecord::FrameSummary { at, summary } => {
+                emit_at(at, &frame::summary_line(&summary))
+            }
         }
     }
+}
+
+fn defer_frame(frame: Box<frame::FrameData>) {
+    defer_record(DeferredRecord::Frame {
+        at: SystemTime::now(),
+        frame,
+    });
+}
+
+fn defer_frame_summary(summary: Box<frame::Summary>) {
+    defer_record(DeferredRecord::FrameSummary {
+        at: SystemTime::now(),
+        summary,
+    });
 }
 
 fn try_defer_to(tx: Option<&SyncSender<DeferredRecord>>, record: DeferredRecord) -> bool {
@@ -1429,13 +1473,60 @@ fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
         view,
         stage,
         started,
+        frame: 0,
     })
 }
 
-/// Mark root-view element construction as the current UI-thread render stage.
-/// Normal frames touch atomics only and produce no log record.
+/// Mark root-view element construction as the current UI-thread render stage
+/// and open this draw's frame attribution (`frame.rs`). With profiling on,
+/// each frame allocates its record and reads the thread's cycle counter and
+/// the process's page-fault count when it opens and closes. Only a slow frame
+/// writes a record of its own; the rest feed the ten-second summary.
 pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
-    watch_render(view, RenderStage::Build)
+    let mut watch = watch_render(view, RenderStage::Build)?;
+    frame::begin(view, watch.token);
+    watch.frame = watch.token;
+    Some(watch)
+}
+
+/// Build one region of a window and attribute its frame cost: `build` covers
+/// this call, and the returned layout-transparent wrapper times the region's
+/// request-layout, prepaint and paint. Nested regions are subtracted. With
+/// profiling off this is `build().into_any_element()`.
+pub(crate) fn region<E: IntoElement>(region: Region, build: impl FnOnce() -> E) -> AnyElement {
+    if !is_enabled() {
+        return build().into_any_element();
+    }
+    let scope = frame::open(region, frame::Phase::Build);
+    let inner = build().into_any_element();
+    drop(scope);
+    frame::ProfiledRegion { inner, region }.into_any_element()
+}
+
+/// Attribute build work up to the guard's drop to `region`, for code that
+/// builds a region in pieces. Pair it with [`wrap_region`].
+pub(crate) fn region_scope(region: Region) -> Option<frame::RegionScope> {
+    if !is_enabled() {
+        return None;
+    }
+    frame::open(region, frame::Phase::Build)
+}
+
+/// The element half of [`region`], for a region built under [`region_scope`].
+pub(crate) fn wrap_region(region: Region, element: impl IntoElement) -> AnyElement {
+    let inner = element.into_any_element();
+    if !is_enabled() {
+        return inner;
+    }
+    frame::ProfiledRegion { inner, region }.into_any_element()
+}
+
+/// The next tab-group slot of the frame being built (leaf render order).
+pub(crate) fn frame_group(tabs: usize) -> usize {
+    if !is_enabled() {
+        return 0;
+    }
+    frame::next_group(tabs)
 }
 
 /// Wrap the application element beneath gpui-component's thin window Root so
@@ -1447,6 +1538,8 @@ pub fn finish_render(
     element: impl IntoElement,
 ) -> AnyElement {
     let inner = element.into_any_element();
+    let frame_token = build.as_ref().map_or(0, |build| build.frame);
+    frame::mark(frame_token, frame::Mark::BuildEnd);
     drop(build);
     if !is_enabled() {
         inner
@@ -1455,6 +1548,8 @@ pub fn finish_render(
             inner,
             view,
             frame: watch_render(view, RenderStage::Frame),
+            frame_token,
+            _close: frame::FrameClose(frame_token),
         }
         .into_any_element()
     }
@@ -1752,35 +1847,6 @@ mod tests {
                 line: "second".into(),
             }
         ));
-    }
-
-    #[test]
-    fn ui_rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
-        let dir = std::env::temp_dir().join(format!("muxel-ui-prof-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create rotation fixture");
-        let path = dir.join("ui-prof.log");
-        let rotated = rotated_log_path(&path);
-        std::fs::write(&path, vec![b'x'; LOG_MAX_BYTES as usize + 1])
-            .expect("write oversized live log");
-        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
-        let mut slot = Some(
-            OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("hold live log open"),
-        );
-
-        reopen_log(&mut slot, &path);
-
-        assert_eq!(
-            std::fs::metadata(&rotated).expect("rotated log").len(),
-            LOG_MAX_BYTES + 1
-        );
-        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
-        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
-        drop(slot);
-        assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
-        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
     }
 
     #[test]
