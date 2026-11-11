@@ -1053,6 +1053,48 @@ struct ResizeState {
     since: Instant,
 }
 
+/// Whether raw input bytes put text in front of the program. Escape sequences
+/// (arrows, function keys, bracketed-paste markers, OSC and DCS strings) and
+/// C0 controls (Enter, Tab, Backspace, ctrl keys) don't, though their encodings
+/// can contain printable ASCII (`ESC [ A`). An ESC inside a sequence starts a
+/// new one, as it does for the terminal, so `keys esc down` in one write
+/// (`ESC ESC [ B`) is still no text.
+fn has_printable_input(data: &[u8]) -> bool {
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Ss3,
+        String,
+    }
+    let mut state = State::Ground;
+    for &byte in data {
+        state = match state {
+            State::Ground if byte >= 0x20 && byte != 0x7f => return true,
+            _ if byte == 0x1b => State::Escape,
+            State::Ground => State::Ground,
+            // `ESC \` (the string terminator) lands here too, and ends.
+            State::Escape => match byte {
+                b'[' => State::Csi,
+                b'O' => State::Ss3,
+                b']' | b'P' | b'_' | b'^' | b'X' => State::String,
+                _ => State::Ground,
+            },
+            State::Csi if (0x40..=0x7e).contains(&byte) => State::Ground,
+            State::Csi => State::Csi,
+            State::Ss3 => State::Ground,
+            State::String if byte == 0x07 => State::Ground,
+            State::String => State::String,
+        };
+    }
+    false
+}
+
+/// Whether pasted `text` holds any text, whatever bytes its encoding uses.
+fn has_text(text: &str) -> bool {
+    text.chars().any(|ch| !ch.is_control())
+}
+
 fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
     if !has_bytes {
         previous
@@ -2317,8 +2359,15 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.try_write_input_as(data, has_printable_input(data))
+    }
+
+    /// [`Self::try_write_input`], with `text` saying whether the bytes put text
+    /// in front of the program (and so latch the draft bit). An encoded paste
+    /// is text even when every byte of its encoding is an escape sequence.
+    fn try_write_input_as(&self, data: &[u8], text: bool) -> std::io::Result<()> {
         self.check_input_gate()?;
-        self.admit_input(!data.is_empty());
+        self.admit_input(!data.is_empty(), text);
         self.try_write_raw(data)?;
         self.shell_prompt.submitted(data);
         Ok(())
@@ -2337,11 +2386,19 @@ impl TerminalSession {
     }
 
     /// The bookkeeping every input write does before its bytes go anywhere.
-    fn admit_input(&self, nonempty: bool) {
+    /// Only `text` latches the draft bit: escape, arrows, ctrl keys and an
+    /// answer to a question advance the revision but leave the draft as it was.
+    fn admit_input(&self, nonempty: bool, text: bool) {
         self.scroll_input_to_bottom();
         if nonempty {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
+            self.advance_input(if submitted_enter {
+                Some(true)
+            } else if text {
+                Some(false)
+            } else {
+                None
+            });
             if submitted_enter {
                 self.trigger_runtime();
             }
@@ -2412,7 +2469,9 @@ impl TerminalSession {
         let Some(tmux) = &self.tmux_input else {
             let written = match &input {
                 ControlInput::Paste(text) => match self.control_paste.encode(text) {
-                    Ok(Some(encoded)) => self.try_write_input(encoded.as_bytes()),
+                    Ok(Some(encoded)) => {
+                        self.try_write_input_as(encoded.as_bytes(), has_text(text))
+                    }
                     Ok(None) => self.try_paste(text),
                     Err(why) => {
                         return ControlWrite::done(Err(ControlWriteError::InvalidInput(why)));
@@ -2423,6 +2482,13 @@ impl TerminalSession {
                         .iter()
                         .flat_map(|key| key.bytes(*app_cursor))
                         .collect::<Vec<u8>>(),
+                ),
+                ControlInput::Answer(keys) => self.try_write_input_as(
+                    &keys
+                        .iter()
+                        .flat_map(|key| key.bytes(false))
+                        .collect::<Vec<u8>>(),
+                    false,
                 ),
                 ControlInput::Submit => self.try_submit_input(b"\r"),
                 ControlInput::SubmitKey => self.try_submit(b"\r", false),
@@ -2447,11 +2513,18 @@ impl TerminalSession {
                 Some((self.clone(), SystemTime::now(), prompt))
             }
             ControlInput::Paste(text) => {
-                self.admit_input(!text.is_empty());
+                self.admit_input(!text.is_empty(), has_text(text));
                 None
             }
             ControlInput::Keys { keys, .. } => {
-                self.admit_input(!keys.is_empty());
+                let text = keys
+                    .iter()
+                    .any(|key| has_printable_input(&key.bytes(false)));
+                self.admit_input(!keys.is_empty(), text);
+                None
+            }
+            ControlInput::Answer(keys) => {
+                self.admit_input(!keys.is_empty(), false);
                 None
             }
         };
@@ -2657,14 +2730,14 @@ impl TerminalSession {
             .clipboard(text)
             .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?
         {
-            return self.try_write_input(encoded.as_bytes());
+            return self.try_write_input_as(encoded.as_bytes(), has_text(text));
         }
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
-        self.try_write_input(payload.as_bytes())
+        self.try_write_input_as(payload.as_bytes(), has_text(text))
     }
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
@@ -6521,6 +6594,63 @@ mod runtime_fact_tests {
         // A mouse or wheel report leaves the draft as it was.
         assert_eq!(next_input_state(state(4, true), None), state(5, true));
         assert_eq!(next_input_state(state(4, false), None), state(5, false));
+    }
+
+    /// `ctl send` refuses a pane whose draft bit is set, so only text may set
+    /// it. One `keys esc`, an arrow through a menu, or `answer 1` would
+    /// otherwise refuse every later automated send until the next Enter.
+    #[test]
+    fn escape_arrows_and_answers_type_no_draft_but_text_does() {
+        use super::{has_printable_input, has_text};
+        use crate::ControlInput;
+        use muxel_core::control::Key;
+        for keys in [
+            b"\x1b".as_slice(),
+            b"\x1b[A",
+            b"\x1bOB",
+            b"\x1b[3~",
+            b"\x1b[200~\x1b[201~",
+            b"\x1b]0;title\x07",
+            b"\x1b]0;title\x1b\\",
+            b"\x1b\x1b[B",
+            b"\x03",
+            b"\t",
+            b"\x7f",
+        ] {
+            assert!(!has_printable_input(keys), "{keys:?}");
+        }
+        assert!(has_printable_input(b"hello"));
+        assert!(has_printable_input(b"\x1b[200~hello\x1b[201~"));
+        assert!(has_printable_input("é".as_bytes()));
+        // A Windows Codex paste is all escape sequences, and still text.
+        assert!(has_text("hi") && !has_text("\r\n"));
+
+        #[cfg(windows)]
+        let spec = CommandSpec::program("cmd.exe", vec!["/d".into(), "/q".into(), "/k".into()]);
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        session.write_input(b"\x1b");
+        session.write_input(b"\x1b[B");
+        let answered = session.control_write(ControlInput::Answer(vec![Key::Char('1')]));
+        assert!(matches!(answered.ready(), Some(Ok(()))));
+        let pressed = session.control_write(ControlInput::Keys {
+            keys: vec![Key::Escape, Key::Down],
+            app_cursor: false,
+        });
+        assert!(matches!(pressed.ready(), Some(Ok(()))));
+        assert_eq!(session.input_snapshot(), (4, false));
+        session.write_input(b"draft");
+        assert_eq!(session.input_snapshot(), (5, true));
+        // Leaving and moving around the draft keeps it.
+        session.write_input(b"\x1b[D");
+        assert_eq!(session.input_snapshot(), (6, true));
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert_eq!(session.input_snapshot(), (7, false));
+        session.paste("pasted");
+        assert_eq!(session.input_snapshot(), (8, true));
+        session.kill();
     }
 
     #[test]

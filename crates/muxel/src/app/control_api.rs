@@ -23,10 +23,15 @@ type CtlResult<T> = Result<T, ctl::Error>;
 
 mod approval;
 mod new;
+mod safe_send;
 pub(super) use approval::PreparedCreation;
+use safe_send::QueueRequest;
+pub(super) use safe_send::{OnceKeys, QueuedSend};
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
+#[cfg(all(test, windows))]
+mod safe_send_tests;
 #[cfg(all(test, windows))]
 mod startup_reservation_tests;
 
@@ -193,6 +198,8 @@ pub(super) enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    /// `send --when-idle`: wait for the pane before typing.
+    Queue(QueueRequest),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -206,9 +213,11 @@ enum Input {
     /// Key presses, `KEY_GAP_MS` apart; `true` marks one that submits. The keys
     /// of one press are written together. `app_cursor` is the cursor-key mode
     /// when the request came in, which a directly written terminal's arrows use.
+    /// `answer` keys pick an option of a question, so they type no draft.
     Keys {
         presses: Vec<(Vec<ctl::Key>, bool)>,
         app_cursor: bool,
+        answer: bool,
     },
 }
 
@@ -264,6 +273,13 @@ pub(super) struct Typing {
     /// A prompt holds its pane from admission until its Enter is in: admitted,
     /// or through tmux, taken by tmux.
     in_flight: Option<SendInFlight>,
+    /// `send --once`: the key this prompt holds (see [`OnceKeys`]).
+    once: Option<String>,
+    /// `send --when-idle`: how long it waited, for its receipt.
+    waited_ms: Option<u64>,
+    /// `send --when-idle`: set once its caller has gone. Checked before the
+    /// paste; once the paste is in, the send finishes.
+    cancelled: Option<Arc<AtomicBool>>,
     reply: Value,
 }
 
@@ -298,6 +314,14 @@ impl SendInFlight {
         *sends += 1;
         Ok(Self(pane))
     }
+
+    /// Whether a send to `pane` is between its admission and its Enter.
+    fn held(pane: Uuid) -> bool {
+        Self::panes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&pane)
+    }
 }
 
 impl Drop for SendInFlight {
@@ -316,6 +340,8 @@ impl Drop for SendInFlight {
 struct SendAdmission {
     state: Option<AgentState>,
     just_submitted: bool,
+    /// The agent's composer holds text (see [`TerminalView::composer_has_draft`]).
+    draft_present: bool,
     force: bool,
 }
 
@@ -449,6 +475,13 @@ fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
                 ));
             }
             _ => {}
+        }
+        if admission.draft_present {
+            return Err(ctl::Error::new(
+                ErrorCode::DraftPresent,
+                "the agent's composer already holds text, so a prompt would be added to it: \
+                 nothing was typed. Leave it to the user (or pass --force to type anyway)",
+            ));
         }
     }
     Ok(())
@@ -876,12 +909,28 @@ impl MuxelApp {
             command,
             caller_instance_id,
             reply,
+            cancelled,
         } = incoming;
+        let answer = self.control_command(command, caller_instance_id, cx);
+        self.deliver_control_answer(answer, reply, cancelled, cx);
+    }
+
+    /// Carry out `answer` and send its reply. A prompt holding a `--once` key
+    /// records how it ended before the reply goes, so a repeat asked the moment
+    /// this one is answered already sees it.
+    fn deliver_control_answer(
+        &mut self,
+        answer: Answer,
+        reply: std::sync::mpsc::Sender<ctl::Response>,
+        cancelled: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
         let respond = |result: CtlResult<Value>| match result {
             Ok(value) => ctl::Response::ok(value),
             Err(error) => ctl::Response::err(error),
         };
-        match self.control_command(command, caller_instance_id, cx) {
+        match answer {
+            Answer::Queue(request) => self.queue_control_send(request, reply, cancelled, cx),
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -896,11 +945,23 @@ impl MuxelApp {
                     .detach();
             }
             Answer::Type(mut typing) => {
+                let iid = typing.iid;
+                let once = typing.once.clone();
+                // A `--once` key records how its send ended before the reply
+                // goes, so a repeat asked the moment this is answered sees it.
+                let finish = move |this: &WeakEntity<Self>, cx: &mut AsyncApp, result| {
+                    if let Some(key) = once.as_deref() {
+                        let _ =
+                            this.update(cx, |app, _| app.control_once.finish(iid, key, &result));
+                    }
+                    let _ = reply.send(respond(result));
+                };
                 let Some((site, turn)) = typing.site.take().zip(typing.turn.as_ref()) else {
                     // No tmux session (so nothing to share), or keys that start no turn.
                     let pressed = self.control_press(*typing, None, None, cx);
-                    cx.spawn(async move |_this: WeakEntity<Self>, _cx| {
-                        let _ = reply.send(respond(pressed.await));
+                    cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                        let result = pressed.await;
+                        finish(&this, cx, result);
                     })
                     .detach();
                     return;
@@ -958,7 +1019,7 @@ impl MuxelApp {
                         }
                         Err(error) => Err(error),
                     };
-                    let _ = reply.send(respond(result));
+                    finish(&this, cx, result);
                 })
                 .detach();
             }
@@ -997,6 +1058,7 @@ impl MuxelApp {
         }
         let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
         self.control_turns.retain(|id, _| live.contains(id));
+        self.control_once.retain(&live);
         let now = now_ms();
         match command {
             Command::New { project, options } => Answer::Open { project, options },
@@ -1031,10 +1093,54 @@ impl MuxelApp {
                 text,
                 force,
                 launch_id,
-            } => match self.control_resolve_for_typing(&agent, caller_instance_id, force) {
-                Ok(iid) => typed(self.control_send(iid, text, force, launch_id, cx)),
-                Err(error) => Answer::Now(Err(error)),
-            },
+                once,
+                when_idle,
+                timeout_secs,
+            } => {
+                let iid = match self.control_resolve(&agent) {
+                    Ok(iid) => iid,
+                    Err(error) => return Answer::Now(Err(error)),
+                };
+                // A repeat is answered before anything about the pane is
+                // checked: it types nothing, and its caller needs the first
+                // result whatever the pane is doing now.
+                if let Some(key) = once.as_deref()
+                    && let Some(repeat) = self.control_once.reserve(iid, key)
+                {
+                    return Answer::Now(repeat);
+                }
+                let admitted = self
+                    .control_check_typing_target(iid, caller_instance_id, force)
+                    .and_then(|()| {
+                        if when_idle {
+                            return Ok(Answer::Queue(QueueRequest {
+                                iid,
+                                text,
+                                launch_id,
+                                once: once.clone(),
+                                timeout_secs,
+                            }));
+                        }
+                        let mut typing = self.control_send(iid, text, force, launch_id, cx)?;
+                        typing.once = once.clone();
+                        Ok(Answer::Type(Box::new(typing)))
+                    });
+                admitted.unwrap_or_else(|error| {
+                    if let Some(key) = once.as_deref() {
+                        self.control_once.finish(iid, key, &Err(error.clone()));
+                    }
+                    Answer::Now(Err(error))
+                })
+            }
+            Command::OnceStatus { agent, key } => {
+                Answer::Now(self.control_resolve(&agent).map(|iid| {
+                    let mut status = self.control_once.status(iid, &key);
+                    status["agent"] = json!(ctl::short_id(iid));
+                    status["uuid"] = json!(iid);
+                    status["key"] = json!(key);
+                    status
+                }))
+            }
             Command::Answer {
                 agent,
                 option,
@@ -1126,11 +1232,22 @@ impl MuxelApp {
         force: bool,
     ) -> CtlResult<Uuid> {
         let iid = self.control_resolve(query)?;
+        self.control_check_typing_target(iid, caller_instance_id, force)?;
+        Ok(iid)
+    }
+
+    /// The checks on whom a typing request may go to: not a closing pane, and
+    /// not the caller's own unless forced.
+    fn control_check_typing_target(
+        &self,
+        iid: Uuid,
+        caller_instance_id: Option<Uuid>,
+        force: bool,
+    ) -> CtlResult<()> {
         if let Some(error) = self.closing_control_error(iid) {
             return Err(error);
         }
-        ctl::check_self_target(caller_instance_id, iid, force)?;
-        Ok(iid)
+        ctl::check_self_target(caller_instance_id, iid, force)
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
@@ -1519,6 +1636,9 @@ impl MuxelApp {
             force,
             launch_id: None,
             in_flight: None,
+            once: None,
+            waited_ms: None,
+            cancelled: None,
             reply,
         })
     }
@@ -1554,9 +1674,8 @@ impl MuxelApp {
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
         let state = inst.and_then(|inst| self.control_admission_state(inst, cx));
-        let coverage = self
-            .terminal_view(iid)
-            .map(|view| view.read(cx).runtime_snapshot().coverage);
+        let view = self.terminal_view(iid).map(|view| view.read(cx));
+        let coverage = view.map(|view| view.runtime_snapshot().coverage);
         let just_submitted = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 just_submitted_turn(turn, coverage, state, &inst.activity, now_ms())
@@ -1565,6 +1684,7 @@ impl MuxelApp {
         SendAdmission {
             state,
             just_submitted,
+            draft_present: view.is_some_and(TerminalView::composer_has_draft),
             force,
         }
     }
@@ -1652,6 +1772,7 @@ impl MuxelApp {
         let input = Input::Keys {
             presses: vec![(key.chars().map(ctl::Key::Char).collect(), false)],
             app_cursor: false,
+            answer: true,
         };
         self.control_typing(iid, input, Some(turn), false, reply, cx)
     }
@@ -1697,6 +1818,7 @@ impl MuxelApp {
         let input = Input::Keys {
             presses,
             app_cursor,
+            answer: false,
         };
         self.control_typing(iid, input, turn, false, reply, cx)
     }
@@ -1725,6 +1847,9 @@ impl MuxelApp {
             launch_id,
             force,
             in_flight,
+            once,
+            waited_ms,
+            cancelled,
             ..
         } = typing;
         if session.id != admitted_launch {
@@ -1744,6 +1869,13 @@ impl MuxelApp {
                 // This is the same UI update as local keyboard input and PTY
                 // draining. Re-read after the asynchronous tmux claim settle.
                 let admission = self.control_send_admission(iid, force, cx);
+                // A waiting send whose caller has gone types nothing. Past
+                // the paste it finishes, and its `--once` key keeps the result.
+                if cancelled.is_some_and(|gone| gone.load(Ordering::Acquire)) {
+                    return Task::ready(Err(
+                        "the caller disconnected before the queued send was typed".into(),
+                    ));
+                }
                 let attempt = self
                     .terminal_view(iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
@@ -1752,6 +1884,12 @@ impl MuxelApp {
                         Ok(pasted) => pasted,
                         Err(error) => return Task::ready(Err(error)),
                     };
+                if let Some(key) = once.as_deref() {
+                    self.control_once.typing(iid, key);
+                }
+                if let Some(waited_ms) = waited_ms {
+                    reply["waited_ms"] = json!(waited_ms);
+                }
                 let pasted = session.input_rev();
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     // A paste through tmux is in only once tmux has run it.
@@ -1883,6 +2021,7 @@ impl MuxelApp {
             Input::Keys {
                 presses,
                 app_cursor,
+                answer,
             } => {
                 debug_assert!(deferred.is_none(), "only forced prompts can defer a claim");
                 let through_tmux = session.delivers_through_tmux();
@@ -1916,6 +2055,8 @@ impl MuxelApp {
                                 let input = if submit {
                                     debug_assert!(keys == [ctl::Key::Enter]);
                                     ControlInput::SubmitKey
+                                } else if answer {
+                                    ControlInput::Answer(keys)
                                 } else {
                                     ControlInput::Keys { keys, app_cursor }
                                 };
@@ -2868,6 +3009,7 @@ mod prompt_submission_tests {
         let admission = SendAdmission {
             state: Some(super::AgentState::Idle),
             just_submitted: false,
+            draft_present: false,
             force: false,
         };
         let refusal =
@@ -3233,6 +3375,7 @@ mod prompt_submission_tests {
             SendAdmission {
                 state: Some(super::AgentState::Working),
                 just_submitted: false,
+                draft_present: false,
                 force: false,
             },
         )
@@ -4338,6 +4481,7 @@ mod runtime_control_tests {
             let result = check_send_state(SendAdmission {
                 state,
                 just_submitted: false,
+                draft_present: false,
                 force: false,
             });
             assert_eq!(result.is_ok(), binding == 1 && attributable);
@@ -4380,6 +4524,7 @@ mod runtime_control_tests {
                 let result = check_send_state(SendAdmission {
                     state,
                     just_submitted: false,
+                    draft_present: false,
                     force: false,
                 });
                 // A listing can't vouch for a prompt a switch may have left.
@@ -4429,6 +4574,7 @@ mod runtime_control_tests {
             check_send_state(SendAdmission {
                 state: Some(state),
                 just_submitted: false,
+                draft_present: false,
                 force,
             })
         };
@@ -4531,6 +4677,7 @@ mod runtime_control_tests {
         let error = check_send_state(SendAdmission {
             state: Some(AgentState::Idle),
             just_submitted: true,
+            draft_present: false,
             force: false,
         })
         .unwrap_err();
@@ -4542,6 +4689,7 @@ mod runtime_control_tests {
         let working = SendAdmission {
             state: Some(AgentState::Working),
             just_submitted: true,
+            draft_present: false,
             force: false,
         };
         assert_eq!(

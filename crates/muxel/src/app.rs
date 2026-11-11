@@ -6424,6 +6424,10 @@ pub struct MuxelApp {
     control_failed: bool,
     /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
     control_turns: HashMap<Uuid, control_api::ControlTurn>,
+    /// `send --once` keys, per pane, in memory only.
+    control_once: control_api::OnceKeys,
+    /// `send --when-idle` calls waiting for their pane, one per pane.
+    control_queue: HashMap<Uuid, control_api::QueuedSend>,
     /// Runtime-only click approvals; no connection waits for the human.
     control_approvals: muxel_core::control::ApprovalQueue<control_api::PreparedCreation>,
     control_approval_notified: Option<Uuid>,
@@ -7973,6 +7977,7 @@ impl MuxelApp {
                 if view
                     .update_in(cx, |this, window, cx| {
                         this.tick(window, cx);
+                        this.pump_control_queue(cx);
                         this.tick_libraries(cx);
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
@@ -8678,6 +8683,8 @@ impl MuxelApp {
             control_task: None,
             control_failed: false,
             control_turns: HashMap::new(),
+            control_once: Default::default(),
+            control_queue: HashMap::new(),
             control_approvals: Default::default(),
             control_approval_notified: None,
         };
@@ -12296,6 +12303,8 @@ impl MuxelApp {
 
         self.failed_launches.clear();
         self.control_turns.clear();
+        self.refuse_control_queue();
+        self.control_once.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();

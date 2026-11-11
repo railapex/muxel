@@ -4078,6 +4078,20 @@ impl TerminalView {
         self.exited
     }
 
+    /// Whether the agent's composer holds text, for `ctl send`'s draft refusal.
+    /// Claude and Codex are read from their drawn composer while it can be
+    /// found, so a placeholder suggestion is not a draft and a draft deleted
+    /// back to empty is none. Any other program, or a composer that can't be
+    /// found, falls back to the draft bit: text typed since the last Enter.
+    pub fn composer_has_draft(&self) -> bool {
+        let drawn = match self.title_provider {
+            TitleProvider::Claude => self.session.startup_screen().claude_composer_draft(),
+            TitleProvider::Codex => self.session.startup_screen().codex_composer_draft(),
+            _ => None,
+        };
+        drawn.unwrap_or_else(|| self.session.input_snapshot().1)
+    }
+
     /// A complete live draft, never a clipped prefix or collapsed paste marker.
     pub fn prompt_in_composer(&self, text: &str) -> bool {
         let screen = self.session.startup_screen();
@@ -8466,7 +8480,8 @@ mod provider_switch_tests {
         let (navigation, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         navigation.write_input(b"\x1b[B"); // Down in the resume picker.
-        assert!(navigation.input_snapshot().1);
+        let (moved, draft) = navigation.input_snapshot();
+        assert!(moved > 0 && !draft, "navigation is input, not a draft");
         navigation.mark_turn_submitted();
         navigation.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0014 | Ready\x07");
         navigation.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=idle\x07");
