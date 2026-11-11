@@ -17,7 +17,8 @@ changes (a turn starts, finishes or stops, including when its process exits; a
 question is asked or answered) or when the clock crosses into another band.
 Mostly that is the row's own work; another session's turn can move a finished
 row across the working rows, as below. A file, diff or page also moves when a
-session opens it, as described below.
+session opens it, and a session when you drag it into or out of a family, as
+described below.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A row's band comes from its
@@ -171,13 +172,37 @@ Opening a resource that is already open counts as opening it again: the last
 session to open it owns it, so reopening a file from a second session moves it
 there. An open no session asked for (the file browser, the palette, the
 sidebar) leaves the owner as it was. A page opened from a file, such as an HTML
-preview or a link in the file, belongs to the file's session, so nesting is one
-level deep. When the owning session has closed, is counting down to close, or
+preview or a link in the file, belongs to the file's session, so a file never
+nests under another file. When the owning session has closed, is counting down to close, or
 is in another project, the resource is an ordinary row. It has no work of its
 own, so it sits with the never-used rows by the later of when it was opened and
 when a session last opened it. A pinned resource
 nests only under a pinned session, so its pin keeps it in the pinned block.
 Layout order ignores owners, and tab strips don't change.
+
+A session nests too, one level under the session that spawned it: `muxel ctl
+new` run from a pane records that pane's session as the new one's opener, when
+it's a live pane in the same project, unless `--top-level` is given. The
+caller is declared, not verified, so the worst a wrong one does is put a row
+in the wrong family. A session spawned by a nested session nests under the
+same top-level session, so there are at most two levels: a session, its child
+sessions, and each one's files (a child's files are drawn two steps in).
+Spawners that loop back on each other nest nothing. A family moves as one row,
+placed by its top session, except that while any child shows a question the
+whole family sorts as Asking, in the latest band among those asking, by its
+newest question. The top row then shows an **N asking** tag, since the
+child's own row may be far below where you'd look. Viewing still moves
+nothing. Children never close with their parent: closing a session takes its
+files, not its child sessions, which become ordinary rows once it's gone. A
+pinned session nests only under a pinned one.
+
+In Recent work, dragging a session onto another session's row nests it under
+that row's top-level session (`sidebar::nest_on_drop`), as if it had spawned
+it, bringing its own children along. Dragging a session onto its project's
+header makes it a row of its own. A drop that would change nothing (onto
+itself, its own child, where it already nests, a file, or another project's
+row) is ignored. Layout order has no nesting, so its row drops still swap
+panes.
 
 The owner is `opened_by` (the session's instance id) and `opened_at` (Unix
 milliseconds) on the resource's instance in this machine's `workspace.json`.

@@ -27,9 +27,13 @@ pub enum SidebarEntry {
     Worktree(Uuid),
     Band(ActivityBand),
     Pane(Uuid),
-    /// A file, diff or page drawn under the session row before it, which
-    /// opened it. Recent work only.
+    /// A row drawn one level in, under the top-level session row before it:
+    /// a file, diff or page that session opened, or a session it spawned.
+    /// Recent work only.
     Nested(Uuid),
+    /// A file, diff or page drawn two levels in, under the nested session row
+    /// before it, which opened it. Recent work only.
+    NestedTwice(Uuid),
 }
 
 pub type InstancesById<'a> = HashMap<Uuid, &'a Instance>;
@@ -230,29 +234,115 @@ pub fn is_unread(activity: &AgentActivity) -> bool {
         .is_some_and(|event| activity.last_attended_at.is_none_or(|seen| event > seen))
 }
 
-/// The session row resource `id` nests under in Recent work: the session that
-/// last opened it, when that session is one of `listed` (the project's rows).
-/// A session that has closed, is held for Undo, or sits in another project
-/// leaves the resource as an ordinary row. Sessions never nest and only
-/// sessions take nested rows, so nesting is one level deep. A pinned resource
-/// nests only under a pinned session, so its pin keeps it in the pinned block.
+/// The session row `id` nests under in Recent work. A file, diff or page nests
+/// under the session that last opened it. A session nests one level under the
+/// session that spawned it (`muxel ctl new` from its pane) or that the user
+/// dragged it onto, and a session spawned by a nested one nests under the same
+/// top-level session, so there are at most two levels: a session, its child
+/// sessions, and each one's files. Only a session in `listed` (the project's
+/// rows) takes nested rows: one that has closed, is held for Undo, or sits in
+/// another project leaves its rows as ordinary ones. A pinned row nests only
+/// under a pinned session, so its pin keeps it in the pinned block. Spawners
+/// that loop back on each other nest nothing.
 pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) -> Option<Uuid> {
     let instance = instances.get(&id)?;
-    if instance.kind == InstanceKind::Terminal {
-        return None;
+    let parent = listed_parent(instance, instances, listed)?;
+    if instance.kind != InstanceKind::Terminal {
+        return Some(parent);
     }
-    instance.opened_by.filter(|session| {
-        listed.contains(session)
-            && instances.get(session).is_some_and(|session| {
-                session.kind == InstanceKind::Terminal && (session.pinned || !instance.pinned)
+    let mut seen = HashSet::from([id]);
+    let mut top = parent;
+    loop {
+        if !seen.insert(top) {
+            return None;
+        }
+        match instances
+            .get(&top)
+            .and_then(|session| listed_parent(session, instances, listed))
+        {
+            Some(up) => top = up,
+            None => return Some(top),
+        }
+    }
+}
+
+/// `instance`'s opener or spawner when it is a listed session it may nest
+/// under.
+fn listed_parent(
+    instance: &Instance,
+    instances: &InstancesById,
+    listed: &HashSet<Uuid>,
+) -> Option<Uuid> {
+    instance.opened_by.filter(|parent| {
+        *parent != instance.id
+            && listed.contains(parent)
+            && instances.get(parent).is_some_and(|parent| {
+                parent.kind == InstanceKind::Terminal && (parent.pinned || !instance.pinned)
             })
     })
+}
+
+/// The `opened_by` that dropping session `dragged` on session row `onto` gives
+/// it in Recent work: `onto`'s top-level session, so nesting stays one level
+/// deep. `None` when the drop changes nothing: `dragged` or `onto` isn't a
+/// session among the project's rows (`listed`), `onto` is `dragged` or nests
+/// under it, `dragged` already nests there, or its pin would keep it out (a
+/// pinned session nests only under a pinned one).
+pub fn nest_on_drop(
+    dragged: Uuid,
+    onto: Uuid,
+    instances: &InstancesById,
+    listed: &HashSet<Uuid>,
+) -> Option<Uuid> {
+    let session = instances
+        .get(&dragged)
+        .filter(|i| i.kind == InstanceKind::Terminal && listed.contains(&dragged))?;
+    instances
+        .get(&onto)
+        .filter(|i| i.kind == InstanceKind::Terminal && listed.contains(&onto))?;
+    let top = nests_under(onto, instances, listed).unwrap_or(onto);
+    let parent = instances.get(&top)?;
+    (top != dragged
+        && nests_under(dragged, instances, listed) != Some(top)
+        && (parent.pinned || !session.pinned))
+        .then_some(top)
+}
+
+/// How many sessions nested under the row at `entries[at]` show a question,
+/// so that row can say so: its whole family sorts as Asking meanwhile.
+pub fn nested_asking(
+    entries: &[SidebarEntry],
+    at: usize,
+    instances: &InstancesById,
+    shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+) -> usize {
+    entries
+        .iter()
+        .skip(at + 1)
+        .take_while(|entry| {
+            matches!(
+                entry,
+                SidebarEntry::Nested(_) | SidebarEntry::NestedTwice(_)
+            )
+        })
+        .filter(|entry| match entry {
+            SidebarEntry::Nested(id) => {
+                instances
+                    .get(id)
+                    .is_some_and(|i| i.kind == InstanceKind::Terminal)
+                    && shown(*id) == Some(AgentActivityState::Blocked)
+            }
+            _ => false,
+        })
+        .count()
 }
 
 /// The files, diffs and pages that close with `sessions` when the user closes
 /// them in Recent work: each one in a session's project whose last opener is
 /// that session. A resource another session opened again since belongs to that
-/// session and stays. Returns `(resource, session)` pairs in workspace order.
+/// session and stays. Sessions nested under them never close with them: they
+/// are work of their own. Returns `(resource, session)` pairs in workspace
+/// order.
 pub fn closes_with(
     sort: SidebarSort,
     sessions: &[Uuid],
@@ -361,8 +451,10 @@ pub fn sidebar_rows_each<'a>(
 /// The caller supplies this project's rows ([`sidebar_rows`]). Layout
 /// preserves existing worktree groups. Recent work is flat, so worktree
 /// membership cannot hold older sessions above newer work, except that a file,
-/// diff or page follows the session that opened it ([`nests_under`]), newest
-/// open first.
+/// diff or page follows the session that opened it, newest open first, and a
+/// session follows the one that spawned it ([`nests_under`]). A family moves
+/// as one row, placed by its top session or, while any of it asks, as Asking
+/// ([`nested_asking`] tells the top row).
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
 /// state each row shows (`shown`), with the rows that last worked before the
@@ -397,33 +489,6 @@ pub fn sidebar_order(
         return plain;
     }
 
-    let listed: HashSet<Uuid> = pane_ids.iter().copied().collect();
-    let mut top = Vec::new();
-    let mut nested: HashMap<Uuid, Vec<(Uuid, Option<i64>)>> = HashMap::new();
-    for &id in pane_ids {
-        match nests_under(id, instances, &listed) {
-            Some(session) => nested
-                .entry(session)
-                .or_default()
-                .push((id, instances.get(&id).and_then(|i| i.opened_at))),
-            None => top.push(id),
-        }
-    }
-    // Newest open first; the sort is stable, so ties keep layout order.
-    for children in nested.values_mut() {
-        children.sort_by_key(|(_, at)| Reverse(*at));
-    }
-    let row = |out: &mut Vec<SidebarEntry>, id: Uuid| {
-        out.push(SidebarEntry::Pane(id));
-        if let Some(children) = nested.get(&id) {
-            out.extend(
-                children
-                    .iter()
-                    .map(|(child, _)| SidebarEntry::Nested(*child)),
-            );
-        }
-    };
-
     // A row with no instance has no work and no open time.
     let unknown = RecentPlace {
         band: ActivityBand::Older,
@@ -434,16 +499,77 @@ pub fn sidebar_order(
     let oldest_turn =
         oldest_running_turn(pane_ids.iter().filter_map(|id| instances.get(id).copied()))
             .map(|started| started.min(clock.now));
-    let placed = |ids: Vec<Uuid>| {
-        let mut rows: Vec<_> = ids
-            .into_iter()
-            .map(|id| {
-                let place = instances.get(&id).map_or(unknown, |i| {
-                    RecentPlace::of(i, shown(id), clock).behind(oldest_turn)
-                });
-                (id, place)
+    let places: HashMap<Uuid, RecentPlace> = pane_ids
+        .iter()
+        .map(|&id| {
+            let place = instances.get(&id).map_or(unknown, |i| {
+                RecentPlace::of(i, shown(id), clock).behind(oldest_turn)
+            });
+            (id, place)
+        })
+        .collect();
+    let place = |id: &Uuid| places.get(id).copied().unwrap_or(unknown);
+
+    let listed: HashSet<Uuid> = pane_ids.iter().copied().collect();
+    let mut top = Vec::new();
+    let mut files: HashMap<Uuid, Vec<(Uuid, Option<i64>)>> = HashMap::new();
+    let mut sessions: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for &id in pane_ids {
+        let Some(parent) = nests_under(id, instances, &listed) else {
+            top.push(id);
+            continue;
+        };
+        let instance = instances.get(&id);
+        if instance.is_some_and(|i| i.kind == InstanceKind::Terminal) {
+            sessions.entry(parent).or_default().push(id);
+        } else {
+            let opened = instance.and_then(|i| i.opened_at);
+            files.entry(parent).or_default().push((id, opened));
+        }
+    }
+    // Files newest open first, child sessions by the same rule as any row; both
+    // sorts are stable, so ties keep layout order.
+    for children in files.values_mut() {
+        children.sort_by_key(|(_, at)| Reverse(*at));
+    }
+    for children in sessions.values_mut() {
+        children.sort_by_key(place);
+    }
+    // A family sorts by its top row, except that while any of it asks, the
+    // whole family sorts as Asking, in the latest band among those asking, by
+    // its newest question.
+    let family = |id: Uuid| {
+        let own = place(&id);
+        let members = sessions.get(&id).into_iter().flatten().map(place);
+        std::iter::once(own)
+            .chain(members)
+            .filter(|member| member.group == RecentGroup::Asking)
+            .fold(None, |lifted: Option<RecentPlace>, asking| {
+                Some(lifted.map_or(
+                    RecentPlace {
+                        band: asking.band.min(own.band),
+                        ..asking
+                    },
+                    |lifted| RecentPlace {
+                        band: lifted.band.min(asking.band),
+                        at: lifted.at.max(asking.at),
+                        ..lifted
+                    },
+                ))
             })
-            .collect();
+            .unwrap_or(own)
+    };
+    let row = |out: &mut Vec<SidebarEntry>, id: Uuid| {
+        out.push(SidebarEntry::Pane(id));
+        let files_of = |session: &Uuid| files.get(session).into_iter().flatten().map(|(f, _)| *f);
+        out.extend(files_of(&id).map(SidebarEntry::Nested));
+        for child in sessions.get(&id).into_iter().flatten() {
+            out.push(SidebarEntry::Nested(*child));
+            out.extend(files_of(child).map(SidebarEntry::NestedTwice));
+        }
+    };
+    let placed = |ids: Vec<Uuid>| {
+        let mut rows: Vec<_> = ids.into_iter().map(|id| (id, family(id))).collect();
         rows.sort_by_key(|&(_, place)| place);
         rows
     };
@@ -657,6 +783,307 @@ mod tests {
             leaf.tabs.push(id);
         }
         id
+    }
+
+    /// A session in `project`'s single tab group with `activity`, spawned an
+    /// hour ago by `spawner`, or by no session (`ctl new --top-level`, or the
+    /// user opened it).
+    fn session(
+        workspace: &mut Workspace,
+        project: &mut Project,
+        spawner: Option<Uuid>,
+        activity: AgentActivity,
+    ) -> Uuid {
+        let mut instance = Instance::shell(project.id);
+        instance.activity = activity;
+        instance.record_opener(spawner, NOW - HOUR);
+        let id = instance.id;
+        workspace.add_instance(instance);
+        if let Some(PaneNode::Leaf(leaf)) = &mut project.layout {
+            leaf.tabs.push(id);
+        }
+        id
+    }
+
+    /// Close `ids` in Recent work's eyes: they leave the project's rows.
+    fn unlist(project: &mut Project, ids: &[Uuid]) {
+        if let Some(PaneNode::Leaf(leaf)) = &mut project.layout {
+            leaf.tabs.retain(|id| !ids.contains(id));
+            leaf.active = 0;
+        }
+    }
+
+    #[test]
+    fn a_spawned_session_nests_under_its_spawner_and_the_family_moves_as_one() {
+        use SidebarEntry::{Nested, NestedTwice, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, b) = (ids[0], ids[1]);
+        // B spawns two sessions that have both finished since A did; a third
+        // session opted out with `--top-level`.
+        let older = session(&mut workspace, &mut project, Some(b), worked(NOW - 600));
+        let newer = session(&mut workspace, &mut project, Some(b), worked(NOW - 300));
+        let alone = session(&mut workspace, &mut project, None, worked(NOW - 5_000));
+        let page = file(&mut workspace, &mut project, Some(b), 10);
+        let notes = file(&mut workspace, &mut project, Some(older), 20);
+        // The family goes by B, however new its children's work. B's own
+        // files come first, then each child with its files a level further in.
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(a),
+                Pane(b),
+                Nested(page),
+                Nested(newer),
+                Nested(older),
+                NestedTwice(notes),
+                Pane(alone)
+            ]
+        );
+
+        // B finishes a turn: the whole family moves above A.
+        workspace.instance_mut(b).unwrap().activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            NOW - 100,
+        );
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(b),
+                Nested(page),
+                Nested(newer),
+                Nested(older),
+                NestedTwice(notes),
+                Pane(a),
+                Pane(alone)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_asking_child_lifts_its_family_and_its_parent_row_says_so() {
+        use AgentActivityState::{Blocked, Working};
+        use SidebarEntry::{Band, Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 40 * DAY)]);
+        let (a, b) = (ids[0], ids[1]);
+        let child = session(
+            &mut workspace,
+            &mut project,
+            Some(b),
+            worked(NOW - 40 * DAY + 1_000),
+        );
+        let asking = |workspace: &Workspace, entries: &[SidebarEntry], at: usize| {
+            let index = instances_by_id(workspace);
+            nested_asking(entries, at, &index, &|id| {
+                index.get(&id).and_then(|i| live(i))
+            })
+        };
+        let settled = vec![
+            Band(ActivityBand::Today),
+            Pane(a),
+            Band(ActivityBand::Older),
+            Pane(b),
+            Nested(child),
+        ];
+        assert_eq!(recent(&project, &workspace), settled);
+        assert_eq!(asking(&workspace, &settled, 3), 0);
+
+        // The child asks: its old parent leads the list with it, and says so.
+        change(&mut workspace, child, Blocked, NOW - 50);
+        let lifted = recent(&project, &workspace);
+        assert_eq!(lifted, vec![Pane(b), Nested(child), Pane(a)]);
+        assert_eq!(asking(&workspace, &lifted, 0), 1);
+        assert_eq!(asking(&workspace, &lifted, 2), 0);
+        // Looking at the question moves nothing.
+        attend(&mut workspace, child, NOW - 10);
+        assert_eq!(recent(&project, &workspace), lifted);
+
+        // Answering it lets the family fall back to B's own place.
+        change(&mut workspace, child, Working, NOW - 5);
+        assert_eq!(recent(&project, &workspace), settled);
+    }
+
+    #[test]
+    fn an_old_question_lifts_its_family_without_dragging_it_down_a_band() {
+        use SidebarEntry::{Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 500)]);
+        let (a, b) = (ids[0], ids[1]);
+        // A's child asked nine days ago and is still waiting.
+        let child = session(
+            &mut workspace,
+            &mut project,
+            Some(a),
+            worked(NOW - 9 * DAY - 1_000),
+        );
+        change(
+            &mut workspace,
+            child,
+            AgentActivityState::Blocked,
+            NOW - 9 * DAY,
+        );
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(a), Nested(child), Pane(b)]
+        );
+    }
+
+    #[test]
+    fn a_spawned_session_never_closes_with_its_spawner_and_outlives_it() {
+        use SidebarEntry::{Nested, NestedTwice, Pane};
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let parent = ids[0];
+        let child = session(
+            &mut workspace,
+            &mut project,
+            Some(parent),
+            worked(NOW - 2_000),
+        );
+        let plan = file(&mut workspace, &mut project, Some(parent), 10);
+        let notes = file(&mut workspace, &mut project, Some(child), 20);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(parent),
+                Nested(plan),
+                Nested(child),
+                NestedTwice(notes)
+            ]
+        );
+        // Closing the parent takes its own files, not its child or the
+        // child's files.
+        assert_eq!(
+            closes_with(SidebarSort::RecentWork, &[parent], &workspace.instances),
+            vec![(plan, parent)]
+        );
+        // Once it has closed, or while it is held for Undo, the child is an
+        // ordinary row with its files one level in.
+        unlist(&mut project, &[parent, plan]);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(child), Nested(notes)]
+        );
+    }
+
+    #[test]
+    fn a_grandchild_session_nests_under_the_top_session_so_there_are_two_levels() {
+        use SidebarEntry::{Nested, NestedTwice, Pane};
+        let (mut project, mut workspace, ids) = fixture(vec![worked(NOW - 1_000)]);
+        let top = ids[0];
+        let child = session(&mut workspace, &mut project, Some(top), worked(NOW - 2_000));
+        let grandchild = session(
+            &mut workspace,
+            &mut project,
+            Some(child),
+            worked(NOW - 3_000),
+        );
+        let notes = file(&mut workspace, &mut project, Some(grandchild), 10);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(top),
+                Nested(child),
+                Nested(grandchild),
+                NestedTwice(notes)
+            ]
+        );
+
+        // The top session closes: its child takes the grandchild.
+        unlist(&mut project, &[top]);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(child), Nested(grandchild), NestedTwice(notes)]
+        );
+
+        // Spawners that loop back on each other nest no session.
+        workspace.instance_mut(child).unwrap().opened_by = Some(grandchild);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(child), Pane(grandchild), Nested(notes)]
+        );
+    }
+
+    #[test]
+    fn dropping_a_session_on_a_row_nests_it_under_that_rows_top_session() {
+        use SidebarEntry::{Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, x) = (ids[0], ids[1]);
+        let child = session(&mut workspace, &mut project, Some(a), worked(NOW - 3_000));
+        let mine = session(&mut workspace, &mut project, Some(x), worked(NOW - 4_000));
+        let plan = file(&mut workspace, &mut project, Some(a), 10);
+        let gone = Instance::shell(project.id);
+        let closed = gone.id;
+        workspace.add_instance(gone);
+        {
+            let index = instances_by_id(&workspace);
+            let listed: HashSet<Uuid> = project.instances().into_iter().collect();
+            let nest = |dragged, onto| nest_on_drop(dragged, onto, &index, &listed);
+            // Onto a top session or a session nested under it: one level under
+            // the top session either way.
+            assert_eq!(nest(x, a), Some(a));
+            assert_eq!(nest(x, child), Some(a));
+            // Onto itself or its own child, where it already nests, a file
+            // either way, or a session that has closed: nothing changes.
+            assert_eq!(nest(a, a), None);
+            assert_eq!(nest(a, child), None);
+            assert_eq!(nest(child, a), None);
+            assert_eq!(nest(plan, x), None);
+            assert_eq!(nest(x, plan), None);
+            assert_eq!(nest(x, closed), None);
+            // A session that isn't one of the project's rows (closed, held
+            // for Undo, in another project) can't be nested by a drop.
+            assert_eq!(nest(closed, a), None);
+        }
+
+        // X joins A and brings its own child along, still two levels.
+        workspace.instance_mut(x).unwrap().opened_by = Some(a);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![
+                Pane(a),
+                Nested(plan),
+                Nested(x),
+                Nested(child),
+                Nested(mine)
+            ]
+        );
+
+        // Dropped on the project's heading, a session leaves its family.
+        workspace.instance_mut(child).unwrap().opened_by = None;
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(a), Nested(plan), Nested(x), Nested(mine), Pane(child)]
+        );
+    }
+
+    #[test]
+    fn a_pinned_session_nests_only_under_a_pinned_spawner() {
+        use SidebarEntry::{Nested, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
+        let (a, b) = (ids[0], ids[1]);
+        let child = session(&mut workspace, &mut project, Some(b), worked(NOW - 3_000));
+        workspace.instance_mut(child).unwrap().pinned = true;
+        // B isn't pinned, so the child leads the list on its own pin, and
+        // dropping it back on B changes nothing.
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(child), Pane(a), Pane(b)]
+        );
+        let listed: HashSet<Uuid> = project.instances().into_iter().collect();
+        assert_eq!(
+            nest_on_drop(child, b, &instances_by_id(&workspace), &listed),
+            None
+        );
+        // Pin B as well and the child nests under it inside the pinned block.
+        workspace.instance_mut(b).unwrap().pinned = true;
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(b), Nested(child), Pane(a)]
+        );
     }
 
     #[test]
@@ -895,6 +1322,13 @@ mod tests {
         for (&id, (_, opened)) in ids.iter().zip(&rows) {
             workspace.instance_mut(id).unwrap().created_at = *opened;
         }
+        // Every third row spawns the next, which spawns the one after, so the
+        // families read take every shape: an asking parent, child or grandchild.
+        for (row, pair) in ids.windows(2).enumerate() {
+            if row % 3 != 2 {
+                workspace.instance_mut(pair[1]).unwrap().opened_by = Some(pair[0]);
+            }
+        }
         // Each row can be unseen, seen up to just before any of its events, or
         // seen now.
         let choices: Vec<Vec<Option<i64>>> = rows
@@ -930,6 +1364,7 @@ mod tests {
                 order_at(&project, workspace, shown, clock())
             };
             let unseen = read(&mut workspace, &|_, _| 0);
+            assert!(unseen.iter().any(|e| matches!(e, SidebarEntry::Nested(_))));
             for round in 0..16 {
                 let order = read(&mut workspace, &|row, len| (row * 7 + round * 13) % len);
                 assert_eq!(order, unseen, "attendance round {round}");

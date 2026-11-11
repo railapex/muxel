@@ -971,7 +971,9 @@ feature is added or changed, update the matching entry here in the same change**
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
   that project's toolbar preset. Run from one of that project's panes, the tab
-  joins the caller's own group; otherwise it joins the focused group.
+  joins the caller's own group; otherwise it joins the focused group. Run from
+  a pane, the new session also nests under the caller's session in Recent
+  work; `--top-level` opens it as a session of its own.
   `--model M` and `--effort E` select per-pane values for plain and prompt
   launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
@@ -1720,6 +1722,16 @@ feature is added or changed, update the matching entry here in the same change**
   in another project, the resource is an ordinary row again, with the
   never-used rows by when it was last opened. A pinned file stays
   with the pins unless its session is pinned too.
+- **Sessions nest under the session that spawned them** — in Recent work, a
+  session started by `muxel ctl new` from another session's pane shows indented
+  under that session's row, and the family moves as one. A session spawned by a
+  nested one nests under the same top session, so there are two levels at most:
+  a session, its child sessions, and each one's files. While any child asks a
+  question, the whole family sorts as asking and the top row shows **N asking**,
+  so nothing that needs you is buried. Drag a session onto another session's
+  row to nest it there, or onto its project's header to make it a row of its
+  own. Children never close with their parent; once the parent closes they are
+  ordinary rows. A pinned session nests only under a pinned one.
 - **Files close with their session** — in Recent work, closing a session (its
   tab, its pane, or Close terminals) also closes the files, diffs and pages it
   last opened. They join the session's countdown, so one Undo brings them all

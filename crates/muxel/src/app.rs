@@ -36,7 +36,8 @@ use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
     ActivityBand, BandClock, InstancesById, SidebarEntry, SidebarSort, instances_by_id, is_unread,
-    notification_in_feed, sidebar_order, sidebar_rows_each, unread_count,
+    nest_on_drop, nested_asking, notification_in_feed, sidebar_order, sidebar_rows_each,
+    unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -25449,6 +25450,73 @@ impl MuxelApp {
         sidebar_order(pane_ids, placing, &shown, bands, self.settings.sidebar_sort)
     }
 
+    /// Session `dragged` dropped on session row `onto` in Recent work: it nests
+    /// under `onto`'s family ([`nest_on_drop`]), and stays there, as if that
+    /// session had spawned it. A drop that changes nothing is ignored.
+    fn nest_session_on(&mut self, dragged: Uuid, onto: Uuid, cx: &mut Context<Self>) {
+        let Some(pid) = self.workspace.instance(onto).map(|i| i.project_id) else {
+            return;
+        };
+        let parent = {
+            let listed: HashSet<Uuid> = self
+                .sidebar_rows_each()
+                .remove(&pid)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            nest_on_drop(dragged, onto, &instances_by_id(&self.workspace), &listed)
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(instance) = self.workspace.instance_mut(dragged) {
+            instance.record_opener(Some(parent), now);
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Session `dragged` dropped on project `pid`'s header in Recent work: it
+    /// no longer nests under the session that spawned it, or that it was
+    /// dropped on, and is a row of its own.
+    fn unnest_session(&mut self, dragged: Uuid, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(instance) = self.workspace.instance_mut(dragged) else {
+            return;
+        };
+        if instance.project_id != pid
+            || instance.kind != InstanceKind::Terminal
+            || instance.opened_by.is_none()
+        {
+            return;
+        }
+        instance.opened_by = None;
+        instance.opened_at = None;
+        self.persist();
+        cx.notify();
+    }
+
+    /// For each of `entries` ([`Self::sidebar_entries`]), how many sessions
+    /// nested under it are asking: what a family's top row tells, since its
+    /// children sit below it. Zero for any other row.
+    fn sidebar_family_asking(
+        &self,
+        entries: &[SidebarEntry],
+        placing: &InstancesById,
+        cx: &App,
+    ) -> Vec<usize> {
+        let shown = |iid: Uuid| {
+            let instance = placing.get(&iid).copied();
+            Some(activity_state(self.sidebar_status(iid, instance, cx)))
+        };
+        (0..entries.len())
+            .map(|at| match entries[at] {
+                SidebarEntry::Pane(_) => nested_asking(entries, at, placing, &shown),
+                _ => 0,
+            })
+            .collect()
+    }
+
     /// `pid`'s sidebar entries as the sidebar draws them now, for the Windows
     /// app tests that click rows.
     #[cfg(all(test, windows))]
@@ -30491,6 +30559,17 @@ impl MuxelApp {
                         this.reorder_projects(p.from, ix, cx)
                     }))
                     .drag_over::<DragProject>(move |s, _, _, _| s.bg(drop_hl))
+                    // In Recent work a session dropped on its project's header
+                    // leaves the session it nested under.
+                    .when(sort == SidebarSort::RecentWork, |header| {
+                        header
+                            .on_drop::<DragInstance>(cx.listener(
+                                move |this, p: &DragInstance, _w, cx| {
+                                    this.unnest_session(p.iid, pid, cx)
+                                },
+                            ))
+                            .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
+                    })
                     .context_menu({
                         let entity = entity.clone();
                         move |menu, window, cx| {
@@ -30959,13 +31038,14 @@ impl MuxelApp {
                     })
                     .collect();
                 let entries = self.sidebar_entries(&visible, &placing, bands, cx);
+                let asking_below = self.sidebar_family_asking(&entries, &placing, cx);
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                for entry in entries {
-                    let (iid, nested) = match entry {
+                for (entry, asking_below) in entries.into_iter().zip(asking_below) {
+                    let (iid, depth) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
@@ -30988,9 +31068,11 @@ impl MuxelApp {
                             );
                             continue;
                         }
-                        SidebarEntry::Pane(iid) => (iid, false),
-                        // Under the session that opened it, one step further in.
-                        SidebarEntry::Nested(iid) => (iid, true),
+                        SidebarEntry::Pane(iid) => (iid, 0.0),
+                        // Under the session that opened or spawned it, one step
+                        // further in; a child session's files, two.
+                        SidebarEntry::Nested(iid) => (iid, 1.0),
+                        SidebarEntry::NestedTwice(iid) => (iid, 2.0),
                     };
                     let inst = instances.get(&iid).copied();
                     let popped_out = self.popouts.contains_key(&iid);
@@ -31104,7 +31186,7 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
-                        .ml(rems(if nested { 2.0 } else { 1.0 }))
+                        .ml(rems(1.0 + depth))
                         .mr_1()
                         .px_2()
                         .py_1()
@@ -31262,6 +31344,14 @@ impl MuxelApp {
                                             .flex_none()
                                             .bg(cx.theme().primary)
                                     }))
+                                    // A family's top row says when a session nested under
+                                    // it asks: the family sorts as Asking meanwhile.
+                                    .children((asking_below > 0).then(|| {
+                                        div().flex_none().child(status_tag(
+                                            AgentStatus::Blocked,
+                                            tf("{n} asking", &[("n", &asking_below.to_string())]),
+                                        ))
+                                    }))
                                     .child(badge),
                             );
                         let row = base
@@ -31296,10 +31386,19 @@ impl MuxelApp {
                             });
                         // Recent order is independent of layout positions. Accept
                         // row swaps only when their result can be seen in the list.
+                        // In Recent work a session row takes another session to
+                        // nest under it instead.
                         let row = if sort == SidebarSort::Layout {
                             row.on_drop::<DragInstance>(cx.listener(
                                 move |this, p: &DragInstance, _w, cx| {
                                     this.swap_terminals(p.iid, iid, cx)
+                                },
+                            ))
+                            .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
+                        } else if inst.is_some_and(|i| i.kind == InstanceKind::Terminal) {
+                            row.on_drop::<DragInstance>(cx.listener(
+                                move |this, p: &DragInstance, _w, cx| {
+                                    this.nest_session_on(p.iid, iid, cx)
                                 },
                             ))
                             .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))

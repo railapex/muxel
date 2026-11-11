@@ -506,7 +506,85 @@ fn control_new_trusts_a_declared_caller_only_when_it_is_a_live_terminal() {
         let opened = open_from(&mut app, Some(declared));
         assert_eq!(group(&app, focused), [focused, opened]);
         assert_eq!(group(&app, declared), [declared]);
+        // Nor may it claim the new session in Recent work.
+        assert_eq!(app.workspace.instance(opened).unwrap().opened_by, None);
     }
+}
+
+#[test]
+fn control_new_records_the_calling_session_as_spawner_unless_top_level() {
+    let opened_by = |app: &MuxelApp, iid: Uuid| app.workspace.instance(iid).unwrap().opened_by;
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (_, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+
+    let child = open_from(&mut app, Some(caller));
+    assert_eq!(opened_by(&app, child), Some(caller));
+
+    let independent = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane: Some(caller),
+                top_level: true,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let independent: Uuid = serde_json::from_value(independent["uuid"].clone()).unwrap();
+    assert_eq!(opened_by(&app, independent), None);
+
+    // No caller, a closed one, or one in another project spawns nothing.
+    let (_, other_project_pane) = target_project(&mut app, false);
+    for declared in [None, Some(Uuid::new_v4()), other_project_pane] {
+        let opened = open_from(&mut app, declared);
+        assert_eq!(opened_by(&app, opened), None, "{declared:?}");
+    }
+}
+
+/// The whole way from `ctl new` to the sidebar: a session opened from a pane
+/// is drawn in Recent work nested under that pane's row, and one opened with
+/// `--top-level` is a row of its own.
+#[test]
+fn a_session_opened_from_a_pane_is_a_nested_row_under_it_in_recent_work() {
+    use muxel_core::sidebar::{
+        BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order, sidebar_rows,
+    };
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (_, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+    let child = open_from(&mut app, Some(caller));
+    let independent = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane: Some(caller),
+                top_level: true,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let independent: Uuid = serde_json::from_value(independent["uuid"].clone()).unwrap();
+
+    let project = app.workspace.project(pid).unwrap();
+    let rows = sidebar_rows(project, &app.workspace, &|_| false, SidebarSort::RecentWork);
+    let entries = sidebar_order(
+        &rows,
+        &instances_by_id(&app.workspace),
+        &|_| None,
+        BandClock::at(&chrono::Local::now()),
+        SidebarSort::RecentWork,
+    );
+    let at = |entry| entries.iter().position(|row| *row == entry);
+    let caller_row = at(SidebarEntry::Pane(caller)).expect("the caller's row");
+    assert_eq!(
+        at(SidebarEntry::Nested(child)),
+        Some(caller_row + 1),
+        "{entries:?}"
+    );
+    assert!(at(SidebarEntry::Pane(independent)).is_some(), "{entries:?}");
 }
 
 #[test]

@@ -1492,10 +1492,12 @@ usage: muxel ctl <command> [args]
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
   new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
-              [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait]
+              [--focus] [--top-level] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
-                                 --background is a compatibility no-op; --prompt - reads stdin
+                                 from a pane, nests under its session in Recent work
+                                 unless --top-level; --background is a compatibility
+                                 no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   focus AGENT                    open a pane; start it if dormant
@@ -1568,7 +1570,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down] [--focus] [--top-level] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. Opened from a pane, it nests under that pane's session in Recent work; --top-level opens it as a session of its own. --name sets a starting label that an agent title replaces; the label stays resolvable and is reported by status/panes. --name-fixed keeps a fixed name. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -2004,7 +2006,7 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   Replies `{woken: true, status: "starting"}`, or `{woken: false,
   already_running: true, status}` when it already runs, so a retry is harmless.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  [--focus] [--top-level] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
   new tab: in your own pane's group when you run it from one of that project's
   panes, otherwise in the group the user has focused. `--split right|down` makes
   a new pane beside that group instead. PROJECT resolves as for `panes`.
@@ -2012,6 +2014,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   replaces it on screen. The label remains a resolver alias and a `label` field
   in `panes`/`status`; the row tooltip keeps it visible. `--name-fixed` instead
   keeps a sticky name, like an inline rename. The two options are exclusive.
+  Run from one of the project's panes, the new session nests under your session
+  in the sidebar's Recent work order, so the user sees it as your work; a
+  question it asks lifts your row with it. Pass `--top-level` for a session that
+  is independent work. Nesting never closes it with you.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
