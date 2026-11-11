@@ -39390,7 +39390,7 @@ impl Render for MuxelApp {
             .child(ui_profile::region(ui_profile::Region::Titlebar, || {
                 self.render_titlebar(active_name, cx)
             }))
-            .children(self.render_rescue_strip(cx))
+            .children(self.render_rescue_strip(window, cx))
             .child(ui_profile::wrap_region(
                 ui_profile::Region::Shell,
                 div().flex_1().min_h_0().flex().child(outer),
