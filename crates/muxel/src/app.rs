@@ -99,6 +99,9 @@ mod restart_guard;
 #[cfg(all(test, windows))]
 mod rich_copy_tests;
 mod session_discovery;
+mod sleep;
+#[cfg(all(test, windows))]
+mod sleep_tests;
 mod sound_alerts;
 mod strip_button;
 #[cfg(test)]
@@ -6111,6 +6114,12 @@ pub struct MuxelApp {
     restoring_activity: HashSet<Uuid>,
     /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
     dormant_instances: HashSet<Uuid>,
+    /// Terminals put to sleep whose program is still quitting (see `sleep`).
+    sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
+    /// When the idle timer last looked for agents to sleep.
+    auto_sleep_checked: Option<Instant>,
+    /// When `ctl wake` started a pane (Unix ms): the idle timer counts from it.
+    woken_at: HashMap<Uuid, i64>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8634,6 +8643,9 @@ impl MuxelApp {
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
+            sleep_exits: HashMap::new(),
+            auto_sleep_checked: None,
+            woken_at: HashMap::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -8834,12 +8846,12 @@ impl MuxelApp {
                     && !instance.use_tmux
                     && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
                     && local.contains(&instance.project_id)
-                    && muxel_core::should_restore_dormant(
-                        &instance.activity,
-                        self.settings.dormant_after_days,
+                    && muxel_core::sleep::opens_dormant(
+                        instance,
+                        self.instance_resume_trusted(instance),
+                        &self.settings,
                         now,
                         false,
-                        instance.pinned,
                     )
             })
             .map(|instance| instance.id)
@@ -9919,6 +9931,7 @@ impl MuxelApp {
         if !self.launch_permitted(instance_id, reason) {
             return;
         }
+        self.end_pending_sleep(instance_id, cx);
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
         // An explicit/immediate spawn supersedes a deferred launch still creating
         // its PTY. Its token will fail validation and dropping it kills the child.
@@ -10058,6 +10071,8 @@ impl MuxelApp {
             }
             return None;
         }
+        // A wake during a sleep's quit grace: never run beside the old process.
+        self.end_pending_sleep(instance_id, cx);
         if reason != muxel_core::TerminalLaunchReason::NewPane {
             self.cancel_control_startup(instance_id);
         }
@@ -10627,10 +10642,10 @@ impl MuxelApp {
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
-        if let Some(inst) = self.workspace.instance_mut(instance_id)
-            && inst.consume_runner_prompt()
-        {
-            state_changed = true;
+        if let Some(inst) = self.workspace.instance_mut(instance_id) {
+            // Any launch that lands wakes a sleeping pane, whatever started it.
+            state_changed |= inst.asleep_since.take().is_some();
+            state_changed |= inst.consume_runner_prompt();
         }
         state_changed |= self.mark_terminal_session_started(instance_id);
         if state_changed {
@@ -10830,12 +10845,12 @@ impl MuxelApp {
                     && !self.terminals.contains_key(&iid)
                     && !self.terminal_launching.contains_key(&iid)
                     && !self.failed_launches.contains_key(&iid)
-                    && muxel_core::should_restore_dormant(
-                        &instance.activity,
-                        self.settings.dormant_after_days,
+                    && muxel_core::sleep::opens_dormant(
+                        instance,
+                        self.instance_resume_trusted(instance),
+                        &self.settings,
                         now,
                         self.active_instance == Some(iid),
-                        instance.pinned,
                     );
                 if dormant {
                     self.dormant_instances.insert(iid);
@@ -14708,6 +14723,7 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
+        self.auto_sleep_pass(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
@@ -19034,6 +19050,8 @@ impl MuxelApp {
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
+        self.end_pending_sleep(iid, cx);
+        self.woken_at.remove(&iid);
         if let Some(popout) = self.popouts.remove(&iid) {
             if let PaneView::Terminal(view) = &popout.view {
                 view.read(cx).session().kill();
@@ -26556,9 +26574,10 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_default();
-                                div()
-                                    .flex_none()
-                                    .child(status_tag(status, format!("{age} · {}", t("dormant"))))
+                                div().flex_none().child(status_tag(
+                                    status,
+                                    format!("{age} · {}", self.dormant_badge(tab)),
+                                ))
                             }))
                             // A tab being read aloud says so — even when another tab
                             // of its pane is showing — and pauses or resumes on click.
@@ -28565,6 +28584,19 @@ impl MuxelApp {
                                         )),
                                 );
                             }
+                            // Only local plain terminals can sleep.
+                            if is_local {
+                                menu = menu.item(
+                                    PopupMenuItem::new(t("Sleep idle agents"))
+                                        .icon(Icon::empty().path("icons/pause.svg"))
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.sleep_idle_agents(pid, cx)
+                                            },
+                                        )),
+                                );
+                            }
                             // Git actions (only when the project is a repo).
                             if is_repo {
                                 menu = menu.separator();
@@ -28933,7 +28965,7 @@ impl MuxelApp {
                                         chrono::Utc::now().timestamp_millis(),
                                     );
                                     if dormant {
-                                        format!("{label} · {}", t("dormant"))
+                                        format!("{label} · {}", self.dormant_badge(iid))
                                     } else {
                                         label
                                     }
@@ -28994,34 +29026,55 @@ impl MuxelApp {
                             .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
                             .context_menu({
                                 let entity = entity.clone();
-                                move |menu, window, _cx| {
-                                    menu.item(
-                                        PopupMenuItem::new(t("Rename"))
-                                            .icon(Icon::empty().path("icons/pencil.svg"))
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.start_rename_instance(
-                                                        iid,
-                                                        RenameOrigin::InstanceSidebar,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            )),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t("Duplicate"))
-                                            .icon(IconName::Copy)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.duplicate_instance(iid, window, cx)
-                                                },
-                                            )),
-                                    )
-                                    .separator()
-                                    .item(
+                                move |menu, window, cx| {
+                                    // Read when the menu opens, not at render: a
+                                    // pane's state moves between the two.
+                                    let sleep = entity.read(cx).sleep_menu_state(iid, cx);
+                                    let menu = menu
+                                        .item(
+                                            PopupMenuItem::new(t("Rename"))
+                                                .icon(Icon::empty().path("icons/pencil.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.start_rename_instance(
+                                                            iid,
+                                                            RenameOrigin::InstanceSidebar,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new(t("Duplicate"))
+                                                .icon(IconName::Copy)
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.duplicate_instance(iid, window, cx)
+                                                    },
+                                                )),
+                                        );
+                                    let menu = match sleep {
+                                        Some(Ok(())) => menu.item(
+                                            PopupMenuItem::new(t("Sleep"))
+                                                .icon(Icon::empty().path("icons/pause.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, _window, cx| {
+                                                        this.sleep_from_menu(iid, cx)
+                                                    },
+                                                )),
+                                        ),
+                                        Some(Err(why)) => menu.item(
+                                            PopupMenuItem::new(why)
+                                                .icon(Icon::empty().path("icons/pause.svg"))
+                                                .disabled(true),
+                                        ),
+                                        None => menu,
+                                    };
+                                    menu.separator().item(
                                         PopupMenuItem::new(t("Kill"))
                                             .icon(IconName::CircleX)
                                             .on_click(window.listener_for(
@@ -34433,6 +34486,7 @@ impl MuxelApp {
                         this.settings.dormant_after_days = this.settings.dormant_after_days.saturating_add(1);
                         this.persist_settings(); cx.notify();
                     }))))
+            .child(self.render_sleep_setting(cx))
             .child(
                 self.check_row(
                     Checkbox::new("b-notif")

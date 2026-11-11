@@ -1,0 +1,416 @@
+//! Putting an idle local agent to sleep: its program ends and its pane stays in
+//! the layout as a dormant pane, which resumes the same conversation when it is
+//! opened or woken. These rules decide which panes may sleep; the app gathers
+//! the facts and does the stopping.
+
+use crate::{Instance, Settings, is_known_agent_program, should_restore_dormant};
+
+/// How long an agent stays idle before automatic sleep, unless the user picks
+/// another value. Long enough that a pane touched this morning is still running
+/// after lunch, short enough that the panes left over from yesterday stop
+/// holding memory before the next working day's builds start.
+pub const DEFAULT_SLEEP_AFTER_HOURS: u32 = 4;
+
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
+/// Who asked for a sleep. Only automatic sleep waits for the idle threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepRequest {
+    /// A pane's own Sleep item, or a project's "Sleep idle agents".
+    ByHand,
+    /// The idle timer.
+    Auto { after_hours: u32, now: i64 },
+}
+
+/// A running pane's state, as far as sleeping it is concerned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SleepStatus {
+    /// Launching or reconnecting: there is no settled conversation yet.
+    #[default]
+    Starting,
+    Idle,
+    /// Finished a turn and waits for the user.
+    Done,
+    Working,
+    /// Waiting on a permission or choice prompt.
+    Asking,
+    /// The program ended, failed, or isn't running.
+    NotRunning,
+}
+
+/// What the app knows about a pane when deciding whether it may sleep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SleepFacts {
+    /// Runs one of muxel's known agent providers (not a shell or a wrapper).
+    pub agent: bool,
+    /// A plain PTY on this machine: not a remote project, not tmux.
+    pub local_pty: bool,
+    /// Its saved conversation id will resume it (see [`crate::resume_trusted`]).
+    pub resume_trusted: bool,
+    pub status: SleepStatus,
+    /// The provider's screen says work still runs beside the turn (subagents,
+    /// background shells), or muxel holds the turn open for it.
+    pub background_held: bool,
+    /// The pane the user has focused.
+    pub focused: bool,
+    /// Text typed into the agent's input that hasn't been submitted.
+    pub unsent_text: bool,
+    pub pinned: bool,
+    /// The latest work, completion, question or attendance (Unix ms).
+    pub last_active_at: Option<i64>,
+}
+
+/// Why a pane may not sleep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepRefusal {
+    NotAgent,
+    NotLocal,
+    NoResume,
+    Pinned,
+    NotRunning,
+    Starting,
+    Working,
+    Asking,
+    Background,
+    UnsentText,
+    Focused,
+    /// Automatic sleep only: active within the threshold, or its age is unknown.
+    RecentlyActive,
+}
+
+impl SleepRefusal {
+    /// Stable machine-readable form, for logs and outside control.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotAgent => "not_agent",
+            Self::NotLocal => "not_local",
+            Self::NoResume => "no_resume",
+            Self::Pinned => "pinned",
+            Self::NotRunning => "not_running",
+            Self::Starting => "starting",
+            Self::Working => "working",
+            Self::Asking => "asking",
+            Self::Background => "background",
+            Self::UnsentText => "unsent_text",
+            Self::Focused => "focused",
+            Self::RecentlyActive => "recently_active",
+        }
+    }
+}
+
+/// Whether an agent last active at `last_active_at` has been idle for at least
+/// `hours`. Zero hours turns automatic sleep off; an unknown age never qualifies.
+pub fn sleep_due(last_active_at: Option<i64>, hours: u32, now: i64) -> bool {
+    hours > 0
+        && last_active_at.is_some_and(|at| now.saturating_sub(at) >= i64::from(hours) * HOUR_MS)
+}
+
+/// The first rule that keeps this pane awake, or `None` when it may sleep.
+///
+/// Pinned panes never sleep: pinning already means "always start" for dormant
+/// restore, and toggling a pin on wakes a dormant pane, so a pin keeps a pane
+/// running in every path.
+pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepRefusal> {
+    let refusal = if !facts.agent {
+        SleepRefusal::NotAgent
+    } else if !facts.local_pty {
+        SleepRefusal::NotLocal
+    } else if !facts.resume_trusted {
+        SleepRefusal::NoResume
+    } else if facts.pinned {
+        SleepRefusal::Pinned
+    } else {
+        match facts.status {
+            SleepStatus::NotRunning => SleepRefusal::NotRunning,
+            SleepStatus::Starting => SleepRefusal::Starting,
+            // A turn held open for its background work reads as working; say why.
+            _ if facts.background_held => SleepRefusal::Background,
+            SleepStatus::Working => SleepRefusal::Working,
+            SleepStatus::Asking => SleepRefusal::Asking,
+            SleepStatus::Idle | SleepStatus::Done if facts.unsent_text => SleepRefusal::UnsentText,
+            SleepStatus::Idle | SleepStatus::Done if facts.focused => SleepRefusal::Focused,
+            SleepStatus::Idle | SleepStatus::Done => match request {
+                SleepRequest::Auto { after_hours, now }
+                    if !sleep_due(facts.last_active_at, after_hours, now) =>
+                {
+                    SleepRefusal::RecentlyActive
+                }
+                _ => return None,
+            },
+        }
+    };
+    Some(refusal)
+}
+
+/// Whether a saved local PTY pane opens dormant instead of starting: it was put
+/// to sleep; or it is an agent idle past the automatic-sleep threshold whose
+/// resume muxel trusts (starting it only for the timer to stop it again would
+/// cost a launch and the memory spike sleep exists to avoid); or it is older
+/// than the dormant-restore threshold. Active and pinned panes always start.
+pub fn opens_dormant(
+    instance: &Instance,
+    resume_trusted: bool,
+    settings: &Settings,
+    now: i64,
+    active: bool,
+) -> bool {
+    if active || instance.pinned {
+        return false;
+    }
+    if instance.asleep_since.is_some() {
+        return true;
+    }
+    let idle_agent = resume_trusted
+        && is_known_agent_program(instance.program.as_deref())
+        && sleep_due(
+            instance.activity.last_active_at(),
+            settings.sleep_after_hours,
+            now,
+        );
+    idle_agent
+        || should_restore_dormant(
+            &instance.activity,
+            settings.dormant_after_days,
+            now,
+            false,
+            false,
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_SLEEP_AFTER_HOURS, HOUR_MS, SleepFacts, SleepRefusal, SleepRequest, SleepStatus,
+        opens_dormant, sleep_due, sleep_refusal,
+    };
+    use crate::{AgentActivity, Instance, Settings};
+    use uuid::Uuid;
+
+    fn sleepy() -> SleepFacts {
+        SleepFacts {
+            agent: true,
+            local_pty: true,
+            resume_trusted: true,
+            status: SleepStatus::Idle,
+            background_held: false,
+            focused: false,
+            unsent_text: false,
+            pinned: false,
+            last_active_at: Some(0),
+        }
+    }
+
+    #[test]
+    fn an_idle_or_done_local_agent_with_a_trusted_resume_sleeps_by_hand() {
+        for status in [SleepStatus::Idle, SleepStatus::Done] {
+            let facts = SleepFacts {
+                status,
+                // By hand ignores age, including an unknown one.
+                last_active_at: None,
+                ..sleepy()
+            };
+            assert_eq!(sleep_refusal(&facts, SleepRequest::ByHand), None);
+        }
+    }
+
+    #[test]
+    fn every_never_rule_keeps_a_pane_awake_by_hand_and_automatically() {
+        let auto = SleepRequest::Auto {
+            after_hours: 4,
+            now: 9 * HOUR_MS,
+        };
+        let cases: [(SleepFacts, SleepRefusal); 11] = [
+            (
+                SleepFacts {
+                    agent: false,
+                    ..sleepy()
+                },
+                SleepRefusal::NotAgent,
+            ),
+            (
+                SleepFacts {
+                    local_pty: false,
+                    ..sleepy()
+                },
+                SleepRefusal::NotLocal,
+            ),
+            (
+                SleepFacts {
+                    resume_trusted: false,
+                    ..sleepy()
+                },
+                SleepRefusal::NoResume,
+            ),
+            (
+                SleepFacts {
+                    pinned: true,
+                    ..sleepy()
+                },
+                SleepRefusal::Pinned,
+            ),
+            (
+                SleepFacts {
+                    status: SleepStatus::NotRunning,
+                    ..sleepy()
+                },
+                SleepRefusal::NotRunning,
+            ),
+            (
+                SleepFacts {
+                    status: SleepStatus::Starting,
+                    ..sleepy()
+                },
+                SleepRefusal::Starting,
+            ),
+            (
+                SleepFacts {
+                    status: SleepStatus::Working,
+                    ..sleepy()
+                },
+                SleepRefusal::Working,
+            ),
+            (
+                SleepFacts {
+                    status: SleepStatus::Asking,
+                    ..sleepy()
+                },
+                SleepRefusal::Asking,
+            ),
+            (
+                SleepFacts {
+                    status: SleepStatus::Done,
+                    background_held: true,
+                    ..sleepy()
+                },
+                SleepRefusal::Background,
+            ),
+            (
+                SleepFacts {
+                    unsent_text: true,
+                    ..sleepy()
+                },
+                SleepRefusal::UnsentText,
+            ),
+            (
+                SleepFacts {
+                    focused: true,
+                    ..sleepy()
+                },
+                SleepRefusal::Focused,
+            ),
+        ];
+        for (facts, refusal) in cases {
+            for request in [SleepRequest::ByHand, auto] {
+                assert_eq!(
+                    sleep_refusal(&facts, request),
+                    Some(refusal),
+                    "{facts:?} {request:?}"
+                );
+            }
+        }
+        assert_eq!(sleep_refusal(&sleepy(), auto), None);
+    }
+
+    #[test]
+    fn automatic_sleep_waits_for_the_threshold_and_never_guesses_an_age() {
+        let at = |now| SleepRequest::Auto {
+            after_hours: 4,
+            now,
+        };
+        let facts = SleepFacts {
+            last_active_at: Some(HOUR_MS),
+            ..sleepy()
+        };
+        assert_eq!(
+            sleep_refusal(&facts, at(5 * HOUR_MS - 1)),
+            Some(SleepRefusal::RecentlyActive)
+        );
+        assert_eq!(sleep_refusal(&facts, at(5 * HOUR_MS)), None);
+        let unknown = SleepFacts {
+            last_active_at: None,
+            ..sleepy()
+        };
+        assert_eq!(
+            sleep_refusal(&unknown, at(99 * HOUR_MS)),
+            Some(SleepRefusal::RecentlyActive)
+        );
+        let off = SleepRequest::Auto {
+            after_hours: 0,
+            now: 99 * HOUR_MS,
+        };
+        assert_eq!(
+            sleep_refusal(&facts, off),
+            Some(SleepRefusal::RecentlyActive)
+        );
+        assert!(!sleep_due(Some(0), 0, 99 * HOUR_MS));
+    }
+
+    #[test]
+    fn automatic_sleep_is_on_at_four_hours_for_new_and_old_configs() {
+        assert_eq!(
+            Settings::default().sleep_after_hours,
+            DEFAULT_SLEEP_AFTER_HOURS
+        );
+        assert_eq!(DEFAULT_SLEEP_AFTER_HOURS, 4);
+        let old: Settings = toml::from_str("").expect("an empty config parses");
+        assert_eq!(old.sleep_after_hours, 4);
+        let off: Settings = toml::from_str("sleep_after_hours = 0").expect("parse");
+        assert_eq!(off.sleep_after_hours, 0);
+    }
+
+    fn agent(activity: AgentActivity) -> Instance {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.program = Some("claude".into());
+        instance.activity = activity;
+        instance
+    }
+
+    #[test]
+    fn a_slept_pane_stays_dormant_across_restarts_unless_active_or_pinned() {
+        let settings = Settings {
+            sleep_after_hours: 0,
+            dormant_after_days: 0,
+            ..Settings::default()
+        };
+        let mut slept = agent(AgentActivity {
+            completed_at: Some(9 * HOUR_MS),
+            ..Default::default()
+        });
+        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
+        slept.asleep_since = Some(9 * HOUR_MS);
+        // Neither threshold applies: the sleep itself keeps it dormant.
+        assert!(opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
+        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, true));
+        slept.pinned = true;
+        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
+    }
+
+    #[test]
+    fn an_agent_idle_past_the_threshold_opens_dormant_only_with_a_trusted_resume() {
+        let settings = Settings::default();
+        let old = agent(AgentActivity {
+            completed_at: Some(0),
+            last_attended_at: Some(HOUR_MS),
+            ..Default::default()
+        });
+        // Attendance counts as activity: idle since hour 1, due at hour 5.
+        assert!(!opens_dormant(
+            &old,
+            true,
+            &settings,
+            5 * HOUR_MS - 1,
+            false
+        ));
+        assert!(opens_dormant(&old, true, &settings, 5 * HOUR_MS, false));
+        assert!(!opens_dormant(&old, false, &settings, 5 * HOUR_MS, false));
+        let mut shell = old.clone();
+        shell.program = None;
+        assert!(!opens_dormant(&shell, true, &settings, 5 * HOUR_MS, false));
+        // Dormant restore still covers shells and untrusted resumes by days.
+        let days = Settings {
+            dormant_after_days: 1,
+            ..Settings::default()
+        };
+        assert!(opens_dormant(&shell, false, &days, 25 * HOUR_MS, false));
+    }
+}

@@ -194,6 +194,7 @@ pub(super) enum Answer {
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
     Focus(Uuid),
+    Wake(Uuid),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -376,6 +377,15 @@ fn state_name(state: AgentState) -> String {
 }
 
 /// Control decisions use live facts, never the attention record held through a switch.
+/// How a ctl message names a `not_running_reason`.
+fn dormant_word(reason: &str) -> &'static str {
+    if reason == "sleeping" {
+        "asleep"
+    } else {
+        "dormant"
+    }
+}
+
 fn runtime_control_state(
     runtime: muxel_terminal::TerminalRuntimeSnapshot,
     binding_rev: u64,
@@ -925,6 +935,27 @@ impl MuxelApp {
                     let _ = reply.send(respond(result));
                 });
             }
+            Answer::Wake(iid) => {
+                let app = cx.weak_entity();
+                let workspace = self.current_workspace;
+                // The window that would show the pane installs its terminal,
+                // as a background restore does; nothing is selected or raised.
+                let handle = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|i| self.window_showing(i.project_id))
+                    .or(self.main_window);
+                cx.defer(move |cx| {
+                    let result = handle
+                        .and_then(|handle| {
+                            Self::update_in_window(&app, handle, cx, |this, window, cx| {
+                                this.control_wake(iid, workspace, window, cx)
+                            })
+                        })
+                        .unwrap_or_else(|| Err("no muxel window is available".into()));
+                    let _ = reply.send(respond(result));
+                });
+            }
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -1022,6 +1053,7 @@ impl MuxelApp {
             &command,
             Command::New { .. }
                 | Command::Focus { .. }
+                | Command::Wake { .. }
                 | Command::Send { .. }
                 | Command::Answer { .. }
                 | Command::Keys { .. }
@@ -1064,6 +1096,10 @@ impl MuxelApp {
             ),
             Command::Focus { agent } => match self.control_resolve(&agent) {
                 Ok(iid) => Answer::Focus(iid),
+                Err(error) => Answer::Now(Err(error)),
+            },
+            Command::Wake { agent } => match self.control_resolve(&agent) {
+                Ok(iid) => Answer::Wake(iid),
                 Err(error) => Answer::Now(Err(error)),
             },
             Command::Show { agent, full } => match self.control_resolve(&agent) {
@@ -1213,7 +1249,7 @@ impl MuxelApp {
             .unwrap_or_default()
     }
 
-    fn control_info_of(&self, iid: Uuid, now: i64, cx: &App) -> CtlResult<AgentInfo> {
+    pub(super) fn control_info_of(&self, iid: Uuid, now: i64, cx: &App) -> CtlResult<AgentInfo> {
         let inst = self
             .workspace
             .instance(iid)
@@ -1266,7 +1302,7 @@ impl MuxelApp {
             is_agent: inst.kind == InstanceKind::Terminal
                 && readaloud::is_agent_program(inst.program.as_deref()),
             status,
-            not_running_reason: self.is_dormant(inst.id).then(|| "dormant".to_string()),
+            not_running_reason: self.dormant_reason(inst.id).map(str::to_string),
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
                 status,
@@ -1441,12 +1477,15 @@ impl MuxelApp {
     }
 
     fn control_screen(&self, iid: Uuid, lines: Option<usize>, cx: &App) -> Answer {
-        if self.is_dormant(iid) {
+        if let Some(reason) = self.dormant_reason(iid) {
             return Answer::Now(Err(ctl::Error::new(
                 ErrorCode::NotRunning,
-                "that pane is dormant; open it in muxel or use ctl focus to start it",
+                format!(
+                    "that pane is {}; open it in muxel or use ctl wake or ctl focus to start it",
+                    dormant_word(reason)
+                ),
             )
-            .with_reason("dormant")));
+            .with_reason(reason)));
         }
         let lines = lines
             .unwrap_or(ctl::SCREEN_LINES)
@@ -1481,12 +1520,15 @@ impl MuxelApp {
             .instance(iid)
             .ok_or("that agent has just closed")?;
         let name = inst.display_name();
-        if self.is_dormant(iid) {
+        if let Some(reason) = self.dormant_reason(iid) {
             return Err(ctl::Error::new(
                 ErrorCode::NotRunning,
-                format!("'{name}' is dormant; open it in muxel or use ctl focus to start it"),
+                format!(
+                    "'{name}' is {}; open it in muxel or use ctl wake or ctl focus to start it",
+                    dormant_word(reason)
+                ),
             )
-            .with_reason("dormant"));
+            .with_reason(reason));
         }
         if inst.kind != InstanceKind::Terminal {
             return Err(format!(

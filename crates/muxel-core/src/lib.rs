@@ -30,6 +30,7 @@ pub mod remote_ops;
 pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
+pub mod sleep;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -52,7 +53,7 @@ pub use agent::{
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
     find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
     memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args, stored_claude_session_path,
+    resolve_launch_for_session, resume_trusted, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -130,6 +131,12 @@ impl AgentActivity {
             .into_iter()
             .flatten()
             .max()
+    }
+
+    /// Latest work transition or deliberate attendance, in Unix milliseconds:
+    /// how long ago anyone, agent or user, last did anything in the pane.
+    pub fn last_active_at(&self) -> Option<i64> {
+        self.last_work_at().max(self.last_attended_at)
     }
 
     pub fn current_state(&self) -> Option<AgentActivityState> {
@@ -711,6 +718,10 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// When this local agent was put to sleep (Unix ms): its program was ended
+    /// and it stays dormant, across restarts too, until it is opened or woken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -822,6 +833,8 @@ impl Instance {
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        // A copy of a sleeping pane is a new conversation, started on creation.
+        self.asleep_since = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -886,6 +899,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 
@@ -955,6 +969,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 }
@@ -2744,6 +2759,10 @@ pub struct Settings {
     /// Start old local PTY sessions only when opened. Zero disables dormancy.
     #[serde(default)]
     pub dormant_after_days: u32,
+    /// Put local agents to sleep once idle this many hours (see [`sleep`]).
+    /// Zero turns automatic sleep off; sleeping by hand still works.
+    #[serde(default = "default_sleep_after_hours")]
+    pub sleep_after_hours: u32,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3032,6 +3051,10 @@ pub struct Settings {
 /// the limit from running out.
 pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
 
+fn default_sleep_after_hours() -> u32 {
+    sleep::DEFAULT_SLEEP_AFTER_HOURS
+}
+
 fn default_pane_memory_limit_gb() -> u32 {
     DEFAULT_PANE_MEMORY_LIMIT_GB
 }
@@ -3298,6 +3321,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             dormant_after_days: 0,
+            sleep_after_hours: default_sleep_after_hours(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,

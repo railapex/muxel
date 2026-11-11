@@ -22,6 +22,9 @@ another process. Closing a dormant pane never starts it.
 Opening a particular pane in another project selects that target directly;
 it does not also start the project's previously focused dormant session.
 
+A running agent can also be made dormant on purpose: see
+[Sleeping idle agents](agent-sleep.md).
+
 This setting applies to local PTY terminals. SSH and local tmux restoration
 are unchanged; it does not disconnect or suspend an existing remote session.
 Editors, diffs and browsers are unchanged.
