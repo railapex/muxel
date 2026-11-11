@@ -129,6 +129,8 @@ pub enum Command {
     },
     /// Deliberately open an existing pane, starting it if dormant.
     Focus { agent: String },
+    /// Start a sleeping or dormant pane in the background, without focusing it.
+    Wake { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
         agent: String,
@@ -1376,6 +1378,7 @@ usage: muxel ctl <command> [args]
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   focus AGENT                    open a pane; start it if dormant
+  wake AGENT                     start a sleeping or dormant pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
@@ -1449,6 +1452,9 @@ Open a terminal as a tab in the calling pane's group (else the focused group); -
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
         }
         "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, starting it if dormant.",
+        "wake" => {
+            "usage: muxel ctl wake AGENT\nStart a sleeping or dormant pane in the background; focus stays where it is."
+        }
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
         }
@@ -1486,6 +1492,7 @@ fn unknown_command_error(command: &str) -> String {
             "new-status",
             "status",
             "focus",
+            "wake",
             "show",
             "screen",
             "send",
@@ -1627,6 +1634,12 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         "focus" => {
             at_most(1)?;
             Command::Focus {
+                agent: agent(&words)?,
+            }
+        }
+        "wake" => {
+            at_most(1)?;
+            Command::Wake {
                 agent: agent(&words)?,
             }
         }
@@ -1828,6 +1841,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
   starting it through normal restore if dormant. This changes keyboard focus.
+- `muxel ctl wake AGENT` - start a sleeping or dormant pane in the background on
+  its saved conversation, leaving focus, the window and the active tab alone.
+  Replies `{woken: true, status: "starting"}`, or `{woken: false,
+  already_running: true, status}` when it already runs, so a retry is harmless.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT | --name-fixed TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
   new tab: in your own pane's group when you run it from one of that project's
@@ -2072,10 +2089,13 @@ hosts ignore this caller ID, so check the target when driving one.
   start. `not_running` - the pane hasn't been started this session; the user has
   to open it in muxel.
 
-Old local sessions may be dormant: `status` and `panes` report
-`status: "not_running", not_running_reason: "dormant"`. `show` includes this
-reason; `screen`, `send`, `keys`, and `answer` refuse with `not_running` and
-`reason: "dormant"`, even with `--force`. `focus` opens and resumes the session.
+Old local sessions may be dormant, and idle ones may be asleep: `status` and
+`panes` report `status: "not_running"` with `not_running_reason: "dormant"`
+(deferred at launch) or `"sleeping"` (put to sleep by the user or the idle
+timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
+refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
+and resumes the session; `wake` resumes it without focusing it, then `status`
+moves from `starting` to idle with a new `launch_id`.
 An approved `new --focus` also leaves other dormant sessions asleep.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
@@ -3008,6 +3028,21 @@ Steps:
         );
         assert!(parse_cli(&words(&["focus"])).is_err());
         assert!(parse_cli(&words(&["focus", "a", "b"])).is_err());
+        assert_eq!(
+            parse_cli(&words(&["wake", "old-session"])),
+            Ok(CliCommand::Request(Command::Wake {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["wake"])).is_err());
+        assert!(parse_cli(&words(&["wake", "a", "b"])).is_err());
+        // Wire sends the wire form directly.
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"cmd":"wake","agent":"abcd1234"}"#).unwrap(),
+            Command::Wake {
+                agent: "abcd1234".into()
+            }
+        );
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))

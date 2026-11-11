@@ -91,6 +91,16 @@ feature is added or changed, update the matching entry here in the same change**
   pinned panes and panes with no work history always start; SSH and local tmux
   restores keep their existing behavior. `ctl status`/`panes` expose
   `not_running_reason: "dormant"`; typing commands refuse without waking it.
+- **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
+  put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
+  seconds) and its pane becomes a dormant placeholder that resumes the same
+  conversation when opened, across restarts too. Sleep a pane from its sidebar
+  menu, a whole project's idle agents from the project menu, or let Settings →
+  Behavior do it after N hours idle (on, 4 hours, by default). Working, asking,
+  background-held, focused, pinned and drafting agents, agents without a saved
+  conversation, shells, and remote or tmux panes stay running. `ctl status`
+  reports `not_running_reason: "sleeping"`, and `ctl wake AGENT` resumes one
+  without moving focus.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
