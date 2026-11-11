@@ -254,9 +254,9 @@ fn listed_parent(
 /// The `opened_by` that dropping session `dragged` on session row `onto` gives
 /// it in Recent work: `onto`'s top-level session, so nesting stays one level
 /// deep. `None` when the drop changes nothing: `dragged` or `onto` isn't a
-/// session, `onto` is `dragged` or nests under it, `dragged` already nests
-/// there, or its pin would keep it out (a pinned session nests only under a
-/// pinned one).
+/// session among the project's rows (`listed`), `onto` is `dragged` or nests
+/// under it, `dragged` already nests there, or its pin would keep it out (a
+/// pinned session nests only under a pinned one).
 pub fn nest_on_drop(
     dragged: Uuid,
     onto: Uuid,
@@ -265,7 +265,7 @@ pub fn nest_on_drop(
 ) -> Option<Uuid> {
     let session = instances
         .get(&dragged)
-        .filter(|i| i.kind == InstanceKind::Terminal)?;
+        .filter(|i| i.kind == InstanceKind::Terminal && listed.contains(&dragged))?;
     instances
         .get(&onto)
         .filter(|i| i.kind == InstanceKind::Terminal && listed.contains(&onto))?;
@@ -289,7 +289,10 @@ pub fn nested_asking(
         .iter()
         .skip(at + 1)
         .take_while(|entry| {
-            matches!(entry, SidebarEntry::Nested(_) | SidebarEntry::NestedTwice(_))
+            matches!(
+                entry,
+                SidebarEntry::Nested(_) | SidebarEntry::NestedTwice(_)
+            )
         })
         .filter(|entry| match entry {
             SidebarEntry::Nested(id) => {
@@ -836,7 +839,9 @@ mod tests {
         );
         let asking = |workspace: &Workspace, entries: &[SidebarEntry], at: usize| {
             let index = instances_by_id(workspace);
-            nested_asking(entries, at, &index, &|id| index.get(&id).and_then(|i| live(i)))
+            nested_asking(entries, at, &index, &|id| {
+                index.get(&id).and_then(|i| live(i))
+            })
         };
         let settled = vec![
             Band(ActivityBand::Today),
@@ -903,7 +908,12 @@ mod tests {
         let notes = file(&mut workspace, &mut project, Some(child), 20);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(parent), Nested(plan), Nested(child), NestedTwice(notes)]
+            vec![
+                Pane(parent),
+                Nested(plan),
+                Nested(child),
+                NestedTwice(notes)
+            ]
         );
         // Closing the parent takes its own files, not its child or the
         // child's files.
@@ -986,6 +996,9 @@ mod tests {
             assert_eq!(nest(plan, x), None);
             assert_eq!(nest(x, plan), None);
             assert_eq!(nest(x, closed), None);
+            // A session that isn't one of the project's rows (closed, held
+            // for Undo, in another project) can't be nested by a drop.
+            assert_eq!(nest(closed, a), None);
         }
 
         // X joins A and brings its own child along, still two levels.
@@ -1005,13 +1018,7 @@ mod tests {
         workspace.instance_mut(child).unwrap().opened_by = None;
         assert_eq!(
             recent(&project, &workspace),
-            vec![
-                Pane(a),
-                Nested(plan),
-                Nested(x),
-                Nested(mine),
-                Pane(child)
-            ]
+            vec![Pane(a), Nested(plan), Nested(x), Nested(mine), Pane(child)]
         );
     }
 

@@ -500,17 +500,20 @@ fn new_top_level_opts_out_of_nesting_and_stays_off_the_wire_unless_set() {
     let nested = parsed(&[]);
     assert!(!nested.top_level);
     // Older hosts see the same request they always did.
-    assert!(!serde_json::to_string(&nested).unwrap().contains("top_level"));
+    assert!(
+        !serde_json::to_string(&nested)
+            .unwrap()
+            .contains("top_level")
+    );
     let top = parsed(&["--top-level"]);
     assert!(top.top_level);
-    let restored: NewOptions =
-        serde_json::from_value(serde_json::to_value(&top).unwrap()).unwrap();
+    let restored: NewOptions = serde_json::from_value(serde_json::to_value(&top).unwrap()).unwrap();
     assert!(restored.top_level);
     let skill = muxel_core::control::skill("muxel");
     for help in [
         muxel_core::control::USAGE,
         skill.as_str(),
-        &muxel_core::control::command_help("new").unwrap(),
+        muxel_core::control::command_help("new").unwrap(),
     ] {
         assert!(help.contains("--top-level"), "{help}");
     }
