@@ -13,17 +13,19 @@ The saved `config.toml` setting is `sidebar_sort = "Layout"` or
 Recent work follows two rules. Looking at a session never moves its row:
 reading, focusing and clicking change no position, and read state drives only
 the unread mark and the Done pill. A row moves only when its work changes (a
-turn starts or finishes, a question is asked or answered) or when the clock
-crosses into another band. A file, diff or page also moves when a session opens
-it, as described below.
+turn starts, finishes or stops, including when its process exits; a question is
+asked or answered) or when the clock crosses into another band. A file, diff or
+page also moves when a session opens it, as described below.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A row's band comes from its
 latest event of any kind, a start, a finish or a question
 (`AgentActivity::last_work_at`), so a row that stops working stays in the band
-its turn started in. A working row is Today however long its turn has run. A
-row that has never worked goes by when it was opened (`created_at` on its
-instance); a pane saved before muxel recorded that sits with Older. The sidebar
+its turn started in. One exception: a working row is Today however long its
+turn has run, so a turn started yesterday and still running sits with today's
+work, not in the band of its start. A row that has never worked goes by when
+it was opened (`created_at` on its instance); a pane saved before muxel
+recorded that sits with Older. The sidebar
 redraws at midnight, when rows change band. A block spanning only one band
 needs no band label. Within each band, `sidebar::RecentPlace` puts rows in four
 groups:
@@ -43,20 +45,99 @@ rule, without band labels.
 Groups go by the status the row shows. A session with no live terminal (in a
 project not opened since a restart, say) shows idle, or Done if its last turn
 finished, and sorts with the recent rows by its latest event. Timestamps are
-Unix milliseconds; future ones count as now. Ties keep layout order.
+Unix milliseconds; future ones count as now. Ties keep the order the panes were
+opened in, so popping a row out into its own window or docking it back never
+moves it.
 
 An event is stamped when it happened, not when muxel noticed it. The terminal
-records when its status changed, and the app records that time even when it
-reads the status late: a pane held for Undo, or a finish the status tick hadn't
-recorded when you clicked the row. Three things are not work and never move a
-row: a process exiting (the row keeps the state it had, so a turn cut short
-reads as idle and nothing is marked unread), a relaunched agent reporting
-Working before any turn is submitted, and startup output while a restored
-terminal settles. Row ages and `muxel ctl` use `last_work_at` too.
+reads the wall clock as each event happens (its status changing, its provider
+reporting a completion, its provider switching conversations) and keeps that
+time, so a second turn that ends at the same Done badge gets its own time. The
+app records those times however late it reads them, as for a pane held for
+Undo. Two kinds of time are bounds, not readings: a status the last sample
+couldn't show (held back while a restored terminal settled, or before any turn
+was submitted) is stamped no earlier than that sample, and a new conversation's
+first status no earlier than the switch. A row sits where the work its terminal
+shows puts it before the status tick has recorded that work, and focusing the
+pane records exactly that, so clicking a row that has just finished moves
+nothing. The tick then samples that same work again; what the focus read (the
+conversation switch, the completion by its revision) isn't recorded twice or
+notified, so the finish the click read stays read. That holds when the click
+left the stored values as they were, too (a completion the floor dates to the
+stored time after a clock correction). Auto-read and the accomplishment log
+still take it. A click while the restore guard holds a restored pane's sample
+records nothing, and leaves the tick to record that sample as it would without
+the click.
+
+A clock correction rewrites nothing already recorded. A time the clock reads as
+in the future after it steps back is kept as stamped; only ages and the order
+count it as now. Looking at a pane covers every event recorded so far, whatever
+the clock reads, and never moves back, and an event after that look is stamped
+after it even when the clock has stepped back behind it, so it stays unread.
+Times are still wall-clock times: across a clock step, two panes' events order
+by what the clock read, not by which came first.
+
+A process exiting is a finish only for a pane started to run a command
+(`muxel_core::LaunchPurpose::Job`): a literal command, a custom command preset,
+or an agent's one-shot run (`claude -p`, `codex exec`). Its exit marks it
+unread, notifies Done, and moves the row to the top of the recent rows like any
+finish. A non-zero exit counts too. Its notification gives the code ("exited
+with code 3"), since a code isn't always a failure (`grep` exits 1 when nothing
+matches), in place of the unexpected-exit report, and the row shows Done, as
+there is no failed badge. That notification is the job's first exit's, whatever
+the pane notified before and whether or not you're watching it: a job that
+announced a finish and then exited has that notice replaced.
+
+Only the command's own exit counts. Behind tmux the pane's process is a client
+whose exit a lost server or connection, a detach and the session ending all
+cause alike, so a job there finishes only when its provider reports it. ssh
+alone exits with the command's code, or 255 for its own failures, which count
+as no exit. ssh run through `sshpass` exits 0 only when the command did, which
+finishes the job; any other code may be sshpass's own (1 to 6) or ssh's, so it
+counts as no exit, and a failing job there finishes only by its provider.
+
+An interactive session (an agent conversation or a shell) finishes turns while
+it runs, so its exit (`/exit`, a kill, a crash, `exit` typed in a shell) records
+no finish, marks nothing unread and doesn't notify: a working row stops and
+joins the recent rows by when its turn started. A provider that reported its own
+finish before exiting is finished all the same, notifies, and keeps its chime
+through the exit until you look at the pane. A finish that only a bell or the
+title showed is lost if the process exits before the status tick reads it.
+
+The purpose comes from the program and arguments the pane runs, so a pane
+saved before this rule gets the same answer as a new one. The provider comes
+from the program (a built-in agent preset's: `claude`, `codex`, `grok`, `muse`,
+`opencode`, `amp`, `pi`, `ollama`, `hermes`) and whether it runs one-shot from
+its arguments, so a literal `claude` is still a session. A one-shot subcommand
+is the agent's first operand (`codex exec`, `codex review`, `opencode run`), so
+a prompt after another subcommand (`codex resume <id> e`) isn't one. A shell is
+a session unless it was started to run a command or a script and exit: `-c`,
+`cmd /c`, or a script's path (`bash build.sh`). A shell's options end where its
+command begins, so `cmd /k` keeps the prompt only before the command; after it
+it is the command's. PowerShell (`pwsh`, `powershell.exe`) is always a session,
+as on `master`, so a pane running `pwsh -Command make` doesn't finish when it
+exits. Its two hosts take different options, prefixes and values, and `-File -`
+reads commands from the terminal; reading those lines kept finding cases a
+session was read as a job, and a session read as a job finishes falsely when you
+quit it. fish, nu, xonsh and csh are read by their
+command flag alone, so a script they run by path stays a session. Any other
+program, an agent muxel doesn't know included, is a command, and so is a
+wrapper (`npx`, `uvx`, `wsl`, `ssh host`): the program it starts isn't looked
+at. That has a known limit: quitting an interactive program started as a
+literal command or a custom preset (`lazygit`, `vim`, `htop`, a `python` or
+`node` REPL, an agent behind `npx` or `wsl`, `ssh host`) counts as its finish,
+with an unread mark and a Done notification, as every exit did before this
+rule.
+
+Some other states are not work either. A relaunched agent reporting Working
+before any turn is submitted, and startup output while a restored terminal
+settles, record nothing. Row ages and `muxel ctl` use `last_work_at` too.
 
 Read state stays on each machine, as the rest of a pane's activity does. Since
-reading never moves a row, two machines that saw the same work order it the
-same way; only their unread marks differ.
+reading never moves a row, two machines that saw the same work and keep the
+same calendar order it the same way; only their unread marks differ. Machines
+in different time zones can put one event in different bands, and so order
+rows differently.
 
 Recent work is flat within the project so a worktree cannot hold an older
 session above newer work. Worktree color dots remain; detached worktrees retain
@@ -121,8 +202,10 @@ read or unread while the row shows Done. The mark also flags a finish whose
 agent has started again, and tells an unseen question from a seen one, which
 the blocked pill shows alike.
 
-Agent events are omitted from the Recent work notification feed because the
-session's own row carries the event and its unread mark. App messages such as git results,
-SSH errors and save failures remain in NOTIFICATIONS. This is a presentation
+A session's finishes and questions are omitted from the Recent work
+notification feed because the session's own row carries the event and its
+unread mark. What a row can't show stays: a job's "exited with code N", whose
+row shows Done. App messages such as git results, SSH errors and save failures
+remain in NOTIFICATIONS. This is a presentation
 filter over the notification collection; tray and desktop delivery are
 unchanged. Switching back to Layout reveals the ordinary agent feed rows.

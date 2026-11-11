@@ -15,6 +15,7 @@ pub mod geometry;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;
+mod launch;
 pub mod library;
 pub mod locale;
 pub mod memory;
@@ -57,6 +58,7 @@ pub use agent::{
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
+pub use launch::{LaunchPurpose, PaneTransport};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
@@ -156,8 +158,14 @@ impl AgentActivity {
         self.current_state() == Some(AgentActivityState::Done) && sidebar::is_unread(self)
     }
 
-    /// Apply one displayed-status transition. Returns whether durable state
-    /// changed, so callers can avoid rewriting the workspace on idle ticks.
+    /// Apply one displayed-status transition, which happened at `now`.
+    /// Returns whether durable state changed, so callers can avoid rewriting
+    /// the workspace on idle ticks.
+    ///
+    /// Attendance is recorded only after what it saw ([`Self::attend`]), so
+    /// a new finish or question happened after the last attendance. If the
+    /// clock has stepped back behind that attendance, the event is recorded
+    /// just after it instead, so it still reads as unseen.
     pub fn observe(
         &mut self,
         previous: Option<AgentActivityState>,
@@ -165,6 +173,7 @@ impl AgentActivity {
         now: i64,
     ) -> bool {
         let now = now.max(0);
+        let event_at = self.last_attended_at.map_or(now, |seen| now.max(seen + 1));
         let before = self.clone();
         let previous_persisted = self.current_state();
         match status {
@@ -178,7 +187,7 @@ impl AgentActivity {
                     && !(previous.is_none()
                         && previous_persisted == Some(AgentActivityState::Blocked))
                 {
-                    self.blocked_at = Some(now);
+                    self.blocked_at = Some(event_at);
                 }
             }
             AgentActivityState::Done => {
@@ -188,7 +197,7 @@ impl AgentActivity {
                 if previous != Some(AgentActivityState::Done)
                     && !(previous.is_none() && previous_persisted == Some(AgentActivityState::Done))
                 {
-                    self.completed_at = Some(now);
+                    self.completed_at = Some(event_at);
                 }
             }
             AgentActivityState::Idle => {}
@@ -199,14 +208,25 @@ impl AgentActivity {
         *self != before
     }
 
-    /// Record deliberate attendance. This clears unattended completion by
-    /// ordering rather than by maintaining a second persisted boolean.
+    /// Record deliberate attendance at `now`: everything recorded so far has
+    /// been seen. This clears unattended completion by ordering rather than
+    /// by maintaining a second persisted boolean. It covers every recorded
+    /// event, even one the clock now reads as in the future, and never moves
+    /// back, so a seen event can't turn unread when the clock steps back.
     pub fn attend(&mut self, now: i64) -> bool {
-        let now = now.max(0);
-        if self.last_attended_at == Some(now) {
+        let seen = [
+            Some(now.max(0)),
+            self.last_attended_at,
+            self.completed_at,
+            self.blocked_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if self.last_attended_at == seen {
             return false;
         }
-        self.last_attended_at = Some(now);
+        self.last_attended_at = seen;
         true
     }
 }
@@ -372,6 +392,32 @@ mod agent_activity_tests {
             100_001
         ));
         assert!(activity.has_unattended_completion());
+    }
+
+    /// When the clock steps back, attendance still covers what it saw, and
+    /// what happens after it still comes after it.
+    #[test]
+    fn attendance_covers_what_it_saw_whatever_the_clock_reads() {
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        // Finished at 400 by a clock that then stepped back to 200.
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            400,
+        );
+        assert!(activity.attend(200));
+        assert!(!activity.has_unattended_completion(), "seen at 200");
+        assert!(!activity.attend(150), "attendance never moves back");
+        assert_eq!(activity.last_attended_at, Some(400));
+        // Asked at 300 by the clock, after that look.
+        activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Blocked,
+            300,
+        );
+        assert_eq!(activity.blocked_at, Some(401));
+        assert!(crate::sidebar::is_unread(&activity));
     }
 
     #[test]
@@ -684,6 +730,13 @@ impl Instance {
 
     pub fn working_directory(&self) -> Option<&std::path::Path> {
         self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// What this pane was started to do, from the program and arguments it
+    /// runs ([`LaunchPurpose::of`]). Saved panes get the same answer as new
+    /// ones, so nothing is stored for it.
+    pub fn launch_purpose(&self) -> LaunchPurpose {
+        LaunchPurpose::of(self.program.as_deref(), &self.args)
     }
 
     /// An unspawned saved literal command is stopped, rather than an idle agent.
@@ -2988,6 +3041,33 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
+    /// Most memory, in GB, each process a local pane starts may commit
+    /// (Windows only; 0 = no limit). A process that asks for more is refused,
+    /// which usually stops it.
+    #[serde(default = "default_pane_memory_limit_gb")]
+    pub pane_memory_limit_gb: u32,
+}
+
+/// Default per-process memory limit for local panes, in GB, fitted to a
+/// measured developer workload: on a 64 GB machine the largest legitimate
+/// process peaked near 6 GB committed (a local Node service); rustc building
+/// and testing this workspace peaked under 5 GB and the linker near 2 GB.
+/// 16 GB is more than twice the largest of those. Workloads outside that
+/// (large JVM heaps, LTO links, local model runners) can legitimately need
+/// more, which is what the setting is for. The limit only bounds one process;
+/// it reserves nothing, so it can't stop a machine with less free commit than
+/// the limit from running out.
+pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
+
+fn default_pane_memory_limit_gb() -> u32 {
+    DEFAULT_PANE_MEMORY_LIMIT_GB
+}
+
+impl Settings {
+    /// The per-process limit for new local panes, in bytes; `None` when off.
+    pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
+        (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
 }
 
 fn default_stt_model() -> String {
@@ -3315,6 +3395,7 @@ impl Default for Settings {
             accomplishment_retention_days: default_accomplishment_retention_days(),
             new_project_memory: false,
             new_project_accomplishments: false,
+            pane_memory_limit_gb: default_pane_memory_limit_gb(),
         }
     }
 }
@@ -3728,6 +3809,16 @@ mod settings_tests {
         assert_eq!(s.read_aloud_scope, ReadAloudScope::WholeTurn);
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::All);
         assert_eq!(s.speak_options().max_chars, 1000);
+    }
+
+    #[test]
+    fn pane_memory_limit_is_on_for_old_configs_and_zero_turns_it_off() {
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(16 << 30));
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 0}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), None);
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 48}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(48 << 30));
     }
 
     #[test]

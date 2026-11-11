@@ -324,7 +324,13 @@ feature is added or changed, update the matching entry here in the same change**
   sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  indexes take one stat. A Claude pane reads its hook record when a watcher on
+  the hook directory reports it written, so `/clear` or `/resume` rebinds at
+  once, and otherwise every thirty seconds, for events a watcher loses. A
+  record that can't be adopted or read yet is retried every two seconds. Where
+  the watcher can't start, reports an error, stops, or loses its directory (it,
+  or the directory above it, was removed or renamed), Claude retries
+  unresolved results with backoff, as Grok does, for the rest of the run.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
@@ -555,8 +561,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell, never from a quiet spell — so
   an incidental redraw (e.g. a focus repaint when you click the pane) can't fake a
-  finished turn. A process exit isn't a finish either: the pane keeps the state
-  it had, with no unread mark or Done notification.
+  finished turn. An interactive session's process exit isn't a finish either
+  (`/exit`, a kill, a crash, `exit` typed in a shell): the pane keeps the state
+  it had, with no unread mark or Done notification. A command job's exit is its
+  finish (see Literal launches).
 - **Event-driven status snapshots** — terminal output, semantic titles, bells,
   process exit, resize invalidation, and exact quiet/debounce deadlines update one
   per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
@@ -925,8 +933,24 @@ feature is added or changed, update the matching entry here in the same change**
   modifying the command or injecting startup input.
   They restore stopped; project selection, Restart and wake never replay their
   opening brief. The pane's explicit **Run again** action reruns the saved argv.
-  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
-  exited terminals keep their **done** badge and completion age.
+  The sidebar labels an unspawned restored literal pane as **stopped**. A pane
+  started to run a command (a literal command, a custom command preset, a
+  shell given a command or a script's path, an agent's one-shot run such as
+  `claude -p`, `codex exec` or `codex review`) finishes when it exits,
+  whatever its code: **done** with its completion age, an unread mark and a
+  Done notification. A non-zero exit's notification gives the code (**exited
+  with code 3**) in place of the unexpected-exit report, even after a finish
+  the pane already announced or while you watch it, and Recent work's feed
+  lists it, as the row shows only Done. Only the command's own exit counts:
+  behind tmux a client's exit finishes nothing, ssh's own failures (code 255)
+  don't either, and through `sshpass` only exit 0 does. PowerShell (`pwsh`,
+  `powershell.exe`) is a session whatever it's started with, as before: a
+  pane running a PowerShell command doesn't finish when it exits. A literal
+  `claude`, `codex` or shell is an interactive session, whose exit is no finish: it
+  keeps the state it had, unless its agent reported a finish first, whose
+  chime then still rings. The purpose comes from the pane's program and
+  arguments (`muxel_core::LaunchPurpose`), so saved panes get it too; a
+  wrapper such as `npx` or `wsl` counts as a command whatever it starts.
   Literal panes never claim or clean up tmux sessions, including stale peer
   metadata. A layout written back by an older peer that doesn't know them
   cannot clear a pane's literal argv, launch directory or outside-creation
@@ -1192,6 +1216,22 @@ feature is added or changed, update the matching entry here in the same change**
   that had already closed its terminal is not force-killed, as before. The
   operating system's own hangup when the pane's terminal closes is separate and
   outside muxel's control, so a program is not guaranteed those five seconds.
+- **Per-process memory limit (Windows)** — each local pane's process tree runs in
+  its own job object, and every process in it can commit at most 16 GB by default
+  (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
+  after it). A process that asks for more is refused, which usually stops it, so
+  a single runaway doesn't take the machine down in the common case. It's no
+  guarantee: when less memory is free than the limit, or several large
+  processes share what is free, memory can still run out. The default fits
+  typical developer tools; large Java heaps, optimized links and local model
+  runners can need more. When Windows reports a hit (best effort), the
+  notifications feed names the process when it can, its PID, and whether it
+  stopped. The limit is per process, so a pane running many large processes at
+  once (parallel compilers) is unaffected. Processes started in the pane's first
+  instant are covered; programs started from a pane still outlive it and stay
+  under its limit. A child that asks to break away from the job, and processes a
+  remote host or tmux server runs, aren't covered. If Windows can't apply the
+  limit, the pane starts without one and the reason is logged.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -1330,7 +1370,8 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
+  position and leaves keyboard focus where it was, so an agent rewriting an open file
+  doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resources open beside their pane** — a file, diff or web page opened from a
@@ -1390,9 +1431,12 @@ feature is added or changed, update the matching entry here in the same change**
   the order each started, so one that starts a turn joins the bottom of them;
   then sessions never used, newest open first. A working session counts as Today
   however long its turn has run. Reading, focusing or clicking a session never
-  moves its row; only a change in its work or a new day does. Exiting is not a
-  finish. Pinned sessions follow the same order. Project order and keyboard
-  navigation stay the same. Live popped-out sessions remain in Recent work;
+  moves its row; only a change in its work or a new day does. A command job's
+  exit is its finish; an interactive session's isn't, though an agent that
+  reported its finish before exiting is finished and notifies. Pinned sessions
+  follow the same order. Project order and keyboard
+  navigation stay the same. Live popped-out sessions remain in Recent work, and
+  popping one out or docking it back never moves its row;
   their external-window icon marks rows that raise an existing window on click.
   Layout retains worktree subheaders and row swapping;
   recent rows can still be dragged onto panes.
@@ -1417,9 +1461,14 @@ feature is added or changed, update the matching entry here in the same change**
   mark, even if another turn starts; Done persists. The mark and a read done's
   outline pill follow the same rule, so a done row's pill and mark always agree;
   the mark also keeps an unseen finish or question visible after the agent moves
-  on. Project rows show the unread count even when collapsed. Agent notifications appear on these session rows
-  instead of duplicating them in NOTIFICATIONS; app messages, desktop alerts,
-  and tray notifications keep their usual behavior.
+  on. A clock that steps back can't mark a seen event unread or a new one read:
+  attendance covers everything recorded before it, and a later event is stamped
+  after it. A finish read by clicking its row before the status tick recorded
+  it stays read when the tick catches up. Project rows show the unread count
+  even when collapsed. Agent finishes and questions appear on these session
+  rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
+  a row can't show, stays in the feed. App messages, desktop alerts, and tray
+  notifications keep their usual behavior.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
