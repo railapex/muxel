@@ -425,6 +425,20 @@ pub(crate) fn codex(
     )
 }
 
+/// Whether `provider`'s input box is in `capture`: what a draft read can
+/// find, holding text or empty. A dialog drawn in its place (a permission
+/// question, a picker) hides it. `None` when muxel can't tell: a program
+/// whose box it doesn't read, or a screen without the bracketed paste
+/// Claude's and Codex's boxes ask for.
+pub(crate) fn box_shown(capture: &DraftCapture, provider: TitleProvider) -> Option<bool> {
+    let read = match provider {
+        TitleProvider::Claude if capture.bracketed => claude(capture, None, None),
+        TitleProvider::Codex if capture.bracketed => codex(capture, None, None),
+        _ => return None,
+    };
+    Some(read != DraftRead::Unknown)
+}
+
 /// A shell's command line: the text from its last OSC 133 B mark up to the
 /// cursor, through soft wraps. Anything drawn after the cursor (an
 /// autosuggestion, an inline prediction, or typed text the cursor was moved

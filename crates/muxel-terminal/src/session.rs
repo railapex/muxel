@@ -2825,6 +2825,20 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
+        self.mark_submission(|_| true);
+    }
+
+    /// [`Self::mark_turn_submitted`] for a key the user pressed in a pane
+    /// running `provider`. An Enter pressed while a dialog covers the input
+    /// box (a permission question) answers the dialog and leaves the draft
+    /// parked in the box saved, since the program shows it again afterwards.
+    pub(crate) fn mark_key_submitted(&self, provider: crate::view::TitleProvider) {
+        self.mark_submission(|screen| crate::draft::box_shown(screen, provider) != Some(false));
+    }
+
+    /// The turn facts of a submission; its draft facts too when `sends_box`
+    /// says the screen shows the box being sent.
+    fn mark_submission(&self, sends_box: impl FnOnce(&crate::draft::DraftCapture) -> bool) {
         if !self.accepts_input_epoch(self.input_epoch()) {
             return;
         }
@@ -2832,7 +2846,10 @@ impl TerminalSession {
         self.evidence.lock().record_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
-        self.draft_submission(self.draft_screen());
+        let screen = self.draft_screen();
+        if sends_box(&screen) {
+            self.draft_submission(screen);
+        }
     }
 
     /// Explicit prompt submission from a path that supplied the prompt text.
@@ -8654,5 +8671,63 @@ mod shell_draft_tests {
             TitleProvider::Claude,
             &session
         ));
+    }
+
+    /// Claude Code 2.1.322's permission question where its box was, as a raw
+    /// capture of a 120-column pane drew it: a rule, the request, the options,
+    /// and no bottom rule.
+    fn claude_question(session: &TerminalSession) {
+        let rule = "─".repeat(78);
+        let dashes = "╌".repeat(78);
+        let rows = [
+            "⏺ Pinging localhost three times",
+            "  ⎿  $ ping -n 3 127.0.0.1",
+            "",
+            &rule,
+            " Bash command",
+            " Ping localhost three times",
+            &dashes,
+            " ping -n 3 127.0.0.1",
+            &dashes,
+            " This command requires approval",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don’t ask again for: ping *",
+            "   3. Yes, and switch to auto mode",
+            "   4. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ];
+        let screen = format!("\x1b[?2004h\x1b[2J\x1b[H{}\x1b[13;4H", rows.join("\r\n"));
+        session.process_probe_output(screen.as_bytes());
+    }
+
+    #[test]
+    fn a_draft_parked_behind_a_dialog_survives_the_answer() {
+        let session = shell();
+        let draft = "remember the follow-up about tide pools";
+        session.write_input(draft.as_bytes());
+        claude_box(&session, draft);
+        // A permission question takes the box's place; Enter, as a pane's key
+        // handler sends it, picks the highlighted option.
+        claude_question(&session);
+        crate::view::note_key_submission(b"\r", TitleProvider::Claude, &session);
+        session.write_user_input(b"\r");
+        assert!(!session.take_draft_submitted(), "the saved draft stays");
+        // The turn goes on, and Claude draws its box again with the draft in
+        // it: still unsent, so still read.
+        claude_box(&session, draft);
+        assert!(
+            matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { text, .. } if text == draft
+            ),
+            "the draft is read again once the box is back"
+        );
+        // Enter on the box sends it.
+        crate::view::note_key_submission(b"\r", TitleProvider::Claude, &session);
+        session.write_user_input(b"\r");
+        assert!(session.take_draft_submitted());
     }
 }

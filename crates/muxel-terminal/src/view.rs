@@ -1932,6 +1932,18 @@ pub(crate) fn submits_turn(
         && !(provider == TitleProvider::Claude && session.backslash_before_cursor())
 }
 
+/// Note the submission `bytes` make, typed as keys into a pane running
+/// `provider` (see [`submits_turn`] and [`TerminalSession::mark_key_submitted`]).
+pub(crate) fn note_key_submission(
+    bytes: &[u8],
+    provider: TitleProvider,
+    session: &TerminalSession,
+) {
+    if submits_turn(bytes, provider, session) {
+        session.mark_key_submitted(provider);
+    }
+}
+
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
 /// `Settings.terminal_mouse`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4132,9 +4144,7 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if submits_turn(&bytes, self.title_provider, &self.session) {
-                self.session.mark_turn_submitted();
-            }
+            note_key_submission(&bytes, self.title_provider, &self.session);
             profile::key_started(self.instance_id, t0);
             self.session.write_user_input(&bytes);
             if cleared {
