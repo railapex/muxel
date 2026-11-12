@@ -6118,6 +6118,10 @@ pub struct MuxelApp {
     /// load, project open, sleep, wake, and once a minute): their row and pane
     /// say "no history". Outside control's `resumes` looks afresh instead.
     conversations_gone: HashSet<Uuid>,
+    /// Panes whose current launch is a wake: until their terminal draws, the
+    /// pane keeps its asleep face (saying "Waking…") in place of the spinner.
+    /// Every new launch clears it (`reset_terminal_runtime`).
+    wake_launches: HashSet<Uuid>,
     /// Terminals put to sleep whose program is still quitting (see `sleep`).
     sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
     /// When the idle timer last looked for agents to sleep.
@@ -8646,6 +8650,7 @@ impl MuxelApp {
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
             conversations_gone: HashSet::new(),
+            wake_launches: HashSet::new(),
             sleep_exits: HashMap::new(),
             auto_sleep_checked: None,
             auto: HashMap::new(),
@@ -8853,7 +8858,6 @@ impl MuxelApp {
                         self.instance_resume_trusted(instance),
                         &self.settings,
                         now,
-                        false,
                     )
             })
             .map(|instance| instance.id)
@@ -9878,6 +9882,9 @@ impl MuxelApp {
     fn reset_terminal_runtime(&mut self, iid: Uuid) {
         // A respawn replaces any exited view; its next exit is a fresh event.
         self.exit_logged.remove(&iid);
+        // Only a wake marks its own launch (after this reset); a restart or
+        // recovery shows the ordinary spinner.
+        self.wake_launches.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
         self.size_claimed.remove(&iid);
         self.size_claim_failures.remove(&iid);
@@ -10860,7 +10867,6 @@ impl MuxelApp {
                         self.instance_resume_trusted(instance),
                         &self.settings,
                         now,
-                        self.active_instance == Some(iid),
                     );
                 if dormant {
                     self.dormant_instances.insert(iid);
@@ -13119,7 +13125,9 @@ impl MuxelApp {
         let _phase = ui_profile::phase("workspace", "focus-pane", Some(iid));
         ui_profile::focus_action(reason, Some(iid), window);
         self.active_instance = Some(iid);
-        self.start_dormant(iid, window, cx);
+        // Selecting an asleep pane shows it and leaves it asleep: a wake is a
+        // deliberate act (Enter or typing in it, Wake, pinning, `ctl focus`),
+        // so clicking through rows or cycling tabs starts nothing.
         if attend {
             // Deliberately selecting a pane clears its pending notification.
             self.clear_notifications_for(iid);
@@ -25649,16 +25657,39 @@ impl MuxelApp {
             && !self.terminal_launching.contains_key(&iid)
     }
 
+    /// An asleep pane's face: who it is, what it last did, and how to wake it.
+    /// Selecting the pane shows this without starting anything. While a wake
+    /// starts the program, the same face says "Waking…" until the terminal
+    /// draws, in place of the startup spinner.
     fn terminal_dormant(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let inst = self.workspace.instance(iid);
+        let waking = !self.is_dormant(iid);
         // Waking starts a new conversation; say so before the click.
-        let gone = self.conversations_gone.contains(&iid);
+        let gone = !waking && self.conversations_gone.contains(&iid);
         let folder = inst.and_then(Instance::working_directory).or_else(|| {
             inst.and_then(|i| self.workspace.project(i.project_id))
                 .map(|p| p.root_path.as_path())
         });
+        let action = if waking {
+            div()
+                .debug_selector(move || format!("pane-waking-{}", iid.simple()))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new().small().ease(linear))
+                .child(t("Waking…"))
+                .into_any_element()
+        } else {
+            Button::new(format!("start-dormant-{iid}"))
+                .label(if gone { t("Start fresh") } else { t("Wake") })
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.wake_and_show(iid, window, cx)),
+                )
+                .into_any_element()
+        };
         div()
             .id(format!("terminal-dormant-{iid}"))
+            .debug_selector(move || format!("terminal-dormant-{}", iid.simple()))
             .size_full()
             .flex()
             .flex_col()
@@ -25680,19 +25711,24 @@ impl MuxelApp {
             )
             .child(if gone {
                 Self::conversation_gone_words()
+            } else if waking {
+                t("Resuming its conversation")
             } else {
-                t("Starts when you open it")
+                t("Press Enter or start typing to wake it")
             })
-            .child(
-                Button::new(format!("start-dormant-{iid}"))
-                    .label(if gone { t("Start fresh") } else { t("Start") })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.focus_instance(iid, window, cx)
-                        }),
-                    ),
-            )
+            .child(action)
             .into_any_element()
+    }
+
+    /// A starting pane: the asleep face, waking, when a wake started it (so
+    /// the pane doesn't flash a spinner between its face and its terminal),
+    /// else the startup spinner.
+    fn terminal_starting_or_waking(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        if self.wake_launches.contains(&iid) {
+            self.terminal_dormant(iid, cx)
+        } else {
+            self.terminal_starting(iid, cx)
+        }
     }
 
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
@@ -25875,8 +25911,9 @@ impl MuxelApp {
                     } else if !v.has_visible_content() && self.terminal_is_loading(iid, cx) {
                         // The spinner animates the whole window every frame, so
                         // it gets the sidebar's startup window: a program that
-                        // never prints shows its blank screen after that.
-                        self.terminal_starting(iid, cx)
+                        // never prints shows its blank screen after that. A
+                        // wake keeps the asleep face up instead.
+                        self.terminal_starting_or_waking(iid, cx)
                     } else {
                         terminal_pane_element(view, !is_active, shown, cx)
                     }
@@ -25945,7 +25982,7 @@ impl MuxelApp {
                         )
                         .into_any_element()
                 } else {
-                    self.terminal_starting(iid, cx)
+                    self.terminal_starting_or_waking(iid, cx)
                 };
                 drop(content_scope);
                 let content = ui_profile::wrap_region(ui_profile::Region::Content(group), content);
@@ -28917,8 +28954,10 @@ impl MuxelApp {
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
                     let hover_col = cx.theme().sidebar_accent.opacity(0.45);
                     let drop_hl = cx.theme().primary.opacity(0.3);
+                    let row_group = SharedString::from(format!("inst-row-{}", iid.simple()));
                     let mut base = div()
-                        .id(SharedString::from(format!("inst-row-{}", iid.simple())))
+                        .id(row_group.clone())
+                        .group(row_group.clone())
                         .debug_selector(move || format!("inst-row-{}", iid.simple()))
                         .ml_4()
                         .mr_1()
@@ -29016,7 +29055,21 @@ impl MuxelApp {
                                     .id(SharedString::from(format!("inst-badge-{}", iid.simple())))
                                     .debug_selector(move || format!("inst-badge-{}", iid.simple()))
                                     .flex_none()
-                                    .child(badge)
+                                    .relative()
+                                    // Hovering an asleep row turns its pill
+                                    // into a Wake button in the same place.
+                                    .child(
+                                        div()
+                                            .when(asleep, |pill| {
+                                                pill.group_hover(row_group.clone(), |s| {
+                                                    s.invisible()
+                                                })
+                                            })
+                                            .child(badge),
+                                    )
+                                    .when(asleep, |slot| {
+                                        slot.child(self.asleep_wake_button(iid, row_group, cx))
+                                    })
                                     .when_some(asleep_tip, |badge, tip| {
                                         let tip = SharedString::from(tip);
                                         badge.tooltip(move |window, cx| {
@@ -29060,6 +29113,7 @@ impl MuxelApp {
                                     // Read when the menu opens, not at render: a
                                     // pane's state moves between the two.
                                     let sleep = entity.read(cx).sleep_menu_state(iid, cx);
+                                    let wake = entity.read(cx).is_dormant(iid);
                                     let menu = menu
                                         .item(
                                             PopupMenuItem::new(t("Rename"))
@@ -29101,6 +29155,16 @@ impl MuxelApp {
                                             PopupMenuItem::new(why)
                                                 .icon(Icon::empty().path("icons/pause.svg"))
                                                 .disabled(true),
+                                        ),
+                                        None if wake => menu.item(
+                                            PopupMenuItem::new(t("Wake"))
+                                                .icon(Icon::empty().path("icons/moon.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.wake_and_show(iid, window, cx)
+                                                    },
+                                                )),
                                         ),
                                         None => menu,
                                     };
@@ -36799,6 +36863,13 @@ impl Render for MuxelApp {
             // Focus target for "deselect pane": focusing this (a non-Terminal
             // context) routes muxel shortcuts (incl. Ctrl+P) to the root handlers.
             .track_focus(&self.focus_handle)
+            // An asleep pane has no terminal, so the root holds the keyboard
+            // while it is selected: Enter or a typed key wakes it.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if this.wake_on_key(&ev.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
         let actions = ui_profile::region_scope(ui_profile::Region::Actions);

@@ -220,15 +220,16 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
 /// to sleep; or it is an agent idle past the automatic-sleep threshold whose
 /// resume muxel trusts (starting it only for the timer to stop it again would
 /// cost a launch and the memory spike sleep exists to avoid); or it is older
-/// than the dormant-restore threshold. Active and pinned panes always start.
+/// than the dormant-restore threshold. Pinned panes always start. The pane
+/// the user is in is not exempt: selecting a pane shows it, and only a
+/// deliberate wake starts it, so the active pane opens asleep like any other.
 pub fn opens_dormant(
     instance: &Instance,
     resume_trusted: bool,
     settings: &Settings,
     now: i64,
-    active: bool,
 ) -> bool {
-    if active || instance.pinned {
+    if instance.pinned {
         return false;
     }
     if instance.asleep_since.is_some() {
@@ -476,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slept_pane_stays_dormant_across_restarts_unless_active_or_pinned() {
+    fn a_slept_pane_stays_dormant_across_restarts_unless_pinned() {
         let settings = Settings {
             sleep_after_hours: 0,
             dormant_after_days: 0,
@@ -486,13 +487,12 @@ mod tests {
             completed_at: Some(9 * HOUR_MS),
             ..Default::default()
         });
-        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
+        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
         slept.asleep_since = Some(9 * HOUR_MS);
         // Neither threshold applies: the sleep itself keeps it dormant.
-        assert!(opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
-        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, true));
+        assert!(opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
         slept.pinned = true;
-        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS, false));
+        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
     }
 
     #[test]
@@ -504,24 +504,18 @@ mod tests {
             ..Default::default()
         });
         // Attendance counts as activity: idle since hour 1, due at hour 5.
-        assert!(!opens_dormant(
-            &old,
-            true,
-            &settings,
-            5 * HOUR_MS - 1,
-            false
-        ));
-        assert!(opens_dormant(&old, true, &settings, 5 * HOUR_MS, false));
-        assert!(!opens_dormant(&old, false, &settings, 5 * HOUR_MS, false));
+        assert!(!opens_dormant(&old, true, &settings, 5 * HOUR_MS - 1));
+        assert!(opens_dormant(&old, true, &settings, 5 * HOUR_MS));
+        assert!(!opens_dormant(&old, false, &settings, 5 * HOUR_MS));
         let mut shell = old.clone();
         shell.program = None;
-        assert!(!opens_dormant(&shell, true, &settings, 5 * HOUR_MS, false));
+        assert!(!opens_dormant(&shell, true, &settings, 5 * HOUR_MS));
         // Dormant restore still covers shells and untrusted resumes by days.
         let days = Settings {
             dormant_after_days: 1,
             ..Settings::default()
         };
-        assert!(opens_dormant(&shell, false, &days, 25 * HOUR_MS, false));
+        assert!(opens_dormant(&shell, false, &days, 25 * HOUR_MS));
     }
 
     #[test]
@@ -535,14 +529,8 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(woken.activity.last_active_at(), Some(5 * HOUR_MS));
-        assert!(!opens_dormant(
-            &woken,
-            true,
-            &settings,
-            9 * HOUR_MS - 1,
-            false
-        ));
-        assert!(opens_dormant(&woken, true, &settings, 9 * HOUR_MS, false));
+        assert!(!opens_dormant(&woken, true, &settings, 9 * HOUR_MS - 1));
+        assert!(opens_dormant(&woken, true, &settings, 9 * HOUR_MS));
         // `ctl wake` must not mark the finished turn read.
         assert!(woken.activity.has_unattended_completion());
     }
