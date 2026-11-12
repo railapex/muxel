@@ -149,6 +149,22 @@ impl ResumeFile {
     }
 }
 
+/// How long ago an asleep pane last worked, as its row shows it beside the
+/// moon: minutes under an hour (at least 1m), hours under a day, then days.
+/// `None` with no recorded work.
+pub fn asleep_age(activity: &crate::AgentActivity, now: i64) -> Option<String> {
+    const MINUTE_MS: i64 = 60_000;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    let age = now.saturating_sub(activity.last_work_at()?).max(0);
+    Some(if age < HOUR_MS {
+        format!("{}m", (age / MINUTE_MS).max(1))
+    } else if age < DAY_MS {
+        format!("{}h", age / HOUR_MS)
+    } else {
+        format!("{}d", age / DAY_MS)
+    })
+}
+
 /// Whether an agent last active at `last_active_at` has been idle for at least
 /// `hours`. Zero hours turns automatic sleep off; an unknown age never qualifies.
 pub fn sleep_due(last_active_at: Option<i64>, hours: u32, now: i64) -> bool {

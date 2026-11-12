@@ -393,6 +393,16 @@ fn an_agent_whose_conversation_file_is_gone_stays_awake_and_ctl_says_so() {
                     app.control_info_of(agent, 0, cx).unwrap().resumes,
                     Some(false)
                 );
+                // The row's "no history" follows the file within the minute,
+                // with the sleep timer off too.
+                app.settings.sleep_after_hours = 0;
+                app.auto_sleep_checked = None;
+                app.auto_sleep_pass(cx);
+                assert!(app.conversations_gone.contains(&agent));
+                std::fs::write(&transcript, "{}\n").unwrap();
+                app.auto_sleep_checked = None;
+                app.auto_sleep_pass(cx);
+                assert!(!app.conversations_gone.contains(&agent));
             })
             .unwrap();
         wait_until(
@@ -629,9 +639,15 @@ fn a_dormant_sidebar_row_stays_one_line_at_the_narrowest_sidebar() {
                 let now = chrono::Utc::now().timestamp_millis();
                 let mut instance = app.workspace.instance(running).unwrap().clone();
                 instance.id = Uuid::new_v4();
-                instance.session_id = Some(Uuid::new_v4().to_string());
+                let id = Uuid::new_v4().to_string();
+                // Its transcript is gone, so the pill also carries "no history".
+                instance.session_path = instance
+                    .session_path
+                    .as_ref()
+                    .map(|path| path.with_file_name(format!("{id}.jsonl")));
+                instance.session_id = Some(id);
                 instance.custom_name = Some("sleeping agent".into());
-                // The longest label a finished turn gets: "done · 23h".
+                // The widest pill: a moon, "23h" and the no-history mark.
                 instance.activity = AgentActivity {
                     completed_at: Some(now - 23 * HOUR_MS),
                     last_state: Some(AgentActivityState::Done),
@@ -644,6 +660,7 @@ fn a_dormant_sidebar_row_stays_one_line_at_the_narrowest_sidebar() {
                 assert!(add_tab(layout, running, iid));
                 assert!(muxel_core::set_active_tab(layout, running));
                 app.dormant_instances.insert(iid);
+                assert!(app.refresh_conversations_gone());
                 app.active_instance = Some(running);
                 cx.notify();
                 iid
@@ -653,7 +670,8 @@ fn a_dormant_sidebar_row_stays_one_line_at_the_narrowest_sidebar() {
         cx.run_until_parked();
         assert!(
             window
-                .read_with(cx, |app, _| app.is_dormant(asleep))
+                .read_with(cx, |app, _| app.is_dormant(asleep)
+                    && app.conversations_gone.contains(&asleep))
                 .unwrap()
         );
         let mut visual = VisualTestContext::from_window(window.into(), cx);

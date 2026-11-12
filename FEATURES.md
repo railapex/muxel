@@ -94,7 +94,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
   put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
   seconds) and its pane becomes a dormant placeholder that resumes the same
-  conversation when opened, across restarts too. Sleep a pane from its sidebar
+  conversation when opened, across restarts too. Asleep and dormant panes look
+  the same: a muted one-line row with an outlined moon-and-age pill (plus `∅`
+  and **Start fresh** when the saved conversation is gone) and a moon on the
+  tab. Sleep a pane from its sidebar
   menu, a whole project's idle agents from the project menu, or let Settings →
   Behavior do it after N hours idle (on, 4 hours, by default); every wake
   restarts that clock. Working, asking,

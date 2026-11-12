@@ -12,10 +12,12 @@ change that work timestamp. At exactly N elapsed days, an old pane becomes
 dormant. Panes without these timestamps start normally. Pinned panes always
 start, as does the active pane of the active project at launch.
 
-A dormant pane owns no PTY or child process. Its sidebar entry keeps its saved
-name and status color on one line, with a "dormant" badge whose tooltip gives
-the saved status and age; its tab also says dormant.
-The pane body shows its name, last saved title and folder with a Start button.
+A dormant pane owns no PTY or child process. It looks exactly like a pane put
+to sleep, since opening either does the same thing (see
+[Sleeping idle agents](agent-sleep.md#how-an-asleep-pane-looks)): one sidebar
+line with a muted name and an outlined moon-and-age pill, and a moon on its tab.
+The pane body shows its name, last saved title, saved status and folder with a
+Start button.
 Selecting it through the sidebar, tab, notification, tray or `ctl focus`
 starts it using the ordinary restore path, including the saved provider session
 id and existing session discovery. Repeated focus during launch does not start

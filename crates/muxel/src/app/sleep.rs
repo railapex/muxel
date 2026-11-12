@@ -261,6 +261,8 @@ impl MuxelApp {
             None => Default::default(),
         };
         self.dormant_instances.insert(iid);
+        // Sleep needs the file a resume reads, so it was there just now.
+        self.conversations_gone.remove(&iid);
         self.terminal_launches.remove(&iid);
         // The preset names the provider, so a quit that needed a kill says whose.
         muxel_store::append_event_log(&format!(
@@ -449,11 +451,11 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// The idle timer: once a minute, sleep agents idle past the setting.
+    /// The idle timer: once a minute, sleep agents idle past the setting. The
+    /// same minute re-checks which asleep panes' conversations are gone, since
+    /// a provider deletes old ones whether or not muxel sleeps anything.
     pub(super) fn auto_sleep_pass(&mut self, cx: &mut Context<Self>) {
-        let hours = self.settings.sleep_after_hours;
-        if hours == 0
-            || self.current_workspace.is_none()
+        if self.current_workspace.is_none()
             || self
                 .auto_sleep_checked
                 .is_some_and(|at| at.elapsed() < AUTO_SLEEP_EVERY)
@@ -461,6 +463,13 @@ impl MuxelApp {
             return;
         }
         self.auto_sleep_checked = Some(Instant::now());
+        if self.refresh_conversations_gone() {
+            cx.notify();
+        }
+        let hours = self.settings.sleep_after_hours;
+        if hours == 0 {
+            return;
+        }
         let request = SleepRequest::Auto {
             after_hours: hours,
             now: chrono::Utc::now().timestamp_millis(),
@@ -491,6 +500,7 @@ impl MuxelApp {
         if !self.dormant_instances.remove(&iid) {
             return false;
         }
+        self.conversations_gone.remove(&iid);
         self.spawn_terminal_deferred(iid, muxel_core::TerminalLaunchReason::Restore, window, cx);
         if !self.terminal_launching.contains_key(&iid) && !self.terminals.contains_key(&iid) {
             return false;
@@ -608,13 +618,83 @@ impl MuxelApp {
         })
     }
 
-    /// The word a dormant pane's tab and sidebar badge carry.
-    pub(super) fn dormant_badge(&self, iid: Uuid) -> SharedString {
-        if self.is_asleep(iid) {
-            t("asleep")
-        } else {
-            t("dormant")
+    /// Re-check which asleep panes' conversations are gone; whether that
+    /// changed. One bounded look per asleep agent (see [`Self::resume_file`]).
+    pub(super) fn refresh_conversations_gone(&mut self) -> bool {
+        let gone: HashSet<Uuid> = self
+            .dormant_instances
+            .iter()
+            .copied()
+            .filter(|iid| {
+                self.workspace
+                    .instance(*iid)
+                    .is_some_and(|inst| self.resumes(inst) == Some(false))
+            })
+            .collect();
+        let changed = gone != self.conversations_gone;
+        self.conversations_gone = gone;
+        changed
+    }
+
+    /// An asleep pane in words, for its tooltip and placeholder: one word for
+    /// a pane put to sleep and one deferred at launch, its saved status, and
+    /// how long ago it last worked.
+    pub(super) fn asleep_words(&self, iid: Uuid) -> String {
+        let Some(inst) = self.workspace.instance(iid) else {
+            return t("Asleep").to_string();
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        match (
+            saved_activity_status(&inst.activity),
+            muxel_core::sleep::asleep_age(&inst.activity, now),
+        ) {
+            (_, None) => t("Asleep").to_string(),
+            (AgentStatus::Done, Some(age)) => tf("Asleep · finished {age} ago", &[("age", &age)]),
+            // Its turn or question ended with the program.
+            (AgentStatus::Working | AgentStatus::Blocked, Some(age)) => {
+                tf("Asleep · interrupted {age} ago", &[("age", &age)])
+            }
+            (AgentStatus::Idle, Some(age)) => {
+                tf("Asleep · last active {age} ago", &[("age", &age)])
+            }
         }
+    }
+
+    /// An asleep pane's sidebar pill: a moon and the age of its last work,
+    /// outlined in its saved status color (green finished, amber interrupted,
+    /// grey idle), with `∅` when its conversation is gone. Filled pills are
+    /// left to running panes.
+    pub(super) fn asleep_pill(&self, iid: Uuid, cx: &App) -> Tag {
+        let inst = self.workspace.instance(iid);
+        let status = inst
+            .map(|inst| saved_activity_status(&inst.activity))
+            .unwrap_or(AgentStatus::Idle);
+        let (tag, color) = match status {
+            AgentStatus::Done => (Tag::success(), cx.theme().success),
+            AgentStatus::Working | AgentStatus::Blocked => (Tag::warning(), cx.theme().warning),
+            AgentStatus::Idle => (Tag::new(), cx.theme().muted_foreground),
+        };
+        let age = inst.and_then(|inst| {
+            muxel_core::sleep::asleep_age(&inst.activity, chrono::Utc::now().timestamp_millis())
+        });
+        tag.outline()
+            .small()
+            .gap_1()
+            .text_color(color)
+            .child(
+                svg()
+                    .path("icons/moon.svg")
+                    .size(px(10.0))
+                    .flex_none()
+                    .text_color(color),
+            )
+            .children(age)
+            .when(self.conversations_gone.contains(&iid), |tag| tag.child("∅"))
+    }
+
+    /// What waking an asleep pane whose conversation is gone does.
+    pub(super) fn conversation_gone_words() -> SharedString {
+        t("The saved conversation is gone. Waking starts a new one in the same folder.")
     }
 
     pub(super) fn is_asleep(&self, iid: Uuid) -> bool {
@@ -690,7 +770,7 @@ impl MuxelApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(t(
-                        "A sleeping agent's program stops, freeing its memory. Opening it resumes the same conversation. Working, asking, focused and pinned agents, and shells, keep running.",
+                        "A sleeping agent's program stops, freeing its memory, and its row shows a moon and how long ago it last worked. Opening it resumes the same conversation, or starts a new one if the provider has deleted it. Working, asking, focused and pinned agents, and shells, keep running.",
                     )),
             )
             .into_any_element()
