@@ -2268,8 +2268,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   `--when-idle` waits in muxel until the agent can take the prompt: not
   working, blocked or starting, no reply due to a control turn, no other send
   in flight, no draft, and for an agent kept in tmux no other attached tmux
-  client. Then it sends with every check above, and the reply adds
-  `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
+  client. When someone else submits while it waits (a person pressing Enter
+  on the draft it waited behind), it also waits for that turn to show: a
+  send holding a conversation until the turn starts, since a `/clear` starts
+  none and muxel hears of the new conversation a moment later; one holding
+  none for up to three seconds. Then it sends with every check above, and
+  the reply adds `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
   then fails with `timed_out` and `reason` naming what it was still waiting on
   (`working`, `blocked`, `starting`, `just_submitted`, `send_in_flight`,
   `draft_present`, `tmux_clients` or `conversation_unconfirmed`). The agent

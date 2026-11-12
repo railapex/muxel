@@ -335,6 +335,11 @@ impl LifecycleEvidence {
         self.first_submission_at
     }
 
+    /// When the latest submission went in, in any binding.
+    pub(crate) fn last_submission_at(&self) -> Option<SystemTime> {
+        self.submitted.map(|mark| mark.at)
+    }
+
     pub(crate) fn binding_rev(&self) -> u64 {
         self.binding_rev
     }

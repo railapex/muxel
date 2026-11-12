@@ -276,6 +276,8 @@ pub(in crate::app) struct QueuedSend {
     /// reaches nobody and `cancelled` is set only by `once-cancel`.
     detached: bool,
     queued_at: Instant,
+    /// `queued_at` on the wall clock, to compare with submission times.
+    queued_ms: i64,
     deadline: Instant,
     /// What it is waiting on, for its `timed_out` reason.
     waiting_on: &'static str,
@@ -290,6 +292,9 @@ pub(in crate::app) struct QueuedSend {
 
 /// How long after finding another tmux client a waiting send asks again.
 const CLIENTS_RECHECK: Duration = Duration::from_secs(5);
+/// How long after someone else's submission a waiting send that holds no
+/// conversation gives that turn to show, when it shows none.
+const SUBMISSION_SETTLE_MS: i64 = 3_000;
 
 /// What a waiting send does now.
 #[derive(Debug, PartialEq)]
@@ -309,6 +314,11 @@ struct PaneFacts {
     /// What an ordinary send would refuse with now, if anything.
     refusal: Option<ctl::Error>,
     send_in_flight: bool,
+    /// When the latest submission into the pane went in (wall-clock ms).
+    submitted_at: Option<i64>,
+    /// When the pane last started a turn or asked a question (wall-clock ms).
+    turn_started_at: Option<i64>,
+    now_ms: i64,
 }
 
 /// Wait while the pane is busy in a way that passes; refuse once it can't
@@ -346,6 +356,21 @@ fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
             return Verdict::Wait("conversation_unconfirmed");
         }
         Err(error) => return Verdict::Refuse(error),
+    }
+    // Someone submitted while it waited: a person's Enter on their draft, or
+    // another send. That can start a turn the pane doesn't show yet, or end
+    // the conversation (`/clear` starts no turn, and muxel hears of the new
+    // conversation a moment later). So the send waits for that turn to show.
+    // One holding a conversation waits until then, or until muxel's reading
+    // of the conversation moves and the check above settles it; one holding
+    // none, which no conversation change can wrong, gives the turn a moment.
+    if let Some(submitted) = facts.submitted_at.filter(|at| *at >= queued.queued_ms) {
+        let shown = facts.turn_started_at.is_some_and(|at| at >= submitted);
+        let settled =
+            queued.conversation.is_none() && facts.now_ms - submitted >= SUBMISSION_SETTLE_MS;
+        if !shown && !settled {
+            return Verdict::Wait("just_submitted");
+        }
     }
     if facts.send_in_flight {
         return Verdict::Wait("send_in_flight");
@@ -450,7 +475,7 @@ impl MuxelApp {
             Err(error) if error.code == Some(ErrorCode::Starting) => launch_id,
             Err(error) => return refuse(self, error),
         };
-        let queued_at = Instant::now();
+        let (queued_at, queued_ms) = (Instant::now(), now_ms());
         let wait = Duration::from_secs(timeout_secs.unwrap_or(if detach {
             ctl::DETACHED_TIMEOUT_SECS
         } else {
@@ -465,7 +490,7 @@ impl MuxelApp {
             Some(key) => {
                 let withdraw = Arc::new(AtomicBool::new(false));
                 let expires_at =
-                    now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
+                    queued_ms.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
                 let receipt = json!({
                     "queued": true,
                     "agent": ctl::short_id(iid),
@@ -490,6 +515,7 @@ impl MuxelApp {
                 pinned,
                 detached: detach,
                 queued_at,
+                queued_ms,
                 deadline: queued_at + wait,
                 waiting_on: "working",
                 reply,
@@ -544,12 +570,26 @@ impl MuxelApp {
             .as_ref()
             .ok()
             .and_then(|_| check_send_state(self.control_send_admission(iid, false, cx)).err());
+        let submitted_at = self
+            .terminal_view(iid)
+            .and_then(|view| view.read(cx).session().last_submission_at())
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+        let turn_started_at = self.workspace.instance(iid).and_then(|inst| {
+            [inst.activity.work_started_at, inst.activity.blocked_at]
+                .into_iter()
+                .flatten()
+                .max()
+        });
         PaneFacts {
             cancelled: queued.cancelled.load(Ordering::Acquire),
             expired: Instant::now() >= queued.deadline,
             writable,
             refusal,
             send_in_flight: SendInFlight::held(iid),
+            submitted_at,
+            turn_started_at,
+            now_ms: now_ms(),
         }
     }
 
@@ -697,6 +737,7 @@ impl MuxelApp {
                 pinned: false,
                 detached: false,
                 queued_at: now,
+                queued_ms: now_ms(),
                 deadline: now + Duration::from_secs(600),
                 waiting_on: "working",
                 reply: std::sync::mpsc::channel().0,
@@ -899,6 +940,7 @@ mod tests {
             pinned: false,
             detached: false,
             queued_at: now,
+            queued_ms: QUEUED_MS,
             deadline: now + Duration::from_secs(600),
             waiting_on: "draft_present",
             reply: std::sync::mpsc::channel().0,
@@ -908,6 +950,9 @@ mod tests {
         }
     }
 
+    /// When [`queued`] sends were queued, on the wall clock.
+    const QUEUED_MS: i64 = 1_000_000;
+
     fn ready(launch: Uuid) -> PaneFacts {
         PaneFacts {
             cancelled: false,
@@ -915,7 +960,62 @@ mod tests {
             writable: Ok((launch, ctl::Conversation::Known("conversation".into()))),
             refusal: None,
             send_in_flight: false,
+            submitted_at: Some(QUEUED_MS - 60_000),
+            turn_started_at: Some(QUEUED_MS - 59_000),
+            now_ms: QUEUED_MS + 1_000,
         }
+    }
+
+    /// A person submits the draft a send waited behind. The pane reads idle
+    /// at once, before the turn shows, and a `/clear` shows none at all while
+    /// muxel hasn't heard of the new conversation yet. A send holding a
+    /// conversation waits for the turn to show; one holding none waits only
+    /// a moment.
+    #[test]
+    fn a_waiting_send_waits_for_the_turn_someone_else_just_submitted() {
+        let launch = Uuid::new_v4();
+        let submitted = QUEUED_MS + 5_000;
+        let just_submitted = |now_ms| PaneFacts {
+            submitted_at: Some(submitted),
+            now_ms,
+            ..ready(launch)
+        };
+        let pinned = queued(Some(launch), Some("conversation"));
+        for now_ms in [submitted, submitted + 60_000] {
+            assert_eq!(
+                verdict(&pinned, just_submitted(now_ms)),
+                Verdict::Wait("just_submitted"),
+                "{now_ms}"
+            );
+        }
+        // Once that turn has shown, the send goes at the next idle moment.
+        let shown = PaneFacts {
+            turn_started_at: Some(submitted + 800),
+            ..just_submitted(submitted + 30_000)
+        };
+        assert_eq!(verdict(&pinned, shown), Verdict::Send);
+        // Muxel adopts the conversation a `/clear` started: dropped.
+        let cleared = PaneFacts {
+            writable: Ok((launch, ctl::Conversation::Known("another".into()))),
+            ..just_submitted(submitted + 2_000)
+        };
+        assert!(matches!(verdict(&pinned, cleared), Verdict::Refuse(_)));
+        let unbound = queued(Some(launch), None);
+        assert_eq!(
+            verdict(&unbound, just_submitted(submitted + 1_000)),
+            Verdict::Wait("just_submitted")
+        );
+        assert_eq!(
+            verdict(&unbound, just_submitted(submitted + 3_000)),
+            Verdict::Send
+        );
+        // A submission from before it was queued is no news.
+        let earlier = PaneFacts {
+            submitted_at: Some(QUEUED_MS - 1),
+            turn_started_at: None,
+            ..ready(launch)
+        };
+        assert_eq!(verdict(&pinned, earlier), Verdict::Send);
     }
 
     #[test]

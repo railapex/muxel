@@ -111,6 +111,13 @@ fn send(agent: Uuid, text: &str, once: Option<&str>, when_idle: bool, force: boo
     }
 }
 
+/// A person presses Enter on the pane's draft. (On `next`, which gates
+/// submission writes, this is `write_user_submission(b"\r", Submission::Turn)`.)
+fn submit_draft(session: &TerminalSession) {
+    session.mark_turn_submitted();
+    session.write_input(b"\r");
+}
+
 /// `command`, a send, detached (`--when-idle --detach`).
 fn detached(mut command: Command) -> Command {
     if let Command::Send {
@@ -716,8 +723,7 @@ fn a_detached_send_answers_at_once_and_types_after_the_draft() {
         assert_eq!(retry["queued"], true);
         assert_eq!(retry["duplicate"], true);
         // The person submits the draft; once the pane is idle the send types.
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        submit_draft(&session);
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
             let status = once_status(cx, window, pane, "d-20");
@@ -794,6 +800,50 @@ fn a_detached_send_is_dropped_when_its_conversation_changes() {
     });
 }
 
+/// The draft a doorbell waits behind is `/clear`, and the person submits it.
+/// The pane reads idle with no draft at once, and `/clear` starts no turn,
+/// but muxel hears of the new conversation only a moment later. The
+/// doorbell waits for a turn to show, so muxel's next reading drops it
+/// instead of letting it type into the new conversation.
+#[test]
+fn a_waiting_send_behind_a_submitted_clear_types_nothing_into_the_new_conversation() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-clear");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        session.write_input(b"/clear");
+        let doorbell = pinned(
+            detached(send(pane, "echo rung", Some("d-24"), true, false)),
+            CONVERSATION_A,
+        );
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell, cx))
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        // One update: the Enter, then the queue, before any status tick.
+        let (submitted, waiting) = window
+            .update(cx, |app, _, cx| {
+                submit_draft(&session);
+                let submitted = session.input_rev();
+                app.pump_control_queue(cx);
+                (submitted, app.once_status(pane, "d-24"))
+            })
+            .unwrap();
+        assert_eq!(waiting["state"], "queued", "{waiting}");
+        assert_eq!(waiting["waiting_on"], "just_submitted");
+        assert_eq!(session.input_rev(), submitted, "the doorbell typed");
+        // muxel adopts the conversation /clear started.
+        adopt_conversation(cx, window, pane, CONVERSATION_B);
+        window
+            .update(cx, |app, _, cx| app.pump_control_queue(cx))
+            .unwrap();
+        let status = once_status(cx, window, pane, "d-24");
+        assert_eq!(status["state"], "dropped", "{status}");
+        assert_eq!(status["result"]["reason"], "conversation_changed");
+        assert_eq!(session.input_rev(), submitted, "A's doorbell typed into B");
+        session.kill();
+    });
+}
+
 /// Wire's hook withdraws a doorbell whose mail it has already delivered. A
 /// withdrawn send never types, and a cancel with nothing to withdraw is an
 /// answer, not an error, so the hook can fire it without asking first.
@@ -844,8 +894,7 @@ fn once_cancel_withdraws_a_waiting_detached_send() {
         assert_eq!(unused["cancelled"], false);
         assert_eq!(unused["state"], "unused");
         // The pane frees up, and nothing types.
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        submit_draft(&session);
         let submitted = session.input_rev();
         for _ in 0..30 {
             cx.executor().advance_clock(Duration::from_millis(100));
