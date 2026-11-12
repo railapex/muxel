@@ -1037,10 +1037,11 @@ feature is added or changed, update the matching entry here in the same change**
   turn (unless forced). It checks again at paste after the shared tmux claim settles.
   `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
   forced. An older host ignores the caller ID. `answer` only picks an option
-  the prompt actually offers, and a pane that isn't running says so rather than
-  swallowing the input. Shell panes are off limits unless "Also allow typing into
-  shell panes" is on too, since typing into a shell is running commands. That
-  setting also grants `new` shell preset/default and all literal argv launches
+  the prompt actually offers (numbered rows such as Claude's `1. Yes` or the
+  `1 (○) Alpha` rows of Grok's question card), and a pane that isn't running
+  says so rather than swallowing the input. Shell panes are off limits unless
+  "Also allow typing into shell panes" is on too, since typing into a shell is
+  running commands. That setting also grants `new` shell preset/default and all literal argv launches
   when the separate outside terminal-creation grant is enabled. Existing shell
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
