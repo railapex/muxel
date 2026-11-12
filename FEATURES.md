@@ -321,7 +321,10 @@ feature is added or changed, update the matching entry here in the same change**
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
-  pane; directly launched Codex panes learn it from a later OSC title. Both are accepted only after the
+  pane. Claude Code 2.1.322's `/fork` starts a copy beside the pane's conversation
+  and leaves the pane in it; the copy's start reaches the pane's hook, so muxel moves
+  the pane on a fork start only after the bound conversation's end record, which
+  `/fork` doesn't write. Directly launched Codex panes learn the switch from a later OSC title. Both are accepted only after the
   new UUID's own on-disk session proves it real and no sibling pane already owns it —
   terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
   A Claude conversation is matched by UUID across Claude's whole store rather than only
