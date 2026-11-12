@@ -50,6 +50,8 @@ pub struct SleepFacts {
     /// A plain PTY on this machine: not a remote project, not tmux.
     pub local_pty: bool,
     /// Its saved conversation id will resume it (see [`crate::resume_trusted`]).
+    /// Whether the file behind that id still exists is checked after these
+    /// rules, by [`ResumeFile::sleep_refusal`].
     pub resume_trusted: bool,
     pub status: SleepStatus,
     /// The provider's screen says work still runs beside the turn (subagents,
@@ -105,6 +107,44 @@ impl SleepRefusal {
             Self::PoppedOut => "popped_out",
             Self::Focused => "focused",
             Self::RecentlyActive => "recently_active",
+        }
+    }
+}
+
+/// What a bounded look on disk found of the file a resume would read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeFile {
+    /// The conversation file is where the pane's saved binding puts it.
+    Present,
+    /// It isn't: the provider deleted it (Claude removes transcripts older than
+    /// `cleanupPeriodDays`, 30 days by default) or never wrote it.
+    Gone,
+    /// The look failed, or couldn't settle it without walking the provider's
+    /// whole store.
+    Unknown,
+    /// muxel can't name this provider's file (Grok, a custom resume program),
+    /// so the saved id is all there is to go on.
+    Unnamed,
+}
+
+impl ResumeFile {
+    /// The last sleep rule, asked only once every other rule lets the pane
+    /// sleep because it reads the disk: a resume needs the file it would read.
+    /// A provider whose file muxel can't name keeps trusting its saved id.
+    pub fn sleep_refusal(self) -> Option<SleepRefusal> {
+        match self {
+            Self::Present | Self::Unnamed => None,
+            Self::Gone | Self::Unknown => Some(SleepRefusal::NoResume),
+        }
+    }
+
+    /// Outside control's `resumes` for a pane whose saved id would resume it:
+    /// `None` when muxel can't tell.
+    pub fn resumes(self) -> Option<bool> {
+        match self {
+            Self::Present => Some(true),
+            Self::Gone => Some(false),
+            Self::Unknown | Self::Unnamed => None,
         }
     }
 }

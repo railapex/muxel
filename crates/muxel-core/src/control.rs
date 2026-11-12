@@ -722,6 +722,11 @@ pub struct AgentInfo {
     /// Why a terminal is not running. `dormant` means it starts when opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_running_reason: Option<String>,
+    /// For a sleeping or dormant agent: whether waking it resumes its
+    /// conversation (`false` when the saved conversation is gone), checked
+    /// when asked. Absent while it runs, or when muxel can't tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<bool>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -2421,6 +2426,11 @@ timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
 refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
 and resumes the session; `wake` resumes it without focusing it, then `status`
 moves from `starting` to idle with a new `launch_id`.
+For a dormant or sleeping agent, `status` and `panes` also report `resumes`,
+checked on disk when you ask: `true` when a wake brings its conversation back,
+`false` when it will start a new one (the provider deleted the saved
+conversation, or muxel never captured one). It is left out when muxel can't tell
+(Grok, whose files muxel can't locate) and while the agent runs.
 An approved `new --focus` also leaves other dormant sessions asleep.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
@@ -3068,6 +3078,7 @@ mod tests {
             activity: None,
             blocked_on: None,
             not_running_reason: None,
+            resumes: None,
             status_since: None,
             launch_id: None,
             session_id: None,

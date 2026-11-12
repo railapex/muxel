@@ -37,7 +37,8 @@ minute later.
 - the pane you're in (the focused pane, or the one a project window shows),
   except by its own Sleep, and a popped-out pane;
 - a pane whose resume can't be trusted: it hasn't launched, its conversation
-  id hasn't been captured, or its preset doesn't resume by id;
+  id hasn't been captured, its preset doesn't resume by id, or the file a
+  resume would read isn't there (see below);
 - a shell or any program that isn't one of muxel's known agents;
 - a remote (SSH) pane or a local tmux pane;
 - a pinned pane. Pinning already means "always start" for dormant restore,
@@ -50,6 +51,25 @@ moves it, to the tab its group shows next or another running pane of the
 project (focusing a dormant pane starts it, so focus doesn't stay). Sleep idle
 agents and the timer name no pane and leave the one you're in. Only automatic
 sleep waits for the idle threshold.
+
+A saved conversation id is only as good as the file behind it: Claude deletes
+transcripts older than `cleanupPeriodDays` (30 by default). So the last rule,
+checked only once every other rule lets the pane sleep, looks for the file a
+resume would read:
+
+- **Claude:** the saved transcript path, or `~/.claude/projects/<slug>/<id>.jsonl`
+  for the pane's folder when none was saved. One stat.
+- **Codex:** the saved rollout path and its compression sibling, or the rollout
+  in the dated directories its id names when no path was saved.
+- **Muse Code:** the session's `session.jsonl` in its dated store.
+- **Grok:** not checked. Grok files a session under its own encoding of the
+  working directory, which muxel doesn't reproduce, so its saved id is trusted
+  as before.
+
+A pane sleeps only when its file is there. A missing file, or a look that
+fails or would need a walk of the provider's whole store, keeps it awake with
+"no saved conversation to resume". The look never walks a whole store, so it
+doesn't stall the UI.
 
 ## How a sleep ends the program
 
@@ -84,6 +104,12 @@ dormant.
 the reason for a pane deferred at launch). `show` includes the reason; `screen`,
 `send`, `keys` and `answer` refuse with code `not_running` and that reason.
 
+For a sleeping or dormant agent, `status` and `panes` also report `resumes`,
+made from the same look as the sleep rule each time they are asked: `true`
+when its file is there, `false` when it is gone or no conversation was ever
+captured. It is left out while the pane runs, and when muxel can't tell (Grok,
+or a look that failed).
+
 `muxel ctl wake AGENT` starts a sleeping or dormant pane in the background,
 through the same restore path, without selecting it, raising a window,
 changing the active tab or marking its notifications read. Replies:
@@ -98,10 +124,18 @@ changing the active tab or marking its notifications read. Replies:
 
 Waking isn't attendance: it marks nothing read. Like any wake, it restarts the
 idle clock, which leaves the caller N hours to deliver what it woke the pane
-for. A wake never starts a new
-conversation; if the provider's saved transcript is gone, restore's ordinary
-recovery applies and `session_id` changes, so a caller holding the old id can
-tell.
+for. A wake never mints a new conversation id for a conversation that still
+exists.
+
+A pane can sleep for longer than its provider keeps the file, so a wake can
+find it gone. Before every resume, muxel's launch path looks for the file
+(walking the provider's store when the cheap look misses); when the file is
+gone, the launch starts a new conversation in the same folder instead of
+resuming, and `session_id` changes. muxel then posts "NAME: saved conversation
+is gone · Started a new one in the same folder" to Notifications and the event
+log. The same notice follows the rarer case where the resume itself reports the
+conversation missing. The new launch is not a resume, so it can't fail the same
+way again: one wake, one launch.
 
 Sleep is for local PTY panes only. SSH and tmux sessions, editors, diffs and
 browsers are unchanged.

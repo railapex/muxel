@@ -1595,6 +1595,7 @@ impl MuxelApp {
             activity,
             blocked_on: fields.blocked_on,
             not_running_reason: self.dormant_reason(inst.id).map(str::to_string),
+            resumes: self.resumes(inst),
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
                 live,
