@@ -14,6 +14,7 @@ pub mod diff;
 pub mod geometry;
 mod gui_path;
 pub mod import;
+pub mod input_box;
 pub mod isolated_root;
 pub mod library;
 pub mod locale;
