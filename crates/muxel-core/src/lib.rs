@@ -108,16 +108,31 @@ pub struct AgentActivity {
     pub blocked_at: Option<i64>,
     #[serde(default)]
     pub last_attended_at: Option<i64>,
-    /// When the pane was last woken from sleep or dormancy (opened, pinned or
-    /// `ctl wake`). It counts toward idle time only, so every wake gets the
-    /// whole automatic-sleep threshold, across restarts too, without marking
-    /// a completion read.
+    /// When the pane was last woken from sleep or dormancy (Enter or typing
+    /// in it, Wake, pinning, `ctl focus` or `ctl wake`). It counts toward idle
+    /// time only, so a wake restarts the automatic-sleep clock, across
+    /// restarts too, without marking a completion read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub woken_at: Option<i64>,
+    /// Who made that wake. A machine's wake that nobody has looked at since
+    /// gets a short idle limit ([`crate::sleep::MACHINE_WAKE_IDLE_MINUTES`]) in place
+    /// of the whole threshold. Older saves have none, which reads as the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_by: Option<Waker>,
     /// Latest lifecycle state, independent from whether its notification was read.
     /// Older workspaces infer it from their existing transition timestamps.
     #[serde(default)]
     pub last_state: Option<AgentActivityState>,
+}
+
+/// Who woke an asleep pane: the user, by their own input in muxel (Enter or
+/// typing in it, Wake, pinning), or a machine, by anything through ctl (`ctl
+/// wake`, `ctl focus`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waker {
+    User,
+    Machine,
 }
 
 /// Provider-neutral lifecycle state used by the persisted activity reducer.
@@ -146,6 +161,15 @@ impl AgentActivity {
         self.last_work_at()
             .max(self.last_attended_at)
             .max(self.woken_at)
+    }
+
+    /// Woken by a machine, and nobody has looked at the pane since: it woke
+    /// for one job. The first look makes it an ordinary pane again.
+    pub fn machine_woken_unattended(&self) -> bool {
+        self.woken_by == Some(Waker::Machine)
+            && self
+                .woken_at
+                .is_some_and(|woken| self.last_attended_at.is_none_or(|seen| seen < woken))
     }
 
     pub fn current_state(&self) -> Option<AgentActivityState> {

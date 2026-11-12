@@ -1,6 +1,5 @@
 //! Putting an idle local agent to sleep: its program ends and its pane stays in
-//! the layout as a dormant pane, which resumes the same conversation when it is
-//! opened or woken. These rules decide which panes may sleep; the app gathers
+//! the layout asleep, and resumes the same conversation when it is woken. These rules decide which panes may sleep; the app gathers
 //! the facts and does the stopping.
 
 use crate::{Instance, Settings, is_known_agent_program, should_restore_dormant};
@@ -11,7 +10,15 @@ use crate::{Instance, Settings, is_known_agent_program, should_restore_dormant};
 /// holding memory before the next working day's builds start.
 pub const DEFAULT_SLEEP_AFTER_HOURS: u32 = 4;
 
-const HOUR_MS: i64 = 60 * 60 * 1000;
+/// How long a pane a machine woke (`ctl wake`) may idle before automatic sleep
+/// takes it again, while nobody has looked at it. It woke for one job; holding
+/// an agent's memory for the whole threshold after every such wake would cost
+/// hours of it each time. A guess: the event log's wake lines show whether a
+/// second job tends to arrive later than this.
+pub const MACHINE_WAKE_IDLE_MINUTES: u32 = 30;
+
+const MINUTE_MS: i64 = 60 * 1000;
+const HOUR_MS: i64 = 60 * MINUTE_MS;
 
 /// Who asked for a sleep. Only automatic sleep waits for the idle threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,8 +72,11 @@ pub struct SleepFacts {
     /// Text typed into the agent's input that hasn't been submitted.
     pub unsent_text: bool,
     pub pinned: bool,
-    /// The latest work, completion, question or attendance (Unix ms).
+    /// The latest work, completion, question, attendance or wake (Unix ms).
     pub last_active_at: Option<i64>,
+    /// Woken by a machine and not looked at since: automatic sleep gives it
+    /// [`MACHINE_WAKE_IDLE_MINUTES`] in place of the whole threshold.
+    pub machine_woken: bool,
 }
 
 /// Why a pane may not sleep.
@@ -153,7 +163,6 @@ impl ResumeFile {
 /// moon: minutes under an hour (at least 1m), hours under a day, then days.
 /// `None` with no recorded work.
 pub fn asleep_age(activity: &crate::AgentActivity, now: i64) -> Option<String> {
-    const MINUTE_MS: i64 = 60_000;
     const DAY_MS: i64 = 24 * HOUR_MS;
     let age = now.saturating_sub(activity.last_work_at()?).max(0);
     Some(if age < HOUR_MS {
@@ -166,10 +175,15 @@ pub fn asleep_age(activity: &crate::AgentActivity, now: i64) -> Option<String> {
 }
 
 /// Whether an agent last active at `last_active_at` has been idle for at least
-/// `hours`. Zero hours turns automatic sleep off; an unknown age never qualifies.
-pub fn sleep_due(last_active_at: Option<i64>, hours: u32, now: i64) -> bool {
-    hours > 0
-        && last_active_at.is_some_and(|at| now.saturating_sub(at) >= i64::from(hours) * HOUR_MS)
+/// `hours`, or for [`MACHINE_WAKE_IDLE_MINUTES`] when a machine woke it and
+/// nobody has looked at it since (the shorter of the two). Zero hours turns
+/// automatic sleep off; an unknown age never qualifies.
+pub fn sleep_due(last_active_at: Option<i64>, hours: u32, machine_woken: bool, now: i64) -> bool {
+    let mut limit = i64::from(hours) * HOUR_MS;
+    if machine_woken {
+        limit = limit.min(i64::from(MACHINE_WAKE_IDLE_MINUTES) * MINUTE_MS);
+    }
+    hours > 0 && last_active_at.is_some_and(|at| now.saturating_sub(at) >= limit)
 }
 
 /// The first rule that keeps this pane awake, or `None` when it may sleep.
@@ -205,7 +219,7 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
             }
             SleepStatus::Idle | SleepStatus::Done => match request {
                 SleepRequest::Auto { after_hours, now }
-                    if !sleep_due(facts.last_active_at, after_hours, now) =>
+                    if !sleep_due(facts.last_active_at, after_hours, facts.machine_woken, now) =>
                 {
                     SleepRefusal::RecentlyActive
                 }
@@ -217,8 +231,8 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
 }
 
 /// Whether a saved local PTY pane opens dormant instead of starting: it was put
-/// to sleep; or it is an agent idle past the automatic-sleep threshold whose
-/// resume muxel trusts (starting it only for the timer to stop it again would
+/// to sleep; or it is an agent idle past the automatic-sleep threshold (or a
+/// machine's unattended wake past its shorter limit) whose resume muxel trusts (starting it only for the timer to stop it again would
 /// cost a launch and the memory spike sleep exists to avoid); or it is older
 /// than the dormant-restore threshold. Pinned panes always start. The pane
 /// the user is in is not exempt: selecting a pane shows it, and only a
@@ -240,6 +254,7 @@ pub fn opens_dormant(
         && sleep_due(
             instance.activity.last_active_at(),
             settings.sleep_after_hours,
+            instance.activity.machine_woken_unattended(),
             now,
         );
     idle_agent
@@ -258,8 +273,10 @@ mod tests {
         DEFAULT_SLEEP_AFTER_HOURS, HOUR_MS, SleepFacts, SleepRefusal, SleepRequest, SleepStatus,
         opens_dormant, sleep_due, sleep_refusal,
     };
-    use crate::{AgentActivity, AgentActivityState, Instance, Settings};
+    use crate::{AgentActivity, AgentActivityState, Instance, Settings, Waker};
     use uuid::Uuid;
+
+    const MINUTE_MS: i64 = 60 * 1000;
 
     fn sleepy() -> SleepFacts {
         SleepFacts {
@@ -273,6 +290,7 @@ mod tests {
             unsent_text: false,
             pinned: false,
             last_active_at: Some(0),
+            machine_woken: false,
         }
     }
 
@@ -453,7 +471,31 @@ mod tests {
             sleep_refusal(&facts, off),
             Some(SleepRefusal::RecentlyActive)
         );
-        assert!(!sleep_due(Some(0), 0, 99 * HOUR_MS));
+        assert!(!sleep_due(Some(0), 0, false, 99 * HOUR_MS));
+    }
+
+    #[test]
+    fn a_machine_woken_pane_sleeps_after_thirty_idle_minutes() {
+        let at = |now| SleepRequest::Auto {
+            after_hours: 4,
+            now,
+        };
+        let woken = SleepFacts {
+            last_active_at: Some(HOUR_MS),
+            machine_woken: true,
+            ..sleepy()
+        };
+        assert_eq!(
+            sleep_refusal(&woken, at(HOUR_MS + 30 * MINUTE_MS - 1)),
+            Some(SleepRefusal::RecentlyActive)
+        );
+        assert_eq!(sleep_refusal(&woken, at(HOUR_MS + 30 * MINUTE_MS)), None);
+        // The short limit only shortens the setting: zero hours is still off,
+        // and an unknown age still never qualifies.
+        assert!(!sleep_due(Some(0), 0, true, 99 * HOUR_MS));
+        assert!(!sleep_due(None, 4, true, 99 * HOUR_MS));
+        // By hand ignores age either way.
+        assert_eq!(sleep_refusal(&woken, SleepRequest::Pane), None);
     }
 
     #[test]
@@ -533,5 +575,60 @@ mod tests {
         assert!(opens_dormant(&woken, true, &settings, 9 * HOUR_MS));
         // `ctl wake` must not mark the finished turn read.
         assert!(woken.activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn only_a_machine_wake_nobody_has_looked_at_gets_the_short_limit() {
+        let settings = Settings::default();
+        // Finished at hour 0, woken by `ctl wake` at hour 5.
+        let machine = agent(AgentActivity {
+            completed_at: Some(0),
+            woken_at: Some(5 * HOUR_MS),
+            woken_by: Some(Waker::Machine),
+            ..Default::default()
+        });
+        let half_hour = 5 * HOUR_MS + 30 * MINUTE_MS;
+        assert!(!opens_dormant(&machine, true, &settings, half_hour - 1));
+        assert!(opens_dormant(&machine, true, &settings, half_hour));
+        // Its work counts too: 30 minutes from the later of wake and work.
+        let mut worked = machine.clone();
+        worked.activity.completed_at = Some(6 * HOUR_MS);
+        let after_work = 6 * HOUR_MS + 30 * MINUTE_MS;
+        assert!(!opens_dormant(&worked, true, &settings, after_work - 1));
+        assert!(opens_dormant(&worked, true, &settings, after_work));
+        // A look before the wake isn't a look at it.
+        let mut seen_before = machine.clone();
+        seen_before.activity.last_attended_at = Some(4 * HOUR_MS);
+        assert!(opens_dormant(&seen_before, true, &settings, half_hour));
+        // The first look after it makes an ordinary pane: N hours from the look.
+        let mut seen = machine.clone();
+        seen.activity.last_attended_at = Some(5 * HOUR_MS + MINUTE_MS);
+        // Half an hour after the look, where the short limit would end.
+        assert!(!opens_dormant(
+            &seen,
+            true,
+            &settings,
+            half_hour + MINUTE_MS
+        ));
+        assert!(!opens_dormant(
+            &seen,
+            true,
+            &settings,
+            9 * HOUR_MS + MINUTE_MS - 1
+        ));
+        assert!(opens_dormant(
+            &seen,
+            true,
+            &settings,
+            9 * HOUR_MS + MINUTE_MS
+        ));
+        // The user's own wake, and an older save that never said who woke it,
+        // get the whole threshold.
+        for by in [Some(Waker::User), None] {
+            let mut user = machine.clone();
+            user.activity.woken_by = by;
+            assert!(!opens_dormant(&user, true, &settings, 9 * HOUR_MS - 1));
+            assert!(opens_dormant(&user, true, &settings, 9 * HOUR_MS));
+        }
     }
 }

@@ -921,8 +921,15 @@ impl MuxelApp {
                                 } else {
                                     // `focus` opens on purpose, so it wakes an
                                     // asleep pane, where selecting by hand
-                                    // only shows it.
-                                    this.wake_and_show(iid, window, cx);
+                                    // only shows it. Like anything through
+                                    // ctl, it is a machine's wake until the
+                                    // user looks at the live pane.
+                                    this.wake_and_show(
+                                        iid,
+                                        super::sleep::WakeCause::CtlFocus,
+                                        window,
+                                        cx,
+                                    );
                                 }
                                 this.persist();
                                 window.activate_window();

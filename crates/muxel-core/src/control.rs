@@ -1796,11 +1796,14 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
-  waking it through normal restore if asleep. This changes keyboard focus.
+  waking it through normal restore if asleep. This changes keyboard focus. A
+  pane it wakes sleeps again after 30 idle minutes unless the user looks at it.
 - `muxel ctl wake AGENT` - wake an asleep pane in the background on
   its saved conversation, leaving focus, the window and the active tab alone.
   Replies `{woken: true, status: "starting"}`, or `{woken: false,
   already_running: true, status}` when it already runs, so a retry is harmless.
+  Until the user looks at it, the pane sleeps again after 30 idle minutes,
+  counted from the wake or its latest work, so deliver what you woke it for.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
   new tab: in your own pane's group when you run it from one of that project's

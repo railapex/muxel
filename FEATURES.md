@@ -97,14 +97,16 @@ feature is added or changed, update the matching entry here in the same change**
   seconds) and its pane stays, asleep, and resumes the same conversation when
   woken, across restarts too. Asleep and dormant panes look the same: a muted
   one-line row with an outlined moon-and-age pill (plus `∅`, "no history" and
-  **Start fresh** when the saved conversation is gone) and a moon on the tab. Selecting one shows it without starting it, so clicking through
+  **Start fresh** when the saved conversation is gone) and a moon on the tab.
+  Selecting one shows it without starting it, so clicking through
   sleeping rows costs nothing; Enter or typing in it, its Wake button, the
   Wake its row's pill turns into on hover, or Wake in the row menu starts it,
   and its face stays up ("Waking…") until the terminal draws. A pane's own
   Sleep leaves you in it, on its face. Sleep a pane from its sidebar
   menu, a whole project's idle agents from the project menu, or let Settings →
   Behavior do it after N hours idle (on, 4 hours, by default); every wake
-  restarts that clock. Working, asking,
+  restarts that clock, and a pane woken through ctl sleeps again after 30
+  idle minutes unless you look at it. Working, asking,
   background-held, pinned and drafting agents, the focused agent (unless its
   own Sleep is chosen), agents without a saved
   conversation (or whose provider deleted its file), shells, and remote or tmux

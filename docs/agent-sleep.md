@@ -88,10 +88,21 @@ that lands for the pane clears the mark. Waking it during the quit grace ends
 the old process first, so two copies never run on one conversation.
 
 Every wake (see [Waking an asleep pane](#waking-an-asleep-pane)) records
-`activity.woken_at`, and the idle timer counts from it. A woken pane therefore
-runs at least N hours before the timer can sleep it again, even if nobody
-types into it, and a restart in that time starts it rather than leaving it
-dormant.
+`activity.woken_at` and who woke it (`activity.woken_by`), and the idle timer
+counts from it. A wake by the user's own input in muxel (Enter, typing, Wake,
+pinning) gets the whole threshold: the pane runs at least N hours before the timer can
+sleep it again, even if nobody types into it, and a restart in that time
+starts it rather than leaving it asleep.
+
+Anything through ctl (`ctl wake`, `ctl focus`) is a machine's wake, for one
+job, so until someone looks at the pane it sleeps after 30 idle minutes (or N hours, if shorter), counted from the
+later of the wake and its last work. Holding an agent's memory for four hours
+after every scripted wake would cost hours of it each time. The first time the
+user focuses the live pane, it becomes an ordinary pane on the whole
+threshold. A look before the wake doesn't count, and a restart applies the
+same limit. Thirty minutes is a guess: each wake writes
+`wake: "NAME" [ID] by CAUSE (user|machine)` to the event log, which shows how
+often a second job arrives after the short limit.
 
 ## How an asleep pane looks
 
@@ -167,9 +178,10 @@ changing the active tab or marking its notifications read. Replies:
   `failed` for a failed launch, none for a pane not started this session),
   `exited`, `closing`, and `control_disabled`.
 
-Waking isn't attendance: it marks nothing read. Like any wake, it restarts the
-idle clock, which leaves the caller N hours to deliver what it woke the pane
-for. A wake never mints a new conversation id for a conversation that still
+Waking isn't attendance: it marks nothing read. It is a machine's wake, so it
+leaves the caller 30 idle minutes, counted again from each piece of work, to
+deliver what it woke the pane for, unless the user looks at the pane in that
+time. A wake never mints a new conversation id for a conversation that still
 exists.
 
 A pane can sleep for longer than its provider keeps the file, so a wake can

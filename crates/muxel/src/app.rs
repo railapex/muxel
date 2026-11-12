@@ -24268,7 +24268,7 @@ impl MuxelApp {
             inst.pinned = !inst.pinned;
         }
         if self.tab_is_pinned(iid) {
-            self.start_dormant(iid, window, cx);
+            self.start_dormant(iid, sleep::WakeCause::Pin, window, cx);
         }
         self.reflow_pins(iid);
         self.persist();
@@ -25684,9 +25684,9 @@ impl MuxelApp {
                 .label(if gone { t("Start fresh") } else { t("Wake") })
                 // Typing in the pane wakes it too.
                 .tooltip(t("Enter"))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.wake_and_show(iid, window, cx)),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.wake_and_show(iid, sleep::WakeCause::Button, window, cx)
+                }))
                 .into_any_element()
         };
         div()
@@ -29150,7 +29150,12 @@ impl MuxelApp {
                                                 .on_click(window.listener_for(
                                                     &entity,
                                                     move |this, _, window, cx| {
-                                                        this.wake_and_show(iid, window, cx)
+                                                        this.wake_and_show(
+                                                            iid,
+                                                            sleep::WakeCause::Button,
+                                                            window,
+                                                            cx,
+                                                        )
                                                     },
                                                 )),
                                         ),
