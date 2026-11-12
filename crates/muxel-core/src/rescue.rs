@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
+use uuid::Uuid;
 
 /// How long input must stop before a pane's draft is read and saved.
 pub const DRAFT_DEBOUNCE: Duration = Duration::from_millis(1000);
@@ -1102,15 +1103,48 @@ pub fn backup_offer(
     }
 }
 
+/// The panes the crash notice's Review visits, in `order` (the workspace's
+/// projects and their layouts): the panes in `working` (mid-turn at the last
+/// save), then the panes in `unsent` (holding an unsent prompt) not already
+/// visited. A pane no longer in `order` is skipped.
+pub fn review_order(order: &[Uuid], working: &[Uuid], unsent: &[Uuid]) -> Vec<Uuid> {
+    let mut steps: Vec<Uuid> = order
+        .iter()
+        .copied()
+        .filter(|iid| working.contains(iid))
+        .collect();
+    steps.extend(
+        order
+            .iter()
+            .copied()
+            .filter(|iid| unsent.contains(iid) && !working.contains(iid)),
+    );
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BackupOffer, DRAFT_DEBOUNCE, DraftAction, DraftRead, DraftTracker, EditorBackup, FileStamp,
         Joined, MAX_RESCUE_BYTES, PASTE_LOG_BYTES, PASTE_LOG_ENTRIES, PasteLog, PromptDraft,
         RowWidths, TypedDraft, backup_offer, debounce_remaining, input_newlines, join_rows,
-        merge_clipped, still_shows_sent, substitute_pastes, typed_matches,
+        merge_clipped, review_order, still_shows_sent, substitute_pastes, typed_matches,
     };
     use std::time::Duration;
+    use uuid::Uuid;
+
+    #[test]
+    fn review_visits_working_panes_then_unsent_ones_each_once_in_layout_order() {
+        let [a, b, c, d, gone] = std::array::from_fn(|_| Uuid::new_v4());
+        let order = [a, b, c, d];
+        // Working first, then unsent, each in layout order; a pane in both is
+        // visited once, with the working ones; a closed pane is skipped.
+        assert_eq!(
+            review_order(&order, &[c, a, gone], &[d, b, c]),
+            vec![a, c, b, d]
+        );
+        assert_eq!(review_order(&order, &[], &[gone]), Vec::<Uuid>::new());
+    }
 
     #[test]
     fn a_box_still_shows_what_was_sent_until_it_shows_other_text() {

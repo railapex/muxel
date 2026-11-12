@@ -43,8 +43,10 @@ pub(super) struct Rescue {
     /// a pane's older offers under its row.
     pub(super) whole: HashSet<std::path::PathBuf>,
     /// What muxel kept when this workspace last stopped without closing
-    /// cleanly, until dismissed.
+    /// cleanly, until dismissed or reviewed.
     pub(super) crash: Option<CrashNotice>,
+    /// Panes the crash notice's Review has already taken you to.
+    pub(super) reviewed: HashSet<Uuid>,
 }
 
 /// The one notice after an unclean exit.
@@ -549,6 +551,7 @@ impl MuxelApp {
     /// that no longer exist, and list closed panes' drafts.
     pub(super) fn load_workspace_rescue(&mut self, crash: Option<CrashNotice>) {
         self.rescue.crash = crash;
+        self.rescue.reviewed.clear();
         let Some(dir) = self.rescue_dir() else {
             return;
         };
@@ -846,56 +849,161 @@ impl MuxelApp {
         Some(row.child(list).into_any_element())
     }
 
-    /// The crash notice's text: `Unclean exit · 1 unsent prompt · Working at
-    /// last save: Claude 2`, naming the mid-turn panes still in the workspace.
+    /// The names of the panes the last save recorded as working, those still
+    /// in the workspace.
+    pub(super) fn crash_names(&self, notice: &CrashNotice) -> Vec<&str> {
+        notice
+            .mid_turn
+            .iter()
+            .filter_map(|&iid| self.workspace.instance(iid))
+            .map(|instance| instance.display_name())
+            .collect()
+    }
+
+    /// The crash notice's text: `Unclean exit · 2 unsent · 1 unsaved file ·
+    /// 2 were working`. Hovering it names the working panes.
     pub(super) fn crash_label(&self, notice: &CrashNotice) -> String {
         let mut parts = vec![t("Unclean exit").to_string()];
         if notice.drafts > 0 {
             parts.push(tn(
-                "{n} unsent prompt",
-                "{n} unsent prompts",
+                "{n} unsent",
+                "{n} unsent",
                 notice.drafts,
                 &[("n", &notice.drafts.to_string())],
             ));
         }
         if notice.editors > 0 {
             parts.push(tn(
-                "{n} editor's unsaved changes",
-                "{n} editors' unsaved changes",
+                "{n} unsaved file",
+                "{n} unsaved files",
                 notice.editors,
                 &[("n", &notice.editors.to_string())],
             ));
         }
-        let names: Vec<&str> = notice
-            .mid_turn
-            .iter()
-            .filter_map(|&iid| self.workspace.instance(iid))
-            .map(|instance| instance.display_name())
-            .collect();
-        if !names.is_empty() {
-            // The workspace's last save, not the moment it stopped.
-            parts.push(tf(
-                "Working at last save: {names}",
-                &[("names", &names.join(", "))],
+        let working = self.crash_names(notice).len();
+        if working > 0 {
+            // As of the workspace's last save, not the moment it stopped.
+            parts.push(tn(
+                "{n} was working",
+                "{n} were working",
+                working,
+                &[("n", &working.to_string())],
             ));
         }
         parts.join(" · ")
     }
 
+    /// The panes Review visits, in project and layout order: those working
+    /// at the last save, then those holding an unsent prompt.
+    pub(super) fn crash_review_steps(&self, notice: &CrashNotice) -> Vec<Uuid> {
+        let order: Vec<Uuid> = self
+            .workspace
+            .projects
+            .iter()
+            .flat_map(|project| project.instances())
+            .collect();
+        let unsent: Vec<Uuid> = self
+            .rescue
+            .offers
+            .iter()
+            .filter(|(_, offers)| !offers.is_empty())
+            .map(|(&iid, _)| iid)
+            .collect();
+        muxel_core::rescue::review_order(&order, &notice.mid_turn, &unsent)
+    }
+
+    /// Take Review's next step: focus the next pane not yet visited. The
+    /// step to the last one also closes the notice.
+    pub(super) fn review_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.rescue.crash.as_ref() else {
+            return;
+        };
+        let steps = self.crash_review_steps(notice);
+        let next = steps
+            .iter()
+            .copied()
+            .find(|iid| !self.rescue.reviewed.contains(iid));
+        if let Some(iid) = next {
+            self.rescue.reviewed.insert(iid);
+        }
+        if steps.iter().all(|iid| self.rescue.reviewed.contains(iid)) {
+            self.rescue.crash = None;
+        }
+        if let Some(iid) = next {
+            self.select_instance(iid, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The crash notice in the title bar, until dismissed or reviewed.
     fn render_crash_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let notice = self.rescue.crash.as_ref()?;
+        let steps = self.crash_review_steps(notice);
+        let seen = steps
+            .iter()
+            .filter(|iid| self.rescue.reviewed.contains(iid))
+            .count();
+        let names = self.crash_names(notice).join(", ");
+        let label = div()
+            .id("rescue-crash-label")
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_xs()
+            .child(self.crash_label(notice));
+        let label = if names.is_empty() {
+            label
+        } else {
+            let tip: SharedString =
+                tf("Working at last save: {names}", &[("names", &names)]).into();
+            label.tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+        };
+        let review = (!steps.is_empty()).then(|| {
+            let text: SharedString = if seen == 0 {
+                t("Review")
+            } else {
+                tf(
+                    "Next {i}/{n}",
+                    &[
+                        ("i", &(seen + 1).to_string()),
+                        ("n", &steps.len().to_string()),
+                    ],
+                )
+                .into()
+            };
+            Button::new("rescue-crash-review")
+                .primary()
+                .xsmall()
+                .label(text)
+                .on_click(cx.listener(|this, _, window, cx| this.review_crash(window, cx)))
+        });
         Some(
             div()
+                .id("rescue-crash-notice")
                 .flex()
                 .items_center()
-                .justify_between()
-                .gap_2()
-                .child(div().child(self.crash_label(notice)))
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .max_w(px(440.0))
+                .min_w_0()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().warning)
+                // The title bar is a drag region: claim presses over the
+                // notice so its buttons don't start a window move.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+                .children(review)
                 .child(
                     Button::new("rescue-crash-dismiss")
                         .ghost()
                         .xsmall()
-                        .label(t("Dismiss"))
+                        .icon(IconName::Close)
+                        .tooltip(t("Dismiss"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.rescue.crash = None;
                             cx.notify();
@@ -905,25 +1013,36 @@ impl MuxelApp {
         )
     }
 
-    /// The strip under the title bar: the crash notice, and one line for
-    /// closed panes' drafts that opens a list of them, each with its text.
-    /// The open list pushes the panes down instead of drawing over them, so
-    /// browser panes need no overlay flag for it.
+    /// The title bar's one slot: a close's Undo chip while it counts down or
+    /// is checked, otherwise the crash notice.
+    pub(super) fn render_title_slot(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.close_groups.is_empty()
+            && self.close_requests.is_empty()
+            && let Some(notice) = self.render_crash_notice(cx)
+        {
+            return notice;
+        }
+        self.render_close_chip(cx)
+    }
+
+    /// The strip under the title bar: one line for closed panes' drafts that
+    /// opens a list of them, each with its text. The open list pushes the
+    /// panes down instead of drawing over them, so browser panes need no
+    /// overlay flag for it.
     pub(super) fn render_rescue_strip(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let crash = self.render_crash_notice(cx);
         let closed = if self.rescue.closed_hidden {
             &[][..]
         } else {
             &self.rescue.closed[..]
         };
-        if crash.is_none() && closed.is_empty() {
+        if closed.is_empty() {
             return None;
         }
-        let strip = div()
+        let mut strip = div()
             .flex_none()
             .flex()
             .flex_col()
@@ -934,10 +1053,6 @@ impl MuxelApp {
             .bg(cx.theme().secondary)
             .border_b_1()
             .border_color(cx.theme().border);
-        let mut strip = strip.children(crash);
-        if closed.is_empty() {
-            return Some(strip.into_any_element());
-        }
         let open = self.rescue.closed_open;
         let count = closed.len();
         strip =

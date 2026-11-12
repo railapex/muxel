@@ -1769,9 +1769,14 @@ feature is added or changed, update the matching entry here in the same change**
   straight after Restore still finds them. Saving, reloading or closing without saving
   deletes the backup, and a backup write still on its way can't bring it back.
 - **Crash notice** — after muxel stops without closing a workspace cleanly, the
-  next time it opens one, a line under the title bar reads **Unclean exit**,
-  then how many unsent prompts and editors were kept and which agents were
-  working when muxel last saved the workspace.
+  next time it opens one, the title bar reads **Unclean exit**, then how many
+  unsent prompts and unsaved files were kept and how many agents were working
+  when muxel last saved the workspace (hover for their names). **Review** takes
+  you to each of those panes in turn, working ones first, and the notice goes
+  with the last; × dismisses it. A close's Undo chip takes the slot while it
+  counts down, and the notice comes back after. In a narrow window the
+  workspace name gives way first, then the notice's words shorten; Review, ×
+  and the window buttons stay.
 - **Rescue storage** — unsent prompts and editor backups are private files
   beside the workspace, written atomically, never logged, and capped at 2 MB per
   prompt and 8 MB per editor backup. Each pane keeps one live copy of its prompt,

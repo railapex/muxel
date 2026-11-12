@@ -11,6 +11,7 @@ use crate::editor::{ExternalChange, read_disk_change};
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
 use muxel_core::rescue::{DraftSource, PromptDraft};
+use muxel_core::{SplitDirection, split};
 use muxel_store::rescue::RescueDir;
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession};
 use std::path::PathBuf;
@@ -1197,7 +1198,19 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
         agent.activity.last_state = Some(muxel_core::AgentActivityState::Working);
         let agent_id = agent.id;
         doc.add_instance(agent);
-        doc.project_mut(project).unwrap().layout = Some(PaneNode::leaf(agent_id));
+        let mut second = Instance::shell(project);
+        second.title = "Codex 1".into();
+        second.activity.last_state = Some(muxel_core::AgentActivityState::Working);
+        let second_id = second.id;
+        doc.add_instance(second);
+        let layout = &mut doc.project_mut(project).unwrap().layout;
+        *layout = Some(PaneNode::leaf(agent_id));
+        assert!(split(
+            layout,
+            agent_id,
+            SplitDirection::Horizontal,
+            second_id
+        ));
         muxel_store::save_workspace_to(&muxel_store::workspace_doc_path(crashed).unwrap(), &doc)
             .unwrap();
         let draft = PromptDraft {
@@ -1232,12 +1245,30 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
                     CrashNotice {
                         drafts: 1,
                         editors: 0,
-                        mid_turn: vec![agent_id],
+                        mid_turn: vec![agent_id, second_id],
                     }
                 );
-                let label = app.crash_label(&notice);
-                assert!(label.contains("1 unsent prompt"), "{label}");
-                assert!(label.contains("Claude 2"), "{label}");
+                assert_eq!(
+                    app.crash_label(&notice),
+                    "Unclean exit · 1 unsent · 2 were working"
+                );
+                assert_eq!(app.crash_names(&notice), ["Claude 2", "Codex 1"]);
+                let files = CrashNotice {
+                    drafts: 0,
+                    editors: 2,
+                    mid_turn: Vec::new(),
+                };
+                assert_eq!(app.crash_label(&files), "Unclean exit · 2 unsaved files");
+
+                // Review takes you to each pane in turn; the step to the last
+                // one closes the notice.
+                assert_eq!(app.crash_review_steps(&notice), [agent_id, second_id]);
+                app.review_crash(window, cx);
+                assert_eq!(app.active_instance, Some(agent_id));
+                assert!(app.rescue.crash.is_some(), "one pane still to see");
+                app.review_crash(window, cx);
+                assert_eq!(app.active_instance, Some(second_id));
+                assert!(app.rescue.crash.is_none(), "reviewed: the notice goes");
 
                 // Leaving cleanly and coming back: no notice.
                 app.enter_workspace(other, window, cx);
