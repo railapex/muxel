@@ -127,6 +127,10 @@ pub enum Command {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// Deliberately open an existing pane, waking it if asleep.
+    Focus { agent: String },
+    /// Wake an asleep pane in the background, without focusing it.
+    Wake { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
         agent: String,
@@ -484,6 +488,16 @@ pub struct AgentInfo {
     /// `None` for editors and browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentState>,
+    /// Why a terminal is not running. `dormant` and `sleeping` mean it starts
+    /// when woken (Enter or typing in it, Wake, `focus` or `wake`); selecting
+    /// it in muxel only shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_running_reason: Option<String>,
+    /// For an asleep agent: whether waking it resumes its conversation
+    /// (`false` when the saved conversation is gone), checked
+    /// when asked. Absent while it runs, or when muxel can't tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<bool>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -534,14 +548,7 @@ pub fn short_id(id: Uuid) -> String {
 
 /// The latest lifecycle transition an agent has recorded (unix ms).
 pub fn status_since(activity: &AgentActivity) -> Option<i64> {
-    [
-        activity.work_started_at,
-        activity.completed_at,
-        activity.blocked_at,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    activity.last_work_at()
 }
 
 /// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has
@@ -1325,6 +1332,8 @@ usage: muxel ctl <command> [args]
                                  --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
+  focus AGENT                    open a pane; wake it if asleep
+  wake AGENT                     wake an asleep pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
@@ -1398,6 +1407,10 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "status" => {
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
         }
+        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, waking it if asleep.",
+        "wake" => {
+            "usage: muxel ctl wake AGENT\nWake an asleep pane in the background; focus stays where it is."
+        }
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
         }
@@ -1434,6 +1447,8 @@ fn unknown_command_error(command: &str) -> String {
             "new",
             "new-status",
             "status",
+            "focus",
+            "wake",
             "show",
             "screen",
             "send",
@@ -1570,6 +1585,18 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             at_most(1)?;
             Command::Status {
                 agent: words.first().cloned(),
+            }
+        }
+        "focus" => {
+            at_most(1)?;
+            Command::Focus {
+                agent: agent(&words)?,
+            }
+        }
+        "wake" => {
+            at_most(1)?;
+            Command::Wake {
+                agent: agent(&words)?,
             }
         }
         "show" => {
@@ -1768,6 +1795,15 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
+  waking it through normal restore if asleep. This changes keyboard focus. A
+  pane it wakes sleeps again after 30 idle minutes unless the user looks at it.
+- `muxel ctl wake AGENT` - wake an asleep pane in the background on
+  its saved conversation, leaving focus, the window and the active tab alone.
+  Replies `{woken: true, status: "starting"}`, or `{woken: false,
+  already_running: true, status}` when it already runs, so a retry is harmless.
+  Until the user looks at it, the pane sleeps again after 30 idle minutes,
+  counted from the wake or its latest work, so deliver what you woke it for.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
   new tab: in your own pane's group when you run it from one of that project's
@@ -1995,8 +2031,23 @@ hosts ignore this caller ID, so check the target when driving one.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; the user has
-  to open it in muxel.
+  start. `not_running` - the pane hasn't been started this session; selecting it
+  in muxel only shows it, so the user wakes it there (Enter, typing or Wake) or
+  you call `focus` or `wake`.
+
+Old local sessions may open asleep, and idle ones may be put to sleep: `status`
+and `panes` report `status: "not_running"` with `not_running_reason: "dormant"`
+(asleep since launch) or `"sleeping"` (put to sleep by the user or the idle
+timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
+refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
+and resumes the session; `wake` resumes it without focusing it, then `status`
+moves from `starting` to idle with a new `launch_id`.
+For an asleep agent, `status` and `panes` also report `resumes`,
+checked on disk when you ask: `true` when a wake brings its conversation back,
+`false` when it will start a new one (the provider deleted the saved
+conversation, or muxel never captured one). It is left out when muxel can't tell
+(Grok, whose files muxel can't locate) and while the agent runs.
+An approved `new --focus` also leaves other asleep sessions alone.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to
@@ -2435,6 +2486,8 @@ mod tests {
             model: None,
             is_agent: true,
             status: Some(AgentState::NotRunning),
+            not_running_reason: None,
+            resumes: None,
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
@@ -2895,6 +2948,29 @@ Steps:
     #[test]
     fn cli_parses_commands_flags_and_literal_text() {
         assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
+        assert_eq!(
+            parse_cli(&words(&["focus", "old-session"])),
+            Ok(CliCommand::Request(Command::Focus {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["focus"])).is_err());
+        assert!(parse_cli(&words(&["focus", "a", "b"])).is_err());
+        assert_eq!(
+            parse_cli(&words(&["wake", "old-session"])),
+            Ok(CliCommand::Request(Command::Wake {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["wake"])).is_err());
+        assert!(parse_cli(&words(&["wake", "a", "b"])).is_err());
+        // Wire sends the wire form directly.
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"cmd":"wake","agent":"abcd1234"}"#).unwrap(),
+            Command::Wake {
+                agent: "abcd1234".into()
+            }
+        );
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))

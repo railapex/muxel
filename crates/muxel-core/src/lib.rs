@@ -33,6 +33,7 @@ pub mod rescue;
 pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
+pub mod sleep;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -55,7 +56,7 @@ pub use agent::{
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
     find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
     memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args, stored_claude_session_path,
+    resolve_launch_for_session, resume_trusted, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -110,10 +111,31 @@ pub struct AgentActivity {
     pub blocked_at: Option<i64>,
     #[serde(default)]
     pub last_attended_at: Option<i64>,
+    /// When the pane was last woken from sleep or dormancy (Enter or typing
+    /// in it, Wake, pinning, `ctl focus` or `ctl wake`). It counts toward idle
+    /// time only, so a wake restarts the automatic-sleep clock, across
+    /// restarts too, without marking a completion read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_at: Option<i64>,
+    /// Who made that wake. A machine's wake that nobody has looked at since
+    /// gets a short idle limit ([`crate::sleep::MACHINE_WAKE_IDLE_MINUTES`]) in place
+    /// of the whole threshold. Older saves have none, which reads as the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_by: Option<Waker>,
     /// Latest lifecycle state, independent from whether its notification was read.
     /// Older workspaces infer it from their existing transition timestamps.
     #[serde(default)]
     pub last_state: Option<AgentActivityState>,
+}
+
+/// Who woke an asleep pane: the user, by their own input in muxel (Enter or
+/// typing in it, Wake, pinning), or a machine, by anything through ctl (`ctl
+/// wake`, `ctl focus`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waker {
+    User,
+    Machine,
 }
 
 /// Provider-neutral lifecycle state used by the persisted activity reducer.
@@ -127,11 +149,30 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    /// Latest work, completion or blocked transition, in Unix milliseconds.
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
             .max()
+    }
+
+    /// Latest work transition, deliberate attendance or wake, in Unix
+    /// milliseconds: how long ago anyone, agent or user, last did anything in
+    /// the pane.
+    pub fn last_active_at(&self) -> Option<i64> {
+        self.last_work_at()
+            .max(self.last_attended_at)
+            .max(self.woken_at)
+    }
+
+    /// Woken by a machine, and nobody has looked at the pane since: it woke
+    /// for one job. The first look makes it an ordinary pane again.
+    pub fn machine_woken_unattended(&self) -> bool {
+        self.woken_by == Some(Waker::Machine)
+            && self
+                .woken_at
+                .is_some_and(|woken| self.last_attended_at.is_none_or(|seen| seen < woken))
     }
 
     pub fn current_state(&self) -> Option<AgentActivityState> {
@@ -231,7 +272,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -267,6 +308,93 @@ fn state_with_age(state: &str, at: Option<i64>, now: i64) -> String {
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
+
+/// Defer an old local PTY until opened. Unknown ages start normally; attendance
+/// does not count as work. Active and pinned panes always start.
+pub fn should_restore_dormant(
+    activity: &AgentActivity,
+    days: u32,
+    now: i64,
+    active: bool,
+    pinned: bool,
+) -> bool {
+    days > 0
+        && !active
+        && !pinned
+        && activity
+            .last_work_at()
+            .is_some_and(|at| now.saturating_sub(at) >= i64::from(days) * DAY_MS)
+}
+
+#[cfg(test)]
+mod dormant_restore_tests {
+    use super::{AgentActivity, DAY_MS, Settings, should_restore_dormant};
+
+    #[test]
+    fn dormant_threshold_uses_latest_work_and_includes_exact_boundary() {
+        let activity = AgentActivity {
+            work_started_at: Some(DAY_MS),
+            completed_at: Some(2 * DAY_MS),
+            blocked_at: Some(3 * DAY_MS),
+            last_attended_at: Some(9 * DAY_MS),
+            ..Default::default()
+        };
+        assert_eq!(activity.last_work_at(), Some(3 * DAY_MS));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS - 1,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            2 * DAY_MS,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn dormant_restore_exempts_active_pinned_unknown_and_disabled() {
+        let old = AgentActivity {
+            completed_at: Some(0),
+            ..Default::default()
+        };
+        for (days, active, pinned) in [(0, false, false), (3, true, false), (3, false, true)] {
+            assert!(!should_restore_dormant(
+                &old,
+                days,
+                9 * DAY_MS,
+                active,
+                pinned
+            ));
+        }
+        assert!(!should_restore_dormant(
+            &AgentActivity::default(),
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert_eq!(Settings::default().dormant_after_days, 0);
+    }
+}
 
 fn age_millis(at: Option<i64>, now: i64) -> Option<i64> {
     at.map(|at| now.saturating_sub(at).max(0))
@@ -626,6 +754,10 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// When this local agent was put to sleep (Unix ms): its program was ended
+    /// and it stays dormant, across restarts too, until it is opened or woken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -737,6 +869,8 @@ impl Instance {
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        // A copy of a sleeping pane is a new conversation, started on creation.
+        self.asleep_since = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -801,6 +935,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 
@@ -870,6 +1005,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 }
@@ -1322,6 +1458,11 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+    /// The pane that had keyboard focus at the last save, when it was awake
+    /// (running or starting); None when it was asleep. A relaunch starts this
+    /// one pane whatever its idle age (`sleep::opens_dormant`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awake_focus: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -2679,6 +2820,13 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Open old local PTY sessions asleep, until woken. Zero disables dormancy.
+    #[serde(default)]
+    pub dormant_after_days: u32,
+    /// Put local agents to sleep once idle this many hours (see [`sleep`]).
+    /// Zero turns automatic sleep off; sleeping by hand still works.
+    #[serde(default = "default_sleep_after_hours")]
+    pub sleep_after_hours: u32,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -2974,6 +3122,10 @@ pub struct Settings {
 /// the limit from running out.
 pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
 
+fn default_sleep_after_hours() -> u32 {
+    sleep::DEFAULT_SLEEP_AFTER_HOURS
+}
+
 fn default_pane_memory_limit_gb() -> u32 {
     DEFAULT_PANE_MEMORY_LIMIT_GB
 }
@@ -3239,6 +3391,8 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            dormant_after_days: 0,
+            sleep_after_hours: default_sleep_after_hours(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,

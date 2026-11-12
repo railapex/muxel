@@ -83,6 +83,39 @@ feature is added or changed, update the matching entry here in the same change**
   silent program can't keep the window redrawing. Editors, diffs and browsers open
   without waiting on terminals, and switching projects cancels the old project's
   pending waves.
+- **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can leave sessions not worked
+  on in N days asleep (off by default; enabling starts at 3 days).
+  Old local PTY panes retain their name, lifecycle status and age and open
+  asleep, without starting a process. Selecting
+  one only shows it; Enter or typing in it, Wake, pinning or `ctl focus`
+  resumes it through the normal restore path. Pinned panes, panes with no
+  work history, and the pane awake in front when muxel quit always start (one
+  asleep then stays asleep); SSH and local tmux
+  restores keep their existing behavior. `ctl status`/`panes` expose
+  `not_running_reason: "dormant"`; typing commands refuse without waking it.
+- **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
+  put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
+  seconds) and its pane stays, asleep, and resumes the same conversation when
+  woken, across restarts too. Asleep and dormant panes look the same: a muted
+  one-line row with an outlined moon-and-age pill (plus `∅`, "no history" and
+  **Start fresh** when the saved conversation is gone) and a moon on the tab.
+  Selecting one shows it without starting it, so clicking through
+  sleeping rows costs nothing; Enter or typing in it, its Wake button, the
+  Wake its row's pill turns into on hover, or Wake in the row menu starts it,
+  and its face stays up ("Waking…") until the terminal draws. A pane's own
+  Sleep leaves you in it, on its face. Sleep a pane from its sidebar
+  menu, a whole project's idle agents from the project menu, or let Settings →
+  Behavior do it after N hours idle (on, 4 hours, by default); every wake
+  restarts that clock, and a pane woken through ctl sleeps again after 30
+  idle minutes unless you look at it. Working, asking,
+  background-held, pinned and drafting agents, the focused agent (unless its
+  own Sleep is chosen), agents without a saved
+  conversation (or whose provider deleted its file), shells, and remote or tmux
+  panes stay running. `ctl status` reports `not_running_reason: "sleeping"` and
+  whether a wake `resumes` the conversation, and `ctl wake AGENT` resumes one
+  without moving focus. A wake that finds the saved conversation deleted
+  starts a new one in the same folder, and Notifications says "started fresh ·
+  no history".
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
