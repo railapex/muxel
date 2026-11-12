@@ -3,6 +3,7 @@
 //! the facts and does the stopping.
 
 use crate::{Instance, Settings, is_known_agent_program, should_restore_dormant};
+use uuid::Uuid;
 
 /// How long an agent stays idle before automatic sleep, unless the user picks
 /// another value. Long enough that a pane touched this morning is still running
@@ -234,11 +235,14 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
 /// to sleep; or it is an agent idle past the automatic-sleep threshold (or a
 /// machine's unattended wake past its shorter limit) whose resume muxel trusts (starting it only for the timer to stop it again would
 /// cost a launch and the memory spike sleep exists to avoid); or it is older
-/// than the dormant-restore threshold. Pinned panes always start. The pane
-/// the user is in is not exempt: selecting a pane shows it, and only a
-/// deliberate wake starts it, so the active pane opens asleep like any other.
+/// than the dormant-restore threshold. Pinned panes always start, and so does
+/// `awake_focus`, the one pane that had keyboard focus at quit while awake,
+/// whatever its idle age: coming back to an asleep pane in front is odd. A pane
+/// asleep at quit stays asleep even in front, and each project's last focused
+/// pane opens like any other.
 pub fn opens_dormant(
     instance: &Instance,
+    awake_focus: Option<Uuid>,
     resume_trusted: bool,
     settings: &Settings,
     now: i64,
@@ -248,6 +252,9 @@ pub fn opens_dormant(
     }
     if instance.asleep_since.is_some() {
         return true;
+    }
+    if awake_focus == Some(instance.id) {
+        return false;
     }
     let idle_agent = resume_trusted
         && is_known_agent_program(instance.program.as_deref())
@@ -529,12 +536,38 @@ mod tests {
             completed_at: Some(9 * HOUR_MS),
             ..Default::default()
         });
-        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
+        assert!(!opens_dormant(&slept, None, true, &settings, 9 * HOUR_MS));
         slept.asleep_since = Some(9 * HOUR_MS);
         // Neither threshold applies: the sleep itself keeps it dormant.
-        assert!(opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
+        assert!(opens_dormant(&slept, None, true, &settings, 9 * HOUR_MS));
         slept.pinned = true;
-        assert!(!opens_dormant(&slept, true, &settings, 9 * HOUR_MS));
+        assert!(!opens_dormant(&slept, None, true, &settings, 9 * HOUR_MS));
+    }
+
+    #[test]
+    fn the_pane_awake_in_front_at_quit_starts_whatever_its_idle_age() {
+        let settings = Settings {
+            dormant_after_days: 1,
+            ..Settings::default()
+        };
+        let mut old = agent(AgentActivity {
+            completed_at: Some(0),
+            ..Default::default()
+        });
+        let late = 30 * 24 * HOUR_MS;
+        assert!(opens_dormant(&old, None, true, &settings, late));
+        assert!(!opens_dormant(&old, Some(old.id), true, &settings, late));
+        // Another pane in front exempts nothing.
+        assert!(opens_dormant(
+            &old,
+            Some(Uuid::new_v4()),
+            true,
+            &settings,
+            late
+        ));
+        // Asleep at quit, it stays asleep even in front.
+        old.asleep_since = Some(HOUR_MS);
+        assert!(opens_dormant(&old, Some(old.id), true, &settings, late));
     }
 
     #[test]
@@ -546,18 +579,18 @@ mod tests {
             ..Default::default()
         });
         // Attendance counts as activity: idle since hour 1, due at hour 5.
-        assert!(!opens_dormant(&old, true, &settings, 5 * HOUR_MS - 1));
-        assert!(opens_dormant(&old, true, &settings, 5 * HOUR_MS));
-        assert!(!opens_dormant(&old, false, &settings, 5 * HOUR_MS));
+        assert!(!opens_dormant(&old, None, true, &settings, 5 * HOUR_MS - 1));
+        assert!(opens_dormant(&old, None, true, &settings, 5 * HOUR_MS));
+        assert!(!opens_dormant(&old, None, false, &settings, 5 * HOUR_MS));
         let mut shell = old.clone();
         shell.program = None;
-        assert!(!opens_dormant(&shell, true, &settings, 5 * HOUR_MS));
+        assert!(!opens_dormant(&shell, None, true, &settings, 5 * HOUR_MS));
         // Dormant restore still covers shells and untrusted resumes by days.
         let days = Settings {
             dormant_after_days: 1,
             ..Settings::default()
         };
-        assert!(opens_dormant(&shell, false, &days, 25 * HOUR_MS));
+        assert!(opens_dormant(&shell, None, false, &days, 25 * HOUR_MS));
     }
 
     #[test]
@@ -571,8 +604,14 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(woken.activity.last_active_at(), Some(5 * HOUR_MS));
-        assert!(!opens_dormant(&woken, true, &settings, 9 * HOUR_MS - 1));
-        assert!(opens_dormant(&woken, true, &settings, 9 * HOUR_MS));
+        assert!(!opens_dormant(
+            &woken,
+            None,
+            true,
+            &settings,
+            9 * HOUR_MS - 1
+        ));
+        assert!(opens_dormant(&woken, None, true, &settings, 9 * HOUR_MS));
         // `ctl wake` must not mark the finished turn read.
         assert!(woken.activity.has_unattended_completion());
     }
@@ -588,36 +627,57 @@ mod tests {
             ..Default::default()
         });
         let half_hour = 5 * HOUR_MS + 30 * MINUTE_MS;
-        assert!(!opens_dormant(&machine, true, &settings, half_hour - 1));
-        assert!(opens_dormant(&machine, true, &settings, half_hour));
+        assert!(!opens_dormant(
+            &machine,
+            None,
+            true,
+            &settings,
+            half_hour - 1
+        ));
+        assert!(opens_dormant(&machine, None, true, &settings, half_hour));
         // Its work counts too: 30 minutes from the later of wake and work.
         let mut worked = machine.clone();
         worked.activity.completed_at = Some(6 * HOUR_MS);
         let after_work = 6 * HOUR_MS + 30 * MINUTE_MS;
-        assert!(!opens_dormant(&worked, true, &settings, after_work - 1));
-        assert!(opens_dormant(&worked, true, &settings, after_work));
+        assert!(!opens_dormant(
+            &worked,
+            None,
+            true,
+            &settings,
+            after_work - 1
+        ));
+        assert!(opens_dormant(&worked, None, true, &settings, after_work));
         // A look before the wake isn't a look at it.
         let mut seen_before = machine.clone();
         seen_before.activity.last_attended_at = Some(4 * HOUR_MS);
-        assert!(opens_dormant(&seen_before, true, &settings, half_hour));
+        assert!(opens_dormant(
+            &seen_before,
+            None,
+            true,
+            &settings,
+            half_hour
+        ));
         // The first look after it makes an ordinary pane: N hours from the look.
         let mut seen = machine.clone();
         seen.activity.last_attended_at = Some(5 * HOUR_MS + MINUTE_MS);
         // Half an hour after the look, where the short limit would end.
         assert!(!opens_dormant(
             &seen,
+            None,
             true,
             &settings,
             half_hour + MINUTE_MS
         ));
         assert!(!opens_dormant(
             &seen,
+            None,
             true,
             &settings,
             9 * HOUR_MS + MINUTE_MS - 1
         ));
         assert!(opens_dormant(
             &seen,
+            None,
             true,
             &settings,
             9 * HOUR_MS + MINUTE_MS
@@ -627,8 +687,14 @@ mod tests {
         for by in [Some(Waker::User), None] {
             let mut user = machine.clone();
             user.activity.woken_by = by;
-            assert!(!opens_dormant(&user, true, &settings, 9 * HOUR_MS - 1));
-            assert!(opens_dormant(&user, true, &settings, 9 * HOUR_MS));
+            assert!(!opens_dormant(
+                &user,
+                None,
+                true,
+                &settings,
+                9 * HOUR_MS - 1
+            ));
+            assert!(opens_dormant(&user, None, true, &settings, 9 * HOUR_MS));
         }
     }
 }

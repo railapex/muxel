@@ -6114,6 +6114,11 @@ pub struct MuxelApp {
     restoring_activity: HashSet<Uuid>,
     /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
     dormant_instances: HashSet<Uuid>,
+    /// The loaded workspace's `awake_focus`: the pane awake in front when it
+    /// was last saved, which starts whatever its idle age. Kept from the load
+    /// because every save rewrites the workspace's own copy, and a project
+    /// opened later still needs the one it was saved with.
+    relaunch_focus: Option<Uuid>,
     /// Asleep agents whose saved conversation was gone at the last look (on
     /// load, project open, sleep, wake, and once a minute): their row and pane
     /// say "no history". Outside control's `resumes` looks afresh instead.
@@ -8650,6 +8655,7 @@ impl MuxelApp {
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
+            relaunch_focus: None,
             conversations_gone: HashSet::new(),
             wake_launches: HashSet::new(),
             sleep_exits: HashMap::new(),
@@ -8844,6 +8850,7 @@ impl MuxelApp {
         let repaired =
             workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
+        self.relaunch_focus = self.workspace.awake_focus;
         let now = chrono::Utc::now().timestamp_millis();
         self.dormant_instances = self
             .workspace
@@ -8854,12 +8861,7 @@ impl MuxelApp {
                     && !instance.use_tmux
                     && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
                     && local.contains(&instance.project_id)
-                    && muxel_core::sleep::opens_dormant(
-                        instance,
-                        self.instance_resume_trusted(instance),
-                        &self.settings,
-                        now,
-                    )
+                    && self.pane_opens_dormant(instance, now)
             })
             .map(|instance| instance.id)
             .collect();
@@ -10863,12 +10865,7 @@ impl MuxelApp {
                     && !self.terminals.contains_key(&iid)
                     && !self.terminal_launching.contains_key(&iid)
                     && !self.failed_launches.contains_key(&iid)
-                    && muxel_core::sleep::opens_dormant(
-                        instance,
-                        self.instance_resume_trusted(instance),
-                        &self.settings,
-                        now,
-                    );
+                    && self.pane_opens_dormant(instance, now);
                 if dormant {
                     self.dormant_instances.insert(iid);
                 } else {
@@ -12309,6 +12306,7 @@ impl MuxelApp {
         let Some(path) = muxel_store::workspace_doc_path(id) else {
             return false;
         };
+        self.workspace.awake_focus = self.awake_focus();
         let durable =
             (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
         match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
@@ -12476,6 +12474,7 @@ impl MuxelApp {
         self.maximized = None;
         self.workspace = Workspace::default();
         self.active_instance = None;
+        self.relaunch_focus = None;
 
         self.current_workspace = Some(id);
         {

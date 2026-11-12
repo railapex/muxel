@@ -1452,6 +1452,11 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+    /// The pane that had keyboard focus at the last save, when it was awake
+    /// (running or starting); None when it was asleep. A relaunch starts this
+    /// one pane whatever its idle age (`sleep::opens_dormant`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awake_focus: Option<Uuid>,
 }
 
 /// Where a project's dedicated window lives: which monitor (stable UUID) and

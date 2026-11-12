@@ -56,44 +56,79 @@ fn pane(
 ) -> (Uuid, Entity<TerminalView>, ChildHandle) {
     window
         .update(cx, |app, window, cx| {
-            let root = app.workspace.project(pid).unwrap().root_path.clone();
-            let mut instance = Instance::shell(pid);
-            instance.custom_name = Some(name.into());
-            if agent {
-                let claude = app
-                    .presets
-                    .iter()
-                    .find(|preset| preset.name == "Claude")
-                    .expect("built-in Claude preset")
-                    .clone();
-                instance.program = Some(
-                    root.join("missing")
-                        .join("claude.exe")
-                        .display()
-                        .to_string(),
-                );
-                instance.preset = claude.name.clone();
-                instance.preset_id = Some(claude.id);
-                let id = Uuid::new_v4().to_string();
-                let transcript = root.join("transcripts").join(format!("{id}.jsonl"));
-                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-                std::fs::write(&transcript, "{}\n").unwrap();
-                instance.session_id = Some(id);
-                instance.session_path = Some(transcript);
-                instance.session_started = true;
-            }
-            let iid = instance.id;
-            app.workspace.add_instance(instance);
-            let project = app.workspace.project_mut(pid).unwrap();
-            if let Some(anchor) = project.first_instance() {
-                assert!(add_tab(&mut project.layout, anchor, iid));
-            } else {
-                project.layout = Some(PaneNode::leaf(iid));
-            }
+            let iid = add_pane(app, pid, name, agent);
             let (view, child) = launch(app, window, cx, iid, name);
             (iid, view, child)
         })
         .unwrap()
+}
+
+/// Add pane `name` to project `pid`'s layout without starting anything.
+/// `agent` saves it as a resumable Claude conversation, with a transcript file
+/// at its saved path and a program that doesn't exist.
+fn add_pane(app: &mut MuxelApp, pid: Uuid, name: &str, agent: bool) -> Uuid {
+    let root = app.workspace.project(pid).unwrap().root_path.clone();
+    let mut instance = Instance::shell(pid);
+    instance.custom_name = Some(name.into());
+    if agent {
+        let claude = app
+            .presets
+            .iter()
+            .find(|preset| preset.name == "Claude")
+            .expect("built-in Claude preset")
+            .clone();
+        instance.program = Some(
+            root.join("missing")
+                .join("claude.exe")
+                .display()
+                .to_string(),
+        );
+        instance.preset = claude.name.clone();
+        instance.preset_id = Some(claude.id);
+        let id = Uuid::new_v4().to_string();
+        let transcript = root.join("transcripts").join(format!("{id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        instance.session_id = Some(id);
+        instance.session_path = Some(transcript);
+        instance.session_started = true;
+    }
+    let iid = instance.id;
+    app.workspace.add_instance(instance);
+    let project = app.workspace.project_mut(pid).unwrap();
+    if let Some(anchor) = project.first_instance() {
+        assert!(add_tab(&mut project.layout, anchor, iid));
+    } else {
+        project.layout = Some(PaneNode::leaf(iid));
+    }
+    iid
+}
+
+/// A saved agent that last worked `idle_ms` ago and isn't running.
+fn saved_agent(app: &mut MuxelApp, pid: Uuid, name: &str, idle_ms: i64) -> Uuid {
+    let iid = add_pane(app, pid, name, true);
+    let now = chrono::Utc::now().timestamp_millis();
+    app.workspace.instance_mut(iid).unwrap().activity = AgentActivity {
+        completed_at: Some(now - idle_ms),
+        ..Default::default()
+    };
+    iid
+}
+
+/// Save the workspace as quitting does, then load it as a relaunch does, with
+/// none of the last run's runtime state. Returns what was saved.
+fn relaunch(
+    app: &mut MuxelApp,
+    window: &mut Window,
+    cx: &mut Context<MuxelApp>,
+) -> muxel_core::Workspace {
+    app.persist();
+    let document = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+    let saved = muxel_store::load_workspace_from(&document).unwrap();
+    app.dormant_instances.clear();
+    app.active_instance = None;
+    app.restore(saved.clone(), window, cx);
+    saved
 }
 
 /// Run pane `iid`'s fixture program and install it as the pane's terminal.
@@ -767,6 +802,80 @@ fn a_pane_ctl_focus_woke_is_looked_at_once_it_draws_in_front_of_an_active_window
                     "drawn in front of an active window is a look"
                 );
                 assert!(activity.last_attended_at >= activity.woken_at);
+            })
+            .unwrap();
+    });
+}
+
+/// The one pane awake in front at quit starts on relaunch whatever its idle
+/// age. Another project's last focused pane, just as idle, opens asleep.
+#[test]
+fn the_pane_awake_in_front_at_quit_starts_on_relaunch_and_no_other_does() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let other = project(cx, window);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sleep_after_hours = 4;
+                let front = saved_agent(app, pid, "front agent", 5 * HOUR_MS);
+                let elsewhere = saved_agent(app, other, "other agent", 5 * HOUR_MS);
+                app.workspace
+                    .project_mut(other)
+                    .unwrap()
+                    .last_focused_instance = Some(elsewhere);
+                app.workspace.active_project = Some(pid);
+                app.active_instance = Some(front);
+                let saved = relaunch(app, window, cx);
+                assert_eq!(saved.awake_focus, Some(front));
+                assert!(!app.is_dormant(front), "awake in front at quit");
+                assert!(app.is_dormant(elsewhere), "its project's last focused pane");
+                // Never let the deferred launch run its (missing) program.
+                app.close_instance(front, cx);
+            })
+            .unwrap();
+    });
+}
+
+/// A pane asleep at quit stays asleep on relaunch, even the one in front.
+#[test]
+fn a_pane_asleep_in_front_at_quit_stays_asleep_on_relaunch() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sleep_after_hours = 4;
+                let front = saved_agent(app, pid, "slept agent", 5 * HOUR_MS);
+                // What putting it to sleep leaves behind.
+                app.workspace.instance_mut(front).unwrap().asleep_since =
+                    Some(chrono::Utc::now().timestamp_millis());
+                app.dormant_instances.insert(front);
+                app.active_instance = Some(front);
+                let saved = relaunch(app, window, cx);
+                assert_eq!(saved.awake_focus, None);
+                assert!(app.is_dormant(front));
+            })
+            .unwrap();
+    });
+}
+
+/// A pane that opened asleep and was only looked at, never woken, was asleep
+/// at quit, though nothing saved marks it so: it stays asleep next time too.
+#[test]
+fn a_pane_opened_asleep_and_only_looked_at_stays_asleep_on_the_next_relaunch() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sleep_after_hours = 4;
+                let agent = saved_agent(app, pid, "old agent", 5 * HOUR_MS);
+                relaunch(app, window, cx);
+                assert!(app.is_dormant(agent), "idle 5 h, nothing in front at quit");
+                app.select_instance(agent, window, cx);
+                assert_eq!(app.active_instance, Some(agent));
+                assert!(app.is_dormant(agent), "selecting only shows it");
+                let saved = relaunch(app, window, cx);
+                assert_eq!(saved.awake_focus, None);
+                assert!(app.is_dormant(agent), "looked at, never woken");
             })
             .unwrap();
     });

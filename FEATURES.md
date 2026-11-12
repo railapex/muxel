@@ -88,8 +88,9 @@ feature is added or changed, update the matching entry here in the same change**
   Old local PTY panes retain their name, lifecycle status and age and open
   asleep, without starting a process. Selecting
   one only shows it; Enter or typing in it, Wake, pinning or `ctl focus`
-  resumes it through the normal restore path. Pinned panes and panes with no
-  work history always start; SSH and local tmux
+  resumes it through the normal restore path. Pinned panes, panes with no
+  work history, and the pane awake in front when muxel quit always start (one
+  asleep then stays asleep); SSH and local tmux
   restores keep their existing behavior. `ctl status`/`panes` expose
   `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be

@@ -27,7 +27,8 @@ Four hours keeps everything touched this morning running through the
 afternoon, while the panes left from yesterday stop holding memory before the
 next day's work starts. The same threshold applies at launch: an agent already
 idle that long opens asleep instead of starting only to be put to sleep a
-minute later.
+minute later. The one exception is the pane awake in front when muxel quit,
+which starts whatever its age (see [dormant restore](dormant-restore.md)).
 
 ## What never sleeps
 

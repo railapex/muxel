@@ -10,8 +10,13 @@ The age is measured from the latest of `activity.work_started_at`,
 `completed_at`, and `blocked_at` (Unix milliseconds). Opening a pane does not
 change that work timestamp. At exactly N elapsed days, an old pane becomes
 dormant. Panes without these timestamps start normally. Pinned panes always
-start. The active pane is not exempt: at launch or project open it shows its
-asleep face like any other dormant pane until it is woken.
+start, and so does the one pane that had keyboard focus when muxel last saved
+(at quit, normally), if it was awake then, whatever its age: coming back to an
+asleep pane in front is odd. The workspace saves its id as `awake_focus`. A
+pane asleep at that point stays asleep even in front, including one that
+opened asleep and was only looked at. Each project's last focused pane is not
+exempt: it shows its asleep face like any other dormant pane until it is
+woken.
 
 A dormant pane owns no PTY or child process. It looks exactly like a pane put
 to sleep, since waking either does the same thing (see

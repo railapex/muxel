@@ -857,6 +857,31 @@ impl MuxelApp {
             .instance(iid)
             .is_some_and(|inst| inst.asleep_since.is_some())
     }
+
+    /// Whether saved pane `instance` opens asleep instead of starting, on load
+    /// and when its project opens (`sleep::opens_dormant`).
+    pub(super) fn pane_opens_dormant(&self, instance: &Instance, now: i64) -> bool {
+        muxel_core::sleep::opens_dormant(
+            instance,
+            self.relaunch_focus,
+            self.instance_resume_trusted(instance),
+            &self.settings,
+            now,
+        )
+    }
+
+    /// The pane with keyboard focus while it is awake (running, starting, or
+    /// woken and starting): what a relaunch starts whatever its idle age. A
+    /// pane asleep in front, put to sleep or opened asleep and only looked at,
+    /// gives none.
+    pub(super) fn awake_focus(&self) -> Option<Uuid> {
+        self.active_instance.filter(|&iid| {
+            self.workspace
+                .instance(iid)
+                .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
+                && !self.is_dormant(iid)
+        })
+    }
 }
 
 impl MuxelApp {
