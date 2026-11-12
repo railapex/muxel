@@ -926,6 +926,15 @@ fn activity_state(status: AgentStatus) -> AgentActivityState {
 
 const RESTORE_ACTIVITY_MAX_WAIT_MS: u64 = 30_000;
 
+/// Whether a launch `elapsed` old is still inside the time its CLI may take
+/// to boot: the restore wait plus the preset's configured startup delay.
+fn within_startup_window(elapsed: Option<Duration>, startup_delay_ms: u32) -> bool {
+    let budget = Duration::from_millis(
+        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
+    );
+    elapsed.is_some_and(|elapsed| elapsed < budget)
+}
+
 fn restore_activity_guard_active(
     pending: bool,
     submitted_turn: bool,
@@ -933,13 +942,10 @@ fn restore_activity_guard_active(
     elapsed: Option<Duration>,
     startup_delay_ms: u32,
 ) -> bool {
-    let budget = Duration::from_millis(
-        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
-    );
     pending
         && !submitted_turn
         && !completion_ready
-        && elapsed.is_some_and(|elapsed| elapsed < budget)
+        && within_startup_window(elapsed, startup_delay_ms)
 }
 
 /// A restored terminal may emit a synthetic Working cycle while its CLI boots.
@@ -1056,10 +1062,11 @@ struct ActivityUpdates {
 #[cfg(test)]
 mod restored_activity_tests {
     use super::{
-        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose,
-        activity_needs_observation, attention_rank, done_is_read, is_restored_transition,
-        persisted_status, restore_activity_guard_active, restored_activity_sample, sample_status,
-        unprompted_report_working,
+        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose, SeenStatus,
+        StatusBinding, StatusSample, activity_needs_observation, apply_status_sample,
+        attention_rank, done_is_read, is_restored_transition, persisted_status,
+        restore_activity_guard_active, restored_activity_sample, sample_status,
+        unprompted_report_working, within_startup_window,
     };
     use muxel_terminal::{TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason};
     use std::time::Duration;
@@ -1136,14 +1143,14 @@ mod restored_activity_tests {
             ),
         ] {
             assert_eq!(
-                sample_status(&exit, Some(&pane), false, true, true),
+                sample_status(&exit, Some(&pane), false, true, false, true),
                 shown,
                 "{what}"
             );
         }
         // A turn that finished before the process exited stays finished.
         assert_eq!(
-            sample_status(&exit, Some(&attended_completion()), false, true, true),
+            sample_status(&exit, Some(&attended_completion()), false, true, false, true),
             AgentStatus::Done
         );
     }
@@ -1163,11 +1170,11 @@ mod restored_activity_tests {
         );
         assert_eq!(job.launch_purpose(), LaunchPurpose::Job);
         assert_eq!(
-            sample_status(&exit, Some(&job), false, true, false),
+            sample_status(&exit, Some(&job), false, true, false, false),
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&exit, Some(&job), false, true, true),
+            sample_status(&exit, Some(&job), false, true, false, true),
             AgentStatus::Done
         );
     }
@@ -1181,26 +1188,26 @@ mod restored_activity_tests {
         );
         // Codex reports Working while it boots, before any turn is submitted.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, false, true),
+            sample_status(&booting, Some(&saved), false, false, true, true),
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&booting, Some(&attended_completion()), false, false, true),
+            sample_status(&booting, Some(&attended_completion()), false, false, true, true),
             AgentStatus::Done
         );
         // Startup output while the relaunch settles is not a turn either.
         let noise = runtime(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
         assert_eq!(
-            sample_status(&noise, Some(&saved), true, false, true),
+            sample_status(&noise, Some(&saved), true, false, true, true),
             AgentStatus::Idle
         );
         // A submitted turn is, and so is visible work once the relaunch settles.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, true, true),
+            sample_status(&booting, Some(&saved), false, true, true, true),
             AgentStatus::Working
         );
         assert_eq!(
-            sample_status(&noise, Some(&saved), false, false, true),
+            sample_status(&noise, Some(&saved), false, false, true, true),
             AgentStatus::Working
         );
     }
@@ -1341,23 +1348,110 @@ mod restored_activity_tests {
         // Ready title that ends the restore guard.
         let guarded = restore_activity_guard_active(true, false, true, Some(Duration::ZERO), 0);
         assert!(!guarded);
-        let held = guarded || unprompted_report_working(&runtime, false);
+        let starting = within_startup_window(Some(Duration::ZERO), 0);
+        let held = guarded || unprompted_report_working(&runtime, false, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Done
         );
         // A submitted turn makes the report real work.
-        let held = unprompted_report_working(&runtime, true);
+        let held = unprompted_report_working(&runtime, true, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Working
         );
         // Visible evidence and other reported states keep their own rules.
         runtime.reason = TerminalStatusReason::ProviderTitle;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
         runtime.reason = TerminalStatusReason::ProgramStatus(None);
         runtime.status = AgentStatus::Blocked;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
+    }
+
+    /// One status tick for a pane nothing has typed a turn into, `elapsed`
+    /// into its launch: the shown status as the tick computes it, applied to
+    /// the record and durable activity.
+    fn tick_without_submission(
+        instance: &mut Instance,
+        record: &mut Option<SeenStatus>,
+        runtime: TerminalRuntimeSnapshot,
+        elapsed: Duration,
+        now: i64,
+    ) -> AgentStatus {
+        let elapsed = Some(elapsed);
+        let restoring =
+            restore_activity_guard_active(true, false, runtime.completion_ready, elapsed, 0);
+        let starting = within_startup_window(elapsed, 0);
+        let shown = sample_status(&runtime, Some(instance), restoring, false, starting, true);
+        let (preserve, _) = restored_activity_sample(restoring, false, runtime.status);
+        apply_status_sample(
+            record,
+            Some(&mut instance.activity),
+            StatusSample::from_runtime(runtime, runtime.binding_rev, shown, false, preserve),
+            now,
+        );
+        shown
+    }
+
+    #[test]
+    fn a_provider_reported_turn_without_a_muxel_submission_records_work() {
+        use muxel_core::control::status_since;
+        let launch = Uuid::new_v4();
+        let report = |status, completion_revision| TerminalRuntimeSnapshot {
+            launch_id: launch,
+            completion_ready: true,
+            completion_revision,
+            ..runtime(status, TerminalStatusReason::ProgramStatus(None))
+        };
+        let settled = || {
+            Some(SeenStatus {
+                status: AgentStatus::Done,
+                binding: StatusBinding { launch, rev: 0 },
+                coverage: TerminalStatusCoverage::ProgramStatus,
+                completion_revision: 1,
+                sampled_at: 500,
+            })
+        };
+
+        // A builder finished a turn and sat idle. An hour into the launch, a
+        // message from another session starts its next turn, and nothing was
+        // typed into the pane.
+        let mut instance = attended_completion();
+        let mut record = settled();
+        let an_hour = Duration::from_secs(3_600);
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            an_hour,
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Working);
+        assert_eq!(instance.activity.work_started_at, Some(1_000));
+        assert_eq!(status_since(&instance.activity), Some(1_000));
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Done, 2),
+            an_hour,
+            2_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(instance.activity.completed_at, Some(2_000));
+        assert_eq!(status_since(&instance.activity), Some(2_000));
+
+        // The same report while the launch boots is startup noise.
+        let mut booting = attended_completion();
+        let mut record = settled();
+        let shown = tick_without_submission(
+            &mut booting,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            Duration::from_secs(2),
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(booting.activity.work_started_at, Some(100));
     }
 
     #[test]
@@ -1548,15 +1642,20 @@ fn persisted_status(
     }
 }
 
-/// Whether the provider's own report is all that says Working: no turn has
-/// been submitted in this launch. Codex reports Working while it boots a
-/// resumed session, before any prompt and after its first Ready title. Like
-/// startup noise during restore, that is not a turn.
+/// Whether the provider's own report is all that says Working while the
+/// launch boots (`starting`, see [`within_startup_window`]) and no turn has
+/// been submitted in it. Codex reports Working while it boots a resumed
+/// session, before any prompt and after its first Ready title. Like startup
+/// noise during restore, that is not a turn. Past the startup window a
+/// report's Working is a turn, though muxel typed nothing: a message from
+/// another session, a scheduled wakeup or a remote prompt starts one.
 fn unprompted_report_working(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     submitted_turn: bool,
+    starting: bool,
 ) -> bool {
-    runtime.status == AgentStatus::Working
+    starting
+        && runtime.status == AgentStatus::Working
         && matches!(
             runtime.reason,
             muxel_terminal::TerminalStatusReason::ProgramStatus(_)
@@ -1591,18 +1690,20 @@ fn own_exit(view: &TerminalView) -> bool {
 
 /// The lifecycle status one terminal sample stands for. Some runtime states
 /// are not work: an exit that finishes nothing ([`exit_finishes_nothing`]); a
-/// provider's Working before any turn in this launch (a relaunch booting); and
-/// Working while a restore settles (`restoring`). They read as idle, so none
-/// records a start or a finish, and durable Done stays.
+/// provider's Working before any turn while the launch starts up (`starting`:
+/// a relaunch booting); and Working while a restore settles (`restoring`).
+/// They read as idle, so none records a start or a finish, and durable Done
+/// stays.
 fn sample_status(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     instance: Option<&Instance>,
     restoring: bool,
     submitted_turn: bool,
+    starting: bool,
     own_exit: bool,
 ) -> AgentStatus {
     let status = if exit_finishes_nothing(runtime, instance, own_exit)
-        || unprompted_report_working(runtime, submitted_turn)
+        || unprompted_report_working(runtime, submitted_turn, starting)
         || (restoring && runtime.status == AgentStatus::Working)
     {
         AgentStatus::Idle
@@ -1617,12 +1718,14 @@ fn shown_terminal_status(
     view: &TerminalView,
     instance: Option<&Instance>,
     restoring: bool,
+    starting: bool,
 ) -> AgentStatus {
     sample_status(
         &view.runtime_snapshot(),
         instance,
         restoring,
         view.session().has_submitted_turn(),
+        starting,
         own_exit(view),
     )
 }
@@ -24036,9 +24139,43 @@ impl MuxelApp {
     fn sidebar_status(&self, iid: Uuid, instance: Option<&Instance>, cx: &App) -> AgentStatus {
         let restoring = self.restoring_activity.contains(&iid);
         let status = self.terminal_view(iid).map_or(AgentStatus::Idle, |view| {
-            shown_terminal_status(view.read(cx), instance, restoring)
+            shown_terminal_status(
+                view.read(cx),
+                instance,
+                restoring,
+                self.in_startup_window(iid, instance),
+            )
         });
         persisted_status(status, instance, restoring)
+    }
+
+    /// How long ago `iid`'s current launch started.
+    fn launch_elapsed(&self, iid: Uuid) -> Option<Duration> {
+        self.terminal_launches
+            .get(&iid)
+            .map(|&(at, _)| at.elapsed())
+    }
+
+    /// The configured startup delay of `instance`'s preset.
+    fn startup_delay_ms(&self, instance: Option<&Instance>) -> u32 {
+        instance
+            .and_then(|instance| {
+                instance
+                    .preset_id
+                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                    .or_else(|| {
+                        self.presets
+                            .iter()
+                            .find(|preset| preset.name == instance.preset)
+                    })
+            })
+            .map_or(0, |preset| preset.startup_delay_ms)
+    }
+
+    /// Whether pane `iid`'s current launch is still booting its CLI, with its
+    /// instance (`None`: none).
+    fn in_startup_window(&self, iid: Uuid, instance: Option<&Instance>) -> bool {
+        within_startup_window(self.launch_elapsed(iid), self.startup_delay_ms(instance))
     }
 
     /// `terminal`'s sample for pane `iid`, whose instance the caller has
@@ -24053,26 +24190,12 @@ impl MuxelApp {
         let binding_rev = terminal.session().binding_revision();
         let raw_status = runtime.status;
         let submitted_turn = terminal.session().has_submitted_turn();
-        let startup_delay_ms = instance
-            .and_then(|instance| {
-                instance
-                    .preset_id
-                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
-                    .or_else(|| {
-                        self.presets
-                            .iter()
-                            .find(|preset| preset.name == instance.preset)
-                    })
-            })
-            .map_or(0, |preset| preset.startup_delay_ms);
         let restoring = restore_activity_guard_active(
             self.restoring_activity.contains(&iid),
             submitted_turn,
             terminal.completion_ready(),
-            self.terminal_launches
-                .get(&iid)
-                .map(|&(at, _)| at.elapsed()),
-            startup_delay_ms,
+            self.launch_elapsed(iid),
+            self.startup_delay_ms(instance),
         );
         TerminalActivitySample {
             status: sample_status(
@@ -24080,6 +24203,7 @@ impl MuxelApp {
                 instance,
                 restoring,
                 submitted_turn,
+                self.in_startup_window(iid, instance),
                 own_exit(terminal),
             ),
             raw_status,
@@ -27516,7 +27640,12 @@ impl MuxelApp {
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
                 let status = self.terminals.get(&iid).map(|v| {
-                    shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
+                    shown_terminal_status(
+                        v.read(cx),
+                        inst,
+                        self.restoring_activity.contains(&iid),
+                        self.in_startup_window(iid, inst),
+                    )
                 });
                 let color = status
                     .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
