@@ -801,6 +801,7 @@ fn selecting_an_asleep_pane_shows_it_and_enter_typing_or_ctl_focus_wakes_it() {
                         },
                         caller_instance_id: None,
                         reply,
+                        cancelled: std::sync::Arc::default(),
                     },
                     cx,
                 );

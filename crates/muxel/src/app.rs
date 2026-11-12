@@ -1495,6 +1495,7 @@ mod restored_activity_tests {
                 binding: StatusBinding { launch, rev: 0 },
                 coverage: TerminalStatusCoverage::ProgramStatus,
                 completion_revision: 1,
+                held: false,
                 sampled_at: 500,
             })
         };
