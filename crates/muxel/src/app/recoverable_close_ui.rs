@@ -3,7 +3,7 @@
 use super::*;
 
 fn countdown_label(deadline: Instant) -> SharedString {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(crate::scene_mode::now_instant());
     let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
     tf("Undo {seconds}", &[("seconds", &seconds.to_string())]).into()
 }
