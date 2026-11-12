@@ -80,6 +80,9 @@ mod first_prompt_size_tests;
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+mod pane_bar;
+#[cfg(all(test, windows))]
+mod pane_bar_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
@@ -26362,10 +26365,10 @@ impl MuxelApp {
                     tabs[leaf_active]
                 };
                 let is_active = pane_has_focus;
-                let draft_offer = self
+                let pane_bar = self
                     .terminals
                     .contains_key(&iid)
-                    .then(|| self.render_draft_offer(iid, cx))
+                    .then(|| self.render_pane_bar(iid, cx))
                     .flatten();
                 // Frame attribution: the group's card (`Body`) encloses its
                 // strip and content regions, which are subtracted from it.
@@ -26374,98 +26377,18 @@ impl MuxelApp {
                 let content_scope = ui_profile::region_scope(ui_profile::Region::Content(group));
                 let content: AnyElement = if let Some(view) = self.terminals.get(&iid) {
                     let v = view.read(cx);
-                    if v.exited() {
-                        // Tombstone: keep the final screen (crash output and
-                        // all) visible under an explicit banner, so a dead
-                        // process never masquerades as a live pane or a random
-                        // disappearance. The toolbar Restart respawns in place.
-                        //
-                        // A remote pane mid-reconnect is NOT a tombstone: its tmux
-                        // session is alive on the host and muxel is retrying, so it
-                        // reads as "reconnecting…", not "exited".
-                        let reconnecting = self.reconnecting.contains_key(&iid);
-                        let abnormal = !reconnecting
-                            && (v.exit_read_error().is_some() || v.exit_code() != Some(0));
-                        // A signalled child reports code 1; say "killed by
-                        // <signal>" rather than mislabelling it a crash.
-                        let label: SharedString = if reconnecting {
-                            t("Connection lost — reconnecting…")
-                        } else {
-                            match (v.exit_read_error(), v.exit_signal(), v.exit_code()) {
-                                (Some(_), _, _) => t("process ended — terminal read failed"),
-                                (None, Some(sig), _) => {
-                                    tf("process killed — signal {sig}", &[("sig", sig)]).into()
-                                }
-                                (None, None, Some(0)) => t("process exited"),
-                                (None, None, Some(code)) => tf(
-                                    "process exited — code {code}",
-                                    &[("code", &code.to_string())],
-                                )
-                                .into(),
-                                (None, None, None) => t("process exited — code unknown"),
-                            }
-                        };
-                        let (bg, fg) = if reconnecting {
-                            (cx.theme().warning.opacity(0.15), cx.theme().warning)
-                        } else if abnormal {
-                            (cx.theme().danger.opacity(0.15), cx.theme().danger)
-                        } else {
-                            (cx.theme().muted.opacity(0.5), cx.theme().muted_foreground)
-                        };
-                        let hint = if reconnecting {
-                            t("Waiting for the host…")
-                        } else {
-                            t("Restart to relaunch")
-                        };
-                        let action = if self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
-                        {
-                            Button::new(format!("run-again-{iid}"))
-                                .label(t("Run again"))
-                                .disabled(!self.launch_permitted(
-                                    iid,
-                                    muxel_core::TerminalLaunchReason::RunAgain,
-                                ))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_literal_again(iid, window, cx)
-                                }))
-                                .into_any_element()
-                        } else {
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(hint)
-                                .into_any_element()
-                        };
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(terminal_pane_element(view, !is_active, shown, cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .justify_between()
-                                    .px_2()
-                                    .py_1()
-                                    .text_xs()
-                                    .bg(bg)
-                                    .text_color(fg)
-                                    .child(label)
-                                    .child(action),
-                            )
-                            .into_any_element()
-                    } else if !v.has_visible_content() && self.terminal_is_loading(iid, cx) {
+                    if !v.exited() && !v.has_visible_content() && self.terminal_is_loading(iid, cx)
+                    {
                         // The spinner animates the whole window every frame, so
                         // it gets the sidebar's startup window: a program that
                         // never prints shows its blank screen after that. A
                         // wake keeps the asleep face up instead.
                         self.terminal_starting_or_waking(iid, cx)
-                    } else if let Some(offer) = draft_offer {
+                    } else if let Some(bar) = pane_bar {
+                        // The bar sits under the screen. An ended pane keeps
+                        // its final screen, crash output and all, so a dead
+                        // process never passes for a live pane or a random
+                        // disappearance.
                         div()
                             .size_full()
                             .flex()
@@ -26476,7 +26399,7 @@ impl MuxelApp {
                                     .overflow_hidden()
                                     .child(terminal_pane_element(view, !is_active, shown, cx)),
                             )
-                            .child(offer)
+                            .child(bar)
                             .into_any_element()
                     } else {
                         terminal_pane_element(view, !is_active, shown, cx)
@@ -37490,9 +37413,12 @@ impl Render for MuxelApp {
             // context) routes muxel shortcuts (incl. Ctrl+P) to the root handlers.
             .track_focus(&self.focus_handle)
             // An asleep pane has no terminal, so the root holds the keyboard
-            // while it is selected: Enter or a typed key wakes it.
+            // while it is selected: Enter or a typed key wakes it. An ended
+            // pane's terminal passes its Enter up here to restart it.
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if this.wake_on_key(&ev.keystroke, window, cx) {
+                if this.wake_on_key(&ev.keystroke, window, cx)
+                    || this.restart_on_enter(&ev.keystroke, window, cx)
+                {
                     cx.stop_propagation();
                 }
             }))

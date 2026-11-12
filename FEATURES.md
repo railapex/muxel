@@ -1440,14 +1440,20 @@ feature is added or changed, update the matching entry here in the same change**
   pane looking live and accepting input forever. Final output is drained before
   the exit banner appears.
 - **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
-  the PTY failing outright) is never auto-closed: it keeps its final screen under
-  a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
-  (plus a desktop notification when unattended), and Restart relaunches in place
-  (resuming a resume-capable agent's conversation).
+  the PTY failing outright) is never auto-closed: it keeps its final screen above
+  a red-tinted **■ Ended · exit N** line in its pane bar, fires an error in the
+  NOTIFICATIONS feed (plus a desktop notification when unattended), and the line's
+  **Restart**, or Enter in the pane, relaunches it in place (resuming a
+  resume-capable agent's conversation; a literal command shows **Run again**).
+  A clean exit that stays open reads a muted **Ended**.
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
-  is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
+  is named as such — **Ended · signal Hangup/Killed/Terminated** — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
   of its own and it would otherwise be indistinguishable from `exit(1)`.
+- **Pane bar** — the row under a terminal pane for how its program ended and what
+  waits for it: the Ended line, a remote pane's reconnecting line, and unsent
+  prompts. A loss comes first, then what waits on you, then the rest, three lines
+  at most. It pushes the screen up rather than covering it.
 - **Event log** — pane lifecycle events (every exit with its code and signal, every
   close, auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
   (rotated at 1 MB), so "why did this pane disappear?" is answerable even when
@@ -1906,8 +1912,8 @@ feature is added or changed, update the matching entry here in the same change**
   from the screen alone is labelled partial, because the screen can't show
   spaces at a row's end, after the cursor, or how many a wrap took. So is one
   taller than the pane, and a paste marker muxel can't tie to one paste. When
-  the pane starts again after a crash, a restart or a relaunch, a line under it
-  offers **Unsent prompt from HH:MM**, the prompt's first line (cut short with …
+  the pane starts again after a crash, a restart or a relaunch, its pane bar
+  offers **✎ Unsent · HH:MM**, the prompt's first line in quotes (cut short with …
   when there is more), **Restore** and **Discard**, and **(+N older)** when
   earlier ones wait too. Clicking the line opens the prompts in place, pushing
   the pane down, each with its own **Restore** and **Discard**: the newest

@@ -645,9 +645,9 @@ impl MuxelApp {
     fn offer_label(offer: &DraftOffer) -> String {
         let time = rescue_time(offer.draft.saved_at_ms);
         if offer.draft.partial {
-            tf("Unsent prompt from {time} (partial)", &[("time", &time)])
+            tf("Unsent · {time} · partial", &[("time", &time)])
         } else {
-            tf("Unsent prompt from {time}", &[("time", &time)])
+            tf("Unsent · {time}", &[("time", &time)])
         }
     }
 
@@ -687,6 +687,7 @@ impl MuxelApp {
             .gap_1()
             .child(
                 Button::new(format!("draft-restore-{iid}-{index}"))
+                    .primary()
                     .xsmall()
                     .label(t("Restore"))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -738,7 +739,8 @@ impl MuxelApp {
                     IconName::ChevronRight
                 })
                 .xsmall(),
-            );
+            )
+            .child(div().flex_none().child("✎"));
         let title = if open && many {
             title.child(div().truncate().child(tn(
                 "{n} unsent prompt",
@@ -760,7 +762,7 @@ impl MuxelApp {
                     div()
                         .min_w_0()
                         .truncate()
-                        .child(Self::offer_first_line(&newest.draft.text)),
+                        .child(format!("“{}”", Self::offer_first_line(&newest.draft.text))),
                 )
                 .children(many.then(|| {
                     div().flex_none().text_color(muted).child(tf(

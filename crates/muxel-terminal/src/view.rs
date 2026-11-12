@@ -4527,6 +4527,12 @@ impl TerminalView {
         // is `WM_SYSKEYDOWN`; if gpui returns unhandled, DefWindowProc rings the
         // system ding (Windows Terminal never does — it eats the message).
         let key = event.keystroke.key.as_str();
+        // An ended pane has no program to type into, so its plain Enter goes
+        // on to the app, whose pane bar starts it again. A running pane's
+        // Enter always stays with its program.
+        if key == "enter" && !m.modified() && self.exited() {
+            return;
+        }
         if key == "insert" || key == "ins" {
             if m.control && !m.alt && !m.shift {
                 if let Some(text) = self.session.selection_to_string()

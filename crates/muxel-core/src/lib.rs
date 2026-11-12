@@ -22,6 +22,7 @@ pub mod memory;
 pub mod muse;
 pub mod outage;
 mod pane;
+pub mod pane_bar;
 pub mod pane_scope;
 pub mod path_paste;
 pub mod placement;
