@@ -6,6 +6,7 @@ use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch, HeldView,
     LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
     held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
+    windows_shell_close_evidence,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -43,6 +44,9 @@ pub(super) struct CloseGroup {
     /// The decision is whether to close without reading the shared layout.
     pub layout_unread: bool,
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
+    /// Each project's live layout just before and just after this close hid
+    /// its panes. Undo puts the first back while the second is still live.
+    pub hides: HashMap<Uuid, recoverable_layout::LiveHide>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
 }
@@ -78,13 +82,34 @@ fn reason_close_evidence(reason: TerminalStatusReason) -> CloseEvidence {
         TerminalStatusReason::ProgramStatusError => CloseEvidence::Quiet,
         TerminalStatusReason::ProviderHook => CloseEvidence::Hook,
         TerminalStatusReason::ProviderTitle => CloseEvidence::Title,
-        TerminalStatusReason::ProviderScreen => CloseEvidence::Screen,
+        TerminalStatusReason::ProviderScreen | TerminalStatusReason::BackgroundWork => {
+            CloseEvidence::Screen
+        }
         TerminalStatusReason::BlockedMarker | TerminalStatusReason::WorkingMarker => {
             CloseEvidence::Output
         }
         TerminalStatusReason::Bell => CloseEvidence::Bell,
         TerminalStatusReason::RecentOutput => CloseEvidence::Output,
         TerminalStatusReason::Quiet => CloseEvidence::Quiet,
+    }
+}
+
+/// Whether the close prompt should name a pane's listed work: only when that is
+/// why the pane counts as busy. A pane waiting for input or working in the
+/// foreground says so instead.
+fn listed_work_is_why_busy(status: AgentStatus, reason: TerminalStatusReason) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
+        || reason == TerminalStatusReason::BackgroundWork
+}
+
+/// A close kills what runs beside a finished turn, so it counts as busy and asks.
+fn close_state(
+    state: AgentState,
+    background: Option<muxel_core::control::BackgroundWork>,
+) -> AgentState {
+    match state {
+        AgentState::Idle | AgentState::Done if background.is_some() => AgentState::Working,
+        state => state,
     }
 }
 
@@ -187,6 +212,21 @@ impl MuxelApp {
     }
 
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
+        self.close_facts_walking(iid, false, cx)
+    }
+
+    /// [`Self::close_facts`] for the last check before a close kills the pane:
+    /// a Windows shell's children come from a process table walked now, not
+    /// the snapshot another pane's close may have just taken. Its prompt
+    /// evidence is the shell's marks, read again: nothing asks PowerShell to
+    /// check itself a second time, so work inside PowerShell shows here only
+    /// through a mark printed since, which [`CloseFacts::shell_marks`] counts
+    /// even when the shell is back at an idle prompt.
+    fn close_facts_at_expiry(&self, iid: Uuid, cx: &App) -> CloseFacts {
+        self.close_facts_walking(iid, true, cx)
+    }
+
+    fn close_facts_walking(&self, iid: Uuid, fresh_walk: bool, cx: &App) -> CloseFacts {
         let inst = self.workspace.instance(iid);
         let mut state = inst
             .and_then(|inst| self.control_state(inst, cx))
@@ -196,20 +236,40 @@ impl MuxelApp {
         let attributable = view.zip(snapshot).is_some_and(|(view, snapshot)| {
             snapshot.is_attributable_to(view.session().binding_revision())
         });
+        let mut shell_marks = 0;
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
-                shell_close_evidence(
-                    inst.and_then(|inst| inst.program.as_deref()),
-                    inst.is_some_and(|inst| {
+                if cfg!(windows) {
+                    let session = view.session();
+                    let prompt = session.shell_reading();
+                    shell_marks = prompt.marks;
+                    windows_shell_close_evidence(
+                        prompt,
+                        || {
+                            if fresh_walk {
+                                session.is_idle_foreground_now()
+                            } else {
+                                session.is_idle_foreground()
+                            }
+                        },
+                        || session.shell_reading(),
+                    )
+                } else {
+                    let program = inst.and_then(|inst| inst.program.as_deref());
+                    let via_client = inst.is_some_and(|inst| {
                         inst.tmux_session.is_some()
                             || self
                                 .workspace
                                 .project(inst.project_id)
                                 .is_some_and(Project::is_remote)
-                    }),
-                    cfg!(unix) && view.session().is_idle_foreground(),
-                    view.session().shell_at_prompt(),
-                )
+                    });
+                    shell_close_evidence(
+                        program,
+                        via_client,
+                        view.session().foreground_idle(),
+                        view.session().shell_at_prompt(),
+                    )
+                }
             } else if !attributable {
                 CloseEvidence::Settling
             } else {
@@ -221,6 +281,7 @@ impl MuxelApp {
         if evidence == CloseEvidence::ShellPrompt && state != AgentState::Exited {
             state = AgentState::Idle;
         }
+        state = close_state(state, snapshot.and_then(|snapshot| snapshot.background));
         let awaiting_reply = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 turn.awaiting_reply(
@@ -248,6 +309,7 @@ impl MuxelApp {
             binding_rev: view.map_or(0, |view| view.session().binding_revision()),
             input_rev: view.map_or(0, |view| view.session().input_rev()),
             completion_rev: view.map_or(0, TerminalView::launch_completion_revision),
+            shell_marks,
         }
     }
 
@@ -320,7 +382,7 @@ impl MuxelApp {
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
+                .is_some_and(|editor| editor.read(cx).is_dirty(cx))
         }) {
             self.request_confirm(
                 t("Save changes before closing?"),
@@ -362,6 +424,20 @@ impl MuxelApp {
                         return tf(
                             "{name}'s tmux session may still be running.",
                             &[("name", inst.display_name())],
+                        );
+                    }
+                    if let Some(work) = self.terminal_view(iid).and_then(|view| {
+                        let view = view.read(cx);
+                        let runtime = view.runtime_snapshot();
+                        view.background_work()
+                            .filter(|_| listed_work_is_why_busy(runtime.status, runtime.reason))
+                    }) {
+                        return tf(
+                            "{name} is still running {work}.",
+                            &[
+                                ("name", inst.display_name()),
+                                ("work", &super::background_label(work)),
+                            ],
                         );
                     }
                     let state = match facts.status {
@@ -421,7 +497,7 @@ impl MuxelApp {
             let step = if inst.kind != InstanceKind::Terminal {
                 if self
                     .close_editor(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
                     AcceptedClose::Stays
                 } else {
@@ -523,6 +599,7 @@ impl MuxelApp {
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: self.active_instance,
             caller,
         };
@@ -548,7 +625,19 @@ impl MuxelApp {
                     .project(pid)
                     .and_then(|project| project.layout.clone())
             });
+            let hide = group.hides.entry(pid).or_insert_with(|| {
+                let live = self
+                    .workspace
+                    .project(pid)
+                    .and_then(|project| project.layout.clone());
+                recoverable_layout::LiveHide {
+                    before: live,
+                    after: None,
+                }
+            });
             if let Some(popout) = self.popouts.get(&iid) {
+                // Undo docks it where it would redock.
+                Self::restore_popout_layout(&mut hide.before, iid, popout.redock);
                 Self::restore_popout_layout(
                     group.layouts.get_mut(&pid).unwrap(),
                     iid,
@@ -575,6 +664,9 @@ impl MuxelApp {
         let gid = group.id;
         let members = group.members.clone();
         self.close_groups.push(group);
+        // They leave their layouts now, in this order.
+        self.close_history.retain(|iid| !members.contains(iid));
+        self.close_history.extend(&members);
         for iid in members {
             self.close_requests.remove(&iid);
             self.terminal_restarts.cancel(iid);
@@ -604,6 +696,14 @@ impl MuxelApp {
             }
             if self.active_instance == Some(iid) {
                 self.active_instance = self.workspace.active().and_then(Project::first_instance);
+            }
+        }
+        if let Some(group) = self.close_groups.iter_mut().find(|group| group.id == gid) {
+            for (pid, hide) in &mut group.hides {
+                hide.after = self
+                    .workspace
+                    .project(*pid)
+                    .and_then(|project| project.layout.clone());
             }
         }
         self.persist();
@@ -638,7 +738,8 @@ impl MuxelApp {
     }
 
     /// Put every held pane of project `pid` back into `layout`, where the
-    /// durable document keeps it until its close is final.
+    /// durable document keeps it until its close is final. Newest close first,
+    /// so each undoes onto the layout its own hide left.
     fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
         for group in self.close_groups.iter().rev() {
             let Some(original) = group.layouts.get(&pid) else {
@@ -652,8 +753,27 @@ impl MuxelApp {
                 })
                 .copied()
                 .collect();
-            recoverable_layout::restore_layout(layout, original, &ids);
+            recoverable_layout::restore_hidden(
+                layout,
+                group.hides.get(&pid),
+                original,
+                &ids,
+                &self.close_history,
+            );
         }
+    }
+
+    /// Forget the closes no held snapshot holds any more. Their order can't
+    /// change a restore.
+    fn prune_close_history(&mut self) {
+        let held: HashSet<_> = self
+            .close_groups
+            .iter()
+            .flat_map(|group| group.layouts.values())
+            .flatten()
+            .flat_map(PaneNode::collect_instances)
+            .collect();
+        self.close_history.retain(|iid| held.contains(iid));
     }
 
     /// The project as the saved and shared documents hold it: a held pane is
@@ -715,12 +835,27 @@ impl MuxelApp {
             return;
         };
         let durable = project.layout.clone();
-        let gone = rehide_held(&mut project.layout, &held);
+        let mut gone = Vec::new();
+        // Hide them close by close, oldest first, so each close's before and
+        // after are the adopted layout's.
         for group in &mut self.close_groups {
             if let Some(original) = group.layouts.get_mut(&pid) {
                 *original = durable.clone();
             }
+            let members: Vec<_> = group
+                .members
+                .iter()
+                .copied()
+                .filter(|iid| held.contains(iid))
+                .collect();
+            let before = project.layout.clone();
+            gone.extend(rehide_held(&mut project.layout, &members));
+            if let Some(hide) = group.hides.get_mut(&pid) {
+                hide.before = before;
+                hide.after = project.layout.clone();
+            }
         }
+        self.prune_close_history();
         for iid in gone {
             muxel_store::append_event_log(&format!("close: a peer closed held pane [{iid}]"));
             self.forget_close(iid);
@@ -844,9 +979,18 @@ impl MuxelApp {
             .or_else(|| group.members.iter().copied().find(|iid| ids.contains(iid)));
         for (&pid, original) in &group.layouts {
             if let Some(project) = self.workspace.project_mut(pid) {
-                recoverable_layout::restore_layout(&mut project.layout, original, &ids);
+                recoverable_layout::restore_hidden(
+                    &mut project.layout,
+                    group.hides.get(&pid),
+                    original,
+                    &ids,
+                    &self.close_history,
+                );
             }
         }
+        // Back in their layouts, so no longer closed.
+        self.close_history.retain(|iid| !ids.contains(iid));
+        self.prune_close_history();
         let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
@@ -1048,7 +1192,7 @@ impl MuxelApp {
             .filter(|&iid| {
                 self.workspace.instance(iid).is_none()
                     || self.closing.get(&iid).is_none_or(|held| {
-                        let now = self.close_facts(iid, cx);
+                        let now = self.close_facts_at_expiry(iid, cx);
                         exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
                     })
             })
@@ -1259,6 +1403,12 @@ impl MuxelApp {
             group.members.retain(|&member| member != iid);
         }
         self.close_groups.retain(|group| !group.members.is_empty());
+        // Going final keeps the place it took when held. A pane closed at once
+        // leaves now, after every close held so far.
+        if !self.close_history.contains(&iid) {
+            self.close_history.push(iid);
+        }
+        self.prune_close_history();
         if self.close_groups.is_empty() {
             self.show_close_list = false;
         }
@@ -1525,12 +1675,12 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseGroup, reason_close_evidence};
+    use super::{CloseGroup, close_state, listed_work_is_why_busy, reason_close_evidence};
     use muxel_core::control::AgentState;
     use muxel_core::recoverable_close::{
         CloseDecision, CloseFacts, CloseStage, decide, departure_finalizes,
     };
-    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+    use muxel_terminal::{AgentStatus, ProgramStatusKind, TerminalStatusReason};
     use std::collections::HashMap;
     use std::time::Instant;
     use uuid::Uuid;
@@ -1547,7 +1697,99 @@ mod tests {
             binding_rev: 0,
             input_rev: 0,
             completion_rev: 0,
+            shell_marks: 0,
         }
+    }
+
+    /// A Windows shell back at an idle prompt, with nothing typed and no
+    /// child, that printed marks after its close was made doesn't finish the
+    /// close. Here the marks come from a PowerShell whose parent cmd has
+    /// exited, which no check sees; in use they'd come from a line PowerShell
+    /// ran from input it had already read.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_shell_that_printed_marks_since_its_close_does_not_finish_it() {
+        use gpui::AppContext as _;
+        use muxel_core::recoverable_close::{CloseEvidence, CloseFacts, may_finalize};
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+        use std::time::Duration;
+
+        let powershell = std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+            .to_string_lossy()
+            .into_owned();
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let (pane, session) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("close-marks");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("close", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some(powershell.clone());
+                    instance.args = vec!["-NoLogo".into(), "-NoProfile".into()];
+                    let pane = instance.id;
+                    let spec = CommandSpec::program(&powershell, instance.args.clone());
+                    app.workspace.add_instance(instance);
+                    let launch = TerminalLaunch::spawn(spec, (100, 30)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    (pane, session)
+                })
+                .unwrap();
+            let facts = |cx: &mut gpui::TestAppContext| -> CloseFacts {
+                window
+                    .update(cx, |app, _, cx| app.close_facts(pane, cx))
+                    .unwrap()
+            };
+            let until =
+                |cx: &mut gpui::TestAppContext, what: &str, done: &dyn Fn(CloseFacts) -> bool| {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        cx.run_until_parked();
+                        let now = facts(cx);
+                        if done(now) {
+                            return now;
+                        }
+                        assert!(Instant::now() < deadline, "no {what}: {now:?}");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                };
+            let idle = |facts: CloseFacts| facts.evidence == CloseEvidence::ShellPrompt;
+            until(cx, "idle prompt", &idle);
+            // In 2 s, print a command start and then a plain prompt mark.
+            let late = muxel_core::winshell::encoded_command(
+                "Start-Sleep -Seconds 2; [Console]::Write(\"$([char]27)]133;C$([char]27)\\$([char]27)]133;B$([char]27)\\\")",
+            );
+            session.write_input(
+                format!("cmd /d /c start /b {powershell} -NoProfile -EncodedCommand {late}\r")
+                    .as_bytes(),
+            );
+            let before = until(cx, "the prompt after cmd exits", &idle);
+            let now = until(cx, "the late marks", &|now| {
+                idle(now) && now.shell_marks != before.shell_marks
+            });
+            assert_eq!(now.input_rev, before.input_rev, "nothing typed since");
+            assert!(!may_finalize(before, now, false), "{before:?} then {now:?}");
+        });
+    }
+
+    /// A dev server past its hold reads done, and a close would still kill it.
+    #[test]
+    fn a_close_asks_while_anything_runs_beside_a_finished_turn() {
+        let shell = muxel_core::control::BackgroundWork {
+            shells: 1,
+            ..Default::default()
+        };
+        let program = TerminalStatusReason::ProgramStatus(None);
+        let ask = |state, background| {
+            decide(facts(close_state(state, background), program), true) == CloseDecision::Ask
+        };
+        assert!(!ask(AgentState::Done, None), "a finished turn counts down");
+        assert!(ask(AgentState::Done, Some(shell)));
+        assert!(ask(AgentState::Idle, Some(shell)));
     }
 
     #[test]
@@ -1591,6 +1833,7 @@ mod tests {
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: None,
             caller: None,
         };
@@ -1613,6 +1856,24 @@ mod tests {
             assert_eq!(group.stage(), stage);
             assert!(!group.syncing(), "{stage:?}");
             assert!(!departure_finalizes(stage), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn the_close_prompt_names_listed_work_only_when_it_makes_the_pane_busy() {
+        use TerminalStatusReason::{BackgroundWork, BlockedMarker, ProviderScreen, ProviderTitle};
+        for (status, reason, named) in [
+            (AgentStatus::Done, ProviderTitle, true),
+            (AgentStatus::Idle, ProviderTitle, true),
+            (AgentStatus::Working, BackgroundWork, true),
+            (AgentStatus::Working, ProviderScreen, false),
+            (AgentStatus::Blocked, BlockedMarker, false),
+        ] {
+            assert_eq!(
+                listed_work_is_why_busy(status, reason),
+                named,
+                "{status:?} by {reason:?}"
+            );
         }
     }
 }

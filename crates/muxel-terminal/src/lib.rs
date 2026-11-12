@@ -8,14 +8,21 @@
 // master isn't `Sync`). Same trade-off gpui-component makes for its entities.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(windows)]
+mod codex_version;
 mod colors;
 mod control_input;
+mod control_paste;
 mod element;
 mod keymap;
 mod links;
 mod listener;
 mod pane_job;
 mod present_flag;
+#[cfg(windows)]
+mod process_tree;
+#[cfg(unix)]
+mod process_tree_unix;
 mod profile;
 mod profile_idle;
 pub mod profile_log;
@@ -33,6 +40,8 @@ pub use control_input::{
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};
+#[cfg(windows)]
+pub use process_tree::process_parent_map;
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{
@@ -45,5 +54,5 @@ pub use view::{
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    TextPasteErrorHandler, clean_agent_title, pane_grid, paste_clipboard_into_session,
 };
