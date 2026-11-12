@@ -1193,7 +1193,7 @@ impl EditorView {
         let time = rescue_time(backup.saved_at_ms);
         let label = match offer {
             BackupOffer::ChangedOnDisk => tf(
-                "Restore unsaved changes from {time}? The file changed on disk since; restoring keeps both.",
+                "Restore unsaved changes from {time}? The file changed on disk since.",
                 &[("time", &time)],
             ),
             _ => tf("Restore unsaved changes from {time}?", &[("time", &time)]),

@@ -19,6 +19,7 @@ pub mod geometry;
 pub mod git_for_windows;
 mod gui_path;
 pub mod import;
+pub mod input_box;
 pub mod isolated_root;
 mod launch;
 pub mod library;
