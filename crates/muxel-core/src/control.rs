@@ -608,6 +608,23 @@ pub enum Conversation {
     /// Nothing muxel can vouch for: the provider has named a conversation
     /// muxel hasn't confirmed yet, or there is none.
     Unconfirmed,
+    /// The provider ended the conversation muxel had confirmed (Claude runs
+    /// its SessionEnd hook before a `/clear` or `/resume` finishes), and muxel
+    /// hasn't confirmed the one it is in now.
+    Ended(ConversationEnd),
+}
+
+/// The end of the conversation a pane was in, while muxel hasn't confirmed
+/// the next ([`AgentInfo::conversation_ended`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationEnd {
+    /// The conversation that ended.
+    pub session_id: String,
+    /// The provider's own word for why: Claude's SessionEnd `reason`
+    /// (`clear`, `resume`, `prompt_input_exit`, …).
+    pub reason: String,
+    /// When it ended (unix ms).
+    pub at: i64,
 }
 
 impl Conversation {
@@ -615,14 +632,22 @@ impl Conversation {
     pub fn id(&self) -> Option<&str> {
         match self {
             Self::Known(id) => Some(id),
-            Self::Unconfirmed => None,
+            Self::Unconfirmed | Self::Ended(_) => None,
         }
     }
 
     pub fn into_id(self) -> Option<String> {
         match self {
             Self::Known(id) => Some(id),
-            Self::Unconfirmed => None,
+            Self::Unconfirmed | Self::Ended(_) => None,
+        }
+    }
+
+    /// The pane's [`AgentInfo::conversation_ended`].
+    pub fn ended(&self) -> Option<&ConversationEnd> {
+        match self {
+            Self::Ended(end) => Some(end),
+            Self::Known(_) | Self::Unconfirmed => None,
         }
     }
 }
@@ -649,6 +674,17 @@ pub fn check_session_id(expected: Option<&str>, current: &Conversation) -> Resul
             format!(
                 "muxel can't yet confirm which conversation the agent's pane is in, so not \
                  {expected} either: nothing was typed. Check `status` for its session_id"
+            ),
+            "conversation_unconfirmed",
+        ),
+        // A waiting send waits this out like any unconfirmed pane: the next
+        // start may name the pinned conversation again (`/resume` back to it).
+        Conversation::Ended(end) => (
+            format!(
+                "the agent ended conversation {} ({}) and muxel hasn't confirmed which one \
+                 its pane is in now, so not {expected} either: nothing was typed. Check \
+                 `status` for its session_id",
+                end.session_id, end.reason
             ),
             "conversation_unconfirmed",
         ),
@@ -739,6 +775,13 @@ pub struct AgentInfo {
     /// haven't named a conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Why `session_id` is missing for a running Claude pane: the conversation
+    /// it was in ended (its SessionEnd hook wrote an end record) and muxel
+    /// hasn't confirmed the next one. It stays until a SessionStart record
+    /// names where the pane is now, so an end that nothing followed reads as
+    /// that, with when it happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_ended: Option<ConversationEnd>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
     /// What the agent's own screen says is still running beside its turn.
@@ -2251,9 +2294,14 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   is switching, or names none) fails with `reason: conversation_unconfirmed`;
   `--when-idle` waits through it instead. Either way nothing is typed. A pane
   that isn't running is matched on the id it will resume, then checked again
-  once it runs. muxel learns of a Claude `/clear` or `/resume` from its hook a
-  moment after it happens, so the pin holds against muxel's latest
-  knowledge. `--force` never overrides it. It needs protocol v5: check
+  once it runs. In a local Claude pane it also reads Claude's record that the
+  conversation ended, which Claude writes before a `/clear` or `/resume`
+  finishes, before the paste and again before Enter: an ended conversation
+  fails with `reason: conversation_unconfirmed` (with `pasted: true` and Enter
+  withheld if it ended after the paste), and `--when-idle` waits for muxel to
+  confirm the next conversation, which then drops the send. Elsewhere muxel
+  learns of a switch a moment after it happens, so the pin holds against
+  muxel's latest knowledge. `--force` never overrides it. It needs protocol v5: check
   `protocol` in `status` first. An agent muxel types into through tmux
   refuses it with `parameter_unsupported`, `reason: tmux_delivery`, and types
   nothing: there the paste waits in tmux's input queue after the last check,
@@ -2275,7 +2323,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   on the draft it waited behind), it also waits for that turn to show: a
   send holding a conversation until the turn starts, since a `/clear` starts
   none and muxel hears of the new conversation a moment later; one holding
-  none for up to three seconds. Then it sends with every check above, and
+  none, or holding a local Claude pane's conversation (whose end record
+  shows a `/clear`), for up to three seconds. Then it sends with every check above, and
   the reply adds `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
   then fails with `timed_out` and `reason` naming what it was still waiting on
   (`working`, `blocked`, `prompt_hidden`, `starting`, `just_submitted`,
@@ -2406,6 +2455,13 @@ one. A pane that isn't running shows the id it will resume. Shells and agents
 that haven't named a conversation have none. Pass it to `send --session-id`
 to pin a send to that conversation.
 
+`conversation_ended` appears instead when a local Claude pane's conversation
+has ended and muxel hasn't confirmed the next one: `{"session_id", "reason",
+"at"}`, the ended id, Claude's reason (`clear`, `resume`, an exit reason) and
+when, in Unix milliseconds. It stays until Claude starts the next conversation
+and muxel adopts it, so an agent that ended its conversation and never started
+another reads as that.
+
 `status` and `panes` also report `protocol`, the newest control protocol
 version this muxel accepts. An older muxel leaves it out.
 
@@ -2424,7 +2480,9 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`,
   or, with `reason: conversation_changed`, the pane isn't in the conversation
   the send was pinned to, or, with `reason: conversation_unconfirmed`, muxel
-  can't confirm which conversation it is in yet. Nothing was typed; check
+  can't confirm which conversation it is in yet. Nothing was typed unless
+  `pasted: true` (the conversation ended between the paste and Enter, so Enter
+  was withheld and the text may still be in the prompt: see `screen`); check
   `status`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
@@ -2873,14 +2931,24 @@ mod tests {
     /// each with its own reason.
     #[test]
     fn a_conversation_pin_accepts_only_that_conversation() {
-        use super::Conversation::{Known, Unconfirmed};
+        use super::Conversation::{Ended, Known, Unconfirmed};
         let check = super::check_session_id;
         assert_eq!(check(None, &Unconfirmed), Ok(()));
         assert_eq!(check(None, &Known("a".into())), Ok(()));
         assert_eq!(check(Some("a"), &Known("a".into())), Ok(()));
+        // The pinned conversation itself ended: a waiting send waits, since a
+        // `/resume` may bring the pane back to it.
+        let ended = Ended(super::ConversationEnd {
+            session_id: "a".into(),
+            reason: "clear".into(),
+            at: 1,
+        });
+        assert_eq!(ended.id(), None);
+        assert!(ended.ended().is_some());
         for (current, reason) in [
             (Known("b".into()), "conversation_changed"),
             (Unconfirmed, "conversation_unconfirmed"),
+            (ended, "conversation_unconfirmed"),
         ] {
             let error = check(Some("a"), &current).unwrap_err();
             assert_eq!(error.code, Some(ErrorCode::LaunchMismatch), "{current:?}");
@@ -3093,6 +3161,7 @@ mod tests {
             status_since: None,
             launch_id: None,
             session_id: None,
+            conversation_ended: None,
             awaiting_reply: false,
             background: None,
             turn_over: false,
@@ -3107,12 +3176,25 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("launch_id").is_none(), "{json}");
         assert!(json.get("session_id").is_none(), "{json}");
+        assert!(json.get("conversation_ended").is_none(), "{json}");
         info.status = Some(AgentState::Idle);
         info.launch_id = Some(id(42));
         info.session_id = Some("5a40c944-0000-4000-8000-000000000001".into());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["launch_id"], id(42).to_string());
         assert_eq!(json["session_id"], "5a40c944-0000-4000-8000-000000000001");
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+        // Ended: no session_id, and the end that left it unconfirmed.
+        info.session_id = None;
+        info.conversation_ended = Some(super::ConversationEnd {
+            session_id: "5a40c944-0000-4000-8000-000000000001".into(),
+            reason: "clear".into(),
+            at: 1_762_970_000_000,
+        });
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("session_id").is_none(), "{json}");
+        assert_eq!(json["conversation_ended"]["reason"], "clear");
+        assert_eq!(json["conversation_ended"]["at"], 1_762_970_000_000_i64);
         assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
     }
 

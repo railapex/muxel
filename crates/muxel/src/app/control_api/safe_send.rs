@@ -288,12 +288,16 @@ pub(in crate::app) struct QueuedSend {
     /// When a check last found another client attached. Over SSH each check
     /// is a command on the host, so they are spaced out.
     clients_seen: Option<Instant>,
+    /// A read of the pane's Claude end record for its conversation is running.
+    checking_end: bool,
 }
 
 /// How long after finding another tmux client a waiting send asks again.
 const CLIENTS_RECHECK: Duration = Duration::from_secs(5);
-/// How long after someone else's submission a waiting send that holds no
-/// conversation gives that turn to show, when it shows none.
+/// How long after someone else's submission a waiting send gives that turn to
+/// show, when it shows none (`/model`, a `/clear`). One holding a conversation
+/// gets this only where muxel reads the provider's conversation ends (a local
+/// Claude pane), since an end the turn didn't show is then still seen.
 const SUBMISSION_SETTLE_MS: i64 = 3_000;
 
 /// What a waiting send does now.
@@ -318,6 +322,9 @@ struct PaneFacts {
     submitted_at: Option<i64>,
     /// When the pane last started a turn or asked a question (wall-clock ms).
     turn_started_at: Option<i64>,
+    /// muxel reads the pane's Claude end records, so a conversation that
+    /// ended shows in `writable` without a turn to show it.
+    ends_recorded: bool,
     now_ms: i64,
 }
 
@@ -359,15 +366,17 @@ fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
     }
     // Someone submitted while it waited: a person's Enter on their draft, or
     // another send. That can start a turn the pane doesn't show yet, or end
-    // the conversation (`/clear` starts no turn, and muxel hears of the new
-    // conversation a moment later). So the send waits for that turn to show.
-    // One holding a conversation waits until then, or until muxel's reading
-    // of the conversation moves and the check above settles it; one holding
-    // none, which no conversation change can wrong, gives the turn a moment.
+    // the conversation (`/clear` starts no turn). So the send waits for that
+    // turn to show, or gives it a moment. One holding a conversation gets the
+    // moment only where muxel reads the provider's conversation ends: Claude
+    // writes the end record before its `/clear` or `/resume` finishes, so
+    // the check above sees the end however long muxel takes to adopt the
+    // next conversation. Elsewhere it waits for the turn, or for muxel's
+    // reading of the conversation to move and the check above to settle it.
     if let Some(submitted) = facts.submitted_at.filter(|at| *at >= queued.queued_ms) {
         let shown = facts.turn_started_at.is_some_and(|at| at >= submitted);
-        let settled =
-            queued.conversation.is_none() && facts.now_ms - submitted >= SUBMISSION_SETTLE_MS;
+        let settled = (queued.conversation.is_none() || facts.ends_recorded)
+            && facts.now_ms - submitted >= SUBMISSION_SETTLE_MS;
         if !shown && !settled {
             return Verdict::Wait("just_submitted");
         }
@@ -523,6 +532,7 @@ impl MuxelApp {
                 cancelled,
                 checking_clients: false,
                 clients_seen: None,
+                checking_end: false,
             },
         );
         self.pump_control_queue(cx);
@@ -590,6 +600,7 @@ impl MuxelApp {
             send_in_flight: SendInFlight::held(iid),
             submitted_at,
             turn_started_at,
+            ends_recorded: self.claude_end_records_apply(iid, cx),
             now_ms: now_ms(),
         }
     }
@@ -608,6 +619,7 @@ impl MuxelApp {
             let first_launch = facts.writable.as_ref().ok().map(|(launch, _)| *launch);
             let decided = verdict(queued, facts);
             let ask_clients_later = queued.checking_clients
+                || queued.checking_end
                 || queued
                     .clients_seen
                     .is_some_and(|seen| seen.elapsed() < CLIENTS_RECHECK);
@@ -617,6 +629,7 @@ impl MuxelApp {
             if queued.launch.is_none() {
                 queued.launch = first_launch;
             }
+            let conversation = queued.conversation.clone();
             match decided {
                 Verdict::Refuse(error) => {
                     if let Some(queued) = self.control_queue.remove(&iid) {
@@ -631,7 +644,39 @@ impl MuxelApp {
                         .instance(iid)
                         .and_then(|inst| self.control_claim_site(inst));
                     let Some(site) = site else {
-                        self.send_queued(iid, cx);
+                        // A local Claude pane: read its end record for this
+                        // conversation first, so an end muxel hasn't taken in
+                        // yet makes the send wait rather than type, or fail at
+                        // the paste.
+                        let check = self.claude_end_check(iid, conversation.as_deref(), cx);
+                        let Some(check) = check else {
+                            self.send_queued(iid, cx);
+                            continue;
+                        };
+                        if let Some(queued) = self.control_queue.get_mut(&iid) {
+                            queued.checking_end = true;
+                        }
+                        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                            let read = cx
+                                .background_executor()
+                                .spawn(async move { check.read() })
+                                .await;
+                            let _ = this.update(cx, |app, cx| {
+                                let Some(queued) = app.control_queue.get_mut(&iid) else {
+                                    return;
+                                };
+                                queued.checking_end = false;
+                                if read.end.is_err() {
+                                    // Unread is not "not ended": ask again on
+                                    // the next tick.
+                                    queued.waiting_on = "conversation_unconfirmed";
+                                    return;
+                                }
+                                app.note_claude_end(read, cx);
+                                app.send_queued(iid, cx);
+                            });
+                        })
+                        .detach();
                         continue;
                     };
                     if let Some(queued) = self.control_queue.get_mut(&iid) {
@@ -745,6 +790,7 @@ impl MuxelApp {
                 cancelled: Arc::default(),
                 checking_clients: false,
                 clients_seen: None,
+                checking_end: false,
             },
         );
     }
@@ -948,6 +994,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             checking_clients: false,
             clients_seen: None,
+            checking_end: false,
         }
     }
 
@@ -964,14 +1011,15 @@ mod tests {
             submitted_at: Some(QUEUED_MS - 60_000),
             turn_started_at: Some(QUEUED_MS - 59_000),
             now_ms: QUEUED_MS + 1_000,
+            ends_recorded: false,
         }
     }
 
     /// A person submits the draft a send waited behind. The pane reads idle
     /// at once, before the turn shows, and a `/clear` shows none at all while
     /// muxel hasn't heard of the new conversation yet. A send holding a
-    /// conversation waits for the turn to show; one holding none waits only
-    /// a moment.
+    /// conversation waits for the turn to show, unless muxel reads the
+    /// provider's conversation ends; one holding none waits only a moment.
     #[test]
     fn a_waiting_send_waits_for_the_turn_someone_else_just_submitted() {
         let launch = Uuid::new_v4();
@@ -989,6 +1037,22 @@ mod tests {
                 "{now_ms}"
             );
         }
+        // Where muxel reads Claude's conversation ends, a `/model` (no turn,
+        // no end) lets a pinned send go after the same moment: a `/clear`
+        // would have left an end record, which the send checks before it
+        // types.
+        let reads_ends = |now_ms| PaneFacts {
+            ends_recorded: true,
+            ..just_submitted(now_ms)
+        };
+        assert_eq!(
+            verdict(&pinned, reads_ends(submitted + 1_000)),
+            Verdict::Wait("just_submitted")
+        );
+        assert_eq!(
+            verdict(&pinned, reads_ends(submitted + 3_000)),
+            Verdict::Send
+        );
         // Once that turn has shown, the send goes at the next idle moment.
         let shown = PaneFacts {
             turn_started_at: Some(submitted + 800),

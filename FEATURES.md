@@ -1167,8 +1167,11 @@ feature is added or changed, update the matching entry here in the same change**
   muxel (ten minutes by default, at most an hour) while the agent is working,
   starting, asking a question, holding a draft, taking another send, or has
   another tmux client attached, and after someone else submits (a person's
-  Enter on their draft) until that turn shows, so a submitted `/clear` can't
-  pass its send into the new conversation; then it types with every ordinary check; the
+  Enter on their draft) until that turn shows, or for a few seconds when none
+  does (`/model`). A send pinned to a conversation waits for the turn, so a
+  submitted `/clear` can't pass it into the new conversation, except in a local
+  Claude pane, where Claude's end record catches the `/clear` instead (see
+  Conversation-pinned sends); then it types with every ordinary check; the
   receipt adds `waited_ms`. It ends `timed_out` with the condition it was
   still waiting on, or with the refusal the pane now gives (exited, replaced
   launch, `conversation_changed`); a caller that disconnects before typing
@@ -1190,6 +1193,23 @@ feature is added or changed, update the matching entry here in the same change**
   `conversation_unconfirmed` (a waiting send waits it out). Nothing is typed.
   An agent behind tmux refuses the pin with `parameter_unsupported`, `reason:
   tmux_delivery`, since its paste waits in tmux's queue after the last check.
+  In a local Claude pane muxel also reads Claude's own record that a
+  conversation ended. muxel's hook writes one from Claude's SessionEnd, which
+  Claude Code 2.1.322 runs, and waits for, before a `/clear` or `/resume`
+  finishes, so the record is there before muxel can adopt the next
+  conversation. A pinned send reads it before the paste and again before the
+  Enter: an ended conversation refuses `conversation_unconfirmed`, or, after
+  the paste, withholds the Enter and says the text may still be in the
+  prompt; a waiting send waits until muxel adopts the next conversation,
+  which drops it. Meanwhile `status` names no `session_id` and shows
+  `conversation_ended` with the ended id, Claude's reason (`clear`,
+  `resume`, …) and when. This rests on Claude behaviour that was observed,
+  not documented. A Claude started by an older muxel, one launched with its
+  own `--settings` or as a literal command, and a remote pane write no end
+  records, and keep the
+  moment between Claude's switch and muxel adopting it; muxel logs a warning
+  when a `/clear` or `/resume` start arrives with no end before it. Codex,
+  Grok and Muse are unverified and use no end records.
 - **Detached sends** — `send --when-idle --detach --once KEY` answers
   `queued` at once and muxel keeps the send with nobody connected, so a mail
   doorbell needs no process of its own. It waits and types exactly as

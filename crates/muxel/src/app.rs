@@ -4350,6 +4350,7 @@ mod claude_resume_tests {
             cwd: Default::default(),
             path: Default::default(),
             from_resume: true,
+            from_fork: false,
             stamp: Some(crate::session_binding::ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: SystemTime::now(),
@@ -4993,6 +4994,7 @@ mod loop_cleanup_tests {
             cwd: Default::default(),
             path: Default::default(),
             from_resume: true,
+            from_fork: false,
             stamp: Some(crate::session_binding::ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: SystemTime::now(),
@@ -6431,6 +6433,13 @@ pub struct MuxelApp {
     /// The terminal binding each pane's stored conversation id was adopted
     /// in, so `ctl` vouches for that id only while the binding lasts.
     control_conversations: HashMap<Uuid, control_api::AdoptedConversation>,
+    /// The latest end record read for each Claude pane's stored conversation,
+    /// with the terminal it was read in (see [`MuxelApp::control_conversation`]).
+    claude_ends: HashMap<Uuid, control_api::ClaudeEndSeen>,
+    /// Claude terminals that started a conversation by `/clear` or `/resume`
+    /// with no end record for the one before: their SessionEnd hook didn't
+    /// write, so an end record can't be waited for in them.
+    claude_end_hook_missed: std::collections::HashSet<Uuid>,
     /// Runtime-only click approvals; no connection waits for the human.
     control_approvals: muxel_core::control::ApprovalQueue<control_api::PreparedCreation>,
     control_approval_notified: Option<Uuid>,
@@ -8689,6 +8698,8 @@ impl MuxelApp {
             control_once: Default::default(),
             control_queue: HashMap::new(),
             control_conversations: HashMap::new(),
+            claude_ends: HashMap::new(),
+            claude_end_hook_missed: Default::default(),
             control_approvals: Default::default(),
             control_approval_notified: None,
         };
@@ -12310,6 +12321,8 @@ impl MuxelApp {
         self.refuse_control_queue();
         self.control_once.clear();
         self.control_conversations.clear();
+        self.claude_ends.clear();
+        self.claude_end_hook_missed.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();
@@ -14166,8 +14179,10 @@ impl MuxelApp {
             self.browsers.remove(&iid);
             self.last_status.remove(&iid);
             self.failed_launches.remove(&iid);
+            self.claude_ends.remove(&iid);
             if let Some(data_dir) = muxel_store::data_dir() {
                 crate::session_binding::clear_muse_binding(&data_dir, iid);
+                crate::session_binding::clear_claude_ends(&data_dir, iid);
             }
             self.workspace.remove_instance_meta(iid);
         }
@@ -18170,8 +18185,10 @@ impl MuxelApp {
                 self.take_deferred_worktree_dispose(project_id, *wid);
             }
         }
+        self.claude_ends.remove(&iid);
         if let Some(data_dir) = muxel_store::data_dir() {
             crate::session_binding::clear_muse_binding(&data_dir, iid);
+            crate::session_binding::clear_claude_ends(&data_dir, iid);
         }
         let is_remote = self
             .workspace

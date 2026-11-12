@@ -917,6 +917,9 @@ pub(crate) struct ClaudeBinding {
     pub path: PathBuf,
     pub cwd: PathBuf,
     pub from_resume: bool,
+    /// A `/fork`: on Claude Code 2.1.322 a copy started beside the pane's
+    /// conversation, which the pane stays in.
+    pub from_fork: bool,
     /// `None` for a record written by an older muxel's hook.
     pub stamp: Option<ClaudeHookStamp>,
 }
@@ -1012,17 +1015,24 @@ pub(crate) fn claude_hook_settings() -> Option<String> {
     Some(argument)
 }
 
+/// SessionStart writes the record that names the pane's next conversation;
+/// SessionEnd, with no matcher so every reason counts, writes the record that
+/// its current one ended ([`ClaudeEnd`]).
 fn claude_hook_settings_for(executable: &Path) -> String {
+    let hook = json!({
+        "type": "command",
+        "command": executable.to_string_lossy(),
+        "args": [CLAUDE_HOOK_FLAG],
+        "timeout": 5
+    });
     json!({
         "hooks": {
             "SessionStart": [{
                 "matcher": "resume|clear|fork",
-                "hooks": [{
-                    "type": "command",
-                    "command": executable.to_string_lossy(),
-                    "args": [CLAUDE_HOOK_FLAG],
-                    "timeout": 5
-                }]
+                "hooks": [hook.clone()]
+            }],
+            "SessionEnd": [{
+                "hooks": [hook]
             }]
         }
     })
@@ -1097,6 +1107,140 @@ pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf
     claude_binding_dir(data_dir).join(format!("{instance_id}.json"))
 }
 
+/// Claude's record that it ended a conversation in a pane, from its
+/// SessionEnd hook. Claude Code 2.1.322 runs SessionEnd, and waits for it,
+/// before it finishes a `/clear` or `/resume`, and as it exits; a `/fork`
+/// copy, `/model` and an ordinary prompt run none. Each ended conversation
+/// has its own file (`<pane>.end.<conversation>.json`), so a later end can't
+/// hide an earlier one muxel hasn't read yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeEnd {
+    pub session_id: String,
+    /// Claude's own word for it: `clear`, `resume`, `prompt_input_exit`, …
+    pub reason: String,
+    pub recorded_at: SystemTime,
+}
+
+fn claude_end_path(data_dir: &Path, instance_id: Uuid, session: Uuid) -> PathBuf {
+    claude_binding_dir(data_dir).join(format!("{instance_id}.end.{session}.json"))
+}
+
+/// The pane a hook record's file stem names: `<pane>` for a start record,
+/// `<pane>.end.<conversation>` for an end record. muxel's own `.claimed`
+/// name, and anything else, names none.
+pub(crate) fn claude_record_stem_pane(stem: &str) -> Option<Uuid> {
+    match stem.split_once(".end.") {
+        Some((pane, conversation)) => {
+            Uuid::parse_str(conversation).ok()?;
+            Uuid::parse_str(pane).ok()
+        }
+        None => Uuid::parse_str(stem).ok(),
+    }
+}
+
+fn write_claude_end(data_dir: &Path, instance_id: Uuid, event: &Value) -> Result<()> {
+    let session = event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("Claude SessionEnd event has no session_id")?;
+    let session = Uuid::parse_str(session).context("Claude SessionEnd session_id is not a UUID")?;
+    let reason = event
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("other");
+    let mut record = json!({
+        "hook_event_name": "SessionEnd",
+        "session_id": session.to_string(),
+        "reason": reason,
+    });
+    stamp_claude_event(&mut record, Uuid::new_v4(), SystemTime::now());
+    let path = claude_end_path(data_dir, instance_id, session);
+    let parent = path
+        .parent()
+        .context("Claude end record path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating Claude binding directory {}", parent.display()))?;
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temp, record.to_string())
+        .with_context(|| format!("writing Claude end record {}", temp.display()))?;
+    // Nothing claims an end record, so the rename replaces an earlier end of
+    // the same conversation in one step.
+    std::fs::rename(&temp, &path)
+        .with_context(|| format!("installing Claude end record {}", path.display()))?;
+    Ok(())
+}
+
+/// The pane's end record for `session_id`, if Claude has ended that
+/// conversation there. A record that exists but doesn't parse still says an
+/// end ran, so it reads as one at its write time: a check fails closed.
+pub(crate) fn read_claude_end(
+    data_dir: &Path,
+    instance_id: Uuid,
+    session_id: &str,
+) -> std::io::Result<Option<ClaudeEnd>> {
+    let Ok(session) = Uuid::parse_str(session_id) else {
+        return Ok(None);
+    };
+    let file = match std::fs::File::open(claude_end_path(data_dir, instance_id, session)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let modified = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let mut bytes = Vec::new();
+    file.take(MAX_HOOK_INPUT_BYTES).read_to_end(&mut bytes)?;
+    let event = serde_json::from_slice::<Value>(&bytes).ok();
+    Ok(Some(ClaudeEnd {
+        session_id: session_id.to_owned(),
+        reason: event
+            .as_ref()
+            .and_then(|event| event.get("reason")?.as_str())
+            .unwrap_or("unreadable")
+            .to_owned(),
+        recorded_at: event
+            .as_ref()
+            .and_then(claude_hook_stamp)
+            .map(|stamp| stamp.recorded_at)
+            .or(modified)
+            .unwrap_or_else(SystemTime::now),
+    }))
+}
+
+/// A closed pane's end records go with it.
+pub(crate) fn clear_claude_ends(data_dir: &Path, instance_id: Uuid) {
+    let Ok(entries) = std::fs::read_dir(claude_binding_dir(data_dir)) else {
+        return;
+    };
+    let prefix = format!("{instance_id}.end.");
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// When Claude ended the conversation muxel has `bound` to a pane, and why,
+/// from that conversation's end record. `bound_since` is when the start that
+/// bound it was recorded, or the launch for a conversation the launch opened:
+/// an end at or before then belongs to an earlier binding of the same id (a
+/// `/resume` back into it, or a previous process). The next start rebinds the
+/// pane, to another id or to this one with a later `bound_since`, and so
+/// confirms it again.
+pub(crate) fn claude_conversation_ended<'a>(
+    bound: &str,
+    bound_since: SystemTime,
+    end: Option<&'a ClaudeEnd>,
+) -> Option<&'a ClaudeEnd> {
+    end.filter(|end| end.session_id == bound && end.recorded_at > bound_since)
+}
+
 pub(crate) fn write_claude_binding_from_reader(
     data_dir: &Path,
     instance_id: Uuid,
@@ -1106,12 +1250,14 @@ pub(crate) fn write_claude_binding_from_reader(
     reader
         .take(MAX_HOOK_INPUT_BYTES + 1)
         .read_to_string(&mut input)
-        .context("reading Claude SessionStart input")?;
+        .context("reading Claude hook input")?;
     if input.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        bail!("Claude SessionStart input exceeds {MAX_HOOK_INPUT_BYTES} bytes");
+        bail!("Claude hook input exceeds {MAX_HOOK_INPUT_BYTES} bytes");
     }
-    let mut event: Value =
-        serde_json::from_str(&input).context("parsing Claude SessionStart input")?;
+    let mut event: Value = serde_json::from_str(&input).context("parsing Claude hook input")?;
+    if event.get("hook_event_name").and_then(Value::as_str) == Some("SessionEnd") {
+        return write_claude_end(data_dir, instance_id, &event);
+    }
     validate_claude_event(&event)?;
     stamp_claude_event(&mut event, Uuid::new_v4(), SystemTime::now());
 
@@ -1249,6 +1395,7 @@ pub(crate) fn claude_binding_from_record(record: &[u8], home: &Path) -> Option<C
         path: transcript.to_path_buf(),
         cwd: PathBuf::from(event.get("cwd")?.as_str()?),
         from_resume: source == "resume",
+        from_fork: source == "fork",
         stamp: claude_hook_stamp(&event),
     })
 }
@@ -2113,6 +2260,11 @@ mod tests {
         assert_eq!(handler["hooks"][0]["command"], "C:/Program Files/muxel.exe");
         assert_eq!(handler["hooks"][0]["args"][0], CLAUDE_HOOK_FLAG);
         assert_eq!(handler["hooks"][0]["args"].as_array().unwrap().len(), 1);
+        // Every SessionEnd reason runs the same hook: an end of any kind
+        // leaves the pane's conversation unconfirmed.
+        let end = &value["hooks"]["SessionEnd"][0];
+        assert!(end.get("matcher").is_none());
+        assert_eq!(end["hooks"][0], handler["hooks"][0]);
     }
 
     #[test]
@@ -2345,6 +2497,7 @@ mod tests {
             path: PathBuf::new(),
             cwd: PathBuf::new(),
             from_resume: true,
+            from_fork: false,
             stamp: Some(ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: receipt_at,
@@ -2383,6 +2536,7 @@ mod tests {
         }
         let clear = ClaudeBinding {
             from_resume: false,
+            from_fork: false,
             ..binding
         };
         assert!(!claude_receipt_confirms_launch(
@@ -3021,5 +3175,219 @@ mod tests {
             hook_instance_from_args([OsString::from("--other")], Some(id.to_string().into())),
             Ok(None)
         );
+    }
+
+    /// A pane running Claude Code 2.1.322, through the hook records it writes
+    /// and the binding muxel keeps from them: the conversation it's bound to,
+    /// and when the start that bound it was recorded (the launch, for the
+    /// launch's own).
+    struct ClaudePane {
+        root: PathBuf,
+        data: PathBuf,
+        home: PathBuf,
+        cwd: PathBuf,
+        pane: Uuid,
+        bound: String,
+        since: SystemTime,
+    }
+
+    impl ClaudePane {
+        fn launch(conversation: &str) -> Self {
+            let root = temp_dir();
+            let cwd = root.join("project");
+            std::fs::create_dir_all(&cwd).unwrap();
+            Self {
+                data: root.join("data"),
+                home: root.join("home"),
+                cwd,
+                root,
+                pane: Uuid::new_v4(),
+                bound: conversation.to_owned(),
+                since: SystemTime::now(),
+            }
+        }
+
+        /// The process restarts in the same pane with `--resume`.
+        fn relaunch(&mut self) {
+            self.since = SystemTime::now();
+        }
+
+        /// What Claude's hook is given, as 2.1.322 sends it.
+        fn hook(&self, event: &str, session: &str, kind: (&str, &str)) {
+            let transcript = muxel_core::claude_session_path(&self.home, &self.cwd, session);
+            let mut input = json!({
+                "session_id": session,
+                "transcript_path": transcript,
+                "cwd": self.cwd,
+                "hook_event_name": event,
+            });
+            input[kind.0] = json!(kind.1);
+            write_claude_binding_from_reader(
+                &self.data,
+                self.pane,
+                std::io::Cursor::new(input.to_string()),
+            )
+            .unwrap();
+        }
+
+        /// SessionEnd, which `/clear`, `/resume` and exiting run for the
+        /// conversation they leave, and wait for.
+        fn end(&self, session: &str, reason: &str) {
+            self.hook("SessionEnd", session, ("reason", reason));
+        }
+
+        /// SessionStart, and muxel adopting the conversation it names. A
+        /// `/fork` copy's start leaves the pane where it was.
+        fn start(&mut self, session: &str, source: &str) {
+            let transcript = muxel_core::claude_session_path(&self.home, &self.cwd, session);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, "{}\n").unwrap();
+            self.hook("SessionStart", session, ("source", source));
+            let record = claim_claude_binding(&self.data, self.pane).unwrap();
+            let binding = claude_binding_from_record(&record.bytes, &self.home).unwrap();
+            assert_eq!(binding.from_fork, source == "fork");
+            if !binding.from_fork {
+                self.bound = binding.session_id;
+                self.since = binding.stamp.unwrap().recorded_at;
+            }
+            acknowledge_claude_binding(record);
+        }
+
+        /// What a send pinned to the bound conversation checks before it
+        /// types: whether Claude ended it since muxel bound it, and why.
+        fn ended(&self) -> Option<String> {
+            let end = read_claude_end(&self.data, self.pane, &self.bound).unwrap();
+            claude_conversation_ended(&self.bound, self.since, end.as_ref())
+                .map(|end| end.reason.clone())
+        }
+    }
+
+    impl Drop for ClaudePane {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The pane's conversation has ended once Claude records its end, before
+    /// muxel adopts the next one, and only an end of the bound conversation
+    /// since muxel bound it counts. The sequences are the hook runs observed
+    /// on Claude Code 2.1.322 for each command.
+    #[test]
+    fn a_claude_conversation_ends_only_by_its_own_end_since_it_was_bound() {
+        let [a, b, c, f] = [(); 4].map(|_| Uuid::new_v4().to_string());
+        let mut pane = ClaudePane::launch(&a);
+        assert_eq!(pane.ended(), None);
+        // `/model` and an ordinary prompt run no hook.
+        // An idle `/clear`: A's end, then B's start.
+        pane.end(&a, "clear");
+        assert_eq!(pane.ended().as_deref(), Some("clear"));
+        pane.start(&b, "clear");
+        assert_eq!(pane.ended(), None);
+        // A `/clear` queued behind a busy turn, with a prompt queued ahead of
+        // it: the turn ends, the prompt runs (no hook), then the `/clear`.
+        // Until its end lands, B stands.
+        assert_eq!(pane.ended(), None);
+        pane.end(&b, "clear");
+        assert_eq!(pane.ended().as_deref(), Some("clear"));
+        pane.start(&c, "clear");
+        // `/fork`: the copy starts beside C and the pane stays in C, so the
+        // copy's own end doesn't touch it.
+        pane.start(&f, "fork");
+        pane.end(&f, "other");
+        assert_eq!(pane.bound, c);
+        assert_eq!(pane.ended(), None);
+        // `/resume` back into A, whose end from the first `/clear` is still on
+        // disk: C's end, then A's start, which binds A after that old end.
+        pane.end(&c, "resume");
+        assert_eq!(pane.ended().as_deref(), Some("resume"));
+        pane.start(&a, "resume");
+        assert_eq!(pane.bound, a);
+        assert_eq!(pane.ended(), None);
+        // Exiting ends A; the next launch resumes it.
+        pane.end(&a, "prompt_input_exit");
+        assert_eq!(pane.ended().as_deref(), Some("prompt_input_exit"));
+        pane.relaunch();
+        assert_eq!(pane.ended(), None);
+        // Its next end replaces the old record.
+        pane.end(&a, "clear");
+        assert_eq!(pane.ended().as_deref(), Some("clear"));
+    }
+
+    /// An end record that exists but doesn't parse still says an end ran: it
+    /// reads as one at its write time, so a check refuses rather than types.
+    #[test]
+    fn an_end_record_that_doesnt_parse_still_reads_as_an_end() {
+        let conversation = Uuid::new_v4().to_string();
+        let pane = ClaudePane::launch(&conversation);
+        let path = claude_end_path(
+            &pane.data,
+            pane.pane,
+            Uuid::parse_str(&conversation).unwrap(),
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"session_id\":").unwrap();
+        let end = read_claude_end(&pane.data, pane.pane, &conversation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(end.reason, "unreadable");
+        assert_eq!(
+            end.recorded_at,
+            std::fs::metadata(&path).unwrap().modified().unwrap()
+        );
+        assert_eq!(pane.ended().as_deref(), Some("unreadable"));
+    }
+
+    /// The SessionEnd hook writes only for a conversation it can name, never
+    /// touches the start record muxel claims, and a closed pane's end records
+    /// go with it while another pane's stay.
+    #[test]
+    fn the_end_hook_writes_one_record_per_conversation_and_close_clears_them() {
+        let [a, b] = [(); 2].map(|_| Uuid::new_v4().to_string());
+        let mut pane = ClaudePane::launch(&a);
+        let hook = |input: Value| {
+            write_claude_binding_from_reader(
+                &pane.data,
+                pane.pane,
+                std::io::Cursor::new(input.to_string()),
+            )
+        };
+        assert!(hook(json!({"hook_event_name": "SessionEnd", "reason": "clear"})).is_err());
+        assert!(hook(json!({"hook_event_name": "SessionEnd", "session_id": "../a"})).is_err());
+        // No reason is still an end.
+        hook(json!({"hook_event_name": "SessionEnd", "session_id": a})).unwrap();
+        let end = read_claude_end(&pane.data, pane.pane, &a).unwrap().unwrap();
+        assert_eq!(end.reason, "other");
+        assert!(
+            read_pending_claude_binding(&pane.data, pane.pane)
+                .unwrap()
+                .is_none()
+        );
+        pane.start(&b, "clear");
+        pane.end(&b, "clear");
+        let other = Uuid::new_v4();
+        let other_end = claude_end_path(&pane.data, other, Uuid::parse_str(&a).unwrap());
+        std::fs::write(&other_end, b"{}").unwrap();
+        // Each end names its pane for the watcher; temp files and muxel's
+        // own names name none.
+        for name in [&a, &b] {
+            let stem = format!("{}.end.{name}", pane.pane);
+            assert_eq!(claude_record_stem_pane(&stem), Some(pane.pane));
+        }
+        assert_eq!(
+            claude_record_stem_pane(&pane.pane.to_string()),
+            Some(pane.pane)
+        );
+        assert_eq!(
+            claude_record_stem_pane(&format!("{}.end.x", pane.pane)),
+            None
+        );
+        assert_eq!(
+            claude_record_stem_pane(&format!("{}.claimed", pane.pane)),
+            None
+        );
+        clear_claude_ends(&pane.data, pane.pane);
+        assert_eq!(read_claude_end(&pane.data, pane.pane, &a).unwrap(), None);
+        assert_eq!(read_claude_end(&pane.data, pane.pane, &b).unwrap(), None);
+        assert!(other_end.exists(), "another pane's end went too");
     }
 }

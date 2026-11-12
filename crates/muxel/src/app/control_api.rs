@@ -9,7 +9,9 @@
 //! check, before typing into an agent, that muxel on another computer sharing its
 //! tmux session isn't mid-turn with it (see [`claim_agent`]).
 
+use super::session_discovery::ClaudeEndRead;
 use super::*;
+use crate::session_binding;
 use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
@@ -283,6 +285,10 @@ pub(super) struct Typing {
     /// `send --when-idle`: set once its caller has gone. Checked before the
     /// paste; once the paste is in, the send finishes.
     cancelled: Option<Arc<AtomicBool>>,
+    /// Its conversation pin has been checked against the pane's Claude end
+    /// record (see [`MuxelApp::claude_end_check`]); the check before Enter
+    /// still runs.
+    end_checked: bool,
     reply: Value,
 }
 
@@ -292,6 +298,37 @@ pub(in crate::app) struct AdoptedConversation {
     launch: Uuid,
     binding: u64,
     id: String,
+    /// When the start that bound it was recorded (Claude's hook stamp), so an
+    /// end record from before then belongs to an earlier binding. `None`: the
+    /// launch's own start.
+    since: Option<SystemTime>,
+}
+
+/// A Claude pane's end record for its stored conversation, and the terminal
+/// it was read for (see [`MuxelApp::control_conversation`]).
+pub(in crate::app) struct ClaudeEndSeen {
+    launch: Uuid,
+    end: session_binding::ClaudeEnd,
+}
+
+/// A read of a pane's end record for one conversation, off the UI thread,
+/// before a pinned send types and again before its Enter.
+#[derive(Clone)]
+struct ClaudeEndCheck {
+    data_dir: PathBuf,
+    pane: Uuid,
+    session: String,
+}
+
+impl ClaudeEndCheck {
+    fn read(self) -> ClaudeEndRead {
+        let end = session_binding::read_claude_end(&self.data_dir, self.pane, &self.session);
+        ClaudeEndRead {
+            pane: self.pane,
+            session: self.session,
+            end,
+        }
+    }
 }
 
 /// A `send` from this process between its admission and its Enter. While one
@@ -969,6 +1006,40 @@ impl MuxelApp {
             }
             Answer::Type(mut typing) => {
                 let iid = typing.iid;
+                // A send pinned to a local Claude pane's conversation first
+                // reads, off the UI thread, whether Claude has ended it: the
+                // end record is on disk before Claude can finish a `/clear` or
+                // `/resume`, while muxel's own reading of it may lag. Then it
+                // goes on as any send does.
+                let end_check = (!typing.end_checked && matches!(typing.input, Input::Prompt(_)))
+                    .then(|| self.claude_end_check(iid, typing.session_id.as_deref(), cx))
+                    .flatten();
+                if let Some(check) = end_check {
+                    typing.end_checked = true;
+                    cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                        let read = cx
+                            .background_executor()
+                            .spawn(async move { check.read() })
+                            .await;
+                        let _ = this.update(cx, |app, cx| match app.claude_end_refusal(read, cx) {
+                            Ok(()) => app.deliver_control_answer(
+                                Answer::Type(typing),
+                                reply,
+                                cancelled,
+                                cx,
+                            ),
+                            Err(error) => {
+                                let result = Err(error);
+                                if let Some(key) = typing.once.as_deref() {
+                                    app.control_once.finish(iid, key, &result);
+                                }
+                                let _ = reply.send(respond(result));
+                            }
+                        });
+                    })
+                    .detach();
+                    return;
+                }
                 let once = typing.once.clone();
                 // A `--once` key records how its send ended before the reply
                 // goes, so a repeat asked the moment this is answered sees it.
@@ -1366,22 +1437,73 @@ impl MuxelApp {
         if session.binding_pending() {
             return ctl::Conversation::Unconfirmed;
         }
-        let adopted = self.control_conversations.get(&iid).is_some_and(|adopted| {
+        let adopted = self.control_conversations.get(&iid).filter(|adopted| {
             adopted.launch == session.id
                 && adopted.binding == session.binding_revision()
                 && adopted.id == stored
         });
-        if adopted || session.binding_names(stored) {
-            ctl::Conversation::Known(stored.to_owned())
-        } else {
-            ctl::Conversation::Unconfirmed
+        if adopted.is_none() && !session.binding_names(stored) {
+            return ctl::Conversation::Unconfirmed;
         }
+        // Claude ended this conversation since it was bound (`/clear`,
+        // `/resume`, exiting), and its next start hasn't been adopted: the pane
+        // is in a conversation muxel can't name yet.
+        let since = adopted
+            .and_then(|adopted| adopted.since)
+            .unwrap_or_else(|| session.launched_at());
+        match self.claude_ended(iid, stored, session.id, since) {
+            Some(end) => ctl::Conversation::Ended(conversation_end(end)),
+            None => ctl::Conversation::Known(stored.to_owned()),
+        }
+    }
+
+    /// The end record that ended `bound` in `iid`'s terminal `launch` since
+    /// it was bound there at `since`, if muxel has read one.
+    fn claude_ended(
+        &self,
+        iid: Uuid,
+        bound: &str,
+        launch: Uuid,
+        since: SystemTime,
+    ) -> Option<&session_binding::ClaudeEnd> {
+        let seen = self
+            .claude_ends
+            .get(&iid)
+            .filter(|seen| seen.launch == launch)?;
+        session_binding::claude_conversation_ended(bound, since, Some(&seen.end))
+    }
+
+    /// Whether muxel has read an end of `bound`, the conversation `iid` is
+    /// stored in, since its terminal bound it: what a `/clear` or `/resume`
+    /// start record should follow.
+    pub(in crate::app) fn claude_bound_conversation_ended(
+        &self,
+        iid: Uuid,
+        bound: &str,
+        cx: &App,
+    ) -> bool {
+        let Some(session) = self.terminal_view(iid).map(|view| view.read(cx).session()) else {
+            return false;
+        };
+        let since = self
+            .control_conversations
+            .get(&iid)
+            .filter(|adopted| adopted.launch == session.id && adopted.id == bound)
+            .and_then(|adopted| adopted.since)
+            .unwrap_or_else(|| session.launched_at());
+        self.claude_ended(iid, bound, session.id, since).is_some()
     }
 
     /// `iid`'s stored conversation id was just adopted for its running
     /// terminal, after any switch the adoption reported: it names the
-    /// terminal's current binding until that binding changes.
-    pub(in crate::app) fn note_adopted_conversation(&mut self, iid: Uuid, cx: &App) {
+    /// terminal's current binding until that binding changes. `since` is when
+    /// the start that bound it was recorded, when a hook record did.
+    pub(in crate::app) fn note_adopted_conversation(
+        &mut self,
+        iid: Uuid,
+        since: Option<SystemTime>,
+        cx: &App,
+    ) {
         let adopted = self
             .terminal_view(iid)
             .map(|view| view.read(cx).session())
@@ -1394,11 +1516,104 @@ impl MuxelApp {
                 launch: session.id,
                 binding: session.binding_revision(),
                 id: id.to_owned(),
+                since,
             });
         match adopted {
             Some(adopted) => self.control_conversations.insert(iid, adopted),
             None => self.control_conversations.remove(&iid),
         };
+    }
+
+    /// Keep what a read of a pane's end record found, when it is for the
+    /// conversation the pane is stored in now. A read that failed changes
+    /// nothing here; a check before typing refuses on it instead.
+    pub(in crate::app) fn note_claude_end(&mut self, read: ClaudeEndRead, cx: &App) {
+        let end = match read.end {
+            Ok(Some(end)) => end,
+            Ok(None) => return,
+            Err(error) => {
+                log::debug!("Claude end record for {} unreadable: {error}", read.pane);
+                return;
+            }
+        };
+        let Some(launch) = self
+            .terminal_view(read.pane)
+            .map(|view| view.read(cx).session().id)
+        else {
+            return;
+        };
+        let stored = self
+            .workspace
+            .instance(read.pane)
+            .and_then(|inst| inst.session_id.as_deref());
+        if stored != Some(end.session_id.as_str()) {
+            return;
+        }
+        let newer = self.claude_ends.get(&read.pane).is_none_or(|seen| {
+            seen.launch != launch
+                || seen.end.session_id != end.session_id
+                || seen.end.recorded_at < end.recorded_at
+        });
+        if newer {
+            self.claude_ends
+                .insert(read.pane, ClaudeEndSeen { launch, end });
+        }
+    }
+
+    /// The end-record check a send pinned to `session` makes before it types
+    /// into `iid`, and again before its Enter: a local Claude pane, typed
+    /// into directly. Through tmux a pin is refused anyway, and a remote
+    /// pane's hook records stay on its host.
+    fn claude_end_check(
+        &self,
+        iid: Uuid,
+        session: Option<&str>,
+        cx: &App,
+    ) -> Option<ClaudeEndCheck> {
+        let session = session?;
+        if !self.claude_end_records_apply(iid, cx) {
+            return None;
+        }
+        Some(ClaudeEndCheck {
+            data_dir: muxel_store::data_dir()?,
+            pane: iid,
+            session: session.to_owned(),
+        })
+    }
+
+    /// Whether `iid` is a Claude pane whose conversation ends muxel reads: run
+    /// locally, and typed into directly rather than through tmux.
+    pub(in crate::app) fn claude_end_records_apply(&self, iid: Uuid, cx: &App) -> bool {
+        let Some(inst) = self.workspace.instance(iid) else {
+            return false;
+        };
+        is_claude_program(inst.program.as_deref())
+            && self
+                .workspace
+                .project(inst.project_id)
+                .is_some_and(|project| project.remote.is_none())
+            && self
+                .terminal_view(iid)
+                .is_some_and(|view| !view.read(cx).session().delivers_through_tmux())
+    }
+
+    /// Note a check's read and say whether a send pinned to its conversation
+    /// must not type: the conversation ended, or its end record couldn't be
+    /// read (a check fails closed).
+    fn claude_end_refusal(&mut self, read: ClaudeEndRead, cx: &App) -> CtlResult<()> {
+        let (pane, session) = (read.pane, read.session.clone());
+        if let Err(error) = &read.end {
+            return Err(ctl::Error::new(
+                ErrorCode::LaunchMismatch,
+                format!(
+                    "muxel couldn't read whether the agent ended conversation {session} \
+                     ({error}), so it can't vouch for it: nothing was typed"
+                ),
+            )
+            .with_reason("conversation_unconfirmed"));
+        }
+        self.note_claude_end(read, cx);
+        ctl::check_session_id(Some(&session), &self.control_conversation(pane, cx))
     }
 
     fn control_info_in(
@@ -1425,6 +1640,8 @@ impl MuxelApp {
             .working_directory()
             .map(|p| p.to_string_lossy().into_owned())
             .or(root);
+        let conversation = self.control_conversation(inst.id, cx);
+        let conversation_ended = conversation.ended().cloned();
         AgentInfo {
             id: ctl::short_id(inst.id),
             uuid: inst.id,
@@ -1445,7 +1662,8 @@ impl MuxelApp {
                     .get(&inst.id)
                     .map(|view| view.read(cx).session().id),
             ),
-            session_id: self.control_conversation(inst.id, cx).into_id(),
+            session_id: conversation.into_id(),
+            conversation_ended,
             awaiting_reply: self
                 .control_turns
                 .get(&inst.id)
@@ -1744,6 +1962,7 @@ impl MuxelApp {
             once: None,
             waited_ms: None,
             cancelled: None,
+            end_checked: false,
             reply,
         })
     }
@@ -2010,6 +2229,7 @@ impl MuxelApp {
                     reply["waited_ms"] = json!(waited_ms);
                 }
                 let pasted = session.input_rev();
+                let end_check = self.claude_end_check(iid, session_id.as_deref(), cx);
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     // A paste through tmux is in only once tmux has run it.
                     // Until then there is no receipt and nothing to press
@@ -2025,6 +2245,17 @@ impl MuxelApp {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
+                    // Claude may have started ending the pinned conversation
+                    // while the paste went in (a person's `/clear` just
+                    // before it): its end record is read again before Enter.
+                    let ended = match end_check {
+                        Some(check) => Some(
+                            cx.background_executor()
+                                .spawn(async move { check.read() })
+                                .await,
+                        ),
+                        None => None,
+                    };
                     let enter = this.update(cx, |app, cx| -> CtlResult<ControlWrite> {
                         if !session.accepts_input_epoch(input_epoch) { return Err(ctl::Error::new(ErrorCode::InputChanged, "closing cancelled this queued Enter").after_paste()); }
                         let live = app.control_writable(iid, cx);
@@ -2036,6 +2267,22 @@ impl MuxelApp {
                             })
                         }) {
                             return Err(ctl::Error::from("the provider conversation changed after the paste, so Enter was withheld: check its `screen`").after_paste());
+                        }
+                        if let Some(read) = ended
+                            && let Err(refused) = app.claude_end_refusal(read, cx)
+                        {
+                            return Err(ctl::Error::new(
+                                ErrorCode::LaunchMismatch,
+                                "the agent ended or left the conversation this send was pinned \
+                                 to after the paste, so Enter was withheld: the text may still \
+                                 be in its prompt. Check its `screen`",
+                            )
+                            .with_reason(
+                                refused
+                                    .reason
+                                    .unwrap_or_else(|| "conversation_unconfirmed".into()),
+                            )
+                            .after_paste());
                         }
                         press_prompt_enter(&session, pasted)
                     })
@@ -2412,6 +2659,20 @@ fn enter_verdict<T>(
 fn with_protocol(mut reply: Value) -> Value {
     reply["protocol"] = json!(ctl::NEWEST_VERSION);
     reply
+}
+
+/// What `status` says ended a Claude pane's conversation.
+fn conversation_end(end: &session_binding::ClaudeEnd) -> ctl::ConversationEnd {
+    ctl::ConversationEnd {
+        session_id: end.session_id.clone(),
+        reason: end.reason.clone(),
+        at: end
+            .recorded_at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            }),
+    }
 }
 
 /// A conversation pin is checked last immediately before the paste. Through

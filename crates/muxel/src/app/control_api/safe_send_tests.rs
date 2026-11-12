@@ -177,7 +177,7 @@ fn adopt_conversation(
     window
         .update(cx, |app, _, cx| {
             app.workspace.instance_mut(pane).unwrap().session_id = Some(sid.into());
-            app.note_adopted_conversation(pane, cx);
+            app.note_adopted_conversation(pane, None, cx);
         })
         .unwrap();
 }
@@ -186,6 +186,107 @@ fn adopt_conversation(
 /// at once, before muxel has validated it, let alone stored it.
 fn codex_titles(session: &TerminalSession, sid: &str) {
     session.process_probe_output(format!("\x1b]0;{sid} | Ready\x07").as_bytes());
+}
+
+/// A local Claude pane as muxel sees it: its program is Claude's, so muxel
+/// reads its conversation ends, while its terminal runs cmd.exe.
+fn claude_pane(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+) -> (Uuid, Arc<TerminalSession>) {
+    let (pane, _view, session) = shell_pane(cx, window, name);
+    window
+        .update(cx, |app, _, _| {
+            app.workspace.instance_mut(pane).unwrap().program = Some("claude".into());
+        })
+        .unwrap();
+    (pane, session)
+}
+
+/// Claude's SessionEnd hook for conversation `sid` in `pane`, which `/clear`,
+/// `/resume` and exiting run, and wait for, before the next conversation
+/// starts (Claude Code 2.1.322).
+fn claude_ends(pane: Uuid, sid: &str, reason: &str) {
+    let input = serde_json::json!({
+        "session_id": sid,
+        "transcript_path": format!("C:/claude/projects/control/{sid}.jsonl"),
+        "cwd": "C:/control",
+        "hook_event_name": "SessionEnd",
+        "reason": reason,
+    });
+    crate::session_binding::write_claude_binding_from_reader(
+        &muxel_store::data_dir().unwrap(),
+        pane,
+        std::io::Cursor::new(input.to_string()),
+    )
+    .unwrap();
+}
+
+/// Muxel adopts conversation `sid` from a start record Claude wrote just now:
+/// the conversation a `/clear` or `/resume` opened.
+fn adopt_started(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>, pane: Uuid, sid: &str) {
+    window
+        .update(cx, |app, _, cx| {
+            app.workspace.instance_mut(pane).unwrap().session_id = Some(sid.into());
+            app.note_adopted_conversation(pane, Some(std::time::SystemTime::now()), cx);
+        })
+        .unwrap();
+}
+
+/// `status` for `pane`.
+fn status_of(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+) -> serde_json::Value {
+    let answer = window
+        .update(cx, |app, _, cx| {
+            app.control_command(
+                Command::Status {
+                    agent: Some(pane.to_string()),
+                },
+                None,
+                cx,
+            )
+        })
+        .unwrap();
+    let Answer::Now(Ok(status)) = answer else {
+        panic!("status answers at once");
+    };
+    status
+}
+
+/// Run the app until `key`'s waiting send has typed and finished, or was
+/// dropped.
+fn until_settled(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+    key: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = once_status(cx, window, pane, key);
+        if !matches!(status["state"].as_str(), Some("queued" | "typing")) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the send never settled: {status}"
+        );
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The wall clock in milliseconds, as pane activity records it.
+fn wall_ms() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(since.as_millis()).unwrap()
 }
 
 /// Run `command` as the control server would, and hand back its reply.
@@ -420,7 +521,7 @@ fn a_send_pinned_to_a_conversation_types_only_into_it() {
                 );
                 assert!(matches!(typed, Answer::Type(_)), "the send was admitted");
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(CONVERSATION_B.into());
-                app.note_adopted_conversation(pane, cx);
+                app.note_adopted_conversation(pane, None, cx);
                 let (reply, answer) = std::sync::mpsc::channel();
                 let cancelled = Arc::new(AtomicBool::new(false));
                 app.deliver_control_answer(typed, reply, cancelled.clone(), cx);
@@ -840,6 +941,271 @@ fn a_waiting_send_behind_a_submitted_clear_types_nothing_into_the_new_conversati
         assert_eq!(status["state"], "dropped", "{status}");
         assert_eq!(status["result"]["reason"], "conversation_changed");
         assert_eq!(session.input_rev(), submitted, "A's doorbell typed into B");
+        session.kill();
+    });
+}
+
+/// Claude records the end of a pane's conversation before its `/clear`
+/// finishes, and muxel hears of the next conversation a moment later. A send
+/// pinned to the old one types nothing in that moment, and `status` says the
+/// pane's conversation ended, why and when, rather than naming one. Once muxel
+/// adopts the next one, a send pinned to it types.
+#[test]
+fn a_pinned_send_types_nothing_once_claude_has_ended_its_conversation() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = claude_pane(cx, window, "control-claude-clear");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        assert_eq!(status_of(cx, window, pane)["session_id"], CONVERSATION_A);
+        // An idle `/clear`: A's end is on disk; muxel hasn't adopted B.
+        claude_ends(pane, CONVERSATION_A, "clear");
+        let before = session.input_rev();
+        let (refused, _) = window
+            .update(cx, |app, _, cx| {
+                ask(
+                    app,
+                    pinned(
+                        send(pane, "echo pinned", Some("c-1"), false, true),
+                        CONVERSATION_A,
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+        let refused = reply(cx, &refused).into_result().unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::LaunchMismatch));
+        assert_eq!(refused.reason.as_deref(), Some("conversation_unconfirmed"));
+        assert_eq!(refused.pasted, None);
+        assert!(
+            refused.message.contains("ended conversation"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(
+            session.input_rev(),
+            before,
+            "A's prompt typed into the conversation /clear started"
+        );
+        let key = window
+            .update(cx, |app, _, _| app.control_once.status(pane, "c-1"))
+            .unwrap();
+        assert_eq!(key["state"], "unused");
+        let status = status_of(cx, window, pane);
+        assert!(status.get("session_id").is_none(), "{status}");
+        assert_eq!(status["conversation_ended"]["session_id"], CONVERSATION_A);
+        assert_eq!(status["conversation_ended"]["reason"], "clear");
+        assert!(
+            status["conversation_ended"]["at"].as_i64().unwrap() > wall_ms() - 60_000,
+            "{status}"
+        );
+        // Muxel adopts the conversation `/clear` started.
+        adopt_started(cx, window, pane, CONVERSATION_B);
+        let status = status_of(cx, window, pane);
+        assert_eq!(status["session_id"], CONVERSATION_B);
+        assert!(status.get("conversation_ended").is_none(), "{status}");
+        let (sent, _) = window
+            .update(cx, |app, _, cx| {
+                ask(
+                    app,
+                    pinned(
+                        send(pane, "echo pinned", Some("c-2"), false, true),
+                        CONVERSATION_B,
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(reply(cx, &sent).into_result().unwrap()["sent"], true);
+        session.kill();
+    });
+}
+
+/// A `/clear` queued behind a busy turn, with a prompt queued ahead of it.
+/// The prompt's turn shows after the `/clear`'s Enter, so a turn having shown
+/// says nothing about whether the conversation survived. On Claude Code
+/// 2.1.322 the pane reads working through that turn and the gap before the
+/// `/clear` runs, which holds a waiting send; this test just doesn't run the
+/// queue then. Claude records A's end before the `/clear` finishes, so when
+/// the pane is next idle, before muxel adopts B, the send reads it and waits,
+/// and muxel adopting B drops it.
+#[test]
+fn a_waiting_send_types_nothing_into_the_conversation_a_queued_clear_starts() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = claude_pane(cx, window, "control-claude-queued-clear");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        session.write_input(b"fix the tests");
+        let doorbell = pinned(
+            detached(send(pane, "echo rung", Some("c-3"), true, false)),
+            CONVERSATION_A,
+        );
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell, cx))
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        let typed = window
+            .update(cx, |app, _, cx| {
+                // The prompt, then `/clear`, both queued behind the busy turn.
+                submit_draft(&session);
+                session.write_input(b"/clear");
+                submit_draft(&session);
+                // The prompt's turn starts after the `/clear`'s Enter.
+                app.workspace
+                    .instance_mut(pane)
+                    .unwrap()
+                    .activity
+                    .work_started_at = Some(wall_ms() + 1);
+                // The `/clear` runs: Claude ends A and the pane is idle.
+                claude_ends(pane, CONVERSATION_A, "clear");
+                let typed = session.input_rev();
+                app.pump_control_queue(cx);
+                typed
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = once_status(cx, window, pane, "c-3");
+            assert_eq!(status["state"], "queued", "{status}");
+            assert_eq!(
+                session.input_rev(),
+                typed,
+                "A's doorbell typed into the conversation /clear started"
+            );
+            if status["waiting_on"] == "conversation_unconfirmed" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{status}");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        adopt_started(cx, window, pane, CONVERSATION_B);
+        window
+            .update(cx, |app, _, cx| app.pump_control_queue(cx))
+            .unwrap();
+        let status = once_status(cx, window, pane, "c-3");
+        assert_eq!(status["state"], "dropped", "{status}");
+        assert_eq!(status["result"]["reason"], "conversation_changed");
+        assert_eq!(session.input_rev(), typed, "A's doorbell typed into B");
+        session.kill();
+    });
+}
+
+/// `/model` keeps the conversation and starts no turn, so nothing shows
+/// after its Enter, and Claude writes no end record. A send pinned to the
+/// conversation waits a moment and types; an ordinary prompt shows its turn,
+/// and the send types once the pane is idle.
+#[test]
+fn a_waiting_send_pinned_to_a_claude_conversation_goes_after_model_and_a_prompt() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = claude_pane(cx, window, "control-claude-model");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        for (key, draft, turn) in [("c-5", "/model", false), ("c-6", "hello", true)] {
+            session.write_input(draft.as_bytes());
+            let doorbell = pinned(
+                detached(send(pane, "echo rung", Some(key), true, false)),
+                CONVERSATION_A,
+            );
+            let (queued, _) = window
+                .update(cx, |app, _, cx| ask(app, doorbell, cx))
+                .unwrap();
+            assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+            window
+                .update(cx, |app, _, _| {
+                    submit_draft(&session);
+                    if turn {
+                        app.workspace
+                            .instance_mut(pane)
+                            .unwrap()
+                            .activity
+                            .work_started_at = Some(wall_ms() + 1);
+                    }
+                })
+                .unwrap();
+            let status = until_settled(cx, window, pane, key);
+            assert_eq!(status["state"], "done", "{draft}: {status}");
+            assert_eq!(status["result"]["result"]["sent"], true, "{draft}");
+        }
+        session.kill();
+    });
+}
+
+/// `/resume` ends the pane's conversation before it opens the chosen one, as
+/// `/clear` does. A send pinned to the one it left types nothing; once muxel
+/// adopts the resumed one, a send pinned to that types. Resuming back into
+/// the first conversation, whose end record is still on disk, binds it after
+/// that end, so a send pinned to it types again.
+#[test]
+fn a_pinned_send_follows_resume_away_from_its_conversation_and_back() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = claude_pane(cx, window, "control-claude-resume");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        let send_to = |cx: &mut TestAppContext, sid: &str| {
+            let (answer, _) = window
+                .update(cx, |app, _, cx| {
+                    ask(
+                        app,
+                        pinned(send(pane, "echo pinned", None, false, true), sid),
+                        cx,
+                    )
+                })
+                .unwrap();
+            reply(cx, &answer).into_result()
+        };
+        claude_ends(pane, CONVERSATION_A, "resume");
+        let before = session.input_rev();
+        let refused = send_to(cx, CONVERSATION_A).unwrap_err();
+        assert_eq!(refused.reason.as_deref(), Some("conversation_unconfirmed"));
+        assert_eq!(
+            session.input_rev(),
+            before,
+            "A's prompt typed after /resume"
+        );
+        adopt_started(cx, window, pane, CONVERSATION_B);
+        assert_eq!(send_to(cx, CONVERSATION_B).unwrap()["sent"], true);
+        // And back into A.
+        claude_ends(pane, CONVERSATION_B, "resume");
+        let refused = send_to(cx, CONVERSATION_B).unwrap_err();
+        assert_eq!(refused.reason.as_deref(), Some("conversation_unconfirmed"));
+        adopt_started(cx, window, pane, CONVERSATION_A);
+        assert_eq!(send_to(cx, CONVERSATION_A).unwrap()["sent"], true);
+        session.kill();
+    });
+}
+
+/// A person's `/clear` can land between a send's paste and its Enter. muxel
+/// reads the end record again before the Enter and withholds it, saying the
+/// text may still be in the prompt.
+#[test]
+fn an_end_between_the_paste_and_the_enter_withholds_the_enter() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = claude_pane(cx, window, "control-claude-enter");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        let before = session.input_rev();
+        let (answer, _) = window
+            .update(cx, |app, _, cx| {
+                ask(
+                    app,
+                    pinned(send(pane, "echo pinned", None, false, true), CONVERSATION_A),
+                    cx,
+                )
+            })
+            .unwrap();
+        // The paste goes in; the Enter waits out its delay on the fake clock.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while session.input_rev() == before {
+            assert!(Instant::now() < deadline, "the send never pasted");
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        claude_ends(pane, CONVERSATION_A, "clear");
+        let refused = reply(cx, &answer).into_result().unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::LaunchMismatch));
+        assert_eq!(refused.reason.as_deref(), Some("conversation_unconfirmed"));
+        assert_eq!(refused.pasted, Some(true));
+        assert!(
+            refused.message.contains("Enter was withheld"),
+            "{}",
+            refused.message
+        );
         session.kill();
     });
 }
