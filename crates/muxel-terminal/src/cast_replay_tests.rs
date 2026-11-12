@@ -50,21 +50,22 @@ const EXPECTED_GAPS: &[(&str, &str, &str)] = &[
     ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", SEND_DRAFT),
     ("codex-0.164.0-windows-command-approval#idle", "composer", CODEX_FOOTER),
     ("codex-0.164.0-windows-command-approval#idle", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", CODEX_TITLE_UNSET),
     ("codex-0.164.0-windows-question#idle", "composer", CODEX_FOOTER),
     ("codex-0.164.0-windows-question#idle", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", CODEX_TITLE_UNSET),
     ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", SEND_COVERED),
     ("codex-0.164.0-windows-turn#idle", "composer", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#idle", "draft/empty", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "composer", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "takes_prompt/startup", CODEX_TITLE_UNSET),
     ("codex-0.167.2-windows-composer-tour#idle-first", "composer", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-first", "draft/empty", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-first", "takes_prompt/startup", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-home", "draft/empty", HOME_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/startup", HOME_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-backspaced", "composer", CODEX_AGENTS_HINT),
@@ -125,6 +126,12 @@ const GROK_TRUST: &str = "Grok's trust card (`Do you trust the contents of this 
     1.0.70 and 1.0.77) isn't read as a startup blocker";
 const GROK_SPINNER: &str = "Grok 1.0.77 spins its title with `| / - \\`, and muxel knows only the \
     braille frames, so a turn reads Idle throughout";
+/// A fault of the recording, not of muxel: these Codex casts were launched
+/// without the terminal-title override muxel gives every Codex pane, so their
+/// title is the bare thread id with no run-state, and startup input, which
+/// waits for an Idle title, never fires. Goes when they are re-recorded.
+const CODEX_TITLE_UNSET: &str =
+    "recording: Codex ran without muxel's terminal-title override, so no Idle title";
 /// A fault of the recording, not of muxel: the recorder answered Claude's
 /// cursor-position query with 1;1 while the cursor sat in the box, and Claude
 /// moved its cursor there. Muxel answers with the real position. Goes when
@@ -787,17 +794,29 @@ fn personal_detail(text: &str) -> Option<String> {
             return Some(format!("…@{domain}"));
         }
     }
-    let hex = |s: &[u8]| s.iter().all(u8::is_ascii_hexdigit);
-    for start in 0..bytes.len().saturating_sub(35) {
-        let s = &bytes[start..start + 36];
-        let shaped = [8, 13, 18, 23].iter().all(|&i| s[i] == b'-')
-            && hex(&s[..8])
-            && hex(&s[9..13])
-            && hex(&s[14..18])
-            && hex(&s[19..23])
-            && hex(&s[24..]);
-        if shaped && !s.eq_ignore_ascii_case(PLACEHOLDER_ID.as_bytes()) {
-            return Some(String::from_utf8_lossy(s).into_owned());
+    // A session id, whole or cut short the way a title cuts one
+    // (`0123abcd-4567-7890-abcd-ef012...`): a run shaped like at least the
+    // start of one, `xxxxxxxx-xxxx`, that isn't the start of the placeholder.
+    let shaped = |i: usize, b: u8| {
+        if [8, 13, 18, 23].contains(&i) {
+            b == b'-'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    };
+    for start in 0..bytes.len() {
+        if start > 0 && bytes[start - 1].is_ascii_hexdigit() {
+            continue;
+        }
+        let run = &bytes[start..];
+        let len = run
+            .iter()
+            .take(PLACEHOLDER_ID.len())
+            .enumerate()
+            .take_while(|&(i, &b)| shaped(i, b))
+            .count();
+        if len >= 13 && !run[..len].eq_ignore_ascii_case(&PLACEHOLDER_ID.as_bytes()[..len]) {
+            return Some(String::from_utf8_lossy(&run[..len]).into_owned());
         }
     }
     None
@@ -810,10 +829,15 @@ fn personal_detail(text: &str) -> Option<String> {
 fn casts_hold_no_personal_data() {
     for cast in repo_casts() {
         let mut texts = vec![serde_json::to_string(&cast.header["launch"]).unwrap_or_default()];
-        for (_, kind, payload) in &cast.events {
-            if matches!(kind.as_str(), "out" | "in" | "reply") {
-                texts.push(String::from_utf8_lossy(&decode_bytes(payload)).into_owned());
-            }
+        // Each stream joined, so nothing hides across a read boundary.
+        for stream in ["out", "in", "reply"] {
+            let bytes: Vec<u8> = cast
+                .events
+                .iter()
+                .filter(|(_, kind, _)| kind == stream)
+                .flat_map(|(_, _, payload)| decode_bytes(payload))
+                .collect();
+            texts.push(String::from_utf8_lossy(&bytes).into_owned());
         }
         for text in &texts {
             if let Some(found) = personal_detail(text) {
@@ -830,6 +854,8 @@ fn the_personal_data_scan_catches_each_kind() {
     assert!(personal_detail("mail me at someone@example.com").is_some());
     assert!(personal_detail("session 019f95d7-db31-7db0-904d-9e08330e0016").is_some());
     assert!(personal_detail("session 00000000-0000-7000-8000-000000000001").is_none());
+    assert!(personal_detail("0123abcd-4567-7890-abcd-ef012... | Ready").is_some());
+    assert!(personal_detail("00000000-0000-7000-8000-00000... | Ready").is_none());
     assert!(personal_detail(r"D:\work\demo · @filename").is_none());
 }
 
@@ -867,10 +893,18 @@ fn sanitizing_changes_no_verdict() {
             continue;
         };
         let name = &clean.name;
+        // The box's text is the one verdict sanitizing changes on purpose;
+        // its replacements keep every width, so its length must not change.
         let verdicts = |cast: &Cast| -> Vec<(String, Verdicts)> {
             replay(cast)
                 .into_iter()
-                .map(|read| (read.id, read.verdicts))
+                .map(|mut read| {
+                    read.verdicts.composer_text = read
+                        .verdicts
+                        .composer_text
+                        .map(|text| format!("{} chars", text.chars().count()));
+                    (read.id, read.verdicts)
+                })
                 .collect()
         };
         assert_eq!(
