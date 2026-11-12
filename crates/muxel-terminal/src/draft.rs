@@ -27,6 +27,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use muxel_core::input_box::{ClaudeBox, read_claude_box};
 use muxel_core::rescue::{
     DraftAction, DraftRead, DraftSource, DraftTracker, PromptDraft, RowWidths, debounce_remaining,
     has_paste_markers, join_rows, text_columns, typed_matches,
@@ -299,15 +300,19 @@ pub(crate) fn claude(
         let first = rows.start;
         // Every row between the rules is the text's, blank ones too.
         let keep = rows.end - 1;
+        let lines = capture.text_rows(rows, indent, keep);
+        let widths = claude_widths(edge, indent);
+        // A Claude drawn without colour (NO_COLOR) doesn't dim its suggestion,
+        // so only the suggestion's shape and muxel's copy of what was typed
+        // tell it from a draft whose cursor went home.
+        let shown: Vec<&str> = lines.iter().map(String::as_str).collect();
+        if read_claude_box(&shown, capture.cursor_at(first, indent)) == ClaudeBox::Suggestion
+            && !typed.is_some_and(|typed| typed_matches(typed, &shown, widths))
+        {
+            return DraftRead::Empty;
+        }
         return text_read(
-            capture,
-            capture.text_rows(rows, indent, keep),
-            first,
-            indent,
-            claude_widths(edge, indent),
-            false,
-            newlines,
-            typed,
+            capture, lines, first, indent, widths, false, newlines, typed,
         );
     }
     // Clipped: the last rule is the box's bottom edge, everything above it is
@@ -584,6 +589,35 @@ mod tests {
         assert_eq!(
             super::claude(&home, None, Some("keep me")),
             text("keep me", false)
+        );
+    }
+
+    /// Claude Code 2.1.322 drawn without colour (NO_COLOR), as the
+    /// composer-tour cast recorded it at 120 columns: the box after End and
+    /// Ctrl+U (`draft-cleared`) and with a draft and the cursor at Home
+    /// (`draft-home`). Neither row is dim and the cursor is at column 2 in
+    /// both, so only the suggestion's shape tells them apart.
+    #[test]
+    fn claude_suggestion_drawn_without_colour_reads_empty_and_a_homed_draft_does_not() {
+        let rule = "─".repeat(118);
+        let cleared = capture(
+            &[&rule, "❯\u{a0}Try \"write a test for <filepath>\"", &rule],
+            (1, 2),
+            &[],
+        );
+        assert_eq!(super::claude(&cleared, None, None), DraftRead::Empty);
+        // muxel's copy says the box was emptied.
+        assert_eq!(super::claude(&cleared, None, Some("")), DraftRead::Empty);
+        let home = capture(&[&rule, "❯\u{a0}fix the login bug", &rule], (1, 2), &[]);
+        assert_eq!(
+            super::claude(&home, None, None),
+            partial("fix the login bug")
+        );
+        // Typed by the person, the suggestion's shape is a draft.
+        let typed = "Try \"write a test for <filepath>\"";
+        assert_eq!(
+            super::claude(&cleared, None, Some(typed)),
+            text(typed, false)
         );
     }
 
