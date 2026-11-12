@@ -379,6 +379,7 @@ fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
         None => Verdict::Send,
         Some(refusal) => Verdict::Wait(match (refusal.code, refusal.reason.as_deref()) {
             (Some(ErrorCode::Working), Some("just_submitted")) => "just_submitted",
+            (Some(ErrorCode::Blocked), Some("prompt_hidden")) => "prompt_hidden",
             (Some(ErrorCode::Blocked), _) => "blocked",
             (Some(ErrorCode::DraftPresent), _) => "draft_present",
             _ => "working",
@@ -1030,6 +1031,10 @@ mod tests {
                 "just_submitted",
             ),
             (ctl::Error::new(ErrorCode::Blocked, "asks"), "blocked"),
+            (
+                ctl::Error::new(ErrorCode::Blocked, "picker").with_reason("prompt_hidden"),
+                "prompt_hidden",
+            ),
             (
                 ctl::Error::new(ErrorCode::DraftPresent, "draft"),
                 "draft_present",

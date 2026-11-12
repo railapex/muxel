@@ -353,6 +353,9 @@ struct SendAdmission {
     just_submitted: bool,
     /// The agent's composer holds text (see [`TerminalView::composer_has_draft`]).
     draft_present: bool,
+    /// No prompt is showing to type into: a startup card covers the screen, or
+    /// Claude's input box is replaced by a picker or not drawn yet.
+    prompt_hidden: bool,
     force: bool,
 }
 
@@ -486,6 +489,15 @@ fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
                 ));
             }
             _ => {}
+        }
+        if admission.prompt_hidden {
+            return Err(ctl::Error::new(
+                ErrorCode::Blocked,
+                "no prompt is showing to type into: a picker, menu or startup card covers it, \
+                 or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send \
+                 again once the prompt is back (or pass --force)",
+            )
+            .with_reason("prompt_hidden"));
         }
         if admission.draft_present {
             return Err(ctl::Error::new(
@@ -1778,6 +1790,7 @@ impl MuxelApp {
             state,
             just_submitted,
             draft_present: view.is_some_and(TerminalView::composer_has_draft),
+            prompt_hidden: view.is_some_and(TerminalView::prompt_hidden),
             force,
         }
     }
@@ -3154,6 +3167,7 @@ mod prompt_submission_tests {
             state: Some(super::AgentState::Idle),
             just_submitted: false,
             draft_present: false,
+            prompt_hidden: false,
             force: false,
         };
         let launch = |launch| super::Pins {
@@ -3212,6 +3226,7 @@ mod prompt_submission_tests {
             state: Some(super::AgentState::Idle),
             just_submitted: false,
             draft_present: false,
+            prompt_hidden: false,
             force: true,
         };
         let pinned = super::Pins {
@@ -3585,6 +3600,7 @@ mod prompt_submission_tests {
                 state: Some(super::AgentState::Working),
                 just_submitted: false,
                 draft_present: false,
+                prompt_hidden: false,
                 force: false,
             },
         )
@@ -3769,6 +3785,45 @@ mod prompt_submission_tests {
             let sent = sent.try_recv().expect("the send finished");
             assert!(sent.is_ok(), "{sent:?}");
             assert!(SendInFlight::begin(pane, false).is_ok());
+        });
+    }
+
+    /// Every send's admission asks the pane whether a prompt is showing: a
+    /// Claude pane whose input box isn't drawn has none, and a shell always does.
+    #[cfg(windows)]
+    #[test]
+    fn send_admission_reads_whether_the_pane_shows_a_prompt() {
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::time::Instant;
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir()
+                        .unwrap()
+                        .join("control-prompt-shown");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    let mut hidden = |status_program: Option<&str>| {
+                        let mut instance = Instance::shell(project);
+                        instance.program = Some("cmd.exe".into());
+                        instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                        let pane = instance.id;
+                        let spec = CommandSpec::program("cmd.exe", instance.args.clone())
+                            .with_status_program(status_program.map(str::to_owned));
+                        app.workspace.add_instance(instance);
+                        let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                        let view = cx
+                            .new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                        app.terminals.insert(pane, view);
+                        app.control_send_admission(pane, false, cx).prompt_hidden
+                    };
+                    assert!(hidden(Some("claude")), "no Claude input box is drawn");
+                    assert!(!hidden(None), "a shell's prompt is never covered");
+                })
+                .unwrap();
         });
     }
 
@@ -4691,6 +4746,7 @@ mod runtime_control_tests {
                 state,
                 just_submitted: false,
                 draft_present: false,
+                prompt_hidden: false,
                 force: false,
             });
             assert_eq!(result.is_ok(), binding == 1 && attributable);
@@ -4734,6 +4790,7 @@ mod runtime_control_tests {
                     state,
                     just_submitted: false,
                     draft_present: false,
+                    prompt_hidden: false,
                     force: false,
                 });
                 // A listing can't vouch for a prompt a switch may have left.
@@ -4784,6 +4841,7 @@ mod runtime_control_tests {
                 state: Some(state),
                 just_submitted: false,
                 draft_present: false,
+                prompt_hidden: false,
                 force,
             })
         };
@@ -4887,6 +4945,7 @@ mod runtime_control_tests {
             state: Some(AgentState::Idle),
             just_submitted: true,
             draft_present: false,
+            prompt_hidden: false,
             force: false,
         })
         .unwrap_err();
@@ -4899,6 +4958,7 @@ mod runtime_control_tests {
             state: Some(AgentState::Working),
             just_submitted: true,
             draft_present: false,
+            prompt_hidden: false,
             force: false,
         };
         assert_eq!(
@@ -4909,6 +4969,35 @@ mod runtime_control_tests {
             check_send_state(SendAdmission {
                 force: true,
                 ..working
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_send_with_no_prompt_showing_is_refused_as_blocked() {
+        let hidden = SendAdmission {
+            state: Some(AgentState::Idle),
+            just_submitted: false,
+            draft_present: false,
+            prompt_hidden: true,
+            force: false,
+        };
+        let error = check_send_state(hidden).unwrap_err();
+        assert_eq!(error.code, Some(ctl::ErrorCode::Blocked));
+        assert_eq!(error.reason.as_deref(), Some("prompt_hidden"));
+        // A working agent is still reported as working.
+        let working = check_send_state(SendAdmission {
+            state: Some(AgentState::Working),
+            ..hidden
+        })
+        .unwrap_err();
+        assert_eq!(working.code, Some(ctl::ErrorCode::Working));
+        assert_eq!(working.reason, None);
+        assert!(
+            check_send_state(SendAdmission {
+                force: true,
+                ..hidden
             })
             .is_ok()
         );

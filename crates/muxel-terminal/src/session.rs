@@ -8109,7 +8109,7 @@ mod startup_tests {
                 .unwrap()
         );
         let frame = format!(
-            "\x1b[2J\x1b[HClaude Code\r\n{}\r\n❯ Try a task\r\n{}\r\nmode\x1b[3;3H\x1b[?25h\x1b[?2004h",
+            "\x1b[2J\x1b[HClaude Code\r\n{}\r\n❯ Try \"write a test for <filepath>\"\r\n{}\r\nmode\x1b[3;3H\x1b[?25h\x1b[?2004h",
             "─".repeat(30),
             "─".repeat(30)
         );
