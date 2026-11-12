@@ -1,5 +1,6 @@
 //! Guards for a startup turn. PTY silence is not an application's input-ready signal.
 
+use muxel_core::input_box::{ClaudeBox, read_claude_box};
 use std::{io, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,7 +338,10 @@ impl Screen {
         let lower = self.text.to_ascii_lowercase();
         let (kind, marker) = if (lower.contains("trust this folder")
             || lower.contains("trust the files in this folder")
-            || lower.contains("folder access"))
+            || lower.contains("folder access")
+            // Grok 1.0.70: "Do you trust the contents of this directory?",
+            // answered by y or n, so typed text would answer it.
+            || lower.contains("trust the contents of this directory"))
             && (lower.contains("no,")
                 || lower.contains("exit")
                 || lower.contains("quit")
@@ -382,6 +386,30 @@ impl Screen {
             .take(600)
             .collect();
         Some(StartupBlocker { kind, excerpt })
+    }
+
+    /// A folder-trust card drawn as its own rows, as Grok 1.0.70 and Codex
+    /// 0.164 draw theirs: its question opens one row and an answer opens
+    /// another. A draft or reply quoting a card inside a sentence isn't one,
+    /// which matters for providers whose input box muxel can't find to leave
+    /// out. Claude's card reads as Blocked through its own status instead.
+    pub(crate) fn folder_trust_card(&self) -> bool {
+        let opens = |starts: &[&str]| {
+            self.text
+                .lines()
+                .map(str::trim)
+                .any(|row| starts.iter().any(|start| row.starts_with(start)))
+        };
+        opens(&[
+            "Do you trust the contents of this directory?",
+            "Trust this folder?",
+            "Folder access",
+        ]) && opens(&[
+            "No, quit",
+            "2. Quit",
+            "enter continue · esc quit",
+            "enter continue · esc back",
+        ])
     }
 
     // Master can render a model row followed by a shortcuts footer. The
@@ -840,8 +868,16 @@ impl Screen {
             return None;
         }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
+        // The cursor at the prompt's start means empty only while the box
+        // shows nothing a person typed: a draft with its cursor moved Home is
+        // still a draft.
+        let text_rows: Vec<&str> = std::iter::once(after)
+            .chain(rows[top + 2..bottom].iter().copied())
+            .collect();
+        let empty_box =
+            cursor_at_start && read_claude_box(&text_rows, cursor_at_start) != ClaudeBox::Typed;
         empty
-            .is_none_or(|empty| cursor_at_start == empty)
+            .is_none_or(|empty| empty_box == empty)
             .then_some(top + 1..bottom)
     }
 }
@@ -1038,6 +1074,11 @@ mod tests {
             ),
             (
                 "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                // Grok 1.0.70, answered by y or n.
+                "Do you trust the contents of this directory?\nproject\nGrok Build may run or modify contents in this directory,\nposing security risks.\n     Yes, proceed      y\n     No, quit          n",
                 StartupBlockerKind::FolderTrust,
             ),
             (
@@ -1527,7 +1568,7 @@ mod tests {
     #[test]
     fn real_composer_allows_placeholder_and_wrapped_or_multiline_draft() {
         let empty = screen(
-            "Claude Code\n────────────────\n❯ Try a task\n────────────────\nmode",
+            "Claude Code\n────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────\nmode",
             2,
             2,
         );
@@ -1540,6 +1581,32 @@ mod tests {
         );
         assert!(!draft.claude_composer(true));
         assert!(draft.claude_composer(false));
+    }
+    /// Claude 2.1.322 as recorded: a draft with its cursor moved Home is a draft,
+    /// and only a blank box or its `Try "…"` suggestion is empty. A Claude run
+    /// with `NO_COLOR` draws the suggestion like typed text, so only the text
+    /// tells them apart.
+    #[test]
+    fn a_claude_draft_with_its_cursor_at_the_start_is_a_draft() {
+        let rule = "─".repeat(40);
+        for (rows, empty) in [
+            ("❯ fix the login bug", false),
+            ("❯ fix the login bug and\n  then the signup form", false),
+            ("❯ Try \"fix lint errors\"", true),
+            (
+                "❯ Try \"write a test for a function in\n  <filepath>\"",
+                true,
+            ),
+            ("❯ ", true),
+        ] {
+            let home = screen(
+                &format!("Claude Code\n{rule}\n{rows}\n{rule}\n  ? for shortcuts"),
+                2,
+                2,
+            );
+            assert_eq!(home.claude_composer(true), empty, "{rows:?}");
+            assert_eq!(home.claude_composer(false), !empty, "{rows:?}");
+        }
     }
     #[test]
     fn status_box_edges_ignore_a_rule_typed_into_the_draft() {
@@ -1565,7 +1632,7 @@ mod tests {
                 2,
             ),
             (
-                "❯ /b12-ready\n● quoted answer\n────────────────\n❯ Try a task\n────────────────\nmode",
+                "❯ /b12-ready\n● quoted answer\n────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────\nmode",
                 0,
                 2,
             ),
@@ -1577,7 +1644,11 @@ mod tests {
         ] {
             assert!(!screen(text, row, column).claude_composer(true));
         }
-        let mut sample = screen("────────────────\n❯ Try a task\n────────────────", 1, 2);
+        let mut sample = screen(
+            "────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────",
+            1,
+            2,
+        );
         sample.bracketed_paste = false;
         assert!(!sample.claude_composer(true));
         sample.bracketed_paste = true;

@@ -742,8 +742,12 @@ feature is added or changed, update the matching entry here in the same change**
   Grok's semantic idle state after its configured startup delay. In a tmux
   pane, which forwards no program titles unless tmux's own `set-titles` is on,
   muxel reads the provider's title through tmux (`#{pane_title}`) while that
-  task waits; it never changes tmux options. Codex folder-trust menus receive no
-  task input; readiness failure leaves the provider running and reports
+  task waits; it never changes tmux options. Codex and Grok folder-trust cards
+  receive no task input (Grok's answers to y and n, so a typed task would answer
+  it). Claude's composer counts as empty only while it shows nothing typed, or
+  just its `Try "…"` suggestion: a draft with its cursor moved Home is a draft,
+  and the suggestion is told by its text, so a Claude run with `NO_COLOR` reads
+  the same. Readiness failure leaves the provider running and reports
   `startup_error` through `ctl status` and `show`.
   Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
@@ -1034,7 +1038,10 @@ feature is added or changed, update the matching entry here in the same change**
   to a question counts as a turn too, so `answer` then `wait` works the same way.
 - **Refuses what would go wrong** — `send` won't type into an agent that is
   working, waiting on a question, or still in the grace after a submitted control
-  turn (unless forced). It checks again at paste after the shared tmux claim settles.
+  turn (unless forced). Nor will it type while no prompt is showing: a folder-trust
+  card covers it, or Claude's input box is replaced by a picker such as `/model`
+  or not drawn yet after a launch (`blocked`, reason `prompt_hidden`). It checks
+  again at paste after the shared tmux claim settles.
   `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
   forced. An older host ignores the caller ID. `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
@@ -1166,9 +1173,9 @@ feature is added or changed, update the matching entry here in the same change**
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
   command to follow; `--wait-delivery` reads until it settles, for up to 90
-  seconds. Known folder trust, update and login menus stop delivery as soon as
-  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
-  never answered automatically. `--no-wait` returns before approval with a
+  seconds. Known folder trust (Claude, Codex, Grok), update and login menus stop
+  delivery as soon as they appear, with `blocked_by` and a short
+  `screen_excerpt`; trust prompts are never answered automatically. `--no-wait` returns before approval with a
   polling command. Status exposes the same delivery facts.
   Codex launches carrying a startup task suppress its startup update menu.
 - **Windows Codex multiline control** — native presets disable heuristic paste

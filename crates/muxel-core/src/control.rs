@@ -1873,7 +1873,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl send AGENT TEXT` - type TEXT into the agent and press Enter. Refused
   while the agent is working, blocked, or still in the grace after a submitted
   control turn, while muxel on another computer is mid-turn with it, or while
-  another `send` to it from this muxel hasn't pressed Enter yet. For long
+  another `send` to it from this muxel hasn't pressed Enter yet. Also refused,
+  as `blocked` with `reason: prompt_hidden`, while no prompt is showing: a
+  folder-trust card covers it, or Claude's input box is replaced by a picker
+  or not drawn yet. For long
   or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
   literal prompt text that starts with `-`; `-h` and `--help` before `--` refuse
   with exit 2 and are never typed. Use `muxel ctl help COMMAND` for help.
@@ -2012,7 +2015,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 `keys`, and host connection failures have a `code`:
 
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
-  again in a moment.
+  again in a moment. `blocked` with `reason: prompt_hidden` means `send` found no
+  prompt to type into: see `screen`, and send again once the prompt is back.
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim, or another
   `send` to the agent hasn't pressed Enter yet.

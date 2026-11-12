@@ -2494,6 +2494,10 @@ fn startup_ready(
     blocked_markers: &[String],
     empty: bool,
 ) -> bool {
+    // A trust card takes keys, not a task: Grok's answers to y and n.
+    if screen.folder_trust_card() {
+        return false;
+    }
     if provider == TitleProvider::Claude {
         return claude_startup_ready(screen, title, blocked_markers, empty);
     }
@@ -2556,6 +2560,25 @@ fn startup_draft_matches(
         TitleProvider::Claude => screen.claude_draft_matches(input),
         TitleProvider::Codex => screen.codex_draft_matches(input),
         _ => false,
+    }
+}
+
+/// Whether `ctl send` has no prompt to type into an agent. For Claude, its
+/// input box isn't on screen with the cursor in it: a picker or card replaced
+/// it, or Claude hasn't drawn it yet. Other agents are checked for a trust card
+/// only. Codex's box reader needs a status footer it knows, so a missing box
+/// isn't proof there, and Grok's box has no reader. A shell is never checked:
+/// card text an exited agent left on its screen isn't a card.
+fn prompt_hidden(provider: TitleProvider, screen: &crate::startup::Screen) -> bool {
+    match provider {
+        TitleProvider::Other => false,
+        TitleProvider::Claude => {
+            screen.claude_composer_context(true).is_none()
+                && screen.claude_composer_context(false).is_none()
+        }
+        TitleProvider::Codex | TitleProvider::Grok | TitleProvider::Muse => {
+            screen.folder_trust_card()
+        }
     }
 }
 
@@ -4088,6 +4111,12 @@ impl TerminalView {
         self.exited
     }
 
+    /// Whether no prompt is showing for `ctl send` to type into: a startup
+    /// card covers the screen, or Claude's input box isn't there.
+    pub fn prompt_hidden(&self) -> bool {
+        prompt_hidden(self.title_provider, &self.session.startup_screen())
+    }
+
     /// A complete live draft, never a clipped prefix or collapsed paste marker.
     pub fn prompt_in_composer(&self, text: &str) -> bool {
         let screen = self.session.startup_screen();
@@ -5054,9 +5083,9 @@ mod startup_readiness_tests {
         STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS, STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS,
         StartupAttempt, TitleProvider, claude_startup_ready, codex_ctl_ready,
         controlled_startup_deadline, ctl_acceptance_observable, ctl_title_can_confirm,
-        ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
-        startup_pending_draft_matches, startup_provider_accepted, startup_ready,
-        startup_retry_allowed,
+        ctl_transcript_prompt, prompt_hidden, prompt_submission_state, quiet_startup,
+        startup_has_fresh_user_row, startup_pending_draft_matches, startup_provider_accepted,
+        startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
 
@@ -6212,6 +6241,84 @@ mod startup_readiness_tests {
             Some("scratch - grok"),
             &[],
             false
+        ));
+    }
+
+    /// The cards and picker as Grok 1.0.70, Codex 0.164.0 and Claude 2.1.322
+    /// drew them in the recorded casts, trimmed.
+    #[test]
+    fn ctl_send_finds_no_prompt_under_a_picker_or_trust_card() {
+        let at = |text: &str, cursor_row: i32, cursor_column: usize, cursor_visible: bool| Screen {
+            text: text.into(),
+            cursor_column,
+            cursor_row,
+            cursor_visible,
+            bracketed_paste: true,
+        };
+        let rule = "─".repeat(40);
+        let grok_card = "  ≡ main project\n\n      Do you trust the contents of this directory?\n          project\n\n   Grok Build may run or modify contents in this directory,\n           posing security risks.\n\n          Yes, proceed        y\n          No, quit            n\n";
+        let codex_card = "  Folder access\n  project\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n";
+        let picker = format!(
+            "{}\n   Select model\n     1.  Default (recommended)\n   ❯ 4.  Sonnet 5.5 ✔   Most efficient for simpler tasks\n   Enter to set as default · s to use this session only · Esc to cancel",
+            "▔".repeat(40)
+        );
+        let idle =
+            format!("Claude Code\n{rule}\n❯ Try \"fix lint errors\"\n{rule}\n  ? for shortcuts");
+        let drafted = idle.replace("Try \"fix lint errors\"", "fix the login bug");
+        let starting = "Claude Code v2.1.322\n Sonnet 5.5 with low effort\n";
+
+        assert!(prompt_hidden(
+            TitleProvider::Grok,
+            &at(grok_card, 9, 30, false)
+        ));
+        assert!(prompt_hidden(
+            TitleProvider::Codex,
+            &at(codex_card, 6, 27, false)
+        ));
+        assert!(prompt_hidden(
+            TitleProvider::Claude,
+            &at(&picker, 3, 3, false)
+        ));
+        // Started but not drawn yet: the paste would be lost.
+        assert!(prompt_hidden(
+            TitleProvider::Claude,
+            &at(starting, 2, 0, true)
+        ));
+
+        assert!(!prompt_hidden(
+            TitleProvider::Claude,
+            &at(&idle, 2, 2, true)
+        ));
+        assert!(!prompt_hidden(
+            TitleProvider::Claude,
+            &at(&drafted, 2, 19, true)
+        ));
+        let quoting = "Grok\n› Explain Trust this folder? and Folder access and 2. Quit\n";
+        assert!(!prompt_hidden(
+            TitleProvider::Grok,
+            &at(quoting, 1, 60, true)
+        ));
+        // A shell showing card text an agent left behind takes commands.
+        assert!(!prompt_hidden(
+            TitleProvider::Other,
+            &at(codex_card, 9, 0, true)
+        ));
+
+        // Startup input doesn't type a task into Grok's card either.
+        let grok_idle = "  ≡ main project\n\n›\n";
+        assert!(startup_ready(
+            TitleProvider::Grok,
+            &at(grok_idle, 2, 2, true),
+            Some("grok"),
+            &[],
+            true
+        ));
+        assert!(!startup_ready(
+            TitleProvider::Grok,
+            &at(grok_card, 9, 30, false),
+            Some("grok"),
+            &[],
+            true
         ));
     }
 
