@@ -1742,6 +1742,44 @@ fn a_prompt_drawn_only_after_its_enter_is_never_kept_but_one_typed_after_it_is()
     });
 }
 
+/// Claude's permission question drawn where its input box was.
+fn paint_claude_question(session: &TerminalSession) {
+    let mut screen = String::from("\x1b[?2004h\x1b[2J\x1b[H");
+    screen.push_str("⏺ Bash(ping -n 8 localhost)\r\n\r\n");
+    screen.push_str(RULE);
+    screen.push_str("\r\n Bash command\r\n\r\n   ping -n 8 localhost\r\n\r\n");
+    screen.push_str(" Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel");
+    screen.push_str("\x1b[9;4H");
+    session.process_probe_output(screen.as_bytes());
+}
+
+#[test]
+fn restore_types_nothing_and_keeps_the_offer_while_a_question_covers_the_box() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        dir.save_draft(iid, &draft("fix the flaky resize test"))
+            .unwrap();
+        let session = launch_child(cx, window, iid, deaf());
+        paint_claude_question(&session);
+        let typed_before = session.last_user_input();
+        window
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
+            .unwrap();
+        settle(cx);
+        assert_eq!(
+            session.last_user_input(),
+            typed_before,
+            "nothing was pasted into the question"
+        );
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.rescue.offers.get(&iid).map(Vec::len), Some(1))
+            })
+            .unwrap();
+        assert_eq!(dir.draft_offers(iid).len(), 1, "the draft is still offered");
+    });
+}
+
 #[test]
 fn an_older_offer_restores_on_its_own_and_the_newer_one_stays_offered() {
     with_app(|cx, window| {

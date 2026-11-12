@@ -3609,6 +3609,12 @@ impl TerminalView {
         }
     }
 
+    /// Whether this pane's input box is on screen, `None` when muxel can't
+    /// tell (see [`crate::draft::box_shown`]).
+    pub fn input_box_shown(&self) -> Option<bool> {
+        crate::draft::box_shown(&self.session.draft_screen(), self.title_provider)
+    }
+
     /// What the pane's saved draft should become now, as the pane goes away
     /// (close, Restart, quit). An empty box clears it, and so does a box
     /// still showing the prompt just sent; text read whole replaces it.

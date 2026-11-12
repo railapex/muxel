@@ -1747,13 +1747,14 @@ feature is added or changed, update the matching entry here in the same change**
   the newest whole, older ones by their first three lines (click one for the
   rest). Restore types the text back into the box as it was saved, line breaks
   included, and never presses Enter, and a prompt with a line break goes to the
-  clipboard instead when the program would read it as Enter. A pane closed for
-  good keeps its draft under the title bar, where one line counts the closed
-  panes' unsent prompts and opens a list, newest first. Each entry shows the
-  prompt's first three lines (**Show all** for the rest), the pane, the time,
-  and **Copy** and **Discard**; **Discard all** sits on the line while the list
-  is open, and **Hide** puts the line away until another pane's draft is kept.
-  Grok, Muse, opencode and Amp input boxes are not read yet.
+  clipboard instead when the program would read it as Enter. While a question
+  covers the box, Restore types nothing, keeps the offer and says why. A pane
+  closed for good keeps its draft under the title bar, where one line counts the
+  closed panes' unsent prompts and opens a list, newest first. Each entry shows
+  the prompt's first three lines (**Show all** for the rest), the pane, the
+  time, and **Copy** and **Discard**; **Discard all** sits on the line while the
+  list is open, and **Hide** puts the line away until another pane's draft is
+  kept. Grok, Muse, opencode and Amp input boxes are not read yet.
 - **Unsaved editor changes survive** — an editor with unsaved changes, or an
   input method's uncommitted text, backs them up about a second after edits
   stop; text an input method commits counts as an unsaved change. When it opens

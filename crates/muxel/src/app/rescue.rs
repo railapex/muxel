@@ -358,7 +358,9 @@ impl MuxelApp {
     /// Restore: paste offered draft `path` into the pane's input box as it
     /// was saved, line breaks and all, and never submit it. Where a pasted
     /// line break would reach the program as Enter, the draft goes to the
-    /// clipboard instead.
+    /// clipboard instead. While something covers the box (a permission
+    /// question, a picker) a paste would land there, so nothing is typed and
+    /// the draft stays offered.
     pub(super) fn restore_offer(
         &mut self,
         iid: Uuid,
@@ -389,6 +391,19 @@ impl MuxelApp {
                     .to_string(),
             );
         } else {
+            let box_shown = self
+                .rescue_view(iid)
+                .and_then(|view| view.read(cx).input_box_shown());
+            if box_shown == Some(false) {
+                self.add_event(
+                    NotifKind::Error,
+                    t("Couldn't restore the unsent prompt"),
+                    t("The pane's input box isn't on screen, so the prompt is still offered.")
+                        .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             session.mark_user_input();
             if let Err(e) = session.try_paste(text) {
                 self.add_event(
@@ -1071,7 +1086,7 @@ impl MuxelApp {
         strip = strip.child(list).child(
             div()
                 .text_color(cx.theme().muted_foreground)
-                .child(t("Kept until you copy or discard them.")),
+                .child(t("Kept until you discard them.")),
         );
         Some(strip.into_any_element())
     }
