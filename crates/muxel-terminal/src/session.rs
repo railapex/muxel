@@ -44,6 +44,12 @@ use input_hold::{ShellMarks, ShellPrompt};
 #[path = "unix_shell_idle_tests.rs"]
 mod unix_shell_idle_tests;
 
+#[cfg(test)]
+#[path = "replay_session.rs"]
+mod replay_session;
+#[cfg(test)]
+pub(crate) use replay_session::{ReplayFeed, ReplayWrites};
+
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
 /// Identity and timestamp attached to one PTY read while profiling is enabled.
@@ -3191,13 +3197,6 @@ impl TerminalSession {
         self.process_output(data);
     }
 
-    /// [`Self::process_probe_output`] with the time the bytes were read, so a
-    /// recorded session replays with its own timing rather than the parse time.
-    #[doc(hidden)]
-    pub fn process_probe_output_at(&self, data: &[u8], read_at: SystemTime) {
-        self.parse([(data, read_at)]);
-    }
-
     /// Latest OSC title plus its change generation. Unlike [`Self::title`], this
     /// lets lifecycle consumers observe a ResetTitle or a repeated title event.
     pub fn title_snapshot(&self) -> (u64, Option<String>) {
@@ -4374,6 +4373,25 @@ struct InputShutdown {
     shell_prompt: Arc<ShellPrompt>,
 }
 
+/// What the reader does with one read: answer the queries in it, note shell
+/// prompt marks, then queue it for the UI with the time it was read. Returns
+/// false once the stream has ended.
+fn deliver_read(
+    bytes: &[u8],
+    read_at: SystemTime,
+    timing: Option<PtyReadTiming>,
+    immediate_replies: &mut ImmediateReplies,
+    shell_marks: &mut ShellMarks,
+    shell_prompt: &ShellPrompt,
+    tx: &PtyChunkSender,
+) -> bool {
+    // Before the bytes reach the UI: replies that wait on the UI's drain can
+    // miss the asker's window and be read as typing.
+    immediate_replies.advance(bytes);
+    shell_marks.advance(bytes, shell_prompt);
+    tx.send_output(bytes.to_vec(), timing, read_at)
+}
+
 /// Drain PTY output before publishing Exit. Windows gets child status from a
 /// separate waiter: a live ConPTY can keep its output pipe open after every
 /// client process exits, so waiting for EOF before waiting for the child hangs.
@@ -4429,11 +4447,15 @@ fn read_loop(
                     read_sequence = read_sequence.wrapping_add(1).max(1);
                     profile::pty_read(n, read_sequence)
                 });
-                // Before the bytes reach the UI: replies that wait on the UI's
-                // drain can miss the asker's window and be read as typing.
-                immediate_replies.advance(&buf[..n]);
-                shell_marks.advance(&buf[..n], &input_shutdown.shell_prompt);
-                if !tx.send_output(buf[..n].to_vec(), timing, read_at) {
+                if !deliver_read(
+                    &buf[..n],
+                    read_at,
+                    timing,
+                    &mut immediate_replies,
+                    &mut shell_marks,
+                    &input_shutdown.shell_prompt,
+                    &tx,
+                ) {
                     // The stream has ended: the receiver dropped, or the
                     // session dropped while the receiver was behind. Stop the
                     // child, then keep draining on Windows until EOF so ConPTY

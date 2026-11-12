@@ -7,8 +7,9 @@
 //! moment, and `in`, `reply`, `resize`, `focus`, `hook`, `exit` record the rest.
 //! See `fixtures/casts/README.md`.
 //!
-//! Replay feeds every read to a real [`TerminalSession`] at its recorded time,
-//! reconciles status the way the view does after each read, and at each mark
+//! Replay feeds every read to a [`TerminalSession::replay`] session at its
+//! recorded time, drains and parses it as a pane does, reconciles status the
+//! way the view does after each read, and at each mark
 //! settles the screen and asks the readers what they see. A mark's truth is
 //! compared with those verdicts through [`compare`]; known disagreements are
 //! listed in [`EXPECTED_GAPS`] with the finding each belongs to. Adding a cast
@@ -18,7 +19,9 @@ use super::{
     AgentStatus, RuntimeStatusState, TerminalStatusReason, TitleProvider, startup_empty_composer,
     startup_ready, status_coverage,
 };
-use crate::session::{CommandSpec, PtyReceiver, TerminalSession};
+use crate::session::{
+    ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, ReplayFeed, ReplayWrites, TerminalSession,
+};
 use muxel_core::control::StartupBlockerKind;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -301,10 +304,13 @@ struct Verdicts {
     ready: bool,
 }
 
-/// One cast played through a session nobody else drains.
+/// One cast played through a session with no child.
 struct Replay {
     session: Arc<TerminalSession>,
-    _receiver: PtyReceiver,
+    /// Gone once the cast's child has exited.
+    feed: Option<ReplayFeed>,
+    output: ProfiledPtyReceiver,
+    writes: ReplayWrites,
     runtime: RuntimeStatusState,
     provider: TitleProvider,
     working: Vec<String>,
@@ -320,16 +326,7 @@ impl Replay {
         let provider_name = cast.header["provider"].as_str().expect("provider");
         let cols = cast.header["cols"].as_u64().expect("cols") as u16;
         let rows = cast.header["rows"].as_u64().expect("rows") as u16;
-        // The child is inert: its own output is never drained, so only the
-        // cast's reads reach the grid.
-        #[cfg(windows)]
-        let spec = CommandSpec::program(
-            "cmd.exe",
-            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
-        );
-        #[cfg(unix)]
-        let spec = CommandSpec::program("/bin/cat", vec![]);
-        let (session, receiver) = TerminalSession::spawn(spec, cols, rows).expect("spawn");
+        let (session, feed, output, writes) = TerminalSession::replay(cols, rows);
         let provider = TitleProvider::from_program(provider_name);
         // The built-in preset's markers, as a fresh pane gets them.
         let preset = muxel_core::AgentPreset::defaults()
@@ -340,7 +337,9 @@ impl Replay {
             .unwrap_or_default();
         Self {
             session,
-            _receiver: receiver,
+            feed: Some(feed),
+            output,
+            writes,
             runtime: RuntimeStatusState::new(status_coverage(provider, &working, &blocked)),
             provider,
             working,
@@ -388,10 +387,37 @@ impl Replay {
         }
     }
 
+    /// Parse what the feed queued, as a pane's drain does.
+    fn drain(&mut self) {
+        let mut output = PtyOutput::default();
+        while let Ok(chunk) = self.output.try_recv() {
+            match chunk {
+                ProfiledPtyChunk::Output { bytes, read_at, .. } => output.push(&bytes, read_at),
+                ProfiledPtyChunk::Exit { .. } => self.exited = true,
+            }
+        }
+        if !output.is_empty() {
+            self.session.process_drained(&output);
+        }
+    }
+
     fn read(&mut self, t: u64, bytes: &[u8]) {
         let (now, wall) = self.at(t);
         self.run_due(now);
-        self.session.process_probe_output_at(bytes, wall);
+        if let Some(feed) = &mut self.feed {
+            feed.read(bytes, wall);
+        }
+        self.drain();
+        self.reconcile(now);
+    }
+
+    fn exit(&mut self, t: u64, code: Option<i32>) {
+        let (now, _) = self.at(t);
+        self.run_due(now);
+        if let Some(feed) = self.feed.take() {
+            feed.exit(code);
+        }
+        self.drain();
         self.reconcile(now);
     }
 
@@ -493,12 +519,6 @@ impl Replay {
             out.push_str(&format!("      {index:>2}|{}\n", rows[index].trim_end()));
         }
         out
-    }
-}
-
-impl Drop for Replay {
-    fn drop(&mut self) {
-        self.session.kill();
     }
 }
 
@@ -658,11 +678,7 @@ fn replay(cast: &Cast) -> Vec<MarkRead> {
             // only set a target the grid never reaches. Refuse rather than
             // replay a different screen.
             "resize" => panic!("{}: resize at {t} isn't replayed yet", cast.name),
-            "exit" => {
-                replay.exited = true;
-                let (now, _) = replay.at(*t);
-                replay.reconcile(now);
-            }
+            "exit" => replay.exit(*t, payload["code"].as_i64().map(|code| code as i32)),
             "mark" => {
                 replay.settle(*t);
                 let verdicts = replay.verdicts();
@@ -679,6 +695,42 @@ fn replay(cast: &Cast) -> Vec<MarkRead> {
         }
     }
     marks
+}
+
+/// What muxel wrote back for the last read holding `query` before `mark`.
+fn answer_before(cast: &Cast, query: &[u8], mark: &str) -> Vec<u8> {
+    let mut replay = Replay::new(cast);
+    let mut answer = Vec::new();
+    for (t, kind, payload) in &cast.events {
+        match kind.as_str() {
+            "out" => {
+                let bytes = decode_bytes(payload);
+                replay.writes.take();
+                replay.read(*t, &bytes);
+                if bytes.windows(query.len()).any(|window| window == query) {
+                    answer = replay.writes.take();
+                }
+            }
+            "mark" if payload["id"] == mark => return answer,
+            _ => {}
+        }
+    }
+    panic!("{}: no mark {mark}", cast.name);
+}
+
+/// The replay session catches what muxel writes back. Claude asks for the
+/// cursor position just after drawing its first idle frame, with the cursor
+/// in the box at row 38, column 3. Muxel answers with that position, where
+/// the recorder answered 1;1 and so moved Claude's cursor out of the box
+/// (`HELPER_CPR`).
+#[test]
+fn muxel_answers_claudes_cursor_query_with_where_the_cursor_is() {
+    let cast = repo_casts()
+        .into_iter()
+        .find(|cast| cast.name == "claude-2.1.322-windows-composer-tour")
+        .expect("composer tour cast");
+    let answer = answer_before(&cast, b"\x1b[6n", "idle-first");
+    assert_eq!(String::from_utf8_lossy(&answer), "\x1b[38;3R");
 }
 
 #[test]

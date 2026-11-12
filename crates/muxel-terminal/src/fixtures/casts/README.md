@@ -48,7 +48,7 @@ Truth keys, version 1. Every key is optional; an absent key claims nothing.
 
 ## Replay
 
-Each `out` goes to a real `TerminalSession` through `process_probe_output_at` at its recorded time, and status is reconciled after each read the way the view does, including the runtime's own timers. At a mark the replay ends any open synchronized frame and asks the readers:
+Replay runs on a `TerminalSession` with no child process (`TerminalSession::replay`), so it runs the same on every OS. Each `out` goes in through the session's replay feed at its recorded time and takes the reader's path: muxel answers the queries in it, then the read is queued and drained into the parser as a pane's is. What muxel writes back lands in a buffer the test can read. Status is reconciled after each read the way the view does, including the runtime's own timers. At a mark the replay ends any open synchronized frame and asks the readers:
 
 | truth key | reader |
 |---|---|
