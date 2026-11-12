@@ -5,9 +5,10 @@
 //! it copies the visible screen under the terminal lock, finds the provider's
 //! input box in that copy, puts paste markers back, and hands the draft to the
 //! app's sink, all on a background thread. It writes only when the text
-//! changed. Covered: Claude's and Codex's input boxes, and a shell's command
-//! line after its OSC 133 B mark. Grok, Muse, opencode and Amp draw boxes
-//! muxel can't yet read, so their panes run no watcher.
+//! changed. Covered: Claude's and Codex's input boxes. Grok, Muse, opencode
+//! and Amp draw boxes muxel can't yet read, so their panes run no watcher. A
+//! shell's command line is never read: shells keep their own history, and a
+//! line typed at a prompt can hold a secret.
 //!
 //! A read that can't be sure of every character is flagged partial. The
 //! screen alone never is: a terminal draws spaces at the end of a row, how
@@ -15,9 +16,8 @@
 //! what muxel typed into the box since it was last empty is known (see
 //! [`muxel_core::rescue::TypedDraft`]) and the screen shows that text, the
 //! typed text is the draft, whitespace and all. Even then a paste marker
-//! muxel can't tie to one paste, a box taller than the pane, or shell text
-//! drawn after the cursor (an autosuggestion can't be told from typed text)
-//! leaves it partial.
+//! muxel can't tie to one paste, or a box taller than the pane, leaves it
+//! partial.
 
 use crate::listener::MuxelListener;
 use crate::session::TerminalSession;
@@ -49,40 +49,7 @@ pub type DraftSink = Arc<dyn Fn(DraftUpdate) + Send + Sync>;
 
 /// Whether a pane running `provider` can have its draft read.
 pub(crate) fn readable(provider: TitleProvider) -> bool {
-    matches!(
-        provider,
-        TitleProvider::Claude | TitleProvider::Codex | TitleProvider::Other
-    )
-}
-
-/// Where a shell's OSC 133 B mark left the cursor, which is where its
-/// command input starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShellInputMark {
-    /// The row counted from the top of the scrollback, so scrolling the
-    /// screen doesn't move it.
-    absolute_line: i64,
-    column: usize,
-    /// The prompt text to the left of the mark. A read checks it is still
-    /// there, so a full scrollback (rows shift without the count changing)
-    /// or a cleared screen reads as unknown, not as someone else's text.
-    prefix: String,
-}
-
-impl ShellInputMark {
-    pub(crate) fn at_cursor(term: &Term<MuxelListener>) -> Self {
-        let grid = term.grid();
-        let cursor = grid.cursor.point;
-        let row = &grid[cursor.line];
-        let prefix = (0..cursor.column.0.min(grid.columns()))
-            .map(|column| row[Column(column)].c)
-            .collect();
-        Self {
-            absolute_line: grid.history_size() as i64 + i64::from(cursor.line.0),
-            column: cursor.column.0,
-            prefix,
-        }
-    }
+    matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
 }
 
 /// A suggestion, placeholder or hint drawn in the input area: dim or muted
@@ -439,100 +406,6 @@ pub(crate) fn box_shown(capture: &DraftCapture, provider: TitleProvider) -> Opti
     Some(read != DraftRead::Unknown)
 }
 
-/// A shell's command line: the text from its last OSC 133 B mark up to the
-/// cursor, through soft wraps. Anything drawn after the cursor (an
-/// autosuggestion, an inline prediction, or typed text the cursor was moved
-/// back over) can't be told apart, so it's left out and the read is partial.
-/// So is a command continued on another line, or anything drawn below the
-/// command (a prediction list): only the line with the mark is read. Spaces
-/// after the cursor can't be seen either, so the read is exact only when it
-/// is `typed`, what muxel saw typed since the line was last empty.
-pub(crate) fn shell(
-    term: &Term<MuxelListener>,
-    mark: &ShellInputMark,
-    typed: Option<&str>,
-) -> DraftRead {
-    let grid = term.grid();
-    let rows = grid.screen_lines() as i64;
-    let columns = grid.columns();
-    let line = mark.absolute_line - grid.history_size() as i64;
-    if !(0..rows).contains(&line) || mark.column > columns {
-        return DraftRead::Unknown;
-    }
-    let first = &grid[Line(line as i32)];
-    let prefix: String = (0..mark.column).map(|c| first[Column(c)].c).collect();
-    if prefix != mark.prefix {
-        return DraftRead::Unknown;
-    }
-    let cursor = grid.cursor.point;
-    let cursor = (i64::from(cursor.line.0), cursor.column.0);
-    if cursor < (line, mark.column) {
-        return DraftRead::Unknown;
-    }
-    let mut shown = String::new();
-    let mut after_cursor = false;
-    let mut reached_cursor = false;
-    let mut row = line;
-    let mut start = mark.column;
-    loop {
-        let grid_row = &grid[Line(row as i32)];
-        for column in start..columns {
-            let cell = &grid_row[Column(column)];
-            if spacer(cell) {
-                continue;
-            }
-            if (row, column) >= cursor {
-                reached_cursor = true;
-                after_cursor |= !cell.c.is_whitespace();
-                continue;
-            }
-            shown.push(cell.c);
-            if let Some(combining) = cell.zerowidth() {
-                shown.extend(combining);
-            }
-        }
-        let wrapped = columns > 0
-            && grid_row[Column(columns - 1)]
-                .flags
-                .contains(Flags::WRAPLINE);
-        if !wrapped || row + 1 >= rows {
-            break;
-        }
-        row += 1;
-        start = 0;
-    }
-    let drawn_below = (row + 1..rows).any(|below| {
-        let grid_row = &grid[Line(below as i32)];
-        (0..columns).any(|column| !grid_row[Column(column)].c.is_whitespace())
-    });
-    let partial = after_cursor || !reached_cursor || drawn_below;
-    // Cells before the cursor are typed, blanks included; past the cursor
-    // nothing was kept.
-    let shown = if reached_cursor {
-        shown.as_str()
-    } else {
-        shown.trim_end()
-    };
-    match (shown.trim().is_empty(), partial) {
-        (true, false) => DraftRead::Empty,
-        // Nothing provably typed, but something is there: keep what was saved.
-        (true, true) => DraftRead::Unknown,
-        (false, partial) => DraftRead::Text {
-            text: shown.to_string(),
-            partial: partial || typed != Some(shown),
-            clipped: false,
-        },
-    }
-}
-
-/// What kind of input box `provider`'s drafts come from.
-pub(crate) fn source(provider: TitleProvider) -> DraftSource {
-    match provider {
-        TitleProvider::Claude | TitleProvider::Codex => DraftSource::Agent,
-        _ => DraftSource::Shell,
-    }
-}
-
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -548,7 +421,6 @@ pub(crate) async fn watch(
     sink: DraftSink,
 ) {
     let events = session.draft_events();
-    let source = source(provider);
     let mut tracker = DraftTracker::default();
     while events.recv().await.is_ok() {
         loop {
@@ -592,7 +464,7 @@ pub(crate) async fn watch(
                     text,
                     partial,
                     saved_at_ms: now_ms(),
-                    source,
+                    source: DraftSource::Agent,
                     pane: None,
                 }));
                 log::debug!(

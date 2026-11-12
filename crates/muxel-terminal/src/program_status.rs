@@ -51,8 +51,6 @@ pub(crate) enum Event {
     Report(Report),
     Reset,
     ShellPrompt,
-    /// OSC 133 B: the shell's prompt ends and its command input begins.
-    ShellInput,
     Title(String),
 }
 
@@ -228,8 +226,6 @@ impl Scanner {
             Some(Event::Query)
         } else if self.raw == b"133;A" || self.raw.starts_with(b"133;A;") {
             Some(Event::ShellPrompt)
-        } else if self.raw == b"133;B" || self.raw.starts_with(b"133;B;") {
-            Some(Event::ShellInput)
         } else if self.raw.starts_with(b"0;") || self.raw.starts_with(b"2;") {
             // Match VTE's OSC 0/2 title decoding (16 params including the
             // selector). Binding titles must be observed in wire order even
@@ -367,7 +363,6 @@ impl Perform for ObservedEvent {
             b"7501" if params.len() == 2 && params[1] == b"?" => Some(Event::Query),
             b"7501" if params.len() == 2 => parse_report(params[1]).map(Event::Report),
             b"133" if params.get(1) == Some(&b"A".as_slice()) => Some(Event::ShellPrompt),
-            b"133" if params.get(1) == Some(&b"B".as_slice()) => Some(Event::ShellInput),
             _ => None,
         };
     }
@@ -489,7 +484,7 @@ impl Observer {
             }
             Some(Event::Reset) if escape_attributable => Some(Event::Reset),
             Some(Event::Query | Event::Report(_)) if self.osc_invalid_control => None,
-            Some(event @ (Event::Report(_) | Event::ShellPrompt | Event::ShellInput))
+            Some(event @ (Event::Report(_) | Event::ShellPrompt))
                 if completing_osc && osc_attributable && byte == 0x1b =>
             {
                 self.pending_st = Some(PendingSt { event, generation });

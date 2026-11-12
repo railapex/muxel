@@ -1525,32 +1525,25 @@ fn a_sent_prompt_is_not_kept_when_the_pane_closes_on_a_draft_too_tall_to_save() 
 }
 
 #[test]
-fn a_command_sent_just_before_its_pane_closes_is_not_kept() {
+fn a_shell_prompt_line_is_never_saved() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);
         let session = launch_shell(cx, window, iid);
-        session.process_probe_shell_output(b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test");
+        // PowerShell's prompt, marked the way its shell integration marks it,
+        // with a secret typed after it.
+        session.process_probe_shell_output(
+            b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07$env:SOME_KEY=\"x\"",
+        );
         session.mark_user_input();
         after_debounce(cx);
-        assert_eq!(
-            dir.draft(iid).map(|d| d.text).as_deref(),
-            Some("cargo test")
-        );
+        assert!(dir.draft(iid).is_none(), "the typed line was saved");
 
-        // Enter, as a pane's key handler sends it: the shell runs the
-        // command, and the pane is closed before the watcher deletes the
-        // file.
         window
             .update(cx, |app, _, cx| {
-                session.mark_turn_submitted();
-                session.write_input(b"\r");
                 app.close_instance_inner(iid, "close (test)", cx);
             })
             .unwrap();
-        assert!(
-            dir.closed_drafts().is_empty(),
-            "the sent command isn't kept"
-        );
+        assert!(dir.closed_drafts().is_empty(), "the typed line was kept");
     });
 }
 
