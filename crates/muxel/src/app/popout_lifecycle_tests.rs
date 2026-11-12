@@ -281,6 +281,7 @@ fn popout_renders_its_title_status_close_confirmation_and_theme_updates() {
                     message: "Running".into(),
                     confirm_label: "Close".into(),
                     details: Vec::new(),
+                    leave: None,
                     action: super::ConfirmAction::CloseBatch(vec![pane]),
                 });
                 cx.notify();
@@ -299,24 +300,37 @@ fn popout_renders_its_title_status_close_confirmation_and_theme_updates() {
         draw(cx);
         assert!(count(pane) > 0);
         assert_eq!(count(other), 0);
-        for action in [
-            super::ConfirmAction::CloseBatch(vec![pane, other]),
-            super::ConfirmAction::SaveEditorBeforeClose {
-                iid: pane,
-                rest: vec![other],
-            },
-        ] {
-            reset();
-            window
-                .update(cx, |app, _, cx| {
-                    app.confirm.as_mut().unwrap().action = action;
-                    cx.notify();
-                })
-                .unwrap();
-            draw(cx);
-            assert!(count(pane) > 0, "changed alternative button must render");
-            assert_eq!(count(other), 0);
-        }
+        reset();
+        window
+            .update(cx, |app, _, cx| {
+                app.confirm.as_mut().unwrap().action =
+                    super::ConfirmAction::SaveEditorBeforeClose {
+                        iid: pane,
+                        rest: vec![other],
+                    };
+                cx.notify();
+            })
+            .unwrap();
+        draw(cx);
+        assert!(count(pane) > 0, "changed alternative button must render");
+        assert_eq!(count(other), 0);
+        // A leaving question's rows and buttons: here, its idle choice.
+        reset();
+        window
+            .update(cx, |app, _, cx| {
+                app.confirm.as_mut().unwrap().leave = Some(muxel_core::leaving::Question {
+                    leave: muxel_core::leaving::Leave::Close,
+                    title: muxel_core::leaving::Title::CloseOne(pane),
+                    rows: Vec::new(),
+                    idle: Some(1),
+                    danger: false,
+                });
+                cx.notify();
+            })
+            .unwrap();
+        draw(cx);
+        assert!(count(pane) > 0, "a changed leaving question must render");
+        assert_eq!(count(other), 0);
         reset();
         window
             .update(cx, |app, _, cx| app.cancel_confirm(cx))
@@ -706,6 +720,125 @@ fn actual_popout_lifecycle_restart_keeps_its_workspace_panes_and_geometry() {
                     app.workspace.project_windows.contains_key(&project),
                     "closing a window dropped its project's placement"
                 );
+            })
+            .unwrap();
+    });
+}
+
+/// A pop-out draws its close question's pill as its pane is now, not as it
+/// was when the question opened.
+#[test]
+fn a_popouts_close_question_pill_follows_its_pane() {
+    with_app_drawing(true, |cx, window| {
+        let (pane, _view, _child) = popout_fixture(cx, window);
+        let popout = window
+            .update(cx, |app, _, _| app.popouts[&pane].window)
+            .unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app.settings.confirm_close_terminal = true;
+                app.request_close_instance(pane, cx);
+                assert!(app.confirm.is_some(), "the pop-out's shell didn't ask");
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(popout.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("leave-row").is_some(), "no row drawn");
+        assert!(
+            visual.debug_bounds("leave-pill-Done").is_none(),
+            "the pane read done before its turn finished"
+        );
+        window
+            .update(cx, |app, _, cx| {
+                let activity = &mut app.workspace.instance_mut(pane).unwrap().activity;
+                activity.observe(None, muxel_core::AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(muxel_core::AgentActivityState::Working),
+                    muxel_core::AgentActivityState::Done,
+                    200,
+                );
+                app.restoring_activity.insert(pane);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("leave-pill-Done").is_some(),
+            "the pop-out's row kept the pill it read when the question opened"
+        );
+    });
+}
+
+/// A close question over a pop-out is modal too: while it shows, no key
+/// pressed in the pop-out reaches its terminal, Tab included.
+#[test]
+fn a_key_pressed_in_a_popout_under_its_close_question_never_reaches_its_terminal() {
+    use gpui::Focusable;
+    with_app_drawing(true, |cx, window| {
+        let (pane, view, _child) = popout_fixture(cx, window);
+        let popout = window
+            .update(cx, |app, _, _| app.popouts[&pane].window)
+            .unwrap();
+        popout
+            .update(cx, |_, window, cx| {
+                view.read(cx).focus_handle(cx).focus(window, cx)
+            })
+            .unwrap();
+        // Tab reaches a terminal as an action, bound as the app binds it.
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "tab",
+                super::SendTab,
+                Some("Terminal"),
+            )])
+        });
+        cx.run_until_parked();
+        let session = view.read_with(cx, |view, _| view.session().clone());
+        // The control: with nothing showing, a key and Tab reach the terminal.
+        cx.simulate_keystrokes(popout.into(), "x");
+        let typed = session.last_user_input();
+        assert!(typed.is_some(), "the pop-out's terminal never got the key");
+        std::thread::sleep(Duration::from_millis(2));
+        cx.simulate_keystrokes(popout.into(), "tab");
+        assert_ne!(
+            session.last_user_input(),
+            typed,
+            "the pop-out's terminal never got Tab"
+        );
+        let typed = session.last_user_input();
+
+        window
+            .update(cx, |app, _, cx| {
+                app.confirm = Some(super::PendingConfirm {
+                    title: "Close pane?".into(),
+                    message: "".into(),
+                    confirm_label: "Close".into(),
+                    details: Vec::new(),
+                    leave: Some(muxel_core::leaving::Question {
+                        leave: muxel_core::leaving::Leave::Close,
+                        title: muxel_core::leaving::Title::CloseOne(pane),
+                        rows: Vec::new(),
+                        idle: None,
+                        danger: false,
+                    }),
+                    action: super::ConfirmAction::CloseBatch(vec![pane]),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        for key in ["x", "tab", "escape"] {
+            std::thread::sleep(Duration::from_millis(2));
+            cx.simulate_keystrokes(popout.into(), key);
+            assert_eq!(
+                session.last_user_input(),
+                typed,
+                "{key} reached the terminal"
+            );
+        }
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.confirm.is_none(), "Esc didn't back out")
             })
             .unwrap();
     });

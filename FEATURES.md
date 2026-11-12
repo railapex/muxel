@@ -156,10 +156,15 @@ feature is added or changed, update the matching entry here in the same change**
   shell close always asks.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
-  work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
-  file answer needs the close to take every pane of its worktree, so leaving
-  one open, or one exiting or closed by a peer before the close is accepted,
-  drops the answer and that worktree asks again later.
+  work. A close that asks lists one row per pane it would cut off: the pane's
+  sidebar pill and name, plus a word or two only where the pill can't say it
+  (*maybe busy*, *unmarked prompt*, *tmux open*, *attached elsewhere*). The
+  pill follows its pane while the question shows. A batch
+  offers Close all, **Close N idle**, or Cancel; Enter closes, Esc backs out
+  and I closes only the idle ones, and the button is red only when work would
+  be lost for certain. A file answer needs the close to take every pane of its
+  worktree, so leaving one open, or one exiting or closed by a peer before the
+  close is accepted, drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
   with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
@@ -907,8 +912,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
   menu lists every agent with its live status and the most recent notifications;
-  clicking one restores muxel and focuses that project + pane, and "Quit" exits for
-  real. Linux uses StatusNotifierItem (needs an AppIndicator/SNI host — standard on
+  clicking one restores muxel and focuses that project + pane, and "Quit" raises
+  muxel and quits as `Ctrl+Q` does, counting down or asking. Linux uses StatusNotifierItem (needs an AppIndicator/SNI host — standard on
   KDE, the AppIndicator extension on GNOME); Windows/macOS use the notification-area
   / status-bar item. (Stock GPUI can only iconify, so the window still appears in the
   taskbar; restoring from the tray is best-effort on Wayland — the dash always works.)
@@ -1924,14 +1929,20 @@ feature is added or changed, update the matching entry here in the same change**
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
-  **cleanly** (an abnormal exit always leaves a tombstone pane instead). The quit
-  confirmation names input still being typed that quitting cancels: a ctl send
-  waiting for its Enter or keys mid-sequence (what was already typed stays),
-  dictation, an upload not yet pasted, a wake sweep. When every terminal would
-  close into Undo rather than ask and nothing is pending, Quit and Restart count
-  down 5 s instead, with Cancel and **Quit now** (or **Restart now**). If
-  anything turned busy by the end, they ask. The tray's Quit, and Quit before a
-  workspace is loaded, still quit at once.
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead). Quit,
+  Restart, closing panes and removing a project ask one leaving question, with
+  the same rows and keys: a row per pane or input it would cut off (a busy
+  pane, an unsaved editor, a ctl send waiting for its Enter or keys
+  mid-sequence, dictation, an upload not yet pasted, a wake sweep), Enter to
+  go, Esc to back out. While it shows, no key reaches the pane behind it. A
+  pane in a tmux session never makes Quit or Restart ask, since its session
+  runs on and reattaches; closing it still asks, since that kills the
+  session. When nothing would be cut off, Quit and Restart count
+  down 5 s instead (*Quitting in 5*, a line of time, Cancel and **Quit now**);
+  if anything changed by the end, they ask, naming what changed. The tray's
+  Quit takes the same path; Quit before a workspace is loaded still quits at
+  once. Removing a project always asks, plainly when nothing would be cut off,
+  since no Undo brings it back.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
@@ -1998,8 +2009,9 @@ feature is added or changed, update the matching entry here in the same change**
   for that pane, and closing the last pane on it stops it. A *dropped* SSH
   connection never auto-closes — it leaves a tombstone pane, keeping the remote
   session reconnectable. Quitting the **app** leaves
-  sessions alive by design (they reattach next launch): when any exist, the quit
-  dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
+  sessions alive by design (they reattach next launch), so a busy tmux pane
+  doesn't make the quit ask. When the quit asks for something else and any
+  sessions exist, the quit dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
   kill remote tmux sessions** — both off by default; the kills are
   fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
   waits on a slow host.

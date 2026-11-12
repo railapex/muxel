@@ -1,21 +1,23 @@
 //! A confirmed Restart: what it interrupts stays interrupted, anything it
 //! can't settle makes it give up with the app left running and taking input,
-//! and only a new version that has started ends this one.
+//! and only a new version that has started ends this one. Quit, Restart, a
+//! close and a project removal ask one leaving question, which Enter, Esc
+//! and I answer.
 
-use super::MuxelApp;
-use super::UpdateState;
 use super::control_api::SUBMIT_DELAY_MS;
 use super::control_api::pending_input_tests::{
     add_shell, dying_tmux_route, press_send, tmux_route,
 };
 use super::departure::{ExitKind, Stage};
 use super::pending_input::PendingKind;
-use super::popout_lifecycle_tests::with_app;
+use super::popout_lifecycle_tests::{with_app, with_app_drawing};
 use super::recoverable_close::CloseDeparture;
+use super::{ConfirmAction, MuxelApp, PaneNode, UpdateState};
 use crate::update::RelaunchPlan;
-use gpui::{AppContext, TestAppContext, VisualTestContext, WindowHandle};
-use muxel_core::control::ErrorCode;
-use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
+use gpui::{AppContext, KeyBinding, TestAppContext, VisualTestContext, WindowHandle};
+use muxel_core::AgentActivityState;
+use muxel_core::control::{AgentState, ErrorCode};
+use muxel_terminal::{AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -974,5 +976,440 @@ fn a_restart_takes_over_a_quits_countdown() {
                 app.cancel_exit_countdown(cx);
             })
             .unwrap();
+    });
+}
+
+/// Undo a Quit that went at once, before any assertion: even a failing test
+/// must never quit the real app. Returns whether it went.
+fn undo_quit(app: &mut MuxelApp) -> bool {
+    let went = app.confirm_quit || app.close_departure.is_some();
+    app.confirm_quit = false;
+    app.close_departure = None;
+    app.close_departure_task = None;
+    went
+}
+
+/// The tray's Quit takes Ctrl+Q's path: it counts down when nothing would be
+/// cut off and asks, naming the pane, when something would.
+#[test]
+fn the_trays_quit_counts_down_or_asks_like_ctrl_q() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                // Held, so a Quit that went at once can't end the test app.
+                app.close_tmux_kills
+                    .push(cx.background_executor().spawn(std::future::pending::<()>()));
+                app.handle_tray_action(muxel_tray::TrayAction::Quit, window, cx);
+                let counting = app.exit_countdown.as_ref().map(|c| c.kind);
+                app.cancel_exit_countdown(cx);
+                assert!(!undo_quit(app), "the tray's Quit went at once");
+                assert_eq!(counting, Some(ExitKind::Quit), "it didn't count down");
+
+                let (pane, session) = add_shell(app, None, "tray-quit", window, cx);
+                app.handle_tray_action(muxel_tray::TrayAction::Quit, window, cx);
+                assert!(!undo_quit(app), "the tray's Quit went at once");
+                assert!(app.show_quit_confirm, "it didn't ask");
+                let question = app.quit_leave.as_ref().expect("the question has no rows");
+                let names: Vec<String> = app
+                    .leave_view(question, cx)
+                    .rows
+                    .iter()
+                    .map(|row| row.name.to_string())
+                    .collect();
+                assert_eq!(
+                    names,
+                    [app.workspace.instance(pane).unwrap().display_name()]
+                );
+                app.show_quit_confirm = false;
+                session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// Removing a project asks every time, since no Undo brings it back, and
+/// its rows name the panes it would cut off. Esc keeps it; Enter removes it.
+#[test]
+fn removing_a_project_asks_and_names_the_panes_it_cuts_off() {
+    with_app_drawing(true, |cx, window| {
+        let (pane, pid, session) = window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                let (pane, session) = add_shell(app, None, "remove-asks", window, cx);
+                let pid = app.workspace.instance(pane).unwrap().project_id;
+                app.request_remove_project(pid, cx);
+                (pane, pid, session)
+            })
+            .unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                let pending = app.confirm.as_ref().expect("it didn't ask");
+                assert!(matches!(pending.action, ConfirmAction::DeleteProject(p) if p == pid));
+                assert_eq!(pending.title.as_ref(), "Remove control?");
+                let question = pending.leave.as_ref().expect("the question has no rows");
+                let leave = app.leave_view(question, cx);
+                let names: Vec<String> =
+                    leave.rows.iter().map(|row| row.name.to_string()).collect();
+                assert_eq!(
+                    names,
+                    [app.workspace.instance(pane).unwrap().display_name()]
+                );
+                assert!(leave.danger, "removing a project isn't red");
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |app, _, cx| {
+                assert!(app.confirm.is_none(), "Esc didn't back out");
+                assert!(app.workspace.project(pid).is_some(), "Esc removed it");
+                app.request_remove_project(pid, cx);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.confirm.is_none(), "Enter didn't answer");
+                assert!(
+                    app.workspace.project(pid).is_none(),
+                    "Enter didn't remove it"
+                );
+            })
+            .unwrap();
+        session.kill();
+    });
+}
+
+/// A leaving question is modal. No key pressed while one shows reaches the
+/// focused terminal behind it: not a letter, not the Enter or Esc that
+/// answers it, and not Tab, which is an action rather than a key event.
+#[test]
+fn a_key_pressed_while_a_leaving_question_is_up_never_reaches_a_terminal() {
+    with_app_drawing(true, |cx, window| {
+        let (pid, session) = window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                let (pane, session) = add_shell(app, None, "keys-behind", window, cx);
+                // On screen and focused, so a key that got past the question
+                // would land in it.
+                let pid = app.workspace.instance(pane).unwrap().project_id;
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(pane));
+                app.workspace.active_project = Some(pid);
+                app.focus_instance(pane, window, cx);
+                (pid, session)
+            })
+            .unwrap();
+        // Tab reaches a terminal as an action, bound as the app binds it.
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("tab", super::SendTab, Some("Terminal"))]));
+        cx.run_until_parked();
+        // The control: with nothing showing, a key and Tab reach the shell.
+        cx.simulate_keystrokes(window.into(), "x");
+        let typed = session.last_user_input();
+        assert!(typed.is_some(), "the focused shell never got the key");
+        std::thread::sleep(Duration::from_millis(2));
+        cx.simulate_keystrokes(window.into(), "tab");
+        assert_ne!(
+            session.last_user_input(),
+            typed,
+            "the focused shell never got Tab"
+        );
+        let typed = session.last_user_input();
+        let untouched = |what: &str| {
+            assert_eq!(session.last_user_input(), typed, "{what} reached the shell");
+        };
+
+        // The confirm dialog: Remove project always asks.
+        window
+            .update(cx, |app, _, cx| app.request_remove_project(pid, cx))
+            .unwrap();
+        for key in ["x", "tab", "escape"] {
+            std::thread::sleep(Duration::from_millis(2));
+            cx.simulate_keystrokes(window.into(), key);
+            untouched(key);
+        }
+        // The Quit question or its countdown, whichever the shell brings up.
+        window
+            .update(cx, |app, _, cx| {
+                assert!(app.confirm.is_none(), "Esc didn't back out");
+                app.ask_exit(ExitKind::Quit, cx);
+                assert!(app.show_quit_confirm || app.exit_countdown.is_some());
+            })
+            .unwrap();
+        for key in ["x", "tab", "escape"] {
+            std::thread::sleep(Duration::from_millis(2));
+            cx.simulate_keystrokes(window.into(), key);
+            untouched(key);
+        }
+        window
+            .update(cx, |app, _, cx| {
+                assert!(!app.show_quit_confirm && app.exit_countdown.is_none());
+                app.request_remove_project(pid, cx);
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        cx.simulate_keystrokes(window.into(), "enter");
+        untouched("enter");
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.workspace.project(pid).is_none(), "Enter didn't answer");
+            })
+            .unwrap();
+        session.kill();
+    });
+}
+
+/// A row's pill says what the sidebar says. A pane whose last turn finished
+/// reads done while it restores, whatever its live status.
+#[test]
+fn a_rows_pill_says_what_the_sidebar_says() {
+    with_app(|cx, window| {
+        window
+            .update(cx, |app, window, cx| {
+                let (pane, session) = add_shell(app, None, "pill", window, cx);
+                let activity = &mut app.workspace.instance_mut(pane).unwrap().activity;
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    200,
+                );
+                app.restoring_activity.insert(pane);
+                let (status, _) = app.leave_pill(pane, cx).expect("no pill");
+                assert_eq!(status, AgentStatus::Done);
+                session.kill();
+            })
+            .unwrap();
+    });
+}
+
+/// A row's pill follows its pane while the question shows: a pane whose
+/// turn finishes after the question opened reads done, as the sidebar does.
+#[test]
+fn a_rows_pill_follows_its_pane_while_the_question_shows() {
+    with_app_drawing(true, |cx, window| {
+        let (pane, session) = window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                let (pane, session) = add_shell(app, None, "live-pill", window, cx);
+                let pid = app.workspace.instance(pane).unwrap().project_id;
+                app.request_remove_project(pid, cx);
+                (pane, session)
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("leave-row").is_some(), "no row drawn");
+        assert!(
+            visual.debug_bounds("leave-pill-Done").is_none(),
+            "the pane read done before its turn finished"
+        );
+        window
+            .update(cx, |app, _, cx| {
+                let activity = &mut app.workspace.instance_mut(pane).unwrap().activity;
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    200,
+                );
+                app.restoring_activity.insert(pane);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("leave-pill-Done").is_some(),
+            "the row kept the pill it read when the question opened"
+        );
+        session.kill();
+    });
+}
+
+/// A question answers its keys while focus sits on a pane no longer drawn,
+/// such as one held for Undo after its project was removed. A key travels
+/// only towards the focused element, so this needs the root to take focus.
+#[test]
+fn a_question_answers_keys_when_the_focused_pane_is_gone() {
+    with_app_drawing(true, |cx, window| {
+        let (pid, session) = window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                let (pane, session) = add_shell(app, None, "focus-gone", window, cx);
+                let pid = app.workspace.instance(pane).unwrap().project_id;
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(pane));
+                app.workspace.active_project = Some(pid);
+                app.focus_instance(pane, window, cx);
+                (pid, session)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Off screen, its focus handle alive.
+        window
+            .update(cx, |app, window, cx| {
+                assert!(window.focused(cx).is_some(), "the pane never took focus");
+                app.workspace.project_mut(pid).unwrap().layout = None;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, window, cx| {
+                assert!(
+                    window.focused(cx).is_some(),
+                    "the pane's focus went with it"
+                );
+                app.ask_exit(ExitKind::Quit, cx);
+                assert!(app.show_quit_confirm || app.exit_countdown.is_some());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |app, _, _| {
+                assert!(
+                    !app.show_quit_confirm && app.exit_countdown.is_none(),
+                    "Esc didn't answer the question"
+                );
+            })
+            .unwrap();
+        session.kill();
+    });
+}
+
+/// Enter, Esc and I answer a close question from the keyboard. Modals take
+/// no focus, so the window's root answers them, ahead of the panes.
+#[test]
+fn keys_answer_the_close_question() {
+    with_app_drawing(true, |cx, window| {
+        let (busy, busy_session, dead, dead_session) = window
+            .update(cx, |app, window, cx| {
+                no_overlays(app, cx);
+                app.settings.confirm_close_terminal = true;
+                // The killed shell stays as an exited pane.
+                app.settings.close_on_exit = false;
+                let (busy, busy_session) = add_shell(app, None, "keys-busy", window, cx);
+                let (dead, dead_session) = add_shell(app, None, "keys-dead", window, cx);
+                dead_session.kill();
+                (busy, busy_session, dead, dead_session)
+            })
+            .unwrap();
+        // Run the app and its fake clock until the killed shell reads as exited.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !window
+            .update(cx, |app, _, cx| {
+                app.close_facts(dead, cx).status == AgentState::Exited
+            })
+            .unwrap()
+        {
+            assert!(Instant::now() < deadline, "the killed shell never exited");
+            cx.executor().advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ask = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.request_recoverable_close(vec![busy, dead], cx);
+                    let leave = app
+                        .confirm
+                        .as_ref()
+                        .and_then(|pending| pending.leave.as_ref())
+                        .expect("the close didn't ask");
+                    assert_eq!(leave.rows.len(), 1, "only the busy shell asks");
+                    assert!(leave.idle.is_some(), "no idle choice");
+                })
+                .unwrap();
+        };
+        ask(cx);
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.confirm.is_none(), "Esc didn't back out");
+                assert!(!app.is_closing(busy) && app.workspace.instance(dead).is_some());
+            })
+            .unwrap();
+        ask(cx);
+        cx.simulate_keystrokes(window.into(), "i");
+        window
+            .update(cx, |app, _, cx| {
+                assert!(app.confirm.is_none(), "I didn't answer");
+                assert!(
+                    app.workspace.instance(dead).is_none(),
+                    "I kept the idle pane"
+                );
+                assert!(!app.is_closing(busy), "I closed the busy pane");
+                app.request_recoverable_close(vec![busy], cx);
+                assert!(app.confirm.is_some(), "the close didn't ask");
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.confirm.is_none(), "Enter didn't answer");
+                assert!(app.is_closing(busy), "Enter didn't close it");
+            })
+            .unwrap();
+        busy_session.kill();
+        dead_session.kill();
+    });
+}
+
+/// Esc cancels the quit countdown and Enter goes now; the same keys answer
+/// the question a busy pane brings up.
+#[test]
+fn keys_answer_the_countdown_and_the_quit_question() {
+    with_app_drawing(true, |cx, window| {
+        window
+            .update(cx, |app, _, cx| {
+                ready(app);
+                no_overlays(app, cx);
+                app.relaunch = failing;
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(app.exit_countdown.is_some(), "no countdown");
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |app, _, cx| {
+                assert!(app.exit_countdown.is_none(), "Esc didn't cancel");
+                assert_eq!(app.departing, None);
+                app.ask_exit(ExitKind::Restart, cx);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        window
+            .update(cx, |app, _, _| {
+                assert_eq!(app.departing, Some(Stage::Preparing), "Enter didn't go");
+            })
+            .unwrap();
+        run_until(cx, window, "the Restart never gave up", |app| {
+            app.departing.is_none()
+        });
+
+        let session = window
+            .update(cx, |app, window, cx| {
+                let (_, session) = add_shell(app, None, "keys-quit", window, cx);
+                app.ask_exit(ExitKind::Restart, cx);
+                assert!(app.show_quit_confirm, "it didn't ask");
+                session
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |app, _, cx| {
+                assert!(!app.show_quit_confirm, "Esc didn't back out");
+                app.ask_exit(ExitKind::Restart, cx);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        window
+            .update(cx, |app, _, _| {
+                assert_eq!(app.departing, Some(Stage::Preparing), "Enter didn't go");
+            })
+            .unwrap();
+        run_until(cx, window, "the Restart never gave up", |app| {
+            app.departing.is_none()
+        });
+        session.kill();
     });
 }

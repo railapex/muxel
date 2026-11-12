@@ -843,8 +843,12 @@ fn batch_close_splits_quiet_and_active_members() {
             app.close_other_tabs(anchor, window, cx);
             let pending = app.confirm.as_ref().expect("mixed batch prompts once");
             assert!(matches!(&pending.action, ConfirmAction::CloseBatch(ids) if ids.as_slice() == [quiet, busy]));
-            assert!(pending.message.contains("busy fixture"));
-            assert!(!pending.message.contains("quiet fixture"));
+            // One row, for the pane the close would cut off, and the choice
+            // to close only the idle one.
+            let leave = app.leave_view(pending.leave.as_ref().expect("a close asks with rows"), cx);
+            let names: Vec<_> = leave.rows.iter().map(|row| row.name.to_string()).collect();
+            assert_eq!(names, ["busy fixture"]);
+            assert!(leave.idle.is_some());
             assert!(!app.is_closing(quiet));
             assert!(!app.is_closing(busy));
         }).unwrap();
@@ -2750,7 +2754,7 @@ fn an_answer_never_outlives_the_close_that_asked_for_it() {
                             assert!(app.deferred_worktree_dispose.is_empty());
                         }
                         "pane exits" => {
-                            // Close-on-exit, while "Close terminals?" still waits.
+                            // Close-on-exit, while the close question still waits.
                             app.close_instance_inner(pane, "close (exited)", cx);
                             assert_eq!(
                                 app.pending_worktree_dispose.len(),
@@ -2773,7 +2777,7 @@ fn an_answer_never_outlives_the_close_that_asked_for_it() {
 }
 
 /// Ryan's report: the "pane exits" ending with a sibling still open. The busy
-/// agent exits while "Close terminals?" waits, so Close only the idle ones then
+/// agent exits while the close question waits, so closing only the idle ones then
 /// takes every pane still open. The answer was never accepted for the agent's
 /// later work and must not run over it. A peer closing the agent through the
 /// shared layout removes it without a local close, and must end it the same way.

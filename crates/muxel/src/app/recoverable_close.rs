@@ -2,6 +2,7 @@
 
 use super::*;
 use muxel_core::control::AgentState;
+use muxel_core::leaving::{self, Leave};
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch, HeldView,
     LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
@@ -94,14 +95,6 @@ fn reason_close_evidence(reason: TerminalStatusReason) -> CloseEvidence {
     }
 }
 
-/// Whether the close prompt should name a pane's listed work: only when that is
-/// why the pane counts as busy. A pane waiting for input or working in the
-/// foreground says so instead.
-fn listed_work_is_why_busy(status: AgentStatus, reason: TerminalStatusReason) -> bool {
-    matches!(status, AgentStatus::Idle | AgentStatus::Done)
-        || reason == TerminalStatusReason::BackgroundWork
-}
-
 /// A close kills what runs beside a finished turn, so it counts as busy and asks.
 fn close_state(
     state: AgentState,
@@ -125,7 +118,7 @@ enum AcceptedClose {
     Hold {
         forced: bool,
     },
-    /// Left open: "Close only the idle ones" skipped it, or it has unsaved edits.
+    /// Left open: closing only the idle ones skipped it, or it has unsaved edits.
     Stays,
 }
 
@@ -396,86 +389,56 @@ impl MuxelApp {
         let Some(ids) = self.preflight_close_worktrees(ids, cx) else {
             return;
         };
-        let busy: Vec<_> = ids
+        let panes: Vec<_> = ids
             .iter()
-            .filter(|&&iid| {
-                self.workspace
-                    .instance(iid)
-                    .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
-                    && decide(
-                        self.close_facts(iid, cx),
-                        self.settings.confirm_close_terminal,
-                    ) == CloseDecision::Ask
-            })
-            .copied()
+            .filter_map(|&iid| self.leave_pane(iid, cx))
             .collect();
-        if !busy.is_empty() {
-            let message = busy
-                .iter()
-                .map(|&iid| {
-                    let inst = self.workspace.instance(iid).unwrap();
-                    let facts = self.close_facts(iid, cx);
-                    if facts.session_may_outlive
-                        && matches!(
-                            facts.status,
-                            AgentState::Exited | AgentState::NotRunning | AgentState::Failed
-                        )
-                    {
-                        return tf(
-                            "{name}'s tmux session may still be running.",
-                            &[("name", inst.display_name())],
-                        );
-                    }
-                    if let Some(work) = self.terminal_view(iid).and_then(|view| {
-                        let view = view.read(cx);
-                        let runtime = view.runtime_snapshot();
-                        view.background_work()
-                            .filter(|_| listed_work_is_why_busy(runtime.status, runtime.reason))
-                    }) {
-                        return tf(
-                            "{name} is still running {work}.",
-                            &[
-                                ("name", inst.display_name()),
-                                ("work", &super::background_label(work)),
-                            ],
-                        );
-                    }
-                    let state = match facts.status {
-                        AgentState::Working => t("working"),
-                        AgentState::Idle | AgentState::Done => {
-                            return tf(
-                                "Muxel cannot confirm that {name} is idle.",
-                                &[("name", inst.display_name())],
-                            );
-                        }
-                        AgentState::Blocked => t("waiting for input"),
-                        AgentState::Exited => t("exited"),
-                        AgentState::Starting => t("starting"),
-                        AgentState::NotRunning => t("not running"),
-                        AgentState::Failed => t("unable to start"),
-                    };
-                    tf(
-                        "{name} is {status}.",
-                        &[("name", inst.display_name()), ("status", state.as_ref())],
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let label = if ids.len() > 1 {
-                t("Close all")
-            } else {
-                t("Close")
-            };
-            self.request_confirm(
-                t("Close terminals?"),
-                message,
-                label,
-                ConfirmAction::CloseBatch(ids),
-                cx,
-            );
-            return;
+        match leaving::plan(
+            Leave::Close,
+            &panes,
+            &[],
+            self.settings.confirm_close_terminal,
+        ) {
+            Some(question) => {
+                self.request_leave_confirm(
+                    self.leave_title(&question, ""),
+                    Self::leave_confirm_label(&question),
+                    question,
+                    ConfirmAction::CloseBatch(ids),
+                    cx,
+                );
+            }
+            None => self.accept_close_request(ids, false, cx),
         }
-        self.accept_close_request(ids, false, cx);
+    }
+
+    /// Remove project `pid`, after asking. It always asks, since no Undo
+    /// brings a project back; the question's rows are the panes removing it
+    /// would cut off.
+    // Seam: once Close keeps a closed pane (S7), removing a project moves its
+    // panes to Closed instead of `close_instance` in `delete_project`, and the
+    // question asks only when work would be cut off, like a close.
+    pub(super) fn request_remove_project(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(name) = self.workspace.project(pid).map(|p| p.name.clone()) else {
+            return;
+        };
+        let panes: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|inst| inst.project_id == pid && !self.is_closing(inst.id))
+            .filter_map(|inst| self.leave_pane(inst.id, cx))
+            .collect();
+        let Some(question) = leaving::plan(Leave::RemoveProject, &panes, &[], true) else {
+            return;
+        };
+        self.request_leave_confirm(
+            self.leave_title(&question, &name),
+            Self::leave_confirm_label(&question),
+            question,
+            ConfirmAction::DeleteProject(pid),
+            cx,
+        );
     }
 
     pub(super) fn accept_close_request(
@@ -1675,12 +1638,12 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseGroup, close_state, listed_work_is_why_busy, reason_close_evidence};
+    use super::{CloseGroup, close_state, reason_close_evidence};
     use muxel_core::control::AgentState;
     use muxel_core::recoverable_close::{
         CloseDecision, CloseFacts, CloseStage, decide, departure_finalizes,
     };
-    use muxel_terminal::{AgentStatus, ProgramStatusKind, TerminalStatusReason};
+    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
     use std::collections::HashMap;
     use std::time::Instant;
     use uuid::Uuid;
@@ -1856,24 +1819,6 @@ mod tests {
             assert_eq!(group.stage(), stage);
             assert!(!group.syncing(), "{stage:?}");
             assert!(!departure_finalizes(stage), "{stage:?}");
-        }
-    }
-
-    #[test]
-    fn the_close_prompt_names_listed_work_only_when_it_makes_the_pane_busy() {
-        use TerminalStatusReason::{BackgroundWork, BlockedMarker, ProviderScreen, ProviderTitle};
-        for (status, reason, named) in [
-            (AgentStatus::Done, ProviderTitle, true),
-            (AgentStatus::Idle, ProviderTitle, true),
-            (AgentStatus::Working, BackgroundWork, true),
-            (AgentStatus::Working, ProviderScreen, false),
-            (AgentStatus::Blocked, BlockedMarker, false),
-        ] {
-            assert_eq!(
-                listed_work_is_why_busy(status, reason),
-                named,
-                "{status:?} by {reason:?}"
-            );
         }
     }
 }

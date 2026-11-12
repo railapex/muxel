@@ -14,18 +14,18 @@
 //! version has started, nothing more is written: closing windows and the
 //! app's shutdown change nothing the new version loads.
 
-use super::pending_input::{PendingEntry, PendingKind};
 use super::recoverable_close::CloseDeparture;
 use super::{MuxelApp, NotifKind, PopOut, UpdateState, popout_terminal_views};
-use crate::i18n::{t, tf, tn};
+use crate::i18n::{t, tf};
 use crate::update::RelaunchPlan;
 use gpui::{App, AsyncApp, Context, Task, WeakEntity};
-use muxel_core::InstanceKind;
-use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide, departure_finalizes};
+use muxel_core::leaving::{self, Answer, Leave, Pending, Question, Title};
+use muxel_core::recoverable_close::CloseFacts;
 use muxel_terminal::{InputFence, TerminalSession};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -57,6 +57,8 @@ pub(super) struct ExitCountdown {
     pub(super) kind: ExitKind,
     /// Whole seconds left, for the overlay.
     pub(super) left: u64,
+    /// Tells countdowns apart, so each one's line of time starts full.
+    pub(super) serial: u64,
     /// Each terminal's close facts when it started.
     facts: Vec<(Uuid, CloseFacts)>,
     task: Task<()>,
@@ -99,69 +101,43 @@ impl Drop for DialogOpen {
     }
 }
 
-/// What a confirmed exit cuts short, one line for each kind of pending input.
-/// `name` names a pane, and `host` the remote host a pane's uploads go to.
-pub(super) fn loss_lines(
-    entries: &[PendingEntry],
-    name: impl Fn(Uuid) -> Option<String>,
-    host: impl Fn(Uuid) -> Option<String>,
-) -> Vec<String> {
-    let of = |kind: PendingKind| -> Vec<&PendingEntry> {
-        entries.iter().filter(|entry| entry.kind == kind).collect()
-    };
-    let pane_name = |entry: &PendingEntry| {
-        entry
-            .pane
-            .and_then(&name)
-            .unwrap_or_else(|| t("A pane").to_string())
-    };
-    let mut lines = Vec::new();
-    let sends = of(PendingKind::CtlSend);
-    if let Some(first) = sends.first() {
-        let n = sends.len().to_string();
-        lines.push(tn(
-            "{name}'s ctl send won't press Enter; text already pasted stays in the pane.",
-            "{n} ctl sends won't press Enter; text already pasted stays in their panes.",
-            sends.len(),
-            &[("name", pane_name(first).as_str()), ("n", n.as_str())],
-        ));
-    }
-    let keys = of(PendingKind::CtlKeys);
-    if let Some(first) = keys.first() {
-        let n = keys.len().to_string();
-        lines.push(tn(
-            "{name}'s remaining ctl keys won't be pressed; keys already pressed stay.",
-            "{n} ctl key sequences stop; keys already pressed stay.",
-            keys.len(),
-            &[("name", pane_name(first).as_str()), ("n", n.as_str())],
-        ));
-    }
-    if !of(PendingKind::Dictation).is_empty() {
-        lines.push(t("Dictation in progress will be discarded.").to_string());
-    }
-    let uploads = of(PendingKind::Upload);
-    if !uploads.is_empty() {
-        let mut hosts: Vec<String> = uploads
-            .iter()
-            .filter_map(|entry| entry.pane.and_then(&host))
-            .collect();
-        hosts.sort();
-        hosts.dedup();
-        lines.push(match hosts.as_slice() {
-            [only] => tf(
-                "Files already uploaded to {host} stay there. They won't be pasted.",
-                &[("host", only.as_str())],
-            ),
-            _ => t("Files already uploaded stay on their hosts. They won't be pasted.").to_string(),
-        });
-    }
-    if !of(PendingKind::WakeSweep).is_empty() {
-        lines.push(t("Waking panes stops. Panes not yet woken stay as they are.").to_string());
-    }
-    lines
+/// The panes whose close facts differ between a countdown's start and its
+/// end, and the panes added since. A pane closed meanwhile cuts nothing off.
+fn changed_panes(before: &[(Uuid, CloseFacts)], now: &[(Uuid, CloseFacts)]) -> Vec<Uuid> {
+    now.iter()
+        .filter(|(iid, facts)| {
+            before
+                .iter()
+                .find(|(was, _)| was == iid)
+                .is_none_or(|(_, was)| was != facts)
+        })
+        .map(|(iid, _)| *iid)
+        .collect()
 }
 
 impl MuxelApp {
+    /// Quit or Restart as the user asked for it: Quit, Ctrl+Q, the tray's
+    /// Quit. During a countdown it goes now; with the question showing it
+    /// answers yes; from the first-run screens it quits at once. Otherwise it
+    /// counts down or asks, over the main window.
+    pub(super) fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.exit_countdown.is_some() {
+            self.exit_now(cx);
+        } else if self.show_quit_confirm {
+            self.accept_quit_dialog(cx);
+        } else if self.show_terms || self.show_workspace_selector {
+            self.quit_from_entry_screen(cx);
+        } else {
+            self.ask_exit(ExitKind::Quit, cx);
+            // The question renders in the main window, which may be minimized
+            // (to the tray, say) or behind a pop-out: raise it so it's seen.
+            if let Some(main) = self.main_window {
+                let _ = main.update(cx, |_, window, _| window.activate_window());
+            }
+            cx.notify();
+        }
+    }
+
     /// Quit or restart after a short countdown when every pane looks idle and
     /// no input is pending, and ask otherwise. Nothing to ask while a Restart
     /// is already under way.
@@ -177,64 +153,83 @@ impl MuxelApp {
             }
             return;
         }
-        match self.quiet_exit_facts(cx) {
-            Some(facts) => self.start_exit_countdown(kind, facts, cx),
-            None => self.show_exit_dialog(kind, cx),
+        match self.exit_plan(kind, &[], cx) {
+            Ok(facts) => self.start_exit_countdown(kind, facts, cx),
+            Err(question) => self.show_exit_dialog(kind, &question, cx),
         }
     }
 
-    /// The Quit or Restart confirmation.
-    fn show_exit_dialog(&mut self, kind: ExitKind, cx: &mut Context<Self>) {
+    /// The Quit or Restart question, with `question`'s rows.
+    fn show_exit_dialog(&mut self, kind: ExitKind, question: &Question, cx: &mut Context<Self>) {
         self.quit_kill_tmux_local = false;
         self.quit_kill_tmux_remote = false;
         self.quit_confirm_kind = kind;
+        self.quit_leave = Some(question.clone());
         self.show_quit_confirm = true;
         cx.notify();
     }
 
-    /// Each terminal's close facts, if every pane would count down rather than
-    /// ask when closed, by the rule a pane close uses, and nothing else would
-    /// be cut short: no pending input, the app's or any terminal's own (such
-    /// as a preset's instructions waiting out their startup delay), launch,
-    /// editor move, open file dialog, undecided close or unsaved editor.
-    /// `None` means the exit asks.
-    fn quiet_exit_facts(&self, cx: &App) -> Option<Vec<(Uuid, CloseFacts)>> {
-        if !self.pending_inputs.pending().is_empty()
-            || self
-                .live_sessions(cx)
-                .iter()
-                .any(|(_, session)| session.pending_input_ops() != 0)
-            || !self.restart_settled()
-            || self.native_dialogs.get() > 0
-            || self
-                .close_groups
-                .iter()
-                .any(|group| !departure_finalizes(group.stage()))
-        {
-            return None;
+    /// What the countdown watches ([`leaving::countdown_facts`]), when the
+    /// exit would cut nothing off and so counts down. Otherwise the question
+    /// it asks: a row for every pane
+    /// that would ask when closed, by the rule a pane close uses, and for
+    /// whatever else it would cut short (pending input, the app's or any
+    /// terminal's own such as a preset's instructions waiting out their
+    /// startup delay, a launch, an editor move, an open file dialog, an
+    /// undecided close, an unsaved editor). `changed` names panes whose state
+    /// moved during a countdown; each gets a row too.
+    fn exit_plan(
+        &self,
+        kind: ExitKind,
+        changed: &[Uuid],
+        cx: &App,
+    ) -> Result<Vec<(Uuid, CloseFacts)>, Question> {
+        let panes: Vec<leaving::Pane> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|inst| !self.is_closing(inst.id))
+            .filter_map(|inst| self.leave_pane(inst.id, cx))
+            .collect();
+        let mut pending = self.leave_pending(cx);
+        pending.extend(changed.iter().map(|&iid| Pending::Changed(iid)));
+        let leave = match kind {
+            ExitKind::Quit => Leave::Quit,
+            ExitKind::Restart => Leave::Restart,
+        };
+        if let Some(question) = leaving::plan(leave, &panes, &pending, true) {
+            return Err(question);
         }
-        let mut facts = Vec::new();
-        for inst in &self.workspace.instances {
-            if self.is_closing(inst.id) {
-                continue;
-            }
-            if inst.kind != InstanceKind::Terminal {
-                if self
-                    .close_editor(inst.id)
-                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
-                {
-                    return None;
-                }
-                continue;
-            }
-            let pane = self.close_facts(inst.id, cx);
-            if decide(pane, true) == CloseDecision::Ask {
-                return None;
-            }
-            facts.push((inst.id, pane));
+        Ok(leaving::countdown_facts(&panes))
+    }
+
+    /// The question's Quit or Restart, by click, Enter or a second Quit.
+    pub(super) fn accept_quit_dialog(&mut self, cx: &mut Context<Self>) {
+        let kind = self.quit_confirm_kind;
+        if kind == ExitKind::Quit {
+            self.kill_checked_tmux_sessions();
         }
-        facts.sort_by_key(|(iid, _)| *iid);
-        Some(facts)
+        self.confirm_exit(kind, cx);
+    }
+
+    /// An answer to the Quit or Restart question.
+    pub(super) fn answer_quit(&mut self, answer: Answer, cx: &mut Context<Self>) {
+        match answer {
+            Answer::Confirm => self.accept_quit_dialog(cx),
+            Answer::Cancel | Answer::IdleOnly => {
+                self.show_quit_confirm = false;
+                self.quit_leave = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// An answer to the countdown.
+    pub(super) fn answer_countdown(&mut self, answer: Answer, cx: &mut Context<Self>) {
+        match answer {
+            Answer::Confirm => self.exit_now(cx),
+            Answer::Cancel | Answer::IdleOnly => self.cancel_exit_countdown(cx),
+        }
     }
 
     fn start_exit_countdown(
@@ -263,9 +258,11 @@ impl MuxelApp {
                 }
             }
         });
+        static COUNTDOWNS: AtomicU64 = AtomicU64::new(0);
         self.exit_countdown = Some(ExitCountdown {
             kind,
             left: seconds,
+            serial: COUNTDOWNS.fetch_add(1, Ordering::Relaxed),
             facts,
             task,
         });
@@ -274,7 +271,7 @@ impl MuxelApp {
 
     /// The countdown ran out. Like an Undo expiry, it checks again: if any
     /// pane's facts changed, a pane was added or removed, or input is now
-    /// pending, it asks instead.
+    /// pending, it asks instead, with a row for each pane that changed.
     fn expire_exit_countdown(&mut self, cx: &mut Context<Self>) {
         let Some(countdown) = self.exit_countdown.take() else {
             return;
@@ -282,11 +279,30 @@ impl MuxelApp {
         // This runs inside the countdown's own timer task, which ends once it
         // returns; dropping the task here would cancel the running code.
         countdown.task.detach();
-        if self.quiet_exit_facts(cx).as_ref() == Some(&countdown.facts) {
-            self.confirm_exit(countdown.kind, cx);
-        } else {
-            self.show_exit_dialog(countdown.kind, cx);
-        }
+        let kind = countdown.kind;
+        let changed = match self.exit_plan(kind, &[], cx) {
+            Ok(facts) if facts == countdown.facts => return self.confirm_exit(kind, cx),
+            Ok(facts) => changed_panes(&countdown.facts, &facts),
+            Err(question) => return self.show_exit_dialog(kind, &question, cx),
+        };
+        // Only a pane closed meanwhile: nothing to name, but it still asks.
+        let question = self
+            .exit_plan(kind, &changed, cx)
+            .err()
+            .unwrap_or_else(|| Question {
+                leave: match kind {
+                    ExitKind::Quit => Leave::Quit,
+                    ExitKind::Restart => Leave::Restart,
+                },
+                title: match kind {
+                    ExitKind::Quit => Title::Quit,
+                    ExitKind::Restart => Title::Restart,
+                },
+                rows: Vec::new(),
+                idle: None,
+                danger: false,
+            });
+        self.show_exit_dialog(kind, &question, cx);
     }
 
     /// The countdown's Cancel.
@@ -315,22 +331,6 @@ impl MuxelApp {
             ExitKind::Quit => self.confirm_quit_exit(cx),
             ExitKind::Restart => self.begin_restart(cx),
         }
-    }
-
-    /// The quit confirmation's lines for the input it would cut short.
-    pub(super) fn exit_loss_lines(&self) -> Vec<String> {
-        loss_lines(
-            &self.pending_inputs.pending(),
-            |iid| {
-                self.workspace
-                    .instance(iid)
-                    .map(|i| i.display_name().to_string())
-            },
-            |iid| {
-                self.remote_host_for_instance(iid)
-                    .map(|host| host.name.clone())
-            },
-        )
     }
 
     /// `dialog` counted as open until it answers or is dropped: a confirmed
@@ -412,7 +412,7 @@ impl MuxelApp {
     }
 
     /// Every live terminal, docked or popped out.
-    fn live_sessions(&self, cx: &App) -> Vec<(Uuid, Arc<TerminalSession>)> {
+    pub(super) fn live_sessions(&self, cx: &App) -> Vec<(Uuid, Arc<TerminalSession>)> {
         let popped = popout_terminal_views(&self.terminals, &self.popouts, PopOut::terminal_view)
             .map(|(iid, _, view)| (iid, view));
         self.terminals
@@ -632,57 +632,49 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::loss_lines;
-    use crate::app::pending_input::{PendingEntry, PendingKind};
+    use super::changed_panes;
+    use muxel_core::control::AgentState;
+    use muxel_core::recoverable_close::{CloseEvidence, CloseFacts};
     use uuid::Uuid;
 
-    fn entry(kind: PendingKind, pane: Option<Uuid>) -> PendingEntry {
-        PendingEntry { kind, pane }
+    fn facts(status: AgentState) -> CloseFacts {
+        CloseFacts {
+            status,
+            evidence: CloseEvidence::Title,
+            attributable: true,
+            awaiting_reply: false,
+            another_tmux_client: false,
+            session_may_outlive: false,
+            launch_id: None,
+            binding_rev: 0,
+            input_rev: 0,
+            completion_rev: 0,
+            shell_marks: 0,
+        }
     }
 
-    /// One line per kind, in a fixed order, naming the pane or host when there
-    /// is just one, and saying what already happened stays.
+    /// The countdown's question names the panes that changed under it and
+    /// the panes added, not the ones that stayed as they were or closed.
     #[test]
-    fn the_confirmation_names_each_kind_of_input_it_cuts_short_once() {
-        let alpha = Uuid::new_v4();
-        let beta = Uuid::new_v4();
-        let name = |iid: Uuid| (iid == alpha).then(|| "Alpha".to_string());
-        let host = |iid: Uuid| (iid == beta).then(|| "host-x".to_string());
-        assert!(loss_lines(&[], name, host).is_empty());
-        assert_eq!(
-            loss_lines(
-                &[
-                    entry(PendingKind::WakeSweep, None),
-                    entry(PendingKind::Upload, Some(beta)),
-                    entry(PendingKind::CtlSend, Some(alpha)),
-                    entry(PendingKind::Dictation, None),
-                    entry(PendingKind::CtlKeys, Some(beta)),
-                ],
-                name,
-                host,
+    fn a_countdown_names_what_changed_under_it() {
+        let [same, moved, added, closed] = [(); 4].map(|_| Uuid::new_v4());
+        let before = [
+            (same, facts(AgentState::Idle)),
+            (moved, facts(AgentState::Idle)),
+            (closed, facts(AgentState::Done)),
+        ];
+        let now = [
+            (same, facts(AgentState::Idle)),
+            (
+                moved,
+                CloseFacts {
+                    input_rev: 1,
+                    ..facts(AgentState::Idle)
+                },
             ),
-            [
-                "Alpha's ctl send won't press Enter; text already pasted stays in the pane.",
-                "A pane's remaining ctl keys won't be pressed; keys already pressed stay.",
-                "Dictation in progress will be discarded.",
-                "Files already uploaded to host-x stay there. They won't be pasted.",
-                "Waking panes stops. Panes not yet woken stay as they are.",
-            ]
-        );
-        assert_eq!(
-            loss_lines(
-                &[
-                    entry(PendingKind::CtlSend, Some(alpha)),
-                    entry(PendingKind::CtlSend, Some(beta)),
-                    entry(PendingKind::Upload, Some(alpha)),
-                ],
-                name,
-                host,
-            ),
-            [
-                "2 ctl sends won't press Enter; text already pasted stays in their panes.",
-                "Files already uploaded stay on their hosts. They won't be pasted.",
-            ]
-        );
+            (added, facts(AgentState::Done)),
+        ];
+        assert_eq!(changed_panes(&before, &now), [moved, added]);
+        assert!(changed_panes(&before, &before).is_empty());
     }
 }

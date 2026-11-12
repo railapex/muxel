@@ -81,6 +81,7 @@ mod first_prompt_size_tests;
 #[cfg(all(test, windows))]
 mod hidden_paint_tests;
 mod hotbar;
+mod leave_question;
 mod libraries_ui;
 mod pane_grid;
 #[cfg(all(test, windows))]
@@ -3664,31 +3665,7 @@ pub fn register_actions(cx: &mut App) {
             return;
         };
         if let Some(app) = weak.upgrade() {
-            app.update(cx, |this, cx| {
-                // A second Cmd+Q while the confirm modal or the countdown is
-                // up is the same as clicking its button, Quit or Restart.
-                if this.exit_countdown.is_some() {
-                    this.exit_now(cx);
-                } else if this.show_quit_confirm {
-                    let kind = this.quit_confirm_kind;
-                    if kind == departure::ExitKind::Quit {
-                        this.kill_checked_tmux_sessions();
-                    }
-                    this.confirm_exit(kind, cx);
-                } else if this.show_terms || this.show_workspace_selector {
-                    this.quit_from_entry_screen(cx);
-                } else {
-                    this.ask_exit(departure::ExitKind::Quit, cx);
-                    // The confirmation renders in the main window, which may be
-                    // minimized (to the tray, say) or behind a pop-out when this
-                    // comes from the menu bar or a pop-out's Cmd+Q — raise it so
-                    // the question is actually seen.
-                    if let Some(main) = this.main_window {
-                        let _ = main.update(cx, |_, window, _| window.activate_window());
-                    }
-                    cx.notify();
-                }
-            });
+            app.update(cx, |this, cx| this.request_quit(cx));
         }
     });
     // The macOS app menu's Hide / Hide Others / Show All (see `install_app_menu`).
@@ -6488,6 +6465,9 @@ pub struct MuxelApp {
     quit_kill_tmux_local: bool,
     /// Quit dialog: also kill muxel's REMOTE (SSH) tmux sessions.
     quit_kill_tmux_remote: bool,
+    /// The Quit question: what quitting would cut off. Its rows are drawn
+    /// from it each frame.
+    quit_leave: Option<muxel_core::leaving::Question>,
     /// Whether the keyboard-shortcut cheat-sheet overlay is shown.
     show_keys: bool,
     /// Active terminal scrollback search (None = not searching).
@@ -6883,10 +6863,13 @@ struct PopoutConfirmState {
     message: SharedString,
     confirm_label: SharedString,
     alternative_label: Option<SharedString>,
+    /// The leaving question's rows, idle choice and colour, as the pop-out
+    /// draws them: its pills as the panes are now.
+    leave: Option<leave_question::LeaveView>,
 }
 
 impl PopoutAppState {
-    fn read(app: &MuxelApp, iid: Uuid) -> Self {
+    fn read(app: &MuxelApp, iid: Uuid, cx: &App) -> Self {
         let confirm = app
             .confirm
             .as_ref()
@@ -6896,6 +6879,10 @@ impl PopoutAppState {
                 message: pending.message.clone(),
                 confirm_label: pending.confirm_label.clone(),
                 alternative_label: recoverable_close_ui::close_alternative_label(&pending.action),
+                leave: pending
+                    .leave
+                    .as_ref()
+                    .map(|question| app.leave_view(question, cx)),
             });
         Self {
             present: app.popouts.contains_key(&iid),
@@ -6919,7 +6906,7 @@ impl PopoutView {
         {
             cx.observe(&app, |this, app, cx| {
                 let app = app.read(cx);
-                let state = PopoutAppState::read(app, this.iid);
+                let state = PopoutAppState::read(app, this.iid, cx);
                 if this.app_state.as_ref() != Some(&state) {
                     this.close_confirm = app
                         .confirm
@@ -7335,6 +7322,10 @@ struct PendingConfirm {
     /// Optional label/value rows rendered in mono between the message and the
     /// buttons (host-key fingerprints); empty for plain confirms.
     details: Vec<(SharedString, SharedString)>,
+    /// A leaving question, in place of the message: a close, or a project
+    /// removal. Its rows are drawn from it each frame, so their pills follow
+    /// the panes while it shows.
+    leave: Option<muxel_core::leaving::Question>,
     action: ConfirmAction,
 }
 
@@ -7565,6 +7556,9 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.central_close_confirm_key(event, window, cx)
+            }))
             .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
                 if let Some(app) = cx
                     .try_global::<MuxelHandle>()
@@ -7573,13 +7567,19 @@ impl Render for PopoutView {
                     app.update(cx, |app, cx| app.undo_latest_close(window, cx));
                 }
             }))
+            // Tab is an action, dispatched ahead of the key listeners, so the
+            // close question's own check keeps it from the pane behind.
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
+                if let PaneView::Terminal(v) = &this.view
+                    && this.central_close_confirm(cx).is_none()
+                {
                     v.read(cx).session().write_user_input(b"\t");
                 }
             }))
             .on_action(cx.listener(|this, _: &SendBackTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
+                if let PaneView::Terminal(v) = &this.view
+                    && this.central_close_confirm(cx).is_none()
+                {
                     v.read(cx).session().write_user_input(b"\x1b[Z");
                 }
             }))
@@ -8775,6 +8775,7 @@ impl MuxelApp {
             test_doc_path: None,
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
+            quit_leave: None,
             show_keys: false,
             term_search: None,
             term_search_input,
@@ -15439,8 +15440,8 @@ impl MuxelApp {
             self.persist();
             self.add_event(
                 NotifKind::Success,
-                tf("{title}: no history", &[("title", &title)]),
-                t("Started fresh.").to_string(),
+                tf("{title}: started fresh", &[("title", &title)]),
+                t("no history").to_string(),
             );
             self.spawn_terminal(iid, window, cx);
         }
@@ -22012,6 +22013,11 @@ impl MuxelApp {
     /// open main-window-only chrome raise the main window first.
     fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el
+            // A question this window shows is modal: Enter, Esc and I answer
+            // it, and no key reaches the panes behind it.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.dialog_key(event, window, cx)
+            }))
             // While a tab/pane is dragged, this fires first (capture phase) each
             // move and clears the drop indicators; the element under the cursor
             // then sets the right one. So indicators vanish over no pane, and the
@@ -22062,10 +22068,18 @@ impl MuxelApp {
                 this.activate_main_window(window, cx);
                 this.toggle_settings(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SendTab, _w, cx| this.send_to_active(b"\t", cx)))
-            .on_action(
-                cx.listener(|this, _: &SendBackTab, _w, cx| this.send_to_active(b"\x1b[Z", cx)),
-            )
+            // Tab is an action, dispatched ahead of the key listeners, so a
+            // question showing here has to keep it from the pane itself.
+            .on_action(cx.listener(|this, _: &SendTab, w, cx| {
+                if this.question_shown(w.window_handle()).is_none() {
+                    this.send_to_active(b"\t", cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SendBackTab, w, cx| {
+                if this.question_shown(w.window_handle()).is_none() {
+                    this.send_to_active(b"\x1b[Z", cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &GlobalSearch, window, cx| {
                 this.activate_main_window(window, cx);
                 this.open_search_palette(window, cx)
@@ -22266,6 +22280,7 @@ impl MuxelApp {
                 .into_any_element()
         };
 
+        self.focus_root_for_question(root_focus, window, cx);
         let root = div()
             .size_full()
             .flex()
@@ -22710,15 +22725,45 @@ impl MuxelApp {
         action: ConfirmAction,
         cx: &mut Context<Self>,
     ) {
+        self.show_confirm(
+            PendingConfirm {
+                title: title.into(),
+                message: message.into(),
+                confirm_label: confirm_label.into(),
+                details,
+                leave: None,
+                action,
+            },
+            cx,
+        );
+    }
+
+    /// Ask a leaving question: a close or a project removal.
+    fn request_leave_confirm(
+        &mut self,
+        title: SharedString,
+        confirm_label: SharedString,
+        leave: muxel_core::leaving::Question,
+        action: ConfirmAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_confirm(
+            PendingConfirm {
+                title,
+                message: SharedString::default(),
+                confirm_label,
+                details: Vec::new(),
+                leave: Some(leave),
+                action,
+            },
+            cx,
+        );
+    }
+
+    fn show_confirm(&mut self, pending: PendingConfirm, cx: &mut Context<Self>) {
         // Nothing can accept a close prompt once another replaces it.
         self.cancel_close_prompt_answers();
-        self.confirm = Some(PendingConfirm {
-            title: title.into(),
-            message: message.into(),
-            confirm_label: confirm_label.into(),
-            details,
-            action,
-        });
+        self.confirm = Some(pending);
         if let Some(iid) = self.confirm_popout_iid()
             && let Some(popout) = self.popouts.get(&iid)
         {
@@ -25012,7 +25057,12 @@ impl MuxelApp {
                     self.select_instance(iid, window, cx);
                 }
             }
-            muxel_tray::TrayAction::Quit => self.confirm_exit(departure::ExitKind::Quit, cx),
+            // The same Quit as Ctrl+Q: it counts down, or asks when work would
+            // be cut off, in this window raised from the tray.
+            muxel_tray::TrayAction::Quit => {
+                window.activate_window();
+                self.request_quit(cx);
+            }
         }
     }
 
@@ -26141,8 +26191,7 @@ impl MuxelApp {
                                 }
                                 (None, None, Some(0)) => t("Ended"),
                                 (None, None, Some(code)) => {
-                                    tf("Ended · exit {code}", &[("code", &code.to_string())])
-                                        .into()
+                                    tf("Ended · exit {code}", &[("code", &code.to_string())]).into()
                                 }
                                 (None, None, None) => t("Ended · exit code unknown"),
                             }
@@ -29095,13 +29144,7 @@ impl MuxelApp {
                                     .on_click(window.listener_for(
                                         &entity,
                                         move |this, _, _window, cx| {
-                                            this.request_confirm(
-                                                t("Remove project?"),
-                                                t("The project and its panes will be removed."),
-                                                t("Remove"),
-                                                ConfirmAction::DeleteProject(pid),
-                                                cx,
-                                            )
+                                            this.request_remove_project(pid, cx)
                                         },
                                     )),
                             )
@@ -33386,8 +33429,8 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// "Are you sure you want to quit?" confirmation over a dimmed backdrop.
-    /// Confirmation modal for a destructive action (delete / close).
+    /// Confirmation modal for a destructive action (delete / close), or a
+    /// leaving question's rows when the action is a close or a removal.
     fn render_confirm_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(pending) = self.confirm.as_ref() else {
             return div().into_any_element();
@@ -33397,9 +33440,26 @@ impl MuxelApp {
         let confirm_label = pending.confirm_label.clone();
         let alternative = recoverable_close_ui::close_alternative_label(&pending.action);
         let details = pending.details.clone();
+        if let Some(question) = &pending.leave {
+            let leave = self.leave_view(question, cx);
+            let entity = cx.entity().downgrade();
+            return leave_question::render_leave_dialog(
+                "confirm",
+                title,
+                &leave,
+                None,
+                confirm_label,
+                move |answer, window, cx| {
+                    let _ = entity.update(cx, |this, cx| this.answer_confirm(answer, window, cx));
+                },
+                cx,
+            );
+        }
         // Fingerprint rows need width; plain confirms keep the compact card.
         let width = if details.is_empty() { 360.0 } else { 480.0 };
         let mono = cx.theme().mono_font_family.clone();
+        // Saving is the safe way forward; not saving is what loses work.
+        let saves = matches!(pending.action, ConfirmAction::SaveEditorBeforeClose { .. });
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
@@ -33454,28 +33514,32 @@ impl MuxelApp {
                                 Button::new("confirm-cancel")
                                     .ghost()
                                     .label(t("Cancel"))
+                                    .child(leave_question::key_hint("Esc"))
                                     .on_click(
                                         cx.listener(|this, _e, _w, cx| this.cancel_confirm(cx)),
                                     ),
                             )
                             .children(alternative.map(|label| {
-                                Button::new("confirm-alternative")
-                                    .ghost()
-                                    .label(label)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.run_close_alternative(cx)
-                                        }),
-                                    )
+                                let alternative = Button::new("confirm-alternative").label(label);
+                                if saves {
+                                    alternative.danger()
+                                } else {
+                                    alternative.ghost()
+                                }
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.run_close_alternative(cx)),
+                                )
                             }))
-                            .child(
-                                Button::new("confirm-ok")
-                                    .danger()
+                            .child({
+                                let ok = Button::new("confirm-ok")
                                     .label(confirm_label)
-                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                    .child(leave_question::key_hint("Enter"));
+                                if saves { ok.primary() } else { ok.danger() }.on_click(
+                                    cx.listener(|this, _e, window, cx| {
                                         this.run_confirm(window, cx)
-                                    })),
-                            ),
+                                    }),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -33607,157 +33671,89 @@ impl MuxelApp {
 
     fn render_quit_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let restart = self.quit_confirm_kind == departure::ExitKind::Restart;
-        modal_backdrop()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| {
-                    this.show_quit_confirm = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .w(px(360.0))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_5()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child(if restart {
-                        t("Restart muxel?")
-                    } else {
-                        t("Quit muxel?")
-                    }))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t("Running terminals will be closed.")),
-                    )
-                    // What the exit cuts short: one line per kind of input
-                    // still pending.
-                    .children(self.exit_loss_lines().into_iter().map(|line| {
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(line)
-                    }))
-                    // tmux-backed panes survive a quit by design; offer cleanup
-                    // per scope (local vs remote sessions). A Restart reattaches
-                    // them, so it offers none.
-                    .children({
-                        let sessions = if restart {
-                            Vec::new()
-                        } else {
-                            self.tmux_sessions()
-                        };
-                        let has_local = sessions.iter().any(|(_, _, remote)| !remote);
-                        let has_remote = sessions.iter().any(|(_, _, remote)| *remote);
-                        [
-                            has_local.then(|| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new("quit-kill-tmux-local")
-                                            .checked(self.quit_kill_tmux_local)
-                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                                                this.quit_kill_tmux_local = *c;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div().text_sm().child(t("Also kill local tmux sessions")),
-                                    )
-                            }),
-                            has_remote.then(|| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new("quit-kill-tmux-remote")
-                                            .checked(self.quit_kill_tmux_remote)
-                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                                                this.quit_kill_tmux_remote = *c;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div().text_sm().child(t("Also kill remote tmux sessions")),
-                                    )
-                            }),
-                        ]
-                        .into_iter()
-                        .flatten()
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                Button::new("quit-cancel")
-                                    .ghost()
-                                    .label(t("Cancel"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.show_quit_confirm = false;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("quit-confirm")
-                                    .danger()
-                                    .label(if restart { t("Restart") } else { t("Quit") })
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        let kind = this.quit_confirm_kind;
-                                        if kind == departure::ExitKind::Quit {
-                                            this.kill_checked_tmux_sessions();
-                                        }
-                                        this.confirm_exit(kind, cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        let leave = self
+            .quit_leave
+            .as_ref()
+            .map(|question| self.leave_view(question, cx))
+            .unwrap_or_default();
+        // tmux-backed panes survive a quit by design; offer cleanup per scope
+        // (local vs remote sessions). A Restart reattaches them, so it offers
+        // none.
+        let sessions = if restart {
+            Vec::new()
+        } else {
+            self.tmux_sessions()
+        };
+        let has_local = sessions.iter().any(|(_, _, remote)| !remote);
+        let has_remote = sessions.iter().any(|(_, _, remote)| *remote);
+        let tmux = (has_local || has_remote).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(has_local.then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Checkbox::new("quit-kill-tmux-local")
+                                .checked(self.quit_kill_tmux_local)
+                                .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                                    this.quit_kill_tmux_local = *c;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().text_sm().child(t("Also kill local tmux sessions")))
+                }))
+                .children(has_remote.then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Checkbox::new("quit-kill-tmux-remote")
+                                .checked(self.quit_kill_tmux_remote)
+                                .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                                    this.quit_kill_tmux_remote = *c;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().text_sm().child(t("Also kill remote tmux sessions")))
+                }))
+                .into_any_element()
+        });
+        let entity = cx.entity().downgrade();
+        leave_question::render_leave_dialog(
+            "quit",
+            if restart {
+                t("Restart muxel?")
+            } else {
+                t("Quit muxel?")
+            },
+            &leave,
+            tmux,
+            if restart { t("Restart") } else { t("Quit") },
+            move |answer, _, cx| {
+                let _ = entity.update(cx, |this, cx| this.answer_quit(answer, cx));
+            },
+            cx,
+        )
     }
 
-    /// A Quit or Restart counting down, with Cancel and Quit now or Restart now.
+    /// A Quit or Restart counting down, with a line for the time left, and
+    /// Cancel and Quit now or Restart now.
     fn render_exit_countdown(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let countdown = self.exit_countdown.as_ref()?;
         let restart = countdown.kind == departure::ExitKind::Restart;
         let left = countdown.left.to_string();
         let args = [("n", left.as_str())];
-        let (title, body, now) = if restart {
-            (
-                t("Restarting muxel"),
-                tn(
-                    "Every terminal is idle. Restarting in {n} second.",
-                    "Every terminal is idle. Restarting in {n} seconds.",
-                    countdown.left as usize,
-                    &args,
-                ),
-                t("Restart now"),
-            )
+        let (title, now) = if restart {
+            (tf("Restarting in {n}", &args), t("Restart now"))
         } else {
-            (
-                t("Quitting muxel"),
-                tn(
-                    "Every terminal is idle. Quitting in {n} second.",
-                    "Every terminal is idle. Quitting in {n} seconds.",
-                    countdown.left as usize,
-                    &args,
-                ),
-                t("Quit now"),
-            )
+            (tf("Quitting in {n}", &args), t("Quit now"))
         };
+        let entity = cx.entity().downgrade();
         Some(
             modal_backdrop()
                 .on_mouse_down(
@@ -33778,35 +33774,21 @@ impl MuxelApp {
                         .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
                         .child(div().text_lg().font_semibold().child(title))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(body),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .pt_2()
-                                .child(
-                                    Button::new("exit-countdown-cancel")
-                                        .ghost()
-                                        .label(t("Cancel"))
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            this.cancel_exit_countdown(cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("exit-countdown-now")
-                                        .danger()
-                                        .label(now)
-                                        .on_click(
-                                            cx.listener(|this, _e, _w, cx| this.exit_now(cx)),
-                                        ),
-                                ),
-                        ),
+                        .child(leave_question::time_line(
+                            countdown.serial,
+                            departure::EXIT_COUNTDOWN,
+                            cx,
+                        ))
+                        .child(leave_question::leave_buttons(
+                            "exit-countdown",
+                            now,
+                            None,
+                            false,
+                            move |answer, _, cx| {
+                                let _ =
+                                    entity.update(cx, |this, cx| this.answer_countdown(answer, cx));
+                            },
+                        )),
                 )
                 .into_any_element(),
         )
@@ -36659,13 +36641,7 @@ impl MuxelApp {
                             .ghost()
                             .label(t("Remove project"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.request_confirm(
-                                    t("Remove project?"),
-                                    t("The project and its panes will be removed."),
-                                    t("Remove"),
-                                    ConfirmAction::DeleteProject(pid),
-                                    cx,
-                                )
+                                this.request_remove_project(pid, cx)
                             })),
                     ),
             )
@@ -36856,6 +36832,11 @@ impl Render for MuxelApp {
                 .flex()
                 .flex_col()
                 .bg(cx.theme().background)
+                // Enter and Esc for a confirm over the selector, such as
+                // deleting a workspace.
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.dialog_key(event, window, cx)
+                }))
                 .child(self.render_minimal_titlebar(cx))
                 .child(
                     div()
@@ -37162,6 +37143,7 @@ impl Render for MuxelApp {
             body
         };
 
+        self.focus_root_for_question(&self.focus_handle, window, cx);
         let root = div()
             .size_full()
             .flex()
