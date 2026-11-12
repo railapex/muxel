@@ -546,6 +546,35 @@ impl MuxelApp {
         true
     }
 
+    /// A woken pane that draws live while it is the focused pane of the active
+    /// window has been looked at. Focus records a look only at a pane showing
+    /// something, and a woken pane is usually focused before it draws (the
+    /// one `ctl focus` put in front of someone, or one woken by Enter), so
+    /// without this its first look would wait for the user to focus it again.
+    /// A pane that draws in an inactive window gets its look once that window
+    /// is active with the pane still in front.
+    pub(super) fn record_woken_look(&mut self, cx: &App) {
+        let Some(iid) = self.active_instance else {
+            return;
+        };
+        if !self.wake_launches.contains(&iid)
+            || !self.instance_window_active(iid)
+            || !self
+                .terminals
+                .get(&iid)
+                .is_some_and(|view| view.read(cx).has_visible_content())
+        {
+            return;
+        }
+        self.wake_launches.remove(&iid);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(inst) = self.workspace.instance_mut(iid)
+            && inst.activity.attend(now)
+        {
+            self.persist();
+        }
+    }
+
     /// Wake asleep pane `iid` and show it: the Wake buttons (pane, row, row
     /// menu) and `ctl focus`. Selecting alone never starts a pane.
     pub(super) fn wake_and_show(

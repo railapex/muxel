@@ -708,6 +708,71 @@ fn a_ctl_woken_agent_sleeps_after_thirty_idle_minutes_until_someone_looks() {
 }
 
 #[test]
+fn a_pane_ctl_focus_woke_is_looked_at_once_it_draws_in_front_of_an_active_window() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (shell, _, _shell_child) = pane(cx, window, pid, "a shell", false);
+        let (agent, agent_view, _agent_child) = pane(cx, window, pid, "focused agent", true);
+        wait_ready(cx, window, &agent_view);
+        window
+            .update(cx, |app, _, cx| {
+                app.active_instance = Some(shell);
+                app.sleep_instance(agent, SleepRequest::Pane, SleepCause::Pane, cx)
+                    .expect("an idle agent sleeps by hand");
+            })
+            .unwrap();
+        wait_until(
+            cx,
+            window,
+            QUIT_POLL,
+            "the quit to finish",
+            move |app, _| !app.sleep_exits.contains_key(&agent),
+        );
+        let woken_view = window
+            .update(cx, |app, window, cx| {
+                // A script puts it in front while nobody is at the window.
+                app.window_active = false;
+                app.wake_and_show(agent, WakeCause::CtlFocus, window, cx);
+                assert_eq!(app.active_instance, Some(agent));
+                // Stand in for the launch landing, as the woken-agent test does.
+                app.terminal_launching.remove(&agent);
+                app.workspace.instance_mut(agent).unwrap().asleep_since = None;
+                app.restoring_activity.insert(agent);
+                launch_showing(app, window, cx, agent, "focused agent", "ready for work")
+            })
+            .unwrap();
+        let shown = woken_view.0.clone();
+        wait_until(
+            cx,
+            window,
+            Duration::from_millis(10),
+            "its screen to show something",
+            move |_, cx| shown.read(cx).has_visible_content(),
+        );
+        window
+            .update(cx, |app, window, cx| {
+                app.window_active = false;
+                app.tick(window, cx);
+                let activity = &app.workspace.instance(agent).unwrap().activity;
+                assert!(
+                    activity.machine_woken_unattended(),
+                    "drawn in an inactive window: nobody has looked yet"
+                );
+                // Someone comes back to the window with the pane in front.
+                app.window_active = true;
+                app.tick(window, cx);
+                let activity = &app.workspace.instance(agent).unwrap().activity;
+                assert!(
+                    !activity.machine_woken_unattended(),
+                    "drawn in front of an active window is a look"
+                );
+                assert!(activity.last_attended_at >= activity.woken_at);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
 fn its_own_sleep_takes_the_focused_agent_and_sleep_idle_agents_leaves_it() {
     with_app(|cx, window| {
         let pid = project(cx, window);
