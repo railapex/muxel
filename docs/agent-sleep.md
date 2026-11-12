@@ -100,7 +100,9 @@ same, because opening either does the same thing. Outside control still tells
 them apart (`not_running_reason`).
 
 - **Sidebar row:** one line at any sidebar width, like a running row. The name
-  is muted unless the pane holds an unread finish. The pill is outlined rather
+  is muted unless the pane holds an unread finish, and the agent icon takes the
+  saved status color dimmed the way a read finish is (bright only for an unread
+  finish), so nothing asleep reads as running. The pill is outlined rather
   than filled, so filled pills mean running panes: a moon and how long ago the
   pane last worked (`5m`, `20h`, `31d`), in its saved status color (green
   finished, amber interrupted, grey idle). Hovering the pill gives the words:

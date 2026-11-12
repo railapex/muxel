@@ -666,13 +666,11 @@ impl MuxelApp {
     /// left to running panes.
     pub(super) fn asleep_pill(&self, iid: Uuid, cx: &App) -> Tag {
         let inst = self.workspace.instance(iid);
-        let status = inst
-            .map(|inst| saved_activity_status(&inst.activity))
-            .unwrap_or(AgentStatus::Idle);
-        let (tag, color) = match status {
-            AgentStatus::Done => (Tag::success(), cx.theme().success),
-            AgentStatus::Working | AgentStatus::Blocked => (Tag::warning(), cx.theme().warning),
-            AgentStatus::Idle => (Tag::new(), cx.theme().muted_foreground),
+        let color = self.asleep_color(iid, cx);
+        let tag = match self.asleep_status(iid) {
+            AgentStatus::Done => Tag::success(),
+            AgentStatus::Working | AgentStatus::Blocked => Tag::warning(),
+            AgentStatus::Idle => Tag::new(),
         };
         let age = inst.and_then(|inst| {
             muxel_core::sleep::asleep_age(&inst.activity, chrono::Utc::now().timestamp_millis())
@@ -690,6 +688,36 @@ impl MuxelApp {
             )
             .children(age)
             .when(self.conversations_gone.contains(&iid), |tag| tag.child("∅"))
+    }
+
+    /// The status an asleep pane saved when its program stopped.
+    fn asleep_status(&self, iid: Uuid) -> AgentStatus {
+        self.workspace
+            .instance(iid)
+            .map(|inst| saved_activity_status(&inst.activity))
+            .unwrap_or(AgentStatus::Idle)
+    }
+
+    /// An asleep pane's saved status color: green finished, amber interrupted
+    /// (its turn or question ended with the program), grey idle.
+    fn asleep_color(&self, iid: Uuid, cx: &App) -> Hsla {
+        match self.asleep_status(iid) {
+            AgentStatus::Done => cx.theme().success,
+            AgentStatus::Working | AgentStatus::Blocked => cx.theme().warning,
+            AgentStatus::Idle => cx.theme().muted_foreground,
+        }
+    }
+
+    /// An asleep row's agent icon: its saved status color, dimmed the way a
+    /// read finish is, so nothing asleep reads as running. An unread finish
+    /// stays bright; idle is already the muted grey.
+    pub(super) fn asleep_icon_color(&self, iid: Uuid, finish_unread: bool, cx: &App) -> Hsla {
+        let color = self.asleep_color(iid, cx);
+        match self.asleep_status(iid) {
+            AgentStatus::Done if finish_unread => color,
+            AgentStatus::Idle => color,
+            _ => color.opacity(READ_DONE_OPACITY),
+        }
     }
 
     /// What waking an asleep pane whose conversation is gone does.
