@@ -3519,6 +3519,13 @@ impl TerminalSession {
         self.turn_submitted.load(Ordering::Relaxed)
     }
 
+    /// When the latest submission into this terminal went in: a person's
+    /// Enter, or a prompt muxel submitted. What it submitted (a prompt, a
+    /// `/clear`, a menu pick) isn't known.
+    pub fn last_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().last_submission_at()
+    }
+
     /// Conversation observed before this launch's first submitted turn. None
     /// means no turn was submitted or its recipient was unknown. A later
     /// identity or submission never establishes or transfers that ownership.

@@ -106,8 +106,51 @@ fn send(agent: Uuid, text: &str, once: Option<&str>, when_idle: bool, force: boo
         session_id: None,
         once: once.map(str::to_owned),
         when_idle,
+        detach: false,
         timeout_secs: None,
     }
+}
+
+/// A person presses Enter on the pane's draft, through the key path's
+/// gated write.
+fn submit_draft(session: &TerminalSession) {
+    session.write_user_submission(b"\r", muxel_terminal::Submission::Turn);
+}
+
+/// `command`, a send, detached (`--when-idle --detach`).
+fn detached(mut command: Command) -> Command {
+    if let Command::Send {
+        when_idle, detach, ..
+    } = &mut command
+    {
+        (*when_idle, *detach) = (true, true);
+    }
+    command
+}
+
+/// `once-status KEY` for `pane`.
+fn once_status(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+    key: &str,
+) -> serde_json::Value {
+    let answer = window
+        .update(cx, |app, _, cx| {
+            app.control_command(
+                Command::OnceStatus {
+                    agent: pane.to_string(),
+                    key: key.into(),
+                },
+                None,
+                cx,
+            )
+        })
+        .unwrap();
+    let Answer::Now(Ok(status)) = answer else {
+        panic!("once-status answers at once");
+    };
+    status
 }
 
 /// `command`, a send, pinned to conversation `sid` (`--session-id`).
@@ -627,6 +670,266 @@ fn a_waiting_send_whose_caller_left_types_nothing() {
                 assert_eq!(app.control_once.status(pane, "d-2")["state"], "unused");
             })
             .unwrap();
+        session.kill();
+    });
+}
+
+/// Wire rings a doorbell and goes. muxel answers `queued` at once, keeps the
+/// send although nobody waits on the connection, holds it behind a draft,
+/// and types it once the draft is submitted and the pane is idle again. Its
+/// key reports each step.
+#[test]
+fn a_detached_send_answers_at_once_and_types_after_the_draft() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach");
+        session.write_input(b"half typed");
+        let asked_at = super::now_ms();
+        let doorbell = || detached(send(pane, "echo rung", Some("d-20"), true, false));
+        let (answer, cancelled) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(), cx))
+            .unwrap();
+        cx.run_until_parked();
+        let queued = answer
+            .try_recv()
+            .expect("a detached send answers before it types")
+            .into_result()
+            .unwrap();
+        assert_eq!(queued["queued"], true);
+        assert_eq!(queued["once"], "d-20");
+        assert_eq!(queued["uuid"], pane.to_string());
+        // A day from now, by default.
+        let expires_at = queued["expires_at"].as_i64().unwrap();
+        let day = i64::try_from(ctl::DETACHED_TIMEOUT_SECS * 1000).unwrap();
+        assert!((asked_at + day..asked_at + day + 60_000).contains(&expires_at));
+        // The caller hangs up: the connection marks that, and the reply
+        // channel goes with it.
+        cancelled.store(true, Ordering::Release);
+        drop(answer);
+        let status = once_status(cx, window, pane, "d-20");
+        assert_eq!(status["state"], "queued", "{status}");
+        // A fresh shell can still read as working; the draft holds it after.
+        let waiting_on = status["waiting_on"].as_str().unwrap_or_default();
+        assert!(
+            ["working", "draft_present"].contains(&waiting_on),
+            "{status}"
+        );
+        assert_eq!(status["expires_at"], expires_at);
+        // A retry of a lost reply gets the same one.
+        let (retry, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(), cx))
+            .unwrap();
+        let retry = reply(cx, &retry).into_result().unwrap();
+        assert_eq!(retry["queued"], true);
+        assert_eq!(retry["duplicate"], true);
+        // The person submits the draft; once the pane is idle the send types.
+        submit_draft(&session);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            let status = once_status(cx, window, pane, "d-20");
+            if status["state"] != "queued" {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the detached send never typed");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let status = if status["state"] == "typing" {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let status = once_status(cx, window, pane, "d-20");
+                if status["state"] != "typing" {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the detached send never finished"
+                );
+                cx.executor().advance_clock(Duration::from_millis(100));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            status
+        };
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["result"]["ok"], true);
+        assert_eq!(status["result"]["result"]["sent"], true);
+        session.kill();
+    });
+}
+
+/// A detached doorbell rings one conversation. When the pane moves to
+/// another, the doorbell is dropped having typed nothing, its key says why,
+/// and the key can ring the new conversation.
+#[test]
+fn a_detached_send_is_dropped_when_its_conversation_changes() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-conversation");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        session.write_input(b"half typed");
+        let before = session.input_rev();
+        let doorbell = |sid| {
+            pinned(
+                detached(send(pane, "echo rung", Some("d-21"), true, false)),
+                sid,
+            )
+        };
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(CONVERSATION_A), cx))
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        adopt_conversation(cx, window, pane, CONVERSATION_B);
+        window
+            .update(cx, |app, _, cx| app.pump_control_queue(cx))
+            .unwrap();
+        let status = once_status(cx, window, pane, "d-21");
+        assert_eq!(status["state"], "dropped", "{status}");
+        assert_eq!(status["result"]["code"], "launch_mismatch");
+        assert_eq!(status["result"]["reason"], "conversation_changed");
+        assert_eq!(session.input_rev(), before, "A's doorbell typed into B");
+        // Nothing typed, so the key rings again.
+        let (again, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(CONVERSATION_B), cx))
+            .unwrap();
+        let again = reply(cx, &again).into_result().unwrap();
+        assert_eq!(again["queued"], true);
+        assert!(again.get("duplicate").is_none(), "{again}");
+        session.kill();
+    });
+}
+
+/// The draft a doorbell waits behind is `/clear`, and the person submits it.
+/// The pane reads idle with no draft at once, and `/clear` starts no turn,
+/// but muxel hears of the new conversation only a moment later. The
+/// doorbell waits for a turn to show, so muxel's next reading drops it
+/// instead of letting it type into the new conversation.
+#[test]
+fn a_waiting_send_behind_a_submitted_clear_types_nothing_into_the_new_conversation() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-clear");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        session.write_input(b"/clear");
+        let doorbell = pinned(
+            detached(send(pane, "echo rung", Some("d-24"), true, false)),
+            CONVERSATION_A,
+        );
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell, cx))
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        // One update: the Enter, then the queue, before any status tick.
+        let (submitted, waiting) = window
+            .update(cx, |app, _, cx| {
+                submit_draft(&session);
+                let submitted = session.input_rev();
+                app.pump_control_queue(cx);
+                (submitted, app.once_status(pane, "d-24"))
+            })
+            .unwrap();
+        assert_eq!(waiting["state"], "queued", "{waiting}");
+        assert_eq!(waiting["waiting_on"], "just_submitted");
+        assert_eq!(session.input_rev(), submitted, "the doorbell typed");
+        // muxel adopts the conversation /clear started.
+        adopt_conversation(cx, window, pane, CONVERSATION_B);
+        window
+            .update(cx, |app, _, cx| app.pump_control_queue(cx))
+            .unwrap();
+        let status = once_status(cx, window, pane, "d-24");
+        assert_eq!(status["state"], "dropped", "{status}");
+        assert_eq!(status["result"]["reason"], "conversation_changed");
+        assert_eq!(session.input_rev(), submitted, "A's doorbell typed into B");
+        session.kill();
+    });
+}
+
+/// Wire's hook withdraws a doorbell whose mail it has already delivered. A
+/// withdrawn send never types, and a cancel with nothing to withdraw is an
+/// answer, not an error, so the hook can fire it without asking first.
+#[test]
+fn once_cancel_withdraws_a_waiting_detached_send() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-cancel");
+        session.write_input(b"half typed");
+        let (queued, _) = window
+            .update(cx, |app, _, cx| {
+                ask(
+                    app,
+                    detached(send(pane, "echo rung", Some("d-22"), true, false)),
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        let cancel = |cx: &mut TestAppContext, key: &str| {
+            let answer = window
+                .update(cx, |app, _, cx| {
+                    app.control_command(
+                        Command::OnceCancel {
+                            agent: pane.to_string(),
+                            key: key.into(),
+                        },
+                        None,
+                        cx,
+                    )
+                })
+                .unwrap();
+            let Answer::Now(Ok(answer)) = answer else {
+                panic!("once-cancel answers at once, without an error");
+            };
+            answer
+        };
+        let withdrawn = cancel(cx, "d-22");
+        assert_eq!(withdrawn["cancelled"], true, "{withdrawn}");
+        assert_eq!(withdrawn["state"], "dropped");
+        assert_eq!(withdrawn["result"]["code"], "cancelled");
+        window
+            .update(cx, |app, _, _| assert!(app.control_queue.is_empty()))
+            .unwrap();
+        let again = cancel(cx, "d-22");
+        assert_eq!(again["cancelled"], false);
+        assert_eq!(again["state"], "dropped");
+        let unused = cancel(cx, "d-none");
+        assert_eq!(unused["cancelled"], false);
+        assert_eq!(unused["state"], "unused");
+        // The pane frees up, and nothing types.
+        submit_draft(&session);
+        let submitted = session.input_rev();
+        for _ in 0..30 {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+        assert_eq!(session.input_rev(), submitted, "a withdrawn send typed");
+        session.kill();
+    });
+}
+
+/// The eight-per-muxel cap keeps connections for interactive calls; a
+/// detached send holds none, so a full queue of attached sends doesn't
+/// refuse it.
+#[test]
+fn detached_sends_dont_count_toward_the_waiting_cap() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-cap");
+        session.write_input(b"half typed");
+        let answers = window
+            .update(cx, |app, _, cx| {
+                for _ in 0..super::safe_send::MAX_QUEUED_SENDS {
+                    app.queue_attached_send_for_test(Uuid::new_v4());
+                }
+                let attached = ask(app, send(pane, "echo attached", None, true, false), cx);
+                let detached = ask(
+                    app,
+                    detached(send(pane, "echo rung", Some("d-23"), true, false)),
+                    cx,
+                );
+                (attached.0, detached.0)
+            })
+            .unwrap();
+        let full = reply(cx, &answers.0).into_result().unwrap_err();
+        assert_eq!(full.reason.as_deref(), Some("queue_full"));
+        let queued = reply(cx, &answers.1).into_result().unwrap();
+        assert_eq!(queued["queued"], true, "{queued}");
         session.kill();
     });
 }

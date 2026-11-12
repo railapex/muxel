@@ -63,11 +63,13 @@ pub struct Incoming {
 }
 
 /// How long a connection waits for the app to answer `command`. A `send
-/// --when-idle` first waits for its pane, then has the usual time to send.
+/// --when-idle` first waits for its pane, then has the usual time to send; a
+/// detached one is answered once it is queued.
 fn reply_timeout(command: &Command) -> Duration {
     match command {
         Command::Send {
             when_idle: true,
+            detach: false,
             timeout_secs,
             ..
         } => {
@@ -267,10 +269,12 @@ fn dispatch_on(
     if let Err(error) = control::check_safe_send(&request.command) {
         return Response::err(error);
     }
+    // A detached send outlives its connection, so nothing watches it.
     let queued = matches!(
         &request.command,
         Command::Send {
             when_idle: true,
+            detach: false,
             ..
         }
     );
@@ -394,6 +398,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             session_id,
             once,
             when_idle,
+            detach,
             timeout_secs,
         }) if text == "-" => {
             let mut text = String::new();
@@ -406,6 +411,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     session_id,
                     once,
                     when_idle,
+                    detach,
                     timeout_secs,
                 }),
                 Ok(_) => {
@@ -1616,6 +1622,7 @@ mod tests {
             session_id: None,
             once: None,
             when_idle: false,
+            detach: false,
             timeout_secs: None,
         };
         let refused = request_at(&path, send()).unwrap_err();
@@ -1653,6 +1660,7 @@ mod tests {
             session_id: None,
             once: Some("d-9f2a".into()),
             when_idle: true,
+            detach: false,
             timeout_secs: Some(30),
         };
         let request = control::Request {
@@ -1681,6 +1689,8 @@ mod tests {
 
     /// The caller's read and the connection's wait both outlast the time a
     /// `send --when-idle` may wait, so a send that waited long is never lost.
+    /// A detached send is answered once queued, so its caller waits as long
+    /// as for any other request.
     #[test]
     fn a_waiting_send_has_its_wait_on_top_of_the_reply_window() {
         let send = |when_idle, timeout_secs| Command::Send {
@@ -1691,8 +1701,14 @@ mod tests {
             session_id: None,
             once: None,
             when_idle,
+            detach: false,
             timeout_secs,
         };
+        let mut detached = send(true, Some(control::DETACHED_TIMEOUT_SECS));
+        if let Command::Send { once, detach, .. } = &mut detached {
+            (*once, *detach) = (Some("d-1".into()), true);
+        }
+        assert_eq!(reply_timeout(&detached), super::REPLY_TIMEOUT);
         assert_eq!(reply_timeout(&send(false, None)), super::REPLY_TIMEOUT);
         assert_eq!(
             reply_timeout(&send(true, None)),
@@ -1709,12 +1725,23 @@ mod tests {
     #[test]
     fn the_host_refuses_bad_once_and_when_idle_options_before_the_app() {
         let (tx, rx) = async_channel::unbounded();
-        for (once, when_idle, force, timeout_secs) in [
-            (Some(String::new()), false, false, None),
-            (Some("k".repeat(129)), false, false, None),
-            (None, false, false, Some(5)),
-            (None, true, false, Some(0)),
-            (None, true, true, None),
+        let key = || Some("k".to_owned());
+        for (once, when_idle, detach, force, timeout_secs) in [
+            (Some(String::new()), false, false, false, None),
+            (Some("k".repeat(129)), false, false, false, None),
+            (None, false, false, false, Some(5)),
+            (None, true, false, false, Some(0)),
+            (None, true, false, true, None),
+            // Only a waiting send with a key to report it by detaches.
+            (key(), false, true, false, None),
+            (None, true, true, false, None),
+            (
+                key(),
+                true,
+                true,
+                false,
+                Some(control::DETACHED_TIMEOUT_SECS + 1),
+            ),
         ] {
             let command = Command::Send {
                 agent: "a".into(),
@@ -1724,6 +1751,7 @@ mod tests {
                 session_id: None,
                 once,
                 when_idle,
+                detach,
                 timeout_secs,
             };
             let request = control::Request {
@@ -1859,6 +1887,7 @@ mod tests {
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             },
             Command::Send {
@@ -1869,11 +1898,27 @@ mod tests {
                 session_id: None,
                 once: Some("d-9f2a".into()),
                 when_idle: true,
+                detach: false,
                 timeout_secs: None,
             },
             Command::OnceStatus {
                 agent: "a".into(),
                 key: "d-9f2a".into(),
+            },
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                session_id: None,
+                once: Some("d-9f2b".into()),
+                when_idle: true,
+                detach: true,
+                timeout_secs: None,
+            },
+            Command::OnceCancel {
+                agent: "a".into(),
+                key: "d-9f2b".into(),
             },
             Command::New {
                 project: "repo".into(),
@@ -1899,7 +1944,11 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 // Every one of them needs more than a v1 host can honor.
                 let version = request["version"].as_u64().unwrap();
-                let expected = if request["command"]["cmd"] == "once_status"
+                let expected = if request["command"]["cmd"] == "once_cancel"
+                    || request["command"]["detach"] == true
+                {
+                    6
+                } else if request["command"]["cmd"] == "once_status"
                     || request["command"]["once"].is_string()
                 {
                     4

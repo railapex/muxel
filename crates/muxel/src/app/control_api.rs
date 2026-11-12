@@ -1254,6 +1254,7 @@ impl MuxelApp {
                 session_id,
                 once,
                 when_idle,
+                detach,
                 timeout_secs,
             } => {
                 let iid = match self.control_resolve(&agent) {
@@ -1264,7 +1265,7 @@ impl MuxelApp {
                 // checked: it types nothing, and its caller needs the first
                 // result whatever the pane is doing now.
                 if let Some(key) = once.as_deref()
-                    && let Some(repeat) = self.control_once.reserve(iid, key)
+                    && let Some(repeat) = self.control_once.reserve(iid, key, detach)
                 {
                     return Answer::Now(repeat);
                 }
@@ -1278,6 +1279,7 @@ impl MuxelApp {
                                 launch_id,
                                 session_id,
                                 once: once.clone(),
+                                detach,
                                 timeout_secs,
                             }));
                         }
@@ -1293,12 +1295,17 @@ impl MuxelApp {
                     Answer::Now(Err(error))
                 })
             }
-            Command::OnceStatus { agent, key } => {
+            Command::OnceStatus { agent, key } => Answer::Now(
+                self.control_resolve(&agent)
+                    .map(|iid| self.once_status(iid, &key)),
+            ),
+            // Not a send that can be withdrawn is an answer, not an error, so
+            // a caller can fire it without asking first.
+            Command::OnceCancel { agent, key } => {
                 Answer::Now(self.control_resolve(&agent).map(|iid| {
-                    let mut status = self.control_once.status(iid, &key);
-                    status["agent"] = json!(ctl::short_id(iid));
-                    status["uuid"] = json!(iid);
-                    status["key"] = json!(key);
+                    let cancelled = self.withdraw_detached_send(iid, &key);
+                    let mut status = self.once_status(iid, &key);
+                    status["cancelled"] = json!(cancelled);
                     status
                 }))
             }
@@ -2209,12 +2216,15 @@ impl MuxelApp {
                 // This is the same UI update as local keyboard input and PTY
                 // draining. Re-read after the asynchronous tmux claim settle.
                 let admission = self.control_send_admission(iid, force, cx);
-                // A waiting send whose caller has gone types nothing. Past
-                // the paste it finishes, and its `--once` key keeps the result.
+                // A waiting send whose caller has gone, or a detached one
+                // `once-cancel` withdrew, types nothing. Past the paste it
+                // finishes, and its `--once` key keeps the result.
                 if cancelled.is_some_and(|gone| gone.load(Ordering::Acquire)) {
-                    return Task::ready(Err(
-                        "the caller disconnected before the queued send was typed".into(),
-                    ));
+                    return Task::ready(Err(ctl::Error::new(
+                        ErrorCode::Cancelled,
+                        "the send was withdrawn before it typed: its caller disconnected, or \
+                         once-cancel withdrew it",
+                    )));
                 }
                 let attempt = self
                     .terminal_view(iid)
