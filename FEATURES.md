@@ -759,7 +759,20 @@ feature is added or changed, update the matching entry here in the same change**
   or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy. Cleanup requires current attributable evidence from the launch and
+  copy. A loop whose agent starts through a deferred launch (Claude's launch
+  check) is tracked from the moment it fires and adopts only the terminal that
+  launch installs; if the pane is relaunched first or the launch starts
+  nothing, the run ends without closing anything. A launch that fails and
+  leaves a fallback shell showing the error holds the loop until the runtime
+  cap, so a missing program can't open a pane at every fire. A run finishes
+  once the agent has been seen working after the loop's prompt (checked every
+  second) and is idle again, so a short turn closes an Exit pane at the next
+  loop check and later scheduled runs can fire. Working already under way when
+  the prompt goes in, such as an agent still starting up, doesn't count until
+  it stops. A terminal whose work shows only as output is checked at each loop
+  check rather than every second, since a command can print and then run
+  silently. A turn shorter than about a second, or one that runs inside
+  startup's working, can go unseen and then waits for the cap. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which
@@ -1517,7 +1530,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
-  tab, if there is one.
+  tab, if there is one. While it's on screen, docked or popped out, it refreshes
+  every 1.5 s and keeps your scroll position. A pane hidden behind another tab,
+  another view or a maximized pane runs no git, and refreshes as soon as it's
+  shown. The ↻ button, reopening and popping out never wait on git.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
