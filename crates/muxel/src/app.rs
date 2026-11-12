@@ -12878,6 +12878,18 @@ impl MuxelApp {
         self.select_project_with_attendance(pid, true, window, cx);
     }
 
+    /// Creation will select its new pane. Switch to the project without
+    /// attending the pane it last showed, so that pane's notification and
+    /// unseen finish wait for the user.
+    fn select_project_for_new_pane(
+        &mut self,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_project_with_attendance(pid, false, window, cx);
+    }
+
     fn select_project_with_attendance(
         &mut self,
         pid: Uuid,
@@ -15939,7 +15951,7 @@ impl MuxelApp {
             return;
         };
         if self.window_showing(pid).is_none() {
-            self.select_project(pid, window, cx);
+            self.select_project_for_new_pane(pid, window, cx);
         }
         let placement = self.new_agent_placement();
         self.place_with_preset_in(pid, self.active_instance, placement, preset_idx, window, cx);
