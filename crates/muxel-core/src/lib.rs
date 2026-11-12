@@ -124,6 +124,12 @@ pub struct AgentActivity {
     pub blocked_at: Option<i64>,
     #[serde(default)]
     pub last_attended_at: Option<i64>,
+    /// When the pane was last woken from sleep or dormancy (opened, pinned or
+    /// `ctl wake`). It counts toward idle time only, so every wake gets the
+    /// whole automatic-sleep threshold, across restarts too, without marking
+    /// a completion read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_at: Option<i64>,
     /// Latest lifecycle state, independent from whether its notification was read.
     /// Older workspaces infer it from their existing transition timestamps.
     #[serde(default)]
@@ -149,10 +155,13 @@ impl AgentActivity {
             .max()
     }
 
-    /// Latest work transition or deliberate attendance, in Unix milliseconds:
-    /// how long ago anyone, agent or user, last did anything in the pane.
+    /// Latest work transition, deliberate attendance or wake, in Unix
+    /// milliseconds: how long ago anyone, agent or user, last did anything in
+    /// the pane.
     pub fn last_active_at(&self) -> Option<i64> {
-        self.last_work_at().max(self.last_attended_at)
+        self.last_work_at()
+            .max(self.last_attended_at)
+            .max(self.woken_at)
     }
 
     pub fn current_state(&self) -> Option<AgentActivityState> {
