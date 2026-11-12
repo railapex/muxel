@@ -2600,10 +2600,15 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
+        self.mark_turn_submitted_at(SystemTime::now());
+    }
+
+    /// [`Self::mark_turn_submitted`] at a given time. Cast replay stamps a
+    /// recorded Enter with the cast's clock, as it stamps reads.
+    pub(crate) fn mark_turn_submitted_at(&self, submitted_at: SystemTime) {
         if !self.accepts_input_epoch(self.input_epoch()) {
             return;
         }
-        let submitted_at = SystemTime::now();
         self.evidence.lock().record_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);

@@ -340,6 +340,19 @@ impl Replay {
         self.reconcile(now);
     }
 
+    /// What was typed, written as a pane's keyboard writes it: an Enter on its
+    /// own announces a turn first, stamped with the cast's clock. The bytes
+    /// land in the replay writer.
+    fn input(&mut self, t: u64, bytes: &[u8]) {
+        let (now, wall) = self.at(t);
+        self.run_due(now);
+        if super::is_submission_input(bytes) {
+            self.session.mark_turn_submitted_at(wall);
+        }
+        self.session.write_input(bytes);
+        self.reconcile(now);
+    }
+
     fn exit(&mut self, t: u64, code: Option<i32>) {
         let (now, _) = self.at(t);
         self.run_due(now);
@@ -603,6 +616,7 @@ fn replay(cast: &Cast) -> Vec<MarkRead> {
     for (t, kind, payload) in &cast.events {
         match kind.as_str() {
             "out" => replay.read(*t, &decode_bytes(payload)),
+            "in" => replay.input(*t, &decode_bytes(payload)),
             // The session settles a resize on the real clock, so replay would
             // only set a target the grid never reaches. Refuse rather than
             // replay a different screen.
@@ -619,7 +633,7 @@ fn replay(cast: &Cast) -> Vec<MarkRead> {
                     rows,
                 });
             }
-            // Input, replies, focus and hooks don't touch the grid in replay.
+            // Replies, focus and hooks don't touch the grid in replay.
             _ => {}
         }
     }
