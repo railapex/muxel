@@ -22112,7 +22112,7 @@ impl MuxelApp {
         self.add_event(
             NotifKind::Error,
             tf("Workspace “{name}” was deleted", &[("name", &name)]),
-            t("Another muxel window deleted it, so it can't be opened.").to_string(),
+            t("Another muxel window deleted it.").to_string(),
         );
     }
 
@@ -33864,7 +33864,7 @@ impl MuxelApp {
                         .on_click(
                             cx.listener(|this, c: &bool, _w, cx| this.set_rescue_enabled(*c, cx)),
                         ),
-                    &t("Keep unsent prompts and unsaved editor changes through a crash, a restart or an accidental close"),
+                    &t("Keep unsent prompts and unsaved editor changes"),
                 ),
             )
             .child(

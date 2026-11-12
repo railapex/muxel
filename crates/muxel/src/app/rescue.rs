@@ -143,7 +143,7 @@ impl MuxelApp {
                 }
                 Err(e) => self.add_event(
                     NotifKind::Error,
-                    t("Couldn't delete all saved unsent text"),
+                    t("Couldn't delete every saved unsent prompt"),
                     format!("{e:#}"),
                 ),
             }
@@ -404,8 +404,7 @@ impl MuxelApp {
             self.add_event(
                 NotifKind::Success,
                 t("Unsent prompt copied"),
-                t("This pane would send a multi-line paste, so it's on the clipboard instead.")
-                    .to_string(),
+                t("This pane would send a multi-line paste.").to_string(),
             );
         } else {
             let box_shown = self
@@ -415,8 +414,7 @@ impl MuxelApp {
                 self.add_event(
                     NotifKind::Error,
                     t("Couldn't restore the unsent prompt"),
-                    t("The pane's input box isn't on screen, so the prompt is still offered.")
-                        .to_string(),
+                    t("The pane's input box isn't on screen.").to_string(),
                 );
                 cx.notify();
                 return;
@@ -847,11 +845,12 @@ impl MuxelApp {
         Some(row.child(list).into_any_element())
     }
 
-    /// The crash notice's text.
+    /// The crash notice's text: `Unclean exit · 1 unsent prompt · Working at
+    /// last save: Claude 2`.
     pub(super) fn crash_label(notice: &CrashNotice) -> String {
-        let mut kept = Vec::new();
+        let mut parts = vec![t("Unclean exit").to_string()];
         if notice.drafts > 0 {
-            kept.push(tn(
+            parts.push(tn(
                 "{n} unsent prompt",
                 "{n} unsent prompts",
                 notice.drafts,
@@ -859,30 +858,21 @@ impl MuxelApp {
             ));
         }
         if notice.editors > 0 {
-            kept.push(tn(
+            parts.push(tn(
                 "{n} editor's unsaved changes",
                 "{n} editors' unsaved changes",
                 notice.editors,
                 &[("n", &notice.editors.to_string())],
             ));
         }
-        let mut label = t("muxel didn't close cleanly.").to_string();
-        if !kept.is_empty() {
-            label.push(' ');
-            label.push_str(&tf(
-                "Kept {what}; each pane offers its own.",
-                &[("what", &kept.join(", "))],
-            ));
-        }
         if !notice.mid_turn.is_empty() {
-            label.push(' ');
             // The workspace's last save, not the moment it stopped.
-            label.push_str(&tf(
-                "Working when muxel last saved: {names}.",
+            parts.push(tf(
+                "Working at last save: {names}",
                 &[("names", &notice.mid_turn.join(", "))],
             ));
         }
-        label
+        parts.join(" · ")
     }
 
     fn render_crash_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1100,11 +1090,7 @@ impl MuxelApp {
                     })),
             );
         }
-        strip = strip.child(list).child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Kept until you discard them.")),
-        );
+        strip = strip.child(list);
         Some(strip.into_any_element())
     }
 }
