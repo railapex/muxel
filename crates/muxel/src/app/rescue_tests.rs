@@ -1232,10 +1232,10 @@ fn after_an_unclean_exit_one_notice_says_what_was_kept_and_who_was_mid_turn() {
                     CrashNotice {
                         drafts: 1,
                         editors: 0,
-                        mid_turn: vec!["Claude 2".into()],
+                        mid_turn: vec![agent_id],
                     }
                 );
-                let label = MuxelApp::crash_label(&notice);
+                let label = app.crash_label(&notice);
                 assert!(label.contains("1 unsent prompt"), "{label}");
                 assert!(label.contains("Claude 2"), "{label}");
 

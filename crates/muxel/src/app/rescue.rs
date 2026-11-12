@@ -54,9 +54,10 @@ pub(super) struct CrashNotice {
     pub(super) drafts: usize,
     /// Editors whose unsaved changes were kept.
     pub(super) editors: usize,
-    /// Agents the workspace's last save recorded as working. That save can
-    /// be older than the crash, so this is what was last known, not checked.
-    pub(super) mid_turn: Vec<String>,
+    /// Panes whose agent the workspace's last save recorded as working. That
+    /// save can be older than the crash, so this is what was last known, not
+    /// checked.
+    pub(super) mid_turn: Vec<Uuid>,
 }
 
 pub(super) use crate::editor::rescue_time;
@@ -519,14 +520,14 @@ impl MuxelApp {
             .filter(|_| self.settings.rescue_unsent_text)
             .map(|dir| dir.counts())
             .unwrap_or_default();
-        let mid_turn: Vec<String> = loaded
+        let mid_turn: Vec<Uuid> = loaded
             .map(|ws| {
                 ws.instances
                     .iter()
                     .filter(|i| {
                         i.activity.current_state() == Some(muxel_core::AgentActivityState::Working)
                     })
-                    .map(|i| i.display_name().to_string())
+                    .map(|i| i.id)
                     .collect()
             })
             .unwrap_or_default();
@@ -846,8 +847,8 @@ impl MuxelApp {
     }
 
     /// The crash notice's text: `Unclean exit · 1 unsent prompt · Working at
-    /// last save: Claude 2`.
-    pub(super) fn crash_label(notice: &CrashNotice) -> String {
+    /// last save: Claude 2`, naming the mid-turn panes still in the workspace.
+    pub(super) fn crash_label(&self, notice: &CrashNotice) -> String {
         let mut parts = vec![t("Unclean exit").to_string()];
         if notice.drafts > 0 {
             parts.push(tn(
@@ -865,11 +866,17 @@ impl MuxelApp {
                 &[("n", &notice.editors.to_string())],
             ));
         }
-        if !notice.mid_turn.is_empty() {
+        let names: Vec<&str> = notice
+            .mid_turn
+            .iter()
+            .filter_map(|&iid| self.workspace.instance(iid))
+            .map(|instance| instance.display_name())
+            .collect();
+        if !names.is_empty() {
             // The workspace's last save, not the moment it stopped.
             parts.push(tf(
                 "Working at last save: {names}",
-                &[("names", &notice.mid_turn.join(", "))],
+                &[("names", &names.join(", "))],
             ));
         }
         parts.join(" · ")
@@ -883,7 +890,7 @@ impl MuxelApp {
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .child(div().child(Self::crash_label(notice)))
+                .child(div().child(self.crash_label(notice)))
                 .child(
                     Button::new("rescue-crash-dismiss")
                         .ghost()
