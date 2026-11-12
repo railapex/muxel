@@ -2,24 +2,60 @@
 //! once, and waiting in muxel for a moment it is safe to type it.
 //!
 //! Both are for automation that can't watch the pane, such as a mail doorbell.
-//! Neither is durable: the keys and the waiting sends live in this process.
+//! With `--detach` nobody waits on the connection either: muxel answers
+//! `queued` and keeps the send, and `once-status` reports how it went.
+//! None of it is durable: the keys and the waiting sends live in this process.
 
 use super::*;
 use std::collections::VecDeque;
 
 /// `--once` keys each pane keeps, newest last.
 const ONCE_KEYS_PER_PANE: usize = 64;
-/// `send --when-idle` calls one muxel holds at once. Each holds one of the
-/// control server's connections, and interactive `ctl` calls need the rest.
+/// Attached `send --when-idle` calls one muxel holds at once. Each holds one
+/// of the control server's connections, and interactive `ctl` calls need the
+/// rest. Detached sends hold none, and are bounded by one per pane.
 pub(super) const MAX_QUEUED_SENDS: usize = 8;
 
 #[derive(Clone, Debug)]
 enum OnceState {
     /// The send with this key is still running. `typing` once it may have
     /// typed: its paste has been written.
-    Pending { typing: bool },
+    Pending {
+        typing: bool,
+        detached: Option<Detached>,
+    },
     /// The send typed and ended with this reply.
     Done(CtlResult<Value>),
+    /// A detached send ended with this refusal without typing. The key is
+    /// free again; this only answers `once-status` until it is reused.
+    Dropped(ctl::Error),
+}
+
+/// What a detached send's key keeps while the send runs.
+#[derive(Clone, Debug)]
+struct Detached {
+    /// The `queued` reply, which a repeat gets again.
+    receipt: Value,
+    /// Set by `once-cancel`: the send refuses before its paste.
+    withdraw: Arc<AtomicBool>,
+}
+
+impl Detached {
+    fn withdrawn(&self) -> bool {
+        self.withdraw.load(Ordering::Acquire)
+    }
+}
+
+/// The refusal a withdrawn send ends with.
+pub(super) fn withdrawn_error(detached: bool) -> ctl::Error {
+    ctl::Error::new(
+        ErrorCode::Cancelled,
+        if detached {
+            "once-cancel withdrew the send before it typed"
+        } else {
+            "the caller disconnected before the queued send was typed"
+        },
+    )
 }
 
 /// Each pane's recent `--once` keys. A key is used once the send that carries
@@ -32,32 +68,53 @@ pub(in crate::app) struct OnceKeys {
 impl OnceKeys {
     /// Take `key` for a new send to `pane`, or the answer a repeat gets:
     /// the first receipt with `duplicate: true`, `duplicate` with the first
-    /// failure, or `busy` while the first is still running.
-    pub(super) fn reserve(&mut self, pane: Uuid, key: &str) -> Option<CtlResult<Value>> {
+    /// failure, or `busy` while the first is still running. A `detached`
+    /// repeat of a detached send still running gets its `queued` reply again,
+    /// so a caller whose reply was lost can simply ask again.
+    pub(super) fn reserve(
+        &mut self,
+        pane: Uuid,
+        key: &str,
+        detached: bool,
+    ) -> Option<CtlResult<Value>> {
         let keys = self.by_pane.entry(pane).or_default();
-        if let Some((_, state)) = keys.iter().find(|(held, _)| held == key) {
-            return Some(match state {
-                OnceState::Pending { typing } => {
+        if let Some(at) = keys.iter().position(|(held, _)| held == key) {
+            let repeat = match &keys[at].1 {
+                // A dropped send typed nothing: the key starts a new one.
+                OnceState::Dropped(_) => None,
+                OnceState::Pending {
+                    detached: Some(first),
+                    ..
+                } if detached && !first.withdrawn() => {
+                    let mut repeat = first.receipt.clone();
+                    repeat["duplicate"] = json!(true);
+                    Some(Ok(repeat))
+                }
+                OnceState::Pending { typing, .. } => {
                     let busy = ctl::Error::new(
                         ErrorCode::Busy,
                         "the first send with this --once key hasn't finished: ask again later, \
                          or read it with `once-status`",
                     )
                     .with_reason("once_pending");
-                    Err(if *typing { busy.after_paste() } else { busy })
+                    Some(Err(if *typing { busy.after_paste() } else { busy }))
                 }
                 OnceState::Done(Ok(receipt)) => {
                     let mut repeat = receipt.clone();
                     repeat["duplicate"] = json!(true);
-                    Ok(repeat)
+                    Some(Ok(repeat))
                 }
-                OnceState::Done(Err(first)) => Err(ctl::Error::duplicate_of(first)),
-            });
+                OnceState::Done(Err(first)) => Some(Err(ctl::Error::duplicate_of(first))),
+            };
+            if repeat.is_some() {
+                return repeat;
+            }
+            keys.remove(at);
         }
         if keys.len() >= ONCE_KEYS_PER_PANE {
             let Some(oldest) = keys
                 .iter()
-                .position(|(_, state)| matches!(state, OnceState::Done(_)))
+                .position(|(_, state)| matches!(state, OnceState::Done(_) | OnceState::Dropped(_)))
             else {
                 return Some(Err(ctl::Error::new(
                     ErrorCode::Busy,
@@ -67,21 +124,56 @@ impl OnceKeys {
             };
             keys.remove(oldest);
         }
-        keys.push_back((key.to_owned(), OnceState::Pending { typing: false }));
+        keys.push_back((
+            key.to_owned(),
+            OnceState::Pending {
+                typing: false,
+                detached: None,
+            },
+        ));
         None
+    }
+
+    /// The send holding `key` was queued detached: `receipt` is its `queued`
+    /// reply, and `withdraw` what `once-cancel` sets.
+    pub(super) fn detach(
+        &mut self,
+        pane: Uuid,
+        key: &str,
+        receipt: Value,
+        withdraw: Arc<AtomicBool>,
+    ) {
+        if let Some(OnceState::Pending { detached, .. }) = self.state_mut(pane, key) {
+            *detached = Some(Detached { receipt, withdraw });
+        }
+    }
+
+    /// `once-cancel` for a detached send that has left the queue: it refuses
+    /// before its paste, as long as it hasn't written one. Whether it was
+    /// withdrawn.
+    pub(super) fn withdraw(&mut self, pane: Uuid, key: &str) -> bool {
+        match self.state_mut(pane, key) {
+            Some(OnceState::Pending {
+                typing: false,
+                detached: Some(detached),
+            }) => {
+                detached.withdraw.store(true, Ordering::Release);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The send holding `key` has written its paste.
     pub(super) fn typing(&mut self, pane: Uuid, key: &str) {
-        if let Some(state) = self.state_mut(pane, key)
-            && let OnceState::Pending { typing } = state
-        {
+        if let Some(OnceState::Pending { typing, .. }) = self.state_mut(pane, key) {
             *typing = true;
         }
     }
 
     /// The send holding `key` ended with `result`. One that typed nothing
-    /// gives the key back.
+    /// gives the key back; a detached one also leaves its refusal for
+    /// `once-status`, since nobody received it.
     pub(super) fn finish(&mut self, pane: Uuid, key: &str, result: &CtlResult<Value>) {
         let typed = match result {
             Ok(_) => true,
@@ -96,10 +188,19 @@ impl OnceKeys {
         else {
             return;
         };
-        if typed {
-            keys[at].1 = OnceState::Done(result.clone());
-        } else {
-            keys.remove(at);
+        let detached = matches!(
+            keys[at].1,
+            OnceState::Pending {
+                detached: Some(_),
+                ..
+            }
+        );
+        match result {
+            _ if typed => keys[at].1 = OnceState::Done(result.clone()),
+            Err(error) if detached => keys[at].1 = OnceState::Dropped(error.clone()),
+            _ => {
+                keys.remove(at);
+            }
         }
     }
 
@@ -110,10 +211,26 @@ impl OnceKeys {
             .get(&pane)
             .and_then(|keys| keys.iter().find(|(held, _)| held == key))
             .map(|(_, state)| state);
+        let dropped = |error: &ctl::Error| json!({ "state": "dropped", "result": ctl::Response::err(error.clone()) });
         match state {
             None => json!({ "state": "unused" }),
-            Some(OnceState::Pending { typing: false }) => json!({ "state": "pending" }),
-            Some(OnceState::Pending { typing: true }) => json!({ "state": "typing" }),
+            Some(OnceState::Pending {
+                typing: false,
+                detached: None,
+            }) => json!({ "state": "pending" }),
+            // Withdrawn, it can no longer type: it only has to finish.
+            Some(OnceState::Pending {
+                typing: false,
+                detached: Some(detached),
+            }) if detached.withdrawn() => dropped(&withdrawn_error(true)),
+            Some(OnceState::Pending {
+                typing: false,
+                detached: Some(detached),
+            }) => json!({
+                "state": "queued",
+                "expires_at": detached.receipt["expires_at"],
+            }),
+            Some(OnceState::Pending { typing: true, .. }) => json!({ "state": "typing" }),
             Some(OnceState::Done(result)) => json!({
                 "state": "done",
                 "result": match result {
@@ -121,6 +238,7 @@ impl OnceKeys {
                     Err(error) => ctl::Response::err(error.clone()),
                 },
             }),
+            Some(OnceState::Dropped(error)) => dropped(error),
         }
     }
 
@@ -154,6 +272,9 @@ pub(in crate::app) struct QueuedSend {
     /// `conversation` is the caller's `--session-id`, which must hold to the
     /// paste or not type at all.
     pinned: bool,
+    /// `--detach`: its caller already has the `queued` reply, so `reply`
+    /// reaches nobody and `cancelled` is set only by `once-cancel`.
+    detached: bool,
     queued_at: Instant,
     deadline: Instant,
     /// What it is waiting on, for its `timed_out` reason.
@@ -194,7 +315,7 @@ struct PaneFacts {
 /// take this prompt at all; otherwise send.
 fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
     if facts.cancelled {
-        return Verdict::Refuse("the caller disconnected before the queued send was typed".into());
+        return Verdict::Refuse(withdrawn_error(queued.detached));
     }
     if facts.expired {
         return Verdict::Refuse(
@@ -247,6 +368,7 @@ pub(in crate::app) struct QueueRequest {
     pub(super) launch_id: Option<Uuid>,
     pub(super) session_id: Option<String>,
     pub(super) once: Option<String>,
+    pub(super) detach: bool,
     pub(super) timeout_secs: Option<u64>,
 }
 
@@ -265,6 +387,7 @@ impl MuxelApp {
             launch_id,
             session_id,
             once,
+            detach,
             timeout_secs,
         } = request;
         let refuse = |app: &mut Self, error: ctl::Error| {
@@ -286,7 +409,8 @@ impl MuxelApp {
                 .with_reason("queued"),
             );
         }
-        if self.control_queue.len() >= MAX_QUEUED_SENDS {
+        let attached = self.control_queue.values().filter(|q| !q.detached).count();
+        if !detach && attached >= MAX_QUEUED_SENDS {
             return refuse(
                 self,
                 ctl::Error::new(
@@ -327,9 +451,35 @@ impl MuxelApp {
             Err(error) => return refuse(self, error),
         };
         let queued_at = Instant::now();
-        let wait = Duration::from_secs(timeout_secs.unwrap_or(ctl::WHEN_IDLE_TIMEOUT_SECS));
+        let wait = Duration::from_secs(timeout_secs.unwrap_or(if detach {
+            ctl::DETACHED_TIMEOUT_SECS
+        } else {
+            ctl::WHEN_IDLE_TIMEOUT_SECS
+        }));
         let pinned = session_id.is_some();
         let conversation = session_id.or_else(|| current.into_id());
+        // A detached send is answered now, before it can type, and outlives
+        // its connection: only `once-cancel` withdraws it, and its outcome
+        // goes to its key.
+        let (reply, cancelled) = match once.as_deref().filter(|_| detach) {
+            Some(key) => {
+                let withdraw = Arc::new(AtomicBool::new(false));
+                let expires_at =
+                    now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
+                let receipt = json!({
+                    "queued": true,
+                    "agent": ctl::short_id(iid),
+                    "uuid": iid,
+                    "once": key,
+                    "expires_at": expires_at,
+                });
+                self.control_once
+                    .detach(iid, key, receipt.clone(), withdraw.clone());
+                let _ = reply.send(ctl::Response::ok(receipt));
+                (std::sync::mpsc::channel().0, withdraw)
+            }
+            None => (reply, cancelled),
+        };
         self.control_queue.insert(
             iid,
             QueuedSend {
@@ -338,6 +488,7 @@ impl MuxelApp {
                 launch,
                 conversation,
                 pinned,
+                detached: detach,
                 queued_at,
                 deadline: queued_at + wait,
                 waiting_on: "working",
@@ -348,6 +499,41 @@ impl MuxelApp {
             },
         );
         self.pump_control_queue(cx);
+    }
+
+    /// `once-cancel`: withdraw the detached send holding `key` on `pane`
+    /// before it types. Whether it was withdrawn: a send already typing or
+    /// finished, an attached one, or no send at all, isn't.
+    pub(super) fn withdraw_detached_send(&mut self, pane: Uuid, key: &str) -> bool {
+        let waiting = self
+            .control_queue
+            .get(&pane)
+            .is_some_and(|queued| queued.detached && queued.once.as_deref() == Some(key));
+        if waiting && let Some(queued) = self.control_queue.remove(&pane) {
+            queued.cancelled.store(true, Ordering::Release);
+            self.finish_queued_send(pane, queued, Err(withdrawn_error(true)));
+            return true;
+        }
+        // Out of the queue but not yet typing: its claim is being checked,
+        // and its paste will refuse.
+        self.control_once.withdraw(pane, key)
+    }
+
+    /// `once-status` for `key` on `pane`, with what a queued send waits on.
+    pub(super) fn once_status(&self, pane: Uuid, key: &str) -> Value {
+        let mut status = self.control_once.status(pane, key);
+        if status["state"] == "queued"
+            && let Some(queued) = self
+                .control_queue
+                .get(&pane)
+                .filter(|queued| queued.once.as_deref() == Some(key))
+        {
+            status["waiting_on"] = json!(queued.waiting_on);
+        }
+        status["agent"] = json!(ctl::short_id(pane));
+        status["uuid"] = json!(pane);
+        status["key"] = json!(key);
+        status
     }
 
     fn queued_send_facts(&self, iid: Uuid, queued: &QueuedSend, cx: &App) -> PaneFacts {
@@ -496,6 +682,31 @@ impl MuxelApp {
         });
     }
 
+    /// An attached waiting send to `pane`, which needn't exist, holding a
+    /// place under the cap until the next pump refuses it.
+    #[cfg(all(test, windows))]
+    pub(super) fn queue_attached_send_for_test(&mut self, pane: Uuid) {
+        let now = Instant::now();
+        self.control_queue.insert(
+            pane,
+            QueuedSend {
+                text: "waiting".into(),
+                once: None,
+                launch: None,
+                conversation: None,
+                pinned: false,
+                detached: false,
+                queued_at: now,
+                deadline: now + Duration::from_secs(600),
+                waiting_on: "working",
+                reply: std::sync::mpsc::channel().0,
+                cancelled: Arc::default(),
+                checking_clients: false,
+                clients_seen: None,
+            },
+        );
+    }
+
     /// A workspace switch ends every waiting send: its pane is gone.
     pub(in crate::app) fn refuse_control_queue(&mut self) {
         for (iid, queued) in std::mem::take(&mut self.control_queue) {
@@ -523,16 +734,16 @@ mod tests {
     #[test]
     fn a_repeat_after_a_submitted_send_returns_its_receipt_and_types_nothing() {
         let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
-        assert!(keys.reserve(pane, "d-9f2a").is_none());
+        assert!(keys.reserve(pane, "d-9f2a", false).is_none());
         keys.typing(pane, "d-9f2a");
         let receipt = json!({"sent": true, "pasted": true, "outcome": "submitted"});
         keys.finish(pane, "d-9f2a", &Ok(receipt));
-        let repeat = keys.reserve(pane, "d-9f2a").unwrap().unwrap();
+        let repeat = keys.reserve(pane, "d-9f2a", false).unwrap().unwrap();
         assert_eq!(repeat["duplicate"], true);
         assert_eq!(repeat["outcome"], "submitted");
         // Another pane, or another key, is a new send.
-        assert!(keys.reserve(Uuid::new_v4(), "d-9f2a").is_none());
-        assert!(keys.reserve(pane, "d-0000").is_none());
+        assert!(keys.reserve(Uuid::new_v4(), "d-9f2a", false).is_none());
+        assert!(keys.reserve(pane, "d-0000", false).is_none());
     }
 
     #[test]
@@ -544,7 +755,7 @@ mod tests {
             ctl::Error::new(ErrorCode::TmuxRefused, "tmux said no"),
             ctl::Error::from("the caller disconnected"),
         ] {
-            assert!(keys.reserve(pane, "d-1").is_none());
+            assert!(keys.reserve(pane, "d-1", false).is_none());
             keys.finish(pane, "d-1", &Err(refusal));
             assert_eq!(keys.status(pane, "d-1"), json!({"state": "unused"}));
         }
@@ -553,11 +764,11 @@ mod tests {
     #[test]
     fn a_repeat_after_enter_was_withheld_is_a_duplicate_that_says_it_typed() {
         let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
-        keys.reserve(pane, "d-2");
+        keys.reserve(pane, "d-2", false);
         keys.typing(pane, "d-2");
         let withheld = ctl::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste();
         keys.finish(pane, "d-2", &Err(withheld));
-        let repeat = keys.reserve(pane, "d-2").unwrap().unwrap_err();
+        let repeat = keys.reserve(pane, "d-2", false).unwrap().unwrap_err();
         assert_eq!(repeat.code, Some(ErrorCode::Duplicate));
         assert_eq!(repeat.pasted, Some(true));
         let body = serde_json::to_value(ctl::Response::err(repeat)).unwrap();
@@ -568,34 +779,112 @@ mod tests {
     #[test]
     fn a_repeat_while_the_first_runs_is_busy_and_says_once_it_typed() {
         let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
-        keys.reserve(pane, "d-3");
-        let waiting = keys.reserve(pane, "d-3").unwrap().unwrap_err();
+        keys.reserve(pane, "d-3", false);
+        let waiting = keys.reserve(pane, "d-3", false).unwrap().unwrap_err();
         assert_eq!(waiting.code, Some(ErrorCode::Busy));
         assert_eq!(waiting.reason.as_deref(), Some("once_pending"));
         assert_eq!(waiting.pasted, None);
         keys.typing(pane, "d-3");
         assert_eq!(
-            keys.reserve(pane, "d-3").unwrap().unwrap_err().pasted,
+            keys.reserve(pane, "d-3", false)
+                .unwrap()
+                .unwrap_err()
+                .pasted,
             Some(true)
         );
         assert_eq!(keys.status(pane, "d-3"), json!({"state": "typing"}));
+    }
+
+    /// A detached send's caller has gone, so its key is how it learns what
+    /// happened: queued while it waits, and the refusal once it is dropped.
+    /// A retry of a lost `queued` reply gets that reply again; a dropped send
+    /// typed nothing, so its key starts a new one.
+    #[test]
+    fn a_detached_send_is_queued_until_its_key_records_it_dropped() {
+        let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
+        assert!(keys.reserve(pane, "d-4", true).is_none());
+        let receipt = json!({"queued": true, "once": "d-4", "expires_at": 86_400_000});
+        keys.detach(pane, "d-4", receipt, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            keys.status(pane, "d-4"),
+            json!({"state": "queued", "expires_at": 86_400_000})
+        );
+        let retry = keys.reserve(pane, "d-4", true).unwrap().unwrap();
+        assert_eq!(retry["queued"], true);
+        assert_eq!(retry["duplicate"], true);
+        // A caller waiting on the connection can't be told "queued".
+        let attached = keys.reserve(pane, "d-4", false).unwrap().unwrap_err();
+        assert_eq!(attached.reason.as_deref(), Some("once_pending"));
+        let changed = ctl::Error::new(ErrorCode::LaunchMismatch, "another conversation")
+            .with_reason("conversation_changed");
+        keys.finish(pane, "d-4", &Err(changed));
+        let status = keys.status(pane, "d-4");
+        assert_eq!(status["state"], "dropped");
+        assert_eq!(status["result"]["code"], "launch_mismatch");
+        assert_eq!(status["result"]["reason"], "conversation_changed");
+        assert!(keys.reserve(pane, "d-4", true).is_none());
+        assert_eq!(keys.status(pane, "d-4"), json!({"state": "pending"}));
+    }
+
+    /// Once a detached send has typed, it is done like any other.
+    #[test]
+    fn a_detached_send_that_typed_is_done() {
+        let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
+        keys.reserve(pane, "d-5", true);
+        let queued = json!({"queued": true, "once": "d-5"});
+        keys.detach(pane, "d-5", queued, Arc::new(AtomicBool::new(false)));
+        keys.typing(pane, "d-5");
+        assert_eq!(keys.status(pane, "d-5"), json!({"state": "typing"}));
+        assert_eq!(
+            keys.reserve(pane, "d-5", true).unwrap().unwrap()["queued"],
+            true
+        );
+        let typed = json!({"sent": true, "outcome": "submitted"});
+        keys.finish(pane, "d-5", &Ok(typed));
+        assert_eq!(keys.status(pane, "d-5")["state"], "done");
+        let repeat = keys.reserve(pane, "d-5", true).unwrap().unwrap();
+        assert_eq!(repeat["outcome"], "submitted");
+        assert_eq!(repeat["duplicate"], true);
+    }
+
+    /// `once-cancel` withdraws a detached send only before it has typed, and
+    /// never an attached one, whose caller withdraws it by hanging up.
+    #[test]
+    fn only_a_detached_send_that_hasnt_typed_can_be_withdrawn() {
+        let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
+        assert!(!keys.withdraw(pane, "d-6"), "an unused key");
+        keys.reserve(pane, "d-6", false);
+        assert!(!keys.withdraw(pane, "d-6"), "an attached send");
+        let withdraw = Arc::new(AtomicBool::new(false));
+        keys.reserve(pane, "d-7", true);
+        keys.detach(pane, "d-7", json!({"queued": true}), withdraw.clone());
+        assert!(keys.withdraw(pane, "d-7"));
+        assert!(withdraw.load(std::sync::atomic::Ordering::Acquire));
+        // It can no longer type, so it reads as dropped while it finishes.
+        let status = keys.status(pane, "d-7");
+        assert_eq!(status["state"], "dropped");
+        assert_eq!(status["result"]["code"], "cancelled");
+        keys.reserve(pane, "d-8", true);
+        keys.detach(pane, "d-8", json!({"queued": true}), Arc::default());
+        keys.typing(pane, "d-8");
+        assert!(!keys.withdraw(pane, "d-8"), "a send that typed");
     }
 
     #[test]
     fn each_pane_keeps_its_last_64_finished_keys_and_every_running_one() {
         let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
         for i in 0..64 {
-            keys.reserve(pane, &format!("k{i}"));
+            keys.reserve(pane, &format!("k{i}"), false);
             keys.finish(pane, &format!("k{i}"), &Ok(json!({"sent": true})));
         }
-        keys.reserve(pane, "k64");
+        keys.reserve(pane, "k64", false);
         assert_eq!(keys.status(pane, "k0"), json!({"state": "unused"}));
         assert_eq!(keys.status(pane, "k1")["state"], "done");
         let mut running = OnceKeys::default();
         for i in 0..64 {
-            assert!(running.reserve(pane, &format!("r{i}")).is_none());
+            assert!(running.reserve(pane, &format!("r{i}"), false).is_none());
         }
-        let full = running.reserve(pane, "r64").unwrap().unwrap_err();
+        let full = running.reserve(pane, "r64", false).unwrap().unwrap_err();
         assert_eq!(full.code, Some(ErrorCode::Busy));
         assert_eq!(running.status(pane, "r0"), json!({"state": "pending"}));
     }
@@ -608,6 +897,7 @@ mod tests {
             launch,
             conversation: conversation.map(str::to_owned),
             pinned: false,
+            detached: false,
             queued_at: now,
             deadline: now + Duration::from_secs(600),
             waiting_on: "draft_present",
@@ -691,6 +981,7 @@ mod tests {
             cancelled: true,
             ..ready(launch)
         });
+        assert_eq!(gone.code, Some(ErrorCode::Cancelled));
         assert_eq!(gone.pasted, None);
         let exited = refused(PaneFacts {
             writable: Err(ctl::Error::new(ErrorCode::Exited, "exited")),

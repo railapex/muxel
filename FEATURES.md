@@ -1181,6 +1181,19 @@ feature is added or changed, update the matching entry here in the same change**
   `conversation_unconfirmed` (a waiting send waits it out). Nothing is typed.
   An agent behind tmux refuses the pin with `parameter_unsupported`, `reason:
   tmux_delivery`, since its paste waits in tmux's queue after the last check.
+- **Detached sends** — `send --when-idle --detach --once KEY` answers
+  `queued` at once and muxel keeps the send with nobody connected, so a mail
+  doorbell needs no process of its own. It waits and types exactly as
+  `--when-idle` does: at the next turn end, never into a working turn or a
+  question, behind a draft until it is submitted or cleared, with its
+  conversation and launch checked throughout and again before the paste. It
+  waits a day by default (`--timeout` up to 86400 seconds) and doesn't count
+  toward the eight attached waiting sends. `once-status` reports it `queued`
+  (with what it waits on), `typing`, `done`, or `dropped` with the refusal
+  that ended it untyped (conversation change, replaced or stopped agent,
+  timeout), which frees the key. `ctl once-cancel AGENT KEY` withdraws one
+  that hasn't typed. Detached sends live in memory: closing the pane or
+  quitting muxel drops them.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`

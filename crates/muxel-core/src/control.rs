@@ -60,33 +60,47 @@ pub const SAFE_SEND_VERSION: u32 = 4;
 /// `send --session-id` must be refused by hosts that would ignore it and type
 /// into whatever conversation the pane has moved on to.
 pub const PINNED_SEND_VERSION: u32 = 5;
+/// `send --detach` and `once-cancel` must be refused by hosts that would
+/// ignore `--detach` and hold the caller's connection for the whole wait.
+pub const DETACHED_SEND_VERSION: u32 = 6;
 /// The newest version this host accepts, which `status` and `panes` report as
 /// `protocol` so a client can learn it without sending anything.
-pub const NEWEST_VERSION: u32 = PINNED_SEND_VERSION;
+pub const NEWEST_VERSION: u32 = DETACHED_SEND_VERSION;
 /// How long `send --when-idle` waits for a safe moment by default, and at most.
 pub const WHEN_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const WHEN_IDLE_TIMEOUT_MAX_SECS: u64 = 3600;
+/// How long a `send --when-idle --detach` waits by default, and at most: a
+/// day, which outlasts an overnight turn or a draft left overnight. Past that
+/// a doorbell's news is stale, and a pane misread as working mustn't hold its
+/// queue place and `--once` key for good.
+pub const DETACHED_TIMEOUT_SECS: u64 = 86_400;
 
 /// A `--once` key: 1–128 bytes, not blank, no control characters.
 pub fn valid_once_key(key: &str) -> bool {
     !key.trim().is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
 }
 
-/// The checks a `send` carrying `--once`, `--when-idle`, `--timeout` or
-/// `--session-id` must pass before it reaches the app. The CLI applies them
-/// too; a raw client gets them here, from the host.
+/// The checks a `send` carrying `--once`, `--when-idle`, `--detach`,
+/// `--timeout` or `--session-id` must pass before it reaches the app. The CLI
+/// applies them too; a raw client gets them here, from the host.
 pub fn check_safe_send(command: &Command) -> Result<(), String> {
     let Command::Send {
         force,
         session_id,
         once,
         when_idle,
+        detach,
         timeout_secs,
         ..
     } = command
     else {
         return Ok(());
     };
+    // Nobody waits for a detached send's reply: `once-status KEY` is the only
+    // way to learn how it went.
+    if *detach && (!when_idle || once.is_none()) {
+        return Err("--detach requires --when-idle and --once KEY".into());
+    }
     if once.as_deref().is_some_and(|key| !valid_once_key(key)) {
         return Err("--once KEY must be 1-128 bytes without control characters".into());
     }
@@ -97,10 +111,19 @@ pub fn check_safe_send(command: &Command) -> Result<(), String> {
     if timeout_secs.is_some() && !when_idle {
         return Err("send --timeout requires --when-idle".into());
     }
-    if timeout_secs.is_some_and(|secs| secs == 0 || secs > WHEN_IDLE_TIMEOUT_MAX_SECS) {
-        return Err(format!(
-            "send --timeout must be 1-{WHEN_IDLE_TIMEOUT_MAX_SECS} seconds"
-        ));
+    let max = if *detach {
+        DETACHED_TIMEOUT_SECS
+    } else {
+        WHEN_IDLE_TIMEOUT_MAX_SECS
+    };
+    if timeout_secs.is_some_and(|secs| secs == 0 || secs > max) {
+        return Err(if *detach {
+            format!("send --detach --timeout must be 1-{max} seconds")
+        } else {
+            format!(
+                "send --timeout must be 1-{max} seconds (up to {DETACHED_TIMEOUT_SECS} with --detach)"
+            )
+        });
     }
     if *when_idle && *force {
         return Err("--when-idle waits for the checks --force skips: pass one or the other".into());
@@ -214,12 +237,18 @@ pub enum Command {
         /// Wait in muxel until the pane is safe to type into, then send.
         #[serde(default, skip_serializing_if = "is_false")]
         when_idle: bool,
+        /// With `when_idle` and `once`: answer `queued` at once and keep the
+        /// send in muxel with nobody waiting for it; `once-status` reports it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        detach: bool,
         /// How long `when_idle` waits, in seconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
     },
     /// What became of a `send --once KEY` to this agent, without typing.
     OnceStatus { agent: String, key: String },
+    /// Withdraw a detached `send --once KEY` that hasn't typed yet.
+    OnceCancel { agent: String, key: String },
     /// Pick a numbered option of the question the agent is blocked on.
     Answer {
         agent: String,
@@ -244,6 +273,12 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(
+        command,
+        Command::Send { detach: true, .. } | Command::OnceCancel { .. }
+    ) {
+        return DETACHED_SEND_VERSION;
+    }
     if matches!(
         command,
         Command::Send {
@@ -447,6 +482,9 @@ pub enum ErrorCode {
     /// `send --when-idle` saw no safe moment before its timeout. `reason` names
     /// what it was still waiting on. Nothing was typed.
     TimedOut,
+    /// A waiting send was withdrawn before it typed: `once-cancel` withdrew a
+    /// detached one, or an attached one's caller disconnected.
+    Cancelled,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
     /// off, its `control.json` can't be read or reached, or a read-only creation
     /// status cannot be answered.
@@ -1533,13 +1571,15 @@ usage: muxel ctl <command> [args]
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY]
-       [--when-idle [--timeout SECS]]
+       [--when-idle [--detach] [--timeout SECS]]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal;
                                  --session-id refuses another conversation;
                                  --once never types the same KEY twice;
-                                 --when-idle waits until the agent can take it
+                                 --when-idle waits until the agent can take it;
+                                 --detach answers at once and muxel keeps it
   once-status AGENT KEY          what became of a send --once KEY
+  once-cancel AGENT KEY          withdraw a detached send that hasn't typed
   wait AGENT [--timeout SECS] [--full] [--turn]
                                  wait for the agent to finish, then show it;
                                  --turn stops at an observable turn end, even
@@ -1615,10 +1655,13 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--detach] [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed. --detach (with --when-idle and --once KEY) answers queued at once and muxel keeps the send with nobody waiting (a day by default, --timeout up to 86400); read its outcome with once-status."
         }
         "once-status" => {
-            "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, typing, or done with the first reply as result."
+            "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, queued (a detached send waiting), typing, done with the first reply as result, or dropped (a detached send that ended without typing, its refusal as result)."
+        }
+        "once-cancel" => {
+            "usage: muxel ctl once-cancel AGENT KEY\nWithdraw a detached `send --once KEY` to AGENT that hasn't typed yet: it then never types, and once-status reports it dropped with code cancelled."
         }
         "wait" => {
             "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
@@ -1651,6 +1694,7 @@ fn unknown_command_error(command: &str) -> String {
             "screen",
             "send",
             "once-status",
+            "once-cancel",
             "wait",
             "answer",
             "keys",
@@ -1732,6 +1776,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let mut session_id: Option<String> = None;
     let mut once: Option<String> = None;
     let mut when_idle = false;
+    let mut detach = false;
     let mut lines: Option<usize> = None;
     let mut timeout: Option<u64> = None;
     let mut it = rest.iter();
@@ -1745,6 +1790,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             "--turn" => turn = true,
             "--force" => force = true,
             "--when-idle" => when_idle = true,
+            "--detach" => detach = true,
             "--once" => {
                 let key = it.next().ok_or("--once needs a KEY")?;
                 if once.replace(key.clone()).is_some() {
@@ -1775,8 +1821,8 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     if session_id.is_some() && cmd != "send" {
         return Err("--session-id is only valid with send".into());
     }
-    if (once.is_some() || when_idle) && cmd != "send" {
-        return Err("--once and --when-idle are only valid with send".into());
+    if (once.is_some() || when_idle || detach) && cmd != "send" {
+        return Err("--once, --when-idle and --detach are only valid with send".into());
     }
     let agent = |words: &[String]| -> Result<String, String> {
         words
@@ -1836,22 +1882,27 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 session_id,
                 once,
                 when_idle,
+                detach,
                 timeout_secs: timeout,
             };
             check_safe_send(&send)?;
             send
         }
-        "once-status" => {
+        "once-status" | "once-cancel" => {
             at_most(2)?;
             let agent = agent(&words)?;
             let key = words
                 .get(1)
                 .cloned()
-                .ok_or("`once-status` needs the KEY a `send --once` used")?;
+                .ok_or_else(|| format!("`{cmd}` needs the KEY a `send --once` used"))?;
             if !valid_once_key(&key) {
                 return Err("--once KEY must be 1-128 bytes without control characters".into());
             }
-            Command::OnceStatus { agent, key }
+            if cmd == "once-status" {
+                Command::OnceStatus { agent, key }
+            } else {
+                Command::OnceCancel { agent, key }
+            }
         }
         "answer" => {
             at_most(2)?;
@@ -2229,11 +2280,35 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   queue_full`). Closing the connection cancels a waiting send before it types;
   once typing starts the send finishes, and its `--once` key records the result.
   `--when-idle` and `--force` don't combine. These options need protocol v4.
+  `--detach` (with `--when-idle` and `--once KEY`) lets the caller go: muxel
+  checks the send as above, answers at once with `{"queued": true, "agent",
+  "uuid", "once", "expires_at"}` (Unix milliseconds), and keeps it with nobody
+  waiting. It waits and types exactly as `--when-idle` does: at a turn end,
+  never into a working turn or a question, held by a draft until it clears or
+  its turn ends, its conversation and launch checked throughout and again just
+  before the paste. It waits a day by default, `--timeout SECS` up to 86400.
+  Read its outcome with `once-status KEY`; a repeat while it waits or types
+  returns the same reply with `duplicate: true`. Anything that ends it untyped
+  (a conversation change, the agent replaced, exiting, closing or put to
+  sleep, the timeout, a workspace switch) leaves it `dropped` with that
+  refusal. A closed pane takes its sends with it, and muxel exiting drops
+  them all: after a restart `once-status` answers `unused`. Detached sends
+  don't count toward the eight per muxel, but still take their pane's one
+  place. A pane that isn't running refuses it: wake it first. It needs
+  protocol v6.
 - `muxel ctl once-status AGENT KEY` - what became of `send --once KEY` to the
   agent, typing nothing: `state` is `unused` (no send with it typed, so it can
-  be sent), `pending` (waiting or about to type), `typing` (it may have typed
-  and hasn't finished), or `done`, with `result` holding its first reply
-  exactly as `send` gave it. Use it to settle a send whose reply was lost.
+  be sent), `pending` (waiting or about to type), `queued` (a detached send
+  waiting, with `waiting_on` while it waits for the pane and its
+  `expires_at`), `typing` (it may have typed and hasn't finished), `done`, with
+  `result` holding its first reply exactly as `send` gave it, or `dropped` (a
+  detached send that ended without typing; `result` holds its refusal, and the
+  key can be sent again). Use it to settle a send whose reply was lost.
+- `muxel ctl once-cancel AGENT KEY` - withdraw a detached send that hasn't
+  typed: `{"cancelled": true}`, after which it never types and `once-status`
+  reports `dropped` with code `cancelled`. One already typing or finished,
+  or an attached send, answers `{"cancelled": false}` with its `once-status`
+  `state` (and `result`). Protocol v6.
 - `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
   turn and any subagent hold have finished (or it blocks on a question, or exits),
   then print what `show` prints. Shell and monitor listings do not delay completion;
@@ -2365,6 +2440,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   holds that failure. Nothing was typed now; inspect `screen`.
 - `timed_out` - `send --when-idle` saw no safe moment in time; `reason` says
   what it waited on. Nothing was typed.
+- `cancelled` - a waiting send was withdrawn before it typed: `once-cancel`
+  withdrew a detached one (its `once-status` result). Nothing was typed.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
@@ -2549,6 +2626,7 @@ mod tests {
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             }
         );
@@ -2677,6 +2755,7 @@ mod tests {
             (ErrorCode::Busy, "busy"),
             (ErrorCode::Duplicate, "duplicate"),
             (ErrorCode::TimedOut, "timed_out"),
+            (ErrorCode::Cancelled, "cancelled"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
         ] {
@@ -2699,6 +2778,7 @@ mod tests {
             session_id: None,
             once: None,
             when_idle: false,
+            detach: false,
             timeout_secs: None,
         };
         assert_eq!(super::request_version(&send), 1);
@@ -2737,6 +2817,7 @@ mod tests {
                 session_id: None,
                 once: Some("d-9f2a".into()),
                 when_idle: true,
+                detach: false,
                 timeout_secs: Some(47),
             }
         );
@@ -2824,7 +2905,6 @@ mod tests {
                 if pinned == sid
         ));
         assert_eq!(super::request_version(&send), super::PINNED_SEND_VERSION);
-        assert_eq!(super::NEWEST_VERSION, super::PINNED_SEND_VERSION);
         let line = serde_json::to_string(&send).unwrap();
         assert!(
             line.contains(&format!("\"session_id\":\"{sid}\"")),
@@ -2846,6 +2926,81 @@ mod tests {
             *session_id = Some("a\nb".into());
         }
         assert!(super::check_safe_send(&raw).is_err());
+    }
+
+    /// A host that doesn't know `detach` ignores it and holds the caller's
+    /// connection for the whole wait; one that doesn't know `once_cancel`
+    /// can't withdraw anything. Only the version makes either refuse.
+    #[test]
+    fn a_detached_send_needs_protocol_v6_and_a_key_to_report_it() {
+        let line = |extra: &[&str]| {
+            let mut line = vec!["send", "a", "hi", "--when-idle", "--once", "d-1"];
+            line.extend_from_slice(extra);
+            words(&line)
+        };
+        let Ok(CliCommand::Request(send)) = parse_cli(&line(&["--detach", "--timeout", "86400"]))
+        else {
+            panic!("--detach parses");
+        };
+        assert!(matches!(
+            &send,
+            Command::Send {
+                detach: true,
+                when_idle: true,
+                once: Some(_),
+                timeout_secs: Some(86_400),
+                ..
+            }
+        ));
+        assert_eq!(super::request_version(&send), super::DETACHED_SEND_VERSION);
+        assert_eq!(super::NEWEST_VERSION, super::DETACHED_SEND_VERSION);
+        assert!(
+            serde_json::to_string(&send)
+                .unwrap()
+                .contains("\"detach\":true")
+        );
+        // Wire sends the wire form directly.
+        let raw: Command = serde_json::from_str(
+            r#"{"cmd":"send","agent":"a","text":"hi","once":"d-1","when_idle":true,"detach":true}"#,
+        )
+        .unwrap();
+        assert_eq!(super::request_version(&raw), super::DETACHED_SEND_VERSION);
+        // An attached send leaves the field out, so older hosts read it as before.
+        let Ok(CliCommand::Request(attached)) = parse_cli(&line(&[])) else {
+            panic!("an attached send parses");
+        };
+        assert!(!serde_json::to_string(&attached).unwrap().contains("detach"));
+        // A detached send may wait a day; an attached one still an hour.
+        assert!(parse_cli(&line(&["--timeout", "3601"])).is_err());
+        for args in [
+            words(&["send", "a", "hi", "--detach", "--once", "d-1"]),
+            words(&["send", "a", "hi", "--when-idle", "--detach"]),
+            line(&["--detach", "--timeout", "86401"]),
+            line(&["--detach", "--timeout", "0"]),
+            words(&["status", "a", "--detach"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
+        assert_eq!(
+            parse_cli(&words(&["once-cancel", "a", "d-1"])),
+            Ok(CliCommand::Request(Command::OnceCancel {
+                agent: "a".into(),
+                key: "d-1".into(),
+            }))
+        );
+        let cancel: Command =
+            serde_json::from_str(r#"{"cmd":"once_cancel","agent":"a","key":"d-1"}"#).unwrap();
+        assert_eq!(
+            super::request_version(&cancel),
+            super::DETACHED_SEND_VERSION
+        );
+        for args in [
+            words(&["once-cancel", "a"]),
+            words(&["once-cancel", "a", "k", "extra"]),
+            words(&["once-cancel", "a", "a\tb"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -2877,6 +3032,7 @@ mod tests {
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             }))
         );
@@ -2905,6 +3061,7 @@ mod tests {
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             }))
         );
@@ -2999,6 +3156,7 @@ mod tests {
             ErrorCode::Busy,
             ErrorCode::Duplicate,
             ErrorCode::TimedOut,
+            ErrorCode::Cancelled,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
         ] {
@@ -3016,6 +3174,10 @@ mod tests {
         assert!(text.contains("conversation_changed"));
         assert!(text.contains("conversation_unconfirmed"));
         assert!(text.contains("tmux_delivery"));
+        assert!(text.contains("`--detach`"));
+        assert!(text.contains("muxel ctl once-cancel AGENT KEY"));
+        assert!(text.contains("`dropped`"));
+        assert!(text.contains("`queued`"));
     }
 
     #[test]
@@ -3435,6 +3597,7 @@ Steps:
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             }))
         );
@@ -3448,6 +3611,7 @@ Steps:
                 session_id: None,
                 once: None,
                 when_idle: false,
+                detach: false,
                 timeout_secs: None,
             }))
         );
