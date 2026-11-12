@@ -243,6 +243,17 @@ impl Drop for LineReader {
     }
 }
 
+/// Restore on the pane's newest offered draft, as its row's button does.
+fn restore_newest(
+    app: &mut MuxelApp,
+    iid: Uuid,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<MuxelApp>,
+) {
+    let path = app.rescue.offers[&iid][0].path.clone();
+    app.restore_offer(iid, &path, window, cx);
+}
+
 /// A second of real and test time for the pane's child and timers.
 fn settle(cx: &mut TestAppContext) {
     for _ in 0..4 {
@@ -307,7 +318,7 @@ fn a_typed_prompt_is_saved_once_typing_stops_and_offered_when_the_pane_starts_ag
         // Restore types it into the box without pressing Enter: the child
         // has no line until the test presses Enter itself.
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "Restore never sends Enter");
@@ -1019,7 +1030,7 @@ fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
         paint_claude(&session, "");
         session.process_probe_output(b"\x1b[?2004l");
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "nothing reached the child");
@@ -1363,7 +1374,7 @@ fn restore_keeps_the_line_break_a_draft_ends_with() {
         paint_claude(&session, "");
         session.process_probe_output(b"\x1b[?2004l");
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "nothing reached the child");
@@ -1728,5 +1739,58 @@ fn a_prompt_drawn_only_after_its_enter_is_never_kept_but_one_typed_after_it_is()
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].draft.text, "next step");
         assert!(!closed[0].draft.partial, "it is what muxel saw typed");
+    });
+}
+
+#[test]
+fn an_older_offer_restores_on_its_own_and_the_newer_one_stays_offered() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let at = |text: &str, saved_at_ms| PromptDraft {
+            saved_at_ms,
+            ..draft(text)
+        };
+        dir.save_draft(iid, &at("the older thought", 1)).unwrap();
+        assert_eq!(dir.offer_drafts(iid).len(), 1);
+        dir.save_draft(iid, &at("the newer thought", 2)).unwrap();
+        let (child, reader) = LineReader::spawn();
+        let session = launch_child(cx, window, iid, child);
+        paint_claude(&session, "");
+        session.process_probe_output(b"\x1b[?2004l");
+        window
+            .update(cx, |app, window, cx| {
+                let offers = &app.rescue.offers[&iid];
+                assert_eq!(offers.len(), 2);
+                assert_eq!(offers[0].draft.text, "the newer thought");
+                let older = offers[1].path.clone();
+                app.toggle_offer(iid, cx);
+                app.restore_offer(iid, &older, window, cx);
+            })
+            .unwrap();
+        settle(cx);
+        session.try_write_input(b"\r").unwrap();
+        assert_eq!(reader.wait_line().as_deref(), Some("the older thought"));
+        let newer = window
+            .read_with(cx, |app, _| {
+                let offers = &app.rescue.offers[&iid];
+                assert_eq!(offers.len(), 1);
+                assert_eq!(offers[0].draft.text, "the newer thought");
+                assert!(app.rescue.offers_open.contains(&iid), "the row stays open");
+                offers[0].path.clone()
+            })
+            .unwrap();
+        assert_eq!(dir.draft_offers(iid).len(), 1);
+
+        // Discarding the last one closes the row, so the pane's next offer
+        // starts as one line.
+        window
+            .update(cx, |app, _, cx| {
+                app.forget_draft_offer(iid, &newer);
+                cx.notify();
+                assert!(!app.rescue.offers.contains_key(&iid));
+                assert!(!app.rescue.offers_open.contains(&iid));
+            })
+            .unwrap();
+        assert!(dir.draft_offers(iid).is_empty());
     });
 }
