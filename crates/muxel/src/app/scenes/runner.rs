@@ -163,6 +163,8 @@ async fn draw_frame(
     cx: &mut AsyncApp,
 ) -> Result<Frame> {
     let scene = &loaded.scene;
+    scene_mode::fix_clock(Some(loaded.now));
+    scene_mode::hold_still(true);
     scene_mode::record_regions();
     let dir = root.join(format!("{}-{width}x{height}-{pass}", scene.id));
     std::fs::create_dir_all(&dir)?;

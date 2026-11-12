@@ -1,8 +1,12 @@
-//! What a test that draws an offscreen scene records: where each named region
-//! was drawn, so a frame can be cropped to one region.
+//! What an offscreen scene holds fixed. The app reads the real clock and
+//! animates; a test that draws a scene fixes the clock, holds animation still
+//! and records where each named region was drawn, so two renders of one scene
+//! give the same pixels and a frame can be cropped to one region.
 //!
-//! The record is thread-local and exists only in test builds: the scene
-//! runner draws on the thread that starts it.
+//! The switches are thread-local and exist only in test builds: the scene
+//! runner draws on the thread that sets them.
+
+use chrono::{DateTime, Local};
 
 #[cfg(test)]
 use gpui::{
@@ -10,14 +14,35 @@ use gpui::{
     LayoutId, Pixels, Window,
 };
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(test)]
 use std::collections::HashMap;
 
 #[cfg(test)]
 thread_local! {
+    static FIXED_NOW: Cell<Option<DateTime<chrono::Utc>>> = const { Cell::new(None) };
+    static STILL: Cell<bool> = const { Cell::new(false) };
     static REGIONS: RefCell<Option<HashMap<&'static str, Bounds<Pixels>>>> =
         const { RefCell::new(None) };
+}
+
+/// The wall clock, as the labels that show an age or a date read it.
+pub(crate) fn now_local() -> DateTime<Local> {
+    #[cfg(test)]
+    if let Some(now) = FIXED_NOW.with(Cell::get) {
+        return now.with_timezone(&Local);
+    }
+    Local::now()
+}
+
+/// The easing for an activity spinner: `easing`, or a constant while animation
+/// is held still, which draws the spinner at rest on every frame.
+pub(crate) fn spinner_easing(easing: fn(f32) -> f32) -> fn(f32) -> f32 {
+    #[cfg(test)]
+    if STILL.with(Cell::get) {
+        return |_| 0.0;
+    }
+    easing
 }
 
 /// `element`, recorded under `name` while a scene is recording regions.
@@ -31,6 +56,18 @@ pub(crate) fn region(name: &'static str, element: AnyElement) -> AnyElement {
         .into_any_element();
     }
     element
+}
+
+/// Fix the wall clock at `now`, or release it with `None`.
+#[cfg(test)]
+pub(crate) fn fix_clock(now: Option<DateTime<chrono::Utc>>) {
+    FIXED_NOW.with(|fixed| fixed.set(now));
+}
+
+/// Hold every activity spinner at rest, or let them turn again.
+#[cfg(test)]
+pub(crate) fn hold_still(still: bool) {
+    STILL.with(|held| held.set(still));
 }
 
 /// Start recording where named regions are drawn; elements built after this

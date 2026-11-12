@@ -2,8 +2,9 @@
 //! one PNG per frame, so a change can be reviewed as pictures beside its design.
 //!
 //! A scene names a workspace fixture and what each pane shows. The runner
-//! builds that state directly, draws, reads the frame back and crops it to a
-//! named region. `scene.rs` describes the file.
+//! builds that state directly, holds the clock and every spinner still, draws,
+//! reads the frame back and crops it to a named region; two renders of one
+//! scene on one machine give the same bytes. `scene.rs` describes the file.
 //!
 //! Run it alone and by name, after a build:
 //!
