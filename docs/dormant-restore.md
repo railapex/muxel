@@ -1,7 +1,7 @@
 # Dormant session restore
 
-Settings → Behavior offers “Start sessions not worked on in N days only when
-opened”. It is off by default. Enabling it selects three days; the adjacent
+Settings → Behavior offers “Leave sessions not worked on in N days asleep”. It
+is off by default. Enabling it selects three days; the adjacent
 buttons adjust the threshold. The hand-editable `config.toml` setting is
 `dormant_after_days = 3`; zero disables it. Changes apply on the next project
 open or app launch and do not stop processes that already run.
@@ -14,11 +14,11 @@ start. The active pane is not exempt: at launch or project open it shows its
 asleep face like any other dormant pane until it is woken.
 
 A dormant pane owns no PTY or child process. It looks exactly like a pane put
-to sleep, since opening either does the same thing (see
+to sleep, since waking either does the same thing (see
 [Sleeping idle agents](agent-sleep.md#how-an-asleep-pane-looks)): one sidebar
 line with a muted name and an outlined moon-and-age pill, and a moon on its tab.
-The pane body shows its name, last saved title, saved status and folder with a
-Wake button.
+The pane body shows its name, last saved title, "Asleep" with its age, and
+its folder, with a Wake button.
 
 Selecting it through the sidebar, a tab, tab cycling, a notification or the
 tray shows it and starts nothing, so clicking through sleeping panes to find

@@ -2982,7 +2982,7 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
-    /// Start old local PTY sessions only when opened. Zero disables dormancy.
+    /// Open old local PTY sessions asleep, until woken. Zero disables dormancy.
     #[serde(default)]
     pub dormant_after_days: u32,
     /// Sidebar presentation only; navigation and pane layout keep their order.

@@ -83,10 +83,10 @@ feature is added or changed, update the matching entry here in the same change**
   silent program can't keep the window redrawing. Editors, diffs and browsers open
   without waiting on terminals, and switching projects cancels the old project's
   pending waves.
-- **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can start sessions not worked
-  on in N days only when opened (off by default; enabling starts at 3 days).
-  Old local PTY panes retain their name, lifecycle status and age with a dormant
-  marker and a lightweight placeholder, without starting a process. Selecting
+- **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can leave sessions not worked
+  on in N days asleep (off by default; enabling starts at 3 days).
+  Old local PTY panes retain their name, lifecycle status and age and open
+  asleep, without starting a process. Selecting
   one only shows it; Enter or typing in it, Wake, pinning or `ctl focus`
   resumes it through the normal restore path. Pinned panes and panes with no
   work history always start; SSH and local tmux
@@ -94,11 +94,10 @@ feature is added or changed, update the matching entry here in the same change**
   `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
   put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
-  seconds) and its pane becomes a dormant placeholder that resumes the same
-  conversation when woken, across restarts too. Asleep and dormant panes look
-  the same: a muted one-line row with an outlined moon-and-age pill (plus `∅`
-  and **Start fresh** when the saved conversation is gone) and a moon on the
-  tab. Selecting one shows it without starting it, so clicking through
+  seconds) and its pane stays, asleep, and resumes the same conversation when
+  woken, across restarts too. Asleep and dormant panes look the same: a muted
+  one-line row with an outlined moon-and-age pill (plus `∅`, "no history" and
+  **Start fresh** when the saved conversation is gone) and a moon on the tab. Selecting one shows it without starting it, so clicking through
   sleeping rows costs nothing; Enter or typing in it, its Wake button, the
   Wake its row's pill turns into on hover, or Wake in the row menu starts it,
   and its face stays up ("Waking…") until the terminal draws. A pane's own
@@ -112,7 +111,8 @@ feature is added or changed, update the matching entry here in the same change**
   panes stay running. `ctl status` reports `not_running_reason: "sleeping"` and
   whether a wake `resumes` the conversation, and `ctl wake AGENT` resumes one
   without moving focus. A wake that finds the saved conversation deleted
-  starts a new one in the same folder and says so in Notifications.
+  starts a new one in the same folder, and Notifications says "started fresh ·
+  no history".
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others

@@ -421,15 +421,6 @@ fn state_name(state: AgentState) -> String {
 }
 
 /// Control decisions use live facts, never the attention record held through a switch.
-/// How a ctl message names a `not_running_reason`.
-fn dormant_word(reason: &str) -> &'static str {
-    if reason == "sleeping" {
-        "asleep"
-    } else {
-        "dormant"
-    }
-}
-
 fn runtime_control_state(
     runtime: muxel_terminal::TerminalRuntimeSnapshot,
     binding_rev: u64,
@@ -1791,10 +1782,7 @@ impl MuxelApp {
         if let Some(reason) = self.dormant_reason(iid) {
             return Answer::Now(Err(ctl::Error::new(
                 ErrorCode::NotRunning,
-                format!(
-                    "that pane is {}; open it in muxel or use ctl wake or ctl focus to start it",
-                    dormant_word(reason)
-                ),
+                "that pane is asleep; wake it in muxel, or use ctl wake or ctl focus",
             )
             .with_reason(reason)));
         }
@@ -1834,10 +1822,7 @@ impl MuxelApp {
         if let Some(reason) = self.dormant_reason(iid) {
             return Err(ctl::Error::new(
                 ErrorCode::NotRunning,
-                format!(
-                    "'{name}' is {}; open it in muxel or use ctl wake or ctl focus to start it",
-                    dormant_word(reason)
-                ),
+                format!("'{name}' is asleep; wake it in muxel, or use ctl wake or ctl focus"),
             )
             .with_reason(reason));
         }

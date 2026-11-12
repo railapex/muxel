@@ -2,8 +2,9 @@
 
 An idle agent's program keeps its memory for as long as the pane is open. A
 day's worth of finished panes can hold tens of gigabytes. Sleeping a pane ends
-its program and leaves the pane in place as a [dormant](dormant-restore.md)
-placeholder: same name, saved status, age and last title. Selecting it shows
+its program and leaves the pane in place asleep, as
+[dormant restore](dormant-restore.md) leaves an old one: same name, saved
+status, age and last title. Selecting it shows
 it; waking it resumes the same conversation through the ordinary restore path.
 
 ## Ways in
@@ -12,8 +13,8 @@ it; waking it resumes the same conversation through the ordinary restore path.
   sleep, the item is disabled and says why.
 - **A project at once:** the project menu has **Sleep idle agents**, which
   sleeps every pane in the project the rules below allow and reports how many.
-- **Automatically:** Settings → Behavior → "Put agents to sleep after N hours
-  idle". It is on by default at 4 hours; the hand-editable `config.toml` key is
+- **Automatically:** Settings → Behavior → "Sleep agents idle for N hours". It
+  is on by default at 4 hours; the hand-editable `config.toml` key is
   `sleep_after_hours = 4`, and zero turns it off. Once a minute, muxel sleeps
   each agent idle that long. Idle is measured from the latest of the pane's
   work start, completion, question (`activity.work_started_at`,
@@ -25,7 +26,7 @@ it; waking it resumes the same conversation through the ordinary restore path.
 Four hours keeps everything touched this morning running through the
 afternoon, while the panes left from yesterday stop holding memory before the
 next day's work starts. The same threshold applies at launch: an agent already
-idle that long opens dormant instead of starting only to be put to sleep a
+idle that long opens asleep instead of starting only to be put to sleep a
 minute later.
 
 ## What never sleeps
@@ -67,7 +68,7 @@ resume would read:
 
 A pane sleeps only when its file is there. A missing file, or a look that
 fails or would need a walk of the provider's whole store, keeps it awake with
-"no saved conversation to resume". The look never walks a whole store, so it
+"Can't sleep: no history". The look never walks a whole store, so it
 doesn't stall the UI.
 
 ## How a sleep ends the program
@@ -105,16 +106,18 @@ them apart (`not_running_reason`).
   than filled, so filled pills mean running panes: a moon and how long ago the
   pane last worked (`5m`, `20h`, `31d`), in its saved status color (green
   finished, amber interrupted, grey idle). Hovering the pill gives the words:
-  "Asleep · finished 20h ago". Hovering the row turns the pill into a Wake
-  button in the same place.
+  "Asleep · 20h". Hovering the row turns the pill into a Wake button in the
+  same place.
 - **Tab:** a moon and the muted title, no age.
-- **Pane:** its name, last title, the same words, folder, "Press Enter or start
-  typing to wake it" and a **Wake** button.
+- **Pane:** its name, last title, the same words, folder and a **Wake** button,
+  whose tooltip says Enter.
 
-When the pane's saved conversation is gone (checked on load, project open,
-sleep, wake and once a minute, the same look as the sleep rule), the pill adds
-`∅`, the tooltip and pane say "The saved conversation is gone. Waking starts a
-new one in the same folder.", and the button reads **Start fresh**.
+The words are spent on exceptions. A pane that will resume its conversation
+says nothing about it; an interrupted one adds "interrupted" ("Asleep · 6h ·
+interrupted"). When the pane's saved conversation is gone (checked on load,
+project open, sleep, wake and once a minute, the same look as the sleep rule),
+the pill adds `∅`, the words add "no history" ("Asleep · 31d · no history"),
+and the button reads **Start fresh**.
 
 ## Waking an asleep pane
 
@@ -136,9 +139,8 @@ A deliberate act wakes it:
 - `ctl focus`, which opens the pane on purpose, and `ctl wake`, which starts it
   in the background.
 
-While the program starts, the pane keeps its face, saying "Waking…" and
-"Resuming its conversation", until the terminal draws its first frame, in
-place of the startup spinner.
+While the program starts, the pane keeps its face, saying "Waking…", until
+the terminal draws its first frame, in place of the startup spinner.
 
 ## Outside control
 
@@ -147,13 +149,13 @@ place of the startup spinner.
 the reason for a pane deferred at launch). `show` includes the reason; `screen`,
 `send`, `keys` and `answer` refuse with code `not_running` and that reason.
 
-For a sleeping or dormant agent, `status` and `panes` also report `resumes`,
+For an asleep agent, `status` and `panes` also report `resumes`,
 made from the same look as the sleep rule each time they are asked: `true`
 when its file is there, `false` when it is gone or no conversation was ever
 captured. It is left out while the pane runs, and when muxel can't tell (Grok,
 or a look that failed).
 
-`muxel ctl wake AGENT` starts a sleeping or dormant pane in the background,
+`muxel ctl wake AGENT` wakes an asleep pane in the background,
 through the same restore path, without selecting it, raising a window,
 changing the active tab or marking its notifications read. Replies:
 
@@ -174,9 +176,8 @@ A pane can sleep for longer than its provider keeps the file, so a wake can
 find it gone. Before every resume, muxel's launch path looks for the file
 (walking the provider's store when the cheap look misses); when the file is
 gone, the launch starts a new conversation in the same folder instead of
-resuming, and `session_id` changes. muxel then posts "NAME: saved conversation
-is gone · Started a new one in the same folder" to Notifications and the event
-log. The same notice follows the rarer case where the resume itself reports the
+resuming, and `session_id` changes. muxel then posts "NAME: started fresh · no
+history" to Notifications and the event log. The same notice follows the rarer case where the resume itself reports the
 conversation missing. The new launch is not a resume, so it can't fail the same
 way again: one wake, one launch.
 

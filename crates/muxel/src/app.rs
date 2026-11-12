@@ -17206,8 +17206,8 @@ impl MuxelApp {
         ));
         self.add_event(
             NotifKind::Success,
-            tf("{title}: saved conversation is gone", &[("title", &title)]),
-            t("Started a new one in the same folder."),
+            tf("{title}: started fresh", &[("title", &title)]),
+            t("no history"),
         );
     }
 
@@ -27604,14 +27604,14 @@ impl MuxelApp {
             && !self.terminal_launching.contains_key(&iid)
     }
 
-    /// An asleep pane's face: who it is, what it last did, and how to wake it.
+    /// An asleep pane's face: who it is, how long it has slept, and Wake.
     /// Selecting the pane shows this without starting anything. While a wake
     /// starts the program, the same face says "Waking…" until the terminal
     /// draws, in place of the startup spinner.
     fn terminal_dormant(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let inst = self.workspace.instance(iid);
         let waking = !self.is_dormant(iid);
-        // Waking starts a new conversation; say so before the click.
+        // Waking starts a new conversation: the words say "no history".
         let gone = !waking && self.conversations_gone.contains(&iid);
         let folder = inst.and_then(Instance::working_directory).or_else(|| {
             inst.and_then(|i| self.workspace.project(i.project_id))
@@ -27629,6 +27629,8 @@ impl MuxelApp {
         } else {
             Button::new(format!("start-dormant-{iid}"))
                 .label(if gone { t("Start fresh") } else { t("Wake") })
+                // Typing in the pane wakes it too.
+                .tooltip(t("Enter"))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.wake_and_show(iid, window, cx)),
                 )
@@ -27656,13 +27658,6 @@ impl MuxelApp {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             )
-            .child(if gone {
-                Self::conversation_gone_words()
-            } else if waking {
-                t("Resuming its conversation")
-            } else {
-                t("Press Enter or start typing to wake it")
-            })
             .child(action)
             .into_any_element()
     }
@@ -31378,14 +31373,7 @@ impl MuxelApp {
                             .unwrap_or_else(|| status_label(Some(status)).to_string());
                         // An asleep row's pill is a moon and an age; the words
                         // go to the tooltip.
-                        let asleep_tip = asleep.then(|| {
-                            let words = self.asleep_words(iid);
-                            if self.conversations_gone.contains(&iid) {
-                                format!("{words}\n{}", Self::conversation_gone_words())
-                            } else {
-                                words
-                            }
-                        });
+                        let asleep_tip = asleep.then(|| self.asleep_words(iid));
                         // The asleep pill is a gpui-component Tag (moon and
                         // age); the others are StatusPills.
                         let badge = if loading {
@@ -37332,7 +37320,7 @@ impl MuxelApp {
                         this.persist_settings();
                         cx.notify();
                     })),
-                &tf("Start sessions not worked on in {days} days only when opened", &[("days", &dormant_days.to_string())]),
+                &tf("Leave sessions not worked on in {days} days asleep", &[("days", &dormant_days.to_string())]),
             ))
             .child(div().flex().items_center().gap_2()
                 .child(Button::new("dormant-days-less").small().label("−")
