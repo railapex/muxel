@@ -1761,7 +1761,9 @@ mod binding_regressions {
 mod grok_regressions {
     use super::super::{
         AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopLaunch, LoopRun,
-        MuxelApp, PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        MuxelApp, PostRunAction,
+        conpty_test_support::{ChildHandle, ProcessTree},
+        grok_switch_interval,
         popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
@@ -1775,10 +1777,20 @@ mod grok_regressions {
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
 
+    /// Ends a fixture pane's processes when the test leaves, and waits until
+    /// they are gone. Killing the shell alone leaves `more` running until the
+    /// pseudoconsole closes, which the session's monitor thread does after the
+    /// shell exits. These tests run long and often finish last, so the test
+    /// binary could exit inside that gap and leave conhost and `more` behind
+    /// for good.
     struct StopChild(Arc<TerminalSession>);
     impl Drop for StopChild {
         fn drop(&mut self) {
+            let tree = self.0.child_pid().map(ProcessTree::open);
             self.0.kill();
+            if let Some(tree) = tree {
+                tree.wait_gone(Duration::from_secs(10));
+            }
         }
     }
 
