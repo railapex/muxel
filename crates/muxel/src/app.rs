@@ -27531,7 +27531,7 @@ impl MuxelApp {
                                                 self.terminal_view(iid).and_then(|view| {
                                                     view.read(cx).background_work()
                                                 }),
-                                                chrono::Utc::now().timestamp_millis(),
+                                                crate::scene_mode::now_local().timestamp_millis(),
                                             )
                                         })
                                         .unwrap_or_else(|| status_label(status).to_string()),

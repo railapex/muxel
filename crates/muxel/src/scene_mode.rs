@@ -4,7 +4,8 @@
 //! give the same pixels and a frame can be cropped to one region.
 //!
 //! The switches are thread-local and exist only in test builds: the scene
-//! runner draws on the thread that sets them.
+//! runner draws on the thread that sets them. Their setters are compiled only
+//! where the runner is, in Windows test builds.
 
 use chrono::{DateTime, Local};
 
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 thread_local! {
     static FIXED_NOW: Cell<Option<DateTime<chrono::Utc>>> = const { Cell::new(None) };
+    static FROZEN_INSTANT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     static STILL: Cell<bool> = const { Cell::new(false) };
     static REGIONS: RefCell<Option<HashMap<&'static str, Bounds<Pixels>>>> =
         const { RefCell::new(None) };
@@ -33,6 +35,15 @@ pub(crate) fn now_local() -> DateTime<Local> {
         return now.with_timezone(&Local);
     }
     Local::now()
+}
+
+/// The monotonic clock, as a countdown's label reads it.
+pub(crate) fn now_instant() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = FROZEN_INSTANT.with(Cell::get) {
+        return now;
+    }
+    std::time::Instant::now()
 }
 
 /// The easing for an activity spinner: `easing`, or a constant while animation
@@ -59,41 +70,47 @@ pub(crate) fn region(name: &'static str, element: AnyElement) -> AnyElement {
 }
 
 /// Fix the wall clock at `now`, or release it with `None`.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn fix_clock(now: Option<DateTime<chrono::Utc>>) {
     FIXED_NOW.with(|fixed| fixed.set(now));
 }
 
+/// Stop the monotonic clock at `now`, or let it run with `None`.
+#[cfg(all(test, windows))]
+pub(crate) fn freeze_instant(now: Option<std::time::Instant>) {
+    FROZEN_INSTANT.with(|frozen| frozen.set(now));
+}
+
 /// Hold every activity spinner at rest, or let them turn again.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn hold_still(still: bool) {
     STILL.with(|held| held.set(still));
 }
 
 /// Start recording where named regions are drawn; elements built after this
 /// are wrapped, and each draw replaces a region's bounds.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn record_regions() {
     REGIONS.with(|regions| *regions.borrow_mut() = Some(HashMap::new()));
 }
 
 /// Where `name` was last drawn, in window pixels.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn region_bounds(name: &str) -> Option<Bounds<Pixels>> {
     REGIONS.with(|regions| regions.borrow().as_ref()?.get(name).copied())
 }
 
-/// The names recorded so far, sorted.
-#[cfg(test)]
-pub(crate) fn region_names() -> Vec<&'static str> {
+/// Every region recorded so far with where it was last drawn, by name.
+#[cfg(all(test, windows))]
+pub(crate) fn regions() -> Vec<(&'static str, Bounds<Pixels>)> {
     REGIONS.with(|regions| {
-        let mut names: Vec<_> = regions
+        let mut all: Vec<_> = regions
             .borrow()
             .as_ref()
-            .map(|map| map.keys().copied().collect())
+            .map(|map| map.iter().map(|(name, bounds)| (*name, *bounds)).collect())
             .unwrap_or_default();
-        names.sort_unstable();
-        names
+        all.sort_unstable_by_key(|(name, _)| *name);
+        all
     })
 }
 

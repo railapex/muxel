@@ -4,10 +4,11 @@
 //! while the window is leased never reaches GPUI's layout.
 
 use super::scene::{self, Loaded};
-use crate::app::MuxelApp;
+use crate::app::recoverable_close::CloseGroup;
+use crate::app::{MuxelApp, NotifKind, Notification};
 use crate::editor::EditorView;
 use crate::{scene_mode, theme};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Entity, Task, Window, WindowBounds,
     WindowOptions, point, px, size,
@@ -72,14 +73,13 @@ pub(super) fn run() {
     let report = Rc::new(RefCell::new(Report::default()));
     {
         let report = report.clone();
-        let root = root.clone();
         let out = out.clone();
         gpui_platform::application()
             .with_assets(crate::AppAssets)
             .run(move |cx: &mut App| {
                 init(cx);
                 cx.spawn(async move |cx| {
-                    draw_all(&scenes, repeat, &root, &out, &report, cx).await;
+                    draw_all(&scenes, repeat, &out, &report, cx).await;
                     cx.update(|cx| cx.quit());
                 })
                 .detach();
@@ -123,7 +123,6 @@ fn init(cx: &mut App) {
 async fn draw_all(
     scenes: &[Loaded],
     repeat: usize,
-    root: &Path,
     out: &Path,
     report: &RefCell<Report>,
     cx: &mut AsyncApp,
@@ -132,7 +131,7 @@ async fn draw_all(
         for &(width, height) in &loaded.scene.window {
             for pass in 1..=repeat {
                 let label = format!("{} {width}x{height} pass {pass}", loaded.scene.id);
-                match draw_frame(loaded, (width, height), pass, root, out, cx).await {
+                match draw_frame(loaded, (width, height), pass, out, cx).await {
                     Ok(Frame::Drawn(line)) => {
                         eprintln!("scenes: {label}: {line}");
                         report.borrow_mut().lines.push(line);
@@ -158,16 +157,22 @@ async fn draw_frame(
     loaded: &Loaded,
     (width, height): (u32, u32),
     pass: usize,
-    root: &Path,
     out: &Path,
     cx: &mut AsyncApp,
 ) -> Result<Frame> {
-    let scene = &loaded.scene;
     scene_mode::fix_clock(Some(loaded.now));
+    scene_mode::freeze_instant(Some(Instant::now()));
     scene_mode::hold_still(true);
     scene_mode::record_regions();
-    let dir = root.join(format!("{}-{width}x{height}-{pass}", scene.id));
-    std::fs::create_dir_all(&dir)?;
+    for project in &loaded.fixture.projects {
+        let folder = project.folder();
+        ensure!(
+            !folder.exists(),
+            "project {:?}: {} exists on this machine; a scene's folder must not, so no frame can show a real one",
+            project.name,
+            folder.display()
+        );
+    }
 
     let mut built: Option<Entity<MuxelApp>> = None;
     let handle: AnyWindowHandle = cx
@@ -180,19 +185,26 @@ async fn draw_frame(
         })?
         .into();
     let app = built.context("the window didn't build its app")?;
-    let result = draw_into(loaded, handle, &app, (width, height), pass, &dir, out, cx).await;
+    let result = draw_into(loaded, handle, &app, (width, height), pass, out, cx).await;
     let _ = handle.update(cx, |_, window, _| window.remove_window());
+    for project in &loaded.fixture.projects {
+        let folder = project.folder();
+        ensure!(
+            !folder.exists(),
+            "project {:?}: muxel created {} while drawing; nothing may write to a scene's folder",
+            project.name,
+            folder.display()
+        );
+    }
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn draw_into(
     loaded: &Loaded,
     handle: AnyWindowHandle,
     app: &Entity<MuxelApp>,
     (width, height): (u32, u32),
     pass: usize,
-    dir: &Path,
     out: &Path,
     cx: &mut AsyncApp,
 ) -> Result<Frame> {
@@ -202,9 +214,7 @@ async fn draw_into(
 
     let mut notes = Vec::new();
     handle.update(cx, |_, window, cx| {
-        app.update(cx, |app, cx| {
-            build(app, loaded, dir, &mut notes, window, cx)
-        })
+        app.update(cx, |app, cx| build(app, loaded, &mut notes, window, cx))
     })??;
     cx.update(|cx| apply_theme(scene.theme.as_deref(), cx));
 
@@ -233,14 +243,13 @@ async fn draw_into(
         Err(error) => return Err(error.context("read the frame back")),
     };
 
+    let regions = scene_mode::regions();
     let (image, crop_px) = match &scene.crop {
         None => (image, None),
         Some(name) => {
             let bounds = scene_mode::region_bounds(name).with_context(|| {
-                format!(
-                    "no region {name:?} was drawn; drawn: {}",
-                    scene_mode::region_names().join(", ")
-                )
+                let drawn: Vec<_> = regions.iter().map(|(name, _)| *name).collect();
+                format!("no region {name:?} was drawn; drawn: {}", drawn.join(", "))
             })?;
             let [x, y, w, h] = device_rect(bounds, scale, image.width(), image.height());
             (
@@ -249,6 +258,24 @@ async fn draw_into(
             )
         }
     };
+    // Each region's rectangle in the saved image's pixels, for comparisons
+    // that leave a region out; regions outside a crop are dropped.
+    let (left, top) = crop_px.map_or((0, 0), |[x, y, _, _]| (x as i64, y as i64));
+    let rects: serde_json::Map<String, serde_json::Value> = regions
+        .iter()
+        .filter_map(|(name, bounds)| {
+            let [x, y, w, h] = device_rect(*bounds, scale, u32::MAX, u32::MAX).map(i64::from);
+            let (x0, y0) = ((x - left).max(0), (y - top).max(0));
+            let x1 = (x + w - left).min(image.width() as i64);
+            let y1 = (y + h - top).min(image.height() as i64);
+            (x1 > x0 && y1 > y0).then(|| {
+                (
+                    (*name).to_string(),
+                    serde_json::json!([x0, y0, x1 - x0, y1 - y0]),
+                )
+            })
+        })
+        .collect();
 
     let file = if pass == 1 {
         format!("{}.{width}x{height}.png", scene.id)
@@ -276,7 +303,7 @@ async fn draw_into(
         "sha256": sha256,
         "draw_ms": drawn.as_secs_f64() * 1000.0,
         "readback_ms": read.as_secs_f64() * 1000.0,
-        "regions": scene_mode::region_names(),
+        "rects": rects,
         "notes": notes,
         "for": scene.feature,
         "source": scene.source,
@@ -305,12 +332,12 @@ fn options(width: u32, height: u32) -> WindowOptions {
 fn build(
     app: &mut MuxelApp,
     loaded: &Loaded,
-    dir: &Path,
     notes: &mut Vec<String>,
     window: &mut Window,
     cx: &mut gpui::Context<MuxelApp>,
 ) -> Result<()> {
     let scene = &loaded.scene;
+    let now_ms = loaded.now.timestamp_millis();
     app._status_timer = Task::ready(());
     app._loop_timer = Task::ready(());
     app._diff_timer = Task::ready(());
@@ -319,26 +346,41 @@ fn build(
     app.show_terms = false;
     app.show_workspace_selector = false;
     app.current_workspace = Some(scene::stable_id(&[&scene.id, "workspace"]));
+    if let Some(settings) = &scene.settings {
+        app.settings = scene::overlay(&app.settings, settings, now_ms).context("settings")?;
+    }
 
+    let pane_id = |name: &str| scene::stable_id(&[&scene.id, "pane", name]);
+    let closing = scene.closing_panes();
     let mut ids: HashMap<&str, uuid::Uuid> = HashMap::new();
     let mut pids = HashMap::new();
     for project in &loaded.fixture.projects {
-        let project_root = dir.join(&project.name);
-        std::fs::create_dir_all(&project_root)?;
+        let project_root = project.folder();
         let mut record = Project::new(project.name.clone(), project_root.clone());
         record.id = scene::stable_id(&[&scene.id, "project", &project.name]);
         let pid = app.workspace.add_project(record);
         pids.insert(project.name.as_str(), pid);
+        if let Some(branch) = &project.branch {
+            app.project_branches.insert(pid, Some(branch.clone()));
+        }
+        if project.collapsed {
+            app.collapsed.insert(pid);
+        }
         for pane in &project.panes {
-            let iid = scene::stable_id(&[&scene.id, "pane", &pane.id]);
+            let iid = pane_id(&pane.id);
             let content = scene.panes.get(&pane.id);
             let mut instance = match content.and_then(|c| c.markdown.as_ref()) {
                 Some(text) => {
+                    // Held in memory: the project's folder doesn't exist.
                     let file = project_root.join(&pane.title);
-                    std::fs::write(&file, text)?;
+                    let language = crate::editor::language_for_path(&file).to_string();
                     let config = app.editor_config();
-                    let path = Some(file.clone());
-                    let editor = cx.new(|cx| EditorView::open(path, config, window, cx));
+                    let (text, path) = (text.clone(), Some(file.clone()));
+                    let editor = cx.new(|cx| {
+                        EditorView::from_state(
+                            text, path, language, None, false, None, None, true, config, window, cx,
+                        )
+                    });
                     app.editors.insert(iid, editor);
                     Instance::editor(pid, Some(file))
                 }
@@ -358,10 +400,19 @@ fn build(
                 }
             };
             instance.id = iid;
+            if pane.instance.is_some() || pane.opened_by.is_some() {
+                let mut fields = pane.instance.clone().unwrap_or_default();
+                if let Some(parent) = &pane.opened_by {
+                    fields.insert("opened_by".into(), pane_id(parent).to_string().into());
+                }
+                instance = scene::overlay(&instance, &fields, now_ms)
+                    .with_context(|| format!("pane {:?}: instance", pane.id))?;
+                (instance.id, instance.project_id) = (iid, pid);
+            }
             app.workspace.add_instance(instance);
             ids.insert(pane.id.as_str(), iid);
         }
-        let layout = project.layout(&scene.id, &ids)?;
+        let layout = project.layout(&scene.id, &ids, &closing)?;
         app.workspace
             .project_mut(pid)
             .context("the project was just added")?
@@ -384,10 +435,48 @@ fn build(
     let focus = scene
         .focus
         .as_deref()
-        .or_else(|| active_project.first_pane())
+        .or_else(|| active_project.first_pane(&closing))
         .and_then(|name| ids.get(name).copied());
     if let Some(iid) = focus {
         app.focus_instance(iid, window, cx);
+    }
+    app.notifications = scene
+        .notifications
+        .iter()
+        .enumerate()
+        .map(|(ix, note)| Notification {
+            id: scene::stable_id(&[&scene.id, "notification", &ix.to_string()]),
+            instance: note.pane.as_deref().map(pane_id),
+            kind: match note.kind.as_str() {
+                "blocked" => NotifKind::Blocked,
+                "done" => NotifKind::Done,
+                "success" => NotifKind::Success,
+                _ => NotifKind::Error,
+            },
+            title: note.title.clone(),
+            subtitle: note.subtitle.clone(),
+        })
+        .collect();
+    if scene.dialog.as_deref() == Some("quit") {
+        app.show_quit_confirm = true;
+    }
+    if let Some(closed) = &scene.closing {
+        app.close_groups.push(CloseGroup {
+            id: scene::stable_id(&[&scene.id, "closing"]),
+            members: closed.panes.iter().map(|name| pane_id(name)).collect(),
+            deadline: scene_mode::now_instant() + Duration::from_secs(closed.left),
+            undo_until: now_ms + closed.left as i64 * 1000,
+            needs_decision: false,
+            checking: false,
+            finalizing: false,
+            undoing: false,
+            sync_marks: None,
+            layout_unread: false,
+            layouts: HashMap::new(),
+            hides: HashMap::new(),
+            focus: None,
+            caller: None,
+        });
     }
     cx.notify();
     Ok(())
