@@ -148,12 +148,18 @@ impl RecentPlace {
     /// stays in the band its turn started in. A row that has never worked goes
     /// by when it was last opened (a file a session opened again counts from
     /// then), or with the Older rows when that isn't known. Asking and working
-    /// rows have their own sections above the bands.
-    pub fn of(instance: &Instance, shown: Option<AgentActivityState>, clock: BandClock) -> Self {
+    /// rows have their own sections above the bands. `running` says whether
+    /// the row's process is running (`placed_state`).
+    pub fn of(
+        instance: &Instance,
+        shown: Option<AgentActivityState>,
+        running: bool,
+        clock: BandClock,
+    ) -> Self {
         let activity = &instance.activity;
         let latest = activity.last_work_at();
         let opened = instance.created_at.max(instance.opened_at);
-        let (group, at) = match shown {
+        let (group, at) = match placed_state(shown, running) {
             // A turn or question the reducer hasn't recorded yet began now.
             Some(AgentActivityState::Working) => (
                 RecentGroup::Working,
@@ -201,6 +207,18 @@ impl RecentPlace {
             RecentGroup::Working => RecentSection::Working,
             RecentGroup::Done | RecentGroup::Unused => RecentSection::Band(self.band),
         }
+    }
+}
+
+/// The state a row is placed and counted by: the one it shows, except that a
+/// row whose process isn't running can't be running a turn. A session put to
+/// sleep mid-turn shows the turn it was saved in; it goes with the done rows by
+/// its latest event, and neither Working's count nor a family's working tag
+/// counts it.
+fn placed_state(shown: Option<AgentActivityState>, running: bool) -> Option<AgentActivityState> {
+    match shown {
+        Some(AgentActivityState::Working) if !running => Some(AgentActivityState::Idle),
+        state => state,
     }
 }
 
@@ -381,13 +399,16 @@ pub struct FamilyTags {
 }
 
 /// The tags of the top row at `entries[at]` ([`FamilyTags`]). Any other
-/// row has none.
+/// row has none. `running` says whether a row's process is running
+/// (`placed_state`).
 pub fn family_tags(
     entries: &[SidebarEntry],
     at: usize,
     instances: &InstancesById,
     shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+    running: &dyn Fn(Uuid) -> bool,
 ) -> FamilyTags {
+    let placed = |id: Uuid| placed_state(shown(id), running(id));
     let mut tags = FamilyTags::default();
     let SidebarEntry::Pane(top) = entries[at] else {
         return tags;
@@ -407,7 +428,7 @@ pub fn family_tags(
                     .get(id)
                     .is_some_and(|i| i.kind == InstanceKind::Terminal) =>
             {
-                Some(shown(*id))
+                Some(placed(*id))
             }
             _ => None,
         });
@@ -418,7 +439,7 @@ pub fn family_tags(
             _ => {}
         }
     }
-    if shown(top) == Some(AgentActivityState::Working) {
+    if placed(top) == Some(AgentActivityState::Working) {
         tags.working = 0;
     }
     tags
@@ -544,12 +565,14 @@ pub fn sidebar_rows_each<'a>(
 /// works, else by its newest event ([`family_tags`] tells the top row).
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
-/// state each row shows (`shown`), and labels each section when the unpinned
-/// rows span more than one. Nothing about reading or focus is an input.
+/// state each row shows (`shown`) and whether its process is running
+/// (`running`), and labels each section when the unpinned rows span more than
+/// one. Nothing about reading or focus is an input.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
     instances: &InstancesById,
     shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+    running: &dyn Fn(Uuid) -> bool,
     clock: BandClock,
     sort: SidebarSort,
 ) -> Vec<SidebarEntry> {
@@ -584,9 +607,9 @@ pub fn sidebar_order(
     let places: HashMap<Uuid, RecentPlace> = pane_ids
         .iter()
         .map(|&id| {
-            let place = instances
-                .get(&id)
-                .map_or(unknown, |i| RecentPlace::of(i, shown(id), clock));
+            let place = instances.get(&id).map_or(unknown, |i| {
+                RecentPlace::of(i, shown(id), running(id), clock)
+            });
             (id, place)
         })
         .collect();
@@ -766,7 +789,14 @@ mod tests {
     ) -> Vec<SidebarEntry> {
         let index = instances_by_id(workspace);
         let shown = |id: Uuid| index.get(&id).and_then(|i| shown(i));
-        sidebar_order(rows, &index, &shown, clock, SidebarSort::RecentWork)
+        sidebar_order(
+            rows,
+            &index,
+            &shown,
+            &|_| true,
+            clock,
+            SidebarSort::RecentWork,
+        )
     }
 
     /// Every row shows the state it was saved in, as when each has a live terminal.
@@ -962,9 +992,13 @@ mod tests {
     /// saved state.
     fn tags(workspace: &Workspace, entries: &[SidebarEntry], at: usize) -> FamilyTags {
         let index = instances_by_id(workspace);
-        family_tags(entries, at, &index, &|id| {
-            index.get(&id).and_then(|i| live(i))
-        })
+        family_tags(
+            entries,
+            at,
+            &index,
+            &|id| index.get(&id).and_then(|i| live(i)),
+            &|_| true,
+        )
     }
 
     #[test]
@@ -1460,6 +1494,7 @@ mod tests {
                 &project.instances(),
                 &instances_by_id(&workspace),
                 &|_| None,
+                &|_| true,
                 clock(),
                 SidebarSort::Layout
             ),
@@ -1914,6 +1949,85 @@ mod tests {
         assert_eq!(pane_order(&project, &workspace), vec![saved, read]);
     }
 
+    /// A session put to sleep mid-turn shows the turn it was saved in, but no
+    /// process runs it: it sorts with the done rows by its latest event, and
+    /// neither Working's count nor its family's tag counts it.
+    #[test]
+    fn a_working_row_whose_process_is_not_running_sits_with_the_done_rows() {
+        use SidebarEntry::{Band, Nested, Pane};
+        let (mut project, mut workspace, ids) = fixture(vec![
+            worked(NOW - 3 * HOUR),
+            worked(NOW - 3 * DAY),
+            worked(NOW - HOUR),
+            worked(NOW - 5 * HOUR),
+        ]);
+        let (busy, asleep, finished, parent) = (ids[0], ids[1], ids[2], ids[3]);
+        let child = session(
+            &mut workspace,
+            &mut project,
+            Some(parent),
+            worked(NOW - 4 * DAY),
+        );
+        for (id, started) in [
+            (busy, NOW - 30 * MINUTE),
+            (asleep, NOW - 2 * HOUR),
+            (child, NOW - 90 * MINUTE),
+        ] {
+            change(&mut workspace, id, AgentActivityState::Working, started);
+        }
+        let index = instances_by_id(&workspace);
+        let rows = sidebar_rows(&project, &workspace, &|_| false, SidebarSort::RecentWork);
+        let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        let order = |running: &dyn Fn(Uuid) -> bool| {
+            let entries = sidebar_order(
+                &rows,
+                &index,
+                &shown,
+                running,
+                clock(),
+                SidebarSort::RecentWork,
+            );
+            let at = entries.iter().position(|e| *e == Pane(parent)).unwrap();
+            let working_tag = family_tags(&entries, at, &index, &shown, running).working;
+            (entries, working_tag)
+        };
+
+        // Every process running: all three lead as working rows.
+        assert_eq!(
+            order(&|_| true),
+            (
+                vec![
+                    SidebarEntry::Working(3),
+                    Pane(asleep),
+                    Pane(parent),
+                    Nested(child),
+                    Pane(busy),
+                    Band(ActivityBand::Today),
+                    Pane(finished),
+                ],
+                1
+            )
+        );
+        // The sleeping two run nothing: each sits with the done rows by its
+        // start, the latest thing it did, and only the live turn is counted.
+        let awake = |id: Uuid| id != asleep && id != child;
+        assert_eq!(
+            order(&awake),
+            (
+                vec![
+                    SidebarEntry::Working(1),
+                    Pane(busy),
+                    Band(ActivityBand::Today),
+                    Pane(finished),
+                    Pane(parent),
+                    Nested(child),
+                    Pane(asleep),
+                ],
+                0
+            )
+        );
+    }
+
     #[test]
     fn bands_follow_the_local_calendar() {
         let zone = FixedOffset::west_opt(7 * 3600).unwrap();
@@ -2117,7 +2231,7 @@ mod tests {
         let mut instance = Instance::shell(Uuid::new_v4());
         instance.activity = activity;
         let place = |instance: &Instance| {
-            RecentPlace::of(instance, Some(AgentActivityState::Idle), clock())
+            RecentPlace::of(instance, Some(AgentActivityState::Idle), true, clock())
         };
         assert_eq!(place(&instance).band(), ActivityBand::ThisWeek);
         instance.activity.work_started_at = Some(NOW - HOUR);
@@ -2147,6 +2261,7 @@ mod tests {
                 &project.instances(),
                 &index,
                 &shown,
+                &|_| true,
                 clock(),
                 SidebarSort::Layout
             ),

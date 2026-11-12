@@ -1435,8 +1435,10 @@ feature is added or changed, update the matching entry here in the same change**
   in Today (since midnight), This week (the six days before) and Older bands, by
   each one's latest start, finish or question, newest first, read or not, with
   sessions never used last in each band, newest open first. A finish lands just
-  under the working rows, never above them. Each section gets a thin label, with
-  the working count on Working, when a project's rows span more than one.
+  under the working rows, never above them. A session whose process isn't
+  running (put to sleep mid-turn, say) never counts as working: it sits with
+  the done rows by its latest event. Each section gets a thin label, with the
+  working count on Working, when a project's rows span more than one.
   Reading, focusing or clicking a session never moves its row, and neither does
   another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that

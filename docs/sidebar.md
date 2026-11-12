@@ -25,7 +25,10 @@ Each project's rows sit in sections, top to bottom (`sidebar::RecentPlace`):
    whether or not you have seen it, and whatever day it was asked.
 2. **Working**: sessions running a turn, in the order each started it, so a
    session that starts a turn joins the bottom, however long the others have
-   run.
+   run. Only a session whose process is running counts. One put to sleep
+   mid-turn shows the turn it was saved in but sorts with the done rows by
+   its latest event, and neither this section's count nor its family's
+   working tag includes it.
 3. **Today**, **This week** and **Older**: sessions that have worked and
    aren't running a turn (finished, idle after work, interrupted, exited, or
    not running since a restart or sleep), each in the band of its latest

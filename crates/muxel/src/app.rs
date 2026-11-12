@@ -23960,7 +23960,7 @@ impl MuxelApp {
 
     /// `pane_ids` ([`Self::sidebar_rows_each`]) as the sidebar lists them, placed
     /// by `placing` ([`with_pending`]) and by the status each row shows, like
-    /// its badge.
+    /// its badge, and whether its process runs ([`Self::sidebar_running`]).
     fn sidebar_entries(
         &self,
         pane_ids: &[Uuid],
@@ -23972,7 +23972,22 @@ impl MuxelApp {
             let instance = placing.get(&iid).copied();
             Some(activity_state(self.sidebar_status(iid, instance, cx)))
         };
-        sidebar_order(pane_ids, placing, &shown, bands, self.settings.sidebar_sort)
+        let running = |iid: Uuid| self.sidebar_running(iid);
+        sidebar_order(
+            pane_ids,
+            placing,
+            &shown,
+            &running,
+            bands,
+            self.settings.sidebar_sort,
+        )
+    }
+
+    /// Whether a sidebar row's process may be running: a pane with no live
+    /// terminal isn't, so Recent work never places or counts it as working,
+    /// whatever status it was saved with.
+    fn sidebar_running(&self, iid: Uuid) -> bool {
+        self.terminal_view(iid).is_some()
     }
 
     /// Session `dragged` dropped on session row `onto` in Recent work: it nests
@@ -24126,8 +24141,9 @@ impl MuxelApp {
             let instance = placing.get(&iid).copied();
             Some(activity_state(self.sidebar_status(iid, instance, cx)))
         };
+        let running = |iid: Uuid| self.sidebar_running(iid);
         (0..entries.len())
-            .map(|at| family_tags(entries, at, placing, &shown))
+            .map(|at| family_tags(entries, at, placing, &shown, &running))
             .collect()
     }
 
