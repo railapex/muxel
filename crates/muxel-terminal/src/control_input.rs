@@ -238,7 +238,8 @@ impl ControlWrite {
                 if result.is_ok()
                     && let Some((session, at, prompt)) = submit
                 {
-                    session.commit_submission(at, prompt);
+                    let sent = session.draft_screen();
+                    session.commit_submission(at, prompt, sent);
                 }
                 result
             }

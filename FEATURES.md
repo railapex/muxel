@@ -1854,6 +1854,75 @@ feature is added or changed, update the matching entry here in the same change**
   workspaces or on exit (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
+- **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box
+  is saved about a second after typing stops, off the UI thread; closing the
+  pane, Restart and quitting save it at once. When muxel sees the prompt
+  submitted in that pane, the saved copy goes straight away, even within that
+  second, and the sent prompt still on screen isn't saved again until the
+  program redraws its box, even if keys are typed first. Only the box's text
+  counts, not a menu or footer changing around it, and a program too slow to
+  draw its keys before the Enter (a machine short of memory) can draw the sent
+  prompt after it without that being saved. Enter after a backslash in Claude
+  starts a new line, so it isn't taken as sending. Claude's suggestion in an
+  empty box (`Try "…"`) isn't saved, even when Claude draws it undimmed
+  (`NO_COLOR`), unless muxel saw that very text typed. An Enter that answers a
+  question drawn over the box (a permission prompt) keeps the saved copy; once
+  the box shows it again it is saved as partial, because muxel can't tell what
+  that Enter did to it. What muxel saw typed into the box is kept as typed,
+  spaces and line breaks included, when the screen shows that text. A prompt read
+  from the screen alone is labelled partial, because the screen can't show
+  spaces at a row's end, after the cursor, or how many a wrap took. So is one
+  taller than the pane, and a paste marker muxel can't tie to one paste. When
+  the pane starts again after a crash, a restart or a relaunch, a line under it
+  offers **Unsent prompt from HH:MM**, the prompt's first line (cut short with …
+  when there is more), **Restore** and **Discard**, and **(+N older)** when
+  earlier ones wait too. Clicking the line opens the prompts in place, pushing
+  the pane down, each with its own **Restore** and **Discard**: the newest
+  whole, older ones by their first three lines (click one for the rest). Restore
+  types the text back into the box as it was saved, line breaks included, and
+  never presses Enter, and a prompt with a line break goes to the clipboard
+  instead when the program would read it as Enter. While a question covers the
+  box, Restore types nothing, keeps the offer and says why. A pane closed for
+  good keeps its unsent prompt under the title bar, where one line counts the closed
+  panes' unsent prompts and opens a list, newest first. Each entry shows the
+  prompt's first three lines (**Show all** for the rest), the pane, the time,
+  and **Copy** and **Discard**; **Discard all** sits on the line while the list
+  is open, and **Hide** puts the line away until another pane's prompt is kept. A
+  shell's command line is never saved, because the shell keeps its own history
+  and a typed line can hold a secret; one an earlier build saved is deleted when
+  read. Grok, Muse, opencode and Amp input boxes are not read yet.
+- **Unsaved editor changes survive** — an editor with unsaved changes, or an
+  input method's uncommitted text, backs them up about a second after edits
+  stop; text an input method commits counts as an unsaved change. When it opens
+  again it offers **Restore unsaved changes from HH:MM**, and edits made while
+  the offer shows are backed up too. Restore checks the file again: if it
+  changed since the edits began (before muxel started again or while the offer
+  showed), the offer says so, and restoring keeps both, with the disk version
+  behind **Reload / Keep mine**. The restored changes are backed up before the offer goes, so a crash
+  straight after Restore still finds them. Saving, reloading or closing without saving
+  deletes the backup, and a backup write still on its way can't bring it back.
+- **Crash notice** — after muxel stops without closing a workspace cleanly, the
+  next time it opens one, a line under the title bar reads **Unclean exit**,
+  then how many unsent prompts and editors were kept and which agents were
+  working when muxel last saved the workspace.
+- **Rescue storage** — unsent prompts and editor backups are private files
+  beside the workspace, written atomically, never logged, and capped at 2 MB per
+  prompt and 8 MB per editor backup. Each pane keeps one live copy of its prompt,
+  and its offers until Restore or Discard, with no age or count limit; a
+  workspace keeps the newest 20 closed panes' prompts. Deleting a workspace records the deletion before it
+  leaves the list, then deletes what it kept; a rescue write still on its way
+  deletes what it wrote once it lands. Whatever a crash or a failed delete
+  leaves behind is deleted the next time muxel opens a workspace. A workspace
+  open in another muxel window isn't deleted and stays listed. One another
+  window deleted never opens from a list shown before then: the feed says it
+  was deleted, and it leaves the list. Settings →
+  **Keep unsent prompts and unsaved editor changes** (on by default) turns it
+  off and deletes what every workspace kept, reporting any folder it couldn't
+  read; other muxel windows on the same data stop saving too, and while it is
+  off, opening a workspace deletes anything kept since. Turning it back on in
+  one window turns it on for the others: a window started while it was off
+  follows when it next opens a workspace or Settings, instead of deleting what
+  the others kept, and never saves the setting back off.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
   `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
   a separate keychain service on Windows, macOS and Linux. This separates Muxel
