@@ -86,18 +86,23 @@ feature is added or changed, update the matching entry here in the same change**
 - **[Dormant old sessions](docs/dormant-restore.md)** — Settings → Behavior can start sessions not worked
   on in N days only when opened (off by default; enabling starts at 3 days).
   Old local PTY panes retain their name, lifecycle status and age with a dormant
-  marker and a lightweight placeholder, without starting a process. Opening or
-  focusing one resumes it through the normal restore path. The focused pane,
-  pinned panes and panes with no work history always start; SSH and local tmux
+  marker and a lightweight placeholder, without starting a process. Selecting
+  one only shows it; Enter or typing in it, Wake, pinning or `ctl focus`
+  resumes it through the normal restore path. Pinned panes and panes with no
+  work history always start; SSH and local tmux
   restores keep their existing behavior. `ctl status`/`panes` expose
   `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
   put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
   seconds) and its pane becomes a dormant placeholder that resumes the same
-  conversation when opened, across restarts too. Asleep and dormant panes look
+  conversation when woken, across restarts too. Asleep and dormant panes look
   the same: a muted one-line row with an outlined moon-and-age pill (plus `∅`
   and **Start fresh** when the saved conversation is gone) and a moon on the
-  tab. Sleep a pane from its sidebar
+  tab. Selecting one shows it without starting it, so clicking through
+  sleeping rows costs nothing; Enter or typing in it, its Wake button, the
+  Wake its row's pill turns into on hover, or Wake in the row menu starts it,
+  and its face stays up ("Waking…") until the terminal draws. A pane's own
+  Sleep leaves you in it, on its face. Sleep a pane from its sidebar
   menu, a whole project's idle agents from the project menu, or let Settings →
   Behavior do it after N hours idle (on, 4 hours, by default); every wake
   restarts that clock. Working, asking,

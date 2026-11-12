@@ -757,7 +757,9 @@ pub struct AgentInfo {
     pub activity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_on: Option<AgentBlockedOn>,
-    /// Why a terminal is not running. `dormant` means it starts when opened.
+    /// Why a terminal is not running. `dormant` and `sleeping` mean it starts
+    /// when woken (Enter or typing in it, Wake, `focus` or `wake`); selecting
+    /// it in muxel only shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_running_reason: Option<String>,
     /// For a sleeping or dormant agent: whether waking it resumes its
@@ -2495,8 +2497,9 @@ hosts ignore this caller ID, so check the target when driving one.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; the user has
-  to open it in muxel.
+  start. `not_running` - the pane hasn't been started this session; selecting it
+  in muxel only shows it, so the user wakes it there (Enter, typing or Wake) or
+  you call `focus` or `wake`.
 
 Old local sessions may be dormant, and idle ones may be asleep: `status` and
 `panes` report `status: "not_running"` with `not_running_reason: "dormant"`

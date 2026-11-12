@@ -1008,7 +1008,11 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn answer_control(&mut self, incoming: crate::control::Incoming, cx: &mut Context<Self>) {
+    pub(super) fn answer_control(
+        &mut self,
+        incoming: crate::control::Incoming,
+        cx: &mut Context<Self>,
+    ) {
         let crate::control::Incoming {
             command,
             caller_instance_id,
@@ -1067,7 +1071,10 @@ impl MuxelApp {
                                 if let Some(popout) = this.popouts.get(&iid) {
                                     window.focus(&popout.view.focus_handle(cx), cx);
                                 } else {
-                                    this.select_instance(iid, window, cx);
+                                    // `focus` opens on purpose, so it wakes an
+                                    // asleep pane, where selecting by hand
+                                    // only shows it.
+                                    this.wake_and_show(iid, window, cx);
                                 }
                                 this.persist();
                                 window.activate_window();

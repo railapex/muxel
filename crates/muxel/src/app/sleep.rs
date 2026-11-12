@@ -1,8 +1,9 @@
 //! Sleeping idle local agents: end the program, keep the pane as a dormant
-//! placeholder, and resume the same conversation when it is opened or woken.
+//! placeholder, and resume the same conversation when it is woken.
 //! The rules live in `muxel_core::sleep`; this gathers their facts and does the
-//! stopping. Dormant restore's placeholder, focus wake and ctl refusals do the
-//! rest, so a sleeping pane behaves like one deferred at launch.
+//! stopping. Dormant restore's placeholder and ctl refusals do the rest, so a
+//! sleeping pane behaves like one deferred at launch. Selecting either shows
+//! it; Enter or typing in it, Wake, pinning and `ctl focus`/`wake` start it.
 
 use super::*;
 use muxel_core::control::{self as ctl, AgentState, ErrorCode};
@@ -379,18 +380,14 @@ impl MuxelApp {
     /// The pane menu's Sleep. Its state can change while the menu is open.
     ///
     /// It sleeps the pane even when the user is in it, since they named it.
-    /// Focus then moves the way a close moves it: to the tab its group shows
-    /// next, else another running pane of the project. Focusing a dormant
-    /// pane starts it, so leaving focus there would let the next project
-    /// switch wake it straight back up. With no running pane to go to, focus
-    /// stays and the pane shows its dormant placeholder.
+    /// The user stays in it and sees its asleep face: selecting never wakes a
+    /// pane, so nothing starts it again until they press Enter, type or Wake.
     pub(super) fn sleep_from_menu(
         &mut self,
         iid: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_active = self.active_instance == Some(iid);
         if let Err(refusal) = self.sleep_instance(iid, SleepRequest::Pane, SleepCause::Pane, cx) {
             self.add_event(
                 NotifKind::Error,
@@ -400,25 +397,11 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        if was_active && let Some(next) = self.focus_after_sleep(iid) {
-            self.focus_instance_with_attendance(next, false, window, cx);
+        // The terminal that held the keyboard is gone; the root takes it so
+        // Enter or typing reaches the asleep pane's wake.
+        if self.active_instance == Some(iid) {
+            window.focus(&self.focus_handle, cx);
         }
-    }
-
-    /// Where focus goes after the focused pane `iid` falls asleep: its group's
-    /// next tab, else the project's first other pane, skipping dormant ones.
-    fn focus_after_sleep(&self, iid: Uuid) -> Option<Uuid> {
-        let project = self
-            .workspace
-            .instance(iid)
-            .and_then(|inst| self.workspace.project(inst.project_id))?;
-        project
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.surviving_active_after_remove(iid))
-            .into_iter()
-            .chain(project.instances())
-            .find(|other| *other != iid && !self.is_dormant(*other))
     }
 
     /// Sleep every idle agent in project `pid` the rules allow; say how many.
@@ -485,12 +468,13 @@ impl MuxelApp {
         }
     }
 
-    /// Start dormant pane `iid` through the restore path: opening it, pinning
-    /// it and `ctl wake` all wake it here. The wake restarts its idle clock, so
-    /// it gets the whole threshold before the timer can stop it again, even if
-    /// nobody types into it. `false` when it wasn't dormant or its launch was
-    /// refused; a refused launch leaves it out of `dormant_instances`, where
-    /// its failure shows.
+    /// Start dormant pane `iid` through the restore path: every wake (Enter or
+    /// typing in it, Wake, pinning, `ctl focus` and `ctl wake`) lands here. The
+    /// wake restarts its idle clock, so it gets the whole threshold before the
+    /// timer can stop it again, even if nobody types into it, and the pane
+    /// keeps its asleep face until the terminal draws. `false` when it wasn't
+    /// dormant or its launch was refused; a refused launch leaves it out of
+    /// `dormant_instances`, where its failure shows.
     pub(super) fn start_dormant(
         &mut self,
         iid: Uuid,
@@ -505,12 +489,41 @@ impl MuxelApp {
         if !self.terminal_launching.contains_key(&iid) && !self.terminals.contains_key(&iid) {
             return false;
         }
+        self.wake_launches.insert(iid);
         if let Some(inst) = self.workspace.instance_mut(iid) {
             inst.activity.woken_at = Some(chrono::Utc::now().timestamp_millis());
         }
         self.persist();
         cx.notify();
         true
+    }
+
+    /// Wake asleep pane `iid` and show it: the pane's Wake button and the
+    /// sidebar's. Selecting alone never starts a pane.
+    pub(super) fn wake_and_show(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_instance(iid, window, cx);
+        self.start_dormant(iid, window, cx);
+    }
+
+    /// Enter or a typed character in the asleep pane the user is in wakes it.
+    /// The key itself is dropped: nothing may reach a booting program, which
+    /// could be showing a trust card or an update prompt. Shortcuts (Ctrl,
+    /// Alt, the platform key), arrows, Tab and Escape leave it asleep.
+    pub(super) fn wake_on_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Only when no input has the keyboard: the root holds focus exactly
+        // while an asleep (viewless) pane is the one selected.
+        if !self.focus_handle.is_focused(window) || !key_wakes(keystroke) {
+            return false;
+        }
+        match self.active_instance {
+            Some(iid) if self.is_dormant(iid) => self.start_dormant(iid, window, cx),
+            _ => false,
+        }
     }
 
     /// Start a sleeping or dormant pane through the ordinary restore path,
@@ -720,6 +733,40 @@ impl MuxelApp {
         }
     }
 
+    /// The Wake button an asleep row's pill turns into while the row (group
+    /// `row`) is hovered. Hidden, it takes no clicks, so a stray click on the
+    /// pill only selects the row, which never wakes it.
+    pub(super) fn asleep_wake_button(
+        &self,
+        iid: Uuid,
+        row: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let accent = cx.theme().primary;
+        div()
+            .id(SharedString::from(format!("inst-wake-{}", iid.simple())))
+            .absolute()
+            .inset_0()
+            .invisible()
+            .group_hover(row, |s| s.visible())
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(accent)
+            .bg(cx.theme().sidebar)
+            .text_xs()
+            .text_color(accent)
+            .cursor_pointer()
+            .child(t("Wake"))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                // The row under it would only select.
+                cx.stop_propagation();
+                this.wake_and_show(iid, window, cx);
+            }))
+    }
+
     /// What waking an asleep pane whose conversation is gone does.
     pub(super) fn conversation_gone_words() -> SharedString {
         t("The saved conversation is gone. Waking starts a new one in the same folder.")
@@ -798,7 +845,7 @@ impl MuxelApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(t(
-                        "A sleeping agent's program stops, freeing its memory, and its row shows a moon and how long ago it last worked. Opening it resumes the same conversation, or starts a new one if the provider has deleted it. Working, asking, focused and pinned agents, and shells, keep running.",
+                        "A sleeping agent's program stops, freeing its memory, and its row shows a moon and how long ago it last worked. Selecting it shows it without starting it. Enter, typing in it or Wake resumes the same conversation, or starts a new one if the provider has deleted it. Working, asking, focused and pinned agents, and shells, keep running.",
                     )),
             )
             .into_any_element()
@@ -823,4 +870,18 @@ pub(super) fn sleep_refusal_label(refusal: SleepRefusal) -> String {
         SleepRefusal::RecentlyActive => t("recently active"),
     };
     tf("Can't sleep: {why}", &[("why", why.as_ref())])
+}
+
+/// Whether a key pressed in an asleep pane wakes it: Enter, or a key that
+/// types a character with no shortcut modifier held.
+fn key_wakes(keystroke: &Keystroke) -> bool {
+    let held = &keystroke.modifiers;
+    if held.control || held.alt || held.platform || held.function {
+        return false;
+    }
+    keystroke.key == "enter"
+        || keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|typed| !typed.is_empty() && !typed.chars().any(char::is_control))
 }

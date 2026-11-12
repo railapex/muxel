@@ -12,6 +12,7 @@ use gpui::{
     AppContext, Bounds, Context, Entity, Pixels, TestAppContext, VisualTestContext, Window,
     WindowHandle, px,
 };
+use muxel_core::control::Command;
 use muxel_core::sleep::{ResumeFile, SleepRefusal, SleepRequest};
 use muxel_core::{AgentActivity, AgentActivityState, AgentPreset, EnvVar, PaneNode, add_tab};
 use muxel_terminal::{
@@ -512,8 +513,8 @@ fn a_woken_agent_gets_the_whole_threshold_before_the_timer_sleeps_it_again() {
         let before_wake = chrono::Utc::now().timestamp_millis();
         let woken_view = window
             .update(cx, |app, window, cx| {
-                // Opening it wakes it through the resume launch.
-                app.focus_instance(agent, window, cx);
+                // Waking it by hand (its Wake button) starts the resume launch.
+                app.wake_and_show(agent, window, cx);
                 assert!(app.terminal_launching.contains_key(&agent));
                 // Stand in for that launch landing: the real one would run the
                 // fixture's missing Claude binary.
@@ -603,10 +604,12 @@ fn its_own_sleep_takes_the_focused_agent_and_sleep_idle_agents_leaves_it() {
                         .asleep_since
                         .is_some()
                 );
-                // Focus moves on as after a close, past the dormant tab to the
-                // running shell, so no focus path wakes the pane straight back.
-                assert_eq!(app.active_instance, Some(shell));
+                // The user stays in it, looking at its asleep face, with the
+                // keyboard on the root where Enter or typing wakes it.
+                assert_eq!(app.active_instance, Some(focused));
+                assert!(app.focus_handle.is_focused(window));
                 assert!(app.is_dormant(other));
+                assert!(app.terminals.contains_key(&shell));
             })
             .unwrap();
         wait_until(
@@ -687,5 +690,132 @@ fn a_dormant_sidebar_row_stays_one_line_at_the_narrowest_sidebar() {
             badge.right() <= dormant.right(),
             "the dormant badge ran past its row"
         );
+    });
+}
+
+/// A copy of running agent `from` that is asleep: saved as finished 23 hours
+/// ago with its own conversation file, put to sleep an hour ago, as a tab in
+/// `from`'s group.
+fn asleep_copy(app: &mut MuxelApp, pid: Uuid, from: Uuid, name: &str) -> Uuid {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut instance = app.workspace.instance(from).unwrap().clone();
+    instance.id = Uuid::new_v4();
+    let id = Uuid::new_v4().to_string();
+    instance.session_path = instance
+        .session_path
+        .as_ref()
+        .map(|path| path.with_file_name(format!("{id}.jsonl")));
+    if let Some(path) = &instance.session_path {
+        std::fs::write(path, "{}\n").unwrap();
+    }
+    instance.session_id = Some(id);
+    instance.custom_name = Some(name.into());
+    instance.activity = AgentActivity {
+        completed_at: Some(now - 23 * HOUR_MS),
+        last_state: Some(AgentActivityState::Done),
+        ..Default::default()
+    };
+    instance.asleep_since = Some(now - HOUR_MS);
+    let iid = instance.id;
+    app.workspace.add_instance(instance);
+    let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+    assert!(add_tab(layout, from, iid));
+    app.dormant_instances.insert(iid);
+    iid
+}
+
+#[test]
+fn selecting_an_asleep_pane_shows_it_and_enter_typing_or_ctl_focus_wakes_it() {
+    with_app_drawing(true, |cx, window| {
+        let pid = project(cx, window);
+        let (running, running_view, _child) = pane(cx, window, pid, "running agent", true);
+        wait_ready(cx, window, &running_view);
+        let (first, second, third) = window
+            .update(cx, |app, window, cx| {
+                app.show_terms = false;
+                app.show_workspace_selector = false;
+                let first = asleep_copy(app, pid, running, "first asleep");
+                let second = asleep_copy(app, pid, running, "second asleep");
+                let third = asleep_copy(app, pid, running, "third asleep");
+                // Clicking its row, cycling through every tab and opening its
+                // project again all show it and start nothing.
+                app.select_instance(first, window, cx);
+                assert_eq!(app.active_instance, Some(first));
+                for _ in 0..4 {
+                    app.cycle_tab(1, window, cx);
+                }
+                assert_eq!(app.active_instance, Some(first));
+                app.ensure_project_terminals(pid, window, cx);
+                for iid in [first, second, third] {
+                    assert!(app.is_dormant(iid), "selecting started a pane");
+                    assert!(!app.terminal_launching.contains_key(&iid));
+                }
+                (first, second, third)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        {
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            bounds(&mut visual, "terminal-dormant", first);
+            // Arrows, Escape and shortcuts leave it asleep.
+            visual.simulate_keystrokes("left escape ctrl-shift-x");
+        }
+        assert!(
+            window
+                .read_with(cx, |app, _| app.is_dormant(first))
+                .unwrap()
+        );
+        {
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            visual.simulate_keystrokes("enter");
+            // Its face stays up, waking, while the program starts.
+            bounds(&mut visual, "pane-waking", first);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                // Enter woke it.
+                assert!(!app.is_dormant(first));
+                assert!(app.terminal_launching.contains_key(&first));
+                // Never let the deferred launch run its (missing) program.
+                app.close_instance(first, cx);
+                app.select_instance(second, window, cx);
+                assert!(app.is_dormant(second));
+            })
+            .unwrap();
+        {
+            // Typing a character wakes it too.
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            visual.simulate_keystrokes("a");
+        }
+        let (reply, answer) = std::sync::mpsc::channel();
+        window
+            .update(cx, |app, _, cx| {
+                assert!(!app.is_dormant(second));
+                assert!(app.terminal_launching.contains_key(&second));
+                app.close_instance(second, cx);
+                // `ctl focus` opens on purpose: it still starts the pane.
+                app.answer_control(
+                    crate::control::Incoming {
+                        command: Command::Focus {
+                            agent: third.to_string(),
+                        },
+                        caller_instance_id: None,
+                        reply,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let focused = answer.try_recv().expect("ctl focus answered");
+        assert!(focused.ok, "{:?}", focused.result);
+        window
+            .update(cx, |app, _, cx| {
+                assert_eq!(app.active_instance, Some(third));
+                assert!(!app.is_dormant(third));
+                assert!(app.terminal_launching.contains_key(&third));
+                app.close_instance(third, cx);
+            })
+            .unwrap();
     });
 }

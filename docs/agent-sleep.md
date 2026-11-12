@@ -3,8 +3,8 @@
 An idle agent's program keeps its memory for as long as the pane is open. A
 day's worth of finished panes can hold tens of gigabytes. Sleeping a pane ends
 its program and leaves the pane in place as a [dormant](dormant-restore.md)
-placeholder: same name, saved status, age and last title. Opening it resumes
-the same conversation through the ordinary restore path.
+placeholder: same name, saved status, age and last title. Selecting it shows
+it; waking it resumes the same conversation through the ordinary restore path.
 
 ## Ways in
 
@@ -46,11 +46,10 @@ minute later.
   path.
 
 These rules apply to every way in, with one exception: a pane's own Sleep
-names it, so it sleeps the pane you're in. Focus then moves the way a close
-moves it, to the tab its group shows next or another running pane of the
-project (focusing a dormant pane starts it, so focus doesn't stay). Sleep idle
-agents and the timer name no pane and leave the one you're in. Only automatic
-sleep waits for the idle threshold.
+names it, so it sleeps the pane you're in. You stay in it and see its asleep
+face, since selecting never wakes a pane; Enter, typing or Wake brings it back.
+Sleep idle agents and the timer name no pane and leave the one you're in. Only
+automatic sleep waits for the idle threshold.
 
 A saved conversation id is only as good as the file behind it: Claude deletes
 transcripts older than `cleanupPeriodDays` (30 by default). So the last rule,
@@ -82,12 +81,12 @@ closing its pseudo console ends what it left running, as closing a pane does. Th
 records each sleep with the pane's preset, and whether the program quit or was
 killed.
 
-A slept pane stays dormant across restarts until it is opened or woken, even
-when neither threshold applies. Any launch that lands for the pane clears the
-mark. Opening it during the quit grace ends the old process first, so two
-copies never run on one conversation.
+A slept pane stays dormant across restarts until it is woken, even when
+neither threshold applies, and even when it is the pane you were in. Any launch
+that lands for the pane clears the mark. Waking it during the quit grace ends
+the old process first, so two copies never run on one conversation.
 
-Every wake (opening the pane, pinning it, or `ctl wake`) records
+Every wake (see [Waking an asleep pane](#waking-an-asleep-pane)) records
 `activity.woken_at`, and the idle timer counts from it. A woken pane therefore
 runs at least N hours before the timer can sleep it again, even if nobody
 types into it, and a restart in that time starts it rather than leaving it
@@ -96,7 +95,7 @@ dormant.
 ## How an asleep pane looks
 
 A pane put to sleep and one [deferred at launch](dormant-restore.md) look the
-same, because opening either does the same thing. Outside control still tells
+same, because waking either does the same thing. Outside control still tells
 them apart (`not_running_reason`).
 
 - **Sidebar row:** one line at any sidebar width, like a running row. The name
@@ -106,14 +105,40 @@ them apart (`not_running_reason`).
   than filled, so filled pills mean running panes: a moon and how long ago the
   pane last worked (`5m`, `20h`, `31d`), in its saved status color (green
   finished, amber interrupted, grey idle). Hovering the pill gives the words:
-  "Asleep · finished 20h ago".
+  "Asleep · finished 20h ago". Hovering the row turns the pill into a Wake
+  button in the same place.
 - **Tab:** a moon and the muted title, no age.
-- **Pane:** its name, last title, the same words, folder and a Start button.
+- **Pane:** its name, last title, the same words, folder, "Press Enter or start
+  typing to wake it" and a **Wake** button.
 
 When the pane's saved conversation is gone (checked on load, project open,
 sleep, wake and once a minute, the same look as the sleep rule), the pill adds
 `∅`, the tooltip and pane say "The saved conversation is gone. Waking starts a
 new one in the same folder.", and the button reads **Start fresh**.
+
+## Waking an asleep pane
+
+Selecting an asleep pane (its sidebar row, its tab, tab cycling, a
+notification, the tray, opening its project, or muxel restarting with it
+active) shows its face and starts nothing. Each start costs an agent's memory
+(about 659 MiB for an idle Claude) and keeps it for at least the sleep
+threshold, so clicking through rows to find a session must not start each one.
+
+A deliberate act wakes it:
+
+- Enter, or a key that types a character, while the pane is selected. The key
+  itself is dropped: nothing may reach a booting program, which could be
+  showing a trust card or an update prompt. Shortcuts (Ctrl, Alt, the platform
+  key), arrows, Tab and Escape leave it asleep.
+- the pane's **Wake** (or **Start fresh**) button, the Wake button its row's
+  pill turns into on hover, or **Wake** in the row menu. These also select it.
+- pinning it.
+- `ctl focus`, which opens the pane on purpose, and `ctl wake`, which starts it
+  in the background.
+
+While the program starts, the pane keeps its face, saying "Waking…" and
+"Resuming its conversation", until the terminal draws its first frame, in
+place of the startup spinner.
 
 ## Outside control
 
