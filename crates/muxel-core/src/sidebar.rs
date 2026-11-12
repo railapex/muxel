@@ -25,6 +25,11 @@ pub enum ActivityBand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarEntry {
     Worktree(Uuid),
+    /// Recent work's label over the rows asking for something.
+    NeedsYou,
+    /// Recent work's label over the working rows, with how many sessions in
+    /// them are working.
+    Working(usize),
     Band(ActivityBand),
     Pane(Uuid),
     /// A row drawn one level in, under the top-level session row before it:
@@ -97,28 +102,38 @@ impl BandClock {
     }
 }
 
-/// The groups of rows within each band of Recent work, top to bottom. Whether
-/// a row has been read never decides its group or its place in the group.
+/// The groups of rows in Recent work, top to bottom. Whether a row has been
+/// read never decides its group or its place in the group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecentGroup {
-    /// Asking for something now: newest question first.
+    /// Asking for something now: newest question first, whatever day it was
+    /// asked.
     Asking,
-    /// Has worked and isn't running a turn (finished, stopped, exited or
-    /// interrupted), last at or after the start of the oldest turn still
-    /// running in the project, or with none running. Newest event first.
-    Recent,
     /// Running a turn: oldest start first, so a new turn joins the bottom.
     Working,
-    /// Has worked and isn't running a turn, last before the oldest turn
-    /// still running began: older news than anything working. Newest event
+    /// Has worked and isn't running a turn (finished, stopped, exited,
+    /// interrupted or not running): in the band of its latest event, newest
     /// first.
-    Earlier,
-    /// Has never worked: newest open first.
+    Done,
+    /// Has never worked: in the band it was opened, newest open first, below
+    /// that band's done rows.
     Unused,
 }
 
-/// Where a row sits in Recent work: its band, its group within the band, then
-/// its time within the group.
+/// The sections of Recent work, top to bottom, each under its own label when
+/// a project's rows span more than one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecentSection {
+    /// The asking rows.
+    NeedsYou,
+    /// The working rows.
+    Working,
+    /// The done and never-used rows of one band.
+    Band(ActivityBand),
+}
+
+/// Where a row sits in Recent work: its section, its group within the
+/// section, then its time within the group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecentPlace {
     band: ActivityBand,
@@ -127,13 +142,13 @@ pub struct RecentPlace {
 }
 
 impl RecentPlace {
-    /// `shown` is the state the row shows now. Only a change of work moves a
-    /// row: a start, a finish, a question or an answer. The band comes from
-    /// the latest of those, so a row that stops working stays in the band its
-    /// turn started in. A working row is Today, however long its turn has run.
-    /// A row that has never worked goes by when it was last opened (a file a
-    /// session opened again counts from then), or with the Older rows when
-    /// that isn't known.
+    /// `shown` is the state the row shows now. Only a change of the row's own
+    /// work moves it: a start, a finish, a question or an answer. A done
+    /// row's band comes from the latest of those, so a row that stops working
+    /// stays in the band its turn started in. A row that has never worked goes
+    /// by when it was last opened (a file a session opened again counts from
+    /// then), or with the Older rows when that isn't known. Asking and working
+    /// rows have their own sections above the bands.
     pub fn of(instance: &Instance, shown: Option<AgentActivityState>, clock: BandClock) -> Self {
         let activity = &instance.activity;
         let latest = activity.last_work_at();
@@ -149,7 +164,7 @@ impl RecentPlace {
                 activity.blocked_at.or(latest).unwrap_or(clock.now),
             ),
             _ => match latest {
-                Some(at) => (RecentGroup::Recent, at),
+                Some(at) => (RecentGroup::Done, at),
                 None => {
                     return Self {
                         band: opened.map_or(ActivityBand::Older, |at| clock.band(at)),
@@ -179,42 +194,25 @@ impl RecentPlace {
         self.group
     }
 
-    /// This place once a turn that started at `oldest_turn`, the oldest still
-    /// running in the project, is taken into account: a row that last worked
-    /// before it began sits below the working rows ([`RecentGroup::Earlier`]).
-    /// With no turn running, nothing moves.
-    fn behind(self, oldest_turn: Option<i64>) -> Self {
-        match (self.group, self.at, oldest_turn) {
-            (RecentGroup::Recent, Some(at), Some(started)) if at < started => Self {
-                group: RecentGroup::Earlier,
-                ..self
-            },
-            _ => self,
+    /// The section this place puts its row in.
+    pub fn section(self) -> RecentSection {
+        match self.group {
+            RecentGroup::Asking => RecentSection::NeedsYou,
+            RecentGroup::Working => RecentSection::Working,
+            RecentGroup::Done | RecentGroup::Unused => RecentSection::Band(self.band),
         }
     }
 }
 
-/// When the oldest turn still running among `instances` began, from each
-/// row's recorded lifecycle rather than the status it shows, so a status that
-/// flickers without the reducer recording a change moves no row.
-fn oldest_running_turn<'a>(instances: impl IntoIterator<Item = &'a Instance>) -> Option<i64> {
-    instances
-        .into_iter()
-        .filter(|instance| instance.activity.current_state() == Some(AgentActivityState::Working))
-        .filter_map(|instance| instance.activity.work_started_at)
-        .min()
-}
-
 impl Ord for RecentPlace {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.band, self.group)
-            .cmp(&(other.band, other.group))
+        (self.section(), self.group)
+            .cmp(&(other.section(), other.group))
             .then_with(|| match self.group {
                 RecentGroup::Working => self.at.cmp(&other.at),
-                RecentGroup::Asking
-                | RecentGroup::Recent
-                | RecentGroup::Earlier
-                | RecentGroup::Unused => other.at.cmp(&self.at),
+                RecentGroup::Asking | RecentGroup::Done | RecentGroup::Unused => {
+                    other.at.cmp(&self.at)
+                }
             })
     }
 }
@@ -371,15 +369,30 @@ pub fn select_rows(
     }
 }
 
-/// How many sessions nested under the row at `entries[at]` show a question,
-/// so that row can say so: its whole family sorts as Asking meanwhile.
-pub fn nested_asking(
+/// What a family's top row tells of the sessions nested under it, whose own
+/// rows sit below it, where you may not look.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FamilyTags {
+    /// How many show a question: the family sorts as Asking meanwhile.
+    pub asking: usize,
+    /// How many are working while the top session isn't, whose own badge
+    /// would say so: the family sorts as Working meanwhile, unless one asks.
+    pub working: usize,
+}
+
+/// The tags of the top row at `entries[at]` ([`FamilyTags`]). Any other
+/// row has none.
+pub fn family_tags(
     entries: &[SidebarEntry],
     at: usize,
     instances: &InstancesById,
     shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
-) -> usize {
-    entries
+) -> FamilyTags {
+    let mut tags = FamilyTags::default();
+    let SidebarEntry::Pane(top) = entries[at] else {
+        return tags;
+    };
+    let children = entries
         .iter()
         .skip(at + 1)
         .take_while(|entry| {
@@ -388,16 +401,27 @@ pub fn nested_asking(
                 SidebarEntry::Nested(_) | SidebarEntry::NestedTwice(_)
             )
         })
-        .filter(|entry| match entry {
-            SidebarEntry::Nested(id) => {
-                instances
+        .filter_map(|entry| match entry {
+            SidebarEntry::Nested(id)
+                if instances
                     .get(id)
-                    .is_some_and(|i| i.kind == InstanceKind::Terminal)
-                    && shown(*id) == Some(AgentActivityState::Blocked)
+                    .is_some_and(|i| i.kind == InstanceKind::Terminal) =>
+            {
+                Some(shown(*id))
             }
-            _ => false,
-        })
-        .count()
+            _ => None,
+        });
+    for state in children {
+        match state {
+            Some(AgentActivityState::Blocked) => tags.asking += 1,
+            Some(AgentActivityState::Working) => tags.working += 1,
+            _ => {}
+        }
+    }
+    if shown(top) == Some(AgentActivityState::Working) {
+        tags.working = 0;
+    }
+    tags
 }
 
 /// The files, diffs and pages that close with `sessions` when the user closes
@@ -516,13 +540,12 @@ pub fn sidebar_rows_each<'a>(
 /// membership cannot hold older sessions above newer work, except that a file,
 /// diff or page follows the session that opened it, newest open first, and a
 /// session follows the one that spawned it ([`nests_under`]). A family moves
-/// as one row, placed by its top session or, while any of it asks, as Asking
-/// ([`nested_asking`] tells the top row).
+/// as one row: Asking while any of its sessions asks, else Working while any
+/// works, else by its newest event ([`family_tags`] tells the top row).
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
-/// state each row shows (`shown`), with the rows that last worked before the
-/// project's oldest running turn began below the working ones. Nothing about
-/// reading or focus is an input.
+/// state each row shows (`shown`), and labels each section when the unpinned
+/// rows span more than one. Nothing about reading or focus is an input.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
     instances: &InstancesById,
@@ -558,16 +581,12 @@ pub fn sidebar_order(
         group: RecentGroup::Unused,
         at: None,
     };
-    // Future times count as now, here as in each row's own place.
-    let oldest_turn =
-        oldest_running_turn(pane_ids.iter().filter_map(|id| instances.get(id).copied()))
-            .map(|started| started.min(clock.now));
     let places: HashMap<Uuid, RecentPlace> = pane_ids
         .iter()
         .map(|&id| {
-            let place = instances.get(&id).map_or(unknown, |i| {
-                RecentPlace::of(i, shown(id), clock).behind(oldest_turn)
-            });
+            let place = instances
+                .get(&id)
+                .map_or(unknown, |i| RecentPlace::of(i, shown(id), clock));
             (id, place)
         })
         .collect();
@@ -598,29 +617,30 @@ pub fn sidebar_order(
     for children in sessions.values_mut() {
         children.sort_by_key(place);
     }
-    // A family sorts by its top row, except that while any of it asks, the
-    // whole family sorts as Asking, in the latest band among those asking, by
-    // its newest question.
+    // A family's sessions: its top one and those nested under it.
+    let members =
+        |id: Uuid| std::iter::once(id).chain(sessions.get(&id).into_iter().flatten().copied());
+    // While any of a family asks, it sorts as Asking by its newest question;
+    // else while any of it works, as Working by its earliest start, so a
+    // second turn starting doesn't move it; else by its newest event, so a
+    // child's finish brings the family up.
     let family = |id: Uuid| {
-        let own = place(&id);
-        let members = sessions.get(&id).into_iter().flatten().map(place);
-        std::iter::once(own)
-            .chain(members)
-            .filter(|member| member.group == RecentGroup::Asking)
-            .fold(None, |lifted: Option<RecentPlace>, asking| {
-                Some(lifted.map_or(
-                    RecentPlace {
-                        band: asking.band.min(own.band),
-                        ..asking
-                    },
-                    |lifted| RecentPlace {
-                        band: lifted.band.min(asking.band),
-                        at: lifted.at.max(asking.at),
-                        ..lifted
-                    },
-                ))
+        let all = || members(id).map(|member| place(&member));
+        let of = |group| move |member: &RecentPlace| member.group == group;
+        all()
+            .filter(of(RecentGroup::Asking))
+            .max_by_key(|asking| asking.at)
+            .or_else(|| {
+                all()
+                    .filter(of(RecentGroup::Working))
+                    .min_by_key(|working| working.at)
             })
-            .unwrap_or(own)
+            .or_else(|| {
+                all()
+                    .filter(of(RecentGroup::Done))
+                    .max_by_key(|done| done.at)
+            })
+            .unwrap_or_else(|| place(&id))
     };
     let row = |out: &mut Vec<SidebarEntry>, id: Uuid| {
         out.push(SidebarEntry::Pane(id));
@@ -643,18 +663,31 @@ pub fn sidebar_order(
     for (id, _) in placed(pinned) {
         row(&mut out, id);
     }
-    // Pinned rows have a pin glyph instead of an age heading; their ages must
-    // not cause Older → Today headings to repeat across the pinned boundary.
+    // Pinned rows have a pin glyph instead of a section label; their places
+    // must not cause labels to repeat across the pinned boundary.
     let rest = placed(rest);
-    let label_bands = rest
-        .first()
-        .is_some_and(|(_, first)| rest.iter().any(|(_, place)| place.band != first.band));
+    let labelled = rest.first().is_some_and(|(_, first)| {
+        rest.iter()
+            .any(|(_, place)| place.section() != first.section())
+    });
+    // The working sessions under the Working label, nested ones included.
+    let working = rest
+        .iter()
+        .filter(|(_, place)| place.section() == RecentSection::Working)
+        .flat_map(|&(id, _)| members(id))
+        .filter(|member| place(member).group == RecentGroup::Working)
+        .count();
     let mut current = None;
     for (id, place) in rest {
-        if label_bands && current != Some(place.band) {
-            out.push(SidebarEntry::Band(place.band));
+        let section = place.section();
+        if labelled && current != Some(section) {
+            out.push(match section {
+                RecentSection::NeedsYou => SidebarEntry::NeedsYou,
+                RecentSection::Working => SidebarEntry::Working(working),
+                RecentSection::Band(band) => SidebarEntry::Band(band),
+            });
         }
-        current = Some(place.band);
+        current = Some(section);
         row(&mut out, id);
     }
     out
@@ -877,20 +910,20 @@ mod tests {
     }
 
     #[test]
-    fn a_spawned_session_nests_under_its_spawner_and_the_family_moves_as_one() {
+    fn a_spawned_session_nests_under_its_spawner_and_the_family_moves_by_its_newest_event() {
         use SidebarEntry::{Nested, NestedTwice, Pane};
         let (mut project, mut workspace, ids) =
             fixture(vec![worked(NOW - 1_000), worked(NOW - 2_000)]);
         let (a, b) = (ids[0], ids[1]);
-        // B spawns two sessions that have both finished since A did; a third
+        // B spawns two sessions that both finished before A did; a third
         // session opted out with `--top-level`.
-        let older = session(&mut workspace, &mut project, Some(b), worked(NOW - 600));
-        let newer = session(&mut workspace, &mut project, Some(b), worked(NOW - 300));
+        let older = session(&mut workspace, &mut project, Some(b), worked(NOW - 3_000));
+        let newer = session(&mut workspace, &mut project, Some(b), worked(NOW - 2_500));
         let alone = session(&mut workspace, &mut project, None, worked(NOW - 5_000));
         let page = file(&mut workspace, &mut project, Some(b), 10);
         let notes = file(&mut workspace, &mut project, Some(older), 20);
-        // The family goes by B, however new its children's work. B's own
-        // files come first, then each child with its files a level further in.
+        // B's own files come first, then each child, newest event first, with
+        // its files a level further in.
         assert_eq!(
             recent(&project, &workspace),
             vec![
@@ -904,8 +937,9 @@ mod tests {
             ]
         );
 
-        // B finishes a turn: the whole family moves above A.
-        workspace.instance_mut(b).unwrap().activity.observe(
+        // The older child finishes a turn: the whole family moves above A,
+        // and that child leads it.
+        workspace.instance_mut(older).unwrap().activity.observe(
             Some(AgentActivityState::Working),
             AgentActivityState::Done,
             NOW - 100,
@@ -915,19 +949,28 @@ mod tests {
             vec![
                 Pane(b),
                 Nested(page),
-                Nested(newer),
                 Nested(older),
                 NestedTwice(notes),
+                Nested(newer),
                 Pane(a),
                 Pane(alone)
             ]
         );
     }
 
+    /// The tags the top row at `entries[at]` shows, every row showing its
+    /// saved state.
+    fn tags(workspace: &Workspace, entries: &[SidebarEntry], at: usize) -> FamilyTags {
+        let index = instances_by_id(workspace);
+        family_tags(entries, at, &index, &|id| {
+            index.get(&id).and_then(|i| live(i))
+        })
+    }
+
     #[test]
     fn an_asking_child_lifts_its_family_and_its_parent_row_says_so() {
-        use AgentActivityState::{Blocked, Working};
-        use SidebarEntry::{Band, Nested, Pane};
+        use AgentActivityState::{Blocked, Done, Working};
+        use SidebarEntry::{Band, NeedsYou, Nested, Pane};
         let (mut project, mut workspace, ids) =
             fixture(vec![worked(NOW - 1_000), worked(NOW - 40 * DAY)]);
         let (a, b) = (ids[0], ids[1]);
@@ -937,12 +980,6 @@ mod tests {
             Some(b),
             worked(NOW - 40 * DAY + 1_000),
         );
-        let asking = |workspace: &Workspace, entries: &[SidebarEntry], at: usize| {
-            let index = instances_by_id(workspace);
-            nested_asking(entries, at, &index, &|id| {
-                index.get(&id).and_then(|i| live(i))
-            })
-        };
         let settled = vec![
             Band(ActivityBand::Today),
             Pane(a),
@@ -951,26 +988,59 @@ mod tests {
             Nested(child),
         ];
         assert_eq!(recent(&project, &workspace), settled);
-        assert_eq!(asking(&workspace, &settled, 3), 0);
+        assert_eq!(tags(&workspace, &settled, 3), FamilyTags::default());
 
         // The child asks: its old parent leads the list with it, and says so.
         change(&mut workspace, child, Blocked, NOW - 50);
         let lifted = recent(&project, &workspace);
-        assert_eq!(lifted, vec![Pane(b), Nested(child), Pane(a)]);
-        assert_eq!(asking(&workspace, &lifted, 0), 1);
-        assert_eq!(asking(&workspace, &lifted, 2), 0);
+        assert_eq!(
+            lifted,
+            vec![
+                NeedsYou,
+                Pane(b),
+                Nested(child),
+                Band(ActivityBand::Today),
+                Pane(a)
+            ]
+        );
+        assert_eq!(tags(&workspace, &lifted, 1).asking, 1);
+        assert_eq!(tags(&workspace, &lifted, 4), FamilyTags::default());
         // Looking at the question moves nothing.
         attend(&mut workspace, child, NOW - 10);
         assert_eq!(recent(&project, &workspace), lifted);
 
-        // Answering it lets the family fall back to B's own place.
+        // Answered, the child works on, and the family with it.
         change(&mut workspace, child, Working, NOW - 5);
-        assert_eq!(recent(&project, &workspace), settled);
+        let working = recent(&project, &workspace);
+        assert_eq!(
+            working,
+            vec![
+                SidebarEntry::Working(1),
+                Pane(b),
+                Nested(child),
+                Band(ActivityBand::Today),
+                Pane(a)
+            ]
+        );
+        assert_eq!(
+            tags(&workspace, &working, 1),
+            FamilyTags {
+                asking: 0,
+                working: 1
+            }
+        );
+
+        // Its finish is the family's newest event.
+        change(&mut workspace, child, Done, NOW - 1);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(b), Nested(child), Pane(a)]
+        );
     }
 
     #[test]
-    fn an_old_question_lifts_its_family_without_dragging_it_down_a_band() {
-        use SidebarEntry::{Nested, Pane};
+    fn an_old_question_lifts_its_family_into_needs_you() {
+        use SidebarEntry::{Band, NeedsYou, Nested, Pane};
         let (mut project, mut workspace, ids) =
             fixture(vec![worked(NOW - 1_000), worked(NOW - 500)]);
         let (a, b) = (ids[0], ids[1]);
@@ -989,8 +1059,87 @@ mod tests {
         );
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(a), Nested(child), Pane(b)]
+            vec![
+                NeedsYou,
+                Pane(a),
+                Nested(child),
+                Band(ActivityBand::Today),
+                Pane(b)
+            ]
         );
+    }
+
+    /// The busy day in the order design: a spawner that finished an hour ago
+    /// with one child working and one done sits among the working rows by
+    /// its child's start, and says how many of its children work.
+    #[test]
+    fn a_family_sorts_as_working_while_any_child_works() {
+        use AgentActivityState::{Done, Working};
+        use SidebarEntry::{Band, Nested, Pane};
+        let (mut project, mut workspace, ids) = fixture(vec![
+            worked(NOW - 3 * HOUR),
+            worked(NOW - 3 * HOUR),
+            worked(NOW - 65 * MINUTE),
+            worked(NOW - 3 * HOUR),
+            worked(NOW - 2 * MINUTE),
+        ]);
+        let (early, middle, release, late, finished) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let first = session(
+            &mut workspace,
+            &mut project,
+            Some(release),
+            worked(NOW - 2 * HOUR),
+        );
+        let second = session(
+            &mut workspace,
+            &mut project,
+            Some(release),
+            worked(NOW - 12 * MINUTE),
+        );
+        for (id, started) in [
+            (early, NOW - 130 * MINUTE),
+            (middle, NOW - 48 * MINUTE),
+            (first, NOW - 35 * MINUTE),
+            (late, NOW - 21 * MINUTE),
+        ] {
+            change(&mut workspace, id, Working, started);
+        }
+        let order = recent(&project, &workspace);
+        assert_eq!(
+            order,
+            vec![
+                SidebarEntry::Working(4),
+                Pane(early),
+                Pane(middle),
+                Pane(release),
+                Nested(first),
+                Nested(second),
+                Pane(late),
+                Band(ActivityBand::Today),
+                Pane(finished),
+            ]
+        );
+        assert_eq!(tags(&workspace, &order, 3).working, 1);
+
+        // The second child starts a turn: the family keeps its place, by its
+        // earliest start, and that child goes under the first.
+        change(&mut workspace, second, Working, NOW - MINUTE);
+        let order = recent(&project, &workspace);
+        assert_eq!(order[3..6], [Pane(release), Nested(first), Nested(second)]);
+        assert_eq!(order[0], SidebarEntry::Working(5));
+        assert_eq!(tags(&workspace, &order, 3).working, 2);
+        // The first finishes: the family moves down the block once, by the
+        // second's start.
+        change(&mut workspace, first, Done, NOW);
+        assert_eq!(
+            panes(recent(&project, &workspace)),
+            vec![early, middle, late, release, finished]
+        );
+        // The parent's own turn needs no tag: its own badge says working.
+        change(&mut workspace, release, Working, NOW);
+        let order = recent(&project, &workspace);
+        let at = order.iter().position(|e| *e == Pane(release)).unwrap();
+        assert_eq!(tags(&workspace, &order, at), FamilyTags::default());
     }
 
     #[test]
@@ -1524,87 +1673,6 @@ mod tests {
         }
     }
 
-    /// A finish from before every turn still running is older news than that
-    /// work, so it sits below the working rows; a finish since the oldest of
-    /// them began stays above. While anything works the oldest start only
-    /// moves forward (a new turn starts now), so a row that dropped comes
-    /// back up when the work ends: with nothing working, every finish is
-    /// newest first, as before.
-    #[test]
-    fn a_finish_from_before_every_running_turn_sits_below_the_working_rows() {
-        use AgentActivityState::{Blocked, Done, Working};
-        let (project, mut workspace, ids) = fixture(vec![
-            worked(NOW - 3 * HOUR),
-            worked(NOW - 4 * HOUR),
-            worked(NOW - 5 * HOUR),
-            worked(NOW - 6 * HOUR),
-        ]);
-        let (old, first, second, third) = (ids[0], ids[1], ids[2], ids[3]);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![old, first, second, third]
-        );
-
-        // A turn starts after `old` finished: `old` drops below it, read or not.
-        change(&mut workspace, first, Working, NOW - 2 * HOUR);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![first, old, second, third]
-        );
-        attend(&mut workspace, old, NOW - 2 * HOUR + MINUTE);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![first, old, second, third]
-        );
-
-        // A finish since that turn began is news: it stays above the work.
-        change(&mut workspace, second, Working, NOW - 100 * MINUTE);
-        change(&mut workspace, second, Done, NOW - 90 * MINUTE);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![second, first, old, third]
-        );
-
-        // The oldest turn asks: a question isn't work, so only `third`'s
-        // newer turn is running, and `second` finished before it began.
-        change(&mut workspace, third, Working, NOW - 80 * MINUTE);
-        change(&mut workspace, first, Blocked, NOW - 70 * MINUTE);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![first, third, second, old]
-        );
-
-        // Both turns end: nothing works, so every finish is newest first.
-        change(&mut workspace, first, Done, NOW - 20 * MINUTE);
-        change(&mut workspace, third, Done, NOW - 10 * MINUTE);
-        assert_eq!(
-            pane_order(&project, &workspace),
-            vec![third, first, second, old]
-        );
-    }
-
-    /// The working rows' oldest start comes from what the reducer recorded,
-    /// not from what a row shows, so a status the reducer hasn't recorded (a
-    /// flicker, a turn not yet sampled) drops no finish below it. The row
-    /// showing it still sits with the working rows, as it always has.
-    #[test]
-    fn a_status_the_reducer_has_not_recorded_drops_no_finish_below_it() {
-        let (project, workspace, ids) = fixture(vec![worked(NOW - 3 * HOUR), worked(NOW - HOUR)]);
-        let (done, flicker) = (ids[0], ids[1]);
-        assert_eq!(pane_order(&project, &workspace), vec![flicker, done]);
-        let shows_working = |instance: &Instance| {
-            if instance.id == flicker {
-                Some(AgentActivityState::Working)
-            } else {
-                live(instance)
-            }
-        };
-        assert_eq!(
-            panes(order_at(&project, &workspace, &shows_working, clock())),
-            vec![done, flicker]
-        );
-    }
-
     #[test]
     fn starting_a_turn_joins_the_bottom_of_the_working_rows() {
         let (project, mut workspace, ids) = fixture(vec![
@@ -1628,19 +1696,19 @@ mod tests {
         );
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![read, unseen, first, second]
+            vec![first, second, read, unseen]
         );
         // An unseen finish doesn't hold it up: it keeps only its dot.
         change(&mut workspace, unseen, AgentActivityState::Working, NOW);
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![read, first, second, unseen]
+            vec![first, second, unseen, read]
         );
         assert!(is_unread(&workspace.instance(unseen).unwrap().activity));
     }
 
     #[test]
-    fn finishing_moves_a_row_to_the_top_of_recent_watched_or_not() {
+    fn finishing_moves_a_row_to_the_top_of_the_done_rows_watched_or_not() {
         for watched in [false, true] {
             let (project, mut workspace, ids) = fixture(vec![
                 worked(NOW - 20 * MINUTE),
@@ -1669,16 +1737,17 @@ mod tests {
             if watched {
                 attend(&mut workspace, ids[3], NOW - MINUTE);
             }
+            // Just under the working row, whose turn began before it.
             assert_eq!(
                 pane_order(&project, &workspace),
-                vec![ids[3], ids[0], ids[1], ids[2]],
+                vec![ids[2], ids[3], ids[0], ids[1]],
                 "watched: {watched}"
             );
         }
     }
 
     #[test]
-    fn a_question_leads_its_band_above_newer_finishes() {
+    fn a_question_leads_the_working_rows_and_newer_finishes() {
         let (project, mut workspace, ids) = fixture(vec![
             unread(NOW - MINUTE),
             worked(NOW - 3 * HOUR),
@@ -1705,13 +1774,13 @@ mod tests {
         );
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![asking, finished, working]
+            vec![asking, working, finished]
         );
         // Seen but not yet answered, it is still asking.
         attend(&mut workspace, asking, NOW);
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![asking, finished, working]
+            vec![asking, working, finished]
         );
     }
 
@@ -1743,7 +1812,7 @@ mod tests {
         );
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![asking, read, working]
+            vec![asking, working, read]
         );
         // Answered through `muxel ctl send`, without anyone looking: the
         // question stays unread, and only the dot says so.
@@ -1755,7 +1824,7 @@ mod tests {
         );
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![read, working, asking]
+            vec![working, asking, read]
         );
         assert!(is_unread(&workspace.instance(asking).unwrap().activity));
     }
@@ -1771,7 +1840,7 @@ mod tests {
             AgentActivityState::Working,
             NOW - 10 * MINUTE,
         );
-        // `read` finished before that turn began, so it sits below it.
+        // Working rows lead.
         assert_eq!(pane_order(&project, &workspace), vec![flicker, read]);
         // Idle for a moment: still today's work, the newest event in the band.
         change(
@@ -1841,8 +1910,7 @@ mod tests {
             order_at(&project, &workspace, &no_terminal, clock()),
             vec![SidebarEntry::Pane(saved), SidebarEntry::Pane(read)]
         );
-        // Its terminal comes up still working. `read` finished before that
-        // turn began, so it stays below it and nothing moves.
+        // Its terminal comes up still working: it leads as a working row.
         assert_eq!(pane_order(&project, &workspace), vec![saved, read]);
     }
 
@@ -1920,7 +1988,7 @@ mod tests {
         );
         assert_eq!(
             pane_order(&project, &workspace),
-            vec![asking, read, working, unpinned]
+            vec![asking, working, read, unpinned]
         );
     }
 
@@ -1960,12 +2028,11 @@ mod tests {
     }
 
     #[test]
-    fn working_rows_sit_together_in_start_order_above_older_finishes() {
+    fn working_rows_sit_together_in_start_order_above_every_finish() {
         // Chris's screenshot: three working sessions, two read finishes from
         // 11 h ago, and a session that last finished 13 h ago, yesterday, and
-        // has been working for 2 h. The finishes came before the oldest turn
-        // still running began, so they sit under the working rows.
-        let (project, mut workspace, ids) = fixture(vec![
+        // has been working for 2 h.
+        let (mut project, mut workspace, ids) = fixture(vec![
             worked(NOW - HOUR),
             worked(NOW - 3 * HOUR),
             worked(NOW - 4 * HOUR),
@@ -1986,16 +2053,37 @@ mod tests {
                 started,
             );
         }
+        use SidebarEntry::{Band, Pane, Working};
         assert_eq!(
             recent(&project, &workspace),
-            [ids[2], ids[1], ids[5], ids[0], ids[3], ids[4]]
-                .map(SidebarEntry::Pane)
-                .to_vec()
+            vec![
+                Working(4),
+                Pane(ids[2]),
+                Pane(ids[1]),
+                Pane(ids[5]),
+                Pane(ids[0]),
+                Band(ActivityBand::Today),
+                Pane(ids[3]),
+                Pane(ids[4]),
+            ]
+        );
+        // A session that finished 20 minutes ago, after session 3's turn
+        // began, sits directly under the working rows: a finish is never
+        // above work, however long that work has run.
+        let fresh = session(
+            &mut workspace,
+            &mut project,
+            None,
+            worked(NOW - 20 * MINUTE),
+        );
+        assert_eq!(
+            panes(recent(&project, &workspace)),
+            vec![ids[2], ids[1], ids[5], ids[0], fresh, ids[3], ids[4]]
         );
     }
 
     #[test]
-    fn a_working_row_is_today_however_old_its_last_finish() {
+    fn a_working_row_leads_however_old_its_last_finish() {
         let (project, mut workspace, ids) = fixture(vec![
             worked(NOW - 1_000),
             worked(NOW - 40 * DAY),
@@ -2007,12 +2095,13 @@ mod tests {
             AgentActivityState::Working,
             NOW - 500,
         );
-        use SidebarEntry::{Band, Pane};
+        use SidebarEntry::{Band, Pane, Working};
         assert_eq!(
             recent(&project, &workspace),
             vec![
-                Band(ActivityBand::Today),
+                Working(1),
                 Pane(ids[1]),
+                Band(ActivityBand::Today),
                 Pane(ids[0]),
                 Band(ActivityBand::Older),
                 Pane(ids[2]),
@@ -2033,7 +2122,7 @@ mod tests {
         assert_eq!(place(&instance).band(), ActivityBand::ThisWeek);
         instance.activity.work_started_at = Some(NOW - HOUR);
         assert_eq!(place(&instance).band(), ActivityBand::Today);
-        assert_eq!(place(&instance).group(), RecentGroup::Recent);
+        assert_eq!(place(&instance).group(), RecentGroup::Done);
         for (at, expected) in [
             (NOW - 12 * HOUR, ActivityBand::Today),
             (NOW - 12 * HOUR - 1, ActivityBand::ThisWeek),

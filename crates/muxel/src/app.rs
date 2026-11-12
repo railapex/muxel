@@ -35,8 +35,8 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, InstancesById, SelectClick, SidebarEntry, SidebarSort,
-    instances_by_id, is_unread, nest_on_drop, nested_asking, notification_in_feed, select_rows,
+    ActivityBand, BandClock, FamilyTags, InstancesById, SelectClick, SidebarEntry, SidebarSort,
+    family_tags, instances_by_id, is_unread, nest_on_drop, notification_in_feed, select_rows,
     sessions_under, sidebar_order, sidebar_rows_each, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
@@ -1150,7 +1150,14 @@ mod restored_activity_tests {
         }
         // A turn that finished before the process exited stays finished.
         assert_eq!(
-            sample_status(&exit, Some(&attended_completion()), false, true, false, true),
+            sample_status(
+                &exit,
+                Some(&attended_completion()),
+                false,
+                true,
+                false,
+                true
+            ),
             AgentStatus::Done
         );
     }
@@ -1192,7 +1199,14 @@ mod restored_activity_tests {
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&booting, Some(&attended_completion()), false, false, true, true),
+            sample_status(
+                &booting,
+                Some(&attended_completion()),
+                false,
+                false,
+                true,
+                true
+            ),
             AgentStatus::Done
         );
         // Startup output while the relaunch settles is not a turn either.
@@ -24099,24 +24113,21 @@ impl MuxelApp {
         self.request_recoverable_close(ids, cx);
     }
 
-    /// For each of `entries` ([`Self::sidebar_entries`]), how many sessions
-    /// nested under it are asking: what a family's top row tells, since its
-    /// children sit below it. Zero for any other row.
-    fn sidebar_family_asking(
+    /// For each of `entries` ([`Self::sidebar_entries`]), what a family's top
+    /// row tells of the sessions nested under it ([`family_tags`]), since its
+    /// children sit below it. None for any other row.
+    fn sidebar_family_tags(
         &self,
         entries: &[SidebarEntry],
         placing: &InstancesById,
         cx: &App,
-    ) -> Vec<usize> {
+    ) -> Vec<FamilyTags> {
         let shown = |iid: Uuid| {
             let instance = placing.get(&iid).copied();
             Some(activity_state(self.sidebar_status(iid, instance, cx)))
         };
         (0..entries.len())
-            .map(|at| match entries[at] {
-                SidebarEntry::Pane(_) => nested_asking(entries, at, placing, &shown),
-                _ => 0,
-            })
+            .map(|at| family_tags(entries, at, placing, &shown))
             .collect()
     }
 
@@ -29168,7 +29179,7 @@ impl MuxelApp {
 
             if !collapsed {
                 let entries = self.sidebar_entries(&pane_ids, &placing, bands, cx);
-                let asking_below = self.sidebar_family_asking(&entries, &placing, cx);
+                let tags_below = self.sidebar_family_tags(&entries, &placing, cx);
                 // The rows as drawn, which a Shift-click selects along.
                 let row_order: std::rc::Rc<[Uuid]> = entries
                     .iter()
@@ -29176,7 +29187,10 @@ impl MuxelApp {
                         SidebarEntry::Pane(id)
                         | SidebarEntry::Nested(id)
                         | SidebarEntry::NestedTwice(id) => Some(*id),
-                        SidebarEntry::Worktree(_) | SidebarEntry::Band(_) => None,
+                        SidebarEntry::Worktree(_)
+                        | SidebarEntry::NeedsYou
+                        | SidebarEntry::Working(_)
+                        | SidebarEntry::Band(_) => None,
                     })
                     .collect();
                 // A slight gap between the project header and its panes, so the
@@ -29184,17 +29198,23 @@ impl MuxelApp {
                 if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                for (entry, asking_below) in entries.into_iter().zip(asking_below) {
+                for (entry, tags_below) in entries.into_iter().zip(tags_below) {
                     let (iid, depth) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
                         }
-                        SidebarEntry::Band(band) => {
-                            let label = match band {
-                                ActivityBand::Today => t("Today"),
-                                ActivityBand::ThisWeek => t("This week"),
-                                ActivityBand::Older => t("Older"),
+                        SidebarEntry::NeedsYou
+                        | SidebarEntry::Working(_)
+                        | SidebarEntry::Band(_) => {
+                            let label = match entry {
+                                SidebarEntry::NeedsYou => t("Needs you"),
+                                SidebarEntry::Working(n) => {
+                                    tf("Working · {n}", &[("n", &n.to_string())]).into()
+                                }
+                                SidebarEntry::Band(ActivityBand::ThisWeek) => t("This week"),
+                                SidebarEntry::Band(ActivityBand::Older) => t("Older"),
+                                _ => t("Today"),
                             };
                             list = list.child(
                                 div()
@@ -29400,12 +29420,19 @@ impl MuxelApp {
                                     .flex_none()
                                     .bg(cx.theme().primary)
                             }))
-                            // A family's top row says when a session nested under
-                            // it asks: the family sorts as Asking meanwhile.
-                            .children((asking_below > 0).then(|| {
+                            // A family's top row says when sessions nested under
+                            // it ask, or work while it doesn't: the family sorts
+                            // as Asking, or else as Working, meanwhile.
+                            .children((tags_below.asking > 0).then(|| {
                                 div().flex_none().child(status_tag(
                                     AgentStatus::Blocked,
-                                    tf("{n} asking", &[("n", &asking_below.to_string())]),
+                                    tf("{n} asking", &[("n", &tags_below.asking.to_string())]),
+                                ))
+                            }))
+                            .children((tags_below.working > 0).then(|| {
+                                div().flex_none().child(status_tag(
+                                    AgentStatus::Working,
+                                    tf("{n} working", &[("n", &tags_below.working.to_string())]),
                                 ))
                             }))
                             .child(div().flex_none().child(if loading {

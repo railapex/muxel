@@ -1429,16 +1429,16 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then the rest in Today (since midnight), This week (the six days
-  before), and Older bands, by each session's latest start, finish or question.
-  Within a band, sessions asking a question come first; then the ones newly
-  done (finished since the oldest turn still running in the project began, or
-  any finish while nothing runs), newest first, read or not; then working
-  sessions in the order each started, so one that starts a turn joins the
-  bottom of them; then the ones done before that oldest turn began, newest
-  first; then sessions never used, newest open first. A working session counts
-  as Today however long its turn has run. Reading, focusing or clicking a
-  session never moves its row; only a change in work or a new day does. A command job's
+  each project, then **Needs you** (sessions asking a question, newest question
+  first), then **Working** (sessions running a turn, in the order each started,
+  so one that starts a turn joins the bottom of them), then the sessions done
+  in Today (since midnight), This week (the six days before) and Older bands, by
+  each one's latest start, finish or question, newest first, read or not, with
+  sessions never used last in each band, newest open first. A finish lands just
+  under the working rows, never above them. Each section gets a thin label, with
+  the working count on Working, when a project's rows span more than one.
+  Reading, focusing or clicking a session never moves its row, and neither does
+  another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that
   reported its finish before exiting is finished and notifies. Pinned sessions
   follow the same order. Project order and keyboard
@@ -1459,9 +1459,12 @@ feature is added or changed, update the matching entry here in the same change**
   session started by `muxel ctl new` from another session's pane shows indented
   under that session's row, and the family moves as one. A session spawned by a
   nested one nests under the same top session, so there are two levels at most:
-  a session, its child sessions, and each one's files. While any child asks a
-  question, the whole family sorts as asking and the top row shows **N asking**,
-  so nothing that needs you is buried. Drag a session onto another session's
+  a session, its child sessions, and each one's files. While any of the family
+  asks a question, it sits in Needs you and the top row shows **N asking**, so
+  nothing that needs you is buried; otherwise, while any of it works, it sits
+  with the working rows by its earliest start, and a top session that isn't
+  working itself shows **N working**; otherwise it goes by its newest finish,
+  so a child's finish brings the family up. Drag a session onto another session's
   row to nest it there, or onto its project's header to make it a row of its
   own. Closing a parent leaves its children open as ordinary rows, unless you
   choose Close with everything under it. A pinned session nests only under a

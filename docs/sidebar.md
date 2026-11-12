@@ -12,58 +12,49 @@ The saved `config.toml` setting is `sidebar_sort = "Layout"` or
 
 Recent work follows two rules. Looking at a session never moves its row:
 reading, focusing and clicking change no position, and read state drives only
-the unread mark and the Done pill. A row moves only when work in its project
-changes (a turn starts, finishes or stops, including when its process exits; a
+the unread mark and the Done pill. A row moves only when its own work changes
+(a turn starts, finishes or stops, including when its process exits; a
 question is asked or answered) or when the clock crosses into another band.
-Mostly that is the row's own work; another session's turn can move a finished
-row across the working rows, as below. A file, diff or page also moves when a
-session opens it, and a session when you drag it into or out of a family, as
-described below.
+Another session's turn never moves it. A file, diff or page also moves when a
+session opens it, a family when any of its sessions' work changes, and a
+session when you drag it into or out of a family, as described below.
+
+Each project's rows sit in sections, top to bottom (`sidebar::RecentPlace`):
+
+1. **Needs you**: sessions showing a question now. Newest question first,
+   whether or not you have seen it, and whatever day it was asked.
+2. **Working**: sessions running a turn, in the order each started it, so a
+   session that starts a turn joins the bottom, however long the others have
+   run.
+3. **Today**, **This week** and **Older**: sessions that have worked and
+   aren't running a turn (finished, idle after work, interrupted, exited, or
+   not running since a restart or sleep), each in the band of its latest
+   event, newest event first, read or not. Below them in each band, the
+   sessions that have never worked, newest open first.
+
+The line between Working and the done rows is now. The newest start sits just
+above it and the newest finish just below, so a turn that finishes drops from
+the working rows to the first row under them, and a prompt to a done session
+lifts it to the bottom of the working rows. A label heads each section (Needs
+you, Working with how many sessions in it are working, then each band) when a
+project's rows span more than one; a project whose rows all sit in one section
+needs none.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
-This week the six days before that, Older the rest. A row's band comes from its
-latest event of any kind, a start, a finish or a question
+This week the six days before that, Older the rest. A done row's band comes
+from its latest event of any kind, a start, a finish or a question
 (`AgentActivity::last_work_at`), so a row that stops working stays in the band
-its turn started in. One exception: a working row is Today however long its
-turn has run, so a turn started yesterday and still running sits with today's
-work, not in the band of its start. A row that has never worked goes by when
-it was opened (`created_at` on its instance); a pane saved before muxel
-recorded that sits with Older. The sidebar
-redraws at midnight, when rows change band. A block spanning only one band
-needs no band label. Within each band, `sidebar::RecentPlace` puts rows in five
-groups:
-
-1. **Asking**: sessions showing a question now. Newest question first, whether
-   or not you have seen it.
-2. **Newly done**: sessions that have worked and aren't running a turn
-   (finished, idle after work, interrupted, exited, or not running since a
-   restart) whose latest event is at or after the start of the oldest turn
-   still running in the project. Read or not. Newest event first.
-3. **Working**: sessions running a turn, in the order each started it, so a
-   session that starts a turn joins the bottom.
-4. **Old done**: sessions that have worked and aren't running a turn whose
-   latest event came before that oldest running turn began. Newest event
-   first.
-5. **Never used**: newest open first.
-
-A finish older than every turn still running is older news than that work, so
-it goes below it. With nothing running, every finished row is newly done, and
-the order is newest event first. While anything runs, the oldest start only
-moves forward (a turn starts now; a question takes its turn out of the running
-until it is answered, which starts a new one), so a row that dropped comes back
-up once the work it fell behind ends. That is a change of work, like any other
-move. The oldest start comes from each row's recorded state
-(`AgentActivity::current_state`, `work_started_at`), not the status it shows,
-so a status the reducer hasn't recorded, such as a flicker or a turn the tick
-hasn't sampled yet, drops nothing. It covers the project's rows, the pinned
-block included.
+its turn started in. A row that has never worked goes by when it was opened
+(`created_at` on its instance); a pane saved before muxel recorded that sits
+with Older. The sidebar redraws at midnight, when rows change band.
 
 Pinned sessions form a block at the top of their project, ordered by the same
-rule, without band labels.
+rule, without section labels.
 
-Groups go by the status the row shows. A session with no live terminal (in a
-project not opened since a restart, say) shows idle, or Done if its last turn
-finished, and sorts with the done rows by its latest event. Timestamps are
+Sections go by the status the row shows. A session with no live terminal (in
+a project not opened since a restart, or asleep) shows idle, or Done if its
+last turn finished, and sorts with the done rows by its latest event, even if
+it was saved asking: its question ended with its process. Timestamps are
 Unix milliseconds; future ones count as now. Ties keep the order the panes were
 opened in, so popping a row out into its own window or docking it back never
 moves it.
@@ -149,8 +140,10 @@ with an unread mark and a Done notification, as every exit did before this
 rule.
 
 Some other states are not work either. A relaunched agent reporting Working
-before any turn is submitted, and startup output while a restored terminal
-settles, record nothing. Row ages and `muxel ctl` use `last_work_at` too.
+before any turn is submitted while it starts up, and startup output while a
+restored terminal settles, record nothing. Past the startup wait, a provider's
+Working is a turn even when muxel typed nothing, such as one started by
+another session's message or a scheduled wakeup. Row ages and `muxel ctl` use `last_work_at` too.
 
 Read state stays on each machine, as the rest of a pane's activity does. Since
 reading never moves a row, two machines that saw the same work and keep the
@@ -185,12 +178,17 @@ caller is declared, not verified, so the worst a wrong one does is put a row
 in the wrong family. A session spawned by a nested session nests under the
 same top-level session, so there are at most two levels: a session, its child
 sessions, and each one's files (a child's files are drawn two steps in).
-Spawners that loop back on each other nest nothing. A family moves as one row,
-placed by its top session, except that while any child shows a question the
-whole family sorts as Asking, in the latest band among those asking, by its
-newest question. The top row then shows an **N asking** tag, since the
-child's own row may be far below where you'd look. Viewing still moves
-nothing. Children don't close with their parent: closing a session takes its
+Spawners that loop back on each other nest nothing. A family moves as one
+row. While any of its sessions shows a question, it sits in Needs you by its
+newest question. Otherwise, while any of its sessions works, it sits with the
+working rows by the earliest start among them, so a second child starting a
+turn doesn't move it; when that earliest one finishes and another still works,
+the family moves down the working rows once. Otherwise it goes by the newest
+event among its sessions, so a child's finish brings the family up. Inside a
+family the top session comes first and its children follow by the same rule.
+The top row shows an **N asking** tag while children ask, and an **N
+working** tag while children work and it doesn't, since the children's own
+rows may be far below where you'd look. Viewing still moves nothing. Children don't close with their parent: closing a session takes its
 files, not its child sessions, which become ordinary rows once it's gone,
 unless you choose Close with everything under it (below). A pinned session
 nests only under a pinned one.
