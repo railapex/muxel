@@ -355,7 +355,9 @@ fn pr136_shared_policy_mixed_subagent_listing_holds_only_to_three_hour_cap() {
 #[test]
 fn pr136_shared_policy_grok_title_turn_finishes_beside_shell_monitor_panel() {
     let mut probe = Probe::new();
-    probe.session.write_submission(b"\r", crate::Submission::Turn);
+    probe
+        .session
+        .write_submission(b"\r", crate::Submission::Turn);
     let screen = "Finished.\nv Tasks 1\n· Run Server\nv Watchers 1\n· Monitor Watch server\n╭─────────────╮\n│ >           │\n╰─────────────╯\nShift+Tab:mode  │  Ctrl+x:shortcuts";
     let expected = Some(BackgroundWork {
         shells: 1,

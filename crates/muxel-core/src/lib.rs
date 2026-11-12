@@ -24,6 +24,7 @@ mod pane;
 pub mod pane_scope;
 pub mod path_paste;
 pub mod placement;
+pub mod prompt_marks;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;

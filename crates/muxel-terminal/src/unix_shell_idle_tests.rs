@@ -104,6 +104,7 @@ impl Shell {
                 binding_rev: 0,
                 input_rev: 0,
                 completion_rev: 0,
+                shell_marks: 0,
             },
             true,
         )
