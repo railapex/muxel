@@ -594,8 +594,11 @@ feature is added or changed, update the matching entry here in the same change**
   shows **blocked** while the report says Working. A finished Codex turn also
   reaches **done** when its submitted Working turn reports Idle; protocol `error`
   uses the existing **done** badge with its error source retained. A Working
-  report before any prompt in the launch, such as Codex's while it resumes a
-  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  report before any prompt while the launch starts up, such as Codex's while it
+  resumes a session, keeps a restored **done**. Past the startup wait, a Working
+  report is a turn even when muxel typed nothing, so a turn started by another
+  session's message, a scheduled wakeup or a remote prompt shows **working**
+  and counts as work. Clear, provider switch, shell prompt,
   process exit, or relaunch returns an unfinished pane to its existing fallback
   detection. Both local and remote tmux panes continue using that fallback
   because tmux does not forward OSC 7501 reports. Once Claude has reported in a
@@ -1742,16 +1745,18 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
-  each project, then the rest in Today (since midnight), This week (the six days
-  before), and Older bands, by each session's latest start, finish or question.
-  Within a band, sessions asking a question come first; then the ones newly
-  done (finished since the oldest turn still running in the project began, or
-  any finish while nothing runs), newest first, read or not; then working
-  sessions in the order each started, so one that starts a turn joins the
-  bottom of them; then the ones done before that oldest turn began, newest
-  first; then sessions never used, newest open first. A working session counts
-  as Today however long its turn has run. Reading, focusing or clicking a
-  session never moves its row; only a change in work or a new day does. A command job's
+  each project, then **Needs you** (sessions asking a question, newest question
+  first), then **Working** (sessions running a turn, in the order each started,
+  so one that starts a turn joins the bottom of them), then the sessions done
+  in Today (since midnight), This week (the six days before) and Older bands, by
+  each one's latest start, finish or question, newest first, read or not, with
+  sessions never used last in each band, newest open first. A finish lands just
+  under the working rows, never above them. A session whose process isn't
+  running (put to sleep mid-turn, say) never counts as working: it sits with
+  the done rows by its latest event. Each section gets a thin label, with the
+  working count on Working, when a project's rows span more than one.
+  Reading, focusing or clicking a session never moves its row, and neither does
+  another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that
   reported its finish before exiting is finished and notifies. Pinned sessions
   follow the same order. Project order and keyboard
@@ -1772,12 +1777,28 @@ feature is added or changed, update the matching entry here in the same change**
   session started by `muxel ctl new` from another session's pane shows indented
   under that session's row, and the family moves as one. A session spawned by a
   nested one nests under the same top session, so there are two levels at most:
-  a session, its child sessions, and each one's files. While any child asks a
-  question, the whole family sorts as asking and the top row shows **N asking**,
-  so nothing that needs you is buried. Drag a session onto another session's
+  a session, its child sessions, and each one's files. While any of the family
+  asks a question, it sits in Needs you and the top row shows **N asking**, so
+  nothing that needs you is buried; otherwise, while any of it works, it sits
+  with the working rows by its earliest start, and a top session that isn't
+  working itself shows **N working**; otherwise it goes by its newest finish,
+  so a child's finish brings the family up. Drag a session onto another session's
   row to nest it there, or onto its project's header to make it a row of its
-  own. Children never close with their parent; once the parent closes they are
-  ordinary rows. A pinned session nests only under a pinned one.
+  own. Closing a parent leaves its children open as ordinary rows, unless you
+  choose Close with everything under it. A pinned session nests only under a
+  pinned one.
+- **Close a session with everything under it** — in Recent work, right-click a
+  session with sessions or files nested under it for **Close with everything
+  under it (N)**. It closes the session, the sessions it spawned, and the
+  files, diffs and pages any of them owns as one close: a busy session asks
+  once, and one Undo brings the held ones back. N is how many panes it closes.
+- **Close several rows at once** — Ctrl-click (Cmd-click on macOS) sidebar rows
+  to pick them, or Shift-click to pick every row from the last one Ctrl-clicked
+  to this one; a plain click drops the pick. Right-click a picked row for **Close
+  selected (N)**: the picked rows close as one request under the usual rules,
+  so a busy session asks, a session takes its files in Recent work, and the
+  held sessions come back with one Undo. A file picked on its own closes at
+  once, as closing a file always does.
 - **Files close with their session** — in Recent work, closing a session (its
   tab, its pane, or Close terminals) also closes the files, diffs and pages it
   last opened. They join the session's countdown, so one Undo brings them all

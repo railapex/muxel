@@ -35,9 +35,9 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, InstancesById, SidebarEntry, SidebarSort, instances_by_id, is_unread,
-    nest_on_drop, nested_asking, notification_in_feed, sidebar_order, sidebar_rows_each,
-    unread_count,
+    ActivityBand, BandClock, FamilyTags, InstancesById, SelectClick, SidebarEntry, SidebarSort,
+    family_tags, instances_by_id, is_unread, nest_on_drop, notification_in_feed, select_rows,
+    sessions_under, sidebar_order, sidebar_rows_each, unread_count,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -996,6 +996,15 @@ fn activity_state(status: AgentStatus) -> AgentActivityState {
 
 const RESTORE_ACTIVITY_MAX_WAIT_MS: u64 = 30_000;
 
+/// Whether a launch `elapsed` old is still inside the time its CLI may take
+/// to boot: the restore wait plus the preset's configured startup delay.
+fn within_startup_window(elapsed: Option<Duration>, startup_delay_ms: u32) -> bool {
+    let budget = Duration::from_millis(
+        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
+    );
+    elapsed.is_some_and(|elapsed| elapsed < budget)
+}
+
 fn restore_activity_guard_active(
     pending: bool,
     submitted_turn: bool,
@@ -1003,13 +1012,10 @@ fn restore_activity_guard_active(
     elapsed: Option<Duration>,
     startup_delay_ms: u32,
 ) -> bool {
-    let budget = Duration::from_millis(
-        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
-    );
     pending
         && !submitted_turn
         && !completion_ready
-        && elapsed.is_some_and(|elapsed| elapsed < budget)
+        && within_startup_window(elapsed, startup_delay_ms)
 }
 
 /// A restored terminal may emit a synthetic Working cycle while its CLI boots.
@@ -1126,10 +1132,11 @@ struct ActivityUpdates {
 #[cfg(test)]
 mod restored_activity_tests {
     use super::{
-        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose,
-        activity_needs_observation, attention_rank, done_is_read, is_restored_transition,
-        persisted_status, restore_activity_guard_active, restored_activity_sample, sample_status,
-        unprompted_report_working,
+        AgentActivityState, AgentPreset, AgentStatus, Instance, LaunchPurpose, SeenStatus,
+        StatusBinding, StatusSample, activity_needs_observation, apply_status_sample,
+        attention_rank, done_is_read, is_restored_transition, persisted_status,
+        restore_activity_guard_active, restored_activity_sample, sample_status,
+        unprompted_report_working, within_startup_window,
     };
     use muxel_terminal::{TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason};
     use std::time::Duration;
@@ -1207,14 +1214,21 @@ mod restored_activity_tests {
             ),
         ] {
             assert_eq!(
-                sample_status(&exit, Some(&pane), false, true, true),
+                sample_status(&exit, Some(&pane), false, true, false, true),
                 shown,
                 "{what}"
             );
         }
         // A turn that finished before the process exited stays finished.
         assert_eq!(
-            sample_status(&exit, Some(&attended_completion()), false, true, true),
+            sample_status(
+                &exit,
+                Some(&attended_completion()),
+                false,
+                true,
+                false,
+                true
+            ),
             AgentStatus::Done
         );
     }
@@ -1234,11 +1248,11 @@ mod restored_activity_tests {
         );
         assert_eq!(job.launch_purpose(), LaunchPurpose::Job);
         assert_eq!(
-            sample_status(&exit, Some(&job), false, true, false),
+            sample_status(&exit, Some(&job), false, true, false, false),
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&exit, Some(&job), false, true, true),
+            sample_status(&exit, Some(&job), false, true, false, true),
             AgentStatus::Done
         );
     }
@@ -1252,26 +1266,33 @@ mod restored_activity_tests {
         );
         // Codex reports Working while it boots, before any turn is submitted.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, false, true),
+            sample_status(&booting, Some(&saved), false, false, true, true),
             AgentStatus::Idle
         );
         assert_eq!(
-            sample_status(&booting, Some(&attended_completion()), false, false, true),
+            sample_status(
+                &booting,
+                Some(&attended_completion()),
+                false,
+                false,
+                true,
+                true
+            ),
             AgentStatus::Done
         );
         // Startup output while the relaunch settles is not a turn either.
         let noise = runtime(AgentStatus::Working, TerminalStatusReason::ProviderTitle);
         assert_eq!(
-            sample_status(&noise, Some(&saved), true, false, true),
+            sample_status(&noise, Some(&saved), true, false, true, true),
             AgentStatus::Idle
         );
         // A submitted turn is, and so is visible work once the relaunch settles.
         assert_eq!(
-            sample_status(&booting, Some(&saved), false, true, true),
+            sample_status(&booting, Some(&saved), false, true, true, true),
             AgentStatus::Working
         );
         assert_eq!(
-            sample_status(&noise, Some(&saved), false, false, true),
+            sample_status(&noise, Some(&saved), false, false, true, true),
             AgentStatus::Working
         );
     }
@@ -1413,23 +1434,110 @@ mod restored_activity_tests {
         // Ready title that ends the restore guard.
         let guarded = restore_activity_guard_active(true, false, true, Some(Duration::ZERO), 0);
         assert!(!guarded);
-        let held = guarded || unprompted_report_working(&runtime, false);
+        let starting = within_startup_window(Some(Duration::ZERO), 0);
+        let held = guarded || unprompted_report_working(&runtime, false, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Done
         );
         // A submitted turn makes the report real work.
-        let held = unprompted_report_working(&runtime, true);
+        let held = unprompted_report_working(&runtime, true, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Working
         );
         // Visible evidence and other reported states keep their own rules.
         runtime.reason = TerminalStatusReason::ProviderTitle;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
         runtime.reason = TerminalStatusReason::ProgramStatus(None);
         runtime.status = AgentStatus::Blocked;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
+    }
+
+    /// One status tick for a pane nothing has typed a turn into, `elapsed`
+    /// into its launch: the shown status as the tick computes it, applied to
+    /// the record and durable activity.
+    fn tick_without_submission(
+        instance: &mut Instance,
+        record: &mut Option<SeenStatus>,
+        runtime: TerminalRuntimeSnapshot,
+        elapsed: Duration,
+        now: i64,
+    ) -> AgentStatus {
+        let elapsed = Some(elapsed);
+        let restoring =
+            restore_activity_guard_active(true, false, runtime.completion_ready, elapsed, 0);
+        let starting = within_startup_window(elapsed, 0);
+        let shown = sample_status(&runtime, Some(instance), restoring, false, starting, true);
+        let (preserve, _) = restored_activity_sample(restoring, false, runtime.status);
+        apply_status_sample(
+            record,
+            Some(&mut instance.activity),
+            StatusSample::from_runtime(runtime, runtime.binding_rev, shown, false, preserve),
+            now,
+        );
+        shown
+    }
+
+    #[test]
+    fn a_provider_reported_turn_without_a_muxel_submission_records_work() {
+        use muxel_core::control::status_since;
+        let launch = Uuid::new_v4();
+        let report = |status, completion_revision| TerminalRuntimeSnapshot {
+            launch_id: launch,
+            completion_ready: true,
+            completion_revision,
+            ..runtime(status, TerminalStatusReason::ProgramStatus(None))
+        };
+        let settled = || {
+            Some(SeenStatus {
+                status: AgentStatus::Done,
+                binding: StatusBinding { launch, rev: 0 },
+                coverage: TerminalStatusCoverage::ProgramStatus,
+                completion_revision: 1,
+                sampled_at: 500,
+            })
+        };
+
+        // A builder finished a turn and sat idle. An hour into the launch, a
+        // message from another session starts its next turn, and nothing was
+        // typed into the pane.
+        let mut instance = attended_completion();
+        let mut record = settled();
+        let an_hour = Duration::from_secs(3_600);
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            an_hour,
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Working);
+        assert_eq!(instance.activity.work_started_at, Some(1_000));
+        assert_eq!(status_since(&instance.activity), Some(1_000));
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Done, 2),
+            an_hour,
+            2_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(instance.activity.completed_at, Some(2_000));
+        assert_eq!(status_since(&instance.activity), Some(2_000));
+
+        // The same report while the launch boots is startup noise.
+        let mut booting = attended_completion();
+        let mut record = settled();
+        let shown = tick_without_submission(
+            &mut booting,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            Duration::from_secs(2),
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(booting.activity.work_started_at, Some(100));
     }
 
     #[test]
@@ -1633,15 +1741,20 @@ fn persisted_activity_status(
     }
 }
 
-/// Whether the provider's own report is all that says Working: no turn has
-/// been submitted in this launch. Codex reports Working while it boots a
-/// resumed session, before any prompt and after its first Ready title. Like
-/// startup noise during restore, that is not a turn.
+/// Whether the provider's own report is all that says Working while the
+/// launch boots (`starting`, see [`within_startup_window`]) and no turn has
+/// been submitted in it. Codex reports Working while it boots a resumed
+/// session, before any prompt and after its first Ready title. Like startup
+/// noise during restore, that is not a turn. Past the startup window a
+/// report's Working is a turn, though muxel typed nothing: a message from
+/// another session, a scheduled wakeup or a remote prompt starts one.
 fn unprompted_report_working(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     submitted_turn: bool,
+    starting: bool,
 ) -> bool {
-    runtime.status == AgentStatus::Working
+    starting
+        && runtime.status == AgentStatus::Working
         && matches!(
             runtime.reason,
             muxel_terminal::TerminalStatusReason::ProgramStatus(_)
@@ -1676,18 +1789,20 @@ fn own_exit(view: &TerminalView) -> bool {
 
 /// The lifecycle status one terminal sample stands for. Some runtime states
 /// are not work: an exit that finishes nothing ([`exit_finishes_nothing`]); a
-/// provider's Working before any turn in this launch (a relaunch booting); and
-/// Working while a restore settles (`restoring`). They read as idle, so none
-/// records a start or a finish, and durable Done stays.
+/// provider's Working before any turn while the launch starts up (`starting`:
+/// a relaunch booting); and Working while a restore settles (`restoring`).
+/// They read as idle, so none records a start or a finish, and durable Done
+/// stays.
 fn sample_status(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     instance: Option<&Instance>,
     restoring: bool,
     submitted_turn: bool,
+    starting: bool,
     own_exit: bool,
 ) -> AgentStatus {
     let status = if exit_finishes_nothing(runtime, instance, own_exit)
-        || unprompted_report_working(runtime, submitted_turn)
+        || unprompted_report_working(runtime, submitted_turn, starting)
         || (restoring && runtime.status == AgentStatus::Working)
     {
         AgentStatus::Idle
@@ -1702,12 +1817,14 @@ fn shown_terminal_status(
     view: &TerminalView,
     instance: Option<&Instance>,
     restoring: bool,
+    starting: bool,
 ) -> AgentStatus {
     sample_status(
         &view.runtime_snapshot(),
         instance,
         restoring,
         view.session().has_submitted_turn(),
+        starting,
         own_exit(view),
     )
 }
@@ -6926,6 +7043,10 @@ pub struct MuxelApp {
     /// pane inherits a closed one's size can depend on it.
     close_history: Vec<Uuid>,
     close_requests: HashMap<Uuid, Uuid>,
+    /// Sidebar rows picked with Ctrl- or Shift-click, for Close selected, and
+    /// the row a Shift-click selects from. Runtime only; a plain click clears it.
+    sidebar_selection: Vec<Uuid>,
+    sidebar_anchor: Option<Uuid>,
     close_client_counts: HashMap<Uuid, ClientCount>,
     show_close_list: bool,
     preserve_close_worktrees: bool,
@@ -9557,6 +9678,8 @@ impl MuxelApp {
             close_groups: Vec::new(),
             close_history: Vec::new(),
             close_requests: HashMap::new(),
+            sidebar_selection: Vec::new(),
+            sidebar_anchor: None,
             close_client_counts: HashMap::new(),
             show_close_list: false,
             preserve_close_worktrees: false,
@@ -25484,7 +25607,7 @@ impl MuxelApp {
 
     /// `pane_ids` ([`Self::sidebar_rows_each`]) as the sidebar lists them, placed
     /// by `placing` ([`with_pending`]) and by the status each row shows, like
-    /// its badge.
+    /// its badge, and whether its process runs ([`Self::sidebar_running`]).
     fn sidebar_entries(
         &self,
         pane_ids: &[Uuid],
@@ -25496,7 +25619,22 @@ impl MuxelApp {
             let instance = placing.get(&iid).copied();
             Some(activity_state(self.sidebar_status(iid, instance, cx)))
         };
-        sidebar_order(pane_ids, placing, &shown, bands, self.settings.sidebar_sort)
+        let running = |iid: Uuid| self.sidebar_running(iid);
+        sidebar_order(
+            pane_ids,
+            placing,
+            &shown,
+            &running,
+            bands,
+            self.settings.sidebar_sort,
+        )
+    }
+
+    /// Whether a sidebar row's process may be running: a pane with no live
+    /// terminal isn't, so Recent work never places or counts it as working,
+    /// whatever status it was saved with.
+    fn sidebar_running(&self, iid: Uuid) -> bool {
+        self.terminal_view(iid).is_some()
     }
 
     /// Session `dragged` dropped on session row `onto` in Recent work: it nests
@@ -25545,24 +25683,114 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// For each of `entries` ([`Self::sidebar_entries`]), how many sessions
-    /// nested under it are asking: what a family's top row tells, since its
-    /// children sit below it. Zero for any other row.
-    fn sidebar_family_asking(
+    /// The sessions that closing `iid` with everything under it closes: it and
+    /// the sessions nested under it in Recent work ([`sessions_under`]). Their
+    /// files, diffs and pages go with them by the usual close rule.
+    fn sessions_with_everything_under(&self, iid: Uuid) -> Vec<Uuid> {
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return Vec::new();
+        };
+        let listed = self.sidebar_rows_each().remove(&pid).unwrap_or_default();
+        let instances = instances_by_id(&self.workspace);
+        std::iter::once(iid)
+            .chain(sessions_under(iid, &listed, &instances))
+            .collect()
+    }
+
+    /// How many panes closing session `iid` with everything under it would
+    /// close: it, the sessions nested under it, and the files, diffs and pages
+    /// that go with them ([`Self::close_dependents`]). `None` outside Recent
+    /// work, where nothing nests, and when nothing is under it.
+    fn close_with_everything_under_count(&self, iid: Uuid) -> Option<usize> {
+        if self.settings.sidebar_sort != SidebarSort::RecentWork
+            || self
+                .workspace
+                .instance(iid)
+                .is_none_or(|i| i.kind != InstanceKind::Terminal)
+        {
+            return None;
+        }
+        let sessions = self.sessions_with_everything_under(iid);
+        let count = sessions.len() + self.close_dependents(&sessions).len();
+        (count > 1).then_some(count)
+    }
+
+    /// Close session `iid` and everything under it as one request: a busy
+    /// session among them asks once, and what's held comes back with one Undo.
+    fn close_with_everything_under(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let sessions = self.sessions_with_everything_under(iid);
+        self.request_recoverable_close(sessions, cx);
+    }
+
+    /// A Ctrl- or Shift-click on sidebar row `iid`: change the selection that
+    /// Close selected acts on, along `order` (that project's rows as drawn).
+    fn select_sidebar_row(
+        &mut self,
+        iid: Uuid,
+        click: SelectClick,
+        order: &[Uuid],
+        cx: &mut Context<Self>,
+    ) {
+        let (selected, anchor) = select_rows(
+            &self.sidebar_selection,
+            self.sidebar_anchor,
+            iid,
+            click,
+            order,
+        );
+        self.sidebar_selection = selected;
+        self.sidebar_anchor = anchor;
+        cx.notify();
+    }
+
+    fn clear_sidebar_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_selection.is_empty() || self.sidebar_anchor.is_some() {
+            self.sidebar_selection.clear();
+            self.sidebar_anchor = None;
+            cx.notify();
+        }
+    }
+
+    /// The selected rows still open, when right-clicking row `iid` should offer
+    /// to close them: it is one of them, and there's more than one.
+    fn sidebar_selection_to_close(&self, iid: Uuid) -> Option<Vec<Uuid>> {
+        let open: Vec<Uuid> = self
+            .sidebar_selection
+            .iter()
+            .copied()
+            .filter(|&id| self.workspace.instance(id).is_some() && !self.is_closing(id))
+            .collect();
+        (open.len() > 1 && open.contains(&iid)).then_some(open)
+    }
+
+    /// Close every selected row still open as one request, by the usual rules:
+    /// a busy session asks, a session takes its files in Recent work, and
+    /// what's held comes back with one Undo.
+    fn close_sidebar_selection(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let Some(ids) = self.sidebar_selection_to_close(iid) else {
+            return;
+        };
+        self.sidebar_selection.clear();
+        self.sidebar_anchor = None;
+        self.request_recoverable_close(ids, cx);
+    }
+
+    /// For each of `entries` ([`Self::sidebar_entries`]), what a family's top
+    /// row tells of the sessions nested under it ([`family_tags`]), since its
+    /// children sit below it. None for any other row.
+    fn sidebar_family_tags(
         &self,
         entries: &[SidebarEntry],
         placing: &InstancesById,
         cx: &App,
-    ) -> Vec<usize> {
+    ) -> Vec<FamilyTags> {
         let shown = |iid: Uuid| {
             let instance = placing.get(&iid).copied();
             Some(activity_state(self.sidebar_status(iid, instance, cx)))
         };
+        let running = |iid: Uuid| self.sidebar_running(iid);
         (0..entries.len())
-            .map(|at| match entries[at] {
-                SidebarEntry::Pane(_) => nested_asking(entries, at, placing, &shown),
-                _ => 0,
-            })
+            .map(|at| family_tags(entries, at, placing, &shown, &running))
             .collect()
     }
 
@@ -25586,13 +25814,47 @@ impl MuxelApp {
     fn sidebar_status(&self, iid: Uuid, instance: Option<&Instance>, cx: &App) -> AgentStatus {
         let restoring = self.restoring_activity.contains(&iid);
         let status = match self.terminal_view(iid) {
-            Some(view) => shown_terminal_status(view.read(cx), instance, restoring),
+            Some(view) => shown_terminal_status(
+                view.read(cx),
+                instance,
+                restoring,
+                self.in_startup_window(iid, instance),
+            ),
             None if self.is_dormant(iid) => {
                 instance.map_or(AgentStatus::Idle, |i| saved_activity_status(&i.activity))
             }
             None => AgentStatus::Idle,
         };
         persisted_status(status, instance, restoring)
+    }
+
+    /// How long ago `iid`'s current launch started.
+    fn launch_elapsed(&self, iid: Uuid) -> Option<Duration> {
+        self.terminal_launches
+            .get(&iid)
+            .map(|&(at, _)| at.elapsed())
+    }
+
+    /// The configured startup delay of `instance`'s preset.
+    fn startup_delay_ms(&self, instance: Option<&Instance>) -> u32 {
+        instance
+            .and_then(|instance| {
+                instance
+                    .preset_id
+                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                    .or_else(|| {
+                        self.presets
+                            .iter()
+                            .find(|preset| preset.name == instance.preset)
+                    })
+            })
+            .map_or(0, |preset| preset.startup_delay_ms)
+    }
+
+    /// Whether pane `iid`'s current launch is still booting its CLI, with its
+    /// instance (`None`: none).
+    fn in_startup_window(&self, iid: Uuid, instance: Option<&Instance>) -> bool {
+        within_startup_window(self.launch_elapsed(iid), self.startup_delay_ms(instance))
     }
 
     /// `terminal`'s sample for pane `iid`, whose instance the caller has
@@ -25607,26 +25869,12 @@ impl MuxelApp {
         let binding_rev = terminal.session().binding_revision();
         let raw_status = runtime.status;
         let submitted_turn = terminal.session().has_submitted_turn();
-        let startup_delay_ms = instance
-            .and_then(|instance| {
-                instance
-                    .preset_id
-                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
-                    .or_else(|| {
-                        self.presets
-                            .iter()
-                            .find(|preset| preset.name == instance.preset)
-                    })
-            })
-            .map_or(0, |preset| preset.startup_delay_ms);
         let restoring = restore_activity_guard_active(
             self.restoring_activity.contains(&iid),
             submitted_turn,
             terminal.completion_ready(),
-            self.terminal_launches
-                .get(&iid)
-                .map(|&(at, _)| at.elapsed()),
-            startup_delay_ms,
+            self.launch_elapsed(iid),
+            self.startup_delay_ms(instance),
         );
         TerminalActivitySample {
             status: sample_status(
@@ -25634,6 +25882,7 @@ impl MuxelApp {
                 instance,
                 restoring,
                 submitted_turn,
+                self.in_startup_window(iid, instance),
                 own_exit(terminal),
             ),
             raw_status,
@@ -29391,7 +29640,12 @@ impl MuxelApp {
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
                 let status = self.terminals.get(&iid).map(|v| {
-                    shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
+                    shown_terminal_status(
+                        v.read(cx),
+                        inst,
+                        self.restoring_activity.contains(&iid),
+                        self.in_startup_window(iid, inst),
+                    )
                 });
                 let color = status
                     .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
@@ -31119,23 +31373,42 @@ impl MuxelApp {
                     })
                     .collect();
                 let entries = self.sidebar_entries(&visible, &placing, bands, cx);
-                let asking_below = self.sidebar_family_asking(&entries, &placing, cx);
+                let tags_below = self.sidebar_family_tags(&entries, &placing, cx);
+                // The rows as drawn, which a Shift-click selects along.
+                let row_order: std::rc::Rc<[Uuid]> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        SidebarEntry::Pane(id)
+                        | SidebarEntry::Nested(id)
+                        | SidebarEntry::NestedTwice(id) => Some(*id),
+                        SidebarEntry::Worktree(_)
+                        | SidebarEntry::NeedsYou
+                        | SidebarEntry::Working(_)
+                        | SidebarEntry::Band(_) => None,
+                    })
+                    .collect();
                 // A slight gap between the project header and its panes, so the
                 // rows read as a group rather than one flush block.
                 if !entries.is_empty() {
                     list = list.child(div().h(px(4.0)).flex_none());
                 }
-                for (entry, asking_below) in entries.into_iter().zip(asking_below) {
+                for (entry, tags_below) in entries.into_iter().zip(tags_below) {
                     let (iid, depth) = match entry {
                         SidebarEntry::Worktree(wid) => {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
                         }
-                        SidebarEntry::Band(band) => {
-                            let label = match band {
-                                ActivityBand::Today => t("Today"),
-                                ActivityBand::ThisWeek => t("This week"),
-                                ActivityBand::Older => t("Older"),
+                        SidebarEntry::NeedsYou
+                        | SidebarEntry::Working(_)
+                        | SidebarEntry::Band(_) => {
+                            let label = match entry {
+                                SidebarEntry::NeedsYou => t("Needs you"),
+                                SidebarEntry::Working(n) => {
+                                    tf("Working · {n}", &[("n", &n.to_string())]).into()
+                                }
+                                SidebarEntry::Band(ActivityBand::ThisWeek) => t("This week"),
+                                SidebarEntry::Band(ActivityBand::Older) => t("Older"),
+                                _ => t("Today"),
                             };
                             list = list.child(
                                 div()
@@ -31274,6 +31547,7 @@ impl MuxelApp {
                         .filter(|i| i.kind == InstanceKind::Terminal)
                         .map(|i| self.folder_filter_menu_entry(project, i));
                     let is_sel = self.active_instance == Some(iid);
+                    let picked = self.sidebar_selection.contains(&iid);
                     let renaming = self.rename == Some(RenameTarget::Instance(iid))
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
                     let drop_hl = cx.theme().primary.opacity(0.3);
@@ -31290,7 +31564,11 @@ impl MuxelApp {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .bg(if is_sel {
+                        // A row picked for Close selected keeps its tint even
+                        // when it's also the focused pane.
+                        .bg(if picked {
+                            cx.theme().primary.opacity(0.22)
+                        } else if is_sel {
                             cx.theme().sidebar_accent
                         } else {
                             cx.theme().sidebar
@@ -31317,7 +31595,7 @@ impl MuxelApp {
                             self.instance_worktree_color(iid)
                                 .map(|c| div().size(px(8.0)).rounded_full().flex_none().bg(c)),
                         );
-                    if !is_sel {
+                    if !is_sel && !picked {
                         base = base.hover(move |s| s.bg(hover_col));
                     }
                     // One tooltip per element (gpui asserts): the name and starting
@@ -31435,12 +31713,25 @@ impl MuxelApp {
                                             .flex_none()
                                             .bg(cx.theme().primary)
                                     }))
-                                    // A family's top row says when a session nested under
-                                    // it asks: the family sorts as Asking meanwhile.
-                                    .children((asking_below > 0).then(|| {
+                                    // A family's top row says when sessions nested under
+                                    // it ask, or work while it doesn't: the family sorts
+                                    // as Asking, or else as Working, meanwhile.
+                                    .children((tags_below.asking > 0).then(|| {
                                         div().flex_none().child(status_tag(
                                             AgentStatus::Blocked,
-                                            tf("{n} asking", &[("n", &asking_below.to_string())]),
+                                            tf(
+                                                "{n} asking",
+                                                &[("n", &tags_below.asking.to_string())],
+                                            ),
+                                        ))
+                                    }))
+                                    .children((tags_below.working > 0).then(|| {
+                                        div().flex_none().child(status_tag(
+                                            AgentStatus::Working,
+                                            tf(
+                                                "{n} working",
+                                                &[("n", &tags_below.working.to_string())],
+                                            ),
                                         ))
                                     }))
                                     .child(
@@ -31481,14 +31772,28 @@ impl MuxelApp {
                                             }),
                                     ),
                             );
+                        let order = row_order.clone();
                         let row = base
                             .cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
                             // reset by the drag/release handling, so the pane would
                             // only highlight and you couldn't type. Double-click
-                            // renames (like before).
+                            // renames (like before). Ctrl- and Shift-click pick
+                            // rows for Close selected instead; a plain click
+                            // drops the pick.
                             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                                let modifiers = ev.modifiers();
+                                if modifiers.shift || modifiers.secondary() {
+                                    let click = if modifiers.shift {
+                                        SelectClick::Range
+                                    } else {
+                                        SelectClick::Toggle
+                                    };
+                                    this.select_sidebar_row(iid, click, &order, cx);
+                                    return;
+                                }
+                                this.clear_sidebar_selection(cx);
                                 if matches!(ev, ClickEvent::Mouse(e) if e.up.click_count >= 2) {
                                     this.start_rename_instance(
                                         iid,
@@ -31539,6 +31844,15 @@ impl MuxelApp {
                                 // pane's state moves between the two.
                                 let sleep = entity.read(cx).sleep_menu_state(iid, cx);
                                 let wake = entity.read(cx).is_dormant(iid);
+                                // Counted as the menu opens, so each item says
+                                // how many panes its click closes.
+                                let (selected, under) = {
+                                    let app = entity.read(cx);
+                                    (
+                                        app.sidebar_selection_to_close(iid).map(|ids| ids.len()),
+                                        app.close_with_everything_under_count(iid),
+                                    )
+                                };
                                 let menu = menu
                                     .item(
                                         PopupMenuItem::new(t("Rename"))
@@ -31610,7 +31924,42 @@ impl MuxelApp {
                                     ),
                                     None => menu,
                                 };
-                                menu.separator().item(
+                                let menu = menu.separator();
+                                let menu =
+                                    match under {
+                                        Some(n) => menu.item(
+                                            PopupMenuItem::new(tf(
+                                                "Close with everything under it ({n})",
+                                                &[("n", &n.to_string())],
+                                            ))
+                                            .icon(IconName::CircleX)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, _window, cx| {
+                                                    this.close_with_everything_under(iid, cx)
+                                                },
+                                            )),
+                                        ),
+                                        None => menu,
+                                    };
+                                let menu =
+                                    match selected {
+                                        Some(n) => menu.item(
+                                            PopupMenuItem::new(tf(
+                                                "Close selected ({n})",
+                                                &[("n", &n.to_string())],
+                                            ))
+                                            .icon(IconName::CircleX)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, _window, cx| {
+                                                    this.close_sidebar_selection(iid, cx)
+                                                },
+                                            )),
+                                        ),
+                                        None => menu,
+                                    };
+                                menu.item(
                                     PopupMenuItem::new(t("Kill"))
                                         .icon(IconName::CircleX)
                                         .on_click(window.listener_for(

@@ -92,6 +92,7 @@ fn reopening_a_file_moves_it_under_the_session_that_opened_it_last() {
                     &project.instances(),
                     &instances_by_id(&app.workspace),
                     &|_| None,
+                    &|_| true,
                     BandClock::at(&chrono::Local::now()),
                     SidebarSort::RecentWork,
                 );
