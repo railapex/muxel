@@ -8,7 +8,7 @@ use super::codex_capture_tests::with_app;
 use super::{MuxelApp, claude_test_home, unix_now};
 use gpui::{Task, TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, InjectionMode, Loop, PostRunAction, Project};
-use muxel_terminal::{AgentStatus, TerminalSession, TerminalStatusReason};
+use muxel_terminal::{AgentStatus, Submission, TerminalSession, TerminalStatusReason};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -140,7 +140,7 @@ fn run_turn(
     session: &TerminalSession,
     between_working_and_idle: impl FnOnce(&mut TestAppContext),
 ) {
-    session.mark_turn_submitted();
+    session.write_submission(b"\r", Submission::Turn);
     work(cx, window, pane, session, between_working_and_idle);
 }
 
@@ -319,7 +319,7 @@ fn a_startup_done_seen_after_the_submission_does_not_finish_the_run() {
         wait_for(cx, window, "a startup Done", |app, cx| {
             (app.terminals[&pane].read(cx).status() == AgentStatus::Done).then_some(())
         });
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", Submission::Turn);
         status_tick(cx, window);
         assert_eq!(status(cx, window, pane), AgentStatus::Done);
         heartbeat(cx, window);
@@ -345,7 +345,7 @@ fn a_turn_submitted_while_startup_still_works_waits_for_a_spell_of_its_own() {
         wait_for(cx, window, "startup to work", |app, cx| {
             (app.terminals[&pane].read(cx).status() == AgentStatus::Working).then_some(())
         });
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", Submission::Turn);
         status_tick(cx, window);
         session.write_input(&b"\r".repeat(80));
         wait_for(cx, window, "startup to settle", |app, cx| {
@@ -410,8 +410,7 @@ fn a_command_gone_quiet_after_its_output_keeps_its_run() {
         };
         idle(cx, "the shell to start quiet");
 
-        session.mark_turn_submitted();
-        session.write_input(b"started\r");
+        session.write_submission(b"started\r", Submission::Turn);
         let reason = wait_for(cx, window, "the output to read as Working", |app, cx| {
             let view = app.terminals[&pane].read(cx);
             (view.status() == AgentStatus::Working).then(|| view.runtime_snapshot().reason)

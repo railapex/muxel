@@ -1538,7 +1538,7 @@ impl MuxelApp {
                 .and_then(|inst| self.workspace.project(inst.project_id))
                 .map(|project| project.root_path.clone())
                 .unwrap_or_default();
-            let picked = cx.prompt_for_new_path(&dir, None);
+            let picked = self.native_dialog(cx.prompt_for_new_path(&dir, None));
             cx.spawn(async move |this, cx| {
                 let Ok(Ok(Some(path))) = picked.await else {
                     return;

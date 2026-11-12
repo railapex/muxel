@@ -3230,14 +3230,14 @@ fn run_tmux_input(
     // deadline: a process the child left behind (a backgrounded ssh master,
     // say) can hold a pipe open after the child exits, and must not hold the
     // caller with it. A thread left reading ends when that pipe closes.
-    fn drain(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::io::Result<Receiver<Vec<u8>>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        pipe_thread(move || {
             let mut bytes = Vec::new();
             let _ = pipe.read_to_end(&mut bytes);
             let _ = tx.send(bytes);
-        });
-        rx
+        })?;
+        Ok(rx)
     }
     let unanswered = || {
         std::io::Error::new(
@@ -3258,17 +3258,33 @@ fn run_tmux_input(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
-    // Written from its own thread, so a child that never reads can't hold this
-    // one past the deadline. It ends when the child's end of the pipe closes,
-    // and nothing waits for it.
-    if let Some((data, mut pipe)) = stdin.zip(child.stdin.take()) {
-        let data = data.to_vec();
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(&data);
-        });
-    }
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
+    let piped = (|| {
+        // Written from its own thread, so a child that never reads can't hold
+        // this one past the deadline. It ends when the child's end of the pipe
+        // closes, and nothing waits for it.
+        if let Some((data, mut pipe)) = stdin.zip(child.stdin.take()) {
+            let data = data.to_vec();
+            pipe_thread(move || {
+                let _ = pipe.write_all(&data);
+            })?;
+        }
+        let stdout = child.stdout.take().map(drain).transpose()?;
+        let stderr = child.stderr.take().map(drain).transpose()?;
+        std::io::Result::Ok((stdout, stderr))
+    })();
+    let (stdout, stderr) = match piped {
+        Ok(pipes) => pipes,
+        // The command is running, and may already have typed: stop it, and
+        // say it may have run.
+        Err(error) => {
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("muxel couldn't follow the command's answer: {error}"),
+            ));
+        }
+    };
     let deadline = Instant::now() + within;
     let status = loop {
         match child.try_wait()? {
@@ -3305,6 +3321,93 @@ fn run_tmux_input(
         stdout,
         stderr,
     })
+}
+
+/// Start one of a ctl input command's pipe threads.
+fn pipe_thread(work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    #[cfg(test)]
+    if PIPE_THREADS_BEFORE_REFUSAL.with(|left| match left.get() {
+        Some(0) => true,
+        Some(n) => {
+            left.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(std::io::Error::other("the test refused a thread"));
+    }
+    std::thread::Builder::new()
+        .name("muxel-tmux-pipe".into())
+        .spawn(work)
+        .map(drop)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many pipe threads start before the next is refused, as the OS
+    /// refusing a thread does.
+    static PIPE_THREADS_BEFORE_REFUSAL: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+mod tmux_input_runner_tests {
+    use super::{PIPE_THREADS_BEFORE_REFUSAL, run_tmux_input};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A pipe thread the OS refuses after the command has started leaves no
+    /// command running, and says it may have run, so ctl reports the write
+    /// unknown rather than refused.
+    #[test]
+    fn a_ctl_input_command_without_its_pipe_threads_is_stopped_and_may_have_run() {
+        let dir = std::env::temp_dir().join(format!("muxel-pipe-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // One process that writes a count to `beat` five times a second for
+        // 30 s, then ends. A single process, since taskkill stops a tree's
+        // children before their parent, and a shell can run its next step in
+        // between.
+        let mut late = if cfg!(windows) {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "foreach ($i in 1..150) { [IO.File]::WriteAllText('beat', $i.ToString()); Start-Sleep -Milliseconds 200 }",
+            ]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                "i=0; while [ $i -lt 150 ]; do echo $i > beat; i=$((i+1)); sleep 0.2; done",
+            ]);
+            cmd
+        };
+        late.current_dir(&dir);
+        // The stdout reader starts; the stderr reader is refused.
+        PIPE_THREADS_BEFORE_REFUSAL.with(|left| left.set(Some(1)));
+        let started = Instant::now();
+        let error = run_tmux_input(late, None, false, Duration::from_secs(30))
+            .expect_err("a command whose answer can't be read fails");
+        PIPE_THREADS_BEFORE_REFUSAL.with(|left| left.set(None));
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        // Answered once the command is stopped, not at the 30 s deadline.
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        // Whatever the command wrote before it was stopped, it writes no more.
+        let beat = || std::fs::read_to_string(dir.join("beat")).ok();
+        let stopped_at = beat();
+        let until = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(beat(), stopped_at, "the command ran on");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside

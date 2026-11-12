@@ -1270,6 +1270,10 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A confirmed Restart starts no run; it stays due for the new version.
+        if self.departing.is_some() {
+            return;
+        }
         let active = active_loop_ids(&self.running_loops);
         let workspace = &self.workspace;
         let outcome =

@@ -240,6 +240,32 @@ fn try_lock_dir(dir: &Path) -> Option<std::fs::File> {
     }
 }
 
+/// How often [`wait_for_workspace_lock`] checks the lock.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait up to `limit` for whoever holds workspace `id`'s lock to release it.
+/// `true` once it's free, `false` if it's still held at `limit`. It doesn't
+/// keep the lock: the workspace is locked when it's opened, as on any launch.
+pub fn wait_for_workspace_lock(id: Uuid, limit: std::time::Duration) -> bool {
+    match workspaces_dir() {
+        Some(dir) => wait_for_lock_dir(&dir.join(id.to_string()), limit, LOCK_POLL),
+        None => true,
+    }
+}
+
+fn wait_for_lock_dir(dir: &Path, limit: std::time::Duration, poll: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if try_lock_dir(dir).is_some() {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// Load the workspace from the default location, if present and valid.
 pub fn load_workspace() -> Option<Workspace> {
     load_workspace_from(&workspace_path()?)
@@ -844,6 +870,34 @@ mod tests {
         drop(lock_b);
         drop(lock_a2);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A restarted muxel waits while the old one holds the workspace, stops
+    /// waiting at its limit, goes on as soon as the lock is released, and
+    /// doesn't keep the lock itself.
+    #[test]
+    fn a_restart_waits_for_the_workspace_lock_and_no_longer() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("muxel-store-test-wait-{}", Uuid::new_v4()));
+        let poll = Duration::from_millis(20);
+        let held = try_lock_dir(&dir).expect("the old process holds the workspace");
+
+        let start = Instant::now();
+        assert!(!wait_for_lock_dir(&dir, Duration::from_millis(300), poll));
+        assert!(start.elapsed() >= Duration::from_millis(300));
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let start = Instant::now();
+        assert!(wait_for_lock_dir(&dir, Duration::from_secs(20), poll));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        release.join().unwrap();
+
+        let opened = try_lock_dir(&dir).expect("the wait left the workspace unlocked");
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

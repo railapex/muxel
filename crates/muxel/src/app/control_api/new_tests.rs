@@ -60,6 +60,8 @@ struct MuxelApp {
     workspace_busy: Option<Uuid>,
     confirm_quit: bool,
     show_quit_confirm: bool,
+    /// The app's confirmed-Restart stage; only whether there is one matters here.
+    departing: Option<()>,
     confirm: Option<PendingConfirm>,
     secondary_windows: Vec<SecondaryWindow>,
     main_window: Option<WindowHandle>,
@@ -100,6 +102,7 @@ impl MuxelApp {
             workspace_busy: None,
             confirm_quit: false,
             show_quit_confirm: false,
+            departing: None,
             confirm: None,
             secondary_windows: vec![],
             main_window: Some(WindowHandle(1)),
@@ -929,9 +932,7 @@ fn control_new_policy_write_entry_points_recheck_permission() {
             )
         } else {
             // A submitting key is written as the submit, whose facts are
-            // recorded only once the Enter is taken, never marked ahead of a
-            // write that tmux may refuse.
-            assert!(!callback.contains("mark_turn_submitted"));
+            // recorded only once the Enter is taken.
             assert!(callback.contains("ControlInput::SubmitKey"));
             (
                 callback
@@ -1135,6 +1136,9 @@ fn control_new_policy_keeps_browser_lifecycle_and_window_refusals() {
     app.confirm_quit = true;
     app.refuses_without_mutation(ctl::NewOptions::default(), "quitting");
     app.confirm_quit = false;
+    app.departing = Some(());
+    app.refuses_without_mutation(ctl::NewOptions::default(), "restarting");
+    app.departing = None;
     app.workspace_busy = app.current_workspace;
     app.refuses_without_mutation(ctl::NewOptions::default(), "workspace is closing");
     app.workspace_busy = None;

@@ -601,3 +601,112 @@ fn actual_popout_lifecycle_restart_kills_old_pty_and_installs_one_docked_replace
         }
     });
 }
+
+/// A Restart leaves with the workspace it holds. While it prepares, a switch
+/// to another workspace is refused. Once the new version has started, closing
+/// its windows changes no pane or window placement, and the main window's
+/// geometry isn't saved.
+#[test]
+fn actual_popout_lifecycle_restart_keeps_its_workspace_panes_and_geometry() {
+    with_app(|cx, window| {
+        let (pane, _view, _child) = popout_fixture(cx, window);
+        let (project, secondary) = secondary_fixture(cx, window);
+        let popup = window
+            .read_with(cx, |app, _| app.popouts[&pane].window)
+            .unwrap();
+        let held = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let (kill, killed) = async_channel::bounded::<()>(1);
+        window
+            .update(cx, |app, window, cx| {
+                app.current_workspace = Some(held);
+                app.workspaces.workspaces.extend([
+                    WorkspaceMeta {
+                        id: held,
+                        name: "held".into(),
+                    },
+                    WorkspaceMeta {
+                        id: other,
+                        name: "other".into(),
+                    },
+                ]);
+                muxel_store::save_workspace_to(
+                    &muxel_store::workspace_doc_path(other).unwrap(),
+                    &Workspace::default(),
+                )
+                .unwrap();
+                app.update_state = super::UpdateState::Ready(crate::update::RelaunchPlan {
+                    program: "muxel-next".into(),
+                    ..Default::default()
+                });
+                app.relaunch = |_| Ok(());
+                // A tmux session still dying keeps the Restart preparing.
+                app.close_tmux_kills
+                    .push(cx.background_executor().spawn(async move {
+                        let _ = killed.recv().await;
+                    }));
+                app.confirm_exit(super::departure::ExitKind::Restart, cx);
+                app.enter_workspace(other, window, cx);
+            })
+            .unwrap();
+        // A switch can wait for the tmux kill and run once it ends, so the
+        // workspace is checked again after the Restart.
+        let still_held = |cx: &mut TestAppContext| {
+            window
+                .read_with(cx, |app, _| {
+                    assert_eq!(
+                        app.current_workspace,
+                        Some(held),
+                        "a switch replaced the workspace a Restart holds"
+                    );
+                    assert!(
+                        app.popouts.contains_key(&pane),
+                        "a switch tore down a terminal a Restart holds"
+                    );
+                })
+                .unwrap()
+        };
+        cx.run_until_parked();
+        still_held(cx);
+        kill.try_send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !window.read_with(cx, |app, _| app.restart_ended).unwrap() {
+            assert!(Instant::now() < deadline, "the Restart never ended");
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cx.run_until_parked();
+        still_held(cx);
+
+        let geom = muxel_store::window_geom_path().unwrap();
+        let before = std::fs::read(&geom).ok();
+        window
+            .update(cx, |app, window, _| app.save_window_geom(window))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&geom).ok(),
+            before,
+            "the main window's geometry was saved after the new version started"
+        );
+        popup
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        secondary
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _| {
+                assert!(
+                    app.workspace.instance(pane).is_some(),
+                    "closing a window removed its pane"
+                );
+                assert!(
+                    app.workspace.project_windows.contains_key(&project),
+                    "closing a window dropped its project's placement"
+                );
+            })
+            .unwrap();
+    });
+}

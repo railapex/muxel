@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 #[path = "input_hold.rs"]
 mod input_hold;
-pub(crate) use input_hold::InputGate;
+pub(crate) use input_hold::{Hold, InputGate};
 use input_hold::{ShellMarks, ShellPrompt};
 
 #[cfg(all(test, unix))]
@@ -918,22 +918,226 @@ struct QueuedWrite {
 }
 
 impl QueuedWrite {
+    /// Whether the writer may still write it: no close since it was queued. A
+    /// departure hold doesn't drop it.
     fn admitted(&self, gate: &InputGate) -> bool {
-        self.epoch.is_none_or(|epoch| gate.accepts(epoch))
+        self.epoch.is_none_or(|epoch| gate.current(epoch))
     }
+}
+
+/// What the PTY writer thread takes, in the order it was sent.
+enum PtyInput {
+    Write(QueuedWrite),
+    /// Answered once every write sent before it has been written, failed or
+    /// been dropped. If the writer stops first, the sender drops unanswered,
+    /// which means the same: nothing sent before it can be written any more.
+    Fence(async_channel::Sender<()>),
+    /// The session is going: write nothing more.
+    Stop,
+}
+
+/// The PTY writer thread: writes each queued write in turn and answers each
+/// fence once the writes before it are done. Returns when the session stops
+/// it, every sender is gone, or a write fails (the child is gone).
+fn write_queued(
+    queue: std::sync::mpsc::Receiver<PtyInput>,
+    pipe: &mut dyn Write,
+    gate: &InputGate,
+    closed: &AtomicBool,
+    profile: Option<Uuid>,
+) {
+    let mut prior_profiler_interval = None;
+    while let Ok(input) = queue.recv() {
+        let write = match input {
+            PtyInput::Write(write) => write,
+            PtyInput::Fence(done) => {
+                let _ = done.try_send(());
+                continue;
+            }
+            PtyInput::Stop => break,
+        };
+        if closed.load(Ordering::Acquire) {
+            break;
+        }
+        let queue_delay = write.queued_at.map(|queued_at| {
+            queue_delay_excluding_profiler(queued_at, Instant::now(), prior_profiler_interval)
+        });
+        let write_started = write.queued_at.map(|_| Instant::now());
+        if !write.admitted(gate) {
+            continue;
+        }
+        let result = pipe.write_all(&write.bytes);
+        if result.is_ok() {
+            let _ = pipe.flush();
+        }
+        if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
+            (profile, queue_delay, write_started)
+        {
+            let profile_started = Instant::now();
+            crate::profile::pty_write(
+                instance_id,
+                write.bytes.len(),
+                queue_delay,
+                write_started.elapsed(),
+            );
+            prior_profiler_interval = Some((profile_started, Instant::now()));
+        }
+        if result.is_err() {
+            break;
+        }
+    }
+}
+
+/// A departure's fence on one terminal's writers; see
+/// [`TerminalSession::hold_for_departure`].
+pub struct InputFence {
+    /// The PTY writer's. A writer that stops drops it unanswered, which is
+    /// settled too: it writes on its own thread, nothing it dropped can be
+    /// written later, and each write's facts were committed as it was queued.
+    pty: async_channel::Receiver<()>,
+    tmux: Option<crate::control_input::TmuxFence>,
+}
+
+/// A departure's fence couldn't confirm its writes: a writer died with input
+/// in hand, so what it was writing may still arrive or may never have been
+/// recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceUnknown(pub String);
+
+impl std::fmt::Display for FenceUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl InputFence {
+    /// Wait until every write admitted before the hold has been written or
+    /// has failed, or a writer has died with writes unaccounted for.
+    pub async fn acked(self) -> Result<(), FenceUnknown> {
+        let _ = self.pty.recv().await;
+        match self.tmux {
+            Some(tmux) => tmux.answered().await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// Hold `gate` for departure and queue a fence behind every write `writer`
+/// has queued. Both happen under `writer`'s lock, which every gated write
+/// takes to check the gate and queue its bytes, so each write is either ahead
+/// of the fence or refused.
+fn fence_pty(
+    writer: &Mutex<Box<dyn Write + Send>>,
+    gate: &InputGate,
+    queue: &std::sync::mpsc::Sender<PtyInput>,
+) -> async_channel::Receiver<()> {
+    let (done, acked) = async_channel::bounded(1);
+    let _writer = writer.lock();
+    gate.hold(Hold::Departure);
+    // A writer that has stopped drops this unanswered, which counts as done.
+    let _ = queue.send(PtyInput::Fence(done));
+    acked
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run on the writing thread after a gated write's bytes are queued and
+    /// before its facts are committed, so a test can pause it there.
+    static PAUSE_AFTER_ENQUEUE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 mod input_hold_queue_tests {
-    use super::{ChannelWriter, InputGate, QueuedWrite};
+    use super::{ChannelWriter, Hold, InputGate, PtyInput, fence_pty, write_queued};
+    use crate::test_wait::{joined, settle};
+    use parking_lot::Mutex;
     use std::io::Write;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
+    type Written = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// A PTY that keeps what it's written and, when `paced`, waits for a
+    /// permit before each write, as a child that has stopped reading does.
+    struct Pipe {
+        written: Written,
+        paced: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(permits) = &self.paced {
+                permits.recv().map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            }
+            self.written.lock().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pieces of a session's PTY input: its gate, its gated writer, and
+    /// its writer thread, writing to a [`Pipe`].
+    struct Input {
+        gate: Arc<InputGate>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        queue: mpsc::Sender<PtyInput>,
+        written: Written,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Input {
+        fn new(paced: Option<mpsc::Receiver<()>>) -> Self {
+            let gate = Arc::new(InputGate::default());
+            let closed = Arc::new(AtomicBool::new(false));
+            let (queue, rx) = mpsc::channel();
+            let written = Written::default();
+            let mut pipe = Pipe {
+                written: written.clone(),
+                paced,
+            };
+            let thread = std::thread::spawn({
+                let gate = gate.clone();
+                let closed = closed.clone();
+                move || write_queued(rx, &mut pipe, &gate, &closed, None)
+            });
+            let writer: Box<dyn Write + Send> = Box::new(ChannelWriter {
+                tx: queue.clone(),
+                profile: false,
+                closed,
+                gate: Some(gate.clone()),
+            });
+            Self {
+                gate,
+                writer: Arc::new(Mutex::new(writer)),
+                queue,
+                written,
+                thread,
+            }
+        }
+
+        fn write(&self, bytes: &[u8]) -> bool {
+            self.writer.lock().write_all(bytes).is_ok()
+        }
+
+        fn fence(&self) -> async_channel::Receiver<()> {
+            fence_pty(&self.writer, &self.gate, &self.queue)
+        }
+
+        fn stop(self) -> Vec<Vec<u8>> {
+            let _ = self.queue.send(PtyInput::Stop);
+            joined(self.thread, "the writer thread never stopped");
+            self.written.lock().clone()
+        }
+    }
 
     #[test]
     fn queued_ctl_writes_die_with_the_close_even_after_undo() {
         let gate = Arc::new(InputGate::default());
-        let (tx, rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (tx, rx) = mpsc::channel::<PtyInput>();
         let mut actor = ChannelWriter {
             tx: tx.clone(),
             profile: false,
@@ -948,18 +1152,102 @@ mod input_hold_queue_tests {
         };
         actor.write_all(b"queued keys").unwrap();
         actor.write_all(b"\r").unwrap();
-        gate.hold();
+        gate.hold(Hold::Close);
         assert!(actor.write_all(b"held").is_err());
         protocol.write_all(b"\x1b[0n").unwrap();
-        gate.resume();
+        gate.resume(Hold::Close);
         actor.write_all(b"new input").unwrap();
         let accepted: Vec<_> = rx
             .try_iter()
-            .flatten()
-            .filter(|write| write.admitted(&gate))
-            .map(|write| write.bytes)
+            .filter_map(|input| match input {
+                PtyInput::Write(write) => write.admitted(&gate).then_some(write.bytes),
+                _ => None,
+            })
             .collect();
         assert_eq!(accepted, [b"\x1b[0n".to_vec(), b"new input".to_vec()]);
+    }
+
+    /// Writers on other threads race a departure. Every write is either
+    /// refused or written before the fence answers, and none is written after.
+    #[test]
+    fn a_departure_fence_answers_after_every_admitted_write_and_before_any_other() {
+        const WRITERS: u8 = 4;
+        for round in 0..200 {
+            let input = Arc::new(Input::new(None));
+            let start = Arc::new(Barrier::new(usize::from(WRITERS) + 1));
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|id| {
+                    let input = input.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut admitted = Vec::new();
+                        for seq in 0u32.. {
+                            let mut bytes = vec![id];
+                            bytes.extend(seq.to_le_bytes());
+                            if !input.write(&bytes) {
+                                break;
+                            }
+                            admitted.push(bytes);
+                        }
+                        admitted
+                    })
+                })
+                .collect();
+            start.wait();
+            let fence = input.fence();
+            let _ = settle(fence.recv(), "the fence never answered");
+            let at_ack = input.written.lock().clone();
+            let mut admitted: Vec<_> = writers
+                .into_iter()
+                .flat_map(|writer| joined(writer, "a writer never stopped"))
+                .collect();
+            let input = Arc::into_inner(input).expect("the writers are done");
+            let written = input.stop();
+            assert_eq!(
+                written, at_ack,
+                "round {round}: written after the fence answered"
+            );
+            let mut sorted = written.clone();
+            sorted.sort();
+            admitted.sort();
+            assert_eq!(
+                sorted, admitted,
+                "round {round}: an admitted write went missing"
+            );
+        }
+    }
+
+    /// A fence that went unanswered, and whose departure gave up, can't answer
+    /// for the next one: each waits for the writes queued before itself.
+    #[test]
+    fn a_late_fence_answer_belongs_to_its_own_departure() {
+        let (permit, permits) = mpsc::channel();
+        let input = Input::new(Some(permits));
+        assert!(input.write(b"first"));
+        let first = input.fence();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            first.try_recv().is_err(),
+            "the first write is still blocked"
+        );
+        input.gate.resume(Hold::Departure);
+        assert!(
+            input.write(b"second"),
+            "input flows once the departure gives up"
+        );
+        let second = input.fence();
+        permit.send(()).unwrap();
+        settle(first.recv(), "the first fence never answered").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            second.try_recv().is_err(),
+            "the first fence's answer doesn't answer the second"
+        );
+        permit.send(()).unwrap();
+        settle(second.recv(), "the second fence never answered").unwrap();
+        assert!(!input.write(b"held"));
+        assert_eq!(input.stop(), [b"first".to_vec(), b"second".to_vec()]);
     }
 }
 
@@ -978,7 +1266,7 @@ fn queue_delay_excluding_profiler(
 }
 
 struct ChannelWriter {
-    tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    tx: std::sync::mpsc::Sender<PtyInput>,
     profile: bool,
     closed: Arc<AtomicBool>,
     gate: Option<Arc<InputGate>>,
@@ -1005,7 +1293,7 @@ impl Write for ChannelWriter {
             ));
         }
         self.tx
-            .send(Some(QueuedWrite {
+            .send(PtyInput::Write(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
                 epoch,
@@ -1067,12 +1355,30 @@ struct ResizeState {
     since: Instant,
 }
 
-fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
-    if !has_bytes {
-        previous
-    } else {
-        !submission_pending
-    }
+/// What an input write submits. The write commits it together with its bytes
+/// (see [`TerminalSession::try_write_submission`]), so a refused write records
+/// no submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submission {
+    /// Text, keys or a paste that submit nothing. They latch the draft.
+    None,
+    /// A bare Enter, or a snippet's lone Enter. It can select a resume item,
+    /// so it carries no prompt intent.
+    Turn,
+    /// Enter, or text ending in one, whose caller supplied the prompt.
+    Prompt,
+}
+
+/// What a gated write tells the session besides its bytes.
+#[derive(Clone, Copy)]
+enum InputFacts {
+    Typed(Submission),
+    /// A mouse or wheel report: input, but not text.
+    Pointer,
+}
+
+fn draft_after_input(previous: bool, submitted: bool, has_bytes: bool) -> bool {
+    if !has_bytes { previous } else { !submitted }
 }
 
 /// The input word (see `TerminalSession::input_state`) after one non-empty
@@ -1086,6 +1392,67 @@ fn next_input_state(state: u64, submitted: Option<bool>) -> u64 {
         draft_after_input(previous_draft, submitted, true)
     });
     (revision << 1) | u64::from(draft)
+}
+
+fn advance_input_state(state: &AtomicU64, submitted: Option<bool>) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+        Some(next_input_state(state, submitted))
+    });
+}
+
+/// How long after input its terminal's output paints at the interactive
+/// cadence.
+const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
+
+fn mark_interactive_until(until: &Mutex<Option<Instant>>) {
+    *until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+}
+
+/// What committing a submission changes. It's shared, apart from the
+/// terminal, so the tmux input worker can commit a submission it delivered on
+/// its own thread; the terminal itself stays on the UI thread.
+pub(crate) struct SubmissionFacts {
+    evidence: Arc<Mutex<LifecycleEvidence>>,
+    turn_submitted: Arc<AtomicBool>,
+    input_state: Arc<AtomicU64>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    runtime_trigger: async_channel::Sender<()>,
+}
+
+impl SubmissionFacts {
+    /// The facts an admitted submission records. A `prompt` one follows a
+    /// known prompt; any other is a bare Enter.
+    fn record(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        advance_input_state(&self.input_state, Some(true));
+    }
+
+    /// The facts of a submission tmux has delivered, with the view effects a
+    /// PTY submission has. The tmux input worker commits them once tmux has
+    /// taken the Enter, whether or not anyone still waits for the answer.
+    pub(crate) fn commit(&self, submitted_at: SystemTime, prompt: bool) {
+        self.record(submitted_at, prompt);
+        mark_interactive_until(&self.interactive_until);
+        let _ = self.runtime_trigger.try_send(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_submitted(&self) -> bool {
+        self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
 }
 
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
@@ -1272,7 +1639,9 @@ pub struct TerminalSession {
     input_closed: Arc<AtomicBool>,
     input_gate: Arc<InputGate>,
     shell_prompt: Arc<ShellPrompt>,
-    input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    /// The PTY writer thread's queue, for its stop and departure fences. Input
+    /// goes through `writer`, which checks the gate.
+    input_queue: std::sync::mpsc::Sender<PtyInput>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
     /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
@@ -1344,16 +1713,15 @@ pub struct TerminalSession {
     /// launch. Startup title activity alone is not evidence that a turn
     /// completed. The runtime reducer uses the submission recorded in
     /// `evidence` instead, which counts only within its provider binding.
-    turn_submitted: AtomicBool,
+    turn_submitted: Arc<AtomicBool>,
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
-    submission_pending: AtomicBool,
     /// The input revision and a conservative draft bit in one atomic word, so
     /// a reader never sees one write's revision paired with another write's
     /// draft bit. The low bit is the draft flag; the remaining bits are the
     /// revision, advanced for each input write (see [`Self::input_snapshot`]).
-    input_state: AtomicU64,
+    input_state: Arc<AtomicU64>,
     /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
@@ -1371,7 +1739,9 @@ pub struct TerminalSession {
     /// to recent input. A TUI usually redraws rather than literally echoing the
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
-    interactive_until: Mutex<Option<Instant>>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    /// The submission facts above, shared with the tmux input worker.
+    submission: Arc<SubmissionFacts>,
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
@@ -1380,6 +1750,9 @@ pub struct TerminalSession {
     /// processes still in it keep running.
     #[cfg(windows)]
     pane_job: Option<crate::pane_job::PaneJob>,
+    /// Input admitted that can still be written later (see
+    /// [`crate::pending_ops`]).
+    pending_ops: Arc<crate::pending_ops::PendingOps>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1722,7 +2095,7 @@ impl TerminalSession {
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<PtyInput>();
         let input_closed = Arc::new(AtomicBool::new(false));
         let input_gate = Arc::new(InputGate::default());
         let worker_gate = input_gate.clone();
@@ -1731,44 +2104,13 @@ impl TerminalSession {
         let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
-                // Exits when every sender is gone (session dropped) or the
-                // pipe breaks (child gone).
-                let mut prior_profiler_interval = None;
-                while let Ok(Some(write)) = write_rx.recv() {
-                    if worker_closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let queue_delay = write.queued_at.map(|queued_at| {
-                        queue_delay_excluding_profiler(
-                            queued_at,
-                            Instant::now(),
-                            prior_profiler_interval,
-                        )
-                    });
-                    let write_started = write.queued_at.map(|_| Instant::now());
-                    if !write.admitted(&worker_gate) {
-                        continue;
-                    }
-                    let result = pipe_writer.write_all(&write.bytes);
-                    if result.is_ok() {
-                        let _ = pipe_writer.flush();
-                    }
-                    if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
-                        (profile_writes, queue_delay, write_started)
-                    {
-                        let profile_started = Instant::now();
-                        crate::profile::pty_write(
-                            instance_id,
-                            write.bytes.len(),
-                            queue_delay,
-                            write_started.elapsed(),
-                        );
-                        prior_profiler_interval = Some((profile_started, Instant::now()));
-                    }
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                write_queued(
+                    write_rx,
+                    &mut *pipe_writer,
+                    &worker_gate,
+                    &worker_closed,
+                    profile_writes,
+                )
             })
             .context("spawn pty writer thread")?;
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
@@ -1852,7 +2194,7 @@ impl TerminalSession {
                     let mut child = child;
                     let status = child.wait();
                     monitor_closed.store(true, Ordering::Release);
-                    let _ = monitor_stop.send(None);
+                    let _ = monitor_stop.send(PtyInput::Stop);
                     // Publish before close: the reader emits Exit only after
                     // draining all output produced before the child died.
                     let _ = exit_tx.send(status);
@@ -1863,7 +2205,7 @@ impl TerminalSession {
             monitor_spawn_result(monitor, &output_queue, || {
                 let _ = killer.lock().kill();
                 input_closed.store(true, Ordering::Release);
-                let _ = write_tx.send(None);
+                let _ = write_tx.send(PtyInput::Stop);
                 master.close();
             })
             .context("spawn PTY child monitor")?
@@ -1898,6 +2240,13 @@ impl TerminalSession {
         );
 
         let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+        let submission = Arc::new(SubmissionFacts {
+            evidence: evidence.clone(),
+            turn_submitted: Arc::default(),
+            input_state: Arc::default(),
+            interactive_until: Arc::default(),
+            runtime_trigger: runtime_trigger.clone(),
+        });
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
@@ -1917,7 +2266,7 @@ impl TerminalSession {
             input_closed,
             input_gate: input_gate.clone(),
             shell_prompt,
-            input_stop: write_tx,
+            input_queue: write_tx,
             child_pid,
             #[cfg(unix)]
             child_identity,
@@ -1953,16 +2302,16 @@ impl TerminalSession {
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
-            turn_submitted: AtomicBool::new(false),
+            turn_submitted: submission.turn_submitted.clone(),
             last_user_input: Mutex::new(None),
-            submission_pending: AtomicBool::new(false),
-            input_state: AtomicU64::new(0),
+            input_state: submission.input_state.clone(),
             runtime_trigger,
             runtime_events,
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
-            interactive_until: Mutex::new(None),
+            interactive_until: submission.interactive_until.clone(),
+            submission,
             // ctl input through tmux honours the same close hold.
             tmux_input: spec
                 .tmux_input
@@ -1970,6 +2319,7 @@ impl TerminalSession {
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
             #[cfg(windows)]
             pane_job,
+            pending_ops: Arc::default(),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2253,8 +2603,7 @@ impl TerminalSession {
     /// interaction window, not echo detection: full-screen TUIs redraw in
     /// response to keys and streaming output may already be queued.
     fn mark_interactive(&self) {
-        const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
-        *self.interactive_until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+        mark_interactive_until(&self.interactive_until);
     }
 
     /// Whether output should use the interactive paint cadence.
@@ -2337,13 +2686,86 @@ impl TerminalSession {
     }
 
     /// [`Self::write_input`], saying whether the bytes could be handed to the
-    /// PTY. An error means the terminal's writer is gone (its program exited and
-    /// a write has already failed); `Ok` only means the bytes were queued.
+    /// PTY. An error means the terminal is held for closing or its writer is
+    /// gone (its program exited and a write has already failed); `Ok` only means
+    /// the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.admit_input(!data.is_empty());
-        self.try_write_raw(data)?;
-        self.shell_prompt.submitted(data);
+        self.try_write_submission(data, Submission::None)
+    }
+
+    /// [`Self::write_input`] for input that may submit something: a key the
+    /// user pressed, a snippet, a broadcast line. Its facts are committed with
+    /// the write; see [`Self::try_write_submission`].
+    pub fn write_submission(&self, data: &[u8], submission: Submission) {
+        let _ = self.try_write_submission(data, submission);
+    }
+
+    /// Write input and commit what it says, together: the input revision, the
+    /// draft bit, the shell prompt and, for a [`Submission::Turn`] or
+    /// [`Submission::Prompt`], the submission evidence. A refused write changes
+    /// none of them. Success means queued bytes, not confirmation that the child
+    /// consumed them.
+    pub fn try_write_submission(&self, data: &[u8], submission: Submission) -> std::io::Result<()> {
+        self.try_write_with_facts(data, InputFacts::Typed(submission))
+    }
+
+    /// Admit a complete submission after a known prompt (Enter, or text ending
+    /// in Enter). This is the API `paste_prompt` uses once it has checked the
+    /// pane and input revision. Keyboard Enter alone is a [`Submission::Turn`]:
+    /// it can't prove prompt intent.
+    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.try_write_submission(data, Submission::Prompt)
+    }
+
+    /// The one gated write. Under the writer lock it checks the input gate,
+    /// enqueues `data`, and only if that succeeded commits the facts the write
+    /// justifies. Whatever holds the writer lock (a hold, a fence) therefore
+    /// sees each write either with its facts or refused, never one without the
+    /// other. View effects (scroll, output priority, the runtime trigger) follow
+    /// after the lock is released.
+    fn try_write_with_facts(&self, data: &[u8], facts: InputFacts) -> std::io::Result<()> {
+        // The child can react as soon as the bytes are queued. Take the input
+        // time first, so a resume hook the Enter causes can't make that Enter
+        // belong to the replacement conversation.
+        let submitted_at = SystemTime::now();
+        {
+            let mut writer = self.writer.lock();
+            self.check_input_gate()?;
+            writer.write_all(data)?;
+            writer.flush()?;
+            #[cfg(test)]
+            PAUSE_AFTER_ENQUEUE.with_borrow_mut(|pause| {
+                if let Some(pause) = pause.as_mut() {
+                    pause();
+                }
+            });
+            if !data.is_empty() {
+                match facts {
+                    InputFacts::Pointer => self.advance_input(None),
+                    InputFacts::Typed(Submission::None) => self.advance_input(Some(false)),
+                    InputFacts::Typed(Submission::Turn) => {
+                        self.record_submission(submitted_at, false)
+                    }
+                    InputFacts::Typed(Submission::Prompt) => {
+                        self.record_submission(submitted_at, true)
+                    }
+                }
+            }
+            if let InputFacts::Typed(_) = facts {
+                self.shell_prompt.submitted(data);
+            }
+        }
+        if let InputFacts::Typed(submission) = facts {
+            self.scroll_input_to_bottom();
+            if !data.is_empty() {
+                // A TUI reaction will follow; prioritize output during this
+                // short interaction window even if stream output is queued.
+                self.mark_interactive();
+                if submission != Submission::None {
+                    self.trigger_runtime();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2359,68 +2781,10 @@ impl TerminalSession {
         }
     }
 
-    /// The bookkeeping every input write does before its bytes go anywhere.
-    fn admit_input(&self, nonempty: bool) {
-        self.scroll_input_to_bottom();
-        if nonempty {
-            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
-            if submitted_enter {
-                self.trigger_runtime();
-            }
-            // A TUI reaction will follow; prioritize output during this short
-            // interaction window even if stream output is already queued.
-            self.mark_interactive();
-        }
-    }
-
-    /// Admit a complete submission (Enter, or text ending in Enter) and commit
-    /// its lifecycle facts together. Failed admission leaves the draft and
-    /// submission evidence unchanged, with no marker for a later key to consume.
-    /// Success means queued bytes, not confirmation that the child consumed them.
-    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
-        // This API admits a known prompt after `paste_prompt` has checked
-        // the pane and input revision. Generic keyboard Enter uses
-        // `mark_turn_submitted` and cannot prove prompt intent.
-        self.try_submit(data, true)
-    }
-
-    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
-    /// and a plain one otherwise.
-    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.scroll_input_to_bottom();
-        let mut writer = self.writer.lock();
-        // The child can react as soon as write_all publishes bytes. Keep the
-        // input time before any resume hook it causes, but commit no facts
-        // until writer admission succeeds.
-        let submitted_at = SystemTime::now();
-        self.submission_pending.store(false, Ordering::Release);
-        writer.write_all(data)?;
-        writer.flush()?;
-        self.shell_prompt.submitted(data);
-        if !data.is_empty() {
-            self.commit_submission(submitted_at, prompt);
-        }
-        Ok(())
-    }
-
-    /// The facts an admitted submission commits together. A `prompt` one
-    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
-    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
-        {
-            let mut evidence = self.evidence.lock();
-            if prompt {
-                evidence.record_prompt_submission(submitted_at);
-            } else {
-                evidence.record_submission(submitted_at);
-            }
-        }
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.advance_input(Some(true));
-        self.mark_interactive();
-        self.trigger_runtime();
+    /// The facts an admitted submission records (see
+    /// [`SubmissionFacts::record`]).
+    fn record_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        self.submission.record(submitted_at, prompt);
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
@@ -2429,7 +2793,9 @@ impl TerminalSession {
     /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
     /// [`Self::try_submit_input`]. Either way the input revision and draft bit
     /// move as for a PTY write, and a submit's facts are committed only once it
-    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    /// is admitted. Through tmux, that's when tmux has taken it: the input
+    /// worker commits them then, before it answers, and the write counts in
+    /// [`Self::pending_input_ops`] until it has.
     pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
@@ -2448,37 +2814,83 @@ impl TerminalSession {
                         .collect::<Vec<u8>>(),
                 ),
                 ControlInput::Submit => self.try_submit_input(b"\r"),
-                ControlInput::SubmitKey => self.try_submit(b"\r", false),
+                ControlInput::SubmitKey => self.try_write_submission(b"\r", Submission::Turn),
             };
             return ControlWrite::done(
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
-        // Held for closing, the pane takes no ctl input by this route either.
-        // A write queued before the hold dies on the worker, even after Undo.
+        // Held, the pane takes no ctl input by this route either; the worker
+        // checks under the lock a departure fences with. A write queued
+        // before a close dies on the worker, even after Undo.
         let epoch = self.input_epoch();
-        if !self.accepts_input_epoch(epoch) {
-            return ControlWrite::done(Err(ControlWriteError::Closed(
-                "terminal is closing".into(),
-            )));
-        }
-        let submit = match &input {
+        let (submit, typed) = match &input {
             ControlInput::Submit | ControlInput::SubmitKey => {
-                self.scroll_input_to_bottom();
-                self.submission_pending.store(false, Ordering::Release);
                 let prompt = input == ControlInput::Submit;
-                Some((self.clone(), SystemTime::now(), prompt))
+                let submit = crate::control_input::Submit {
+                    facts: self.submission.clone(),
+                    at: SystemTime::now(),
+                    prompt,
+                };
+                (Some(submit), false)
             }
-            ControlInput::Paste(text) => {
-                self.admit_input(!text.is_empty());
-                None
-            }
-            ControlInput::Keys { keys, .. } => {
-                self.admit_input(!keys.is_empty());
-                None
-            }
+            ControlInput::Paste(text) => (None, !text.is_empty()),
+            ControlInput::Keys { keys, .. } => (None, !keys.is_empty()),
         };
-        ControlWrite::queued(tmux.deliver(input, epoch), submit)
+        let mut queued = false;
+        let delivered = tmux.deliver(input, epoch, submit, self.begin_pending_op(), || {
+            // A paste or key press moves the input revision as it's queued;
+            // tmux reports delivery later, and this doesn't wait for it.
+            if typed {
+                self.advance_input(Some(false));
+            }
+            queued = true;
+        });
+        if !queued {
+            // Refused as it was queued, and answered already: known at once,
+            // as a refused PTY write is.
+            return ControlWrite::done(delivered.try_recv().unwrap_or_else(|_| {
+                Err(ControlWriteError::Refused(
+                    "muxel's tmux input worker stopped".into(),
+                ))
+            }));
+        }
+        self.scroll_input_to_bottom();
+        if typed {
+            self.mark_interactive();
+        }
+        ControlWrite::queued(delivered)
+    }
+
+    /// How many pieces of admitted input can still reach this terminal's
+    /// program: ctl writes queued for tmux that it hasn't answered, and a
+    /// startup automation that hasn't made its last write. Each is counted until
+    /// its write and the facts that go with it are done.
+    pub fn pending_input_ops(&self) -> usize {
+        self.pending_ops.count()
+    }
+
+    pub(crate) fn begin_pending_op(&self) -> crate::pending_ops::PendingOp {
+        self.pending_ops.begin()
+    }
+
+    /// Interrupt this terminal's pending input for a confirmed departure, and
+    /// return how much there was. The startup automation stops at its next
+    /// stage and never resumes, even if the departure gives up; writes
+    /// already queued for tmux still go.
+    pub fn interrupt_pending_input(&self) -> usize {
+        self.pending_ops.interrupt_all()
+    }
+
+    /// Run `probe` with this terminal's submission facts each time its pending
+    /// input drops to none.
+    #[cfg(test)]
+    pub(crate) fn on_pending_input_drained(
+        &self,
+        probe: impl Fn(&SubmissionFacts) + Send + Sync + 'static,
+    ) {
+        let facts = self.submission.clone();
+        self.pending_ops.on_drained(move || probe(&facts));
     }
 
     /// Whether outside-control input reaches this terminal through tmux.
@@ -2512,12 +2924,30 @@ impl TerminalSession {
 
     /// Hide-time cancellation: old queued input stays invalid after Undo.
     pub fn hold_input(&self) {
-        self.input_gate.hold();
-        self.submission_pending.store(false, Ordering::Release);
+        self.input_gate.hold(Hold::Close);
     }
 
+    /// Release the close hold. A departure hold, if any, stays.
     pub fn resume_input(&self) {
-        self.input_gate.resume();
+        self.input_gate.resume(Hold::Close);
+    }
+
+    /// Stop new input for quitting or restarting, and fence the writers: the
+    /// returned fence answers once every write admitted before the hold, by
+    /// PTY or through tmux, has been written or has failed, and reports a
+    /// writer that died with input unaccounted for. Unlike a close, input
+    /// already queued is still written. Each call makes its own fence, so an
+    /// answer that comes after its departure gave up can't answer a later one.
+    pub fn hold_for_departure(&self) -> InputFence {
+        InputFence {
+            pty: fence_pty(&self.writer, &self.input_gate, &self.input_queue),
+            tmux: self.tmux_input.as_ref().map(|tmux| tmux.fence()),
+        }
+    }
+
+    /// Release the departure hold. A close hold, if any, stays.
+    pub fn release_departure(&self) {
+        self.input_gate.resume(Hold::Departure);
     }
 
     pub fn input_epoch(&self) -> u64 {
@@ -2537,8 +2967,14 @@ impl TerminalSession {
     /// [`Self::write_input`] for input the user produced themselves — a key typed
     /// into the pane — so it counts as someone being at this machine.
     pub fn write_user_input(&self, data: &[u8]) {
+        self.write_user_submission(data, Submission::None);
+    }
+
+    /// [`Self::write_submission`] for a key the user pressed themselves, as
+    /// [`Self::write_user_input`] counts it.
+    pub fn write_user_submission(&self, data: &[u8], submission: Submission) {
         self.mark_user_input();
-        self.write_input(data);
+        self.write_submission(data, submission);
     }
 
     /// Note that the user just sent this terminal input themselves: a key, a
@@ -2584,36 +3020,7 @@ impl TerminalSession {
     }
 
     fn advance_input(&self, submitted: Option<bool>) {
-        let _ = self
-            .input_state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
-                Some(next_input_state(state, submitted))
-            });
-    }
-
-    /// Announce that the next input write submits a turn. Call it just before
-    /// writing the Enter (or the text ending in one).
-    pub fn mark_turn_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        self.evidence.lock().record_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
-    }
-
-    /// Explicit prompt submission from a path that supplied the prompt text.
-    /// Keyboard Enter alone can select a resume item, even after arrow input.
-    pub fn mark_prompt_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        let mut evidence = self.evidence.lock();
-        evidence.record_prompt_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
+        advance_input_state(&self.input_state, submitted);
     }
 
     /// Whether any turn was submitted in this launch, in any conversation.
@@ -2632,12 +3039,12 @@ impl TerminalSession {
         self.evidence.lock().initial_unbound_submission()
     }
 
-    /// The input revision and draft bit. Ordinary non-empty input writes (keys,
-    /// pastes, mouse and wheel reports) advance the revision before writer
-    /// admission; fallible submissions commit it after successful admission.
-    /// Focus reports and the terminal's own replies to the program don't count.
-    /// The draft bit is set
-    /// by typed input and cleared by a submission.
+    /// The input revision and draft bit. A non-empty input write (keys, pastes,
+    /// submissions, mouse and wheel reports) advances the revision only once
+    /// the writer has admitted it; a ctl write through tmux advances it when
+    /// queued. Focus reports and the terminal's own replies to the program
+    /// don't count. The draft bit is set by typed input and cleared by a
+    /// submission.
     pub fn input_snapshot(&self) -> (u64, bool) {
         let state = self.input_state.load(Ordering::Relaxed);
         (state >> 1, state & 1 != 0)
@@ -2716,13 +3123,7 @@ impl TerminalSession {
     /// advances the input revision, but it isn't text: the draft bit and the
     /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        if !data.is_empty() {
-            self.advance_input(None);
-        }
-        self.write_raw(data);
+        let _ = self.try_write_with_facts(data, InputFacts::Pointer);
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
@@ -4080,7 +4481,7 @@ fn appimage_env_fixups(
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         self.input_closed.store(true, Ordering::Release);
-        let _ = self.input_stop.send(None);
+        let _ = self.input_queue.send(PtyInput::Stop);
         // Release a reader parked on a full output queue before the `master`
         // field drops and closes the platform PTY; a receiver that outlives
         // the session must not hold that close hostage.
@@ -4338,7 +4739,7 @@ impl HangupChild {
 /// before reaping the child; OSC 133 evidence is observed before UI admission.
 struct InputShutdown {
     closed: Arc<AtomicBool>,
-    stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    stop: std::sync::mpsc::Sender<PtyInput>,
     shell_prompt: Arc<ShellPrompt>,
 }
 
@@ -4431,7 +4832,7 @@ fn read_loop(
         }
     }
     input_shutdown.closed.store(true, Ordering::Release);
-    let _ = input_shutdown.stop.send(None);
+    let _ = input_shutdown.stop.send(PtyInput::Stop);
     // The reader's master-fd dups are no longer needed; free them before the
     // (potentially long) reap below so closed sessions don't hold PTYs open.
     drop(reader);
@@ -6513,13 +6914,14 @@ mod windows_spawn_resolve {
 #[cfg(test)]
 mod runtime_fact_tests {
     use super::{
-        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+        CommandSpec, PAUSE_AFTER_ENQUEUE, PtyOutput, RESIZE_SETTLE, TerminalSession,
+        draft_after_input, next_input_state,
     };
     use crate::listener::SWITCH_SLACK;
+    use crate::test_wait::{joined, received, settle};
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
@@ -6568,8 +6970,7 @@ mod runtime_fact_tests {
         session.write_input(b"\x1b\r");
         assert_eq!(session.input_snapshot(), (2, true));
 
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         assert_eq!(session.input_snapshot(), (3, false));
         assert_eq!(events.try_recv(), Ok(()));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
@@ -6839,7 +7240,7 @@ mod runtime_fact_tests {
     }
 
     #[test]
-    fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
+    fn failed_submission_admission_leaves_no_facts() {
         struct RefuseSubmission {
             on_flush: bool,
         }
@@ -6867,7 +7268,6 @@ mod runtime_fact_tests {
             assert!(!session.has_submitted_turn());
             assert_eq!(session.first_submission_at(), None);
             assert!(!session.runtime_evidence(None).submitted);
-            assert!(!session.submission_pending.load(Ordering::Acquire));
             assert!(events.is_empty());
 
             // A recovered writer must treat the next key as ordinary draft
@@ -6884,6 +7284,45 @@ mod runtime_fact_tests {
             assert_eq!(events.try_recv(), Ok(()));
             session.kill();
         }
+    }
+
+    /// The writer's own refusal is the one that decides: a hold that landed
+    /// after the caller looked, or a writer whose child is gone. A write it
+    /// refuses leaves every input fact as it was: no revision, no draft bit,
+    /// no submission evidence and no runtime event.
+    #[test]
+    fn a_write_the_writer_refuses_changes_no_input_facts() {
+        struct Refuse;
+        impl std::io::Write for Refuse {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "terminal is closing",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session = fixture();
+        session.paste("draft");
+        let before = session.input_snapshot();
+        let events = session.runtime_events();
+        *session.writer.lock() = Box::new(Refuse);
+
+        assert!(session.try_write_input(b"x").is_err());
+        session.write_pointer(b"\x1b[<0;1;1M");
+        for submission in [crate::Submission::Turn, crate::Submission::Prompt] {
+            assert!(session.try_write_submission(b"go\r", submission).is_err());
+        }
+
+        assert_eq!(session.input_snapshot(), before);
+        assert!(!session.has_submitted_turn());
+        assert_eq!(session.first_submission_at(), None);
+        assert!(!session.runtime_evidence(None).submitted);
+        assert!(events.is_empty());
+        session.kill();
     }
 
     #[test]
@@ -6945,6 +7384,59 @@ mod runtime_fact_tests {
             "the resume selector Enter must not arm the replacement conversation"
         );
         assert!(later_submitted, "a later Enter must still arm a turn");
+    }
+
+    /// A departure that finds a write queued but its facts not yet committed
+    /// waits for them before it holds input: what quitting reads after the
+    /// hold includes every write the PTY was given.
+    #[test]
+    fn a_departure_waits_for_the_facts_of_a_write_already_queued() {
+        let session = fixture();
+        let before = session.input_snapshot();
+        let (paused, at_pause) = std::sync::mpsc::channel();
+        let (permit, permits) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                PAUSE_AFTER_ENQUEUE.set(Some(Box::new(move || {
+                    let _ = paused.send(());
+                    received(&permits, "the paused write was never let through");
+                })));
+                session.try_write_submission(b"go\r", crate::Submission::Turn)
+            })
+        };
+        received(&at_pause, "the write never queued");
+        // Paused, the write still holds the writer lock its facts commit
+        // under. A departure takes that lock to hold and fence, so it waits:
+        // this is the proof, and the timed wait below only watches for it.
+        assert!(
+            session.writer.try_lock().is_none(),
+            "the paused write let go of the writer lock before its facts"
+        );
+        let (held, at_hold) = std::sync::mpsc::channel();
+        let departure = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let fence = session.hold_for_departure();
+                let _ = held.send((session.input_snapshot(), session.has_submitted_turn()));
+                fence
+            })
+        };
+        assert!(
+            at_hold.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the departure held input while a queued write's facts were uncommitted"
+        );
+        permit.send(()).unwrap();
+        assert_eq!(
+            received(&at_hold, "the departure never held input"),
+            ((before.0 + 1, false), true),
+            "the departure read the write without its facts"
+        );
+        assert!(joined(writer, "the write never finished").is_ok());
+        let fence = joined(departure, "the departure never fenced");
+        assert_eq!(settle(fence.acked(), "the fence never answered"), Ok(()));
+        session.release_departure();
+        session.kill();
     }
 
     fn fixture() -> std::sync::Arc<TerminalSession> {

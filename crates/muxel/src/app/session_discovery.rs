@@ -2228,7 +2228,7 @@ mod grok_regressions {
                         .clone()
                         .unwrap();
                     session.process_probe_output(format!("\x1b]0;{old} | Ready\x07").as_bytes());
-                    session.mark_turn_submitted();
+                    session.write_submission(b"\r", muxel_terminal::Submission::Turn);
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
                         background: None,

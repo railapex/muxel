@@ -355,7 +355,7 @@ fn pr136_shared_policy_mixed_subagent_listing_holds_only_to_three_hour_cap() {
 #[test]
 fn pr136_shared_policy_grok_title_turn_finishes_beside_shell_monitor_panel() {
     let mut probe = Probe::new();
-    probe.session.mark_turn_submitted();
+    probe.session.write_submission(b"\r", crate::Submission::Turn);
     let screen = "Finished.\nv Tasks 1\n· Run Server\nv Watchers 1\n· Monitor Watch server\n╭─────────────╮\n│ >           │\n╰─────────────╯\nShift+Tab:mode  │  Ctrl+x:shortcuts";
     let expected = Some(BackgroundWork {
         shells: 1,
@@ -550,7 +550,7 @@ fn every_claude_spinner_frame_reads_working_without_a_title() {
         .enumerate()
     {
         if index == 1 {
-            session.mark_turn_submitted();
+            session.write_submission(b"\r", crate::Submission::Turn);
         }
         let mut wire = "\x1b[2J\x1b[H\x1b[?2004h".to_string();
         for (line, text) in screen(&row).lines().enumerate() {

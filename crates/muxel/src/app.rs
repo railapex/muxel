@@ -71,6 +71,9 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+mod departure;
+#[cfg(all(test, windows))]
+mod departure_tests;
 #[cfg(test)]
 mod diff_refresh_tests;
 #[cfg(all(test, windows))]
@@ -82,6 +85,7 @@ mod libraries_ui;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
+mod pending_input;
 #[cfg(all(test, windows))]
 mod placement_tests;
 mod popout_lifecycle;
@@ -3661,19 +3665,20 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| {
-                // Quit outright when there's nothing to confirm: the first-run
-                // screens (nothing running yet), or a second Cmd+Q while the
-                // confirm modal is already up — same as clicking its Quit button.
-                if this.show_terms || this.show_workspace_selector || this.show_quit_confirm {
-                    if this.show_quit_confirm {
+                // A second Cmd+Q while the confirm modal or the countdown is
+                // up is the same as clicking its button, Quit or Restart.
+                if this.exit_countdown.is_some() {
+                    this.exit_now(cx);
+                } else if this.show_quit_confirm {
+                    let kind = this.quit_confirm_kind;
+                    if kind == departure::ExitKind::Quit {
                         this.kill_checked_tmux_sessions();
                     }
-                    this.confirm_quit = true;
-                    this.quit_after_closes(cx);
+                    this.confirm_exit(kind, cx);
+                } else if this.show_terms || this.show_workspace_selector {
+                    this.quit_from_entry_screen(cx);
                 } else {
-                    this.quit_kill_tmux_local = false;
-                    this.quit_kill_tmux_remote = false;
-                    this.show_quit_confirm = true;
+                    this.ask_exit(departure::ExitKind::Quit, cx);
                     // The confirmation renders in the main window, which may be
                     // minimized (to the tray, say) or behind a pop-out when this
                     // comes from the menu bar or a pop-out's Cmd+Q — raise it so
@@ -5110,7 +5115,7 @@ mod loop_cleanup_tests {
     fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
         let (session, _receiver, _) = claude_loop_pane();
         // The startup prompt, typed before Claude has shown any identity.
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         assert_eq!(
             session.first_submission_binding(),
             Some(session.binding_revision())
@@ -5129,7 +5134,7 @@ mod loop_cleanup_tests {
         session.kill();
 
         let (session, _receiver, _) = claude_loop_pane();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let mut left = run(session.id);
         left.post_run = PostRunAction::Leave;
         let mut runs = HashMap::from([(pane, left)]);
@@ -5142,7 +5147,7 @@ mod loop_cleanup_tests {
     #[test]
     fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
         let (session, _receiver, _) = claude_loop_pane();
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
         assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
@@ -5163,7 +5168,7 @@ mod loop_cleanup_tests {
     fn a_fresh_claude_loops_first_same_id_resume_abandons_exit_cleanup() {
         let (session, _receiver, bound) = claude_loop_pane();
         assert!(!session.launch_resumed());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
         assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
@@ -5203,7 +5208,7 @@ mod loop_cleanup_tests {
         // Observe A before submitting, so this exercises verified ownership.
         let first = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let a = session.binding_revision();
         let mut run = run(session.id);
         let working = snapshot(session.id, a, AgentStatus::Working);
@@ -5279,7 +5284,7 @@ mod loop_cleanup_tests {
     fn loop_cleanup_releases_an_ambiguous_initial_turn_at_the_cap() {
         let (session, _receiver) = session();
         let hook = SystemTime::now() - Duration::from_secs(1);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         // An unknown launch's first identity is reported after submission. The
         // task finishes inside its ambiguity window, then emits no more output;
         // the status stays uncertain until the window's settle deadline.
@@ -5322,7 +5327,7 @@ mod loop_cleanup_tests {
         // A fresh Codex launch: its conversation is unknown until it names it.
         let (session, _receiver) = session();
         let mut run = run(session.id);
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         assert_eq!(session.first_submission_binding(), None);
         let first = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
@@ -5358,7 +5363,7 @@ mod loop_cleanup_tests {
         // Later identities and submissions cannot repair unknown ownership.
         let replacement = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{replacement} | Ready\x07").as_bytes());
-        session.mark_turn_submitted();
+        session.write_submission(b"\r", muxel_terminal::Submission::Turn);
         let replaced = session.binding_revision();
         assert_eq!(session.first_submission_binding(), None);
         assert_eq!(
@@ -6489,6 +6494,29 @@ pub struct MuxelApp {
     pending_browser_redock: Vec<(Uuid, String, RedockAnchor)>,
     /// Whether the "Quit?" confirmation modal is shown (close was intercepted).
     show_quit_confirm: bool,
+    /// Which exit that modal asks about.
+    quit_confirm_kind: departure::ExitKind,
+    /// A confirmed Restart under way, and how far it has got (see
+    /// [`departure`]). Launches, automatic turns and new input wait it out.
+    departing: Option<departure::Stage>,
+    /// The confirmed Restart's preparation, from its interruption to its exit.
+    restart_task: Option<Task<()>>,
+    /// A Quit confirmed while a Restart was preparing; it runs if the Restart
+    /// gives up.
+    quit_after_restart: bool,
+    /// Native file dialogs open now. A confirmed Restart doesn't start while
+    /// any is.
+    native_dialogs: std::rc::Rc<std::cell::Cell<usize>>,
+    /// Starts the new version for a confirmed Restart. Tests replace it.
+    relaunch: fn(&crate::update::RelaunchPlan) -> std::io::Result<()>,
+    /// Set where a committed Restart would quit: tests never quit the app.
+    #[cfg(test)]
+    restart_ended: bool,
+    /// A Quit or Restart counting down because every pane looked idle.
+    exit_countdown: Option<departure::ExitCountdown>,
+    /// Where tests save the workspace document instead of the data dir.
+    #[cfg(test)]
+    test_doc_path: Option<PathBuf>,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
     /// reset each time the dialog opens).
     quit_kill_tmux_local: bool,
@@ -6504,10 +6532,15 @@ pub struct MuxelApp {
     broadcasting: bool,
     /// Reused input for the broadcast bar.
     broadcast_input: Entity<InputState>,
+    /// Input operations admitted that can still type into a pane later (see
+    /// [`pending_input`]).
+    pending_inputs: pending_input::PendingInputs,
     /// Speech-to-text dictation state (idle / recording / transcribing / error).
     stt_state: SttState,
-    /// The in-flight microphone capture, held while `stt_state == Recording`.
-    stt_recording: Option<crate::stt::Recording>,
+    /// The in-flight microphone capture, held while `stt_state == Recording`,
+    /// with the dictation's pending-input guard, which the transcription then
+    /// carries until its transcript is delivered.
+    stt_recording: Option<(crate::stt::Recording, pending_input::PendingInput)>,
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
@@ -8759,6 +8792,21 @@ impl MuxelApp {
             pending_editor_redock: Vec::new(),
             pending_browser_redock: Vec::new(),
             show_quit_confirm: false,
+            quit_confirm_kind: departure::ExitKind::Quit,
+            departing: None,
+            restart_task: None,
+            quit_after_restart: false,
+            native_dialogs: Default::default(),
+            relaunch: if cfg!(test) {
+                departure::refuse_relaunch
+            } else {
+                crate::update::relaunch
+            },
+            #[cfg(test)]
+            restart_ended: false,
+            exit_countdown: None,
+            #[cfg(test)]
+            test_doc_path: None,
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
             show_keys: false,
@@ -8766,6 +8814,7 @@ impl MuxelApp {
             term_search_input,
             broadcasting: false,
             broadcast_input,
+            pending_inputs: Default::default(),
             stt_state: SttState::Idle,
             stt_recording: None,
             stt_hold: false,
@@ -8919,6 +8968,11 @@ impl MuxelApp {
             cx.defer(move |cx| {
                 if let Some(app) = weak.upgrade() {
                     app.update(cx, |this, cx| {
+                        // A Restart that has started the new version closes its
+                        // windows by quitting, and keeps their layout as saved.
+                        if this.departing == Some(departure::Stage::Committed) {
+                            return;
+                        }
                         this.handle_secondary_closed(window_id, cx);
                         this.close_popout(window_id, cx);
                         // The generational ID cannot match a replacement window.
@@ -8948,16 +9002,23 @@ impl MuxelApp {
                             this.quit_after_closes(cx);
                             return false;
                         }
+                        // A confirmed Restart closes the window itself.
+                        if this.departing.is_some() {
+                            return false;
+                        }
                         // Minimize-to-tray: iconify and keep running (the tray is
                         // the way back) instead of prompting to quit.
                         if this.minimize_to_tray_active() {
                             window.minimize_window();
                             return false;
                         }
-                        this.quit_kill_tmux_local = false;
-                        this.quit_kill_tmux_remote = false;
-                        this.show_quit_confirm = true;
-                        cx.notify();
+                        // The terms and the selector draw over the exit's
+                        // question and countdown, so they quit their own way.
+                        if this.show_terms || this.show_workspace_selector {
+                            this.quit_from_entry_screen(cx);
+                        } else {
+                            this.ask_exit(departure::ExitKind::Quit, cx);
+                        }
                         false
                     })
                 })
@@ -8970,6 +9031,16 @@ impl MuxelApp {
         }
 
         this.start_library_startup(library_config_ok, cx);
+
+        if crate::restart_handoff::still_held() {
+            this.add_event(
+                NotifKind::Error,
+                t("Restart"),
+                t(
+                    "The previous muxel still had its workspace open 30 seconds after the restart. Until it closes, opening that workspace here says it's in use.",
+                ),
+            );
+        }
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
@@ -10097,7 +10168,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal_restarts.contains(instance_id) {
+        // A confirmed Restart admits no new launch; one already under way
+        // still finishes (`launch_permitted` alone gates those).
+        if self.terminal_restarts.contains(instance_id) || self.departing.is_some() {
             return;
         }
         if reason != muxel_core::TerminalLaunchReason::NewPane {
@@ -10230,7 +10303,8 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "reserve-terminal", Some(instance_id));
         // A queued restart owns this pane's launch and startup lease until its
         // confirmed teardown completes. Merely requesting a launch cannot cancel it.
-        if self.terminal_restarts.contains(instance_id) {
+        // A confirmed app Restart admits no new launch.
+        if self.terminal_restarts.contains(instance_id) || self.departing.is_some() {
             return None;
         }
         if !self.launch_permitted(instance_id, reason)
@@ -10767,6 +10841,7 @@ impl MuxelApp {
         if self.remote_host_for_instance(instance_id).is_some() {
             let origin = Arc::downgrade(view.read(cx).session());
             let app = cx.weak_entity();
+            let inputs = self.pending_inputs.clone();
             let handler: muxel_terminal::LocalPasteHandler = Arc::new(move |paste, cx: &App| {
                 let Some(session) = origin.upgrade() else {
                     return;
@@ -10777,6 +10852,13 @@ impl MuxelApp {
                 if !session.accepts_input_epoch(input_epoch) {
                     return;
                 }
+                // Pending from here until the upload's paste lands or fails.
+                // None starts while muxel is quitting or restarting.
+                let Ok(pending) =
+                    inputs.begin(pending_input::PendingKind::Upload, Some(instance_id))
+                else {
+                    return;
+                };
                 let app = app.clone();
                 let origin = origin.clone();
                 cx.spawn(async move |cx| {
@@ -10788,10 +10870,18 @@ impl MuxelApp {
                             .paste_session(instance_id, cx)
                             .is_some_and(|current| Arc::ptr_eq(&current, &origin))
                             || !origin.accepts_input_epoch(input_epoch)
+                            || pending.interrupted()
                         {
                             return;
                         }
-                        this.paste_into_remote(instance_id, paste, &origin, input_epoch, cx);
+                        this.paste_into_remote(
+                            instance_id,
+                            paste,
+                            &origin,
+                            input_epoch,
+                            pending,
+                            cx,
+                        );
                     });
                 })
                 .detach();
@@ -10877,6 +10967,7 @@ impl MuxelApp {
         paste: muxel_terminal::LocalPaste,
         origin: &Arc<TerminalSession>,
         input_epoch: u64,
+        pending: pending_input::PendingInput,
         cx: &mut Context<Self>,
     ) {
         if !self
@@ -10921,10 +11012,13 @@ impl MuxelApp {
                 let Some(session) = session.upgrade() else {
                     return;
                 };
+                // Quitting or restarting interrupted the upload: the files
+                // are copied, but their paths aren't pasted.
                 if !this
                     .paste_session(iid, cx)
                     .is_some_and(|current| Arc::ptr_eq(&current, &session))
                     || !session.accepts_input_epoch(input_epoch)
+                    || pending.interrupted()
                 {
                     return;
                 }
@@ -10941,6 +11035,7 @@ impl MuxelApp {
                     cx.notify();
                 }
             });
+            drop(pending);
         })
         .detach();
     }
@@ -12445,15 +12540,41 @@ impl MuxelApp {
     /// Persist and report whether the write completed. Workspace switching uses
     /// this to preserve an unsaved auto-title or finalized hold on a failed flush.
     fn try_persist(&mut self) -> bool {
+        match self.departing {
+            // A Restart saves once, after its waits, and that save holds
+            // whatever changed meanwhile.
+            Some(departure::Stage::Preparing) => return false,
+            // That save was the last write: nothing that changes as this app
+            // shuts down may reach the new version.
+            Some(departure::Stage::Committed) => return true,
+            None => {}
+        }
         let Some(id) = self.current_workspace else {
             return true; // no workspace chosen yet (selector still open)
         };
-        let Some(path) = muxel_store::workspace_doc_path(id) else {
+        let Some(path) = self.workspace_doc_path(id) else {
             return false;
         };
         let durable =
             (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
-        match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
+        let saved =
+            muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace));
+        self.note_workspace_save(&path, saved)
+    }
+
+    /// Where workspace `id`'s document is saved.
+    fn workspace_doc_path(&self, id: Uuid) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.test_doc_path {
+            return Some(path.clone());
+        }
+        muxel_store::workspace_doc_path(id)
+    }
+
+    /// Record how a save of the workspace document to `path` went. `true` if
+    /// it was written.
+    fn note_workspace_save(&mut self, path: &Path, saved: anyhow::Result<()>) -> bool {
+        match saved {
             Ok(()) => {
                 self.auto_name_save_due = None;
                 self.close_persist_pending = false;
@@ -12476,6 +12597,10 @@ impl MuxelApp {
     /// workspace. Used at launch (from the selector) and to switch workspaces.
     fn enter_workspace(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let _phase = ui_profile::phase("workspace", "enter", None);
+        // A Restart under way leaves with this workspace, and saves it last.
+        if self.departing.is_some() {
+            return;
+        }
         // Re-entering the current workspace is a no-op except for closing the
         // selector — don't tear it down and re-lock (we already hold the lock).
         if self.current_workspace == Some(id) {
@@ -13100,12 +13225,12 @@ impl MuxelApp {
 
     /// Open a native folder picker, then create a project rooted at the choice.
     fn new_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
+        let receiver = self.native_dialog(cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
             prompt: Some(t("Open")),
-        });
+        }));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
                 && let Some(dir) = paths.pop()
@@ -13903,9 +14028,11 @@ impl MuxelApp {
     /// Query GitHub for a newer release (off the UI thread). Fires a desktop
     /// notification when one is found.
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        // An update downloaded and waiting for its Restart keeps its plan; a
+        // check would replace it and leave Restart with nothing to start.
         if matches!(
             self.update_state,
-            UpdateState::Checking | UpdateState::Downloading
+            UpdateState::Checking | UpdateState::Downloading | UpdateState::Ready(_)
         ) {
             return;
         }
@@ -13994,10 +14121,12 @@ impl MuxelApp {
         .detach();
     }
 
-    /// Relaunch into the freshly-installed version (never returns on success).
-    fn apply_update_restart(&mut self, _cx: &mut Context<Self>) {
-        if let UpdateState::Ready(plan) = &self.update_state {
-            crate::update::relaunch_and_exit(plan);
+    /// Ask before relaunching into the freshly-installed version. Confirming
+    /// saves, starts it, and quits ([`departure`]).
+    fn apply_update_restart(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateState::Ready(_)) {
+            self.show_update_modal = false;
+            self.ask_exit(departure::ExitKind::Restart, cx);
         }
     }
 
@@ -15451,7 +15580,7 @@ impl MuxelApp {
     /// command (Settings → Behavior), and typing it is exactly what the user would
     /// do, with no paste-mode markers for an agent's input box to mishandle.
     fn send_continue(&self, iid: Uuid, cx: &App) {
-        if self.is_closing(iid) {
+        if self.is_closing(iid) || self.departing.is_some() {
             return;
         }
         if let Some(session) = self
@@ -15460,8 +15589,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(self.continue_message_for(iid).as_bytes());
-            session.mark_prompt_submitted();
-            session.write_input(b"\r");
+            session.write_submission(b"\r", muxel_terminal::Submission::Prompt);
         }
     }
 
@@ -15590,7 +15718,8 @@ impl MuxelApp {
     /// resume a stalled-but-unfinished agent, or stand down when it's clearly
     /// getting nowhere.
     fn tick_auto_continue(&mut self, cx: &mut Context<Self>) {
-        if self.auto.is_empty() {
+        // No automatic turn starts while a confirmed Restart is under way.
+        if self.auto.is_empty() || self.departing.is_some() {
             return;
         }
         // Snapshot (activity, screen) for the armed panes first, so the mutable
@@ -15765,6 +15894,11 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A confirmed Restart starts no run; the run stays due for the new
+        // version, since its time isn't recorded.
+        if self.departing.is_some() {
+            return;
+        }
         let Some(lp) = self.loops.get(idx).cloned() else {
             return;
         };
@@ -17143,6 +17277,7 @@ impl MuxelApp {
             || self.show_find_panel
             || self.show_update_modal
             || self.show_quit_confirm
+            || self.exit_countdown.is_some()
             || self.show_keys
             || self.show_terms
             || self.show_workspace_selector
@@ -18340,7 +18475,7 @@ impl MuxelApp {
             .path()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned());
-        let rx = cx.prompt_for_new_path(&dir, suggested.as_deref());
+        let rx = self.native_dialog(cx.prompt_for_new_path(&dir, suggested.as_deref()));
         cx.spawn(async move |view: WeakEntity<Self>, cx| {
             let Ok(Ok(Some(path))) = rx.await else {
                 return;
@@ -22955,7 +23090,7 @@ impl MuxelApp {
     /// a resume-capable agent comes back on its saved conversation (e.g. to pick
     /// up an updated harness binary). Other programs (shells, …) start over.
     fn restart_agent(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_closing(iid) {
+        if self.is_closing(iid) || self.departing.is_some() {
             return;
         }
         #[cfg(windows)]
@@ -23555,8 +23690,7 @@ impl MuxelApp {
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
                 let session = view.read(cx).session();
-                session.mark_prompt_submitted();
-                session.write_input(payload.as_bytes());
+                session.write_submission(payload.as_bytes(), muxel_terminal::Submission::Prompt);
             }
         }
         self.broadcast_input
@@ -23614,14 +23748,14 @@ impl MuxelApp {
                     supplied_prompt |= !text.is_empty();
                 }
                 SnippetStep::Write(bytes) => {
-                    if bytes.ends_with(b"\r") {
-                        if supplied_prompt || bytes.len() > 1 {
-                            session.mark_prompt_submitted();
-                        } else {
-                            session.mark_turn_submitted();
-                        }
-                    }
-                    session.write_input(bytes);
+                    let submission = if !bytes.ends_with(b"\r") {
+                        muxel_terminal::Submission::None
+                    } else if supplied_prompt || bytes.len() > 1 {
+                        muxel_terminal::Submission::Prompt
+                    } else {
+                        muxel_terminal::Submission::Turn
+                    };
+                    session.write_submission(bytes, submission);
                 }
             }
         }
@@ -23691,9 +23825,22 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        // Pending from the start of the recording until its transcript is
+        // delivered, or the recording is dropped.
+        let Ok(pending) = self
+            .pending_inputs
+            .begin(pending_input::PendingKind::Dictation, None)
+        else {
+            self.stt_state = SttState::Error {
+                message: t("muxel is quitting or restarting").to_string(),
+                mic: false,
+            };
+            cx.notify();
+            return;
+        };
         match crate::stt::start_capture() {
             Ok(rec) => {
-                self.stt_recording = Some(rec);
+                self.stt_recording = Some((rec, pending));
                 self.stt_state = SttState::Recording;
             }
             Err(e) => self.stt_state = SttState::error(&e),
@@ -23704,7 +23851,7 @@ impl MuxelApp {
     /// Stop capture, transcribe off the UI thread (local whisper.cpp or the
     /// provider), then paste the transcript into the focused pane.
     fn stop_and_transcribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rec) = self.stt_recording.take() else {
+        let Some((rec, pending)) = self.stt_recording.take() else {
             self.stt_state = SttState::Idle;
             cx.notify();
             return;
@@ -23772,6 +23919,9 @@ impl MuxelApp {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
+                    // Quitting or restarting interrupted the dictation: its
+                    // transcript is neither typed nor run as the wake command.
+                    Ok(_) if pending.interrupted() => this.stt_state = SttState::Idle,
                     Ok(text) if !text.is_empty() => {
                         this.stt_state = SttState::Idle;
                         // The wake phrase is a command, not dictation — it wakes the
@@ -23788,6 +23938,8 @@ impl MuxelApp {
                 }
                 cx.notify();
             });
+            // The transcript is delivered, or dropped.
+            drop(pending);
         })
         .detach();
     }
@@ -24300,6 +24452,14 @@ impl MuxelApp {
             return; // nothing in this workspace has a process to wake
         }
 
+        // Pending until the sweep's last update. None starts while muxel is
+        // quitting or restarting.
+        let Ok(pending) = self
+            .pending_inputs
+            .begin(pending_input::PendingKind::WakeSweep, None)
+        else {
+            return;
+        };
         let home_pid = self.workspace.active_project;
         let home_iid = self.active_instance;
         self.waking = true;
@@ -24308,6 +24468,14 @@ impl MuxelApp {
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             let mut relaunched = 0usize;
             for (pid, iid, admission) in targets {
+                // Quitting or restarting stops the sweep before its next pane.
+                if pending.interrupted() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.waking = false;
+                        cx.notify();
+                    });
+                    return;
+                }
                 let Ok(was_dead) = this.update_in(cx, |this, window, cx| {
                     if this.current_workspace != workspace
                         || !this.launch_permitted(iid, muxel_core::TerminalLaunchReason::Wake)
@@ -24359,6 +24527,7 @@ impl MuxelApp {
                 this.persist();
                 cx.notify();
             });
+            drop(pending);
         })
         .detach();
     }
@@ -24410,8 +24579,7 @@ impl MuxelApp {
             return;
         }
         if submit {
-            session.mark_prompt_submitted();
-            session.write_input(b"\r");
+            session.write_submission(b"\r", muxel_terminal::Submission::Prompt);
         }
         self.focus_instance(target.iid, window, cx);
     }
@@ -24878,10 +25046,7 @@ impl MuxelApp {
                     self.select_instance(iid, window, cx);
                 }
             }
-            muxel_tray::TrayAction::Quit => {
-                self.confirm_quit = true;
-                self.quit_after_closes(cx);
-            }
+            muxel_tray::TrayAction::Quit => self.confirm_exit(departure::ExitKind::Quit, cx),
         }
     }
 
@@ -27210,8 +27375,7 @@ impl MuxelApp {
                     .border_color(cx.theme().border)
                     .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
                         cx.listener(|this, _e, _w, cx| {
-                            this.confirm_quit = true;
-                            this.quit_after_closes(cx);
+                            this.quit_from_entry_screen(cx);
                         }),
                     ))
                     .child(
@@ -27411,8 +27575,7 @@ impl MuxelApp {
                                 .ghost()
                                 .label(t("Quit"))
                                 .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.confirm_quit = true;
-                                    this.quit_after_closes(cx);
+                                    this.quit_from_entry_screen(cx);
                                 })),
                         )
                         .child(
@@ -27431,10 +27594,7 @@ impl MuxelApp {
                         .ghost()
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.workspace_busy = None;
-                            this.cancel_close_departure();
-                            this.show_workspace_selector = false;
-                            cx.notify();
+                            this.leave_workspace_selector(cx);
                         }))
                 })),
         );
@@ -29784,10 +29944,32 @@ impl MuxelApp {
     /// [`Self::render_secondary_titlebar`] instead.
     fn render_minimal_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Self::minimal_titlebar().on_close_window(cx.listener(|this, _ev, _window, cx| {
-            // Nothing is running yet — quit directly (no confirm needed).
-            this.confirm_quit = true;
-            this.quit_after_closes(cx);
+            this.quit_from_entry_screen(cx);
         }))
+    }
+
+    /// Quit from the terms or workspace-selector screen. With no workspace
+    /// loaded nothing runs yet, so it quits at once. Over a loaded workspace,
+    /// as when switching workspaces, the selector closes and the Quit counts
+    /// down or asks like any other.
+    pub(super) fn quit_from_entry_screen(&mut self, cx: &mut Context<Self>) {
+        if self.current_workspace.is_none() {
+            self.confirm_exit(departure::ExitKind::Quit, cx);
+            return;
+        }
+        if self.show_workspace_selector {
+            self.leave_workspace_selector(cx);
+        }
+        self.ask_exit(departure::ExitKind::Quit, cx);
+    }
+
+    /// Close the workspace selector opened over a loaded workspace, as its
+    /// Cancel does.
+    fn leave_workspace_selector(&mut self, cx: &mut Context<Self>) {
+        self.workspace_busy = None;
+        self.cancel_close_departure();
+        self.show_workspace_selector = false;
+        cx.notify();
     }
 
     /// The title bar for a popped-out project window: a sidebar toggle plus the app
@@ -29855,8 +30037,7 @@ impl MuxelApp {
                 if this.minimize_to_tray_active() {
                     window.minimize_window();
                 } else {
-                    this.show_quit_confirm = true;
-                    cx.notify();
+                    this.ask_exit(departure::ExitKind::Quit, cx);
                 }
             }))
             .child(
@@ -30097,6 +30278,9 @@ impl MuxelApp {
     /// Save the current main-window geometry (called debounced from the
     /// window-bounds observer).
     fn save_window_geom(&self, window: &Window) {
+        if self.departing == Some(departure::Stage::Committed) {
+            return;
+        }
         let (bounds, maximized) = match window.inner_window_bounds() {
             WindowBounds::Windowed(b) => (b, false),
             WindowBounds::Maximized(b) => (b, true),
@@ -31876,12 +32060,12 @@ impl MuxelApp {
 
     /// Pick an SSH identity file via the OS file dialog, into the host editor.
     fn browse_identity_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
+        let receiver = self.native_dialog(cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some(t("Choose key")),
-        });
+        }));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
                 && let Some(path) = paths.pop()
@@ -32032,12 +32216,12 @@ impl MuxelApp {
 
     /// Pick an SSH identity file via the OS file dialog, into the identity editor.
     fn browse_identity_key_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
+        let receiver = self.native_dialog(cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some(t("Choose key")),
-        });
+        }));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
                 && let Some(path) = paths.pop()
@@ -32237,12 +32421,12 @@ impl MuxelApp {
         let Some(pid) = self.settings_ui.selected_project else {
             return;
         };
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
+        let receiver = self.native_dialog(cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
             prompt: Some(t("Open")),
-        });
+        }));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
                 && let Some(dir) = paths.pop()
@@ -33457,6 +33641,7 @@ impl MuxelApp {
     }
 
     fn render_quit_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let restart = self.quit_confirm_kind == departure::ExitKind::Restart;
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
@@ -33478,17 +33663,34 @@ impl MuxelApp {
                     .rounded(cx.theme().radius_lg)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child(t("Quit muxel?")))
+                    .child(div().text_lg().font_semibold().child(if restart {
+                        t("Restart muxel?")
+                    } else {
+                        t("Quit muxel?")
+                    }))
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(t("Running terminals will be closed.")),
                     )
+                    // What the exit cuts short: one line per kind of input
+                    // still pending.
+                    .children(self.exit_loss_lines().into_iter().map(|line| {
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(line)
+                    }))
                     // tmux-backed panes survive a quit by design; offer cleanup
-                    // per scope (local vs remote sessions).
+                    // per scope (local vs remote sessions). A Restart reattaches
+                    // them, so it offers none.
                     .children({
-                        let sessions = self.tmux_sessions();
+                        let sessions = if restart {
+                            Vec::new()
+                        } else {
+                            self.tmux_sessions()
+                        };
                         let has_local = sessions.iter().any(|(_, _, remote)| !remote);
                         let has_remote = sessions.iter().any(|(_, _, remote)| *remote);
                         [
@@ -33548,16 +33750,101 @@ impl MuxelApp {
                             .child(
                                 Button::new("quit-confirm")
                                     .danger()
-                                    .label(t("Quit"))
+                                    .label(if restart { t("Restart") } else { t("Quit") })
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.kill_checked_tmux_sessions();
-                                        this.confirm_quit = true;
-                                        this.quit_after_closes(cx);
+                                        let kind = this.quit_confirm_kind;
+                                        if kind == departure::ExitKind::Quit {
+                                            this.kill_checked_tmux_sessions();
+                                        }
+                                        this.confirm_exit(kind, cx);
                                     })),
                             ),
                     ),
             )
             .into_any_element()
+    }
+
+    /// A Quit or Restart counting down, with Cancel and Quit now or Restart now.
+    fn render_exit_countdown(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let countdown = self.exit_countdown.as_ref()?;
+        let restart = countdown.kind == departure::ExitKind::Restart;
+        let left = countdown.left.to_string();
+        let args = [("n", left.as_str())];
+        let (title, body, now) = if restart {
+            (
+                t("Restarting muxel"),
+                tn(
+                    "Every terminal is idle. Restarting in {n} second.",
+                    "Every terminal is idle. Restarting in {n} seconds.",
+                    countdown.left as usize,
+                    &args,
+                ),
+                t("Restart now"),
+            )
+        } else {
+            (
+                t("Quitting muxel"),
+                tn(
+                    "Every terminal is idle. Quitting in {n} second.",
+                    "Every terminal is idle. Quitting in {n} seconds.",
+                    countdown.left as usize,
+                    &args,
+                ),
+                t("Quit now"),
+            )
+        };
+        Some(
+            modal_backdrop()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _w, cx| this.cancel_exit_countdown(cx)),
+                )
+                .child(
+                    div()
+                        .w(px(360.0))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_5()
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius_lg)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                        .child(div().text_lg().font_semibold().child(title))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(body),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .pt_2()
+                                .child(
+                                    Button::new("exit-countdown-cancel")
+                                        .ghost()
+                                        .label(t("Cancel"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.cancel_exit_countdown(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("exit-countdown-now")
+                                        .danger()
+                                        .label(now)
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.exit_now(cx)),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The floating terminal-search bar (shown while `term_search` is Some).
@@ -36962,6 +37249,11 @@ impl Render for MuxelApp {
                 self.show_quit_confirm
                     .then(|| ov(|| self.render_quit_modal(cx))),
             )
+            .children(self.exit_countdown.is_some().then(|| {
+                let _build = ui_profile::region_scope(ui_profile::Region::Overlay);
+                self.render_exit_countdown(cx)
+                    .map(|countdown| ui_profile::wrap_region(ui_profile::Region::Overlay, countdown))
+            }).flatten())
             .children(
                 self.git_modal
                     .is_some()
