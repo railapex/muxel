@@ -2097,33 +2097,41 @@ feature is added or changed, update the matching entry here in the same change**
   workspaces or on exit (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
-- **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box,
-  or after a shell prompt that marks itself with OSC 133, is saved about a second
-  after typing stops, off the UI thread; closing the pane, Restart and quitting
-  save it at once. When muxel sees the prompt submitted in that pane, the saved
-  draft goes straight away, even within that second, and the sent prompt still
-  on screen isn't saved again until the program redraws its box, even if keys
-  are typed first. Only the box's text counts, not a menu or footer changing
-  around it, and a program too slow to draw its keys before the Enter (a
-  machine short of memory) can draw the sent prompt after it without that
-  being saved. Enter after a backslash in Claude starts a new line, so it
-  isn't taken as sending. What muxel saw typed into the box is kept as typed,
-  spaces and line breaks included, when the screen shows that text. A draft
-  read from the screen alone is labelled partial, because the screen can't show
+- **Unsent prompts survive** — a prompt typed into Claude's or Codex's input box
+  is saved about a second after typing stops, off the UI thread; closing the
+  pane, Restart and quitting save it at once. When muxel sees the prompt
+  submitted in that pane, the saved draft goes straight away, even within that
+  second, and the sent prompt still on screen isn't saved again until the
+  program redraws its box, even if keys are typed first. Only the box's text
+  counts, not a menu or footer changing around it, and a program too slow to
+  draw its keys before the Enter (a machine short of memory) can draw the sent
+  prompt after it without that being saved. Enter after a backslash in Claude
+  starts a new line, so it isn't taken as sending. An Enter that answers a
+  question drawn over the box (a permission prompt) keeps the saved draft; once
+  the box shows it again it is saved as partial, because muxel can't tell what
+  that Enter did to it. What muxel saw typed into the box is kept as typed,
+  spaces and line breaks included, when the screen shows that text. A draft read
+  from the screen alone is labelled partial, because the screen can't show
   spaces at a row's end, after the cursor, or how many a wrap took. So is one
-  taller than the pane, a paste marker muxel can't tie to one paste, and in a
-  shell, a grey suggestion, text after the cursor or a continued line (only the
-  text up to the cursor is kept). When the pane starts again after a crash, a
-  restart or a relaunch, it offers **Unsent prompt from HH:MM · Restore · Discard**; Restore types the
-  text back into the box as it was saved, line breaks included, and never
-  presses Enter, and a prompt with a line break goes to the clipboard instead
-  when the program would read it as Enter. A pane closed for good keeps its
-  draft under the title bar, where one line counts the closed panes' unsent
-  prompts and opens a list, newest first. Each entry shows the prompt's first
-  three lines (**Show all** for the rest), the pane, the time, and **Copy** and
-  **Discard**; **Discard all** sits on the line while the list is open, and
-  **Hide** puts the line away until another pane's draft is kept. Grok, Muse,
-  opencode and Amp input boxes are not read yet.
+  taller than the pane, and a paste marker muxel can't tie to one paste. When
+  the pane starts again after a crash, a restart or a relaunch, a line under it
+  offers **Unsent prompt from HH:MM**, the prompt's first line (cut short with …
+  when there is more), **Restore** and **Discard**, and **(+N older)** when
+  earlier drafts wait too. Clicking the line opens the prompts in place, pushing
+  the pane down, each with its own **Restore** and **Discard**: the newest
+  whole, older ones by their first three lines (click one for the rest). Restore
+  types the text back into the box as it was saved, line breaks included, and
+  never presses Enter, and a prompt with a line break goes to the clipboard
+  instead when the program would read it as Enter. While a question covers the
+  box, Restore types nothing, keeps the offer and says why. A pane closed for
+  good keeps its draft under the title bar, where one line counts the closed
+  panes' unsent prompts and opens a list, newest first. Each entry shows the
+  prompt's first three lines (**Show all** for the rest), the pane, the time,
+  and **Copy** and **Discard**; **Discard all** sits on the line while the list
+  is open, and **Hide** puts the line away until another pane's draft is kept. A
+  shell's command line is never saved, because the shell keeps its own history
+  and a typed line can hold a secret; one an earlier build saved is deleted when
+  read. Grok, Muse, opencode and Amp input boxes are not read yet.
 - **Unsaved editor changes survive** — an editor with unsaved changes, or an
   input method's uncommitted text, backs them up about a second after edits
   stop; text an input method commits counts as an unsaved change. When it opens

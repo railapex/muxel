@@ -200,7 +200,6 @@ impl ImmediateReplies {
                 ProgramStatusEvent::Report(_)
                 | ProgramStatusEvent::Reset
                 | ProgramStatusEvent::ShellPrompt
-                | ProgramStatusEvent::ShellInput
                 | ProgramStatusEvent::Title(_) => {}
             }
         }

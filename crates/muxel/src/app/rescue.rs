@@ -18,23 +18,30 @@ const OFFER_PROBE_QUIET: Duration = Duration::from_millis(1500);
 const OFFER_PROBE_POLL: Duration = Duration::from_millis(300);
 /// Stop looking after this long; the offer stays.
 const OFFER_PROBE_LIMIT: Duration = Duration::from_secs(30);
-/// Rows of a closed pane's prompt the open list shows before it clips the
-/// rest.
+/// Rows of a prompt an open list shows before it clips the rest.
 const PREVIEW_ROWS: usize = 3;
+/// More characters than one row of a pane's offer holds: 7680 pixels of
+/// 8-pixel text, no glyph narrower than a fifth of its size. A line is cut
+/// here before it's laid out, so a 2 MB draft isn't laid out to show a row
+/// of it, and a cut line still overflows, so it still ends in an ellipsis.
+const OFFER_ROW_CHARS: usize = 4800;
 
 /// What the app holds of the workspace's rescued text.
 #[derive(Default)]
 pub(super) struct Rescue {
     /// Drafts offered on panes that started again, newest first.
     pub(super) offers: HashMap<Uuid, Vec<DraftOffer>>,
+    /// Panes whose offer row is open to the drafts' text.
+    pub(super) offers_open: HashSet<Uuid>,
     /// Drafts kept from panes closed for good, newest first.
     pub(super) closed: Vec<DraftOffer>,
     /// The strip was hidden; it shows again when another pane's draft is kept.
     pub(super) closed_hidden: bool,
     /// The list under the strip's one line is open.
     pub(super) closed_open: bool,
-    /// Closed panes' drafts the open list shows whole, by file.
-    pub(super) closed_whole: HashSet<std::path::PathBuf>,
+    /// Drafts an open list shows whole, by file: closed panes' in the strip,
+    /// a pane's older offers under its row.
+    pub(super) whole: HashSet<std::path::PathBuf>,
     /// What muxel kept when this workspace last stopped without closing
     /// cleanly, until dismissed.
     pub(super) crash: Option<CrashNotice>,
@@ -89,7 +96,7 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         let Some(dir) = self.rescue_dir() else {
-            self.rescue.offers.remove(&iid);
+            self.drop_offers(iid);
             return;
         };
         // Turn the old draft into an offer before the watcher can replace it.
@@ -98,12 +105,19 @@ impl MuxelApp {
             view.set_draft_sink(Some(Self::draft_sink(dir, iid)), cx)
         });
         if offers.is_empty() {
-            self.rescue.offers.remove(&iid);
+            self.drop_offers(iid);
             return;
         }
         log::info!("pane {iid} offers {} unsent draft(s)", offers.len());
+        self.rescue.offers_open.remove(&iid);
         self.rescue.offers.insert(iid, offers);
         self.probe_draft_offer(iid, view.clone(), cx);
+    }
+
+    /// The pane offers nothing any more.
+    fn drop_offers(&mut self, iid: Uuid) {
+        self.rescue.offers.remove(&iid);
+        self.rescue.offers_open.remove(&iid);
     }
 
     /// Settings toggled keeping rescued text on or off. Off stops every
@@ -341,16 +355,24 @@ impl MuxelApp {
         }
     }
 
-    /// Restore: paste the newest offered draft into the pane's input box as
-    /// it was saved, line breaks and all, and never submit it. Where a
-    /// pasted line break would reach the program as Enter, the draft goes to
-    /// the clipboard instead.
-    pub(super) fn restore_draft(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// Restore: paste offered draft `path` into the pane's input box as it
+    /// was saved, line breaks and all, and never submit it. Where a pasted
+    /// line break would reach the program as Enter, the draft goes to the
+    /// clipboard instead. While something covers the box (a permission
+    /// question, a picker) a paste would land there, so nothing is typed and
+    /// the draft stays offered.
+    pub(super) fn restore_offer(
+        &mut self,
+        iid: Uuid,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(offer) = self
             .rescue
             .offers
             .get(&iid)
-            .and_then(|o| o.first())
+            .and_then(|offers| offers.iter().find(|offer| offer.path == path))
             .cloned()
         else {
             return;
@@ -369,6 +391,19 @@ impl MuxelApp {
                     .to_string(),
             );
         } else {
+            let box_shown = self
+                .rescue_view(iid)
+                .and_then(|view| view.read(cx).input_box_shown());
+            if box_shown == Some(false) {
+                self.add_event(
+                    NotifKind::Error,
+                    t("Couldn't restore the unsent prompt"),
+                    t("The pane's input box isn't on screen, so the prompt is still offered.")
+                        .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             session.mark_user_input();
             if let Err(e) = session.try_paste(text) {
                 self.add_event(
@@ -395,28 +430,16 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Discard: delete the newest offered draft.
-    pub(super) fn discard_draft(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if let Some(offer) = self
-            .rescue
-            .offers
-            .get(&iid)
-            .and_then(|o| o.first())
-            .cloned()
-        {
-            self.forget_draft_offer(iid, &offer.path);
-        }
-        cx.notify();
-    }
-
-    fn forget_draft_offer(&mut self, iid: Uuid, path: &std::path::Path) {
+    /// Discard: delete offered draft `path`.
+    pub(super) fn forget_draft_offer(&mut self, iid: Uuid, path: &std::path::Path) {
         if let Some(dir) = self.rescue_dir_any() {
             dir.delete_offer(path);
         }
+        self.rescue.whole.remove(path);
         if let Some(offers) = self.rescue.offers.get_mut(&iid) {
             offers.retain(|offer| offer.path != path);
             if offers.is_empty() {
-                self.rescue.offers.remove(&iid);
+                self.drop_offers(iid);
             }
         }
     }
@@ -425,7 +448,7 @@ impl MuxelApp {
     /// still offering, in the strip.
     pub(super) fn keep_closed_draft(&mut self, iid: Uuid, cx: &App) {
         self.flush_draft(iid, cx);
-        self.rescue.offers.remove(&iid);
+        self.drop_offers(iid);
         let Some(dir) = self.rescue_dir() else {
             return;
         };
@@ -530,7 +553,7 @@ impl MuxelApp {
             dir.delete_offer(path);
         }
         self.rescue.closed.retain(|c| c.path != path);
-        self.rescue.closed_whole.remove(path);
+        self.rescue.whole.remove(path);
         cx.notify();
     }
 
@@ -541,8 +564,8 @@ impl MuxelApp {
             if let Some(dir) = &dir {
                 dir.delete_offer(&closed.path);
             }
+            self.rescue.whole.remove(&closed.path);
         }
-        self.rescue.closed_whole.clear();
         self.rescue.closed_open = false;
         cx.notify();
     }
@@ -603,65 +626,208 @@ impl MuxelApp {
             .join("\n")
     }
 
-    /// The row under a pane that offers its unsent draft.
+    /// What an offer row calls offered draft `offer`.
+    fn offer_label(offer: &DraftOffer) -> String {
+        let time = rescue_time(offer.draft.saved_at_ms);
+        if offer.draft.partial {
+            tf("Unsent prompt from {time} (partial)", &[("time", &time)])
+        } else {
+            tf("Unsent prompt from {time}", &[("time", &time)])
+        }
+    }
+
+    /// The first line of `text` that holds any, as the offer row shows it:
+    /// cut at [`OFFER_ROW_CHARS`], with an ellipsis when more text follows.
+    fn offer_first_line(text: &str) -> String {
+        let text = text.trim_start();
+        let (line, rest) = text.split_once('\n').unwrap_or((text, ""));
+        let mut shown: String = line.trim_end().chars().take(OFFER_ROW_CHARS).collect();
+        if !rest.trim().is_empty() {
+            shown.push_str(" …");
+        }
+        shown
+    }
+
+    /// Opens or closes pane `iid`'s offer row.
+    pub(super) fn toggle_offer(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if !self.rescue.offers_open.remove(&iid) {
+            self.rescue.offers_open.insert(iid);
+        }
+        cx.notify();
+    }
+
+    /// Restore and Discard for offered draft `path`, the `index`th newest.
+    fn offer_buttons(
+        iid: Uuid,
+        index: usize,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let restore = path.to_path_buf();
+        let discard = path.to_path_buf();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new(format!("draft-restore-{iid}-{index}"))
+                    .xsmall()
+                    .label(t("Restore"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restore_offer(iid, &restore, window, cx)
+                    })),
+            )
+            .child(
+                Button::new(format!("draft-discard-{iid}-{index}"))
+                    .ghost()
+                    .xsmall()
+                    .label(t("Discard"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.forget_draft_offer(iid, &discard);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// The row under a pane that offers its unsent drafts: the newest one's
+    /// first line, cut with an ellipsis, then Restore and Discard. Clicking
+    /// the text, or "+N older", opens the drafts in place: the newest whole,
+    /// older ones three rows each (a click shows one whole), each with its
+    /// own Restore and Discard when there are several. The open row pushes
+    /// the pane's screen up instead of drawing over it, so browser panes
+    /// need no overlay flag for it.
     pub(super) fn render_draft_offer(
         &self,
         iid: Uuid,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let offers = self.rescue.offers.get(&iid)?;
-        let offer = offers.first()?;
-        let time = rescue_time(offer.draft.saved_at_ms);
-        let mut label = if offer.draft.partial {
-            tf("Unsent prompt from {time} (partial)", &[("time", &time)])
+        let newest = offers.first()?;
+        let open = self.rescue.offers_open.contains(&iid);
+        let many = offers.len() > 1;
+        let muted = cx.theme().muted_foreground;
+        let title = div()
+            .id(format!("draft-offer-toggle-{iid}"))
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_offer(iid, cx)))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall(),
+            );
+        let title = if open && many {
+            title.child(div().truncate().child(tn(
+                "{n} unsent prompt",
+                "{n} unsent prompts",
+                offers.len(),
+                &[("n", &offers.len().to_string())],
+            )))
+        } else if open {
+            title.child(div().truncate().child(Self::offer_label(newest)))
         } else {
-            tf("Unsent prompt from {time}", &[("time", &time)])
-        };
-        if offers.len() > 1 {
-            label.push(' ');
-            label.push_str(&tf(
-                "(+{n} older)",
-                &[("n", &(offers.len() - 1).to_string())],
-            ));
-        }
-        Some(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .bg(cx.theme().primary.opacity(0.12))
-                .text_color(cx.theme().foreground)
-                .child(label)
+            title
                 .child(
+                    div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(Self::offer_label(newest)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(Self::offer_first_line(&newest.draft.text)),
+                )
+                .children(many.then(|| {
+                    div().flex_none().text_color(muted).child(tf(
+                        "(+{n} older)",
+                        &[("n", &(offers.len() - 1).to_string())],
+                    ))
+                }))
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(title)
+            .children((!open || !many).then(|| Self::offer_buttons(iid, 0, &newest.path, cx)));
+        let row = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .bg(cx.theme().primary.opacity(0.12))
+            .text_color(cx.theme().foreground)
+            .child(header);
+        if !open {
+            return Some(row.into_any_element());
+        }
+        let mut list = div()
+            .id(format!("draft-offer-list-{iid}"))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(rems(18.))
+            .overflow_y_scroll();
+        for (index, offer) in offers.iter().enumerate() {
+            let text = div()
+                .id(format!("draft-offer-text-{iid}-{index}"))
+                .pl_2()
+                .border_l_2()
+                .border_color(cx.theme().border);
+            // The newest is what the row's text opened; an older one shows
+            // whole once clicked.
+            let text = if index == 0 {
+                text.child(offer.draft.text.clone())
+            } else {
+                let path = offer.path.clone();
+                let text = text
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.rescue.whole.remove(&path) {
+                            this.rescue.whole.insert(path.clone());
+                        }
+                        cx.notify();
+                    }));
+                if self.rescue.whole.contains(&offer.path) {
+                    text.child(offer.draft.text.clone())
+                } else {
+                    text.child(Self::preview_head(&offer.draft.text, OFFER_ROW_CHARS))
+                        .line_clamp(PREVIEW_ROWS)
+                        .text_ellipsis()
+                }
+            };
+            let item = div().flex().flex_col().gap_0p5();
+            let item = if many {
+                item.child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .child(
-                            Button::new(format!("draft-restore-{iid}"))
-                                .xsmall()
-                                .label(t("Restore"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.restore_draft(iid, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(format!("draft-discard-{iid}"))
-                                .ghost()
-                                .xsmall()
-                                .label(t("Discard"))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.discard_draft(iid, cx)),
-                                ),
-                        ),
+                        .justify_between()
+                        .gap_2()
+                        .text_color(muted)
+                        .child(div().truncate().child(Self::offer_label(offer)))
+                        .child(Self::offer_buttons(iid, index, &offer.path, cx)),
                 )
-                .into_any_element(),
-        )
+            } else {
+                item
+            };
+            list = list.child(item.child(text));
+        }
+        Some(row.child(list).into_any_element())
     }
 
     /// The crash notice's text.
@@ -845,7 +1011,7 @@ impl MuxelApp {
                 (None, false) => tf("A closed pane, {time}", &[("time", &time)]),
                 (None, true) => tf("A closed pane, {time} (partial)", &[("time", &time)]),
             };
-            let whole = self.rescue.closed_whole.contains(&kept.path);
+            let whole = self.rescue.whole.contains(&kept.path);
             let clips = whole
                 || Self::preview_clips(&kept.draft.text, width, row_chars, &style, size, window);
             let text = div()
@@ -908,8 +1074,8 @@ impl MuxelApp {
                                 .xsmall()
                                 .label(if whole { t("Show less") } else { t("Show all") })
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.rescue.closed_whole.remove(&whole_path) {
-                                        this.rescue.closed_whole.insert(whole_path.clone());
+                                    if !this.rescue.whole.remove(&whole_path) {
+                                        this.rescue.whole.insert(whole_path.clone());
                                     }
                                     cx.notify();
                                 })),
@@ -920,7 +1086,7 @@ impl MuxelApp {
         strip = strip.child(list).child(
             div()
                 .text_color(cx.theme().muted_foreground)
-                .child(t("Kept until you copy or discard them.")),
+                .child(t("Kept until you discard them.")),
         );
         Some(strip.into_any_element())
     }

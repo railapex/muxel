@@ -37,7 +37,9 @@ pub enum DraftSource {
     /// A coding agent's input box (Claude, Codex).
     #[default]
     Agent,
-    /// A shell's command line, after its OSC 133 B mark.
+    /// A shell's command line, which earlier builds saved. Nothing writes it
+    /// now, and a saved one is deleted when read: a prompt line can hold a
+    /// secret, and the shell keeps its own history.
     Shell,
 }
 

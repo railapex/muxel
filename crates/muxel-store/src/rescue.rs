@@ -31,7 +31,9 @@
 
 use anyhow::{Context, Result, bail};
 use muxel_core::Uuid;
-use muxel_core::rescue::{EditorBackup, MAX_EDITOR_BACKUP_BYTES, MAX_RESCUE_BYTES, PromptDraft};
+use muxel_core::rescue::{
+    DraftSource, EditorBackup, MAX_EDITOR_BACKUP_BYTES, MAX_RESCUE_BYTES, PromptDraft,
+};
 use std::path::{Path, PathBuf};
 
 /// How many closed panes' drafts are kept; older ones are deleted.
@@ -334,9 +336,16 @@ fn write_private(path: &Path, bytes: &[u8], cap: usize, stops: &Stops) -> Result
     stage_private(path, bytes, cap, stops)?.commit()
 }
 
+/// Read a saved draft. A shell's prompt line, which earlier builds saved, is
+/// deleted instead of read.
 fn read_draft(path: &Path) -> Option<PromptDraft> {
     let data = std::fs::read(path).ok()?;
-    serde_json::from_slice(&data).ok()
+    let draft: PromptDraft = serde_json::from_slice(&data).ok()?;
+    if draft.source == DraftSource::Shell {
+        remove(path);
+        return None;
+    }
+    Some(draft)
 }
 
 fn remove(path: &Path) {
@@ -999,6 +1008,26 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn a_shell_line_an_earlier_build_saved_is_deleted_when_read() {
+        let dir = scratch("shell");
+        let pane = Uuid::new_v4();
+        let line = PromptDraft {
+            source: DraftSource::Shell,
+            ..draft("$env:SOME_KEY=\"x\"", 5)
+        };
+        dir.save_draft(pane, &line).unwrap();
+        std::fs::write(
+            dir.path().join(format!("closed-{pane}.5.json")),
+            serde_json::to_vec(&line).unwrap(),
+        )
+        .unwrap();
+        assert!(dir.draft(pane).is_none());
+        assert!(dir.closed_drafts().is_empty());
+        assert!(files(&dir).is_empty(), "left {:?}", files(&dir));
         let _ = std::fs::remove_dir_all(dir.path());
     }
 

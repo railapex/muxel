@@ -245,6 +245,17 @@ impl Drop for LineReader {
     }
 }
 
+/// Restore on the pane's newest offered draft, as its row's button does.
+fn restore_newest(
+    app: &mut MuxelApp,
+    iid: Uuid,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<MuxelApp>,
+) {
+    let path = app.rescue.offers[&iid][0].path.clone();
+    app.restore_offer(iid, &path, window, cx);
+}
+
 /// A second of real and test time for the pane's child and timers.
 fn settle(cx: &mut TestAppContext) {
     for _ in 0..4 {
@@ -309,7 +320,7 @@ fn a_typed_prompt_is_saved_once_typing_stops_and_offered_when_the_pane_starts_ag
         // Restore types it into the box without pressing Enter: the child
         // has no line until the test presses Enter itself.
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "Restore never sends Enter");
@@ -1021,7 +1032,7 @@ fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
         paint_claude(&session, "");
         session.process_probe_output(b"\x1b[?2004l");
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "nothing reached the child");
@@ -1365,7 +1376,7 @@ fn restore_keeps_the_line_break_a_draft_ends_with() {
         paint_claude(&session, "");
         session.process_probe_output(b"\x1b[?2004l");
         window
-            .update(cx, |app, window, cx| app.restore_draft(iid, window, cx))
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
             .unwrap();
         settle(cx);
         assert_eq!(reader.line(), None, "nothing reached the child");
@@ -1516,31 +1527,25 @@ fn a_sent_prompt_is_not_kept_when_the_pane_closes_on_a_draft_too_tall_to_save() 
 }
 
 #[test]
-fn a_command_sent_just_before_its_pane_closes_is_not_kept() {
+fn a_shell_prompt_line_is_never_saved() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);
         let session = launch_shell(cx, window, iid);
-        session.process_probe_shell_output(b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test");
+        // PowerShell's prompt, marked the way its shell integration marks it,
+        // with a secret typed after it.
+        session.process_probe_shell_output(
+            b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07$env:SOME_KEY=\"x\"",
+        );
         session.mark_user_input();
         after_debounce(cx);
-        assert_eq!(
-            dir.draft(iid).map(|d| d.text).as_deref(),
-            Some("cargo test")
-        );
+        assert!(dir.draft(iid).is_none(), "the typed line was saved");
 
-        // Enter, as a pane's key handler sends it: the shell runs the
-        // command, and the pane is closed before the watcher deletes the
-        // file.
         window
             .update(cx, |app, _, cx| {
-                session.write_submission(b"\r", muxel_terminal::Submission::Turn);
                 app.close_instance_inner(iid, "close (test)", cx);
             })
             .unwrap();
-        assert!(
-            dir.closed_drafts().is_empty(),
-            "the sent command isn't kept"
-        );
+        assert!(dir.closed_drafts().is_empty(), "the typed line was kept");
     });
 }
 
@@ -1728,5 +1733,96 @@ fn a_prompt_drawn_only_after_its_enter_is_never_kept_but_one_typed_after_it_is()
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].draft.text, "next step");
         assert!(!closed[0].draft.partial, "it is what muxel saw typed");
+    });
+}
+
+/// Claude's permission question drawn where its input box was.
+fn paint_claude_question(session: &TerminalSession) {
+    let mut screen = String::from("\x1b[?2004h\x1b[2J\x1b[H");
+    screen.push_str("⏺ Bash(ping -n 8 localhost)\r\n\r\n");
+    screen.push_str(RULE);
+    screen.push_str("\r\n Bash command\r\n\r\n   ping -n 8 localhost\r\n\r\n");
+    screen.push_str(" Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel");
+    screen.push_str("\x1b[9;4H");
+    session.process_probe_output(screen.as_bytes());
+}
+
+#[test]
+fn restore_types_nothing_and_keeps_the_offer_while_a_question_covers_the_box() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        dir.save_draft(iid, &draft("fix the flaky resize test"))
+            .unwrap();
+        let session = launch_child(cx, window, iid, deaf());
+        paint_claude_question(&session);
+        let typed_before = session.last_user_input();
+        window
+            .update(cx, |app, window, cx| restore_newest(app, iid, window, cx))
+            .unwrap();
+        settle(cx);
+        assert_eq!(
+            session.last_user_input(),
+            typed_before,
+            "nothing was pasted into the question"
+        );
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.rescue.offers.get(&iid).map(Vec::len), Some(1))
+            })
+            .unwrap();
+        assert_eq!(dir.draft_offers(iid).len(), 1, "the draft is still offered");
+    });
+}
+
+#[test]
+fn an_older_offer_restores_on_its_own_and_the_newer_one_stays_offered() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        let at = |text: &str, saved_at_ms| PromptDraft {
+            saved_at_ms,
+            ..draft(text)
+        };
+        dir.save_draft(iid, &at("the older thought", 1)).unwrap();
+        assert_eq!(dir.offer_drafts(iid).len(), 1);
+        dir.save_draft(iid, &at("the newer thought", 2)).unwrap();
+        let (child, reader) = LineReader::spawn();
+        let session = launch_child(cx, window, iid, child);
+        paint_claude(&session, "");
+        session.process_probe_output(b"\x1b[?2004l");
+        window
+            .update(cx, |app, window, cx| {
+                let offers = &app.rescue.offers[&iid];
+                assert_eq!(offers.len(), 2);
+                assert_eq!(offers[0].draft.text, "the newer thought");
+                let older = offers[1].path.clone();
+                app.toggle_offer(iid, cx);
+                app.restore_offer(iid, &older, window, cx);
+            })
+            .unwrap();
+        settle(cx);
+        session.try_write_input(b"\r").unwrap();
+        assert_eq!(reader.wait_line().as_deref(), Some("the older thought"));
+        let newer = window
+            .read_with(cx, |app, _| {
+                let offers = &app.rescue.offers[&iid];
+                assert_eq!(offers.len(), 1);
+                assert_eq!(offers[0].draft.text, "the newer thought");
+                assert!(app.rescue.offers_open.contains(&iid), "the row stays open");
+                offers[0].path.clone()
+            })
+            .unwrap();
+        assert_eq!(dir.draft_offers(iid).len(), 1);
+
+        // Discarding the last one closes the row, so the pane's next offer
+        // starts as one line.
+        window
+            .update(cx, |app, _, cx| {
+                app.forget_draft_offer(iid, &newer);
+                cx.notify();
+                assert!(!app.rescue.offers.contains_key(&iid));
+                assert!(!app.rescue.offers_open.contains(&iid));
+            })
+            .unwrap();
+        assert!(dir.draft_offers(iid).is_empty());
     });
 }
