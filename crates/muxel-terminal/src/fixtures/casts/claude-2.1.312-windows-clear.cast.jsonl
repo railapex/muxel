@@ -1,4 +1,4 @@
-{"muxel_cast":1,"provider":"claude","version":"2.1.312","os":"windows","pty":"conpty 1.25.260930003","tap":"helper","cols":120,"rows":40,"term":"xterm-256color","replies":{"osc7501":true},"launch":["--resume","00000000-0000-7000-8000-000000000001","--fork-session","--model","sonnet","--effort","low","--tools","","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}"],"recorded":"2026-10-28","sanitized":true,"out_sha256":"3ee867318d984e1b7af25c27efb5aa33953e7cc2120d14ca309ce8a0cd15e7fe"}
+{"muxel_cast":1,"provider":"claude","version":"2.1.312","os":"windows","pty":"conpty 1.25.260930003","tap":"helper","cols":120,"rows":40,"term":"xterm-256color","no_color":true,"replies":{"osc7501":true},"launch":["--resume","00000000-0000-7000-8000-000000000001","--fork-session","--model","sonnet","--effort","low","--tools","","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}"],"recorded":"2026-10-28","sanitized":true,"out_sha256":"3ee867318d984e1b7af25c27efb5aa33953e7cc2120d14ca309ce8a0cd15e7fe"}
 [11,"out","\u001b[1t"]
 [14,"out","\u001b[c\u001b[?1004h\u001b[?9001h"]
 [14,"reply","\u001b[?6c"]

@@ -32,177 +32,99 @@ use std::time::{Duration, Instant, SystemTime};
 /// `file#mark` and the compared key, each with the finding it belongs to. A
 /// listed gap that closes fails the test until its entry is removed, so a fix
 /// on the branch that owns it shows up here.
+#[rustfmt::skip]
 const EXPECTED_GAPS: &[(&str, &str, &str)] = &[
-    (
-        "claude-2.1.312-windows-clear#slash-menu-clear",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#idle-first",
-        "draft/empty",
-        HELPER_CPR,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#idle-first",
-        "takes_prompt/startup",
-        HELPER_CPR,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#draft-end",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#draft-home",
-        "draft/empty",
-        HOME_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#draft-home",
-        "takes_prompt/startup",
-        HOME_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#draft-home",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#draft-mid",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#slash-menu-model",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#model-picker",
-        "takes_prompt/send",
-        SEND_COVERED,
-    ),
-    (
-        "claude-2.1.322-windows-composer-tour#slash-menu-ex",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "claude-2.1.322-windows-permission-parked-draft#idle-first",
-        "draft/empty",
-        HELPER_CPR,
-    ),
-    (
-        "claude-2.1.322-windows-permission-parked-draft#idle-first",
-        "takes_prompt/startup",
-        HELPER_CPR,
-    ),
-    (
-        "claude-2.1.322-windows-permission-parked-draft#after-answer",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "codex-0.164.0-windows-command-approval#idle",
-        "composer",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-command-approval#idle",
-        "draft/empty",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-command-approval#idle",
-        "takes_prompt/startup",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-question#idle",
-        "composer",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-question#idle",
-        "draft/empty",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-question#idle",
-        "takes_prompt/startup",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-trust-card#trust-card",
-        "takes_prompt/send",
-        SEND_COVERED,
-    ),
+    ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#idle-first", "draft/empty", HELPER_CPR),
+    ("claude-2.1.322-windows-composer-tour#idle-first", "takes_prompt/startup", HELPER_CPR),
+    ("claude-2.1.322-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "draft/empty", HOME_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/startup", HOME_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#model-picker", "takes_prompt/send", SEND_COVERED),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-ex", "takes_prompt/send", SEND_DRAFT),
+    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "draft/empty", HELPER_CPR),
+    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "takes_prompt/startup", HELPER_CPR),
+    ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.164.0-windows-command-approval#idle", "composer", CODEX_FOOTER),
+    ("codex-0.164.0-windows-command-approval#idle", "draft/empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "composer", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "draft/empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", SEND_COVERED),
     ("codex-0.164.0-windows-turn#idle", "composer", CODEX_FOOTER),
-    (
-        "codex-0.164.0-windows-turn#idle",
-        "draft/empty",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-turn#post-turn-idle-candidate",
-        "composer",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-turn#post-turn-idle-candidate",
-        "draft/empty",
-        CODEX_FOOTER,
-    ),
-    (
-        "codex-0.164.0-windows-turn#post-turn-idle-candidate",
-        "takes_prompt/startup",
-        CODEX_FOOTER,
-    ),
-    (
-        "grok-1.0.70-windows-question#idle",
-        "takes_prompt/startup",
-        GROK_DRAFT,
-    ),
-    (
-        "grok-1.0.70-windows-question#idle",
-        "takes_prompt/send",
-        SEND_DRAFT,
-    ),
-    (
-        "grok-1.0.70-windows-question#blocked",
-        "overlay",
-        GROK_OPTIONS,
-    ),
-    (
-        "grok-1.0.70-windows-trust-card#trust-card",
-        "overlay",
-        GROK_TRUST,
-    ),
-    (
-        "grok-1.0.70-windows-trust-card#trust-card",
-        "takes_prompt/startup",
-        GROK_TRUST,
-    ),
-    (
-        "grok-1.0.70-windows-trust-card#trust-card",
-        "takes_prompt/send",
-        SEND_COVERED,
-    ),
+    ("codex-0.164.0-windows-turn#idle", "draft/empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "composer", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "draft/empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "takes_prompt/startup", CODEX_FOOTER),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "composer", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "draft/empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "takes_prompt/startup", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "draft/empty", HOME_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "composer", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "draft/empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "takes_prompt/startup", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "composer", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "draft/empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "takes_prompt/startup", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "composer", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "draft/empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "takes_prompt/startup", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#up-recall", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-open", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "composer", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "draft/empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "takes_prompt/startup", CODEX_AGENTS_HINT),
+    ("grok-1.0.70-windows-question#idle", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.70-windows-question#idle", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.70-windows-question#blocked", "overlay", GROK_OPTIONS),
+    ("grok-1.0.70-windows-trust-card#trust-card", "overlay", GROK_TRUST),
+    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/startup", GROK_TRUST),
+    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send", SEND_COVERED),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "overlay", GROK_TRUST),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/startup", GROK_TRUST),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/send", SEND_COVERED),
+    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#turn-running", "turn", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#after-turn", "finished", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/startup", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
 ];
 
 const SEND_DRAFT: &str = "ctl send doesn't read the composer, so it adds to a draft";
 const SEND_COVERED: &str =
     "ctl send doesn't read the composer, so it types while a picker or card covers it";
-const HOME_DRAFT: &str = "a Claude draft with its cursor at Home reads as an empty composer";
+const HOME_DRAFT: &str =
+    "a draft with its cursor at Home reads as an empty composer (Claude, Codex)";
 const CODEX_FOOTER: &str = "the Codex composer reader needs a footer it knows; 0.164.0's status \
     line opens with the model's display name, which here has no digit, and the first frame has \
     no footer yet";
+const CODEX_AGENTS_HINT: &str = "while its box is empty, Codex 0.167.2 ends the status line with \
+    `· ← for agents`; the footer check takes that segment for a key hint and rejects the line, \
+    and no other footer matches, so an empty Codex box is never found";
 const GROK_DRAFT: &str = "Grok has no composer reader, so startup input can't see a draft";
 const GROK_OPTIONS: &str =
     "ctl show and ctl answer find no numbered options in Grok's question rows (`1 (○) Alpha`)";
-const GROK_TRUST: &str = "Grok 1.0.70's trust card (`Do you trust the contents of this \
-    directory?`) isn't read as a startup blocker";
+const GROK_TRUST: &str = "Grok's trust card (`Do you trust the contents of this directory?`, \
+    1.0.70 and 1.0.77) isn't read as a startup blocker";
+const GROK_SPINNER: &str = "Grok 1.0.77 spins its title with `| / - \\`, and muxel knows only the \
+    braille frames, so a turn reads Idle throughout";
 /// A fault of the recording, not of muxel: the recorder answered Claude's
 /// cursor-position query with 1;1 while the cursor sat in the box, and Claude
 /// moved its cursor there. Muxel answers with the real position. Goes when
@@ -737,8 +659,9 @@ fn muxel_answers_claudes_cursor_query_with_where_the_cursor_is() {
 fn every_mark_in_every_cast_agrees_with_the_readers() {
     let mut unexpected = Vec::new();
     let mut seen_gaps = Vec::new();
-    let mut checked = 0;
+    let (mut casts, mut marks, mut checked) = (0, 0, 0);
     for cast in repo_casts() {
+        casts += 1;
         let provider =
             TitleProvider::from_program(cast.header["provider"].as_str().expect("provider"));
         for MarkRead {
@@ -748,6 +671,7 @@ fn every_mark_in_every_cast_agrees_with_the_readers() {
             rows,
         } in replay(&cast)
         {
+            marks += 1;
             for Check {
                 key,
                 truth: want,
@@ -775,6 +699,11 @@ fn every_mark_in_every_cast_agrees_with_the_readers() {
         .filter(|gap| !seen_gaps.contains(gap))
         .map(|(at, key, finding)| format!("{at} {key} ({finding})"))
         .collect();
+    eprintln!(
+        "{casts} casts, {marks} marks, {checked} checks: {} agree, {} known gaps",
+        checked - seen_gaps.len() - unexpected.len(),
+        seen_gaps.len(),
+    );
     assert!(
         unexpected.is_empty() && closed.is_empty(),
         "{checked} comparisons.\n\nDisagreements not in EXPECTED_GAPS:\n{}\nGaps that closed (remove them from EXPECTED_GAPS):\n{}",
@@ -906,8 +835,8 @@ fn the_personal_data_scan_catches_each_kind() {
 
 /// Sanitizing must not change a single verdict. Run from a checkout that can
 /// see the unsanitized casts: `MUXEL_RAW_CASTS` names a folder whose
-/// subfolders hold `raw.cast.jsonl` files, each with a header `name` giving
-/// its repo cast's file name. Skipped when it isn't set.
+/// subfolders hold `raw.cast.jsonl` files; one whose header `name` gives a
+/// repo cast's file name is compared with it. Skipped when it isn't set.
 #[test]
 fn sanitizing_changes_no_verdict() {
     let Some(root) = std::env::var_os("MUXEL_RAW_CASTS") else {
@@ -927,13 +856,17 @@ fn sanitizing_changes_no_verdict() {
             continue;
         }
         let raw = load(&path);
-        let name = raw.header["name"]
-            .as_str()
-            .expect("raw cast names its repo cast");
-        // Not every recording earns a place in the repo.
-        let Some(clean) = repo.get(name) else {
+        // Not every recording earns a place in the repo; one that does names
+        // its repo cast.
+        let Some(clean) = raw
+            .header
+            .get("name")
+            .and_then(|name| name.as_str())
+            .and_then(|name| repo.get(name))
+        else {
             continue;
         };
+        let name = &clean.name;
         let verdicts = |cast: &Cast| -> Vec<(String, Verdicts)> {
             replay(cast)
                 .into_iter()
