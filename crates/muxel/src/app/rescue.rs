@@ -120,21 +120,23 @@ impl MuxelApp {
         self.rescue.offers_open.remove(&iid);
     }
 
-    /// Settings toggled keeping rescued text on or off. Off stops every
-    /// watcher and backup in this window, then deletes what every workspace
-    /// kept; other muxel windows on the same data stop writing too.
+    /// Settings toggled keeping rescued text on or off, for every muxel
+    /// window on the same data: the shared marker is what each reads. Off
+    /// stops every watcher and backup in this window, then deletes what every
+    /// workspace kept; other windows stop writing too.
     pub(super) fn set_rescue_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.rescue_unsent_text = on;
-        self.persist_settings();
-        if on && let Err(e) = muxel_store::rescue::set_rescue_turned_off(false) {
+        // The marker first: settings saves copy it, and a write that races
+        // the purge below deletes itself.
+        let marked = muxel_store::rescue::set_rescue_turned_off(!on);
+        if on && let Err(e) = &marked {
             log::warn!("couldn't turn saving unsent text back on: {e:#}");
         }
+        self.settings.rescue_unsent_text = on && marked.is_ok();
+        self.persist_settings();
         self.point_rescue_writers(self.rescue_dir(), cx);
         if !on {
             self.rescue = Rescue::default();
-            // The marker first: a write that races the purge deletes itself.
-            let purged = muxel_store::rescue::set_rescue_turned_off(true)
-                .and_then(|()| muxel_store::rescue::purge_every_workspace());
+            let purged = marked.and_then(|()| muxel_store::rescue::purge_every_workspace());
             match purged {
                 Ok(workspaces) => {
                     log::info!("saving unsent text off: purged {workspaces} workspace(s)")
@@ -147,6 +149,21 @@ impl MuxelApp {
             }
         }
         cx.notify();
+    }
+
+    /// Take up the shared setting, which another window may have changed
+    /// since this one read it: this window's writers start when saving was
+    /// turned on elsewhere and stop when it was turned off.
+    pub(super) fn adopt_shared_rescue_setting(&mut self, cx: &mut App) {
+        let on = !muxel_store::rescue::rescue_turned_off();
+        if on == self.settings.rescue_unsent_text {
+            return;
+        }
+        self.settings.rescue_unsent_text = on;
+        if !on {
+            self.rescue = Rescue::default();
+        }
+        self.point_rescue_writers(self.rescue_dir(), cx);
     }
 
     /// Point every pane's draft watcher and every editor's backups in this
@@ -474,9 +491,9 @@ impl MuxelApp {
         let Some(dir) = muxel_store::rescue::rescue_dir(id) else {
             return;
         };
-        if muxel_store::rescue::rescue_turned_off() {
-            self.settings.rescue_unsent_text = false;
-        }
+        // The marker decides, not what this window loaded: another window may
+        // have turned saving on or off since.
+        self.settings.rescue_unsent_text = !muxel_store::rescue::rescue_turned_off();
         if !self.settings.rescue_unsent_text {
             if let Err(e) = muxel_store::rescue::purge_every_workspace() {
                 log::warn!("couldn't delete everything kept: {e:#}");

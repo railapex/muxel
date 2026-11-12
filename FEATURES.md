@@ -1782,7 +1782,10 @@ feature is added or changed, update the matching entry here in the same change**
   **Keep unsent prompts and unsaved editor changes** (on by default) turns it
   off and deletes what every workspace kept, reporting any folder it couldn't
   read; other muxel windows on the same data stop saving too, and while it is
-  off, opening a workspace deletes anything kept since.
+  off, opening a workspace deletes anything kept since. Turning it back on in
+  one window turns it on for the others: a window started while it was off
+  follows when it next opens a workspace or Settings, instead of deleting what
+  the others kept, and never saves the setting back off.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
   `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
   a separate keychain service on Windows, macOS and Linux. This separates Muxel
