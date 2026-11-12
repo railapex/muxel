@@ -6,7 +6,9 @@
 
 use super::*;
 use muxel_core::control::{self as ctl, AgentState, ErrorCode};
-use muxel_core::sleep::{SleepFacts, SleepRefusal, SleepRequest, SleepStatus, sleep_refusal};
+use muxel_core::sleep::{
+    ResumeFile, SleepFacts, SleepRefusal, SleepRequest, SleepStatus, sleep_refusal,
+};
 
 /// How often the idle timer looks for agents to put to sleep.
 const AUTO_SLEEP_EVERY: Duration = Duration::from_secs(60);
@@ -97,9 +99,8 @@ impl MuxelApp {
         })
     }
 
-    /// Whether `inst` resumes its saved conversation when its program starts
-    /// again: what makes waking it bring the same work back.
-    pub(super) fn instance_resume_trusted(&self, inst: &Instance) -> bool {
+    /// The preset `inst` launches with: by id, else by name.
+    fn instance_preset(&self, inst: &Instance) -> Option<&AgentPreset> {
         inst.preset_id
             .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
             .or_else(|| {
@@ -107,7 +108,103 @@ impl MuxelApp {
                     .iter()
                     .find(|preset| preset.name == inst.preset)
             })
+    }
+
+    /// Whether `inst` resumes its saved conversation when its program starts
+    /// again: what makes waking it bring the same work back.
+    pub(super) fn instance_resume_trusted(&self, inst: &Instance) -> bool {
+        self.instance_preset(inst)
             .is_some_and(|preset| muxel_core::resume_trusted(preset, inst))
+    }
+
+    /// A bounded look for the file a resume of `inst` would read: one stat for
+    /// Claude, one or two for Codex with a saved path, and a few dated
+    /// directories for Codex without one and for Muse. It never walks a
+    /// provider's whole store, so the UI thread may ask it, and it is asked
+    /// only when the answer is needed: as the last sleep rule, and for an
+    /// asleep pane's `resumes`. The launch path makes its own, fuller check.
+    pub(super) fn resume_file(&self, inst: &Instance) -> ResumeFile {
+        let Some(id) = inst.session_id.as_deref() else {
+            return ResumeFile::Unknown;
+        };
+        let program = self
+            .instance_preset(inst)
+            .and_then(|preset| preset.program.as_deref())
+            .or(inst.program.as_deref());
+        if is_claude_program(program) {
+            let path = match (&inst.session_path, home_dir()) {
+                (Some(path), _) => path.clone(),
+                (None, Some(home)) => {
+                    let Some(cwd) = inst.working_directory().map(Path::to_path_buf).or_else(|| {
+                        self.workspace
+                            .project(inst.project_id)
+                            .map(|project| project.root_path.clone())
+                    }) else {
+                        return ResumeFile::Unknown;
+                    };
+                    muxel_core::claude_session_path(&home, &cwd, id)
+                }
+                (None, None) => return ResumeFile::Unknown,
+            };
+            return match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => ResumeFile::Present,
+                Ok(_) => ResumeFile::Gone,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => ResumeFile::Gone,
+                Err(_) => ResumeFile::Unknown,
+            };
+        }
+        if is_codex_program(program) {
+            let Some(home) = home_dir() else {
+                return ResumeFile::Unknown;
+            };
+            return match session_discovery::resume_codex_session(
+                &home,
+                id,
+                inst.session_path.as_deref(),
+            ) {
+                Ok(muxel_core::CodexResumePath::Found(_)) => ResumeFile::Present,
+                Ok(muxel_core::CodexResumePath::Missing) => ResumeFile::Gone,
+                Ok(muxel_core::CodexResumePath::Unknown) | Err(_) => ResumeFile::Unknown,
+            };
+        }
+        if muxel_core::muse::is_program(program) {
+            let env: Vec<(String, String)> = inst
+                .env
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect();
+            return match crate::session_binding::muse_data_dir(&env)
+                .map(|root| crate::session_binding::muse_session_exists(&root, id))
+            {
+                Some(Ok(true)) => ResumeFile::Present,
+                Some(Ok(false)) => ResumeFile::Gone,
+                Some(Err(_)) | None => ResumeFile::Unknown,
+            };
+        }
+        // Grok keeps a session under a directory named by its own encoding of
+        // the working directory, which muxel doesn't reproduce.
+        ResumeFile::Unnamed
+    }
+
+    /// Outside control's `resumes`: for an asleep local agent, whether waking
+    /// it brings its conversation back, checked on disk now. `None` while it
+    /// runs, for anything else, or when muxel can't tell.
+    pub(super) fn resumes(&self, inst: &Instance) -> Option<bool> {
+        let local = self
+            .workspace
+            .project(inst.project_id)
+            .is_some_and(|project| !project.is_remote());
+        if !local
+            || !self.is_dormant(inst.id)
+            || inst.literal_argv
+            || !muxel_core::is_known_agent_program(inst.program.as_deref())
+        {
+            return None;
+        }
+        if !self.instance_resume_trusted(inst) {
+            return Some(false);
+        }
+        self.resume_file(inst).resumes()
     }
 
     /// The pane the user is in: the focused pane, one popped out into its own
@@ -130,10 +227,14 @@ impl MuxelApp {
         request: SleepRequest,
         cx: &App,
     ) -> Option<SleepRefusal> {
-        match self.sleep_facts(iid, cx) {
-            Some(facts) => sleep_refusal(&facts, request),
-            None => Some(SleepRefusal::NotAgent),
-        }
+        let Some(facts) = self.sleep_facts(iid, cx) else {
+            return Some(SleepRefusal::NotAgent);
+        };
+        sleep_refusal(&facts, request).or_else(|| {
+            self.workspace
+                .instance(iid)
+                .and_then(|inst| self.resume_file(inst).sleep_refusal())
+        })
     }
 
     /// Put pane `iid` to sleep: mark it dormant and asleep at once, so its

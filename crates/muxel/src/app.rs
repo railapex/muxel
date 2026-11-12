@@ -9421,6 +9421,8 @@ impl MuxelApp {
         let resume_cwd = recovered_cwd;
         // `codex resume <id>` without a rollout this check could confirm.
         let mut unconfirmed_resume = false;
+        // The saved conversation's file is gone, so this launch starts anew.
+        let mut conversation_gone = false;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
@@ -9456,6 +9458,7 @@ impl MuxelApp {
                         inst.session_id = None;
                         inst.session_path = None;
                         inst.session_started = false;
+                        conversation_gone = true;
                     }
                     Ok(muxel_core::CodexResumePath::Unknown) => unconfirmed_resume = true,
                     // An unreadable store does not prove an exact identity expired.
@@ -9474,9 +9477,13 @@ impl MuxelApp {
                 inst.session_id = None;
                 inst.session_path = None;
                 inst.session_started = false;
+                conversation_gone = true;
             }
         }
         let snapshot = inst.clone();
+        if conversation_gone {
+            self.report_conversation_gone(iid);
+        }
         // `command_for` keeps this only for a launch that starts a new tmux
         // session (`arms_tmux_resume_recovery`).
         if unconfirmed_resume {
@@ -14799,7 +14806,7 @@ impl MuxelApp {
             .collect();
 
         let mut to_close = Vec::new();
-        let mut to_recover: Vec<(Uuid, String)> = Vec::new();
+        let mut to_recover: Vec<Uuid> = Vec::new();
         // Agents that just finished, whose replies auto-read should speak.
         let mut to_read_aloud: Vec<Uuid> = Vec::new();
         // (instance, title, signal name) — panes to reattach to a live tmux session.
@@ -15066,7 +15073,7 @@ impl MuxelApp {
                     exit_recover,
                 )
             {
-                to_recover.push((iid, title));
+                to_recover.push(iid);
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
             } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
@@ -15193,9 +15200,10 @@ impl MuxelApp {
             self.spawn_terminal(iid, window, cx);
             dirty = true;
         }
-        for (iid, title) in to_recover {
+        for iid in to_recover {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
+            // The new launch is not a resume, so it can't fail this way again.
             self.bump_session_binding_generation(iid);
             let agent_minted = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
@@ -15204,11 +15212,7 @@ impl MuxelApp {
                 inst.session_started = false;
             }
             self.persist();
-            self.add_event(
-                NotifKind::Success,
-                tf("{title}: session expired", &[("title", &title)]),
-                t("Started a fresh session.").to_string(),
-            );
+            self.report_conversation_gone(iid);
             self.spawn_terminal(iid, window, cx);
         }
         for (iid, title) in to_close {
@@ -15784,6 +15788,27 @@ impl MuxelApp {
         subtitle: impl Into<String>,
     ) {
         self.put_event(Uuid::new_v4(), kind, title, subtitle);
+    }
+
+    /// Tell the user pane `iid` is starting a new conversation because its
+    /// saved one is gone: the provider deleted the file a resume reads (Claude
+    /// removes transcripts older than `cleanupPeriodDays`), or the resume
+    /// itself reported it missing. Without this the pane silently comes back
+    /// empty.
+    pub(super) fn report_conversation_gone(&mut self, iid: Uuid) {
+        let title = self
+            .workspace
+            .instance(iid)
+            .map(|inst| inst.display_name().to_string())
+            .unwrap_or_default();
+        muxel_store::append_event_log(&format!(
+            "resume: \"{title}\" [{iid}] saved conversation gone, starting a new one"
+        ));
+        self.add_event(
+            NotifKind::Success,
+            tf("{title}: saved conversation is gone", &[("title", &title)]),
+            t("Started a new one in the same folder."),
+        );
     }
 
     /// Show event `id` in the feed as its newest entry, replacing the earlier

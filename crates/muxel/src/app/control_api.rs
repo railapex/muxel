@@ -1303,6 +1303,7 @@ impl MuxelApp {
                 && readaloud::is_agent_program(inst.program.as_deref()),
             status,
             not_running_reason: self.dormant_reason(inst.id).map(str::to_string),
+            resumes: self.resumes(inst),
             status_since: ctl::status_since(&inst.activity),
             launch_id: ctl::launch_id(
                 status,

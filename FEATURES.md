@@ -100,9 +100,11 @@ feature is added or changed, update the matching entry here in the same change**
   restarts that clock. Working, asking,
   background-held, pinned and drafting agents, the focused agent (unless its
   own Sleep is chosen), agents without a saved
-  conversation, shells, and remote or tmux panes stay running. `ctl status`
-  reports `not_running_reason: "sleeping"`, and `ctl wake AGENT` resumes one
-  without moving focus.
+  conversation (or whose provider deleted its file), shells, and remote or tmux
+  panes stay running. `ctl status` reports `not_running_reason: "sleeping"` and
+  whether a wake `resumes` the conversation, and `ctl wake AGENT` resumes one
+  without moving focus. A wake that finds the saved conversation deleted
+  starts a new one in the same folder and says so in Notifications.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others

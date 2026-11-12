@@ -457,6 +457,8 @@ impl MuxelApp {
             instance.claude_hook_record = Some(record.clone());
         }
         let mut cwd = None;
+        // Only a resume is probed, so a miss means its conversation is gone.
+        let conversation_gone = matches!(&resolution.probe, Probe::Missing);
         if resolution.hook {
             if instance.session_id != resolution.id {
                 instance.auto_name = None;
@@ -507,6 +509,9 @@ impl MuxelApp {
                 cx.notify();
                 return None;
             }
+        }
+        if conversation_gone {
+            self.report_conversation_gone(key.pane);
         }
         // Saving can yield filesystem time to another hook publisher too.
         // Re-probe immediately before constructing the command under this token.
@@ -1107,6 +1112,13 @@ mod tests {
                     assert_ne!(pane.session_id, old);
                     assert!(pane.session_path.is_some());
                     assert!(!pane.session_started);
+                    // The pane comes back empty, so the user is told why.
+                    assert!(
+                        app.notifications
+                            .iter()
+                            .any(|n| n.title.ends_with(": saved conversation is gone")),
+                        "a lost conversation started anew without a word"
+                    );
                 })
                 .unwrap();
         });

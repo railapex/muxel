@@ -6,14 +6,14 @@
 
 use super::conpty_test_support::ChildHandle;
 use super::popout_lifecycle_tests::{with_app, with_app_drawing};
-use super::sleep::{QUIT_POLL, SleepCause};
+use super::sleep::{QUIT_POLL, SleepCause, sleep_refusal_label};
 use super::{Instance, MuxelApp, Project};
 use gpui::{
     AppContext, Bounds, Context, Entity, Pixels, TestAppContext, VisualTestContext, Window,
     WindowHandle, px,
 };
-use muxel_core::sleep::{SleepRefusal, SleepRequest};
-use muxel_core::{AgentActivity, AgentActivityState, PaneNode, add_tab};
+use muxel_core::sleep::{ResumeFile, SleepRefusal, SleepRequest};
+use muxel_core::{AgentActivity, AgentActivityState, AgentPreset, EnvVar, PaneNode, add_tab};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalStatusReason, TerminalView,
 };
@@ -41,7 +41,8 @@ fn project(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
 }
 
 /// A pane running `cmd.exe` that prints `name | state` as a Codex title, then
-/// waits on `more`. `agent` saves it as a resumable Claude conversation.
+/// waits on `more`. `agent` saves it as a resumable Claude conversation, with a
+/// transcript file at its saved path.
 fn pane(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
@@ -69,7 +70,12 @@ fn pane(
                 );
                 instance.preset = claude.name.clone();
                 instance.preset_id = Some(claude.id);
-                instance.session_id = Some(Uuid::new_v4().to_string());
+                let id = Uuid::new_v4().to_string();
+                let transcript = root.join("transcripts").join(format!("{id}.jsonl"));
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                std::fs::write(&transcript, "{}\n").unwrap();
+                instance.session_id = Some(id);
+                instance.session_path = Some(transcript);
                 instance.session_started = true;
             }
             let iid = instance.id;
@@ -310,6 +316,158 @@ fn the_idle_timer_sleeps_only_agents_idle_past_the_threshold_and_not_focused() {
             "the quit to finish",
             move |app, _| !app.sleep_exits.contains_key(&old),
         );
+    });
+}
+
+/// Claude deletes transcripts older than `cleanupPeriodDays`, and a saved id
+/// whose file is gone resumes nothing. Every path refuses to sleep such a pane,
+/// and outside control says whether an asleep pane's wake brings it back.
+#[test]
+fn an_agent_whose_conversation_file_is_gone_stays_awake_and_ctl_says_so() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (shell, _, _shell_child) = pane(cx, window, pid, "a shell", false);
+        let (agent, agent_view, _agent_child) = pane(cx, window, pid, "forgotten agent", true);
+        wait_ready(cx, window, &agent_view);
+        window
+            .update(cx, |app, _, cx| {
+                let now = chrono::Utc::now().timestamp_millis();
+                app.workspace.instance_mut(agent).unwrap().activity = AgentActivity {
+                    completed_at: Some(now - 5 * HOUR_MS),
+                    ..Default::default()
+                };
+                app.active_instance = Some(shell);
+                let paths = [
+                    SleepRequest::Pane,
+                    SleepRequest::Project,
+                    SleepRequest::Auto {
+                        after_hours: 4,
+                        now,
+                    },
+                ];
+                let transcript = app
+                    .workspace
+                    .instance(agent)
+                    .unwrap()
+                    .session_path
+                    .clone()
+                    .unwrap();
+                for request in paths {
+                    assert_eq!(
+                        app.sleep_refusal_for(agent, request, cx),
+                        None,
+                        "{request:?}"
+                    );
+                }
+                // A running pane has no wake to report on.
+                assert_eq!(app.control_info_of(agent, 0, cx).unwrap().resumes, None);
+                std::fs::remove_file(&transcript).unwrap();
+                for request in paths {
+                    assert_eq!(
+                        app.sleep_refusal_for(agent, request, cx),
+                        Some(SleepRefusal::NoResume),
+                        "{request:?} slept a pane whose transcript is gone"
+                    );
+                }
+                assert_eq!(
+                    app.sleep_menu_state(agent, cx),
+                    Some(Err(sleep_refusal_label(SleepRefusal::NoResume)))
+                );
+                app.settings.sleep_after_hours = 4;
+                app.auto_sleep_checked = None;
+                app.auto_sleep_pass(cx);
+                assert!(app.terminals.contains_key(&agent), "the timer slept it");
+                // With its file back it sleeps, and asleep, `resumes` follows
+                // the file each time it is asked.
+                std::fs::write(&transcript, "{}\n").unwrap();
+                assert!(
+                    app.sleep_instance(agent, SleepRequest::Pane, SleepCause::Pane, cx)
+                        .is_ok()
+                );
+                assert_eq!(
+                    app.control_info_of(agent, 0, cx).unwrap().resumes,
+                    Some(true)
+                );
+                std::fs::remove_file(&transcript).unwrap();
+                assert_eq!(
+                    app.control_info_of(agent, 0, cx).unwrap().resumes,
+                    Some(false)
+                );
+            })
+            .unwrap();
+        wait_until(
+            cx,
+            window,
+            QUIT_POLL,
+            "the quit to finish",
+            move |app, _| !app.sleep_exits.contains_key(&agent),
+        );
+    });
+}
+
+/// The look behind that rule and `resumes`, against where each provider writes
+/// its conversation: missing, then written. Grok's isn't located.
+#[test]
+fn the_resume_file_look_finds_each_providers_conversation_where_it_writes_it() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                let home = root.join("home");
+                let _home = super::claude_test_home(Some(home.clone()));
+                let mut started = |preset: AgentPreset, id: &str| {
+                    let mut instance = Instance::from_preset(pid, &preset);
+                    instance.session_id = Some(id.into());
+                    instance.session_started = true;
+                    app.presets.push(preset);
+                    instance
+                };
+                // No saved path: the transcript for the pane's folder.
+                let claude_id = Uuid::new_v4().to_string();
+                let claude = started(AgentPreset::claude(), &claude_id);
+                let claude_file = muxel_core::claude_session_path(&home, &root, &claude_id);
+                let codex_id = "01a1543c-9700-7000-8000-000000000001";
+                let mut codex = started(AgentPreset::codex(), codex_id);
+                let codex_file = home
+                    .join(".codex/sessions/2026/11/12")
+                    .join(format!("rollout-2026-11-12T00-00-00-{codex_id}.jsonl"));
+                codex.session_path = Some(codex_file.clone());
+                let muse_id = Uuid::new_v4().to_string();
+                let mut muse = started(AgentPreset::muse(), &muse_id);
+                let data = root.join("xdg");
+                muse.env = vec![EnvVar {
+                    key: "XDG_DATA_HOME".into(),
+                    value: data.display().to_string(),
+                }];
+                let muse_file = data
+                    .join("muse/sessions/2026/11/12")
+                    .join(&muse_id)
+                    .join("session.jsonl");
+                let grok = started(AgentPreset::grok(), &Uuid::new_v4().to_string());
+                for (instance, file) in [
+                    (&claude, &claude_file),
+                    (&codex, &codex_file),
+                    (&muse, &muse_file),
+                ] {
+                    assert_eq!(
+                        app.resume_file(instance),
+                        ResumeFile::Gone,
+                        "{}",
+                        instance.preset
+                    );
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(file, "{}\n").unwrap();
+                    assert_eq!(
+                        app.resume_file(instance),
+                        ResumeFile::Present,
+                        "{}",
+                        instance.preset
+                    );
+                }
+                assert_eq!(app.resume_file(&grok), ResumeFile::Unnamed);
+            })
+            .unwrap();
     });
 }
 
