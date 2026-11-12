@@ -1017,6 +1017,81 @@ fn saving_turned_off_elsewhere_deletes_what_every_workspace_kept_when_muxel_star
 }
 
 #[test]
+fn a_window_started_with_saving_off_keeps_what_another_window_kept_once_it_is_back_on() {
+    with_app(|cx, window| {
+        let other = saved_workspace("other");
+        let opened = saved_workspace("opened");
+        // This window loaded its settings while saving was off. Another
+        // window has since turned it back on (the marker is gone) and kept a
+        // draft.
+        window
+            .update(cx, |app, _, _| app.settings.rescue_unsent_text = false)
+            .unwrap();
+        let dir = muxel_store::rescue::rescue_dir(other).unwrap();
+        dir.save_draft(Uuid::new_v4(), &draft("kept by the other window"))
+            .unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                app.use_tmux = false;
+                app.enter_workspace(opened, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            files_under(dir.path()).len(),
+            1,
+            "the other window's draft stays"
+        );
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.settings.rescue_unsent_text, "this window saves again")
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_window_that_loaded_saving_off_starts_saving_once_it_takes_up_the_shared_setting() {
+    with_app(|cx, window| {
+        let (iid, dir) = pane(cx, window);
+        // Loaded while saving was off; another window has turned it on since.
+        window
+            .update(cx, |app, _, _| app.settings.rescue_unsent_text = false)
+            .unwrap();
+        let session = launch(cx, window, iid);
+        paint_claude(&session, "typed while this window thought saving was off");
+        session.mark_user_input();
+        after_debounce(cx);
+        assert!(dir.draft(iid).is_none(), "nothing is saved yet");
+
+        // Opening the settings takes up the shared setting.
+        window
+            .update(cx, |app, _, cx| app.adopt_shared_rescue_setting(cx))
+            .unwrap();
+        session.mark_user_input();
+        after_debounce(cx);
+        assert_eq!(
+            dir.draft(iid).map(|d| d.text).as_deref(),
+            Some("typed while this window thought saving was off")
+        );
+    });
+}
+
+#[test]
+fn a_window_that_loaded_saving_off_never_saves_it_off_for_the_others() {
+    with_app(|cx, window| {
+        // Loaded while saving was off; another window has turned it on since.
+        window
+            .update(cx, |app, _, _| {
+                app.settings.rescue_unsent_text = false;
+                app.persist_settings();
+            })
+            .unwrap();
+        assert!(muxel_store::load_settings().rescue_unsent_text);
+        assert!(!muxel_store::rescue::rescue_turned_off());
+    });
+}
+
+#[test]
 fn restoring_a_multi_line_prompt_where_enter_would_send_it_types_nothing() {
     with_app(|cx, window| {
         let (iid, dir) = pane(cx, window);

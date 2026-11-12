@@ -9276,6 +9276,8 @@ impl MuxelApp {
 
         let (mut settings, library_config_ok) =
             libraries_ui::startup_settings(muxel_store::try_load_settings());
+        settings.rescue_unsent_text =
+            muxel_store::rescue::settle_rescue_setting(settings.rescue_unsent_text);
         // Merge in any new built-in presets (e.g. Hermes/Ollama) once. A failed
         // save is reported after construction, once the feed exists.
         let seed_save_error = if settings.seed_builtin_presets() {
@@ -15007,6 +15009,10 @@ impl MuxelApp {
             identities: self.identities.clone(),
             theme: self.theme.clone(),
             theme_mode: self.theme_mode.clone(),
+            // What the shared marker says, so a window that loaded its
+            // settings before another window turned saving on can't save it
+            // off for every window.
+            rescue_unsent_text: !muxel_store::rescue::rescue_turned_off(),
             ..self.settings.clone()
         }
     }
@@ -32410,6 +32416,8 @@ impl MuxelApp {
             let scale = (self.settings.ui_font_size * self.settings.zoom / 16.0).clamp(1.0, 2.5);
             self.settings_size = size(px(780.0 * scale), px(620.0 * scale));
             self.settings_offset = point(px(0.0), px(0.0));
+            // So the rescue checkbox shows what every window does now.
+            self.adopt_shared_rescue_setting(cx);
             self.settings_snapshot = Some(SettingsSnapshot {
                 settings: self.settings.clone(),
                 presets: self.presets.clone(),
@@ -32445,6 +32453,8 @@ impl MuxelApp {
     fn cancel_settings(&mut self, cx: &mut Context<Self>) {
         if let Some(snap) = self.settings_snapshot.take() {
             self.settings = snap.settings;
+            // A toggle already acted on every window; Cancel can't undo it.
+            self.settings.rescue_unsent_text = !muxel_store::rescue::rescue_turned_off();
             self.presets = snap.presets;
             self.theme = snap.theme;
             self.theme_mode = snap.theme_mode;

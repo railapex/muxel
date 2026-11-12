@@ -197,6 +197,28 @@ pub fn set_rescue_turned_off(off: bool) -> Result<()> {
     }
 }
 
+/// Whether saving is on for a window starting with `config_on` in its
+/// settings. The marker decides, for every window on the data directory. A
+/// config that says off without the marker (edited by hand, or saved before
+/// the marker existed) writes it, so saving stays off everywhere.
+pub fn settle_rescue_setting(config_on: bool) -> bool {
+    crate::data_dir().is_some_and(|data| settle_rescue_setting_in(&data, config_on))
+}
+
+fn settle_rescue_setting_in(data: &Path, config_on: bool) -> bool {
+    let marker = data.join(RESCUE_OFF);
+    if marker.exists() {
+        return false;
+    }
+    if !config_on {
+        if let Err(e) = write_private(&marker, b"", 0, &Stops::default()) {
+            log::warn!("couldn't mark saving unsent text off: {e:#}");
+        }
+        return false;
+    }
+    true
+}
+
 /// Delete what every workspace kept, as turning saving off does. Returns how
 /// many workspaces had something to delete. A directory that couldn't be
 /// listed and a file that couldn't be deleted are reported; only a data
@@ -879,8 +901,8 @@ fn mark_running_in(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLOSED_DRAFTS, RescueCounts, RescueDir, delete_workspace_dir_in, mark_running_in,
-        purge_every_workspace_in, rescue_dir_in,
+        MAX_CLOSED_DRAFTS, RESCUE_OFF, RescueCounts, RescueDir, delete_workspace_dir_in,
+        mark_running_in, purge_every_workspace_in, rescue_dir_in, settle_rescue_setting_in,
     };
     use muxel_core::Uuid;
     use muxel_core::rescue::{DraftSource, EditorBackup, MAX_RESCUE_BYTES, PromptDraft};
@@ -1009,6 +1031,21 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn the_marker_decides_whether_saving_is_on_and_a_config_saying_off_adds_it() {
+        let data = scratch_root("settle");
+        std::fs::create_dir_all(&data).unwrap();
+        let marker = data.join(RESCUE_OFF);
+        assert!(settle_rescue_setting_in(&data, true));
+        assert!(!marker.exists());
+        // Off in the config with no marker: off for every window from now on.
+        assert!(!settle_rescue_setting_in(&data, false));
+        assert!(marker.exists());
+        // The marker wins over a config that says on.
+        assert!(!settle_rescue_setting_in(&data, true));
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
