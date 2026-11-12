@@ -17343,6 +17343,13 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Collapse or expand the sidebar's NOTIFICATIONS section (persisted).
+    fn toggle_notifications_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.workspace.notifications_collapsed = !self.workspace.notifications_collapsed;
+        self.persist();
+        cx.notify();
+    }
+
     /// Create a git worktree for `instance`, filling in its worktree fields. On
     /// any problem the worktree option is turned off for this instance.
     fn setup_worktree(&self, pid: Uuid, instance: &mut Instance) {
@@ -29631,14 +29638,26 @@ impl MuxelApp {
         let hover_col = cx.theme().sidebar_accent.opacity(0.45);
         let visible = || self.feed_notifications();
         let has = visible().next().is_some();
+        let collapsed = self.workspace.notifications_collapsed;
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
 
+        // Clicking the header collapses the section to this one line, so new
+        // notifications no longer shift the PROJECTS list below it.
         let header = div()
+            .id("notif-header")
             .px_3()
             .pt_3()
             .pb_1()
             .flex()
             .items_center()
             .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _e, _w, cx| this.toggle_notifications_collapsed(cx)))
+            .child(Icon::new(chevron).small().text_color(muted))
             .child(
                 div()
                     .flex_1()
@@ -29647,6 +29666,12 @@ impl MuxelApp {
                     .text_color(muted)
                     .child(t("NOTIFICATIONS")),
             )
+            .children((collapsed && has).then(|| {
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(visible().count().to_string())
+            }))
             .children(has.then(|| {
                 // stop_propagation so the clear-all click isn't anything else.
                 div()
@@ -29663,6 +29688,10 @@ impl MuxelApp {
             }));
 
         let mut section = div().flex().flex_col().child(header);
+
+        if collapsed {
+            return section;
+        }
 
         if !has {
             return section.child(
