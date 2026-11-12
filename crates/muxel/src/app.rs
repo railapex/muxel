@@ -6114,6 +6114,10 @@ pub struct MuxelApp {
     restoring_activity: HashSet<Uuid>,
     /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
     dormant_instances: HashSet<Uuid>,
+    /// Asleep agents whose saved conversation was gone at the last look (on
+    /// load, project open, sleep, wake, and once a minute): their row and pane
+    /// say "no history". Outside control's `resumes` looks afresh instead.
+    conversations_gone: HashSet<Uuid>,
     /// Terminals put to sleep whose program is still quitting (see `sleep`).
     sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
     /// When the idle timer last looked for agents to sleep.
@@ -8641,6 +8645,7 @@ impl MuxelApp {
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
+            conversations_gone: HashSet::new(),
             sleep_exits: HashMap::new(),
             auto_sleep_checked: None,
             auto: HashMap::new(),
@@ -8853,6 +8858,7 @@ impl MuxelApp {
             })
             .map(|instance| instance.id)
             .collect();
+        self.refresh_conversations_gone();
         if repaired {
             self.persist();
         }
@@ -10862,6 +10868,7 @@ impl MuxelApp {
                     self.dormant_instances.remove(&iid);
                 }
             }
+            self.refresh_conversations_gone();
         }
         // Make sure the shared memory file/gitignore exist (once per session) —
         // handles fresh clones where `.muxel/` was git-ignored away.
@@ -25644,6 +25651,8 @@ impl MuxelApp {
 
     fn terminal_dormant(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let inst = self.workspace.instance(iid);
+        // Waking starts a new conversation; say so before the click.
+        let gone = self.conversations_gone.contains(&iid);
         let folder = inst.and_then(Instance::working_directory).or_else(|| {
             inst.and_then(|i| self.workspace.project(i.project_id))
                 .map(|p| p.root_path.as_path())
@@ -25663,23 +25672,20 @@ impl MuxelApp {
                     .unwrap_or_default(),
             )
             .children(inst.and_then(|i| i.auto_name.clone()))
-            .children(inst.map(|i| {
-                localized_activity_label(
-                    saved_activity_status(&i.activity),
-                    &i.activity,
-                    None,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-            }))
+            .child(self.asleep_words(iid))
             .child(
                 folder
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             )
-            .child(t("Starts when you open it"))
+            .child(if gone {
+                Self::conversation_gone_words()
+            } else {
+                t("Starts when you open it")
+            })
             .child(
                 Button::new(format!("start-dormant-{iid}"))
-                    .label(t("Start"))
+                    .label(if gone { t("Start fresh") } else { t("Start") })
                     .on_click(
                         cx.listener(move |this, _, window, cx| {
                             this.focus_instance(iid, window, cx)
@@ -26558,36 +26564,28 @@ impl MuxelApp {
                                     .flex_none()
                                     .text_color(cx.theme().muted_foreground)
                             }))
+                            // An asleep tab is a moon and its muted title; the
+                            // sidebar row carries the age.
+                            .children(self.is_dormant(tab).then(|| {
+                                svg()
+                                    .path("icons/moon.svg")
+                                    .size(px(10.0))
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground)
+                            }))
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_w(px(if self.is_dormant(tab) { 64.0 } else { 0.0 }))
+                                    .min_w_0()
                                     .pl_1()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
+                                    .when(self.is_dormant(tab), |title| {
+                                        title.text_color(cx.theme().muted_foreground)
+                                    })
                                     .child(tab_title),
                             )
-                            .children(self.is_dormant(tab).then(|| {
-                                let activity = self.workspace.instance(tab).map(|i| &i.activity);
-                                let status = activity
-                                    .map(saved_activity_status)
-                                    .unwrap_or(AgentStatus::Idle);
-                                let age = activity
-                                    .map(|activity| {
-                                        localized_activity_label(
-                                            status,
-                                            activity,
-                                            None,
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                div().flex_none().child(status_tag(
-                                    status,
-                                    format!("{age} · {}", self.dormant_badge(tab)),
-                                ))
-                            }))
                             // A tab being read aloud says so — even when another tab
                             // of its pane is showing — and pauses or resumes on click.
                             .children({
@@ -28969,28 +28967,36 @@ impl MuxelApp {
                                 )
                             })
                             .unwrap_or_else(|| status_label(Some(status)).to_string());
-                        // A dormant row's badge is the one word, so the row
-                        // stays a single line at any sidebar width; its saved
-                        // activity moves to the tooltip.
-                        let dormant_tip = self
-                            .is_dormant(iid)
-                            .then(|| format!("{label} · {}", self.dormant_badge(iid)));
+                        // An asleep row keeps the running row's single line:
+                        // its pill is a moon and an age, and the words go to
+                        // the tooltip.
+                        let asleep = self.is_dormant(iid);
+                        let asleep_tip = asleep.then(|| {
+                            let words = self.asleep_words(iid);
+                            if self.conversations_gone.contains(&iid) {
+                                format!("{words}\n{}", Self::conversation_gone_words())
+                            } else {
+                                words
+                            }
+                        });
                         let badge = if loading {
                             status_tag(AgentStatus::Working, t("loading").to_string())
                         } else if stopped {
                             status_tag(AgentStatus::Idle, t("stopped").to_string())
+                        } else if asleep {
+                            self.asleep_pill(iid, cx)
                         } else {
-                            let tag = status_tag(
-                                status,
-                                if dormant_tip.is_some() {
-                                    self.dormant_badge(iid).to_string()
-                                } else {
-                                    label
-                                },
-                            );
+                            let tag = status_tag(status, label);
                             // A read finish keeps its green as an outline, so
                             // the label stays legible on the sidebar.
                             if read_done { tag.outline() } else { tag }
+                        };
+                        // Asleep rows recede, unless a finish there is unread.
+                        let unread = status == AgentStatus::Done && !read_done;
+                        let name_color = if asleep && !unread {
+                            cx.theme().muted_foreground
+                        } else {
+                            cx.theme().sidebar_foreground
                         };
                         let details = div()
                             .flex_1()
@@ -29006,7 +29012,7 @@ impl MuxelApp {
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground)
+                                    .text_color(name_color)
                                     .child(display),
                             )
                             .child(
@@ -29015,7 +29021,7 @@ impl MuxelApp {
                                     .debug_selector(move || format!("inst-badge-{}", iid.simple()))
                                     .flex_none()
                                     .child(badge)
-                                    .when_some(dormant_tip, |badge, tip| {
+                                    .when_some(asleep_tip, |badge, tip| {
                                         let tip = SharedString::from(tip);
                                         badge.tooltip(move |window, cx| {
                                             gpui_component::tooltip::Tooltip::new(tip.clone())

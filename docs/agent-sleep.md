@@ -87,15 +87,31 @@ when neither threshold applies. Any launch that lands for the pane clears the
 mark. Opening it during the quit grace ends the old process first, so two
 copies never run on one conversation.
 
-Its sidebar row stays one line at any sidebar width: the badge reads just
-"asleep" ("dormant" for a pane deferred at launch), and hovering it shows the
-saved status and age as well.
-
 Every wake (opening the pane, pinning it, or `ctl wake`) records
 `activity.woken_at`, and the idle timer counts from it. A woken pane therefore
 runs at least N hours before the timer can sleep it again, even if nobody
 types into it, and a restart in that time starts it rather than leaving it
 dormant.
+
+## How an asleep pane looks
+
+A pane put to sleep and one [deferred at launch](dormant-restore.md) look the
+same, because opening either does the same thing. Outside control still tells
+them apart (`not_running_reason`).
+
+- **Sidebar row:** one line at any sidebar width, like a running row. The name
+  is muted unless the pane holds an unread finish. The pill is outlined rather
+  than filled, so filled pills mean running panes: a moon and how long ago the
+  pane last worked (`5m`, `20h`, `31d`), in its saved status color (green
+  finished, amber interrupted, grey idle). Hovering the pill gives the words:
+  "Asleep · finished 20h ago".
+- **Tab:** a moon and the muted title, no age.
+- **Pane:** its name, last title, the same words, folder and a Start button.
+
+When the pane's saved conversation is gone (checked on load, project open,
+sleep, wake and once a minute, the same look as the sleep rule), the pill adds
+`∅`, the tooltip and pane say "The saved conversation is gone. Waking starts a
+new one in the same folder.", and the button reads **Start fresh**.
 
 ## Outside control
 
