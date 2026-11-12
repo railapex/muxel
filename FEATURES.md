@@ -1730,8 +1730,9 @@ feature is added or changed, update the matching entry here in the same change**
   draw its keys before the Enter (a machine short of memory) can draw the sent
   prompt after it without that being saved. Enter after a backslash in Claude
   starts a new line, so it isn't taken as sending. Claude's suggestion in an
-  empty box (`Try "…"`) isn't saved, even when Claude draws it undimmed
-  (`NO_COLOR`), unless muxel saw that very text typed. An Enter that answers a
+  empty box (`Try "…"`) and Codex's placeholder (`Ask Codex to do anything`)
+  aren't saved, even when drawn undimmed (`NO_COLOR`), unless muxel saw that
+  very text typed. An Enter that answers a
   question drawn over the box (a permission prompt) keeps the saved copy; once
   the box shows it again it is saved as partial, because muxel can't tell what
   that Enter did to it. What muxel saw typed into the box is kept as typed,
