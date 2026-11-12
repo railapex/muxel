@@ -15330,12 +15330,12 @@ impl MuxelApp {
                 };
                 self.add_event(
                     NotifKind::Error,
-                    tf("{title}: process exited unexpectedly", &[("title", &title)]),
+                    tf("{title}: ended unexpectedly", &[("title", &title)]),
                     detail,
                 );
                 if self.notifications_enabled && !self.window_active {
                     notify(
-                        tf("{title} exited unexpectedly", &[("title", &title)]),
+                        tf("{title} ended unexpectedly", &[("title", &title)]),
                         project,
                         Some(iid),
                     );
@@ -15439,8 +15439,8 @@ impl MuxelApp {
             self.persist();
             self.add_event(
                 NotifKind::Success,
-                tf("{title}: session expired", &[("title", &title)]),
-                t("Started a fresh session.").to_string(),
+                tf("{title}: no history", &[("title", &title)]),
+                t("Started fresh.").to_string(),
             );
             self.spawn_terminal(iid, window, cx);
         }
@@ -26135,17 +26135,16 @@ impl MuxelApp {
                             t("Connection lost — reconnecting…")
                         } else {
                             match (v.exit_read_error(), v.exit_signal(), v.exit_code()) {
-                                (Some(_), _, _) => t("process ended — terminal read failed"),
+                                (Some(_), _, _) => t("Ended · terminal read failed"),
                                 (None, Some(sig), _) => {
-                                    tf("process killed — signal {sig}", &[("sig", sig)]).into()
+                                    tf("Ended · signal {sig}", &[("sig", sig)]).into()
                                 }
-                                (None, None, Some(0)) => t("process exited"),
-                                (None, None, Some(code)) => tf(
-                                    "process exited — code {code}",
-                                    &[("code", &code.to_string())],
-                                )
-                                .into(),
-                                (None, None, None) => t("process exited — code unknown"),
+                                (None, None, Some(0)) => t("Ended"),
+                                (None, None, Some(code)) => {
+                                    tf("Ended · exit {code}", &[("code", &code.to_string())])
+                                        .into()
+                                }
+                                (None, None, None) => t("Ended · exit code unknown"),
                             }
                         };
                         let (bg, fg) = if reconnecting {
@@ -29352,7 +29351,7 @@ impl MuxelApp {
                                     )
                                     .separator()
                                     .item(
-                                        PopupMenuItem::new(t("Kill"))
+                                        PopupMenuItem::new(t("Close"))
                                             .icon(IconName::CircleX)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -29568,7 +29567,7 @@ impl MuxelApp {
                 Button::new("close")
                     .ghost()
                     .icon(IconName::Close)
-                    .tooltip(t("Close pane"))
+                    .tooltip(t("Close"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
             )
             .child(
@@ -36658,12 +36657,12 @@ impl MuxelApp {
                     .child(
                         Button::new("del-project")
                             .ghost()
-                            .label(t("Delete project"))
+                            .label(t("Remove project"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.request_confirm(
-                                    t("Delete project?"),
+                                    t("Remove project?"),
                                     t("The project and its panes will be removed."),
-                                    t("Delete"),
+                                    t("Remove"),
                                     ConfirmAction::DeleteProject(pid),
                                     cx,
                                 )

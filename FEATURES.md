@@ -1429,11 +1429,11 @@ feature is added or changed, update the matching entry here in the same change**
   the exit banner appears.
 - **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
   the PTY failing outright) is never auto-closed: it keeps its final screen under
-  a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
+  an "Ended · exit N" banner, fires an error in the NOTIFICATIONS feed
   (plus a desktop notification when unattended), and Restart relaunches in place
   (resuming a resume-capable agent's conversation).
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
-  is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
+  is named as such — "Ended · signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
   of its own and it would otherwise be indistinguishable from `exit(1)`.
 - **Event log** — pane lifecycle events (every exit with its code and signal, every
