@@ -3069,6 +3069,7 @@ impl TerminalSession {
                 cursor_row: cursor.line.0,
                 cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
                 bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+                typed: self.input_snapshot().1,
             }
         })
     }
@@ -8091,6 +8092,12 @@ mod input_rev_tests {
         session.process_probe_output(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h");
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_ne!(session.input_rev(), wheeled);
+        // The screen Codex's input box is read from carries the draft bit:
+        // typed since the last Enter, and not once an Enter goes in.
+        assert!(session.startup_screen().typed);
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert!(!session.startup_screen().typed);
         session.kill();
     }
 }

@@ -744,7 +744,11 @@ feature is added or changed, update the matching entry here in the same change**
   muxel reads the provider's title through tmux (`#{pane_title}`) while that
   task waits; it never changes tmux options. Codex folder-trust menus receive no
   task input; readiness failure leaves the provider running and reports
-  `startup_error` through `ctl status` and `show`.
+  `startup_error` through `ctl status` and `show`. Codex's editor counts as
+  empty when it shows nothing or its placeholder, and a draft with its cursor at
+  Home is a draft. One row with the cursor at its start still counts as empty
+  while no key has reached the pane since the last Enter, in case Codex shows a
+  placeholder muxel doesn't know.
   Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
   confirms submission only from a fresh provider turn or rendered user row.
