@@ -28893,6 +28893,18 @@ impl MuxelApp {
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
+                    // An asleep row keeps the running row's single line, and
+                    // recedes (muted name, dimmed icon) unless a finish there
+                    // is unread.
+                    let asleep = self.is_dormant(iid);
+                    let finish_unread = status == AgentStatus::Done && !read_done;
+                    let icon_color = if loading {
+                        pane_status_hsla(AgentStatus::Working, inst.map(|i| &i.activity), cx)
+                    } else if asleep {
+                        self.asleep_icon_color(iid, finish_unread, cx)
+                    } else {
+                        pane_status_hsla(status, inst.map(|i| &i.activity), cx)
+                    };
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -28921,19 +28933,7 @@ impl MuxelApp {
                         } else {
                             cx.theme().sidebar
                         })
-                        .child(agent_icon(
-                            program.as_deref(),
-                            px(15.0),
-                            pane_status_hsla(
-                                if loading {
-                                    AgentStatus::Working
-                                } else {
-                                    status
-                                },
-                                inst.map(|i| &i.activity),
-                                cx,
-                            ),
-                        ))
+                        .child(agent_icon(program.as_deref(), px(15.0), icon_color))
                         // Worktree dot (matches the pane outline color).
                         .children(
                             self.instance_worktree_color(iid)
@@ -28967,10 +28967,8 @@ impl MuxelApp {
                                 )
                             })
                             .unwrap_or_else(|| status_label(Some(status)).to_string());
-                        // An asleep row keeps the running row's single line:
-                        // its pill is a moon and an age, and the words go to
-                        // the tooltip.
-                        let asleep = self.is_dormant(iid);
+                        // An asleep row's pill is a moon and an age; the words
+                        // go to the tooltip.
                         let asleep_tip = asleep.then(|| {
                             let words = self.asleep_words(iid);
                             if self.conversations_gone.contains(&iid) {
@@ -28991,9 +28989,7 @@ impl MuxelApp {
                             // the label stays legible on the sidebar.
                             if read_done { tag.outline() } else { tag }
                         };
-                        // Asleep rows recede, unless a finish there is unread.
-                        let unread = status == AgentStatus::Done && !read_done;
-                        let name_color = if asleep && !unread {
+                        let name_color = if asleep && !finish_unread {
                             cx.theme().muted_foreground
                         } else {
                             cx.theme().sidebar_foreground
