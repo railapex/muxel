@@ -799,19 +799,35 @@ fn exec_tmux(targs: &[String], program: Option<&str>, tail: &[String]) -> String
 /// older than 3.2) or is no longer attached to the session, since its tty name may
 /// have passed to someone else's client.
 pub fn claim_window_size_command(session: &crate::tmux::SessionTarget, tag: &str) -> String {
-    let pane = sh_quote(&format!("={}:", session.name));
-    let target = sh_quote(&format!("={}", session.name));
+    claim_window_sizes_command(std::slice::from_ref(session), tag)
+}
+
+/// [`claim_window_size_command`] for several sessions on one host, as one remote
+/// command line. Each session is claimed in turn, so one without a client of this
+/// machine's doesn't stop the rest.
+///
+/// One command per host, not per session: the claims all fall due together (the
+/// first input after a host's panes reattached), and one ssh each over the commands
+/// master ran past sshd's `MaxSessions`. The host refused the excess with `Session
+/// open refused by peer`, and those panes' clients kept sitting out the size, so
+/// tmux went on drawing their windows at an old client's size.
+pub fn claim_window_sizes_command(sessions: &[crate::tmux::SessionTarget], tag: &str) -> String {
     let option = sh_quote(&tmux_client_option(tag));
-    format!(
-        "{}; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
-         && [ -n \"$c\" ] \
-         && {SELECTED_TMUX} list-clients -t {target} -F '#{{client_name}}' \
-         | grep -qxF -- \"$c\" \
-         && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
-         set-option -q -t {pane} {option} \"$c\"",
-        tmux_path_prelude(),
-        select_session_socket(session)
-    )
+    let mut cmd = tmux_path_prelude();
+    for session in sessions {
+        let pane = sh_quote(&format!("={}:", session.name));
+        let target = sh_quote(&format!("={}", session.name));
+        cmd.push_str(&format!(
+            "; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
+             && [ -n \"$c\" ] \
+             && {SELECTED_TMUX} list-clients -t {target} -F '#{{client_name}}' \
+             | grep -qxF -- \"$c\" \
+             && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
+             set-option -q -t {pane} {option} \"$c\"",
+            select_session_socket(session)
+        ));
+    }
+    cmd
 }
 
 /// A remote *program* — run through the user's login+interactive shell.
@@ -968,7 +984,10 @@ fn remote_command(spec: &SshSpec) -> String {
             // This shell command runs only on creation, not on `-A` reattach.
             crate::tmux::control_pane_program(
                 "sh",
-                &["-c".into(), login_shell_command(p, spec.args)],
+                &[
+                    "-c".into(),
+                    crate::pane_scope::remote_exec(&login_shell_command(p, spec.args)),
+                ],
             )
             .iter()
             .map(|arg| sh_quote(arg))
@@ -1052,14 +1071,19 @@ fn remote_command(spec: &SshSpec) -> String {
             let cwd = sh_quote(cwd);
             cmd.push_str(&format!("mkdir -p -- {cwd} && cd {cwd} && "));
         }
-        cmd.push_str("exec ");
-        match spec.program {
+        let program = match spec.program {
             // Same PATH problem without tmux: ssh runs this via a *non-interactive*
             // shell, which reads no profile.
-            Some(p) => cmd.push_str(&login_shell_command(p, spec.args)),
-            // The remote login shell (expanded by the remote shell — left unquoted).
-            None => cmd.push_str("${SHELL:-/bin/sh} -l"),
-        }
+            Some(p) => login_shell_command(p, spec.args),
+            // The remote login shell (expanded by `sh` there — left unquoted).
+            None => "\"${SHELL:-/bin/sh}\" -l".to_string(),
+        };
+        // In a scope of its own where the host can make one: panes multiplexed
+        // over one SSH connection share its login session's scope, which systemd
+        // would otherwise stop whole when one process runs out of memory. Run by
+        // `sh` because the remote login shell may not be a POSIX one.
+        cmd.push_str("exec sh -c ");
+        cmd.push_str(&sh_quote(&crate::pane_scope::remote_exec(&program)));
         cmd
     }
 }
@@ -1270,7 +1294,10 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+            format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec("\"${SHELL:-/bin/sh}\" -l"))
+            )
         );
     }
 
@@ -1594,8 +1621,12 @@ mod tests {
         assert_eq!(v[v.len() - 2], "--");
         assert_eq!(
             v.last().unwrap(),
-            "mkdir -p -- /srv/app && cd /srv/app && \
-             exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+            &format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+                ))
+            )
         );
     }
 
@@ -1615,7 +1646,10 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+            &format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec("\"${SHELL:-/bin/sh}\" -l"))
+            )
         );
     }
 
@@ -1648,9 +1682,12 @@ mod tests {
                  exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- sh -c 'tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"' \
-                 muxel-agent sh -c '\"${{SHELL:-/bin/sh}}\" -ilc '\\''exec claude'\\'''",
+                 muxel-agent sh -c {agent}",
                 tmux_path_prelude(),
-                profile_cleanup = test_profile_cleanup()
+                profile_cleanup = test_profile_cleanup(),
+                agent = sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+                ))
             )
         );
     }
@@ -2197,9 +2234,10 @@ mod tests {
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
-        // The last ` -- `: the first is the `set -- -L mxl` choosing the server.
+        // The command after new-session's ` -- `: the one before it is the
+        // `set -- -L mxl` choosing the server.
         let (_, after) = cmd
-            .rsplit_once(" -- ")
+            .split_once(" -c /srv/app -- ")
             .expect("a command follows the separator");
         assert!(
             after.starts_with("sh -c ")
@@ -2321,7 +2359,10 @@ mod tests {
         let tagged = ssh_args(&spec(Some("ab12"))).last().unwrap().clone();
         let program = crate::tmux::control_pane_program(
             "sh",
-            &["-c".into(), login_shell_command("claude", &[])],
+            &[
+                "-c".into(),
+                crate::pane_scope::remote_exec(&login_shell_command("claude", &[])),
+            ],
         )
         .iter()
         .map(|arg| sh_quote(arg))
@@ -2383,6 +2424,32 @@ mod tests {
         ));
     }
 
+    /// A host's claims go out as one command, so a burst can't run past sshd's
+    /// `MaxSessions`; each session is claimed on its own server, and one with
+    /// nothing to claim doesn't stop the next.
+    #[test]
+    fn a_hosts_claims_share_one_command_and_each_runs_on_its_own() {
+        let first: crate::tmux::SessionTarget = "muxel_app_1".into();
+        let second = crate::tmux::SessionTarget::new("muxel_app_2", Some(Socket::Private));
+        let cmd = claim_window_sizes_command(&[first.clone(), second.clone()], "ab12");
+        assert_eq!(cmd.matches(&tmux_path_prelude()).count(), 1);
+        let (one, two) = cmd
+            .split_once(&format!("; {}; ", select_session_socket(&second)))
+            .expect("the second claim chooses its own server");
+        assert_eq!(one, claim_window_size_command(&first, "ab12"));
+        assert_eq!(
+            format!(
+                "{}; {}; {two}",
+                tmux_path_prelude(),
+                select_session_socket(&second)
+            ),
+            claim_window_size_command(&second, "ab12")
+        );
+        assert_eq!(cmd.matches("refresh-client").count(), 2);
+        // Separated by `;`, not `&&`: an unclaimable first session can't skip the second.
+        assert!(!one.ends_with("&&") && !two.starts_with("&&"));
+    }
+
     /// Both attach paths clear the server id before creating a session. Existing
     /// sessions retain their own environment when reattached.
     #[test]
@@ -2439,8 +2506,12 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "mkdir -p -- '/srv/my app' && cd '/srv/my app' && \
-             exec \"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
+            &format!(
+                "mkdir -p -- '/srv/my app' && cd '/srv/my app' && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
+                ))
+            )
         );
     }
 
