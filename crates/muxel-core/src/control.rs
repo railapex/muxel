@@ -127,9 +127,9 @@ pub enum Command {
         #[serde(default)]
         agent: Option<String>,
     },
-    /// Deliberately open an existing pane, starting it if dormant.
+    /// Deliberately open an existing pane, waking it if asleep.
     Focus { agent: String },
-    /// Start a sleeping or dormant pane in the background, without focusing it.
+    /// Wake an asleep pane in the background, without focusing it.
     Wake { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
@@ -493,8 +493,8 @@ pub struct AgentInfo {
     /// it in muxel only shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_running_reason: Option<String>,
-    /// For a sleeping or dormant agent: whether waking it resumes its
-    /// conversation (`false` when the saved conversation is gone), checked
+    /// For an asleep agent: whether waking it resumes its conversation
+    /// (`false` when the saved conversation is gone), checked
     /// when asked. Absent while it runs, or when muxel can't tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumes: Option<bool>,
@@ -1332,8 +1332,8 @@ usage: muxel ctl <command> [args]
                                  --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
-  focus AGENT                    open a pane; start it if dormant
-  wake AGENT                     start a sleeping or dormant pane, without focus
+  focus AGENT                    open a pane; wake it if asleep
+  wake AGENT                     wake an asleep pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
@@ -1407,9 +1407,9 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "status" => {
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
         }
-        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, starting it if dormant.",
+        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, waking it if asleep.",
         "wake" => {
-            "usage: muxel ctl wake AGENT\nStart a sleeping or dormant pane in the background; focus stays where it is."
+            "usage: muxel ctl wake AGENT\nWake an asleep pane in the background; focus stays where it is."
         }
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
@@ -1796,8 +1796,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
-  starting it through normal restore if dormant. This changes keyboard focus.
-- `muxel ctl wake AGENT` - start a sleeping or dormant pane in the background on
+  waking it through normal restore if asleep. This changes keyboard focus.
+- `muxel ctl wake AGENT` - wake an asleep pane in the background on
   its saved conversation, leaving focus, the window and the active tab alone.
   Replies `{woken: true, status: "starting"}`, or `{woken: false,
   already_running: true, status}` when it already runs, so a retry is harmless.
@@ -2032,19 +2032,19 @@ hosts ignore this caller ID, so check the target when driving one.
   in muxel only shows it, so the user wakes it there (Enter, typing or Wake) or
   you call `focus` or `wake`.
 
-Old local sessions may be dormant, and idle ones may be asleep: `status` and
-`panes` report `status: "not_running"` with `not_running_reason: "dormant"`
-(deferred at launch) or `"sleeping"` (put to sleep by the user or the idle
+Old local sessions may open asleep, and idle ones may be put to sleep: `status`
+and `panes` report `status: "not_running"` with `not_running_reason: "dormant"`
+(asleep since launch) or `"sleeping"` (put to sleep by the user or the idle
 timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
 refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
 and resumes the session; `wake` resumes it without focusing it, then `status`
 moves from `starting` to idle with a new `launch_id`.
-For a dormant or sleeping agent, `status` and `panes` also report `resumes`,
+For an asleep agent, `status` and `panes` also report `resumes`,
 checked on disk when you ask: `true` when a wake brings its conversation back,
 `false` when it will start a new one (the provider deleted the saved
 conversation, or muxel never captured one). It is left out when muxel can't tell
 (Grok, whose files muxel can't locate) and while the agent runs.
-An approved `new --focus` also leaves other dormant sessions asleep.
+An approved `new --focus` also leaves other asleep sessions alone.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to

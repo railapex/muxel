@@ -299,7 +299,7 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
 fn conversation_gone_notice(app: &MuxelApp) -> bool {
     app.notifications
         .iter()
-        .any(|n| n.title.ends_with(": saved conversation is gone"))
+        .any(|n| n.title.ends_with(": started fresh"))
 }
 
 /// A rollout Codex deleted, or one the whole store was read without finding,

@@ -418,19 +418,12 @@ impl MuxelApp {
                     .is_ok()
             })
             .count();
-        if slept == 0 {
-            self.add_event(
-                NotifKind::Success,
-                t("No idle agents to put to sleep"),
-                t("Working, asking, focused and pinned agents keep running."),
-            );
-        } else {
-            self.add_event(
-                NotifKind::Success,
-                tf("Put {n} idle agents to sleep", &[("n", &slept.to_string())]),
-                t("Each resumes its conversation when you open it."),
-            );
-        }
+        let title = match slept {
+            0 => t("No idle agents to sleep").to_string(),
+            1 => t("Slept 1 idle agent").to_string(),
+            n => tf("Slept {n} idle agents", &[("n", &n.to_string())]),
+        };
+        self.add_event(NotifKind::Success, title, "");
         cx.notify();
     }
 
@@ -582,7 +575,7 @@ impl MuxelApp {
             } else {
                 Err(ctl::Error::new(
                     ErrorCode::NotRunning,
-                    format!("'{name}' couldn't be started: open it in muxel to see why"),
+                    format!("'{name}' couldn't be woken: open it in muxel to see why"),
                 ))
             };
         }
@@ -649,28 +642,27 @@ impl MuxelApp {
         changed
     }
 
-    /// An asleep pane in words, for its tooltip and placeholder: one word for
-    /// a pane put to sleep and one deferred at launch, its saved status, and
-    /// how long ago it last worked.
+    /// An asleep pane in words, for its tooltip and face: "Asleep", how long
+    /// ago it last worked, then only the exceptions, an interrupted turn and
+    /// a conversation that is gone ("Asleep · 31d · no history"). A pane that
+    /// will resume its conversation says nothing about it.
     pub(super) fn asleep_words(&self, iid: Uuid) -> String {
-        let Some(inst) = self.workspace.instance(iid) else {
-            return t("Asleep").to_string();
-        };
-        let now = chrono::Utc::now().timestamp_millis();
-        match (
-            saved_activity_status(&inst.activity),
-            muxel_core::sleep::asleep_age(&inst.activity, now),
-        ) {
-            (_, None) => t("Asleep").to_string(),
-            (AgentStatus::Done, Some(age)) => tf("Asleep · finished {age} ago", &[("age", &age)]),
+        let mut words = vec![t("Asleep").to_string()];
+        if let Some(inst) = self.workspace.instance(iid) {
+            let now = chrono::Utc::now().timestamp_millis();
+            words.extend(muxel_core::sleep::asleep_age(&inst.activity, now));
             // Its turn or question ended with the program.
-            (AgentStatus::Working | AgentStatus::Blocked, Some(age)) => {
-                tf("Asleep · interrupted {age} ago", &[("age", &age)])
-            }
-            (AgentStatus::Idle, Some(age)) => {
-                tf("Asleep · last active {age} ago", &[("age", &age)])
+            if matches!(
+                saved_activity_status(&inst.activity),
+                AgentStatus::Working | AgentStatus::Blocked
+            ) {
+                words.push(t("interrupted").to_string());
             }
         }
+        if self.conversations_gone.contains(&iid) {
+            words.push(t("no history").to_string());
+        }
+        words.join(" · ")
     }
 
     /// An asleep pane's sidebar pill: a moon and the age of its last work,
@@ -767,11 +759,6 @@ impl MuxelApp {
             }))
     }
 
-    /// What waking an asleep pane whose conversation is gone does.
-    pub(super) fn conversation_gone_words() -> SharedString {
-        t("The saved conversation is gone. Waking starts a new one in the same folder.")
-    }
-
     pub(super) fn is_asleep(&self, iid: Uuid) -> bool {
         self.workspace
             .instance(iid)
@@ -803,10 +790,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    &tf(
-                        "Put agents to sleep after {hours} hours idle",
-                        &[("hours", &shown)],
-                    ),
+                    &tf("Sleep agents idle for {hours} hours", &[("hours", &shown)]),
                 ),
             )
             .child(
@@ -845,7 +829,7 @@ impl MuxelApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(t(
-                        "A sleeping agent's program stops, freeing its memory, and its row shows a moon and how long ago it last worked. Selecting it shows it without starting it. Enter, typing in it or Wake resumes the same conversation, or starts a new one if the provider has deleted it. Working, asking, focused and pinned agents, and shells, keep running.",
+                        "An asleep agent's program stops and frees its memory. Selecting it shows it; Enter, typing or Wake resumes its conversation. Working, asking, focused and pinned agents keep running, and shells never sleep.",
                     )),
             )
             .into_any_element()
@@ -856,15 +840,15 @@ impl MuxelApp {
 pub(super) fn sleep_refusal_label(refusal: SleepRefusal) -> String {
     let why = match refusal {
         SleepRefusal::NotAgent => t("not an agent"),
-        SleepRefusal::NotLocal => t("not a local session"),
-        SleepRefusal::NoResume => t("no saved conversation to resume"),
+        SleepRefusal::NotLocal => t("not local"),
+        SleepRefusal::NoResume => t("no history"),
         SleepRefusal::Pinned => t("pinned"),
-        SleepRefusal::NotRunning => t("not running"),
+        SleepRefusal::NotRunning => t("ended"),
         SleepRefusal::Starting => t("starting"),
         SleepRefusal::Working => t("working"),
-        SleepRefusal::Asking => t("asking a question"),
-        SleepRefusal::Background => t("background work running"),
-        SleepRefusal::UnsentText => t("unsent text in its input"),
+        SleepRefusal::Asking => t("asking"),
+        SleepRefusal::Background => t("background work"),
+        SleepRefusal::UnsentText => t("unsent prompt"),
         SleepRefusal::PoppedOut => t("popped out"),
         SleepRefusal::Focused => t("you're in it"),
         SleepRefusal::RecentlyActive => t("recently active"),

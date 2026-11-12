@@ -1116,7 +1116,7 @@ mod tests {
                     assert!(
                         app.notifications
                             .iter()
-                            .any(|n| n.title.ends_with(": saved conversation is gone")),
+                            .any(|n| n.title.ends_with(": started fresh")),
                         "a lost conversation started anew without a word"
                     );
                 })
