@@ -96,8 +96,10 @@ feature is added or changed, update the matching entry here in the same change**
   seconds) and its pane becomes a dormant placeholder that resumes the same
   conversation when opened, across restarts too. Sleep a pane from its sidebar
   menu, a whole project's idle agents from the project menu, or let Settings →
-  Behavior do it after N hours idle (on, 4 hours, by default). Working, asking,
-  background-held, focused, pinned and drafting agents, agents without a saved
+  Behavior do it after N hours idle (on, 4 hours, by default); every wake
+  restarts that clock. Working, asking,
+  background-held, pinned and drafting agents, the focused agent (unless its
+  own Sleep is chosen), agents without a saved
   conversation, shells, and remote or tmux panes stay running. `ctl status`
   reports `not_running_reason: "sleeping"`, and `ctl wake AGENT` resumes one
   without moving focus.

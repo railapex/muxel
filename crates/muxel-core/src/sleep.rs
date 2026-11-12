@@ -16,9 +16,13 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 /// Who asked for a sleep. Only automatic sleep waits for the idle threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepRequest {
-    /// A pane's own Sleep item, or a project's "Sleep idle agents".
-    ByHand,
-    /// The idle timer.
+    /// A pane's own Sleep item. The user named this pane, so being in it
+    /// doesn't keep it awake.
+    Pane,
+    /// A project's "Sleep idle agents". It names no pane, so it leaves the one
+    /// the user is in.
+    Project,
+    /// The idle timer, which also leaves the pane the user is in.
     Auto { after_hours: u32, now: i64 },
 }
 
@@ -51,8 +55,11 @@ pub struct SleepFacts {
     /// The provider's screen says work still runs beside the turn (subagents,
     /// background shells), or muxel holds the turn open for it.
     pub background_held: bool,
-    /// The pane the user has focused.
+    /// The pane the user is in: focused, popped out, or shown by a project
+    /// window.
     pub focused: bool,
+    /// Popped out into its own window, which owns its terminal.
+    pub popped_out: bool,
     /// Text typed into the agent's input that hasn't been submitted.
     pub unsent_text: bool,
     pub pinned: bool,
@@ -73,6 +80,9 @@ pub enum SleepRefusal {
     Asking,
     Background,
     UnsentText,
+    /// Sleep can't reach a popped-out pane's terminal until it is docked.
+    PoppedOut,
+    /// The bulk and automatic paths only: the user is in the pane.
     Focused,
     /// Automatic sleep only: active within the threshold, or its age is unknown.
     RecentlyActive,
@@ -92,6 +102,7 @@ impl SleepRefusal {
             Self::Asking => "asking",
             Self::Background => "background",
             Self::UnsentText => "unsent_text",
+            Self::PoppedOut => "popped_out",
             Self::Focused => "focused",
             Self::RecentlyActive => "recently_active",
         }
@@ -128,7 +139,14 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
             SleepStatus::Working => SleepRefusal::Working,
             SleepStatus::Asking => SleepRefusal::Asking,
             SleepStatus::Idle | SleepStatus::Done if facts.unsent_text => SleepRefusal::UnsentText,
-            SleepStatus::Idle | SleepStatus::Done if facts.focused => SleepRefusal::Focused,
+            SleepStatus::Idle | SleepStatus::Done if facts.popped_out => SleepRefusal::PoppedOut,
+            // Only a pane's own Sleep names it; the others leave the pane the
+            // user is in.
+            SleepStatus::Idle | SleepStatus::Done
+                if facts.focused && request != SleepRequest::Pane =>
+            {
+                SleepRefusal::Focused
+            }
             SleepStatus::Idle | SleepStatus::Done => match request {
                 SleepRequest::Auto { after_hours, now }
                     if !sleep_due(facts.last_active_at, after_hours, now) =>
@@ -183,7 +201,7 @@ mod tests {
         DEFAULT_SLEEP_AFTER_HOURS, HOUR_MS, SleepFacts, SleepRefusal, SleepRequest, SleepStatus,
         opens_dormant, sleep_due, sleep_refusal,
     };
-    use crate::{AgentActivity, Instance, Settings};
+    use crate::{AgentActivity, AgentActivityState, Instance, Settings};
     use uuid::Uuid;
 
     fn sleepy() -> SleepFacts {
@@ -194,6 +212,7 @@ mod tests {
             status: SleepStatus::Idle,
             background_held: false,
             focused: false,
+            popped_out: false,
             unsent_text: false,
             pinned: false,
             last_active_at: Some(0),
@@ -209,8 +228,50 @@ mod tests {
                 last_active_at: None,
                 ..sleepy()
             };
-            assert_eq!(sleep_refusal(&facts, SleepRequest::ByHand), None);
+            for request in [SleepRequest::Pane, SleepRequest::Project] {
+                assert_eq!(sleep_refusal(&facts, request), None);
+            }
         }
+    }
+
+    #[test]
+    fn only_its_own_sleep_takes_the_pane_the_user_is_in() {
+        let auto = SleepRequest::Auto {
+            after_hours: 4,
+            now: 9 * HOUR_MS,
+        };
+        let focused = SleepFacts {
+            focused: true,
+            ..sleepy()
+        };
+        assert_eq!(sleep_refusal(&focused, SleepRequest::Pane), None);
+        for request in [SleepRequest::Project, auto] {
+            assert_eq!(
+                sleep_refusal(&focused, request),
+                Some(SleepRefusal::Focused)
+            );
+        }
+        // A popped-out pane's window owns its terminal: no path sleeps it.
+        let popped = SleepFacts {
+            focused: true,
+            popped_out: true,
+            ..sleepy()
+        };
+        for request in [SleepRequest::Pane, SleepRequest::Project, auto] {
+            assert_eq!(
+                sleep_refusal(&popped, request),
+                Some(SleepRefusal::PoppedOut)
+            );
+        }
+        // Being named lifts only the focus rule.
+        let drafting = SleepFacts {
+            unsent_text: true,
+            ..focused
+        };
+        assert_eq!(
+            sleep_refusal(&drafting, SleepRequest::Pane),
+            Some(SleepRefusal::UnsentText)
+        );
     }
 
     #[test]
@@ -219,7 +280,7 @@ mod tests {
             after_hours: 4,
             now: 9 * HOUR_MS,
         };
-        let cases: [(SleepFacts, SleepRefusal); 11] = [
+        let cases: [(SleepFacts, SleepRefusal); 10] = [
             (
                 SleepFacts {
                     agent: false,
@@ -291,16 +352,9 @@ mod tests {
                 },
                 SleepRefusal::UnsentText,
             ),
-            (
-                SleepFacts {
-                    focused: true,
-                    ..sleepy()
-                },
-                SleepRefusal::Focused,
-            ),
         ];
         for (facts, refusal) in cases {
-            for request in [SleepRequest::ByHand, auto] {
+            for request in [SleepRequest::Pane, SleepRequest::Project, auto] {
                 assert_eq!(
                     sleep_refusal(&facts, request),
                     Some(refusal),
@@ -412,5 +466,28 @@ mod tests {
             ..Settings::default()
         };
         assert!(opens_dormant(&shell, false, &days, 25 * HOUR_MS, false));
+    }
+
+    #[test]
+    fn a_wake_restarts_the_idle_clock_across_restarts_without_reading_a_finish() {
+        let settings = Settings::default();
+        // Finished at hour 0, woken at hour 5, and nobody has typed since.
+        let woken = agent(AgentActivity {
+            completed_at: Some(0),
+            last_state: Some(AgentActivityState::Done),
+            woken_at: Some(5 * HOUR_MS),
+            ..Default::default()
+        });
+        assert_eq!(woken.activity.last_active_at(), Some(5 * HOUR_MS));
+        assert!(!opens_dormant(
+            &woken,
+            true,
+            &settings,
+            9 * HOUR_MS - 1,
+            false
+        ));
+        assert!(opens_dormant(&woken, true, &settings, 9 * HOUR_MS, false));
+        // `ctl wake` must not mark the finished turn read.
+        assert!(woken.activity.has_unattended_completion());
     }
 }

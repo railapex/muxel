@@ -6118,8 +6118,6 @@ pub struct MuxelApp {
     sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
     /// When the idle timer last looked for agents to sleep.
     auto_sleep_checked: Option<Instant>,
-    /// When `ctl wake` started a pane (Unix ms): the idle timer counts from it.
-    woken_at: HashMap<Uuid, i64>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8645,7 +8643,6 @@ impl MuxelApp {
             dormant_instances: HashSet::new(),
             sleep_exits: HashMap::new(),
             auto_sleep_checked: None,
-            woken_at: HashMap::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -13108,14 +13105,7 @@ impl MuxelApp {
         let _phase = ui_profile::phase("workspace", "focus-pane", Some(iid));
         ui_profile::focus_action(reason, Some(iid), window);
         self.active_instance = Some(iid);
-        if self.dormant_instances.remove(&iid) {
-            self.spawn_terminal_deferred(
-                iid,
-                muxel_core::TerminalLaunchReason::Restore,
-                window,
-                cx,
-            );
-        }
+        self.start_dormant(iid, window, cx);
         if attend {
             // Deliberately selecting a pane clears its pending notification.
             self.clear_notifications_for(iid);
@@ -19051,7 +19041,6 @@ impl MuxelApp {
             view.read(cx).session().kill();
         }
         self.end_pending_sleep(iid, cx);
-        self.woken_at.remove(&iid);
         if let Some(popout) = self.popouts.remove(&iid) {
             if let PaneView::Terminal(view) = &popout.view {
                 view.read(cx).session().kill();
@@ -24238,13 +24227,8 @@ impl MuxelApp {
         if let Some(inst) = self.workspace.instance_mut(iid) {
             inst.pinned = !inst.pinned;
         }
-        if self.tab_is_pinned(iid) && self.dormant_instances.remove(&iid) {
-            self.spawn_terminal_deferred(
-                iid,
-                muxel_core::TerminalLaunchReason::Restore,
-                window,
-                cx,
-            );
+        if self.tab_is_pinned(iid) {
+            self.start_dormant(iid, window, cx);
         }
         self.reflow_pins(iid);
         self.persist();
@@ -28900,6 +28884,7 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
+                        .debug_selector(move || format!("inst-row-{}", iid.simple()))
                         .ml_4()
                         .mr_1()
                         .px_2()
@@ -28948,7 +28933,23 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
-                        let dormant = self.is_dormant(iid);
+                        let label = inst
+                            .map(|instance| {
+                                localized_activity_label(
+                                    status,
+                                    &instance.activity,
+                                    self.terminal_view(iid)
+                                        .and_then(|view| view.read(cx).background_work()),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                            })
+                            .unwrap_or_else(|| status_label(Some(status)).to_string());
+                        // A dormant row's badge is the one word, so the row
+                        // stays a single line at any sidebar width; its saved
+                        // activity moves to the tooltip.
+                        let dormant_tip = self
+                            .is_dormant(iid)
+                            .then(|| format!("{label} · {}", self.dormant_badge(iid)));
                         let badge = if loading {
                             status_tag(AgentStatus::Working, t("loading").to_string())
                         } else if stopped {
@@ -28956,21 +28957,11 @@ impl MuxelApp {
                         } else {
                             let tag = status_tag(
                                 status,
-                                inst.map(|instance| {
-                                    let label = localized_activity_label(
-                                        status,
-                                        &instance.activity,
-                                        self.terminal_view(iid)
-                                            .and_then(|view| view.read(cx).background_work()),
-                                        chrono::Utc::now().timestamp_millis(),
-                                    );
-                                    if dormant {
-                                        format!("{label} · {}", self.dormant_badge(iid))
-                                    } else {
-                                        label
-                                    }
-                                })
-                                .unwrap_or_else(|| status_label(Some(status)).to_string()),
+                                if dormant_tip.is_some() {
+                                    self.dormant_badge(iid).to_string()
+                                } else {
+                                    label
+                                },
                             );
                             // A read finish keeps its green as an outline, so
                             // the label stays legible on the sidebar.
@@ -28980,12 +28971,11 @@ impl MuxelApp {
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .when(dormant, |details| details.flex_col().items_start().gap_1())
-                            .when(!dormant, |details| details.items_center().gap_2())
+                            .items_center()
+                            .gap_2()
                             .child(
                                 div()
-                                    .when(!dormant, |name| name.flex_1())
-                                    .when(dormant, |name| name.w_full())
+                                    .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -28994,7 +28984,20 @@ impl MuxelApp {
                                     .text_color(cx.theme().sidebar_foreground)
                                     .child(display),
                             )
-                            .child(div().flex_none().child(badge));
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("inst-badge-{}", iid.simple())))
+                                    .debug_selector(move || format!("inst-badge-{}", iid.simple()))
+                                    .flex_none()
+                                    .child(badge)
+                                    .when_some(dormant_tip, |badge, tip| {
+                                        let tip = SharedString::from(tip);
+                                        badge.tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tip.clone())
+                                                .build(window, cx)
+                                        })
+                                    }),
+                            );
                         base.cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
@@ -29062,8 +29065,8 @@ impl MuxelApp {
                                                 .icon(Icon::empty().path("icons/pause.svg"))
                                                 .on_click(window.listener_for(
                                                     &entity,
-                                                    move |this, _, _window, cx| {
-                                                        this.sleep_from_menu(iid, cx)
+                                                    move |this, _, window, cx| {
+                                                        this.sleep_from_menu(iid, window, cx)
                                                     },
                                                 )),
                                         ),

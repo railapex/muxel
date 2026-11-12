@@ -12,8 +12,9 @@ change that work timestamp. At exactly N elapsed days, an old pane becomes
 dormant. Panes without these timestamps start normally. Pinned panes always
 start, as does the active pane of the active project at launch.
 
-A dormant pane owns no PTY or child process. Its sidebar entry retains its
-saved name, status and age, with a dormant marker; its tab also says dormant.
+A dormant pane owns no PTY or child process. Its sidebar entry keeps its saved
+name and status color on one line, with a "dormant" badge whose tooltip gives
+the saved status and age; its tab also says dormant.
 The pane body shows its name, last saved title and folder with a Start button.
 Selecting it through the sidebar, tab, notification, tray or `ctl focus`
 starts it using the ordinary restore path, including the saved provider session

@@ -18,8 +18,9 @@ the same conversation through the ordinary restore path.
   each agent idle that long. Idle is measured from the latest of the pane's
   work start, completion, question (`activity.work_started_at`,
   `completed_at`, `blocked_at`), the last time the user opened it
-  (`last_attended_at`), and the last `ctl wake` (see below). A pane with no
-  work or attendance recorded is never slept automatically.
+  (`last_attended_at`), and the last time it was woken (`woken_at`, see
+  below). A pane with no work or attendance recorded is never slept
+  automatically.
 
 Four hours keeps everything touched this morning running through the
 afternoon, while the panes left from yesterday stop holding memory before the
@@ -33,7 +34,8 @@ minute later.
   (subagents or background shells its provider reports, or a loop run muxel
   is still watching);
 - a pane with text typed into its input and not yet submitted;
-- the focused pane, a popped-out pane, and the pane a project window shows;
+- the pane you're in (the focused pane, or the one a project window shows),
+  except by its own Sleep, and a popped-out pane;
 - a pane whose resume can't be trusted: it hasn't launched, its conversation
   id hasn't been captured, or its preset doesn't resume by id;
 - a shell or any program that isn't one of muxel's known agents;
@@ -42,8 +44,12 @@ minute later.
   and pinning a dormant pane starts it, so a pin keeps a pane running in every
   path.
 
-These rules apply to every way in; only automatic sleep also waits for the
-idle threshold.
+These rules apply to every way in, with one exception: a pane's own Sleep
+names it, so it sleeps the pane you're in. Focus then moves the way a close
+moves it, to the tab its group shows next or another running pane of the
+project (focusing a dormant pane starts it, so focus doesn't stay). Sleep idle
+agents and the timer name no pane and leave the one you're in. Only automatic
+sleep waits for the idle threshold.
 
 ## How a sleep ends the program
 
@@ -53,12 +59,23 @@ presses Ctrl+C twice, 300 ms apart, which quits an idle Claude or Codex the
 way a user would, saving its conversation. If the program is still running
 five seconds later, whatever the provider, muxel ends it by its exact PID, and
 closing its pseudo console ends what it left running, as closing a pane does. The event log
-records each sleep and whether the program quit or was killed.
+records each sleep with the pane's preset, and whether the program quit or was
+killed.
 
 A slept pane stays dormant across restarts until it is opened or woken, even
 when neither threshold applies. Any launch that lands for the pane clears the
 mark. Opening it during the quit grace ends the old process first, so two
 copies never run on one conversation.
+
+Its sidebar row stays one line at any sidebar width: the badge reads just
+"asleep" ("dormant" for a pane deferred at launch), and hovering it shows the
+saved status and age as well.
+
+Every wake (opening the pane, pinning it, or `ctl wake`) records
+`activity.woken_at`, and the idle timer counts from it. A woken pane therefore
+runs at least N hours before the timer can sleep it again, even if nobody
+types into it, and a restart in that time starts it rather than leaving it
+dormant.
 
 ## Outside control
 
@@ -79,10 +96,9 @@ changing the active tab or marking its notifications read. Replies:
   `failed` for a failed launch, none for a pane not started this session),
   `exited`, `closing`, and `control_disabled`.
 
-Waking isn't user activity: it records no attendance and changes no saved
-timestamp. The idle timer also counts from the wake, though, so a woken pane
-runs at least N hours before the timer can sleep it again, which leaves the
-caller time to deliver what it woke the pane for. A wake never starts a new
+Waking isn't attendance: it marks nothing read. Like any wake, it restarts the
+idle clock, which leaves the caller N hours to deliver what it woke the pane
+for. A wake never starts a new
 conversation; if the provider's saved transcript is gone, restore's ordinary
 recovery applies and `session_id` changes, so a caller holding the old id can
 tell.

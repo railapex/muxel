@@ -89,14 +89,11 @@ impl MuxelApp {
                     || runtime.background.is_some_and(|work| !work.is_empty())
             }) || self.running_loops.contains_key(&iid),
             focused: self.pane_focused(iid),
+            popped_out: self.popouts.contains_key(&iid),
             unsent_text: runtime.is_some_and(|runtime| runtime.draft_latched),
             pinned: inst.pinned,
-            // A pane woken from outside is about to receive what it was woken
-            // for; the timer must not put it straight back to sleep first.
-            last_active_at: inst
-                .activity
-                .last_active_at()
-                .max(self.woken_at.get(&iid).copied()),
+            // Counts the last wake: see `start_dormant`.
+            last_active_at: inst.activity.last_active_at(),
         })
     }
 
@@ -155,17 +152,20 @@ impl MuxelApp {
             return Err(SleepRefusal::NotRunning);
         };
         let now = chrono::Utc::now().timestamp_millis();
-        let name = match self.workspace.instance_mut(iid) {
+        let (name, preset) = match self.workspace.instance_mut(iid) {
             Some(inst) => {
                 inst.asleep_since = Some(now);
-                inst.display_name().to_string()
+                (inst.display_name().to_string(), inst.preset.clone())
             }
-            None => String::new(),
+            None => Default::default(),
         };
         self.dormant_instances.insert(iid);
         self.terminal_launches.remove(&iid);
-        self.woken_at.remove(&iid);
-        muxel_store::append_event_log(&format!("sleep: \"{name}\" [{iid}] by {}", cause.word()));
+        // The preset names the provider, so a quit that needed a kill says whose.
+        muxel_store::append_event_log(&format!(
+            "sleep: \"{name}\" [{iid}] ({preset}) by {}",
+            cause.word()
+        ));
         self.persist();
         self.quit_sleeping_terminal(iid, view, cx);
         cx.notify();
@@ -266,7 +266,7 @@ impl MuxelApp {
         if self.is_dormant(iid) {
             return None;
         }
-        match self.sleep_refusal_for(iid, SleepRequest::ByHand, cx) {
+        match self.sleep_refusal_for(iid, SleepRequest::Pane, cx) {
             None => Some(Ok(())),
             Some(SleepRefusal::NotAgent | SleepRefusal::NotLocal) => None,
             Some(refusal) => Some(Err(sleep_refusal_label(refusal))),
@@ -274,15 +274,48 @@ impl MuxelApp {
     }
 
     /// The pane menu's Sleep. Its state can change while the menu is open.
-    pub(super) fn sleep_from_menu(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if let Err(refusal) = self.sleep_instance(iid, SleepRequest::ByHand, SleepCause::Pane, cx) {
+    ///
+    /// It sleeps the pane even when the user is in it, since they named it.
+    /// Focus then moves the way a close moves it: to the tab its group shows
+    /// next, else another running pane of the project. Focusing a dormant
+    /// pane starts it, so leaving focus there would let the next project
+    /// switch wake it straight back up. With no running pane to go to, focus
+    /// stays and the pane shows its dormant placeholder.
+    pub(super) fn sleep_from_menu(
+        &mut self,
+        iid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_active = self.active_instance == Some(iid);
+        if let Err(refusal) = self.sleep_instance(iid, SleepRequest::Pane, SleepCause::Pane, cx) {
             self.add_event(
                 NotifKind::Error,
                 sleep_refusal_label(refusal),
                 String::new(),
             );
             cx.notify();
+            return;
         }
+        if was_active && let Some(next) = self.focus_after_sleep(iid) {
+            self.focus_instance_with_attendance(next, false, window, cx);
+        }
+    }
+
+    /// Where focus goes after the focused pane `iid` falls asleep: its group's
+    /// next tab, else the project's first other pane, skipping dormant ones.
+    fn focus_after_sleep(&self, iid: Uuid) -> Option<Uuid> {
+        let project = self
+            .workspace
+            .instance(iid)
+            .and_then(|inst| self.workspace.project(inst.project_id))?;
+        project
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.surviving_active_after_remove(iid))
+            .into_iter()
+            .chain(project.instances())
+            .find(|other| *other != iid && !self.is_dormant(*other))
     }
 
     /// Sleep every idle agent in project `pid` the rules allow; say how many.
@@ -295,7 +328,7 @@ impl MuxelApp {
         let slept = panes
             .into_iter()
             .filter(|iid| {
-                self.sleep_instance(*iid, SleepRequest::ByHand, SleepCause::IdleAgents, cx)
+                self.sleep_instance(*iid, SleepRequest::Project, SleepCause::IdleAgents, cx)
                     .is_ok()
             })
             .count();
@@ -342,6 +375,33 @@ impl MuxelApp {
         }
     }
 
+    /// Start dormant pane `iid` through the restore path: opening it, pinning
+    /// it and `ctl wake` all wake it here. The wake restarts its idle clock, so
+    /// it gets the whole threshold before the timer can stop it again, even if
+    /// nobody types into it. `false` when it wasn't dormant or its launch was
+    /// refused; a refused launch leaves it out of `dormant_instances`, where
+    /// its failure shows.
+    pub(super) fn start_dormant(
+        &mut self,
+        iid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.dormant_instances.remove(&iid) {
+            return false;
+        }
+        self.spawn_terminal_deferred(iid, muxel_core::TerminalLaunchReason::Restore, window, cx);
+        if !self.terminal_launching.contains_key(&iid) && !self.terminals.contains_key(&iid) {
+            return false;
+        }
+        if let Some(inst) = self.workspace.instance_mut(iid) {
+            inst.activity.woken_at = Some(chrono::Utc::now().timestamp_millis());
+        }
+        self.persist();
+        cx.notify();
+        true
+    }
+
     /// Start a sleeping or dormant pane through the ordinary restore path,
     /// leaving focus, windows and the active tab alone. `false` when it isn't
     /// dormant or its launch was refused (it is then left dormant).
@@ -354,17 +414,11 @@ impl MuxelApp {
         if !self.is_dormant(iid) {
             return false;
         }
-        self.dormant_instances.remove(&iid);
-        self.spawn_terminal_deferred(iid, muxel_core::TerminalLaunchReason::Restore, window, cx);
-        if self.terminal_launching.contains_key(&iid) || self.terminals.contains_key(&iid) {
-            self.woken_at
-                .insert(iid, chrono::Utc::now().timestamp_millis());
-            cx.notify();
-            true
-        } else {
-            self.dormant_instances.insert(iid);
-            false
+        if self.start_dormant(iid, window, cx) {
+            return true;
         }
+        self.dormant_instances.insert(iid);
+        false
     }
 
     /// `ctl wake`: start a sleeping or dormant pane without focusing it. A pane
@@ -555,6 +609,7 @@ pub(super) fn sleep_refusal_label(refusal: SleepRefusal) -> String {
         SleepRefusal::Asking => t("asking a question"),
         SleepRefusal::Background => t("background work running"),
         SleepRefusal::UnsentText => t("unsent text in its input"),
+        SleepRefusal::PoppedOut => t("popped out"),
         SleepRefusal::Focused => t("you're in it"),
         SleepRefusal::RecentlyActive => t("recently active"),
     };
