@@ -1553,6 +1553,10 @@ impl TerminalSession {
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::spawns_refused() {
+            anyhow::bail!("this process refuses to start terminal programs");
+        }
         let launched_at = SystemTime::now();
         let cols = cols.max(1);
         let rows = rows.max(1);

@@ -101,6 +101,8 @@ mod restart_completion_tests;
 mod restart_guard;
 #[cfg(all(test, windows))]
 mod rich_copy_tests;
+#[cfg(test)]
+mod scenes;
 mod session_discovery;
 mod sound_alerts;
 mod strip_button;

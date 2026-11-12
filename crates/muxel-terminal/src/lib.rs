@@ -29,6 +29,8 @@ mod replies;
 mod search;
 mod session;
 mod startup;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod view;
 
 pub use colors::TerminalPalette;

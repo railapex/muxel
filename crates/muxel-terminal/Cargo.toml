@@ -7,6 +7,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Terminal backend (PTY + alacritty_terminal) and GPUI terminal element for muxel."
 
+[features]
+# Switches for test binaries (`test_support`); never enabled for the app.
+test-support = []
+
 [dependencies]
 gpui.workspace = true
 

@@ -137,6 +137,23 @@ impl Region {
             Self::Content(g) => FIXED + 2 * MAX_GROUPS + group(g),
         }
     }
+
+    /// The name a scene crops to. Tab-group slots are numbered only while
+    /// profiling, so a scene can't tell them apart yet.
+    #[cfg(test)]
+    pub(crate) fn scene_name(self) -> Option<&'static str> {
+        match self {
+            Self::Titlebar => Some("titlebar"),
+            Self::Sidebar => Some("sidebar"),
+            Self::Toolbar => Some("toolbar"),
+            Self::Hotbar => Some("hotbar"),
+            Self::Panes => Some("panes"),
+            Self::Overlay => Some("overlay"),
+            Self::Shell => Some("shell"),
+            Self::PaneScrollbar => Some("pane-scrollbar"),
+            Self::Prep | Self::Actions | Self::Strip(_) | Self::Body(_) | Self::Content(_) => None,
+        }
+    }
 }
 
 fn region_label(index: usize) -> String {
