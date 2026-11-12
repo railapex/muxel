@@ -779,6 +779,22 @@ impl Screen {
         Some(self.context_without_rows(composer))
     }
 
+    /// The rows of Claude's input box as status finds it (prompt row to the
+    /// closing rule), whatever it holds and wherever the cursor is. Cast replay
+    /// reports these rows beside its verdicts.
+    #[cfg(test)]
+    pub(crate) fn claude_composer_region(&self) -> Option<std::ops::Range<usize>> {
+        self.composer_rows_inner(None)
+    }
+
+    /// The rows of Codex's editor (prompt row to its footer), empty or not.
+    #[cfg(test)]
+    pub(crate) fn codex_composer_region(&self) -> Option<std::ops::Range<usize>> {
+        let rows: Vec<_> = self.text.lines().collect();
+        self.codex_composer_rows(&rows, true)
+            .or_else(|| self.codex_composer_rows(&rows, false))
+    }
+
     fn context_without_rows(&self, composer: std::ops::Range<usize>) -> String {
         self.text
             .lines()

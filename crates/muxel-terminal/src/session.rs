@@ -3191,6 +3191,13 @@ impl TerminalSession {
         self.process_output(data);
     }
 
+    /// [`Self::process_probe_output`] with the time the bytes were read, so a
+    /// recorded session replays with its own timing rather than the parse time.
+    #[doc(hidden)]
+    pub fn process_probe_output_at(&self, data: &[u8], read_at: SystemTime) {
+        self.parse([(data, read_at)]);
+    }
+
     /// Latest OSC title plus its change generation. Unlike [`Self::title`], this
     /// lets lifecycle consumers observe a ResetTitle or a repeated title event.
     pub fn title_snapshot(&self) -> (u64, Option<String>) {
@@ -3281,14 +3288,39 @@ impl TerminalSession {
         if Instant::now() < deadline {
             return false;
         }
-        self.evidence
-            .lock()
-            .begin_read(clock.effective_at(SystemTime::now()));
+        self.stop_sync_locked(term, processor, clock, SystemTime::now());
+        true
+    }
+
+    fn stop_sync_locked(
+        &self,
+        term: &mut Term<MuxelListener>,
+        processor: &mut Processor,
+        clock: &mut OutputReadClock,
+        at: SystemTime,
+    ) {
+        self.evidence.lock().begin_read(clock.effective_at(at));
         processor.stop_sync(term);
         clock.sync_since = None;
         clock.next_sync_since = None;
         self.evidence.lock().end_read();
         profile::sync_expired();
+    }
+
+    /// End an open synchronized frame as its deadline would, at `at`, without
+    /// waiting for the deadline on the real clock. Replayed sessions settle a
+    /// marked moment with this. Returns whether a frame was open.
+    #[cfg(test)]
+    pub(crate) fn end_sync_frame_at(&self, at: SystemTime) -> bool {
+        let mut term = self.term.lock();
+        let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
+        if processor.sync_timeout().sync_timeout().is_none() {
+            return false;
+        }
+        self.stop_sync_locked(&mut term, &mut processor, &mut clock, at);
+        self.bump_content();
+        self.trigger_runtime();
         true
     }
 

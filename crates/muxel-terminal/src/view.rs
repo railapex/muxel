@@ -6274,6 +6274,9 @@ mod background_hold_review_tests;
 #[cfg(test)]
 #[path = "background_parser_review_tests.rs"]
 mod background_parser_review_tests;
+#[cfg(test)]
+#[path = "cast_replay_tests.rs"]
+mod cast_replay_tests;
 
 #[cfg(test)]
 mod tests {
