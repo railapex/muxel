@@ -866,6 +866,9 @@ feature is added or changed, update the matching entry here in the same change**
   failures report once per cause, not on every autosave). Agent rows are
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
+  Click the NOTIFICATIONS header to collapse the section to one line showing how
+  many notifications it holds, so incoming notifications stop pushing PROJECTS
+  down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
 - **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
@@ -1294,6 +1297,22 @@ feature is added or changed, update the matching entry here in the same change**
   under its limit. A child that asks to break away from the job, and processes a
   remote host or tmux server runs, aren't covered. If Windows can't apply the
   limit, the pane starts without one and the reason is logged.
+- **Per-pane memory limit (Linux)** — each local pane runs in a systemd scope of
+  its own, and the same Settings → Behavior choice (16 GB by default) limits how
+  much memory the pane's processes use together, plus up to a quarter of that in
+  swap. When they reach it, Linux stops the largest of them and the rest of the
+  pane, its agent included, keeps running. Even with the limit off, a process
+  stopped because the whole computer ran out of memory takes nothing else with
+  it: previously systemd could stop everything sharing its group, such as the
+  tmux server's scope or the desktop session muxel was started from. The
+  notifications feed reports each such stop and whether the pane's limit or the
+  computer ran out. A change applies to panes started after it. It needs a
+  systemd user session; without one (or with `MUXEL_PANE_SCOPE=0`) panes start
+  as before. A pane on a remote Linux host (from the desktop or the iOS app)
+  also runs in a scope of its own there when the host has a systemd user
+  session, so a process killed there for memory no longer takes the agent and
+  its tmux session with it; the limit and the feed report apply only to local
+  panes.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
