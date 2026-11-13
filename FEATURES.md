@@ -961,6 +961,14 @@ feature is added or changed, update the matching entry here in the same change**
   spinner shows), for at most a minute after launch; until then `send`, `keys`
   and `answer` refuse with `starting`, even with `--force`, since an agent that
   early is still initialising and a fresh Claude drops an Enter typed then.
+- **What the sidebar shows, from outside** — `status` and `panes` report
+  `unread`, true while a pane has a finished turn nobody has looked at (the
+  finish the sidebar marks, so it can be true while the program reports
+  `idle`), `pinned`, the tab pin that also keeps a pane from being put to
+  sleep, and `last_work_at`, when the agent last started working, finished
+  or blocked, kept through restarts and sleep. `status_since` stays as
+  `last_work_at`'s older name. An older muxel leaves `unread` and `pinned` out
+  rather than sending `false`, so these need no new protocol version.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
   that project's toolbar preset. Run from one of that project's panes, the tab
   joins the caller's own group; otherwise it joins the focused group.

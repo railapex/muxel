@@ -803,6 +803,12 @@ fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
     status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
 }
 
+/// Whether a pane shown in `status` has a finished turn the user hasn't seen:
+/// the sidebar's unread finish, and `ctl status`'s `unread`.
+fn finish_unread(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
+    status == AgentStatus::Done && !done_is_read(status, activity)
+}
+
 /// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
 fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &App) -> Hsla {
     let color = status_hsla(status, cx);
@@ -26242,6 +26248,25 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The status a pane's sidebar row shows: the live terminal's, an asleep
+    /// pane's saved one, idle for editors and browsers, then the durable
+    /// finish laid over it. `ctl status` reads its `unread` from the same.
+    fn shown_status(&self, iid: Uuid, cx: &App) -> AgentStatus {
+        let inst = self.workspace.instance(iid);
+        let restoring = self.restoring_activity.contains(&iid);
+        let status = if let Some(view) = self.terminals.get(&iid) {
+            shown_terminal_status(view.read(cx), inst, restoring, self.in_startup_window(iid))
+        } else if self.editors.contains_key(&iid) || self.browsers.contains_key(&iid) {
+            AgentStatus::Idle
+        } else if self.is_dormant(iid) {
+            inst.map(|i| saved_activity_status(&i.activity))
+                .unwrap_or(AgentStatus::Idle)
+        } else {
+            AgentStatus::Idle
+        };
+        persisted_status(status, inst, restoring)
+    }
+
     fn is_dormant(&self, iid: Uuid) -> bool {
         self.dormant_instances.contains(&iid)
             && !self.terminals.contains_key(&iid)
@@ -29498,57 +29523,40 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
+                    let app_title = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
-                        (
-                            inst.and_then(|instance| {
-                                let remote = self
-                                    .workspace
-                                    .project(instance.project_id)
-                                    .is_some_and(Project::is_remote);
-                                let live_title = view.title();
-                                let program_name = view.program_auto_title();
-                                authoritative_terminal_auto_title(
-                                    instance,
-                                    &self.codex_session_names,
-                                    remote,
-                                    live_title.as_deref(),
-                                    program_name.as_deref(),
-                                )
-                            })
-                            .unwrap_or(meta),
-                            shown_terminal_status(
-                                view,
-                                inst,
-                                self.restoring_activity.contains(&iid),
-                                self.in_startup_window(iid),
-                            ),
-                        )
+                        inst.and_then(|instance| {
+                            let remote = self
+                                .workspace
+                                .project(instance.project_id)
+                                .is_some_and(Project::is_remote);
+                            let live_title = view.title();
+                            let program_name = view.program_auto_title();
+                            authoritative_terminal_auto_title(
+                                instance,
+                                &self.codex_session_names,
+                                remote,
+                                live_title.as_deref(),
+                                program_name.as_deref(),
+                            )
+                        })
+                        .unwrap_or(meta)
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (ed.read(cx).title(), AgentStatus::Idle)
+                        ed.read(cx).title()
                     } else if let Some(bv) = self.browsers.get(&iid) {
-                        (bv.read(cx).tab_title(), AgentStatus::Idle)
+                        bv.read(cx).tab_title()
                     } else {
-                        (
-                            meta,
-                            if self.is_dormant(iid) {
-                                inst.map(|i| saved_activity_status(&i.activity))
-                                    .unwrap_or(AgentStatus::Idle)
-                            } else {
-                                AgentStatus::Idle
-                            },
-                        )
+                        meta
                     };
-                    let status =
-                        persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let status = self.shown_status(iid, cx);
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // An asleep row keeps the running row's single line, and
                     // recedes (muted name, dimmed icon) unless a finish there
                     // is unread.
                     let asleep = self.is_dormant(iid);
-                    let finish_unread = status == AgentStatus::Done && !read_done;
+                    let finish_unread = finish_unread(status, inst.map(|i| &i.activity));
                     let icon_color = if loading {
                         pane_status_hsla(AgentStatus::Working, inst.map(|i| &i.activity), cx)
                     } else if asleep {

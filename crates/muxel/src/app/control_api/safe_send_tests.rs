@@ -4,8 +4,10 @@ use super::{Answer, SendAdmission, check_send_state};
 use crate::app::MuxelApp;
 use gpui::{AppContext as _, Context, Entity, TestAppContext, WindowHandle};
 use muxel_core::control::{self as ctl, Command, ErrorCode};
-use muxel_core::{Instance, PaneNode, Project};
-use muxel_terminal::{CommandSpec, SendRefusal, TerminalLaunch, TerminalSession, TerminalView};
+use muxel_core::{AgentActivity, AgentActivityState, Instance, PaneNode, Project};
+use muxel_terminal::{
+    AgentStatus, CommandSpec, SendRefusal, TerminalLaunch, TerminalSession, TerminalView,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -644,6 +646,99 @@ fn status_and_panes_name_the_conversation_and_the_protocol() {
         assert_eq!(one(cx)["session_id"], CONVERSATION_B);
         session.kill();
     });
+}
+
+/// `status` and `panes` report what the sidebar shows a person: a finish
+/// nobody has looked at is unread until someone looks at the pane, the tab
+/// pin, and when the pane last worked, under its own name and its older one.
+#[test]
+fn status_reports_the_unread_finish_the_pin_and_the_last_work() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, view, session) = shell_pane(cx, window, "control-status-facts");
+        // A look counts once the pane shows something, and the shell's
+        // startup output reads as work until it goes quiet.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !view.read_with(cx, |view, _| {
+            view.has_visible_content() && view.runtime_snapshot().status == AgentStatus::Idle
+        }) {
+            assert!(Instant::now() < deadline, "the shell never settled");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = |app: &mut MuxelApp, cx: &mut Context<MuxelApp>| {
+            let command = Command::Status {
+                agent: Some(pane.to_string()),
+            };
+            let Answer::Now(Ok(status)) = app.control_command(command, None, cx) else {
+                panic!("a read answers at once");
+            };
+            status
+        };
+        let done = wall_ms() - 60_000;
+        window
+            .update(cx, |app, window, cx| {
+                // No work recorded in the pane yet.
+                app.workspace.instance_mut(pane).unwrap().activity = AgentActivity::default();
+                let fresh = status(app, cx);
+                assert_eq!(fresh["unread"], false, "{fresh}");
+                assert_eq!(fresh["pinned"], false, "{fresh}");
+                assert!(fresh.get("last_work_at").is_none(), "{fresh}");
+
+                // A turn finished a minute ago and nobody has looked. The
+                // program reports idle now, which is `status`; the finish it
+                // recorded is what the sidebar marks, which is `unread`.
+                app.workspace.instance_mut(pane).unwrap().activity = AgentActivity {
+                    work_started_at: Some(done - 1_000),
+                    completed_at: Some(done),
+                    last_state: Some(AgentActivityState::Done),
+                    ..Default::default()
+                };
+                let finished = status(app, cx);
+                assert_eq!(finished["status"], "idle", "{finished}");
+                assert_eq!(finished["unread"], true, "{finished}");
+                assert_eq!(finished["last_work_at"], done, "{finished}");
+                assert_eq!(finished["status_since"], done, "{finished}");
+                let listed = listed_in_panes(app, pane, cx);
+                assert_eq!(listed["unread"], true, "{listed}");
+                assert_eq!(listed["last_work_at"], done, "{listed}");
+
+                // The user looks at it: read, and the finish keeps its time.
+                app.select_instance(pane, window, cx);
+                let seen = status(app, cx);
+                assert_eq!(seen["unread"], false, "{seen}");
+                assert_eq!(seen["last_work_at"], done, "{seen}");
+
+                // Pinning the tab shows; unpinning clears it.
+                app.toggle_pin(pane, window, cx);
+                assert_eq!(status(app, cx)["pinned"], true);
+                assert_eq!(listed_in_panes(app, pane, cx)["pinned"], true);
+                app.toggle_pin(pane, window, cx);
+                assert_eq!(status(app, cx)["pinned"], false);
+            })
+            .unwrap();
+        session.kill();
+    });
+}
+
+/// `pane`'s entry in a `panes` reply.
+fn listed_in_panes(
+    app: &mut MuxelApp,
+    pane: Uuid,
+    cx: &mut Context<MuxelApp>,
+) -> serde_json::Value {
+    let Answer::Now(Ok(panes)) = app.control_command(Command::Panes { project: None }, None, cx)
+    else {
+        panic!("a read answers at once");
+    };
+    panes["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|project| project["agents"].as_array().unwrap())
+        .find(|agent| agent["uuid"] == pane.to_string())
+        .expect("panes lists the pane")
+        .clone()
 }
 
 /// Wire checks who owns a conversation, then rings it. A `/clear` between
