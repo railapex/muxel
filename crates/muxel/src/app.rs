@@ -79,6 +79,8 @@ mod first_prompt_size_tests;
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+#[cfg(all(test, windows))]
+mod owed_look_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
@@ -6078,6 +6080,9 @@ pub struct MuxelApp {
     browsers: HashMap<Uuid, Entity<crate::browser::BrowserView>>,
     /// The pane the toolbar actions target.
     active_instance: Option<Uuid>,
+    /// The focused terminal owed a look: focus landed on it before it drew, so
+    /// focus couldn't record one (`pay_owed_look`).
+    owed_look: Option<Uuid>,
     /// The agent preset library and the one currently selected for new panes.
     presets: Vec<AgentPreset>,
     current_preset: usize,
@@ -8647,6 +8652,7 @@ impl MuxelApp {
             rich_copy_convert: muxel_core::rich_copy::markdown_to_html,
             browsers: HashMap::new(),
             active_instance: None,
+            owed_look: None,
             presets,
             current_preset,
             available_programs,
@@ -13215,6 +13221,39 @@ impl MuxelApp {
         self.focus_instance_with_reason(iid, attend, reason, window, cx);
     }
 
+    /// Pay the look owed to the focused terminal (`owed_look`) once it draws
+    /// while it is the focused pane of the active window: the user sees what
+    /// it shows, so a finish saved unread there is read. One that draws in an
+    /// inactive window is paid when that window is active with the pane still
+    /// in front. A finish the terminal reports from then on is attended by the
+    /// status tick as it lands, since the pane is in front of an active window.
+    fn pay_owed_look(&mut self, cx: &App) {
+        let Some(iid) = self.owed_look else {
+            return;
+        };
+        if self.active_instance != Some(iid) {
+            self.owed_look = None;
+            return;
+        }
+        let drawn = self
+            .terminals
+            .get(&iid)
+            .is_some_and(|view| view.read(cx).has_visible_content());
+        if !drawn || !self.instance_window_active(iid) {
+            return;
+        }
+        self.owed_look = None;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(instance) = self.workspace.instance_mut(iid)
+            && instance.activity.attend(now)
+        {
+            self.persist();
+        }
+        if let Some(view) = self.terminals.get(&iid) {
+            view.read(cx).session().clear_bell();
+        }
+    }
+
     fn focus_instance_from_pointer(
         &mut self,
         iid: Uuid,
@@ -13252,6 +13291,20 @@ impl MuxelApp {
             set_active_tab(&mut p.layout, iid);
             p.last_focused_instance = Some(iid);
         }
+        // A terminal focused before it draws (restored in front at launch, or
+        // picked while it starts) is owed the look focus can't record below.
+        // The status tick pays it once the terminal draws in front of an
+        // active window, and focusing anything else cancels it
+        // (`pay_owed_look`).
+        let owed = self
+            .workspace
+            .instance(iid)
+            .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+            && !self
+                .terminals
+                .get(&iid)
+                .is_some_and(|view| view.read(cx).has_visible_content());
+        self.owed_look = owed.then_some(iid);
         // Keep the maximize anchored on the tab its group is showing, so dragging
         // a background tab out of the group leaves the maximize where it is.
         if self.maximized.is_some_and(|m| m != iid) && self.maximized_group().contains(&iid) {
@@ -14852,6 +14905,7 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
+        self.pay_owed_look(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
