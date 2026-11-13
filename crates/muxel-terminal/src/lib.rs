@@ -10,6 +10,7 @@
 
 mod colors;
 mod control_input;
+mod draft;
 mod element;
 mod keymap;
 mod links;
@@ -30,6 +31,7 @@ pub use colors::TerminalPalette;
 pub use control_input::{
     ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner,
 };
+pub use draft::{DraftSink, DraftUpdate};
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};

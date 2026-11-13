@@ -1333,6 +1333,42 @@ pub struct TerminalSession {
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
     runtime_events: async_channel::Receiver<()>,
+    /// Recent pastes, so a provider's paste markers can be put back into a
+    /// saved draft. Bounded; see [`muxel_core::rescue::PasteLog`].
+    paste_log: Mutex<muxel_core::rescue::PasteLog>,
+    /// Wakes the draft watcher after user input or a submission. Capacity one,
+    /// so a burst of keys costs one failed `try_send` per key and nothing when
+    /// no watcher runs.
+    draft_trigger: async_channel::Sender<()>,
+    draft_events: async_channel::Receiver<()>,
+    draft_epoch: Instant,
+    /// Milliseconds after `draft_epoch` of the last user input or submission.
+    draft_touch: AtomicU64,
+    /// A submission was admitted since the draft watcher last looked.
+    draft_submitted: AtomicBool,
+    /// A submission was admitted and the program hasn't been seen to redraw
+    /// its box since: the box may still show what was sent. Only a read
+    /// clears it, on evidence of a redraw (see [`Self::read_draft`]); a key
+    /// typed before the redraw doesn't.
+    draft_sent: AtomicBool,
+    /// The screen when the last submission was admitted, to tell a redrawn
+    /// box from the one that was sent.
+    sent_screen: Mutex<Option<crate::draft::DraftCapture>>,
+    /// What muxel typed into the box since it was last seen empty, and what
+    /// the last submission sent (see [`muxel_core::rescue::TypedDraft`]).
+    /// Never known in tmux, where other clients type too.
+    typed_draft: Mutex<muxel_core::rescue::TypedDraft>,
+    /// Line breaks this terminal's input could have typed into a provider's
+    /// input box, counted as input is written (see
+    /// [`muxel_core::rescue::input_newlines`]).
+    draft_newlines: AtomicU64,
+    /// Inputs that could bring in text with any number of line breaks
+    /// (history recall, search, undo).
+    draft_recalls: AtomicU64,
+    /// Both counts as they stood when the box was last read empty: the box
+    /// holds at most `draft_newlines - floor` line breaks, while no recall
+    /// happened since. `None` when that can't be known.
+    draft_floor: Mutex<Option<(u64, u64)>>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -1825,6 +1861,7 @@ impl TerminalSession {
         );
 
         let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+        let (draft_trigger, draft_events) = async_channel::bounded(1);
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
@@ -1881,6 +1918,25 @@ impl TerminalSession {
             input_state: AtomicU64::new(0),
             runtime_trigger,
             runtime_events,
+            paste_log: Mutex::new(muxel_core::rescue::PasteLog::default()),
+            draft_trigger,
+            draft_events,
+            draft_epoch: Instant::now(),
+            draft_touch: AtomicU64::new(0),
+            draft_submitted: AtomicBool::new(false),
+            draft_sent: AtomicBool::new(false),
+            sent_screen: Mutex::new(None),
+            typed_draft: Mutex::new(if spec.tmux_input.is_none() {
+                muxel_core::rescue::TypedDraft::default()
+            } else {
+                muxel_core::rescue::TypedDraft::unknown()
+            }),
+            draft_newlines: AtomicU64::new(0),
+            draft_recalls: AtomicU64::new(0),
+            // A program muxel just started has an empty box. A tmux session
+            // may have outlived muxel with text in it, and other clients of
+            // it type where muxel can't count.
+            draft_floor: Mutex::new(spec.tmux_input.is_none().then_some((0, 0))),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -2263,10 +2319,35 @@ impl TerminalSession {
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
         self.check_input_gate()?;
-        self.admit_input(!data.is_empty());
+        let submitted = self.admit_input(!data.is_empty());
+        self.note_draft_input(data, submitted);
         self.try_write_raw(data)?;
         self.shell_prompt.submitted(data);
         Ok(())
+    }
+
+    /// Note what `data` can do to the input box before the program sees it,
+    /// so a read that shows its effect also knows it: the line breaks it can
+    /// type, and the typed text. `submitted`: `data` is the Enter of an
+    /// admitted submission, after which the box is empty.
+    fn note_draft_input(&self, data: &[u8], submitted: bool) {
+        match muxel_core::rescue::input_newlines(data) {
+            Some(0) => {}
+            Some(newlines) => {
+                self.draft_newlines.fetch_add(newlines, Ordering::AcqRel);
+            }
+            None => {
+                self.draft_recalls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if self.tmux_input.is_none() {
+            let mut typed = self.typed_draft.lock();
+            if submitted {
+                typed.submitted();
+            } else {
+                typed.feed(data);
+            }
+        }
     }
 
     /// Refuse input while the terminal is held for closing.
@@ -2282,18 +2363,21 @@ impl TerminalSession {
     }
 
     /// The bookkeeping every input write does before its bytes go anywhere.
-    fn admit_input(&self, nonempty: bool) {
+    /// True when the write is the Enter of a submission marked just before.
+    fn admit_input(&self, nonempty: bool) -> bool {
         self.scroll_input_to_bottom();
-        if nonempty {
-            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
-            if submitted_enter {
-                self.trigger_runtime();
-            }
-            // A TUI reaction will follow; prioritize output during this short
-            // interaction window even if stream output is already queued.
-            self.mark_interactive();
+        if !nonempty {
+            return false;
         }
+        let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
+        self.advance_input(Some(submitted_enter));
+        if submitted_enter {
+            self.trigger_runtime();
+        }
+        // A TUI reaction will follow; prioritize output during this short
+        // interaction window even if stream output is already queued.
+        self.mark_interactive();
+        submitted_enter
     }
 
     /// Admit a complete submission (Enter, or text ending in Enter) and commit
@@ -2312,17 +2396,22 @@ impl TerminalSession {
     fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
         self.check_input_gate()?;
         self.scroll_input_to_bottom();
+        // Copied before the writer is locked: the terminal parser holds the
+        // terminal lock while its listener sends replies, which takes the
+        // reply-order lock and then the writer.
+        let sent = self.draft_screen();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
         // input time before any resume hook it causes, but commit no facts
         // until writer admission succeeds.
         let submitted_at = SystemTime::now();
         self.submission_pending.store(false, Ordering::Release);
+        self.note_draft_input(data, !data.is_empty());
         writer.write_all(data)?;
         writer.flush()?;
         self.shell_prompt.submitted(data);
         if !data.is_empty() {
-            self.commit_submission(submitted_at, prompt);
+            self.commit_submission(submitted_at, prompt, sent);
         }
         Ok(())
     }
@@ -2330,7 +2419,14 @@ impl TerminalSession {
     /// The facts an admitted submission commits together. A `prompt` one
     /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
     /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+    /// `sent`: the screen as the submission was admitted, copied without the
+    /// writer locked (see [`Self::draft_screen`]).
+    pub(crate) fn commit_submission(
+        &self,
+        submitted_at: SystemTime,
+        prompt: bool,
+        sent: crate::draft::DraftCapture,
+    ) {
         {
             let mut evidence = self.evidence.lock();
             if prompt {
@@ -2343,6 +2439,7 @@ impl TerminalSession {
         self.advance_input(Some(true));
         self.mark_interactive();
         self.trigger_runtime();
+        self.draft_submission(sent);
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
@@ -2386,6 +2483,7 @@ impl TerminalSession {
                 Some((self.clone(), SystemTime::now(), prompt))
             }
             ControlInput::Paste(text) => {
+                self.paste_log.lock().record(text);
                 self.admit_input(!text.is_empty());
                 None
             }
@@ -2462,6 +2560,198 @@ impl TerminalSession {
     /// auto-continue and outside control type on their own and never mark it.
     pub fn mark_user_input(&self) {
         *self.last_user_input.lock() = Some(Instant::now());
+        self.touch_draft();
+    }
+
+    /// Restart the draft watcher's debounce and wake it. One atomic store and
+    /// one non-blocking send: typing never waits on a draft save.
+    fn touch_draft(&self) {
+        let ms = u64::try_from(self.draft_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.draft_touch.store(ms, Ordering::Relaxed);
+        let _ = self.draft_trigger.try_send(());
+    }
+
+    /// A submission was admitted, with `sent` the screen as it was: the
+    /// watcher drops the saved draft at once and reads the box again once
+    /// input stops. The pastes it sent can't stand for a later marker.
+    fn draft_submission(&self, sent: crate::draft::DraftCapture) {
+        self.paste_log.lock().clear();
+        if self.tmux_input.is_none() {
+            self.typed_draft.lock().submitted();
+        }
+        *self.sent_screen.lock() = Some(sent);
+        self.draft_sent.store(true, Ordering::Release);
+        self.draft_submitted.store(true, Ordering::Release);
+        self.touch_draft();
+    }
+
+    /// A submission was admitted and no read has seen the box redrawn since,
+    /// so nothing was saved after it: whatever is saved was sent.
+    pub(crate) fn draft_sent(&self) -> bool {
+        self.draft_sent.load(Ordering::Acquire)
+    }
+
+    /// Whether the box, showing `text` after a submission, still shows what
+    /// was sent (see [`muxel_core::rescue::still_shows_sent`]): what `parse`
+    /// reads in the screen copied as the submission was admitted, or what
+    /// muxel typed before its Enter, which a program slow to draw its keys
+    /// shows only after it. Through tmux no typed copy is kept.
+    fn shows_sent(
+        &self,
+        text: &str,
+        parse: impl Fn(&crate::draft::DraftCapture) -> muxel_core::rescue::DraftRead,
+    ) -> bool {
+        use muxel_core::rescue::DraftRead;
+        let on_screen = match self.sent_screen.lock().as_ref().map(parse) {
+            Some(DraftRead::Text { text, .. }) => Some(text),
+            _ => None,
+        };
+        let typed = self.typed_draft.lock().sent().map(str::to_string);
+        muxel_core::rescue::still_shows_sent(text, on_screen.as_deref(), typed.as_deref())
+    }
+
+    /// The visible screen, as a draft read copies it. Never call it with the
+    /// writer locked.
+    pub(crate) fn draft_screen(&self) -> crate::draft::DraftCapture {
+        self.with_term(crate::draft::DraftCapture::from_term)
+    }
+
+    /// Whether the text before the cursor ends in a backslash, by what muxel
+    /// saw typed or by the screen: there, Enter in Claude Code starts a new
+    /// line instead of sending.
+    pub(crate) fn backslash_before_cursor(&self) -> bool {
+        let typed = self.tmux_input.is_none()
+            && self
+                .typed_draft
+                .lock()
+                .before_cursor()
+                .is_some_and(|before| before.ends_with('\\'));
+        typed
+            || self.with_term(|term| {
+                use alacritty_terminal::index::Column;
+                let grid = term.grid();
+                let cursor = grid.cursor.point;
+                term.mode().contains(TermMode::SHOW_CURSOR)
+                    && cursor.column.0 > 0
+                    && cursor.column.0 <= grid.columns()
+                    && grid[cursor.line][Column(cursor.column.0 - 1)].c == '\\'
+            })
+    }
+
+    /// How many line breaks the input box can hold, `None` when unknown.
+    fn draft_newline_budget(&self) -> Option<u64> {
+        if self.tmux_input.is_some() {
+            return None;
+        }
+        let (newlines, recalls) = self.draft_counts();
+        let (floor, recalls_then) = (*self.draft_floor.lock())?;
+        (recalls == recalls_then).then(|| newlines.saturating_sub(floor))
+    }
+
+    fn draft_counts(&self) -> (u64, u64) {
+        (
+            self.draft_newlines.load(Ordering::Acquire),
+            self.draft_recalls.load(Ordering::Acquire),
+        )
+    }
+
+    /// Wakeups for [`crate::draft::watch`]. Receivers share one queue.
+    pub(crate) fn draft_events(&self) -> async_channel::Receiver<()> {
+        self.draft_events.clone()
+    }
+
+    /// Time since the last user input or submission.
+    pub(crate) fn draft_idle_for(&self) -> Duration {
+        let touched = Duration::from_millis(self.draft_touch.load(Ordering::Relaxed));
+        self.draft_epoch.elapsed().saturating_sub(touched)
+    }
+
+    pub(crate) fn take_draft_submitted(&self) -> bool {
+        self.draft_submitted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Read the draft in agent `provider`'s input box. Copies the visible
+    /// screen under the terminal lock and parses it after the lock is released.
+    pub(crate) fn read_draft(
+        &self,
+        provider: crate::view::TitleProvider,
+    ) -> muxel_core::rescue::DraftRead {
+        use crate::view::TitleProvider;
+        use muxel_core::rescue::DraftRead;
+        // Counted before the screen is copied: input after this point may
+        // already show in the copy, so an empty box proves only these.
+        let counts_before = self.draft_counts();
+        let read = match provider {
+            TitleProvider::Claude | TitleProvider::Codex => {
+                let capture = self.draft_screen();
+                // Counted after the copy: everything it can show is in here.
+                let newlines = self.draft_newline_budget();
+                let typed = self.typed_draft.lock().text().map(str::to_string);
+                let parse = |capture: &crate::draft::DraftCapture, newlines, typed| {
+                    if provider == TitleProvider::Claude {
+                        crate::draft::claude(capture, newlines, typed)
+                    } else {
+                        crate::draft::codex(capture, newlines, typed)
+                    }
+                };
+                let read = parse(&capture, newlines, typed.as_deref());
+                if let DraftRead::Text { text, partial, .. } = &read
+                    && self.draft_sent()
+                {
+                    // After a submission the box shows what was sent until
+                    // the program redraws it: with what was typed since, or
+                    // with other text than was sent. Only the box's text
+                    // counts: a menu closing around it, a footer changing or
+                    // where the cursor sits says nothing.
+                    let typed_shown = !*partial
+                        && typed
+                            .as_deref()
+                            .is_some_and(|typed| !typed.is_empty() && typed == text);
+                    let redrawn =
+                        typed_shown || !self.shows_sent(text, |sent| parse(sent, None, None));
+                    if !redrawn {
+                        return DraftRead::Empty;
+                    }
+                }
+                read
+            }
+            _ => DraftRead::Unknown,
+        };
+        match read {
+            DraftRead::Text {
+                text,
+                partial,
+                clipped,
+            } => {
+                // Text is read only from a box redrawn since the last
+                // submission (a shell's is a new prompt), and may be saved:
+                // from here on what is saved wasn't sent.
+                self.draft_sent.store(false, Ordering::Release);
+                let mut pastes = self.paste_log.lock();
+                pastes.observe(&text);
+                let substituted = muxel_core::rescue::substitute_pastes(&text, &pastes);
+                DraftRead::Text {
+                    text: substituted.text,
+                    partial: partial || substituted.partial,
+                    clipped,
+                }
+            }
+            DraftRead::Empty => {
+                // Input that hasn't been drawn yet would make an empty box a
+                // false floor; a second without input rules that out.
+                if self.draft_idle_for() >= muxel_core::rescue::DRAFT_DEBOUNCE {
+                    *self.draft_floor.lock() = Some(counts_before);
+                    if self.tmux_input.is_none() {
+                        *self.typed_draft.lock() = muxel_core::rescue::TypedDraft::default();
+                    }
+                }
+                // The program redrew its box after the submission.
+                self.draft_sent.store(false, Ordering::Release);
+                self.paste_log.lock().observe("");
+                DraftRead::Empty
+            }
+            other => other,
+        }
     }
 
     /// Send pastes that name this machine's files — a clipboard image, copied or
@@ -2501,6 +2791,20 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
+        self.mark_submission(|_| true);
+    }
+
+    /// [`Self::mark_turn_submitted`] for a key the user pressed in a pane
+    /// running `provider`. An Enter pressed while a dialog covers the input
+    /// box (a permission question) answers the dialog and leaves the draft
+    /// parked in the box saved, since the program shows it again afterwards.
+    pub(crate) fn mark_key_submitted(&self, provider: crate::view::TitleProvider) {
+        self.mark_submission(|screen| crate::draft::box_shown(screen, provider) != Some(false));
+    }
+
+    /// The turn facts of a submission; its draft facts too when `sends_box`
+    /// says the screen shows the box being sent.
+    fn mark_submission(&self, sends_box: impl FnOnce(&crate::draft::DraftCapture) -> bool) {
         if !self.accepts_input_epoch(self.input_epoch()) {
             return;
         }
@@ -2508,6 +2812,10 @@ impl TerminalSession {
         self.evidence.lock().record_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
+        let screen = self.draft_screen();
+        if sends_box(&screen) {
+            self.draft_submission(screen);
+        }
     }
 
     /// Explicit prompt submission from a path that supplied the prompt text.
@@ -2519,8 +2827,10 @@ impl TerminalSession {
         let submitted_at = SystemTime::now();
         let mut evidence = self.evidence.lock();
         evidence.record_prompt_submission(submitted_at);
+        drop(evidence);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
+        self.draft_submission(self.draft_screen());
     }
 
     /// Whether any turn was submitted in this launch, in any conversation.
@@ -2582,6 +2892,7 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        self.paste_log.lock().record(text);
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
@@ -3086,6 +3397,14 @@ impl TerminalSession {
     /// probe. Product code should let `TerminalView` drain output instead.
     #[doc(hidden)]
     pub fn process_probe_output(&self, data: &[u8]) {
+        self.process_output(data);
+    }
+
+    /// [`Self::process_probe_output`] for a shell's output: the PTY reader's
+    /// prompt tracking sees the bytes first, as it does for real output.
+    #[doc(hidden)]
+    pub fn process_probe_shell_output(&self, data: &[u8]) {
+        ShellMarks::default().advance(data, &self.shell_prompt);
         self.process_output(data);
     }
 
@@ -8096,5 +8415,192 @@ mod throughput_bench {
             report(name, &mut off, &mut on);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Reading Claude's input box around a submission.
+#[cfg(test)]
+mod draft_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::view::TitleProvider;
+    use muxel_core::rescue::DraftRead;
+    use std::sync::Arc;
+
+    /// An inert child, killed when the test ends. Its own output is never
+    /// parsed: the test plays the program with `process_probe_output`.
+    struct Pane(
+        Arc<TerminalSession>,
+        #[allow(dead_code)] Box<dyn std::any::Any>,
+    );
+
+    impl Drop for Pane {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    impl std::ops::Deref for Pane {
+        type Target = TerminalSession;
+        fn deref(&self) -> &TerminalSession {
+            &self.0
+        }
+    }
+
+    fn pane() -> Pane {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        Pane(session, Box::new(output))
+    }
+
+    /// Claude's screen with `draft` in its box and the cursor after it.
+    fn claude_box(session: &TerminalSession, draft: &str) {
+        let rule = "─".repeat(40);
+        let screen = format!(
+            "\x1b[?2004h\x1b[2J\x1b[H{rule}\r\n❯ {draft}\r\n{rule}\x1b[2;{}H",
+            3 + draft.chars().count()
+        );
+        session.process_probe_output(screen.as_bytes());
+    }
+
+    #[test]
+    fn a_sent_prompt_still_on_screen_is_not_read_as_a_new_draft() {
+        let session = pane();
+        claude_box(&session, "ship it");
+        assert!(matches!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text { .. }
+        ));
+        // Enter, before the program redraws its box.
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert_eq!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Empty,
+            "the box still shows what was sent: nothing unsent"
+        );
+        // A key after it starts a new draft, read as usual.
+        claude_box(&session, "ship it now");
+        session.write_input(b" now");
+        assert!(matches!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn a_key_typed_before_the_box_is_redrawn_does_not_bring_back_what_was_sent() {
+        let session = pane();
+        claude_box(&session, "ship it");
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        // A key, before the program redraws its box.
+        session.write_input(b"x");
+        assert!(
+            !matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { .. }
+            ),
+            "the box still shows what was sent"
+        );
+        // The program redraws its box, with the key in it.
+        claude_box(&session, "x");
+        assert_eq!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text {
+                text: "x".into(),
+                partial: false,
+                clipped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn enter_after_a_backslash_in_claude_starts_a_new_line_and_keeps_the_draft() {
+        let session = pane();
+        claude_box(&session, "line one\\");
+        // Enter, as a pane's key handler sends it.
+        if crate::view::submits_turn(b"\r", TitleProvider::Claude, &session) {
+            session.mark_turn_submitted();
+        }
+        session.write_user_input(b"\r");
+        assert!(!session.take_draft_submitted(), "the saved draft stays");
+        assert!(
+            matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { .. }
+            ),
+            "the box is still read"
+        );
+        // Without the backslash, Enter sends.
+        claude_box(&session, "line one");
+        assert!(crate::view::submits_turn(
+            b"\r",
+            TitleProvider::Claude,
+            &session
+        ));
+    }
+
+    /// Claude Code 2.1.322's permission question where its box was, as a raw
+    /// capture of a 120-column pane drew it: a rule, the request, the options,
+    /// and no bottom rule.
+    fn claude_question(session: &TerminalSession) {
+        let rule = "─".repeat(78);
+        let dashes = "╌".repeat(78);
+        let rows = [
+            "⏺ Pinging localhost three times",
+            "  ⎿  $ ping -n 3 127.0.0.1",
+            "",
+            &rule,
+            " Bash command",
+            " Ping localhost three times",
+            &dashes,
+            " ping -n 3 127.0.0.1",
+            &dashes,
+            " This command requires approval",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don’t ask again for: ping *",
+            "   3. Yes, and switch to auto mode",
+            "   4. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ];
+        let screen = format!("\x1b[?2004h\x1b[2J\x1b[H{}\x1b[13;4H", rows.join("\r\n"));
+        session.process_probe_output(screen.as_bytes());
+    }
+
+    #[test]
+    fn a_draft_parked_behind_a_dialog_survives_the_answer() {
+        let session = pane();
+        let draft = "remember the follow-up about tide pools";
+        session.write_input(draft.as_bytes());
+        claude_box(&session, draft);
+        // A permission question takes the box's place; Enter, as a pane's key
+        // handler sends it, picks the highlighted option.
+        claude_question(&session);
+        crate::view::note_key_submission(b"\r", TitleProvider::Claude, &session);
+        session.write_user_input(b"\r");
+        assert!(!session.take_draft_submitted(), "the saved draft stays");
+        // The turn goes on, and Claude draws its box again with the draft in
+        // it: still unsent, so still read.
+        claude_box(&session, draft);
+        assert!(
+            matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { text, .. } if text == draft
+            ),
+            "the draft is read again once the box is back"
+        );
+        // Enter on the box sends it.
+        crate::view::note_key_submission(b"\r", TitleProvider::Claude, &session);
+        session.write_user_input(b"\r");
+        assert!(session.take_draft_submitted());
     }
 }

@@ -16,6 +16,9 @@ portable-pty = "0.9"
 
 parking_lot = "0.12"
 async-channel = "2.3"
+# Racing the draft watcher's debounce timer against input. Already in the tree
+# via gpui's executor crates.
+futures-lite = "2"
 base64 = "0.22"
 libc = "0.2"
 
