@@ -22,7 +22,7 @@
 [2952,"out","\u001b[?25l\u001b[H\r\u001b[2C\u001b[37BUse AskUserQuestion now\u001b[27Gto\u001b[30Gask\u001b[34Gme\u001b[37Gto\u001b[40Gchoose\u001b[47GAlpha\u001b[53Gor\u001b[56GBeta.\u001b[62GDo\u001b[65Gnot\u001b[69Ganswer\u001b[76Git\u001b[79Gyourself.\r\u001b[18C\u001b[2B\u001b[K\u001b[40;1H\u001b[38;88H\u001b[?25h"]
 [3340,"in","\r"]
 [3381,"out","\u001b]7501;state=working:app=claude-code\u0007"]
-[3381,"mark",{"id":"working","by":"hook","truth":{"turn":"running","finished":0}}]
+[3381,"mark",{"id":"working","by":"protocol","truth":{"turn":"running","finished":0},"note":"Claude's OSC 7501 state=working, in the read just before; its UserPromptSubmit hook is logged 65 ms later"}]
 [3386,"out","\u001b[?25l\u001b[H\r\u001b[6B\u001b[48;2;55;55;55m\u001b[38;2;153;153;153m❯ \u001b[38;2;255;255;255mUse AskUserQuestion now to ask me to choose Alpha or Beta. Do not answer it yourself.\u001b[39m                                 \r\u001b[28B\u001b[49m\u001b[38;2;215;119;87m✽\u001b[3GRumina\u001b[38;2;235;159;127mtin\u001b[38;2;215;119;87mg… \u001b[38;2;153;153;153m(running UserPromptSubmit hook · 0s)\r\u001b[3B❯ \u001b[39m\u001b[K\r\u001b[18C\u001b[2B\u001b[38;2;153;153;153m · esc to interrupt · ← 4 agents\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h"]
 [3446,"hook",{"name":"UserPromptSubmit"}]
 [3517,"out","\u001b[?25l\u001b[H\r\u001b[14C\u001b[34B\u001b[K\u001b[40;1H\u001b[38;3H\u001b[?25h"]

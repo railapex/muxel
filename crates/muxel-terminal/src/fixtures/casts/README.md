@@ -32,7 +32,7 @@ A cast is one provider session (Claude Code, Codex, Grok) recorded as its PTY re
 
 ## Marks
 
-A mark sits between events, so always at a read boundary, and describes the settled screen: every read before it processed and no synchronized frame left open. `id` is unique in the file and never renamed. **Truth describes the provider, never muxel's reading of it**, so a cast outlives changes to the readers. `by` says where the truth came from: `script` (the recording script did it: it typed that draft and pressed Home), `hook` (the provider said so), or `hand` (a person read the screen).
+A mark sits between events, so always at a read boundary, and describes the settled screen: every read before it processed and no synchronized frame left open. `id` is unique in the file and never renamed. **Truth describes the provider, never muxel's reading of it**, so a cast outlives changes to the readers. `by` says where the truth came from: `script` (the recording script did it: it typed that draft and pressed Home), `hook` (the provider's own hooks said so, outside the terminal stream), `protocol` (the provider said so in the bytes a reader parses, an OSC 7501 report or its title, so agreement shows the parser reads the report, not that the report was right), or `hand` (a person read the screen, so a reader of the same text is checked against a person, not against the provider). Confirm a `hand` mark on a render other than muxel's, or its parse errors become the truth.
 
 Truth keys, version 1. Every key is optional; an absent key claims nothing.
 
@@ -53,16 +53,17 @@ Replay runs on a `TerminalSession` with no child process (`TerminalSession::repl
 
 | truth key | reader |
 |---|---|
-| `turn`, `finished` | the runtime status (`Idle`, `Working`, `Blocked`, `Done`) |
+| `turn` | the runtime status (`Idle`, `Working`, `Blocked`, `Done`) |
+| `finished` | muxel's completion count for whatever owns the status, exactly (`finished/count`): while a 7501 report owns it, the count the completion pulse reads (`program`); otherwise the launch's count of finishes from titles, markers and hooks, which the held close reads (`launch`). Between turns, the Done badge too (`finished/done`) |
 | `overlay` | the startup blocker `ctl new` reports; the numbered options `ctl show` and `ctl answer` read while Blocked |
 | `options` | those options, each key, label and (when the truth records it) cursor |
 | `composer` | the provider's input box as status finds it (Claude, Codex) |
 | `draft` | startup input's empty-composer reading, and the text in the rows the box reader chose |
-| `takes_prompt` | `startup_ready` (would startup input type now) and `ctl send`'s admission without `--force` |
+| `takes_prompt` | `startup_ready` (would startup input type now: its composer gate, not its wait for quiet output), and `takes_prompt/send_state_copy`, a copy of the state half of `ctl send`'s admission. ctl send's own decision lives in the app crate, which these tests can't call, so agreement on the copy proves nothing about ctl send |
 
 A disagreement fails the test unless it is listed in `EXPECTED_GAPS` with the reader's wrong answer, exactly, and the finding it belongs to. A different wrong answer fails too, since another fault may stand behind the listed one. A listed gap that closes fails, so a fix shows up as an entry to delete, and a listed gap no check reaches fails as lost coverage, not as a fix. Failures name `file#mark`, the key, the truth, the verdict, and the screen rows the reader used.
 
-Status scans the screen at most every 50 ms; at a mark the replay takes a fresh scan, as the view would moments later. Verdicts that depend on age (a title going stale, the quiet and settling fallbacks) read the real clock inside the session and aren't reproducible by replay yet, so no mark's truth depends on a wait. Each `in` is typed into the session at its time, as a pane's keyboard types it (an Enter on its own announces a turn first), so readers that track what was typed since the last Enter see it. `reply`, `focus` and `hook` are carried but not replayed. A `resize` stops the replay: the session settles a resize on the real clock, so replay can't apply one yet.
+Status scans the screen at most every 50 ms; at a mark the replay takes a fresh scan, as the view would moments later. A pane in the background parses its reads in batches every 250 ms, and a synchronized frame left open ends only when its deadline passes on the real clock. Replay parses every read, and a mark closes any open frame, so replay can see a screen a background pane hasn't drawn yet. Verdicts that depend on age (a title going stale, the quiet and settling fallbacks) read the real clock inside the session and aren't reproducible by replay yet, so no mark's truth depends on a wait. Each `in` is typed into the session at its time, as a pane's keyboard types it (an Enter on its own announces a turn first), so readers that track what was typed since the last Enter see it. `reply`, `focus` and `hook` are carried but not replayed. A `resize` stops the replay: the session settles a resize on the real clock, so replay can't apply one yet.
 
 ## Adding a cast
 

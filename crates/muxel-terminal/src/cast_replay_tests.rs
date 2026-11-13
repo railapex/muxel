@@ -40,20 +40,20 @@ type Gap = (&'static str, &'static str, &'static str, &'static str);
 #[rustfmt::skip]
 const EXPECTED_GAPS: &[Gap] = &[
     ("claude-2.1.310-windows-question#blocked", "overlay/options", "4 Chat about this", CLAUDE_QUESTION_RULE),
-    ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("claude-2.1.322-windows-composer-tour#idle-first", "draft/empty", "not empty", HELPER_CPR),
     ("claude-2.1.322-windows-composer-tour#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
-    ("claude-2.1.322-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-end", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("claude-2.1.322-windows-composer-tour#draft-home", "draft/empty", "empty", HOME_DRAFT),
     ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", HOME_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#model-picker", "takes_prompt/send", "send admitted=true", SEND_COVERED),
-    ("claude-2.1.322-windows-composer-tour#slash-menu-ex", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-mid", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-model", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#model-picker", "takes_prompt/send_state_copy", "send admitted=true", SEND_COVERED),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-ex", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("claude-2.1.322-windows-permission-parked-draft#idle-first", "draft/empty", "not empty", HELPER_CPR),
     ("claude-2.1.322-windows-permission-parked-draft#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
-    ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("claude-2.1.322-windows-question#question-card", "overlay/options", "4 Chat about this", CLAUDE_QUESTION_RULE),
     ("codex-0.164.0-windows-command-approval#idle", "composer", "no box", CODEX_FOOTER),
     ("codex-0.164.0-windows-command-approval#idle", "draft/empty", "not empty", CODEX_FOOTER),
@@ -62,7 +62,7 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("codex-0.164.0-windows-question#idle", "draft/empty", "not empty", CODEX_FOOTER),
     ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
     ("codex-0.164.0-windows-question#blocked", "overlay/options", "1 Alpha (Recommended)  Choose Alpha for this request. (selected) | 2 Beta                 Choose Beta for this request. | 3 None of the above    Optionally, add details in notes (tab)", CODEX_OPTION_DESCRIPTION),
-    ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send_state_copy", "send admitted=true", SEND_COVERED),
     ("codex-0.164.0-windows-turn#idle", "composer", "no box", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#idle", "draft/empty", "not empty", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "composer", "no box", CODEX_FOOTER),
@@ -71,11 +71,11 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("codex-0.167.2-windows-composer-tour#idle-first", "composer", "no box", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-first", "draft/empty", "not empty", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-first", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-home", "draft/empty", "empty", HOME_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", HOME_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#draft-backspaced", "composer", "no box", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#draft-backspaced", "draft/empty", "not empty", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#draft-backspaced", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
@@ -85,36 +85,37 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("codex-0.167.2-windows-composer-tour#after-turn", "composer", "no box", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#after-turn", "draft/empty", "not empty", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#after-turn", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#up-recall", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#slash-menu-open", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#up-recall", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-open", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-model", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("codex-0.167.2-windows-composer-tour#idle-last", "composer", "no box", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-last", "draft/empty", "not empty", CODEX_AGENTS_HINT),
     ("codex-0.167.2-windows-composer-tour#idle-last", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
     ("grok-1.0.70-windows-question#idle", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.70-windows-question#idle", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.70-windows-question#idle", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.70-windows-question#blocked", "overlay", "question with 0 options", GROK_OPTIONS),
     ("grok-1.0.70-windows-question#blocked", "overlay/options", "", GROK_OPTIONS),
     ("grok-1.0.70-windows-trust-card#trust-card", "overlay", "none", GROK_TRUST),
     ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/startup", "startup_ready=true", GROK_TRUST),
-    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send_state_copy", "send admitted=true", SEND_COVERED),
     ("grok-1.0.77-windows-composer-tour#trust-card", "overlay", "none", GROK_TRUST),
     ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/startup", "startup_ready=true", GROK_TRUST),
-    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/send_state_copy", "send admitted=true", SEND_COVERED),
     ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#turn-running", "turn", "Idle (ProviderTitle)", GROK_SPINNER),
-    ("grok-1.0.77-windows-composer-tour#after-turn", "finished", "Idle", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#after-turn", "finished/count", "0 (launch)", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#after-turn", "finished/done", "Idle", GROK_SPINNER),
     ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
 ];
 
 const SEND_DRAFT: &str = "ctl send doesn't read the composer, so it adds to a draft";
@@ -230,8 +231,18 @@ struct Verdicts {
     /// The runtime status, as the sidebar and `ctl status` start from it.
     status: AgentStatus,
     reason: TerminalStatusReason,
-    /// `ctl send`'s admission without `--force`: an attributable Idle or Done,
-    /// or a turn held only for background work.
+    /// Turns completed, as muxel counts them for whatever owns the status.
+    /// While a 7501 report owns it, the snapshot's `completion_revision`, which
+    /// the app's completion pulse reads (`program`). Otherwise the launch's
+    /// count of finishes from titles, markers and hooks, which the held close
+    /// reads (`launch`). Neither stands in for the other: the launch count also
+    /// counts a 7501 Working edge no turn caused (Codex starting, Claude's
+    /// `/clear`), and `completion_revision` never moves without 7501.
+    completions: (u64, &'static str),
+    /// A copy of the state half of `ctl send`'s admission without `--force`
+    /// (an attributable Idle or Done, or a turn held only for background
+    /// work). It isn't ctl send's own decision, which lives in the app crate,
+    /// so agreement here proves nothing about ctl send.
     send_admitted: bool,
     /// The options `ctl show`/`ctl answer` read while the status is Blocked.
     question_options: Option<Vec<QuestionOption>>,
@@ -429,6 +440,11 @@ impl Replay {
         Verdicts {
             status: snapshot.status,
             reason: snapshot.reason,
+            completions: if self.runtime.program_status_active {
+                (snapshot.completion_revision, "program")
+            } else {
+                (self.runtime.launch_completion_revision, "launch")
+            },
             send_admitted,
             question_options,
             blocker,
@@ -592,16 +608,25 @@ fn compare(provider: TitleProvider, truth: &Map<String, Value>, v: &Verdicts) ->
         let read = format!("{:?} ({:?})", v.status, v.reason);
         check("turn", turn.to_string(), read, agrees);
     }
-    if let Some(finished) = truth.get("finished").and_then(Value::as_u64)
-        && turn.is_none_or(|turn| turn == "none")
-    {
-        let agrees = (v.status == AgentStatus::Done) == (finished > 0);
+    if let Some(finished) = truth.get("finished").and_then(Value::as_u64) {
+        // The turns muxel counted as completed, exactly: the revision the app
+        // watches for completion alerts.
         check(
-            "finished",
+            "finished/count",
             finished.to_string(),
-            format!("{:?}", v.status),
-            agrees,
+            format!("{} ({})", v.completions.0, v.completions.1),
+            v.completions.0 == finished,
         );
+        // The Done badge between turns: shown once a turn has finished.
+        if turn.is_none_or(|turn| turn == "none") {
+            let agrees = (v.status == AgentStatus::Done) == (finished > 0);
+            check(
+                "finished/done",
+                finished.to_string(),
+                format!("{:?}", v.status),
+                agrees,
+            );
+        }
     }
     if let Some(overlay) = overlay
         // No reader names a picker or a slash menu; the composer and
@@ -710,7 +735,7 @@ fn compare(provider: TitleProvider, truth: &Map<String, Value>, v: &Verdicts) ->
         );
         let read = format!("send admitted={}", v.send_admitted);
         check(
-            "takes_prompt/send",
+            "takes_prompt/send_state_copy",
             takes.to_string(),
             read,
             v.send_admitted == takes,
@@ -722,6 +747,8 @@ fn compare(provider: TitleProvider, truth: &Map<String, Value>, v: &Verdicts) ->
 /// What replay found at one mark.
 struct MarkRead {
     id: String,
+    /// Where the truth came from (`script`, `hook`, `protocol`, `hand`).
+    by: String,
     truth: Map<String, Value>,
     verdicts: Verdicts,
     /// The screen rows the verdicts came from, for a failure report.
@@ -747,6 +774,7 @@ fn replay(cast: &Cast) -> Vec<MarkRead> {
                 let rows = replay.rows_used(&verdicts);
                 marks.push(MarkRead {
                     id: payload["id"].as_str().expect("mark id").to_string(),
+                    by: payload["by"].as_str().expect("mark by").to_string(),
                     truth: payload["truth"].as_object().cloned().unwrap_or_default(),
                     verdicts,
                     rows,
@@ -799,12 +827,17 @@ fn muxel_answers_claudes_cursor_query_with_where_the_cursor_is() {
 fn every_mark_in_every_cast_agrees_with_the_readers() {
     let mut compared = Vec::new();
     let (mut casts, mut marks) = (0, 0);
+    // Agreement by where the truth came from: `protocol` agreement shows the
+    // parser reads the provider's report, the rest that a reader matches what
+    // the script did, a hook said, or a person saw.
+    let mut agree_by = std::collections::BTreeMap::<String, usize>::new();
     for cast in repo_casts() {
         casts += 1;
         let provider =
             TitleProvider::from_program(cast.header["provider"].as_str().expect("provider"));
         for MarkRead {
             id,
+            by,
             truth,
             verdicts,
             rows,
@@ -813,6 +846,7 @@ fn every_mark_in_every_cast_agrees_with_the_readers() {
             marks += 1;
             let at = format!("{}#{id}", cast.name);
             for check in compare(provider, &truth, &verdicts) {
+                *agree_by.entry(by.clone()).or_default() += usize::from(check.agrees);
                 compared.push(Compared {
                     at: at.clone(),
                     check,
@@ -822,10 +856,15 @@ fn every_mark_in_every_cast_agrees_with_the_readers() {
         }
     }
     let ledger = judge(&compared, EXPECTED_GAPS);
+    let by: Vec<_> = agree_by
+        .iter()
+        .map(|(by, count)| format!("{by} {count}"))
+        .collect();
     eprintln!(
-        "{casts} casts, {marks} marks, {} checks: {} agree, {} known gaps",
+        "{casts} casts, {marks} marks, {} checks: {} agree ({}), {} known gaps",
         compared.len(),
         ledger.agree,
+        by.join(", "),
         ledger.known,
     );
     assert!(
@@ -895,6 +934,7 @@ fn a_question_agrees_only_with_all_its_options() {
         let verdicts = Verdicts {
             status: AgentStatus::Blocked,
             reason: TerminalStatusReason::BlockedMarker,
+            completions: (0, "launch"),
             send_admitted: false,
             question_options: Some(read),
             blocker: None,

@@ -374,7 +374,7 @@
 [13623,"out","\u001b[?2026h\u001b[0m\u001b[18;3H"]
 [13623,"out","\u001b[?25h\u001b[?2026l"]
 [13636,"out","\u001b]7501;state=blocked:app=codex:kind=permission\u001b\\"]
-[13636,"mark",{"id":"approval","by":"hand","truth":{"turn":"waiting"},"note":"the 7501 blocked report arrives before the modal is drawn; the composer is still on screen"}]
+[13636,"mark",{"id":"approval","by":"protocol","truth":{"turn":"waiting"},"note":"the 7501 blocked report arrives before the modal is drawn; the composer is still on screen"}]
 [13636,"out","\u001b[?2026h\u001b[14;1H"]
 [13636,"out","\u001b[J"]
 [13637,"out","\u001b[?25l"]
