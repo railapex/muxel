@@ -2998,6 +2998,17 @@ fn preset_icon_obj(preset: &AgentPreset) -> Icon {
     Icon::empty().path(preset_icon_path(preset))
 }
 
+/// The label of a pane whose program ended abnormally: "ended", with the age a
+/// done label would show.
+fn ended_label(activity: &AgentActivity, now: i64) -> String {
+    let label = agent_activity_label(activity_state(AgentStatus::Done), activity, now);
+    // New key: catalogs fall back to English until regenerated.
+    match label.split_once(" · ") {
+        Some((_, age)) => format!("{} · {age}", t("ended")),
+        None => t("ended").to_string(),
+    }
+}
+
 /// A small status pill for an agent.
 fn status_tag(status: AgentStatus, label: String) -> Tag {
     match status {
@@ -23950,6 +23961,59 @@ impl MuxelApp {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
+    /// Whether `iid`'s program ended abnormally: it exited with a non-zero
+    /// code, a signal or no code at all. Its sidebar row and dashboard card both
+    /// ask this, through [`Self::pane_status_label`] and
+    /// [`Self::pane_status_color`], so the two read amber "ended" together where
+    /// its status would read Done. A clean exit stays Done.
+    fn pane_ended(&self, iid: Uuid, cx: &App) -> bool {
+        self.terminal_view(iid).is_some_and(|view| {
+            let view = view.read(cx);
+            view.exited() && view.exit_code() != Some(0)
+        })
+    }
+
+    /// The words of `iid`'s status on its sidebar row and dashboard card:
+    /// "ended" with the age of its ending when its program ended abnormally,
+    /// otherwise its activity label.
+    fn pane_status_label(
+        &self,
+        iid: Uuid,
+        status: AgentStatus,
+        activity: &AgentActivity,
+        cx: &App,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp_millis();
+        if self.pane_ended(iid, cx) {
+            return ended_label(activity, now);
+        }
+        let background = self
+            .terminal_view(iid)
+            .and_then(|view| view.read(cx).background_work());
+        localized_activity_label(status, activity, background, now)
+    }
+
+    /// The color of `iid`'s status on its sidebar row and dashboard card: amber
+    /// when its program ended abnormally, otherwise its status color. Either
+    /// dims once its finish has been read.
+    fn pane_status_color(
+        &self,
+        iid: Uuid,
+        status: AgentStatus,
+        activity: Option<&AgentActivity>,
+        cx: &App,
+    ) -> Hsla {
+        if !self.pane_ended(iid, cx) {
+            return pane_status_hsla(status, activity, cx);
+        }
+        let color = cx.theme().warning;
+        if done_is_read(status, activity) {
+            color.opacity(READ_DONE_OPACITY)
+        } else {
+            color
+        }
+    }
+
     fn terminal_activity_sample(
         &self,
         iid: Uuid,
@@ -27496,7 +27560,7 @@ impl MuxelApp {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
                 let color = status
-                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
+                    .map(|s| self.pane_status_color(iid, s, inst.map(|i| &i.activity), cx))
                     .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
@@ -27529,13 +27593,11 @@ impl MuxelApp {
                                     status
                                         .zip(inst)
                                         .map(|(status, instance)| {
-                                            localized_activity_label(
+                                            self.pane_status_label(
+                                                iid,
                                                 status,
                                                 &instance.activity,
-                                                self.terminal_view(iid).and_then(|view| {
-                                                    view.read(cx).background_work()
-                                                }),
-                                                chrono::Utc::now().timestamp_millis(),
+                                                cx,
                                             )
                                         })
                                         .unwrap_or_else(|| status_label(status).to_string()),
@@ -29111,7 +29173,8 @@ impl MuxelApp {
                         .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            pane_status_hsla(
+                            self.pane_status_color(
+                                iid,
                                 if loading {
                                     AgentStatus::Working
                                 } else {
@@ -29177,20 +29240,20 @@ impl MuxelApp {
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
-                                let tag = status_tag(
-                                    status,
-                                    inst.map(|instance| {
-                                        localized_activity_label(
-                                            status,
-                                            &instance.activity,
-                                            self.terminal_view(iid)
-                                                .and_then(|view| view.read(cx).background_work()),
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
+                                let label = inst
+                                    .map(|instance| {
+                                        self.pane_status_label(iid, status, &instance.activity, cx)
                                     })
-                                    .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                );
-                                // A read finish keeps its green as an outline, so
+                                    .unwrap_or_else(|| status_label(Some(status)).to_string());
+                                // An ended pane's pill takes the amber of a
+                                // blocked one.
+                                let pill = if self.pane_ended(iid, cx) {
+                                    AgentStatus::Blocked
+                                } else {
+                                    status
+                                };
+                                let tag = status_tag(pill, label);
+                                // A read finish keeps its color as an outline, so
                                 // the label stays legible on the sidebar.
                                 if read_done { tag.outline() } else { tag }
                             }))
