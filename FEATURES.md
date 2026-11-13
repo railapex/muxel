@@ -1611,11 +1611,13 @@ feature is added or changed, update the matching entry here in the same change**
   under that session's row, and the family moves as one. A session spawned by a
   nested one nests under the same top session, so there are two levels at most:
   a session, its child sessions, and each one's files. While any of the family
-  asks a question, it sits in Needs you and the top row shows **N asking**, so
-  nothing that needs you is buried; otherwise, while any of it works, it sits
-  with the working rows by its earliest start, and a top session that isn't
-  working itself shows **N working**; otherwise it goes by its newest finish,
-  so a child's finish brings the family up. Drag a session onto another session's
+  asks a question, it sits in Needs you and the top row shows `? n` (asking),
+  so nothing that needs you is buried; otherwise, while any of it works, it
+  sits with the working rows by its earliest start, and a top session that
+  isn't working itself shows `▶ n` (working); otherwise it goes by its newest
+  finish, so a child's finish brings the family up. Each tag's tooltip says it
+  in words. A narrow sidebar shrinks the tags, then a row's own pill, before
+  its name drops under about four characters. Drag a session onto another session's
   row to nest it there, or onto its project's header to make it a row of its
   own. Closing a parent leaves its children open as ordinary rows, unless you
   choose Close with everything under it. A pinned session nests only under a
