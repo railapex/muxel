@@ -69,9 +69,11 @@ pub const PERSISTED_SEND_VERSION: u32 = 7;
 /// `send --no-wake` must be refused by hosts that would ignore it and wake an
 /// asleep pane anyway.
 pub const NO_WAKE_VERSION: u32 = 8;
+/// `close` is new; a host that predates it can't read the request at all.
+pub const CLOSE_VERSION: u32 = 9;
 /// The newest version this host accepts, which `status` and `panes` report as
 /// `protocol` so a client can learn it without sending anything.
-pub const NEWEST_VERSION: u32 = NO_WAKE_VERSION;
+pub const NEWEST_VERSION: u32 = CLOSE_VERSION;
 /// How many asleep panes waiting sends may be waking at once, so a burst of
 /// sends (mail after a restart) can't start every agent together.
 pub const MAX_SEND_WAKES: usize = 2;
@@ -287,6 +289,13 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
     },
+    /// Close panes, all or none, through muxel's countdown with Undo.
+    Close {
+        agents: Vec<String>,
+        /// Close busy panes too, without the re-check at the countdown's end.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -295,6 +304,9 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(command, Command::Close { .. }) {
+        return CLOSE_VERSION;
+    }
     if matches!(command, Command::Send { no_wake: true, .. }) {
         return NO_WAKE_VERSION;
     }
@@ -373,6 +385,28 @@ pub struct Response {
     /// With `duplicate`: the first attempt's failure, as its own reply body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original: Option<Value>,
+    /// A refused `close`: every pane it refused, each with its own reason.
+    /// Nothing was closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refusal>,
+}
+
+/// One pane a refused `close` names: the AGENT as the caller gave it, the
+/// pane it resolved to (absent when it named none), and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<Uuid>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_code"
+    )]
+    pub code: Option<ErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub error: String,
 }
 
 impl Response {
@@ -386,6 +420,7 @@ impl Response {
             error: None,
             undo_until: None,
             original: None,
+            refused: Vec::new(),
         }
     }
 
@@ -400,6 +435,7 @@ impl Response {
             error: Some(error.message),
             undo_until: error.undo_until,
             original: error.original.map(|original| *original),
+            refused: error.refused,
         }
     }
 
@@ -417,6 +453,7 @@ impl Response {
                 .unwrap_or_else(|| "muxel refused the request".into()),
             undo_until: self.undo_until,
             original: self.original.map(Box::new),
+            refused: self.refused,
         })
     }
 }
@@ -528,6 +565,8 @@ pub struct Error {
     pub undo_until: Option<i64>,
     /// See [`Response::original`].
     pub original: Option<Box<Value>>,
+    /// See [`Response::refused`].
+    pub refused: Vec<Refusal>,
 }
 
 impl Error {
@@ -539,6 +578,7 @@ impl Error {
             message: message.into(),
             undo_until: None,
             original: None,
+            refused: Vec::new(),
         }
     }
 
@@ -551,6 +591,7 @@ impl Error {
                 .into(),
             undo_until: Some(undo_until),
             original: None,
+            refused: Vec::new(),
         }
     }
 
@@ -569,6 +610,7 @@ impl Error {
             original: serde_json::to_value(Response::err(original.clone()))
                 .ok()
                 .map(Box::new),
+            refused: Vec::new(),
         }
     }
 
@@ -592,6 +634,7 @@ impl From<String> for Error {
             message,
             undo_until: None,
             original: None,
+            refused: Vec::new(),
         }
     }
 }
@@ -840,12 +883,27 @@ pub struct AgentInfo {
     /// for a recoverable close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<usize>,
+    /// Held for a recoverable close. `status` stays what the program is
+    /// doing, so `wait` and `show` read the pane as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<Closing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// Runs on a remote host over SSH.
     pub remote: bool,
+}
+
+/// Where a pane held for closing is, as [`AgentInfo::closing`] and a refused
+/// write's `closing` error say: `counting_down` with its `undo_until`
+/// deadline (unix ms), or `checking`, `awaiting_decision` or `restoring`
+/// with none. A countdown whose deadline has passed leaves the deadline out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Closing {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_until: Option<i64>,
 }
 
 /// An instance's short id, as tmux session names and `muxel ctl` show it.
@@ -1662,6 +1720,8 @@ usage: muxel ctl <command> [args]
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
+  close AGENT... [--force]       close panes, all or none, with Undo in muxel;
+                                 --force closes busy ones too
   skill                          instructions for an orchestrating agent
   help [COMMAND]                 show general or command-specific help
 
@@ -1750,6 +1810,9 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "keys" => {
             "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
         }
+        "close" => {
+            "usage: muxel ctl close AGENT... [--force]\nClose one or more terminal panes, all or none. Each closes through muxel's 15-second countdown, where the user can Undo it and sees who closed it; an exited pane closes at once. A pane that is working, blocked, starting, settling, or not provably idle refuses unless --force, and a busy pane closed with --force isn't checked again when its countdown ends. Your own pane is working while you run this, so closing it needs --force. A refusal closes nothing and lists every refused pane under refused. A closed pane's conversation can't be reopened from muxel yet: close only panes you are done with."
+        }
         "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
         "help" => {
             "usage: muxel ctl help [COMMAND]\nShow general or command-specific help. Use `--` before literal prompt text that starts with -."
@@ -1778,6 +1841,7 @@ fn unknown_command_error(command: &str) -> String {
             "wait",
             "answer",
             "keys",
+            "close",
             "skill",
             "help",
         ];
@@ -2022,6 +2086,16 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 return Err(format!("unknown key '{bad}'"));
             }
             Command::Keys { agent, keys, force }
+        }
+        "close" => {
+            agent(&words)?;
+            let mut agents: Vec<String> = Vec::new();
+            for word in &words {
+                if !agents.contains(word) {
+                    agents.push(word.clone());
+                }
+            }
+            Command::Close { agents, force }
         }
         "wait" => {
             at_most(1)?;
@@ -2475,6 +2549,20 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   the agent is blocked on.
 - `muxel ctl keys AGENT KEY...` - press keys: enter, esc, tab, shift-tab, up, down,
   left, right, backspace, space, ctrl-c, or any single character.
+- `muxel ctl close AGENT... [--force]` - close one or more terminal panes, all
+  or none. Each goes through muxel's 15-second countdown, where the user can
+  Undo it and sees which pane closed it; an exited pane closes at once. A pane
+  that is `working`, `blocked` or `starting`, or that muxel can't confirm is
+  idle (`busy`, with a `reason`), refuses unless `--force`, and a busy pane
+  closed with `--force` isn't checked again when its countdown ends. Your own
+  pane is working while you run this, so closing it needs `--force`. A refusal
+  closes nothing; its `refused` lists every refused pane with the AGENT you
+  gave, its `uuid` when it named one, and its own `code`, `reason` and
+  `error`. Success is `{"closed": true, "undo_until", "panes": [{"agent",
+  "uuid", "undo_until"}]}`, with `undo_until` null for a pane that closed at
+  once. Notifications in muxel keep a line for each close. A closed pane's
+  conversation can't be reopened from muxel yet: close only panes whose work
+  is finished.
 
 For an agent kept in tmux, `send`, `answer`, `keys` and a `new --prompt` task
 go to the agent's own tmux pane through tmux (`paste-buffer`, `send-keys`),
@@ -2574,7 +2662,7 @@ version this muxel accepts. An older muxel leaves it out.
 ## Errors
 
 Creation permission/approval refusals, typing refusals from `send`, `answer` or
-`keys`, and host connection failures have a `code`:
+`keys`, `close` refusals, and host connection failures have a `code`:
 
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
   again in a moment. `blocked` with `reason: prompt_hidden` means `send` found no
@@ -2582,7 +2670,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim, or another
   `send` to the agent hasn't pressed Enter yet.
-- `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
+- `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. `status AGENT` on a held pane keeps its program's `status` and adds `closing` with the same `reason` (`counting_down` during the countdown) and `undo_until`. `close` refuses a held pane with this code, and one whose close is already waiting on the user in muxel with `reason: requested`. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`,
   or, with `reason: conversation_changed`, the pane isn't in the conversation
   the send was pinned to, or, with `reason: conversation_unconfirmed`, muxel
@@ -2608,7 +2696,12 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `draft_present` - the agent's composer holds text; nothing was typed. Leave
   it to the user, or pass `--force` deliberately.
 - `busy` - something is already in progress for this pane (`reason` `queued`,
-  `queue_full` or `once_pending`); this request typed nothing.
+  `queue_full` or `once_pending`); this request typed nothing. From `close`,
+  muxel can't confirm the pane is idle: `reason` is `settling` (its status
+  isn't settled yet), `awaiting_reply` (a prompt was just sent),
+  `another_client` (another tmux client may be typing into it),
+  `unconfirmed_idle`, or `session_may_outlive` (it exited, but its tmux
+  session may still be running the agent).
 - `duplicate` - this `--once` key's first send failed after typing; `original`
   holds that failure. Nothing was typed now; inspect `screen`.
 - `timed_out` - `send --when-idle` saw no safe moment in time; `reason` says
@@ -2672,7 +2765,9 @@ also withhold Enter and return an error without a code; inspect the input first.
   another computer is using the agent, don't `--force` it: `wait` on the agent
   and try again, or tell the user. Several of you may be driving the same agents.
 - Create panes only when asked, using `new` within the user's granted authority.
-  This interface can't close or rearrange existing panes; the layout is the user's.
+  Close only panes you made or were asked to close, once their work is
+  finished: a closed pane's conversation can't be reopened from muxel yet.
+  This interface can't rearrange panes; the layout is the user's.
 "#;
 
 #[cfg(test)]
@@ -3216,7 +3311,6 @@ mod tests {
             }
         ));
         assert_eq!(super::request_version(&send), super::NO_WAKE_VERSION);
-        assert_eq!(super::NEWEST_VERSION, super::NO_WAKE_VERSION);
         let raw: Command = serde_json::from_str(
             r#"{"cmd":"send","agent":"a","text":"hi","when_idle":true,"no_wake":true}"#,
         )
@@ -3240,6 +3334,65 @@ mod tests {
             serde_json::from_str(r#"{"cmd":"send","agent":"a","text":"hi","no_wake":true}"#)
                 .unwrap();
         assert!(super::check_safe_send(&plain).is_err());
+    }
+
+    /// `close` is new in v9, so a host from before can't read it at all. It
+    /// takes its panes in the order given, each once, and a refused close
+    /// names every refused pane on the wire, which a client reads back whole.
+    #[test]
+    fn close_takes_several_agents_and_needs_protocol_v9() {
+        assert_eq!(
+            parse_cli(&words(&["close", "a", "b", "a", "--force"])),
+            Ok(CliCommand::Request(Command::Close {
+                agents: vec!["a".into(), "b".into()],
+                force: true,
+            }))
+        );
+        let Ok(CliCommand::Request(close)) = parse_cli(&words(&["close", "a"])) else {
+            panic!("close parses");
+        };
+        assert_eq!(super::request_version(&close), super::CLOSE_VERSION);
+        assert_eq!(super::NEWEST_VERSION, super::CLOSE_VERSION);
+        assert_eq!(
+            serde_json::to_string(&close).unwrap(),
+            r#"{"cmd":"close","agents":["a"]}"#
+        );
+        let raw: Command =
+            serde_json::from_str(r#"{"cmd":"close","agents":["a","b"],"force":true}"#).unwrap();
+        assert_eq!(
+            raw,
+            Command::Close {
+                agents: vec!["a".into(), "b".into()],
+                force: true,
+            }
+        );
+        for args in [
+            words(&["close"]),
+            words(&["close", "--force"]),
+            words(&["close", "a", "--once", "k"]),
+            words(&["close", "a", "--when-idle"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
+        let error = super::Error {
+            refused: vec![super::Refusal {
+                agent: "b".into(),
+                uuid: Some(id(2)),
+                code: Some(ErrorCode::Working),
+                reason: None,
+                error: "'b' is working".into(),
+            }],
+            ..super::Error::new(ErrorCode::Working, "nothing was closed")
+        };
+        let wire = serde_json::to_value(super::Response::err(error.clone())).unwrap();
+        assert_eq!(wire["refused"][0]["agent"], "b");
+        assert_eq!(wire["refused"][0]["uuid"], id(2).to_string());
+        assert_eq!(wire["refused"][0]["code"], "working");
+        assert!(wire["refused"][0].get("reason").is_none());
+        let read: super::Response = serde_json::from_value(wire).unwrap();
+        assert_eq!(read.into_result(), Err(error));
+        let ok = serde_json::to_value(super::Response::ok(serde_json::json!({}))).unwrap();
+        assert!(ok.get("refused").is_none());
     }
 
     #[test]
@@ -3335,6 +3488,7 @@ mod tests {
             prompt_delivery: None,
             focused: false,
             pane: Some(1),
+            closing: None,
             worktree_branch: None,
             cwd: None,
             remote: false,
@@ -3435,6 +3589,12 @@ mod tests {
         assert!(text.contains("muxel ctl once-cancel AGENT KEY"));
         assert!(text.contains("`dropped`"));
         assert!(text.contains("`queued`"));
+        assert!(text.contains("muxel ctl close AGENT... [--force]"));
+        assert!(text.contains("`refused`"));
+        // An orchestrator must know what a close costs before it makes one.
+        for doc in [text.as_str(), super::command_help("close").unwrap()] {
+            assert!(doc.contains("can't be reopened from muxel yet"), "{doc}");
+        }
     }
 
     #[test]

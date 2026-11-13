@@ -199,7 +199,7 @@ feature is added or changed, update the matching entry here in the same change**
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
   with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
-  still work. `undo_until` is present only during the countdown; checks,
+  still work, and `status` adds `closing` with the same state. `undo_until` is present only during the countdown; checks,
   Close / Keep and restoration report their state without an expired deadline.
   If the pane disappears while `wait` polls or collects its result, `wait`
   returns `exited` with an explanation. A shell counts down only with prompt
@@ -1286,6 +1286,19 @@ feature is added or changed, update the matching entry here in the same change**
   `outcome: interrupted`; an unpinned one is dropped (`reason: restarted`).
   Replies carry a `boot_id` that is new each time muxel starts. Closing the
   pane drops its sends. Attached sends and their keys live in memory.
+- **Closing panes from outside** — `muxel ctl close AGENT... [--force]`
+  closes one or more terminal panes, all or none, so an orchestrator can
+  retire builders it has finished with. Nobody in muxel confirmed it, so each
+  pane gets the same 15-second countdown with Undo as a quiet close, and the
+  title bar names the pane that closed it; an exited pane closes at once. A
+  pane muxel would ask about (working, waiting on a question, starting,
+  settling, another tmux client, or not provably idle) refuses the whole close
+  with its code unless `--force`, and a forced busy pane isn't checked again
+  when its countdown ends. A refusal lists every refused pane. Notifications
+  keep a line saying who closed which panes and which were forced, after the
+  countdown and its Undo are gone. `status` on a held pane adds `closing` with
+  its countdown deadline. A closed pane's conversation can't be reopened from
+  muxel yet. The same outside-control grants as typing apply.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`

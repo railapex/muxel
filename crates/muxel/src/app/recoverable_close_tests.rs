@@ -23,7 +23,7 @@ use windows::Win32::System::Threading::{
 
 /// Keep the original process handle: an unrelated process reusing its PID must
 /// never count as either survival or successful teardown of this fixture.
-struct OwnedChild {
+pub(super) struct OwnedChild {
     session: Arc<TerminalSession>,
     process: HANDLE,
 }
@@ -42,7 +42,7 @@ impl OwnedChild {
         Self { session, process }
     }
 
-    fn exited(&self) -> bool {
+    pub(super) fn exited(&self) -> bool {
         // SAFETY: this handle stays open until the guard is dropped.
         let status = unsafe { WaitForSingleObject(self.process, 0) };
         if status == WAIT_OBJECT_0 {
@@ -53,7 +53,7 @@ impl OwnedChild {
         }
     }
 
-    fn terminate(&self, exit_code: u32) {
+    pub(super) fn terminate(&self, exit_code: u32) {
         // SAFETY: this is the retained handle of this fixture's own child.
         // Selecting its actual OS exit code exercises both clean and abnormal
         // exit paths without changing TerminalView's runtime fields.
@@ -69,7 +69,7 @@ impl Drop for OwnedChild {
     }
 }
 
-fn project(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
+pub(super) fn project(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
     window
         .update(cx, |app, _, _| {
             let root = muxel_store::data_dir()
@@ -91,7 +91,7 @@ fn project(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
         .unwrap()
 }
 
-fn terminal(
+pub(super) fn terminal(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
     pid: Uuid,
@@ -127,7 +127,7 @@ fn terminal(
         .unwrap()
 }
 
-fn wait_for_exit(cx: &mut TestAppContext, child: &OwnedChild) {
+pub(super) fn wait_for_exit(cx: &mut TestAppContext, child: &OwnedChild) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         cx.run_until_parked();
@@ -624,7 +624,7 @@ fn finalizing_all_held_closes_removes_processes_before_persist() {
     });
 }
 
-fn wait_for_view(
+pub(super) fn wait_for_view(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
     view: &Entity<TerminalView>,
@@ -764,7 +764,7 @@ fn held_panes_skip_tick_attention_and_restart() {
 
 /// The owned command emits real Codex OSC-title protocol bytes through its PTY.
 /// No provider binary, injected runtime status or fake title-source callback is used.
-fn title_terminal(
+pub(super) fn title_terminal(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
     pid: Uuid,

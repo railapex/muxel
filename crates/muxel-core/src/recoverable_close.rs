@@ -1,6 +1,6 @@
 //! Pure close admission and expiry checks. The app supplies current launch facts.
 
-use crate::control::AgentState;
+use crate::control::{AgentState, ErrorCode};
 use crate::{PaneNode, TerminalLaunchReason, remove};
 use std::time::Duration;
 use uuid::Uuid;
@@ -125,6 +125,29 @@ pub fn decide(facts: CloseFacts, ask_busy: bool) -> CloseDecision {
     } else {
         CloseDecision::Hold { forced: true }
     }
+}
+
+/// Why `ctl close` without `--force` refuses a pane [`decide`] would ask about:
+/// the code a script acts on, and for `busy` the reason muxel can't call the
+/// pane idle. A pane `decide` holds or closes at once has no refusal.
+pub fn close_refusal(facts: CloseFacts) -> Option<(ErrorCode, Option<&'static str>)> {
+    if decide(facts, true) != CloseDecision::Ask {
+        return None;
+    }
+    if looks_dead(facts) {
+        return Some((ErrorCode::Busy, Some("session_may_outlive")));
+    }
+    Some(match facts.status {
+        AgentState::Working => (ErrorCode::Working, None),
+        AgentState::Blocked => (ErrorCode::Blocked, None),
+        AgentState::Starting => (ErrorCode::Starting, None),
+        _ if !facts.attributable || facts.evidence == CloseEvidence::Settling => {
+            (ErrorCode::Busy, Some("settling"))
+        }
+        _ if facts.awaiting_reply => (ErrorCode::Busy, Some("awaiting_reply")),
+        _ if facts.another_tmux_client => (ErrorCode::Busy, Some("another_client")),
+        _ => (ErrorCode::Busy, Some("unconfirmed_idle")),
+    })
 }
 
 pub fn may_finalize(before: CloseFacts, now: CloseFacts, forced: bool) -> bool {
@@ -310,11 +333,11 @@ pub fn expired_close_sync(
 mod recoverable_close_policy_tests {
     use super::{
         CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch,
-        HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, UndoLaunch, decide,
+        HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, UndoLaunch, close_refusal, decide,
         departure_finalizes, exit_proves_closed, expired_close_sync, held_launch, may_finalize,
         rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
     };
-    use crate::control::AgentState;
+    use crate::control::{AgentState, ErrorCode};
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
     use std::time::Duration;
     use uuid::Uuid;
@@ -433,6 +456,134 @@ mod recoverable_close_policy_tests {
                 assert_eq!(decide(facts, true), CloseDecision::Hold { forced: false });
                 assert!(may_finalize(facts, facts, false));
             }
+        }
+    }
+
+    /// `ctl close` refuses exactly the panes a person closing them would be
+    /// asked about, each with the code a script acts on: never a pane muxel
+    /// would close quietly, and never lets a busy one through unforced.
+    #[test]
+    fn ctl_close_refuses_exactly_what_a_close_would_ask_about() {
+        let statuses = [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Blocked,
+            AgentState::Done,
+            AgentState::Exited,
+            AgentState::Starting,
+            AgentState::NotRunning,
+            AgentState::Failed,
+        ];
+        let evidences = [
+            CloseEvidence::Process,
+            CloseEvidence::Program,
+            CloseEvidence::Hook,
+            CloseEvidence::Title,
+            CloseEvidence::Screen,
+            CloseEvidence::Bell,
+            CloseEvidence::Output,
+            CloseEvidence::Quiet,
+            CloseEvidence::Settling,
+            CloseEvidence::ShellPrompt,
+        ];
+        for status in statuses {
+            for evidence in evidences {
+                for bits in 0..16u8 {
+                    let facts = CloseFacts {
+                        status,
+                        evidence,
+                        attributable: bits & 1 != 0,
+                        awaiting_reply: bits & 2 != 0,
+                        another_tmux_client: bits & 4 != 0,
+                        session_may_outlive: bits & 8 != 0,
+                        ..quiet()
+                    };
+                    assert_eq!(
+                        close_refusal(facts).is_some(),
+                        decide(facts, true) == CloseDecision::Ask,
+                        "{facts:?}"
+                    );
+                }
+            }
+        }
+        let cases = [
+            (quiet(), None),
+            (
+                CloseFacts {
+                    status: AgentState::Working,
+                    ..quiet()
+                },
+                Some((ErrorCode::Working, None)),
+            ),
+            (
+                CloseFacts {
+                    status: AgentState::Blocked,
+                    ..quiet()
+                },
+                Some((ErrorCode::Blocked, None)),
+            ),
+            (
+                CloseFacts {
+                    status: AgentState::Starting,
+                    ..quiet()
+                },
+                Some((ErrorCode::Starting, None)),
+            ),
+            (
+                CloseFacts {
+                    attributable: false,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("settling"))),
+            ),
+            (
+                CloseFacts {
+                    evidence: CloseEvidence::Settling,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("settling"))),
+            ),
+            (
+                CloseFacts {
+                    awaiting_reply: true,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("awaiting_reply"))),
+            ),
+            (
+                CloseFacts {
+                    another_tmux_client: true,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("another_client"))),
+            ),
+            (
+                CloseFacts {
+                    evidence: CloseEvidence::Output,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("unconfirmed_idle"))),
+            ),
+            (
+                CloseFacts {
+                    status: AgentState::Exited,
+                    evidence: CloseEvidence::Process,
+                    ..quiet()
+                },
+                None,
+            ),
+            (
+                CloseFacts {
+                    status: AgentState::Exited,
+                    evidence: CloseEvidence::Process,
+                    session_may_outlive: true,
+                    ..quiet()
+                },
+                Some((ErrorCode::Busy, Some("session_may_outlive"))),
+            ),
+        ];
+        for (facts, refusal) in cases {
+            assert_eq!(close_refusal(facts), refusal, "{facts:?}");
         }
     }
 
