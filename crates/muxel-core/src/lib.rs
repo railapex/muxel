@@ -21,13 +21,17 @@ pub mod memory;
 pub mod muse;
 pub mod outage;
 mod pane;
+pub mod pane_scope;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
+pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
+pub mod sleep;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
@@ -48,9 +52,9 @@ pub use agent::{
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
     codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
-    find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args, stored_claude_session_path,
+    find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
+    memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    resolve_launch_for_session, resume_trusted, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -105,10 +109,31 @@ pub struct AgentActivity {
     pub blocked_at: Option<i64>,
     #[serde(default)]
     pub last_attended_at: Option<i64>,
+    /// When the pane was last woken from sleep or dormancy (Enter or typing
+    /// in it, Wake, pinning, `ctl focus` or `ctl wake`). It counts toward idle
+    /// time only, so a wake restarts the automatic-sleep clock, across
+    /// restarts too, without marking a completion read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_at: Option<i64>,
+    /// Who made that wake. A machine's wake that nobody has looked at since
+    /// gets a short idle limit ([`crate::sleep::MACHINE_WAKE_IDLE_MINUTES`]) in place
+    /// of the whole threshold. Older saves have none, which reads as the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub woken_by: Option<Waker>,
     /// Latest lifecycle state, independent from whether its notification was read.
     /// Older workspaces infer it from their existing transition timestamps.
     #[serde(default)]
     pub last_state: Option<AgentActivityState>,
+}
+
+/// Who woke an asleep pane: the user, by their own input in muxel (Enter or
+/// typing in it, Wake, pinning), or a machine, by anything through ctl (`ctl
+/// wake`, `ctl focus`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waker {
+    User,
+    Machine,
 }
 
 /// Provider-neutral lifecycle state used by the persisted activity reducer.
@@ -122,11 +147,30 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
-    fn last_lifecycle_at(&self) -> Option<i64> {
+    /// Latest work, completion or blocked transition, in Unix milliseconds.
+    pub fn last_work_at(&self) -> Option<i64> {
         [self.work_started_at, self.completed_at, self.blocked_at]
             .into_iter()
             .flatten()
             .max()
+    }
+
+    /// Latest work transition, deliberate attendance or wake, in Unix
+    /// milliseconds: how long ago anyone, agent or user, last did anything in
+    /// the pane.
+    pub fn last_active_at(&self) -> Option<i64> {
+        self.last_work_at()
+            .max(self.last_attended_at)
+            .max(self.woken_at)
+    }
+
+    /// Woken by a machine, and nobody has looked at the pane since: it woke
+    /// for one job. The first look makes it an ordinary pane again.
+    pub fn machine_woken_unattended(&self) -> bool {
+        self.woken_by == Some(Waker::Machine)
+            && self
+                .woken_at
+                .is_some_and(|woken| self.last_attended_at.is_none_or(|seen| seen < woken))
     }
 
     pub fn current_state(&self) -> Option<AgentActivityState> {
@@ -226,7 +270,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
+            let Some(age) = age_millis(activity.last_work_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -262,6 +306,93 @@ fn state_with_age(state: &str, at: Option<i64>, now: i64) -> String {
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
+
+/// Defer an old local PTY until opened. Unknown ages start normally; attendance
+/// does not count as work. Active and pinned panes always start.
+pub fn should_restore_dormant(
+    activity: &AgentActivity,
+    days: u32,
+    now: i64,
+    active: bool,
+    pinned: bool,
+) -> bool {
+    days > 0
+        && !active
+        && !pinned
+        && activity
+            .last_work_at()
+            .is_some_and(|at| now.saturating_sub(at) >= i64::from(days) * DAY_MS)
+}
+
+#[cfg(test)]
+mod dormant_restore_tests {
+    use super::{AgentActivity, DAY_MS, Settings, should_restore_dormant};
+
+    #[test]
+    fn dormant_threshold_uses_latest_work_and_includes_exact_boundary() {
+        let activity = AgentActivity {
+            work_started_at: Some(DAY_MS),
+            completed_at: Some(2 * DAY_MS),
+            blocked_at: Some(3 * DAY_MS),
+            last_attended_at: Some(9 * DAY_MS),
+            ..Default::default()
+        };
+        assert_eq!(activity.last_work_at(), Some(3 * DAY_MS));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS - 1,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            6 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(should_restore_dormant(
+            &activity,
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert!(!should_restore_dormant(
+            &activity,
+            3,
+            2 * DAY_MS,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn dormant_restore_exempts_active_pinned_unknown_and_disabled() {
+        let old = AgentActivity {
+            completed_at: Some(0),
+            ..Default::default()
+        };
+        for (days, active, pinned) in [(0, false, false), (3, true, false), (3, false, true)] {
+            assert!(!should_restore_dormant(
+                &old,
+                days,
+                9 * DAY_MS,
+                active,
+                pinned
+            ));
+        }
+        assert!(!should_restore_dormant(
+            &AgentActivity::default(),
+            3,
+            9 * DAY_MS,
+            false,
+            false
+        ));
+        assert_eq!(Settings::default().dormant_after_days, 0);
+    }
+}
 
 fn age_millis(at: Option<i64>, now: i64) -> Option<i64> {
     at.map(|at| now.saturating_sub(at).max(0))
@@ -621,6 +752,10 @@ pub struct Instance {
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
+    /// When this local agent was put to sleep (Unix ms): its program was ended
+    /// and it stays dormant, across restarts too, until it is opened or woken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -732,6 +867,8 @@ impl Instance {
         self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        // A copy of a sleeping pane is a new conversation, started on creation.
+        self.asleep_since = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
         // An unconsumed `ctl new --prompt` task belongs to the request that was
@@ -796,6 +933,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 
@@ -865,6 +1003,7 @@ impl Instance {
             session_path: None,
             claude_hook_record: None,
             session_started: false,
+            asleep_since: None,
         }
     }
 }
@@ -1306,6 +1445,9 @@ pub struct Workspace {
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
+    /// Whether the sidebar's NOTIFICATIONS section is collapsed to its header.
+    #[serde(default)]
+    pub notifications_collapsed: bool,
     /// Named git worktrees, referenced by instances via `Instance.worktree_id`.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1314,6 +1456,31 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+    /// The pane that had keyboard focus at the last save, when it was awake
+    /// (running or starting); None when it was asleep. A relaunch starts this
+    /// one pane whatever its idle age (`sleep::opens_dormant`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awake_focus: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod workspace_notifications_tests {
+    use super::Workspace;
+
+    #[test]
+    fn notifications_collapsed_defaults_off_and_round_trips() {
+        let old: Workspace =
+            serde_json::from_str(r#"{"projects":[],"active_project":null,"instances":[]}"#)
+                .unwrap();
+        assert!(!old.notifications_collapsed);
+
+        let ws = Workspace {
+            notifications_collapsed: true,
+            ..Workspace::default()
+        };
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(back.notifications_collapsed);
+    }
 }
 
 /// Where a project's dedicated window lives: which monitor (stable UUID) and
@@ -2039,6 +2206,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -2254,6 +2422,15 @@ fn default_pane_border() -> String {
 fn default_terminal_mouse() -> String {
     "copy_paste".to_string()
 }
+
+fn default_new_agent_placement() -> String {
+    NEW_AGENT_TAB.to_string()
+}
+
+/// [`Settings::new_agent_placement`]: a new agent joins the focused pane as a tab.
+pub const NEW_AGENT_TAB: &str = "tab";
+/// [`Settings::new_agent_placement`]: a new agent gets a pane of its own.
+pub const NEW_AGENT_PANE: &str = "pane";
 
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2641,6 +2818,13 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Open old local PTY sessions asleep, until woken. Zero disables dormancy.
+    #[serde(default)]
+    pub dormant_after_days: u32,
+    /// Put local agents to sleep once idle this many hours (see [`sleep`]).
+    /// Zero turns automatic sleep off; sleeping by hand still works.
+    #[serde(default = "default_sleep_after_hours")]
+    pub sleep_after_hours: u32,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -2714,6 +2898,11 @@ pub struct Settings {
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
+    /// Where the toolbar's agent button and Ctrl+Alt+1–9 put a new agent:
+    /// [`NEW_AGENT_TAB`] (in the focused pane) or [`NEW_AGENT_PANE`] (a new pane
+    /// beside it). Anything else reads as a tab.
+    #[serde(default = "default_new_agent_placement")]
+    pub new_agent_placement: String,
     /// Diff window layout: `true` = side-by-side split, `false` = unified.
     #[serde(default)]
     pub diff_split_view: bool,
@@ -2906,9 +3095,11 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
-    /// Most memory, in GB, each process a local pane starts may commit
-    /// (Windows only; 0 = no limit). A process that asks for more is refused,
-    /// which usually stops it.
+    /// The memory limit for local panes, in GB (0 = no limit). On Windows it
+    /// is how much each process a pane starts may commit: a process that asks
+    /// for more is refused, which usually stops it. On Linux it is how much the
+    /// pane's processes may use together (a systemd scope's `MemoryMax`): when
+    /// they reach it, the kernel kills the largest. Elsewhere it does nothing.
     #[serde(default = "default_pane_memory_limit_gb")]
     pub pane_memory_limit_gb: u32,
 }
@@ -2924,14 +3115,24 @@ pub struct Settings {
 /// the limit from running out.
 pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
 
+fn default_sleep_after_hours() -> u32 {
+    sleep::DEFAULT_SLEEP_AFTER_HOURS
+}
+
 fn default_pane_memory_limit_gb() -> u32 {
     DEFAULT_PANE_MEMORY_LIMIT_GB
 }
 
 impl Settings {
-    /// The per-process limit for new local panes, in bytes; `None` when off.
+    /// The memory limit for new local panes, in bytes; `None` when off.
     pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
         (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
+
+    /// Whether new agents get a pane of their own rather than a tab in the
+    /// focused pane (see [`Settings::new_agent_placement`]).
+    pub fn new_agents_open_as_panes(&self) -> bool {
+        self.new_agent_placement == NEW_AGENT_PANE
     }
 }
 
@@ -3183,6 +3384,8 @@ mod keystroke_tests {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            dormant_after_days: 0,
+            sleep_after_hours: default_sleep_after_hours(),
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,
@@ -3205,6 +3408,7 @@ impl Default for Settings {
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
+            new_agent_placement: default_new_agent_placement(),
             diff_split_view: false,
             minimize_to_tray: false,
             dev_console_enabled: false,
@@ -3957,6 +4161,32 @@ mod settings_tests {
     }
 
     #[test]
+    fn new_agents_open_as_tabs_unless_set_to_panes() {
+        assert!(!Settings::default().new_agents_open_as_panes());
+        // A config from before the setting existed keeps opening tabs.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("new_agent_placement");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.new_agent_placement, NEW_AGENT_TAB);
+        let panes = Settings {
+            new_agent_placement: NEW_AGENT_PANE.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&panes).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .new_agents_open_as_panes()
+        );
+        // A value this version doesn't know reads as the default, a tab.
+        let odd = Settings {
+            new_agent_placement: "window".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.new_agents_open_as_panes());
+    }
+
+    #[test]
     fn settings_terminal_mouse_default_and_round_trip() {
         assert_eq!(Settings::default().terminal_mouse, "copy_paste");
         // An old config missing the key still loads, defaulting to copy_paste.
@@ -4130,6 +4360,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4214,6 +4445,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4228,6 +4460,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4243,6 +4476,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4396,6 +4630,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4448,6 +4683,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4495,6 +4731,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4537,6 +4774,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4934,11 +5172,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -5096,6 +5336,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -5144,6 +5385,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];

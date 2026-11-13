@@ -706,6 +706,11 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let generation = this.session_discoveries.binding_generation(iid);
+                // The whole store was read without the saved rollout.
+                let gone = matches!(
+                    found,
+                    CodexRestoreFound::Resume(muxel_core::CodexResumePath::Missing)
+                );
                 // Hold bumps the binding generation, so the pre-hold answer
                 // stays stale even when Undo makes the pane visible again.
                 if this.codex_restore_lookups.finish(iid, generation)
@@ -714,6 +719,9 @@ impl MuxelApp {
                 {
                     this.bump_session_binding_generation(iid);
                     this.persist();
+                    if gone {
+                        this.report_conversation_gone(iid);
+                    }
                     cx.notify();
                 }
             });
@@ -1760,8 +1768,8 @@ mod binding_regressions {
 #[cfg(all(test, windows))]
 mod grok_regressions {
     use super::super::{
-        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
-        PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopLaunch, LoopRun,
+        MuxelApp, PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
         popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
@@ -2231,6 +2239,7 @@ mod grok_regressions {
                     session.mark_turn_submitted();
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
+                        background: None,
                         status: AgentStatus::Done,
                         attributable: true,
                         reason: TerminalStatusReason::Quiet,
@@ -2245,7 +2254,7 @@ mod grok_regressions {
                     };
                     let mut run = LoopRun {
                         loop_id: Uuid::new_v4(),
-                        launch: Some(session.id),
+                        launch: LoopLaunch::Installed(session.id),
                         seen_working: true,
                         started: Instant::now(),
                         post_run: PostRunAction::Exit,
@@ -2285,6 +2294,7 @@ mod grok_regressions {
                             cached_done,
                             session.binding_revision(),
                             session.first_submission_binding(),
+                            true,
                             Duration::ZERO
                         ),
                         LoopCleanup::Abandon,
