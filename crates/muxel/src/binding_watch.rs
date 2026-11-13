@@ -56,16 +56,17 @@ impl WatchedDirs {
     }
 }
 
-/// The pane a hook record's path names: `<pane>.json`, the extension in any
-/// case. Windows and macOS (by default) open a `.JSON` record at the path
-/// discovery reads; elsewhere such a name costs one lookup that finds nothing.
+/// The pane a hook record's path names: a start record `<pane>.json` or an
+/// end record `<pane>.end.<conversation>.json`, the extension in any case.
+/// Windows and macOS (by default) open a `.JSON` record at the path discovery
+/// reads; elsewhere such a name costs one lookup that finds nothing.
 fn record_pane(path: &Path) -> Option<Uuid> {
     let name = path.file_name()?.to_str()?;
     let split = name.len().checked_sub(".json".len())?;
     if !name.get(split..)?.eq_ignore_ascii_case(".json") {
         return None;
     }
-    Uuid::parse_str(name.get(..split)?).ok()
+    crate::session_binding::claude_record_stem_pane(name.get(..split)?)
 }
 
 /// What a watcher callback reported, gathered until the UI takes it.
@@ -80,9 +81,10 @@ pub(crate) struct BindingChanges {
 }
 
 impl BindingChanges {
-    /// Add one watcher callback. Only the record the hook installs in the hook
-    /// directory counts: `<pane>.json`. Its temporary file is renamed onto
-    /// that name, and the `.claimed` name is muxel's own. Access events are
+    /// Add one watcher callback. Only the records the hook installs in the hook
+    /// directory count: `<pane>.json`, and `<pane>.end.<conversation>.json`.
+    /// Their temporary files are renamed onto those names, and the `.claimed`
+    /// name is muxel's own. Access events are
     /// skipped so that a platform reporting reads could never turn a lookup
     /// into another wake. Removing or renaming the hook directory or its
     /// parent fails the watch: inotify's watches follow the moved directory
@@ -358,6 +360,14 @@ mod tests {
             (EventKind::Access(AccessKind::Any), name.clone()),
             (EventKind::Create(CreateKind::Folder), "settings".into()),
             (EventKind::Modify(ModifyKind::Any), "not-a-pane.json".into()),
+            (
+                EventKind::Create(CreateKind::Any),
+                format!("{pane}.end.{}.json.4242.tmp", Uuid::from_u128(0xc1ea)),
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                format!("{pane}.end.not-a-conversation.json"),
+            ),
         ] {
             changes.record(&root(), event(kind, &file));
         }
@@ -375,6 +385,16 @@ mod tests {
         );
         assert_eq!(changes.panes, HashSet::from([pane]));
         assert!(!changes.rescan && !changes.failed);
+        // An end record wakes its pane as a start record does.
+        let ended = Uuid::from_u128(0xe2d);
+        changes.record(
+            &root(),
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                &format!("{ended}.end.{}.json", Uuid::from_u128(0xc1ea)),
+            ),
+        );
+        assert_eq!(changes.panes, HashSet::from([pane, ended]));
     }
 
     #[test]

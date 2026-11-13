@@ -193,6 +193,10 @@ pub(crate) struct LifecycleEvidence {
     launch: LaunchBinding,
     binding_rev: u64,
     binding_since: u64,
+    /// The binding the latest session-hint title was recorded in. A switch
+    /// reported out of band leaves the hint naming the conversation it
+    /// replaced, so only a hint from the current binding names it.
+    hint_rev: Option<u64>,
     /// The window of the switch reported out of band that began the current
     /// binding, if one did.
     window: Option<SwitchWindow>,
@@ -216,6 +220,25 @@ impl LifecycleEvidence {
             launch: launch.clone(),
             ..Self::default()
         }
+    }
+
+    /// The latest session-hint title was just recorded, in the current binding.
+    pub(crate) fn note_hint(&mut self) {
+        self.hint_rev = Some(self.binding_rev);
+    }
+
+    /// Whether this launch's own evidence names conversation `id` as its live
+    /// binding: the launch opened `id` and nothing has switched since, or
+    /// `hint`, the latest session-hint title, was recorded in the current
+    /// binding and names it.
+    pub(crate) fn binding_names(&self, id: &str, hint: Option<&str>) -> bool {
+        let opened = self.binding_rev == 1
+            && matches!(&self.launch, LaunchBinding::Known(Some(pinned)) if pinned.eq_ignore_ascii_case(id));
+        let titled = self.hint_rev == Some(self.binding_rev)
+            && hint
+                .and_then(session_thread_field)
+                .is_some_and(|thread| thread_names(id, thread));
+        opened || titled
     }
 
     /// Whether the launch's first UUID title, `thread`, begins a new binding.
@@ -312,8 +335,21 @@ impl LifecycleEvidence {
         self.first_submission_at
     }
 
+    /// When the latest submission went in, in any binding.
+    pub(crate) fn last_submission_at(&self) -> Option<SystemTime> {
+        self.submitted.map(|mark| mark.at)
+    }
+
     pub(crate) fn binding_rev(&self) -> u64 {
         self.binding_rev
+    }
+
+    pub(crate) fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        captured == self.binding_rev
+            || (captured == 0
+                && self.binding_rev == 1
+                && matches!(self.launch, LaunchBinding::Unknown)
+                && self.window.is_none())
     }
 
     /// Begin a new binding at sequence `since`, a provider title in the output
@@ -509,6 +545,7 @@ impl EventListener for MuxelListener {
                             self.bell.store(false, Ordering::Relaxed);
                         }
                     }
+                    evidence.note_hint();
                 }
                 *self.title.lock() = Some(title);
                 *self.title_changed_at.lock() = Some(Instant::now());
@@ -622,6 +659,48 @@ mod tests {
         }
     }
 
+    /// The app's stored id for a pane lags a conversation the provider's
+    /// title already names, so the terminal says which one its live binding is.
+    #[test]
+    fn the_live_binding_names_only_its_own_conversation() {
+        let a = "01a1543c-9700-7000-8000-00000000000a";
+        let b = "01a1543c-9700-7000-8000-00000000000b";
+        let names = |listener: &MuxelListener, id: &str| {
+            let hint = listener.session_id_hint.lock().clone();
+            listener.evidence.lock().binding_names(id, hint.as_deref())
+        };
+        let title = |listener: &MuxelListener, thread: &str| {
+            listener.send_event(Event::Title(format!("{thread} | Ready")));
+        };
+        // Launched into A: A until something switches.
+        let listener = listener_for(LaunchBinding::Known(Some(a.into())));
+        assert!(names(&listener, a));
+        assert!(!names(&listener, b));
+        title(&listener, &format!("{}...", &a[..29]));
+        assert!(names(&listener, a), "an abbreviated title of A keeps A");
+        // Codex names B: the binding is B at once, whatever the app has stored.
+        title(&listener, b);
+        assert!(!names(&listener, a));
+        assert!(names(&listener, b));
+        // And back to A.
+        title(&listener, a);
+        assert!(names(&listener, a));
+        assert!(!names(&listener, b));
+        // A switch reported out of band leaves A's title behind; it names
+        // nothing in the new binding.
+        let now = SystemTime::now();
+        listener.evidence.lock().switch_binding(now, now, now);
+        assert!(!names(&listener, a));
+        // A launch that didn't know its conversation knows it from its title.
+        let listener = listener_for(LaunchBinding::Unknown);
+        assert!(!names(&listener, a));
+        title(&listener, a);
+        assert!(names(&listener, a));
+        // One that knew there was a conversation but not its id, likewise.
+        let listener = listener_for(LaunchBinding::Known(None));
+        assert!(!names(&listener, a));
+    }
+
     #[test]
     fn a_launch_into_a_known_conversation_owns_a_turn_before_any_title() {
         // A fresh Claude pane: muxel minted its `--session-id`. Claude puts no
@@ -643,6 +722,28 @@ mod tests {
         assert_eq!(evidence.binding_rev(), 0);
         evidence.record_submission(at);
         assert_eq!(evidence.first_submission_binding(), None);
+    }
+
+    #[test]
+    fn ctl_ergonomics_first_binding_keeps_confirmation_but_a_switch_interrupts_it() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::for_launch(&LaunchBinding::Unknown);
+        let captured = evidence.binding_rev();
+        evidence.record_prompt_submission(at);
+        evidence.begin_binding(1);
+        assert!(
+            evidence.prompt_binding_is_current(captured),
+            "learning the first thread must not interrupt confirmation of its prompt"
+        );
+        evidence.begin_binding(2);
+        assert!(!evidence.prompt_binding_is_current(captured));
+
+        let mut external = LifecycleEvidence::for_launch(&LaunchBinding::Unknown);
+        external.switch_binding(at, at, at);
+        assert!(
+            !external.prompt_binding_is_current(0),
+            "an out-of-band switch is never a first attachment"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Guards for a startup turn. PTY silence is not an application's input-ready signal.
 
+use muxel_core::input_box::{ClaudeBox, CodexBox, read_claude_box, read_codex_box};
 use std::{io, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +21,7 @@ pub(crate) enum AcceptanceAction {
 }
 
 /// How long after its Enter a task has to show provider evidence of acceptance.
-pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct Acceptance {
@@ -58,6 +59,7 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    launch: Option<uuid::Uuid>,
 }
 
 impl Guard {
@@ -68,6 +70,7 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            launch: None,
         }
     }
 
@@ -83,6 +86,37 @@ impl Guard {
         if let Some(owner) = &self.control_turn {
             owner.submitted(at);
         }
+    }
+
+    pub(crate) fn with_launch(mut self, launch: uuid::Uuid) -> Self {
+        self.launch = Some(launch);
+        self.record_guard();
+        self
+    }
+
+    fn record_guard(&self) {
+        if let (Some(owner), Some(launch)) = (&self.control_turn, self.launch) {
+            owner.record_guard(launch, self.expected_revision);
+        }
+    }
+
+    pub(crate) fn record_paste(&self, may_have_pasted: bool) {
+        if let Some(owner) = &self.control_turn {
+            owner.record_paste(may_have_pasted);
+        }
+    }
+
+    pub(crate) fn write_error(&self, error: String) {
+        if let Some(owner) = &self.control_turn {
+            owner.write_error(error);
+        }
+    }
+
+    pub(crate) fn blocked(&mut self, blocker: muxel_core::control::StartupBlocker) {
+        if let Some(owner) = &self.control_turn {
+            owner.blocked(blocker);
+        }
+        self.fail(Stop::NotReady);
     }
 
     pub(crate) fn enter_admitted(&mut self, at: i64) {
@@ -164,6 +198,7 @@ impl Guard {
             return Err(Stop::WriteFailed);
         }
         self.expected_revision = self.expected_revision.wrapping_add(1);
+        self.record_guard();
         Ok(())
     }
 }
@@ -268,6 +303,10 @@ pub(crate) struct Screen {
     pub cursor_row: i32,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    /// A key or a paste reached the pane since its last Enter, text or not.
+    /// Codex draws a placeholder and a draft with its cursor at Home the same
+    /// way; this tells them apart where its text can't.
+    pub typed: bool,
 }
 
 /// An empty-looking, unclipped one-row origin, captured before ctl paste.
@@ -292,6 +331,91 @@ struct CodexCtlDraft {
 }
 
 impl Screen {
+    pub(crate) fn startup_blocker(&self) -> Option<muxel_core::control::StartupBlocker> {
+        use muxel_core::control::{StartupBlocker, StartupBlockerKind};
+        if self.claude_status_context().is_some()
+            || self.codex_composer_context(true).is_some()
+            || self.codex_composer_context(false).is_some()
+        {
+            return None;
+        }
+        let lower = self.text.to_ascii_lowercase();
+        let (kind, marker) = if (lower.contains("trust this folder")
+            || lower.contains("trust the files in this folder")
+            || lower.contains("folder access")
+            // Grok 1.0.70: "Do you trust the contents of this directory?",
+            // answered by y or n, so typed text would answer it.
+            || lower.contains("trust the contents of this directory"))
+            && (lower.contains("no,")
+                || lower.contains("exit")
+                || lower.contains("quit")
+                || lower.contains("back to agent command center"))
+        {
+            (StartupBlockerKind::FolderTrust, "trust")
+        } else if lower.contains("update available")
+            && lower.contains("update now")
+            && lower.contains("skip")
+        {
+            (StartupBlockerKind::CodexUpdate, "update available")
+        } else if (lower.contains("sign in with chatgpt")
+            && (lower.contains("api key") || lower.contains("device code")))
+            || (lower.contains("select login method")
+                && (lower.contains("console") || lower.contains("claude account")))
+        {
+            (
+                StartupBlockerKind::Login,
+                if lower.contains("sign in with chatgpt") {
+                    "sign in"
+                } else {
+                    "select login"
+                },
+            )
+        } else {
+            return None;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let start = rows
+            .iter()
+            .position(|row| row.to_ascii_lowercase().contains(marker))
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let excerpt = rows[start..]
+            .iter()
+            .map(|row| row.trim_end())
+            .skip_while(|row| row.is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(600)
+            .collect();
+        Some(StartupBlocker { kind, excerpt })
+    }
+
+    /// A folder-trust card drawn as its own rows, as Grok 1.0.70 and Codex
+    /// 0.164 draw theirs: its question opens one row and an answer opens
+    /// another. A draft or reply quoting a card inside a sentence isn't one,
+    /// which matters for providers whose input box muxel can't find to leave
+    /// out. Claude's card reads as Blocked through its own status instead.
+    pub(crate) fn folder_trust_card(&self) -> bool {
+        let opens = |starts: &[&str]| {
+            self.text
+                .lines()
+                .map(str::trim)
+                .any(|row| starts.iter().any(|start| row.starts_with(start)))
+        };
+        opens(&[
+            "Do you trust the contents of this directory?",
+            "Trust this folder?",
+            "Folder access",
+        ]) && opens(&[
+            "No, quit",
+            "2. Quit",
+            "enter continue · esc quit",
+            "enter continue · esc back",
+        ])
+    }
+
     // Master can render a model row followed by a shortcuts footer. The
     // generic composer scan uses the last footer; ctl's geometry proof pins
     // the earlier model row when both are present.
@@ -406,6 +530,13 @@ impl Screen {
         let indent = prompt.bytes().take_while(|byte| *byte == b' ').count();
         let content = prompt[indent..].strip_prefix("› ")?.trim_end_matches(' ');
         if !matches!(content, "" | "Ask Codex to do anything") {
+            return None;
+        }
+        // The proof starts with the cursor at the prompt's start. A blank row
+        // with the cursor further along holds typed spaces.
+        if usize::try_from(self.cursor_row).ok() != Some(region.start)
+            || self.cursor_column != indent + 2
+        {
             return None;
         }
         Some(CodexCtlOrigin {
@@ -577,10 +708,51 @@ impl Screen {
             .chars()
             .take_while(|ch| ch.is_whitespace())
             .count();
-        if (cursor == top && self.cursor_column == prefix + 2) != empty {
+        // The editor ends above the status footer, which can take two rows.
+        let end = Self::codex_ctl_footer(rows, bottom)?.max(top + 1);
+        let below = &rows[top + 1..end];
+        // One row with the cursor at its start is empty unless a key or paste
+        // reached the pane since the last Enter, since Codex may show a
+        // placeholder muxel doesn't know there. Otherwise the text decides, so
+        // a draft with its cursor at Home (typed, or recalled with Up) is
+        // still a draft.
+        let at_start = cursor == top
+            && self.cursor_column == prefix + 2
+            && below.iter().all(|row| row.trim().is_empty());
+        let first = rows[top].trim_start().strip_prefix('›').unwrap_or_default();
+        let text: Vec<&str> = std::iter::once(first)
+            .chain(below.iter().copied())
+            .collect();
+        let is_empty = (at_start && !self.typed) || read_codex_box(&text) != CodexBox::Typed;
+        if is_empty != empty {
             return None;
         }
         Some(top..bottom)
+    }
+
+    /// Whether Codex's live editor holds text, when it is drawn: the cursor at
+    /// the prompt's start means empty (a placeholder suggestion may show there),
+    /// anywhere else in the editor means a draft. `None` when no editor is found.
+    pub(crate) fn codex_composer_draft(&self) -> Option<bool> {
+        let rows: Vec<_> = self.text.lines().collect();
+        if self.codex_composer_rows(&rows, true).is_some() {
+            Some(false)
+        } else if self.codex_composer_rows(&rows, false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::codex_composer_draft`] for Claude's framed input box.
+    pub(crate) fn claude_composer_draft(&self) -> Option<bool> {
+        if self.composer_rows(true).is_some() {
+            Some(false)
+        } else if self.composer_rows(false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
@@ -625,6 +797,44 @@ impl Screen {
         .collect::<Vec<_>>()
         .join(" ");
         normalized(&text) == normalized(input)
+    }
+
+    /// A strict pending proof cannot recover hard line breaks or Unicode cell
+    /// widths from rendered rows. Only a complete single ASCII row qualifies.
+    pub(crate) fn claude_exact_draft(&self, input: &str) -> bool {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Some(region) = self.composer_rows(false) else {
+            return false;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let top = region.start;
+        if usize::try_from(self.cursor_row).ok() != Some(top)
+            || rows[top + 1..region.end]
+                .iter()
+                .any(|row| !row.trim().is_empty())
+        {
+            return false;
+        }
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            + 2;
+        let end = prefix + input.len();
+        self.cursor_column == end
+            && rows[top]
+                .chars()
+                .skip(prefix)
+                .take(input.len())
+                .collect::<String>()
+                == input
+            && rows[top].chars().skip(end).all(char::is_whitespace)
     }
 
     /// The cursor must belong to the live input region between two rules. A menu
@@ -710,8 +920,16 @@ impl Screen {
             return None;
         }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
+        // The cursor at the prompt's start means empty only while the box
+        // shows nothing a person typed: a draft with its cursor moved Home is
+        // still a draft.
+        let text_rows: Vec<&str> = std::iter::once(after)
+            .chain(rows[top + 2..bottom].iter().copied())
+            .collect();
+        let empty_box =
+            cursor_at_start && read_claude_box(&text_rows, cursor_at_start) != ClaudeBox::Typed;
         empty
-            .is_none_or(|empty| cursor_at_start == empty)
+            .is_none_or(|empty| empty_box == empty)
             .then_some(top + 1..bottom)
     }
 }
@@ -788,6 +1006,7 @@ mod tests {
             cursor_row: row,
             cursor_visible: true,
             bracketed_paste: true,
+            typed: false,
         }
     }
 
@@ -885,13 +1104,55 @@ mod tests {
         assert_eq!(acceptance.observe(ms(5000), false, true), RetryEnter);
         assert_eq!(acceptance.observe(ms(5100), false, true), Observe);
         assert_eq!(acceptance.observe(ms(9999), false, true), Observe);
-        assert_eq!(acceptance.observe(ms(10_000), false, true), Failed);
+        assert_eq!(acceptance.observe(ms(60_000), false, true), Failed);
         let mut unsupported_retry = Acceptance::default();
         assert_eq!(unsupported_retry.observe(ms(5000), false, false), Observe);
         assert_eq!(unsupported_retry.observe(ms(6000), false, true), Observe);
-        assert_eq!(unsupported_retry.observe(ms(10_000), false, false), Failed);
+        assert_eq!(unsupported_retry.observe(ms(60_000), false, false), Failed);
         let mut accepted = Acceptance::default();
         assert_eq!(accepted.observe(ms(5000), true, true), Accepted);
+    }
+
+    #[test]
+    fn known_startup_blockers_are_named_without_treating_quoted_drafts_as_menus() {
+        use muxel_core::control::StartupBlockerKind;
+        for (text, kind) in [
+            (
+                "Trust this folder?\n› Yes, continue\n  No, quit\nEnter to confirm",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Accessing workspace\n❯ No, exit\n  Yes, I trust this folder",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                // Grok 1.0.70, answered by y or n.
+                "Do you trust the contents of this directory?\nproject\nGrok Build may run or modify contents in this directory,\nposing security risks.\n     Yes, proceed      y\n     No, quit          n",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Update available!\n1. Update now\n2. Skip until next version",
+                StartupBlockerKind::CodexUpdate,
+            ),
+            (
+                "Sign in with ChatGPT\nSign in with a device code\nUse an API key",
+                StartupBlockerKind::Login,
+            ),
+        ] {
+            let blocker = screen(text, 1, 2).startup_blocker().unwrap();
+            assert_eq!(blocker.kind, kind);
+            assert!(blocker.excerpt.chars().count() <= 600);
+        }
+        let quoted = screen(
+            "Claude Code\n────────────────\n❯ Explain: Trust this folder? No, exit\n────────────────\n? for shortcuts",
+            2,
+            42,
+        );
+        assert!(quoted.startup_blocker().is_none());
     }
 
     #[test]
@@ -926,6 +1187,39 @@ mod tests {
         assert!(!residual_menu.codex_draft_matches("task"));
     }
 
+    /// Codex draws a draft whose cursor is at Home where it draws a
+    /// placeholder: text from the prompt row's start, the cursor before it
+    /// (Codex 0.167.2, "fix the login bug" then Home). Keys tell them apart:
+    /// a draft takes keys or a paste since the last Enter, typed or recalled.
+    /// One row with none is empty whatever it says, since Codex may show a
+    /// placeholder muxel doesn't know. Several rows are read by their text.
+    #[test]
+    fn a_codex_draft_with_its_cursor_at_home_is_a_draft() {
+        let at_home = |draft: &[&str], typed| {
+            let mut sample = ctl_screen(draft, false);
+            sample.cursor_row -= draft.len() as i32 - 1;
+            sample.cursor_column = 2;
+            sample.typed = typed;
+            sample
+        };
+        let one = ["fix the login bug"];
+        let two = ["fix the login bug", "and the logout one"];
+        for (draft, typed) in [(&one[..], true), (&two[..], true), (&two[..], false)] {
+            let sample = at_home(draft, typed);
+            assert!(sample.codex_composer_context(true).is_none(), "{draft:?}");
+            assert!(sample.codex_composer_context(false).is_some(), "{draft:?}");
+        }
+        for (text, typed) in [
+            ("Write tests for @filename", false),
+            ("Ask Codex to do anything", true),
+            ("", true),
+        ] {
+            let sample = at_home(&[text], typed);
+            assert!(sample.codex_composer_context(true).is_some(), "{text:?}");
+            assert!(sample.codex_composer_context(false).is_none(), "{text:?}");
+        }
+    }
+
     fn ctl_screen_with_width(draft: &[&str], consumed: bool, width: usize) -> Screen {
         let mut rows = vec![String::new(); 51];
         rows[0] = "OpenAI Codex".into();
@@ -953,6 +1247,49 @@ mod tests {
 
     fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
         ctl_screen_with_width(draft, consumed, 41)
+    }
+
+    /// `ctl send` refuses a pane whose composer holds text. A placeholder
+    /// suggestion drawn in an empty composer must not read as one.
+    #[test]
+    fn a_drawn_composer_says_whether_it_holds_a_draft() {
+        for placeholder in ["", "Ask Codex to do anything", "Write tests for @filename"] {
+            assert_eq!(
+                ctl_origin(placeholder).codex_composer_draft(),
+                Some(false),
+                "{placeholder:?}"
+            );
+        }
+        assert_eq!(
+            ctl_screen(&["half typed"], false).codex_composer_draft(),
+            Some(true)
+        );
+        assert_eq!(
+            ctl_screen(&["first line", "second"], false).codex_composer_draft(),
+            Some(true)
+        );
+        // A draft with its cursor at Home, after the keys that put it there.
+        let mut home = ctl_origin("fix the login bug");
+        home.typed = true;
+        assert_eq!(home.codex_composer_draft(), Some(true));
+        let mut hidden = ctl_screen(&["half typed"], false);
+        hidden.cursor_visible = false;
+        assert_eq!(hidden.codex_composer_draft(), None);
+
+        let rule = "─".repeat(12);
+        let claude = |prompt: &str, column| {
+            screen(&format!("header\n{rule}\n❯ {prompt}\n{rule}"), 2, column)
+        };
+        assert_eq!(claude("", 2).claude_composer_draft(), Some(false));
+        assert_eq!(
+            claude("Try \"refactor app.rs\"", 2).claude_composer_draft(),
+            Some(false)
+        );
+        assert_eq!(claude("half typed", 12).claude_composer_draft(), Some(true));
+        assert_eq!(
+            screen("a permission dialog, no input box", 0, 0).claude_composer_draft(),
+            None
+        );
     }
 
     fn ctl_origin(text: &str) -> Screen {
@@ -1360,7 +1697,7 @@ mod tests {
     #[test]
     fn real_composer_allows_placeholder_and_wrapped_or_multiline_draft() {
         let empty = screen(
-            "Claude Code\n────────────────\n❯ Try a task\n────────────────\nmode",
+            "Claude Code\n────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────\nmode",
             2,
             2,
         );
@@ -1373,6 +1710,32 @@ mod tests {
         );
         assert!(!draft.claude_composer(true));
         assert!(draft.claude_composer(false));
+    }
+    /// Claude 2.1.322 as recorded: a draft with its cursor moved Home is a draft,
+    /// and only a blank box or its `Try "…"` suggestion is empty. A Claude run
+    /// with `NO_COLOR` draws the suggestion like typed text, so only the text
+    /// tells them apart.
+    #[test]
+    fn a_claude_draft_with_its_cursor_at_the_start_is_a_draft() {
+        let rule = "─".repeat(40);
+        for (rows, empty) in [
+            ("❯ fix the login bug", false),
+            ("❯ fix the login bug and\n  then the signup form", false),
+            ("❯ Try \"fix lint errors\"", true),
+            (
+                "❯ Try \"write a test for a function in\n  <filepath>\"",
+                true,
+            ),
+            ("❯ ", true),
+        ] {
+            let home = screen(
+                &format!("Claude Code\n{rule}\n{rows}\n{rule}\n  ? for shortcuts"),
+                2,
+                2,
+            );
+            assert_eq!(home.claude_composer(true), empty, "{rows:?}");
+            assert_eq!(home.claude_composer(false), !empty, "{rows:?}");
+        }
     }
     #[test]
     fn status_box_edges_ignore_a_rule_typed_into_the_draft() {
@@ -1398,7 +1761,7 @@ mod tests {
                 2,
             ),
             (
-                "❯ /b12-ready\n● quoted answer\n────────────────\n❯ Try a task\n────────────────\nmode",
+                "❯ /b12-ready\n● quoted answer\n────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────\nmode",
                 0,
                 2,
             ),
@@ -1410,7 +1773,11 @@ mod tests {
         ] {
             assert!(!screen(text, row, column).claude_composer(true));
         }
-        let mut sample = screen("────────────────\n❯ Try a task\n────────────────", 1, 2);
+        let mut sample = screen(
+            "────────────────\n❯ Try \"write a test for <filepath>\"\n────────────────",
+            1,
+            2,
+        );
         sample.bracketed_paste = false;
         assert!(!sample.claude_composer(true));
         sample.bracketed_paste = true;

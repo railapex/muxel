@@ -14,6 +14,7 @@ pub mod diff;
 pub mod geometry;
 mod gui_path;
 pub mod import;
+pub mod input_box;
 pub mod isolated_root;
 pub mod library;
 pub mod locale;
@@ -22,10 +23,12 @@ pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
+pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
 pub mod sound_alert;
@@ -48,8 +51,8 @@ pub use agent::{
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
     codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
-    find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
+    memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
@@ -2039,6 +2042,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -2254,6 +2258,15 @@ fn default_pane_border() -> String {
 fn default_terminal_mouse() -> String {
     "copy_paste".to_string()
 }
+
+fn default_new_agent_placement() -> String {
+    NEW_AGENT_TAB.to_string()
+}
+
+/// [`Settings::new_agent_placement`]: a new agent joins the focused pane as a tab.
+pub const NEW_AGENT_TAB: &str = "tab";
+/// [`Settings::new_agent_placement`]: a new agent gets a pane of its own.
+pub const NEW_AGENT_PANE: &str = "pane";
 
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2714,6 +2727,11 @@ pub struct Settings {
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
+    /// Where the toolbar's agent button and Ctrl+Alt+1–9 put a new agent:
+    /// [`NEW_AGENT_TAB`] (in the focused pane) or [`NEW_AGENT_PANE`] (a new pane
+    /// beside it). Anything else reads as a tab.
+    #[serde(default = "default_new_agent_placement")]
+    pub new_agent_placement: String,
     /// Diff window layout: `true` = side-by-side split, `false` = unified.
     #[serde(default)]
     pub diff_split_view: bool,
@@ -2932,6 +2950,12 @@ impl Settings {
     /// The per-process limit for new local panes, in bytes; `None` when off.
     pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
         (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
+
+    /// Whether new agents get a pane of their own rather than a tab in the
+    /// focused pane (see [`Settings::new_agent_placement`]).
+    pub fn new_agents_open_as_panes(&self) -> bool {
+        self.new_agent_placement == NEW_AGENT_PANE
     }
 }
 
@@ -3205,6 +3229,7 @@ impl Default for Settings {
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
+            new_agent_placement: default_new_agent_placement(),
             diff_split_view: false,
             minimize_to_tray: false,
             dev_console_enabled: false,
@@ -3957,6 +3982,32 @@ mod settings_tests {
     }
 
     #[test]
+    fn new_agents_open_as_tabs_unless_set_to_panes() {
+        assert!(!Settings::default().new_agents_open_as_panes());
+        // A config from before the setting existed keeps opening tabs.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("new_agent_placement");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.new_agent_placement, NEW_AGENT_TAB);
+        let panes = Settings {
+            new_agent_placement: NEW_AGENT_PANE.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&panes).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .new_agents_open_as_panes()
+        );
+        // A value this version doesn't know reads as the default, a tab.
+        let odd = Settings {
+            new_agent_placement: "window".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.new_agents_open_as_panes());
+    }
+
+    #[test]
     fn settings_terminal_mouse_default_and_round_trip() {
         assert_eq!(Settings::default().terminal_mouse, "copy_paste");
         // An old config missing the key still loads, defaulting to copy_paste.
@@ -4130,6 +4181,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4214,6 +4266,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4228,6 +4281,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4243,6 +4297,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4396,6 +4451,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4448,6 +4504,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4495,6 +4552,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4537,6 +4595,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4934,11 +4993,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -5096,6 +5157,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -5144,6 +5206,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];

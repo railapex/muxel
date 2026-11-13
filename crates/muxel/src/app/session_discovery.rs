@@ -565,6 +565,16 @@ impl DiscoveryCandidate {
 struct DiscoveryBatch {
     results: Vec<DiscoveryResult>,
     grok_read: Option<(SystemTime, SystemTime)>,
+    /// Each Claude pane's end record for the conversation it was bound to when
+    /// its lookup began (see [`session_binding::ClaudeEnd`]).
+    claude_ends: Vec<ClaudeEndRead>,
+}
+
+/// One read of a pane's end record for `session`.
+pub(super) struct ClaudeEndRead {
+    pub(super) pane: Uuid,
+    pub(super) session: String,
+    pub(super) end: std::io::Result<Option<session_binding::ClaudeEnd>>,
 }
 
 #[cfg(windows)]
@@ -1002,6 +1012,11 @@ impl MuxelApp {
     ) {
         #[cfg(not(windows))]
         let _ = batch.grok_read;
+        // Before staging: a start this batch read is judged against the end
+        // read with it.
+        for read in batch.claude_ends {
+            self.note_claude_end(read, cx);
+        }
         let mut ownership = self.session_ownership(cx);
         let mut updates = Vec::new();
         for (request, candidate, miss, observed_hint) in batch.results {
@@ -1338,6 +1353,36 @@ impl MuxelApp {
             session_binding::acknowledge_claude_binding(record);
             return None;
         }
+        let bound_ended =
+            bound.is_some_and(|bound| self.claude_bound_conversation_ended(iid, bound, cx));
+        // On Claude Code 2.1.322 `/fork` starts a copy beside the pane's
+        // conversation. The copy inherits the pane's environment, so its start
+        // reaches this pane's hook, but the pane stays where it was and ends
+        // nothing. A fork start moves the pane only after the bound
+        // conversation's end.
+        if binding.from_fork && !bound_ended {
+            self.remember_claude_hook(iid, Some(launch), current);
+            session_binding::acknowledge_claude_binding(record);
+            return None;
+        }
+        // Claude ends the pane's conversation before it starts the next: a
+        // `/clear` or `/resume` start follows the bound one's end record. One
+        // with no end before it means the SessionEnd hook didn't write, so in
+        // this terminal muxel can't see the next end before the next start.
+        // The launch's own start has no end before it by design.
+        if !confirms_launch
+            && !binding.from_fork
+            && let Some(bound) = bound
+            && !bound_ended
+            && self.claude_end_hook_missed.insert(launch)
+        {
+            log::warn!(
+                "Claude started conversation {} in pane {iid} with no end record for {bound} \
+                 before it: its SessionEnd hook didn't write. Until the pane restarts, a send \
+                 pinned to its conversation is guarded only by muxel adopting the next one",
+                binding.session_id
+            );
+        }
         let switched_at = receipt_at.unwrap_or_else(SystemTime::now);
         // A new nonce can report A -> B -> A between reads even when the final
         // UUID equals the saved one. It still needs a runtime boundary.
@@ -1448,6 +1493,12 @@ impl MuxelApp {
                 {
                     view.update(cx, |view, cx| view.set_muse_hook_state(&metadata, cx));
                 }
+                // After the switch: the adopted id names the binding the
+                // terminal is in now. Codex's title began that binding
+                // already, and this result was checked against it. A hook
+                // record's switch time says when that binding began, so an
+                // end record from before it is an earlier binding's.
+                self.note_adopted_conversation(update.pane, update.switched.map(|(_, to)| to), cx);
             }
             cx.notify();
             true
@@ -1628,12 +1679,34 @@ fn discover_sessions(
             );
             (request, candidate, miss, observed_hint)
         })
-        .collect();
+        .collect::<Vec<DiscoveryResult>>();
     #[cfg(windows)]
     let grok_read = grok_snapshot.map(|(read, _, _)| (read.started, read.finished));
     #[cfg(not(windows))]
     let grok_read = None;
-    DiscoveryBatch { results, grok_read }
+    // After the start records: Claude writes a conversation's end record
+    // before the start record that follows it, so a start read above has its
+    // end here.
+    let claude_ends = data_dir.map_or_else(Vec::new, |data_dir| {
+        results
+            .iter()
+            .filter(|(request, ..)| request.key.provider == SessionProvider::Claude)
+            .filter_map(|(request, ..)| {
+                let session = request.key.binding.clone()?;
+                let end = session_binding::read_claude_end(data_dir, request.key.pane, &session);
+                Some(ClaudeEndRead {
+                    pane: request.key.pane,
+                    session,
+                    end,
+                })
+            })
+            .collect()
+    });
+    DiscoveryBatch {
+        results,
+        grok_read,
+        claude_ends,
+    }
 }
 
 /// Called only after the UI has validated the worker key and launch owner.
@@ -1850,6 +1923,7 @@ mod grok_regressions {
                     None,
                 )],
                 grok_read: Some((now, now)),
+                claude_ends: Vec::new(),
             },
             muxel_store::data_dir().as_deref(),
             cx,
@@ -1899,6 +1973,7 @@ mod grok_regressions {
                                 None,
                             )],
                             grok_read: Some((now, now)),
+                            claude_ends: Vec::new(),
                         },
                         muxel_store::data_dir().as_deref(),
                         cx,
@@ -2190,6 +2265,7 @@ mod grok_regressions {
                             ),
                         ],
                         grok_read: Some((read, read)),
+                        claude_ends: Vec::new(),
                     },
                     muxel_store::data_dir().as_deref(),
                     cx,
@@ -2231,6 +2307,7 @@ mod grok_regressions {
                     session.mark_turn_submitted();
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
+                        background: None,
                         status: AgentStatus::Done,
                         attributable: true,
                         reason: TerminalStatusReason::Quiet,
@@ -2539,6 +2616,75 @@ mod claude_watch_regressions {
         });
     }
 
+    /// Claude's `SessionStart` hook from the copy `/fork` starts. Returns
+    /// the copy's session.
+    fn fork_hook(data: &Path, project: &Path, pane: Uuid) -> String {
+        let copy = Uuid::new_v4().to_string();
+        let event = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "fork",
+            "session_id": copy,
+            "cwd": project,
+            "transcript_path": project.join(format!("{copy}.jsonl")),
+        });
+        session_binding::write_claude_binding_from_reader(data, pane, event.to_string().as_bytes())
+            .unwrap();
+        copy
+    }
+
+    /// Claude's `SessionEnd` hook for `session`, which `/clear` runs before
+    /// it starts the next conversation.
+    fn end_hook(data: &Path, project: &Path, pane: Uuid, session: &str) {
+        let event = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "reason": "clear",
+            "session_id": session,
+            "cwd": project,
+            "transcript_path": project.join(format!("{session}.jsonl")),
+        });
+        session_binding::write_claude_binding_from_reader(data, pane, event.to_string().as_bytes())
+            .unwrap();
+    }
+
+    /// `/fork` on Claude Code 2.1.322 starts a copy beside the pane's
+    /// conversation, and the copy's start reaches the pane's hook. The pane
+    /// stays in its conversation, so muxel takes the record in and keeps the
+    /// binding. A `/clear` after it ends the conversation first, then moves
+    /// the pane.
+    #[test]
+    fn a_fork_copy_leaves_the_pane_in_its_conversation() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let _home = claude_test_home(Some(data.join("home")));
+            let (pane, session, project) = claude_pane(cx, window, &data, false);
+            first_lookup(cx, window);
+            let original = window
+                .update(cx, |app, _, _| {
+                    app.workspace.instance(pane).unwrap().session_id.clone()
+                })
+                .unwrap()
+                .unwrap();
+            let copy = fork_hook(&data, &project, pane);
+            let bound = bound_within(cx, window, pane, &copy, Duration::from_secs(2), true);
+            assert_eq!(
+                bound.as_deref(),
+                Some(original.as_str()),
+                "the pane moved to the fork copy"
+            );
+            assert!(
+                session_binding::read_pending_claude_binding(&data, pane)
+                    .unwrap()
+                    .is_none(),
+                "the fork record was never taken in"
+            );
+            end_hook(&data, &project, pane, &original);
+            let next = clear_hook(&data, &project, pane);
+            let bound = bound_within(cx, window, pane, &next, Duration::from_secs(10), true);
+            session.kill();
+            assert_eq!(bound.as_deref(), Some(next.as_str()));
+        });
+    }
+
     /// Follow a watch on `backend`, a stand-in for notify's.
     fn follow_test_backend(
         cx: &mut TestAppContext,
@@ -2633,6 +2779,7 @@ mod claude_watch_regressions {
                     let batch = DiscoveryBatch {
                         results: vec![(request, DiscoveryCandidate::Unresolved, None, None)],
                         grok_read: None,
+                        claude_ends: Vec::new(),
                     };
                     app.apply_discovery_batch(batch, Some(&data), cx);
                     next
@@ -2666,6 +2813,7 @@ mod claude_watch_regressions {
                     let batch = DiscoveryBatch {
                         results: vec![(request, DiscoveryCandidate::Unresolved, None, None)],
                         grok_read: None,
+                        claude_ends: Vec::new(),
                     };
                     app.apply_discovery_batch(batch, Some(&data), cx);
                     next
