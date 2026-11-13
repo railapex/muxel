@@ -6485,6 +6485,8 @@ pub struct MuxelApp {
     workspace_lock: Option<std::fs::File>,
     /// Unsent drafts offered on restarted panes and kept from closed ones.
     rescue: rescue::Rescue,
+    /// What came back with each pane, for its bar until dismissed.
+    return_lines: pane_bar::ReturnLines,
     /// A workspace the user tried to enter that another muxel process already
     /// holds open — surfaced as an inline note in the selector. Cleared on a
     /// successful entry or when the selector is dismissed.
@@ -8796,6 +8798,7 @@ impl MuxelApp {
             show_workspace_selector: true,
             workspace_lock: None,
             rescue: rescue::Rescue::default(),
+            return_lines: pane_bar::ReturnLines::default(),
             workspace_busy: None,
             workspaces_in_use: HashSet::new(),
             pane_oom_seen: HashMap::new(),
@@ -16228,11 +16231,17 @@ impl MuxelApp {
         muxel_store::append_event_log(&format!(
             "resume: \"{title}\" [{iid}] saved conversation gone, starting a new one"
         ));
-        self.add_event(
-            NotifKind::Success,
-            tf("{title}: started fresh", &[("title", &title)]),
-            t("no history"),
-        );
+        // The pane's bar says so until dismissed. The feed hears of it only
+        // when it happened in a pane other than the one in front.
+        self.return_lines.started_fresh.insert(iid);
+        let in_front = self.active_instance == Some(iid);
+        if !in_front {
+            self.add_event(
+                NotifKind::Success,
+                tf("{title}: started fresh", &[("title", &title)]),
+                t("no history"),
+            );
+        }
     }
 
     /// Show event `id` in the feed as its newest entry, replacing the earlier

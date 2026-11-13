@@ -1,8 +1,10 @@
 #![cfg(windows)]
 //! The pane bar against real PTY children: an ended pane's lines and its
-//! Enter, beside a running pane whose Enter stays its program's.
+//! Enter, beside a running pane whose Enter stays its program's; and what
+//! came back with a pane, line by line until dismissed.
 
 use super::popout_lifecycle_tests::with_app_drawing;
+use super::rescue::CrashNotice;
 use super::{Instance, MuxelApp, PaneNode, Project};
 use gpui::{AppContext, Context, Entity, TestAppContext, VisualTestContext, Window, WindowHandle};
 use muxel_core::add_tab;
@@ -196,6 +198,81 @@ fn an_ended_pane_shows_ended_and_its_unsent_prompt_and_enter_restarts_only_it() 
                 );
                 // Never let the deferred launch run its (missing) program.
                 app.close_instance(ended, cx);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_pane_says_what_came_back_with_it_until_each_line_is_dismissed() {
+    with_app_drawing(true, |cx, window| {
+        let pid = project(cx, window);
+        let (front, behind) = window
+            .update(cx, |app, window, cx| {
+                let script = "@echo back\r\n@more\r\n";
+                let (behind, _) = pane(app, window, cx, pid, "behind", script);
+                let (front, _) = pane(app, window, cx, pid, "front", script);
+                app.focus_instance(front, window, cx);
+                (front, behind)
+            })
+            .unwrap();
+        // A pane still starting shows its placeholder, not its screen and bar.
+        wait_until(cx, window, "the front pane to draw", move |app, cx| {
+            app.terminals
+                .get(&front)
+                .is_some_and(|view| view.read(cx).has_visible_content())
+        });
+        window
+            .update(cx, |app, _, cx| {
+                assert_eq!(app.active_instance, Some(front));
+                // muxel stopped uncleanly with the front pane mid-turn, and
+                // both panes came back in new conversations.
+                app.load_workspace_rescue(Some(CrashNotice {
+                    mid_turn: vec![front],
+                    ..CrashNotice::default()
+                }));
+                let fresh_in_feed = |app: &MuxelApp| {
+                    app.notifications
+                        .iter()
+                        .filter(|n| n.title.ends_with(": started fresh"))
+                        .count()
+                };
+                app.report_conversation_gone(front);
+                assert_eq!(fresh_in_feed(app), 0, "the pane in front");
+                app.report_conversation_gone(behind);
+                assert_eq!(fresh_in_feed(app), 1, "the pane behind it");
+                let lines = |app: &MuxelApp, iid: Uuid, cx: &gpui::App| -> Vec<BarLine> {
+                    app.pane_bar_lines(iid, cx)
+                        .into_iter()
+                        .map(|placed| placed.line)
+                        .collect()
+                };
+                assert_eq!(
+                    lines(app, front, cx),
+                    [BarLine::WasWorking, BarLine::StartedFresh]
+                );
+                assert_eq!(lines(app, behind, cx), [BarLine::StartedFresh]);
+                // Each line goes on its own dismiss, and only that pane's.
+                app.dismiss_return_line(front, true);
+                assert_eq!(lines(app, front, cx), [BarLine::WasWorking]);
+                assert_eq!(lines(app, behind, cx), [BarLine::StartedFresh]);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        {
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            let selector: &'static str =
+                Box::leak(format!("pane-bar-{}", front.simple()).into_boxed_str());
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "the bar wasn't drawn"
+            );
+        }
+        window
+            .update(cx, |app, _, cx| {
+                app.dismiss_return_line(front, false);
+                assert!(app.pane_bar_lines(front, cx).is_empty());
             })
             .unwrap();
     });

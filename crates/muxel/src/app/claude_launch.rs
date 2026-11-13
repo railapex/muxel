@@ -1112,11 +1112,9 @@ mod tests {
                     assert_ne!(pane.session_id, old);
                     assert!(pane.session_path.is_some());
                     assert!(!pane.session_started);
-                    // The pane comes back empty, so the user is told why.
+                    // The pane comes back empty, so its bar says why.
                     assert!(
-                        app.notifications
-                            .iter()
-                            .any(|n| n.title.ends_with(": started fresh")),
+                        app.return_lines.started_fresh.contains(&id),
                         "a lost conversation started anew without a word"
                     );
                 })

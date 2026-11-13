@@ -1,13 +1,26 @@
 //! The pane bar (stop-and-return design, § 3): one row at the bottom of a
-//! terminal pane for how its program ended and what waits for it, in the
-//! order `muxel_core::pane_bar::arrange` gives. It takes the place of the exit
-//! banner, and rescue's unsent-prompt offer is one of its lines. It pushes the
+//! terminal pane for how its program ended, what came back with it and what
+//! waits for it, in the order `muxel_core::pane_bar::arrange` gives. It takes
+//! the place of the exit banner, and rescue's unsent-prompt offer is one of
+//! its lines. It pushes the
 //! pane's screen up rather than drawing over it, so browser panes need no
 //! overlay flag for it.
 
 use super::rescue::RestoreButton;
 use super::*;
 use muxel_core::pane_bar::{BarLine, Ending, Placed, Urgency, arrange};
+
+/// What came back with a pane (design § 4), each shown in its bar until
+/// dismissed. Kept only while muxel runs.
+#[derive(Default)]
+pub(super) struct ReturnLines {
+    /// Panes that came back in a new conversation because the saved one was
+    /// gone.
+    pub(super) started_fresh: HashSet<Uuid>,
+    /// Panes whose agent was working, at muxel's last save, when muxel
+    /// stopped uncleanly.
+    pub(super) was_working: HashSet<Uuid>,
+}
 
 impl MuxelApp {
     /// What pane `iid`'s bar shows, in its order, with its one primary.
@@ -28,6 +41,12 @@ impl MuxelApp {
                     ))
                 });
             }
+        }
+        if self.return_lines.was_working.contains(&iid) {
+            lines.push(BarLine::WasWorking);
+        }
+        if self.return_lines.started_fresh.contains(&iid) {
+            lines.push(BarLine::StartedFresh);
         }
         if let Some(offers) = self.rescue.offers.get(&iid)
             && !offers.is_empty()
@@ -70,6 +89,9 @@ impl MuxelApp {
                         RestoreButton::Plain
                     };
                     self.render_draft_offer(iid, restore, cx)
+                }
+                BarLine::StartedFresh | BarLine::WasWorking => {
+                    Some(Self::render_return_line(iid, &placed.line, cx))
                 }
             };
             if let Some(row) = row {
@@ -187,6 +209,43 @@ impl MuxelApp {
             t("Connection lost — reconnecting…"),
             Some(hint),
         )
+    }
+
+    /// `∅ Started fresh · no history  [×]` or `! Was working at exit  [×]`:
+    /// what came back with the pane, amber until dismissed.
+    fn render_return_line(iid: Uuid, line: &BarLine, cx: &mut Context<Self>) -> AnyElement {
+        let fresh = matches!(line, BarLine::StartedFresh);
+        let (glyph, label, id) = if fresh {
+            ("∅", t("Started fresh · no history"), "fresh")
+        } else {
+            ("!", t("Was working at exit"), "working")
+        };
+        let dismiss = Button::new(format!("pane-bar-dismiss-{id}-{iid}"))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Close)
+            .tooltip(t("Dismiss"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.dismiss_return_line(iid, fresh);
+                cx.notify();
+            }));
+        Self::bar_line(
+            cx.theme().warning.opacity(0.15),
+            cx.theme().foreground,
+            glyph,
+            label,
+            Some(dismiss.into_any_element()),
+        )
+    }
+
+    /// Drop pane `iid`'s started-fresh line, or its was-working line.
+    pub(super) fn dismiss_return_line(&mut self, iid: Uuid, fresh: bool) {
+        let lines = if fresh {
+            &mut self.return_lines.started_fresh
+        } else {
+            &mut self.return_lines.was_working
+        };
+        lines.remove(&iid);
     }
 
     /// One bar line: glyph, words, and its action at the end.

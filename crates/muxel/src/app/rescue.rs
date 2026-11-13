@@ -548,8 +548,13 @@ impl MuxelApp {
     }
 
     /// Load what the newly entered workspace kept: settle drafts of panes
-    /// that no longer exist, and list closed panes' drafts.
+    /// that no longer exist, and list closed panes' drafts. Panes the crash
+    /// notice counts as working also say so in their own bars.
     pub(super) fn load_workspace_rescue(&mut self, crash: Option<CrashNotice>) {
+        self.return_lines.was_working = crash
+            .iter()
+            .flat_map(|notice| notice.mid_turn.iter().copied())
+            .collect();
         self.rescue.crash = crash;
         self.rescue.reviewed.clear();
         let Some(dir) = self.rescue_dir() else {

@@ -114,8 +114,9 @@ feature is added or changed, update the matching entry here in the same change**
   panes stay running. `ctl status` reports `not_running_reason: "sleeping"` and
   whether a wake `resumes` the conversation, and `ctl wake AGENT` resumes one
   without moving focus. A wake that finds the saved conversation deleted
-  starts a new one in the same folder, and Notifications says "started fresh ·
-  no history".
+  starts a new one in the same folder, and its pane bar says **Started fresh ·
+  no history** until dismissed; Notifications says so too when the pane isn't
+  the one in front.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
@@ -1451,13 +1452,16 @@ feature is added or changed, update the matching entry here in the same change**
   is named as such — **Ended · signal Hangup/Killed/Terminated** — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
   of its own and it would otherwise be indistinguishable from `exit(1)`.
-- **Pane bar** — the row under a terminal pane for how its program ended and what
-  waits for it: the Ended line, a remote pane's reconnecting line, and unsent
-  prompts. A line saying the program isn't running comes first, then a loss, then
-  what waits on you, then the rest, three lines at most. Only the top line has a
-  primary button, so an ended pane's is Restart, and its unsent prompt's
-  **Restore** waits until it runs again (**Restart first**). It pushes the screen
-  up rather than covering it.
+- **Pane bar** — the row under a terminal pane for how its program ended, what
+  came back with it, and what waits for it: the Ended line, a remote pane's
+  reconnecting line, **Started fresh · no history** when its saved conversation
+  was gone, **Was working at exit** when muxel stopped uncleanly with its agent
+  working at the last save, and unsent prompts. The two return lines are amber
+  and stay until their × dismisses them. A line saying the program isn't running
+  comes first, then a loss, then what waits on you, then the rest, three lines at
+  most. Only the top line has a primary button, so an ended pane's is Restart,
+  and its unsent prompt's **Restore** waits until it runs again (**Restart
+  first**). It pushes the screen up rather than covering it.
 - **Event log** — pane lifecycle events (every exit with its code and signal, every
   close, auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
   (rotated at 1 MB), so "why did this pane disappear?" is answerable even when
@@ -1950,7 +1954,8 @@ feature is added or changed, update the matching entry here in the same change**
   unsent prompts and unsaved files were kept and how many agents were working
   when muxel last saved the workspace (hover for their names). **Review** takes
   you to each of those panes in turn, working ones first, and the notice goes
-  with the last; × dismisses it. A close's Undo chip takes the slot while it
+  with the last; × dismisses it. Each working pane's own bar also says **Was
+  working at exit** until its × is pressed. A close's Undo chip takes the slot while it
   counts down, and the notice comes back after. In a narrow window the
   workspace name gives way first, then the notice's words shorten; Review, ×
   and the window buttons stay.

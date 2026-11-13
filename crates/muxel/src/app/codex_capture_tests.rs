@@ -290,20 +290,23 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
                 assert_eq!(args, vec!["resume", id]);
                 assert!(app.workspace.instance(pane).unwrap().session_started);
                 // An unreadable store proves nothing gone, so nothing is said.
-                assert!(!conversation_gone_notice(app));
+                assert!(!said_started_fresh(app, pane));
             })
             .unwrap();
     });
 }
 
-fn conversation_gone_notice(app: &MuxelApp) -> bool {
-    app.notifications
-        .iter()
-        .any(|n| n.title.ends_with(": started fresh"))
+/// Pane `pane`'s bar says it started fresh, or the feed does.
+fn said_started_fresh(app: &MuxelApp, pane: Uuid) -> bool {
+    app.return_lines.started_fresh.contains(&pane)
+        || app
+            .notifications
+            .iter()
+            .any(|n| n.title.ends_with(": started fresh"))
 }
 
 /// A rollout Codex deleted, or one the whole store was read without finding,
-/// starts a new conversation; the user is told, since the pane comes back empty.
+/// starts a new conversation; its bar says so, since the pane comes back empty.
 #[test]
 fn codex_rollout_gone_before_resume_starts_anew_and_says_so() {
     with_app(|cx, window| {
@@ -316,7 +319,7 @@ fn codex_rollout_gone_before_resume_starts_anew_and_says_so() {
                 assert_eq!(app.session_resume_for(pane).unwrap(), None);
                 let instance = app.workspace.instance(pane).unwrap();
                 assert!(instance.session_id.is_none() && !instance.session_started);
-                assert!(conversation_gone_notice(app));
+                assert!(app.return_lines.started_fresh.contains(&pane));
             })
             .unwrap();
     });

@@ -46,6 +46,11 @@ pub enum BarLine {
     Reconnecting,
     /// Prompts typed and not sent, offered back.
     Unsent { count: usize },
+    /// The pane came back in a new conversation: its saved one was gone.
+    StartedFresh,
+    /// muxel stopped uncleanly while this pane's agent was working, as of
+    /// muxel's last save.
+    WasWorking,
 }
 
 /// What a line asks of the person, most urgent first.
@@ -63,7 +68,7 @@ impl BarLine {
     pub fn urgency(&self) -> Urgency {
         match self {
             BarLine::Ended(Ending::Clean) | BarLine::Reconnecting => Urgency::Info,
-            BarLine::Ended(_) => Urgency::Loss,
+            BarLine::Ended(_) | BarLine::StartedFresh | BarLine::WasWorking => Urgency::Loss,
             BarLine::Unsent { .. } => Urgency::Waiting,
         }
     }
@@ -72,6 +77,12 @@ impl BarLine {
     /// line's action can work until it runs again.
     pub fn halts(&self) -> bool {
         matches!(self, BarLine::Ended(_) | BarLine::Reconnecting)
+    }
+
+    /// Whether this line's action needs the program running: restoring a
+    /// prompt types it in. Dismissing a line never does.
+    pub fn needs_program(&self) -> bool {
+        matches!(self, BarLine::Unsent { .. })
     }
 }
 
@@ -92,8 +103,8 @@ pub const MAX_LINES: usize = 3;
 /// first, since every other line's action waits on that; then the most
 /// urgent, lines of equal urgency in the order given; at most [`MAX_LINES`].
 /// Only the top line has a primary button, so while the program is down
-/// the primary is its restart, the button Enter presses, and the other
-/// lines' actions are blocked.
+/// the primary is its restart, the button Enter presses, and the actions
+/// that need the program are blocked.
 pub fn arrange(mut lines: Vec<BarLine>) -> Vec<Placed> {
     lines.sort_by_key(|line| (!line.halts(), line.urgency()));
     lines.truncate(MAX_LINES);
@@ -103,7 +114,7 @@ pub fn arrange(mut lines: Vec<BarLine>) -> Vec<Placed> {
         .enumerate()
         .map(|(index, line)| Placed {
             primary: index == 0,
-            blocked: halted && !line.halts(),
+            blocked: halted && line.needs_program(),
             line,
         })
         .collect()
@@ -152,6 +163,25 @@ mod tests {
         // Running, the unsent line is the top one and its action is live.
         let bar = arrange(vec![unsent.clone()]);
         assert!(bar[0].primary && !bar[0].blocked);
+    }
+
+    #[test]
+    fn a_return_line_is_a_loss_whose_dismiss_never_waits() {
+        let unsent = BarLine::Unsent { count: 1 };
+        for returned in [BarLine::StartedFresh, BarLine::WasWorking] {
+            // Running: what came back outranks the prompt that waits.
+            let bar = arrange(vec![unsent.clone(), returned.clone()]);
+            assert_eq!(bar[0].line, returned);
+            assert_eq!(bar[1].line, unsent);
+            assert!(!bar[1].blocked);
+            // Ended: the restart leads, and only the prompt waits for it.
+            let ended = BarLine::Ended(Ending::Code(1));
+            let bar = arrange(vec![unsent.clone(), returned.clone(), ended.clone()]);
+            let lines: Vec<_> = bar.iter().map(|placed| placed.line.clone()).collect();
+            assert_eq!(lines, [ended, returned, unsent.clone()]);
+            let blocked: Vec<_> = bar.iter().map(|placed| placed.blocked).collect();
+            assert_eq!(blocked, [false, false, true]);
+        }
     }
 
     #[test]
