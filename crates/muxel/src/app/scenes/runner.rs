@@ -340,7 +340,6 @@ fn build(
     let now_ms = loaded.now.timestamp_millis();
     app._status_timer = Task::ready(());
     app._loop_timer = Task::ready(());
-    app._diff_timer = Task::ready(());
     app._resource_timer = Task::ready(());
     app._update_timer = Task::ready(());
     app.show_terms = false;
@@ -363,8 +362,10 @@ fn build(
         if let Some(branch) = &project.branch {
             app.project_branches.insert(pid, Some(branch.clone()));
         }
-        if project.collapsed {
-            app.collapsed.insert(pid);
+        if project.collapsed
+            && let Some(record) = app.workspace.project_mut(pid)
+        {
+            record.collapsed = true;
         }
         for pane in &project.panes {
             let iid = pane_id(&pane.id);
