@@ -1,4 +1,5 @@
-//! Launch-folder chip decisions. Paths are lexical identities, never filesystem probes.
+//! Launch-folder chip decisions and the sidebar's filter box. Paths are lexical
+//! identities, never filesystem probes.
 
 /// Normalize separators/trailing slashes, and Windows' case-insensitive spelling.
 pub fn folder_key(path: &str, windows: bool) -> String {
@@ -41,43 +42,140 @@ pub fn chip_label(
     }
 }
 
-/// Project-scoped union of the clicked folder and its known branch.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FolderFilter {
-    folder: String,
-    branch: Option<String>,
+/// One sidebar row as the filter box sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterRow<'a> {
+    /// Its project's name.
+    pub project: &'a str,
+    /// The name the row shows.
+    pub name: &'a str,
+    /// Its launch folder.
+    pub folder: &'a str,
+    /// That folder's known branch.
+    pub branch: Option<&'a str>,
+    /// Whether the folder is a Windows path, matched without case.
+    pub windows: bool,
 }
 
-impl FolderFilter {
-    pub fn new(folder: &str, branch: Option<&str>, windows: bool) -> Self {
-        Self {
-            folder: folder_key(folder, windows),
-            branch: branch.filter(|b| !b.is_empty()).map(str::to_owned),
+/// The sidebar's filter box, read. Each word must appear, ignoring case, in
+/// the row's name, folder path or branch. `project:`, `folder:` and `branch:`
+/// are what a row's menu writes for "this folder and branch": a row then needs
+/// that project, and that folder as a full path (never a basename) or that
+/// known branch. Values with spaces are quoted. Several of one kind are
+/// alternatives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowFilter {
+    words: Vec<String>,
+    projects: Vec<String>,
+    folders: Vec<String>,
+    branches: Vec<String>,
+}
+
+impl RowFilter {
+    pub fn parse(query: &str) -> Self {
+        let mut filter = Self::default();
+        for term in terms(query) {
+            let (list, value) = if let Some(project) = term.strip_prefix("project:") {
+                (&mut filter.projects, project.to_lowercase())
+            } else if let Some(folder) = term.strip_prefix("folder:") {
+                (&mut filter.folders, folder.to_string())
+            } else if let Some(branch) = term.strip_prefix("branch:") {
+                (&mut filter.branches, branch.to_string())
+            } else {
+                (&mut filter.words, term.to_lowercase())
+            };
+            // A bare `folder:` is one being typed, so it filters nothing yet.
+            if !value.is_empty() {
+                list.push(value);
+            }
+        }
+        filter
+    }
+
+    /// What a row's menu puts in the box for its `folder` and that folder's
+    /// known `branch`, in `project`.
+    pub fn for_folder(project: &str, folder: &str, branch: Option<&str>) -> String {
+        let mut text = format!("project:{} folder:{}", quoted(project), quoted(folder));
+        if let Some(branch) = branch.filter(|b| !b.is_empty()) {
+            text.push_str(" branch:");
+            text.push_str(&quoted(branch));
+        }
+        text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+            && self.projects.is_empty()
+            && self.folders.is_empty()
+            && self.branches.is_empty()
+    }
+
+    /// Whether the box names `project`, as a row's menu writes it.
+    pub fn names_project(&self, project: &str) -> bool {
+        let project = project.to_lowercase();
+        self.projects.contains(&project)
+    }
+
+    /// Whether the box names `folder` in `project`, so the row there offers to
+    /// clear it, though its branch may have moved since.
+    pub fn names_folder(&self, project: &str, folder: &str, windows: bool) -> bool {
+        let key = folder_key(folder, windows);
+        (self.projects.is_empty() || self.names_project(project))
+            && self.folders.iter().any(|f| folder_key(f, windows) == key)
+    }
+
+    pub fn matches(&self, row: FilterRow) -> bool {
+        let project = self.projects.is_empty() || self.names_project(row.project);
+        let place = (self.folders.is_empty() && self.branches.is_empty())
+            || self.names_folder(row.project, row.folder, row.windows)
+            || row
+                .branch
+                .is_some_and(|b| self.branches.iter().any(|want| want == b));
+        project
+            && place
+            && self.words.iter().all(|word| {
+                [row.name, row.folder]
+                    .into_iter()
+                    .chain(row.branch)
+                    .any(|field| field.to_lowercase().contains(word.as_str()))
+            })
+    }
+}
+
+/// `query` split at whitespace, a double-quoted stretch kept whole.
+fn terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut term = String::new();
+    let mut quoted = false;
+    for c in query.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !term.is_empty() {
+                    terms.push(std::mem::take(&mut term));
+                }
+            }
+            c => term.push(c),
         }
     }
-
-    pub fn matches(&self, folder: &str, branch: Option<&str>, windows: bool) -> bool {
-        self.folder == folder_key(folder, windows)
-            || self.branch.as_deref().is_some_and(|b| Some(b) == branch)
+    if !term.is_empty() {
+        terms.push(term);
     }
+    terms
+}
 
-    pub fn is_source(&self, folder: &str, windows: bool) -> bool {
-        self.folder == folder_key(folder, windows)
-    }
-
-    /// Choosing the same folder clears; another folder replaces the selection.
-    pub fn toggle(current: &mut Option<Self>, clicked: Self) {
-        *current = if current.as_ref().is_some_and(|f| f.folder == clicked.folder) {
-            None
-        } else {
-            Some(clicked)
-        };
+/// `value` as one term: quoted when it holds whitespace.
+fn quoted(value: &str) -> String {
+    if value.chars().any(char::is_whitespace) {
+        format!("\"{value}\"")
+    } else {
+        value.to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FolderFilter, chip_label, folder_key};
+    use super::{FilterRow, RowFilter, chip_label, folder_key};
 
     #[test]
     fn root_and_external_folder_chip_decisions() {
@@ -134,44 +232,101 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filter_is_folder_or_known_branch_not_basename_or_unknown_branch() {
-        let filter = FolderFilter::new("/one/ember", Some("topic"), false);
-        let rows = [
-            ("/one/ember", None),
-            ("/two/glimmer", Some("topic")),
-            ("/two/ember", Some("other")),
-            ("/repo", None),
-        ];
-        assert_eq!(
-            rows.map(|(p, b)| filter.matches(p, b, false)),
-            [true, true, false, false]
-        );
-        let unknown = FolderFilter::new("/one/ember", None, false);
-        assert!(!unknown.matches("/two/ember", None, false));
-        assert!(unknown.matches("/one/ember/", Some("new"), false));
-        assert!(FolderFilter::new("C:/Repo", None, true).matches("c:\\repo\\", None, true));
-        assert!(!FolderFilter::new("/Repo", None, false).matches("/repo", None, false));
+    fn row<'a>(
+        project: &'a str,
+        name: &'a str,
+        folder: &'a str,
+        branch: Option<&'a str>,
+    ) -> FilterRow<'a> {
+        FilterRow {
+            project,
+            name,
+            folder,
+            branch,
+            windows: false,
+        }
     }
 
+    /// The row menu's text, read back: that project's rows in that full folder
+    /// or on that known branch, never a basename match, an unknown branch or
+    /// another project's same-named branch.
     #[test]
-    fn clicking_same_chip_clears_and_another_replaces() {
-        let first = FolderFilter::new("/a", Some("one"), false);
-        let second = FolderFilter::new("/b", Some("two"), false);
-        let mut current = None;
-        FolderFilter::toggle(&mut current, first.clone());
-        assert_eq!(current, Some(first.clone()));
-        FolderFilter::toggle(&mut current, first);
-        assert_eq!(current, None);
-        FolderFilter::toggle(&mut current, FolderFilter::new("/a", Some("old"), false));
-        FolderFilter::toggle(&mut current, FolderFilter::new("/a", Some("new"), false));
+    fn menu_filter_is_folder_or_known_branch_in_its_project() {
+        let filter = RowFilter::parse(&RowFilter::for_folder("orez", "/one/ember", Some("topic")));
+        let rows = [
+            row("orez", "a", "/one/ember", None),
+            row("orez", "b", "/two/glimmer", Some("topic")),
+            row("orez", "c", "/two/ember", Some("other")),
+            row("orez", "d", "/repo", None),
+            row("muxel", "e", "/elsewhere", Some("topic")),
+            row("muxel", "f", "/one/ember", None),
+        ];
         assert_eq!(
-            current, None,
-            "the source chip must still clear after checkout"
+            rows.map(|r| filter.matches(r)),
+            [true, true, false, false, false, false]
         );
-        FolderFilter::toggle(&mut current, second.clone());
-        let third = FolderFilter::new("/c", None, false);
-        FolderFilter::toggle(&mut current, third.clone());
-        assert_eq!(current, Some(third));
+        let unknown = RowFilter::parse(&RowFilter::for_folder("orez", "/one/ember", None));
+        assert!(!unknown.matches(row("orez", "a", "/two/ember", None)));
+        assert!(unknown.matches(row("orez", "a", "/one/ember/", Some("new"))));
+        let windows = RowFilter::parse(&RowFilter::for_folder("Repo", "C:/Repo", None));
+        assert!(windows.matches(FilterRow {
+            windows: true,
+            ..row("repo", "a", "c:\\repo\\", None)
+        }));
+        let posix = RowFilter::parse(&RowFilter::for_folder("repo", "/Repo", None));
+        assert!(!posix.matches(row("repo", "a", "/repo", None)));
+    }
+
+    /// A folder, branch or project with spaces survives the box, so the row
+    /// that wrote it is the row that offers to clear it, and only in its
+    /// project.
+    #[test]
+    fn menu_text_round_trips_through_the_box() {
+        let text = RowFilter::for_folder("My Project", "/work/my folder", Some("fix/a b"));
+        assert_eq!(
+            text,
+            "project:\"My Project\" folder:\"/work/my folder\" branch:\"fix/a b\""
+        );
+        let filter = RowFilter::parse(&text);
+        assert!(filter.names_project("my project"));
+        assert!(filter.names_folder("My Project", "/work/my folder/", false));
+        assert!(!filter.names_folder("Other", "/work/my folder", false));
+        assert!(!filter.names_folder("My Project", "/work/my", false));
+        assert!(filter.matches(row("My Project", "x", "/else", Some("fix/a b"))));
+        assert!(RowFilter::parse("  ").is_empty());
+        assert!(
+            RowFilter::parse("folder: branch:\"\" project:").is_empty(),
+            "a token still being typed filters nothing"
+        );
+    }
+
+    /// Typed words narrow by name, folder path and branch, each word somewhere,
+    /// ignoring case, together with whatever the menu wrote.
+    #[test]
+    fn words_match_name_folder_or_branch_ignoring_case() {
+        let rows = [
+            row("orez", "Brownout review", "/repo", Some("main")),
+            row("orez", "Dates fix", "/env/ember", Some("fix/dates")),
+            row("muxel", "Sidebar filter", "/dev/muxel-wt-box", None),
+        ];
+        let shown = |query: &str| {
+            let filter = RowFilter::parse(query);
+            rows.iter()
+                .filter(|r| filter.matches(**r))
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown("BROWNOUT"), ["Brownout review"]);
+        assert_eq!(shown("ember"), ["Dates fix"]);
+        assert_eq!(shown("dates"), ["Dates fix"]);
+        assert_eq!(shown("wt-box"), ["Sidebar filter"]);
+        assert_eq!(shown("fix ember"), ["Dates fix"]);
+        assert_eq!(shown("fix brownout"), Vec::<&str>::new());
+        assert_eq!(shown("\"sidebar filter\""), ["Sidebar filter"]);
+        assert_eq!(shown("project:OREZ fix"), ["Dates fix"]);
+        assert_eq!(
+            shown(""),
+            ["Brownout review", "Dates fix", "Sidebar filter"]
+        );
     }
 }

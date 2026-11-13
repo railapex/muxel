@@ -1,9 +1,9 @@
 //! Background launch-folder branch snapshots, shared by sidebar and ctl.
 use super::{MuxelApp, integrations};
 use crate::i18n::t;
-use gpui::SharedString;
+use gpui::{App, Context, SharedString, Window};
 use muxel_core::refresh_gate::RefreshGate;
-use muxel_core::session_folder::{FolderFilter, folder_key};
+use muxel_core::session_folder::{FilterRow, RowFilter, folder_key};
 use muxel_core::{Instance, Project, RemoteOs};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -123,43 +123,65 @@ impl MuxelApp {
             .and_then(|b| b.as_deref())
     }
 
-    pub(super) fn session_matches_filter(&self, project: &Project, instance: &Instance) -> bool {
-        self.folder_filters.get(&project.id).is_none_or(|filter| {
-            filter.matches(
-                &Self::session_folder(project, instance),
-                self.session_branch(project, instance),
-                self.folder_windows(project),
-            )
-        })
+    /// The sidebar's filter box, read.
+    pub(super) fn row_filter(&self, cx: &App) -> RowFilter {
+        RowFilter::parse(&self.sidebar_filter.read(cx).value())
     }
 
-    /// The row menu's filter entry. The row that started a filter offers to clear it.
+    /// Whether `filter` leaves row `iid`, `instance` in `project`: by the name
+    /// the row shows, its launch folder and that folder's cached branch.
+    pub(super) fn row_matches(
+        &self,
+        filter: &RowFilter,
+        project: &Project,
+        iid: Uuid,
+        instance: &Instance,
+        cx: &App,
+    ) -> bool {
+        filter.is_empty()
+            || filter.matches(FilterRow {
+                project: &project.name,
+                name: &self.sidebar_row_title(iid, Some(instance), cx),
+                folder: &Self::session_folder(project, instance),
+                branch: self.session_branch(project, instance),
+                windows: self.folder_windows(project),
+            })
+    }
+
+    /// The row menu's filter entry: its label, and the text it puts in the
+    /// box. The row whose folder the box names offers to clear it (`None`).
     pub(super) fn folder_filter_menu_entry(
         &self,
+        filter: &RowFilter,
         project: &Project,
         instance: &Instance,
-    ) -> (SharedString, FolderFilter) {
+    ) -> (SharedString, Option<String>) {
         let folder = Self::session_folder(project, instance);
         let branch = self.session_branch(project, instance);
-        let windows = self.folder_windows(project);
-        let filtering = self
-            .folder_filters
-            .get(&project.id)
-            .is_some_and(|f| f.is_source(&folder, windows));
-        let label = match (filtering, branch) {
-            (true, _) => t("Show all sessions"),
-            (false, Some(_)) => t("Show only this folder and branch"),
-            (false, None) => t("Show only this folder"),
+        if filter.names_folder(&project.name, &folder, self.folder_windows(project)) {
+            return (t("Show all sessions"), None);
+        }
+        let label = match branch {
+            Some(_) => t("Show only this folder and branch"),
+            None => t("Show only this folder"),
         };
-        (label, FolderFilter::new(&folder, branch, windows))
+        (
+            label,
+            Some(RowFilter::for_folder(&project.name, &folder, branch)),
+        )
     }
 
-    pub(super) fn toggle_folder_filter(&mut self, project: Uuid, clicked: FolderFilter) {
-        let mut filter = self.folder_filters.remove(&project);
-        FolderFilter::toggle(&mut filter, clicked);
-        if let Some(filter) = filter {
-            self.folder_filters.insert(project, filter);
-        }
+    /// Put `text` in the sidebar's filter box, or empty it.
+    pub(super) fn set_sidebar_filter(
+        &mut self,
+        text: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_filter.update(cx, |input, cx| {
+            input.set_value(text.unwrap_or_default(), window, cx)
+        });
+        cx.notify();
     }
 
     /// One probe per project/folder context, with the root sharing its existing read.
@@ -238,7 +260,6 @@ impl MuxelApp {
             project_ids.contains(&key.project)
                 && (key.host.is_some() != remote || current.contains_key(key))
         });
-        self.folder_filters.retain(|id, _| project_ids.contains(id));
         let mut root_reads = Vec::new();
         for result in results {
             if current.get(&result.key) != Some(&result.host_snapshot) {

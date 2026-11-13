@@ -396,6 +396,54 @@ pub fn nests_under(id: Uuid, instances: &InstancesById, listed: &HashSet<Uuid>) 
     }
 }
 
+/// The rows Recent work lists awake only (`Settings::sidebar_awake_only`): all
+/// of `pane_ids` but an asleep session with nothing unread and nothing asked
+/// ([`is_unread`], and Needs you's placed state), and the files, diffs and
+/// pages nested under it. A session that would go stays while a session
+/// nested under it stays, so a family keeps its top. Nothing that needs you is
+/// hidden, so every count and jump still lands on a listed row.
+pub fn awake_rows(
+    pane_ids: &[Uuid],
+    instances: &InstancesById,
+    asleep: &dyn Fn(Uuid) -> bool,
+    shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+    running: &dyn Fn(Uuid) -> bool,
+) -> Vec<Uuid> {
+    let listed: HashSet<Uuid> = pane_ids.iter().copied().collect();
+    let session = |id: Uuid| {
+        instances
+            .get(&id)
+            .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+    };
+    let wanted = |id: Uuid| {
+        !asleep(id)
+            || instances
+                .get(&id)
+                .is_some_and(|instance| is_unread(&instance.activity))
+            || placed_state(shown(id), running(id)) == Some(AgentActivityState::Blocked)
+    };
+    let mut kept: HashSet<Uuid> = pane_ids
+        .iter()
+        .copied()
+        .filter(|&id| session(id) && wanted(id))
+        .collect();
+    let tops: Vec<Uuid> = kept
+        .iter()
+        .filter_map(|&id| nests_under(id, instances, &listed))
+        .collect();
+    kept.extend(tops);
+    pane_ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            kept.contains(&id)
+                || !session(id)
+                    && nests_under(id, instances, &listed)
+                        .is_none_or(|parent| kept.contains(&parent))
+        })
+        .collect()
+}
+
 /// `instance`'s opener or spawner when it is a listed session it may nest
 /// under.
 fn listed_parent(
@@ -2717,6 +2765,85 @@ mod tests {
             shown_and_said(&everything_folded),
             all,
             "bands and families folded"
+        );
+    }
+
+    /// Awake only hides a sleeping session only when nothing in it needs you,
+    /// takes its files with it, and leaves every family its top, over every
+    /// lifecycle and family shape.
+    #[test]
+    fn awake_only_hides_no_question_or_unread_and_keeps_each_family_top() {
+        let rows = population();
+        let (project, mut workspace, ids) =
+            fixture(rows.iter().map(|(activity, _)| activity.clone()).collect());
+        for (row, &id) in ids.iter().enumerate() {
+            let instance = workspace.instance_mut(id).unwrap();
+            if row % 4 == 0 {
+                instance.activity.last_attended_at = Some(NOW);
+            }
+            // Every fifth row is a file.
+            if row % 5 == 4 {
+                instance.kind = InstanceKind::Editor;
+            }
+        }
+        for (row, pair) in ids.windows(2).enumerate() {
+            if row % 3 != 2 {
+                workspace.instance_mut(pair[1]).unwrap().opened_by = Some(pair[0]);
+            }
+        }
+        let listed = sidebar_rows(&project, &workspace, &|_| false, SidebarSort::RecentWork);
+        let index = instances_by_id(&workspace);
+        let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        // Every other session is asleep, so its process isn't running.
+        let session = |id: &Uuid| index[id].kind == InstanceKind::Terminal;
+        let sleeping: HashSet<Uuid> = ids.iter().copied().filter(session).step_by(2).collect();
+        let asleep = |id: Uuid| sleeping.contains(&id);
+        let running = |id: Uuid| !asleep(id);
+        let awake: HashSet<Uuid> = awake_rows(&listed, &index, &asleep, &shown, &running)
+            .into_iter()
+            .collect();
+        let listed_set: HashSet<Uuid> = listed.iter().copied().collect();
+        let parent = |id: Uuid| nests_under(id, &index, &listed_set);
+        let needs_you = |id: Uuid| {
+            is_unread(&index[&id].activity)
+                || row_state(id, &shown, &running) == Some(AgentActivityState::Blocked)
+        };
+        let mut hidden = 0;
+        let mut kept_tops = 0;
+        for &id in &listed {
+            if session(&id) && (!asleep(id) || needs_you(id)) {
+                assert!(
+                    awake.contains(&id),
+                    "an awake session or one that needs you hides"
+                );
+            }
+            if let Some(top) = parent(id).filter(|_| awake.contains(&id)) {
+                assert!(
+                    awake.contains(&top),
+                    "a listed row loses the row it nests under"
+                );
+            }
+            if !awake.contains(&id) {
+                hidden += 1;
+                let holds_family = listed
+                    .iter()
+                    .any(|&row| session(&row) && awake.contains(&row) && parent(row) == Some(id));
+                assert!(
+                    if session(&id) {
+                        asleep(id) && !needs_you(id) && !holds_family
+                    } else {
+                        parent(id).is_some_and(|top| !awake.contains(&top))
+                    },
+                    "a row hides that should stay"
+                );
+            } else if session(&id) && asleep(id) && !needs_you(id) {
+                kept_tops += 1;
+            }
+        }
+        assert!(hidden > 0, "awake only hides something");
+        assert!(
+            kept_tops > 0,
+            "some sleeping session stays as its family's top"
         );
     }
 

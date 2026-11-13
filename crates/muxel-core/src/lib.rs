@@ -3043,6 +3043,11 @@ pub struct Settings {
     /// words. Layout order keeps words.
     #[serde(default)]
     pub sidebar_pills: sidebar::PillStyle,
+    /// Recent work lists awake sessions only: a sleeping one with nothing
+    /// unread or asked is hidden, with its files ([`sidebar::awake_rows`]).
+    /// The PROJECTS line's asleep count toggles it.
+    #[serde(default)]
+    pub sidebar_awake_only: bool,
     /// Open old local PTY sessions asleep, until woken. Zero disables dormancy.
     #[serde(default)]
     pub dormant_after_days: u32,
@@ -3610,6 +3615,7 @@ impl Default for Settings {
             sidebar_sort: sidebar::SidebarSort::default(),
             older_starts_folded: true,
             sidebar_pills: sidebar::PillStyle::default(),
+            sidebar_awake_only: false,
             dormant_after_days: 0,
             sleep_after_hours: default_sleep_after_hours(),
             default_use_tmux: true,

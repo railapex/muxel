@@ -1667,7 +1667,9 @@ feature is added or changed, update the matching entry here in the same change**
   open or collapsed, so a fold never hides a question. The PROJECTS heading
   totals them for the workspace: click asking or unread to go to the next such
   session across projects, which opens its collapsed project, folded band and
-  folded family.
+  folded family. Its asleep count `☾ n` lists awake sessions only while
+  pressed, keeping any sleeping row that has something unread or asks, and a
+  family's top; **Settings → Appearance → Sleeping rows** holds the same choice.
   From 300 px wide the sidebar spells the words out. Ctrl+Shift+A opens what
   hides its target the same way, and like the counts it switches to the
   target's project.
@@ -1682,8 +1684,14 @@ feature is added or changed, update the matching entry here in the same change**
   when it differs from the project root, plus its current Git branch when known.
   Root sessions stay single-line unless their known branch differs from the
   project header; then they show the branch only. Right-click a row to show only
-  sessions in that folder or on that known branch; **Show all sessions** on the
-  same row or the project's clear button resets.
+  sessions in that folder or on that known branch, which fills the sidebar's
+  filter box; **Show all sessions** on the same row or the project's clear button
+  empties it.
+- **Sidebar filter box** — a box under the PROJECTS heading narrows every
+  project to the rows whose name, launch folder or branch hold each typed word,
+  in either sidebar order. Enter opens the first match and Esc clears.
+  `project:`, `folder:` and `branch:` narrow to a project, a full folder path or
+  a branch, as a row's menu writes them. Counts ignore it, and it isn't saved.
   Background refresh supplies the sidebar and `ctl panes` / `status` `branch`
   field. Running programs' later directory changes are not tracked.
 - **Project git** — right-click a git project for: git diff (opens the diff pane;

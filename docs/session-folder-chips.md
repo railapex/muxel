@@ -11,11 +11,15 @@ column so the status badge keeps its space. Hover for the full path and branch.
 A chip is a label: clicking it selects the pane, like the rest of the row.
 Right-click a terminal row and choose **Show only this folder** (or **…folder and
 branch**) to filter that project's sidebar rows to the same full folder **or** the
-same known branch. Matching basenames alone do not count, and unknown branches
-never match each other. **Show all sessions** on the same row clears the filter. The
-project header also has a clear button, including while collapsed or after the
-original session closes. Filtering affects only the sidebar, not the pane layout.
-Filters are not persisted.
+same known branch. The choice fills the sidebar's filter box with
+`project:<name> folder:<path> branch:<name>`, so the box is the one place a
+filter lives and shows what it holds (see [sidebar.md](sidebar.md), "The filter
+box"). Other projects list nothing while it holds a project. Matching basenames
+alone do not count, and unknown branches never match each other. **Show all
+sessions** on the row whose folder the box names empties it. The project header
+also has a clear button, including while collapsed or after the original session
+closes. Filtering affects only the sidebar, not the pane layout. The box is not
+saved.
 
 Long project-header branch labels ellipsize so they cannot paint over the clear
 button. Their tooltip keeps the full branch name.

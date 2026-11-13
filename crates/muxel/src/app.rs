@@ -36,9 +36,10 @@ use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
     ActivityBand, BandClock, FamilyFold, FamilyTags, Fold, InstancesById, PillStyle, PillText,
-    RowCounts, SelectClick, SidebarEntry, SidebarSort, entry_id, family_tags, instances_by_id,
-    is_unread, label_rows, nest_on_drop, next_matching, notification_in_feed, pill_text,
-    row_counts, row_state, select_rows, sessions_under, sidebar_order, sidebar_rows_each,
+    RowCounts, SelectClick, SidebarEntry, SidebarSort, awake_rows, entry_id, family_tags,
+    instances_by_id, is_unread, label_rows, nest_on_drop, next_matching, notification_in_feed,
+    pill_text, row_counts, row_state, select_rows, sessions_under, sidebar_order,
+    sidebar_rows_each,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -108,6 +109,8 @@ mod restart_guard;
 mod rich_copy_tests;
 mod session_discovery;
 mod session_folders;
+#[cfg(all(test, windows))]
+mod sidebar_filter_tests;
 #[cfg(all(test, windows))]
 mod sidebar_fold_tests;
 #[cfg(all(test, windows))]
@@ -6928,7 +6931,10 @@ pub struct MuxelApp {
     /// `refresh_status` as `status_polls` finds them due.
     project_branches: HashMap<Uuid, Option<String>>,
     folder_branches: HashMap<session_folders::FolderKey, Option<String>>,
-    folder_filters: HashMap<Uuid, muxel_core::session_folder::FolderFilter>,
+    /// The sidebar's filter box under the PROJECTS line, the only filter
+    /// state ([`muxel_core::session_folder::RowFilter`]). A row's menu fills it
+    /// with that row's folder and branch. Not saved.
+    sidebar_filter: Entity<InputState>,
     /// Cached branch lists for project context menus. Populated beside
     /// `project_branches` so opening a menu never waits on a git subprocess.
     project_branch_lists: HashMap<Uuid, Vec<String>>,
@@ -9313,6 +9319,22 @@ impl MuxelApp {
         )
         .detach();
 
+        let sidebar_filter = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t("Filter sessions…"))
+                .clean_on_escape()
+        });
+        cx.subscribe_in(
+            &sidebar_filter,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => this.open_first_filtered(window, cx),
+                _ => {}
+            },
+        )
+        .detach();
+
         let find_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("Find in project…")));
         cx.subscribe_in(
@@ -9526,7 +9548,7 @@ impl MuxelApp {
             available_programs,
             project_branches: HashMap::new(),
             folder_branches: HashMap::new(),
-            folder_filters: HashMap::new(),
+            sidebar_filter,
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
             alert_gate: AlertGate::default(),
@@ -24994,7 +25016,8 @@ impl MuxelApp {
     }
 
     /// [`Self::sidebar_entries`] with the bands and families `folded` says are
-    /// folded.
+    /// folded. Awake only leaves out the sleeping rows [`awake_rows`] hides;
+    /// the counts still take them in.
     fn sidebar_entries_folded(
         &self,
         pane_ids: &[Uuid],
@@ -25005,6 +25028,19 @@ impl MuxelApp {
     ) -> Vec<SidebarEntry> {
         let shown = |iid: Uuid| self.sidebar_shown(iid, placing, cx);
         let running = |iid: Uuid| self.sidebar_running(iid);
+        let awake;
+        let pane_ids = if self.awake_only() {
+            awake = awake_rows(
+                pane_ids,
+                placing,
+                &|iid| self.is_dormant(iid),
+                &shown,
+                &running,
+            );
+            &awake[..]
+        } else {
+            pane_ids
+        };
         sidebar_order(
             pane_ids,
             placing,
@@ -25034,6 +25070,108 @@ impl MuxelApp {
         let shown = |iid: Uuid| self.sidebar_shown(iid, placing, cx);
         let running = |iid: Uuid| self.sidebar_running(iid);
         row_counts(pane_ids, placing, &shown, &running)
+    }
+
+    /// Whether Recent work lists awake sessions only (the PROJECTS line's
+    /// asleep count, or Settings, Appearance: "Sleeping rows").
+    fn awake_only(&self) -> bool {
+        self.settings.sidebar_sort == SidebarSort::RecentWork && self.settings.sidebar_awake_only
+    }
+
+    /// The PROJECTS line's asleep count, clicked: Recent work lists awake
+    /// sessions only, or every session again.
+    fn toggle_awake_only(&mut self, cx: &mut Context<Self>) {
+        self.settings.sidebar_awake_only = !self.settings.sidebar_awake_only;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// The name sidebar row `iid` shows: one the user gave it in full, else
+    /// its program's own title (a shell's without its `user@host:` prefix), a
+    /// file's or page's title, or its saved name.
+    fn sidebar_row_title(&self, iid: Uuid, inst: Option<&Instance>, cx: &App) -> String {
+        if let Some(custom) = inst
+            .and_then(|i| i.custom_name.clone())
+            .filter(|c| !c.trim().is_empty())
+        {
+            return custom;
+        }
+        let meta = inst
+            .map(|i| i.display_name().to_string())
+            .unwrap_or_default();
+        if let Some(view) = self.terminal_view(iid) {
+            let view = view.read(cx);
+            inst.and_then(|instance| {
+                let remote = self
+                    .workspace
+                    .project(instance.project_id)
+                    .is_some_and(Project::is_remote);
+                let live_title = view.title();
+                let program_name = view.program_auto_title();
+                authoritative_terminal_auto_title(
+                    instance,
+                    &self.codex_session_names,
+                    remote,
+                    live_title.as_deref(),
+                    program_name.as_deref(),
+                )
+            })
+            .unwrap_or(meta)
+        } else if let Some(ed) = self.editors.get(&iid) {
+            ed.read(cx).title()
+        } else if let Some(bv) = self.browsers.get(&iid) {
+            bv.read(cx).tab_title()
+        } else {
+            meta
+        }
+    }
+
+    /// Project `project`'s rows `pane_ids` that the filter box leaves
+    /// ([`Self::row_matches`]). Counts take every row; the list takes these.
+    fn sidebar_filtered(
+        &self,
+        project: &Project,
+        pane_ids: &[Uuid],
+        filter: &muxel_core::session_folder::RowFilter,
+        instances: &InstancesById,
+        cx: &App,
+    ) -> Vec<Uuid> {
+        if filter.is_empty() {
+            return pane_ids.to_vec();
+        }
+        pane_ids
+            .iter()
+            .copied()
+            .filter(|&iid| {
+                instances
+                    .get(&iid)
+                    .is_none_or(|instance| self.row_matches(filter, project, iid, instance, cx))
+            })
+            .collect()
+    }
+
+    /// Enter in the filter box: open the first row it leaves, in sidebar order
+    /// with every fold open, and show it ([`Self::reveal_row`]).
+    fn open_first_filtered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = {
+            let filter = self.row_filter(cx);
+            let instances = instances_by_id(&self.workspace);
+            let pending = self.pending_instances(cx);
+            let placing = with_pending(&instances, &pending);
+            let mut rows = self.sidebar_rows_each();
+            let bands = BandClock::at(&chrono::Local::now());
+            self.workspace.projects.iter().find_map(|project| {
+                let listed = rows.remove(&project.id).unwrap_or_default();
+                let visible = self.sidebar_filtered(project, &listed, &filter, &instances, cx);
+                self.sidebar_entries_folded(&visible, &placing, bands, &|_| false, cx)
+                    .iter()
+                    .find_map(entry_id)
+            })
+        };
+        if let Some(iid) = first {
+            self.reveal_row(iid, cx);
+            self.select_instance(iid, window, cx);
+        }
     }
 
     /// Whether a sidebar row's process may be running: a pane with no live
@@ -29185,10 +29323,17 @@ impl MuxelApp {
 
     /// Recent work's workspace line, on the PROJECTS heading: how many rows
     /// ask, work and are unread across every project, in the project header's
-    /// order. Asking and unread each
-    /// jump to the next such row ([`Self::jump_to_next`]). Glyphs fit the
+    /// order, then how many are asleep. Asking and unread each
+    /// jump to the next such row ([`Self::jump_to_next`]); asleep toggles
+    /// awake only, and stays pressed while it hides them. Glyphs fit the
     /// default width; from 300 px the words are spelled out.
-    fn workspace_counts(&self, total: RowCounts, cx: &mut Context<Self>) -> AnyElement {
+    fn workspace_counts(
+        &self,
+        total: RowCounts,
+        asleep: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let awake_only = self.awake_only();
         let wide = self.workspace.sidebar_width.unwrap_or(232.0) >= 300.0;
         let text = |glyph: &str, n: usize, word: SharedString| {
             if wide {
@@ -29228,6 +29373,22 @@ impl MuxelApp {
                     .on_click(cx.listener(|this, _e, window, cx| {
                         this.jump_to_next(RowJump::Unread, window, cx)
                     })),
+            )
+            .child(
+                div().debug_selector(|| "workspace-asleep".into()).child(
+                    Button::new("workspace-asleep")
+                        .ghost()
+                        .xsmall()
+                        .label(text("☾", asleep, t("asleep")))
+                        .selected(awake_only)
+                        .disabled(asleep == 0 && !awake_only)
+                        .tooltip(if awake_only {
+                            t("Show sleeping sessions")
+                        } else {
+                            t("Show awake sessions only")
+                        })
+                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_awake_only(cx))),
+                ),
             )
             .into_any_element()
     }
@@ -30121,8 +30282,10 @@ impl MuxelApp {
         let bands = BandClock::at(&chrono::Local::now());
         let sort = self.settings.sidebar_sort;
         let entity = cx.entity();
+        let filter = self.row_filter(cx);
         // Recent work counts each project's asking, working and unread rows for
-        // its header, and totals them on the PROJECTS line.
+        // its header, and totals them on the PROJECTS line, whatever the
+        // filter box or awake only hides.
         let counts: HashMap<Uuid, RowCounts> = if sort == SidebarSort::RecentWork {
             rows.iter()
                 .map(|(&pid, pane_ids)| (pid, self.sidebar_counts(pane_ids, &placing, cx)))
@@ -30142,10 +30305,14 @@ impl MuxelApp {
             .font_semibold()
             .text_color(cx.theme().muted_foreground)
             .child(t("PROJECTS"))
-            .children(
-                (sort == SidebarSort::RecentWork)
-                    .then(|| self.workspace_counts(counts.values().copied().sum(), cx)),
-            );
+            .children((sort == SidebarSort::RecentWork).then(|| {
+                let asleep = rows
+                    .values()
+                    .flatten()
+                    .filter(|&&iid| self.is_dormant(iid))
+                    .count();
+                self.workspace_counts(counts.values().copied().sum(), asleep, cx)
+            }));
         let mut list = div()
             .id("sidebar-scroll")
             .debug_selector(|| "sidebar-scroll".into())
@@ -30156,7 +30323,19 @@ impl MuxelApp {
             .bg(cx.theme().sidebar)
             // NOTIFICATIONS sits above PROJECTS.
             .child(self.render_notifications_section(cx))
-            .child(projects_line);
+            .child(projects_line)
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-filter".into())
+                    .px_2()
+                    .pb_1()
+                    .child(
+                        Input::new(&self.sidebar_filter)
+                            .small()
+                            .cleanable(true)
+                            .w_full(),
+                    ),
+            );
 
         for (ix, project) in self.workspace.projects.iter().enumerate() {
             let pid = project.id;
@@ -30315,8 +30494,10 @@ impl MuxelApp {
                             )),
                     )
                     .child(self.project_counts(project_counts, cx))
-                    .children(self.folder_filters.contains_key(&pid).then(|| {
+                    // The box names this project when a row's menu filled it.
+                    .children(filter.names_project(&project.name).then(|| {
                         div()
+                            .debug_selector(move || format!("clear-filter-{}", pid.simple()))
                             .flex_none()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
@@ -30332,10 +30513,9 @@ impl MuxelApp {
                                 .label(t("Clear"))
                                 .tooltip(t("Clear folder and branch filter"))
                                 .on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                    move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.folder_filters.remove(&pid);
-                                        cx.notify();
+                                        this.set_sidebar_filter(None, window, cx);
                                     },
                                 )),
                             )
@@ -30835,15 +31015,7 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
-                let visible: Vec<Uuid> = pane_ids
-                    .iter()
-                    .copied()
-                    .filter(|iid| {
-                        instances
-                            .get(iid)
-                            .is_none_or(|instance| self.session_matches_filter(project, instance))
-                    })
-                    .collect();
+                let visible = self.sidebar_filtered(project, &pane_ids, &filter, &instances, cx);
                 let entries = self.sidebar_entries(project, &visible, &placing, bands, cx);
                 let tags_below = self.sidebar_family_tags(&entries, &placing, cx);
                 // The rows as drawn, which a Shift-click selects along.
@@ -30889,12 +31061,6 @@ impl MuxelApp {
                     let unread = sort == SidebarSort::RecentWork
                         && inst.is_some_and(|i| is_unread(&i.activity));
                     let program = inst.and_then(|i| i.program.clone());
-                    let custom = inst
-                        .and_then(|i| i.custom_name.clone())
-                        .filter(|c| !c.trim().is_empty());
-                    let meta = inst
-                        .map(|i| i.display_name().to_string())
-                        .unwrap_or_default();
                     let loading = self.terminal_is_loading(iid, cx);
                     let stopped = inst.is_some_and(|instance| {
                         instance.is_stopped_literal(
@@ -30902,33 +31068,6 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let app_title = if let Some(view) = self.terminal_view(iid) {
-                        let view = view.read(cx);
-                        // Shells show their cwd: strip the `user@host:` OSC prefix.
-                        // Agent titles have no such prefix and pass through unchanged.
-                        inst.and_then(|instance| {
-                            let remote = self
-                                .workspace
-                                .project(instance.project_id)
-                                .is_some_and(Project::is_remote);
-                            let live_title = view.title();
-                            let program_name = view.program_auto_title();
-                            authoritative_terminal_auto_title(
-                                instance,
-                                &self.codex_session_names,
-                                remote,
-                                live_title.as_deref(),
-                                program_name.as_deref(),
-                            )
-                        })
-                        .unwrap_or(meta)
-                    } else if let Some(ed) = self.editors.get(&iid) {
-                        ed.read(cx).title()
-                    } else if let Some(bv) = self.browsers.get(&iid) {
-                        bv.read(cx).tab_title()
-                    } else {
-                        meta
-                    };
                     let status = self.sidebar_status(iid, inst, cx);
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // An asleep row keeps the running row's single line, and
@@ -30943,12 +31082,7 @@ impl MuxelApp {
                     } else {
                         pane_status_hsla(status, inst.map(|i| &i.activity), cx)
                     };
-                    // A user-assigned name fully replaces the agent's own title
-                    // (no "custom — title" composite).
-                    let display = match custom {
-                        Some(c) => c,
-                        None => app_title,
-                    };
+                    let display = self.sidebar_row_title(iid, inst, cx);
                     let ghost_label: SharedString = display.clone().into();
                     let hover_col = cx.theme().sidebar_accent.opacity(0.45);
                     let folder_chip =
@@ -30964,10 +31098,7 @@ impl MuxelApp {
                                     self.project_branches.get(&pid).and_then(|b| b.as_deref()),
                                     windows,
                                 )?;
-                                let selected = self
-                                    .folder_filters
-                                    .get(&pid)
-                                    .is_some_and(|f| f.is_source(&folder, windows));
+                                let selected = filter.names_folder(&project.name, &folder, windows);
                                 let tooltip = match branch {
                                     Some(branch) => format!("{folder}\n⎇ {branch}"),
                                     None => folder,
@@ -30997,7 +31128,7 @@ impl MuxelApp {
                             });
                     let folder_filter_item = inst
                         .filter(|i| i.kind == InstanceKind::Terminal)
-                        .map(|i| self.folder_filter_menu_entry(project, i));
+                        .map(|i| self.folder_filter_menu_entry(&filter, project, i));
                     let is_sel = self.active_instance == Some(iid);
                     let picked = self.sidebar_selection.contains(&iid);
                     let renaming = self.rename == Some(RenameTarget::Instance(iid))
@@ -31310,16 +31441,16 @@ impl MuxelApp {
                                     )
                                     .when_some(
                                         folder_filter_item.clone(),
-                                        |menu, (label, filter)| {
+                                        |menu, (label, text)| {
                                             menu.item(PopupMenuItem::new(label).on_click(
                                                 window.listener_for(
                                                     &entity,
-                                                    move |this, _, _, cx| {
-                                                        this.toggle_folder_filter(
-                                                            pid,
-                                                            filter.clone(),
+                                                    move |this, _, window, cx| {
+                                                        this.set_sidebar_filter(
+                                                            text.clone(),
+                                                            window,
+                                                            cx,
                                                         );
-                                                        cx.notify();
                                                     },
                                                 ),
                                             ))
@@ -31451,9 +31582,7 @@ impl MuxelApp {
                     .workspace
                     .worktrees
                     .iter()
-                    .filter(|w| {
-                        w.project_id == pid && w.detached && !self.folder_filters.contains_key(&pid)
-                    })
+                    .filter(|w| w.project_id == pid && w.detached && filter.is_empty())
                     .map(|w| w.id)
                     .collect();
                 for wid in detached {
@@ -36817,6 +36946,26 @@ impl MuxelApp {
                                     self.settings.sidebar_pills == PillStyle::Words,
                                     cx,
                                     |s| s.sidebar_pills = PillStyle::Words,
+                                )),
+                        )
+                        .child(self.settings_label(&t("Sleeping rows"), cx))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(self.option_btn(
+                                    "sidebar-sleeping-shown",
+                                    t("Shown"),
+                                    !self.settings.sidebar_awake_only,
+                                    cx,
+                                    |s| s.sidebar_awake_only = false,
+                                ))
+                                .child(self.option_btn(
+                                    "sidebar-sleeping-hidden",
+                                    t("Awake only"),
+                                    self.settings.sidebar_awake_only,
+                                    cx,
+                                    |s| s.sidebar_awake_only = true,
                                 )),
                         )
                 },

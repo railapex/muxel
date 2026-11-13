@@ -295,7 +295,7 @@ sessions under it, so a working child of an asking family counts on the header
 but sits under Needs you with its family.
 
 The PROJECTS heading carries the workspace's totals: asking, working and
-unread, in the project header's order. Clicking asking or unread focuses the next such session after the
+unread, in the project header's order, then asleep (`☾ n`). Clicking asking or unread focuses the next such session after the
 focused one, across projects in sidebar order, wrapping round
 (`sidebar::next_matching`), and opens whatever hid its row: a collapsed
 project, the folded band it sits in and the folded family it is under, all
@@ -305,6 +305,38 @@ words are spelled out. **Focus next agent needing attention** (Ctrl+Shift+A)
 keeps its own order, blocked then unread finished, and in Recent work opens
 what hid its target the same way. Both switch to the target's project, as
 clicking its row does.
+
+Clicking asleep lists awake sessions only, and the count stays pressed until
+clicked again (Settings, Appearance: "Sleeping rows", Shown or Awake only;
+`Settings::sidebar_awake_only`). It hides a sleeping session with nothing
+unread and nothing asked, and the files, diffs and pages under it
+(`sidebar::awake_rows`). A sleeping top row stays while a session under it
+stays, so a family keeps its top, and a row that needs you never hides, so
+every count and jump still lands on a listed row. The counts, asleep included,
+still take in every row, so the heading says what is hidden. Like the counts
+it is Recent work's; Layout order lists every row.
+
+## The filter box
+
+A box under the PROJECTS heading filters every project's rows, in both
+orders (`session_folder::RowFilter`). Each word must appear, ignoring case, in
+the row's name as shown, its launch folder's path or that folder's known
+branch. Quote words to keep a space. Enter opens the first row left, in sidebar
+order with every fold open, and in Recent work opens what hid it as a jump
+does; Esc or the
+box's clear button empties it. The box is not saved. The counts ignore it, and
+a kept (detached) worktree's subheader, which has no rows to match, hides while
+it filters.
+
+A terminal row's menu fills the box for "this folder and branch" (see
+[session-folder-chips.md](session-folder-chips.md)) with the tokens
+`project:`, `folder:` and `branch:`, which can be typed too. With them a row
+needs that project, and that folder as a full path or that known branch.
+Several of one kind are alternatives. The project is named because branch
+names repeat across repositories: without it, filtering by a root session on
+`master` would list every project's `master` sessions. The project the box
+names shows **Clear** in its header, collapsed or not, and the row whose
+folder it names offers **Show all sessions**; both empty the box.
 
 Recent work writes a row's pill as a glyph and an age by default (Settings,
 Appearance: "Status pills", Icons or Words; `sidebar::pill_text`). Working is
