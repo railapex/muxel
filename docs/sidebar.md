@@ -38,10 +38,22 @@ Each project's rows sit in sections, top to bottom (`sidebar::RecentPlace`):
 The line between Working and the done rows is now. The newest start sits just
 above it and the newest finish just below, so a turn that finishes drops from
 the working rows to the first row under them, and a prompt to a done session
-lifts it to the bottom of the working rows. A label heads each section (Needs
-you, Working with how many sessions in it are working, then each band) when a
-project's rows span more than one; a project whose rows all sit in one section
-needs none.
+lifts it to the bottom of the working rows. Needs you and Working have a label
+when a project's rows span more than one section: Needs you with how many
+sessions in it are asking, Working with how many in it are working. Every band always
+has one, with how many rows it holds (a family counts once), because a band
+folds.
+
+Clicking a band's label folds it: the label stays, with a chevron, and its rows
+go until it is clicked again. A folded band's label also says how many of the
+rows it hides are unread, nested ones included. Needs you and Working never
+fold, so a question or a running turn is never hidden; a row that starts
+working leaves its folded band by itself. Older starts folded in every project
+(Settings, Appearance: "Older section starts", Folded or Open). Each project
+keeps the bands folded or opened by hand that differ from that, and whether the
+project itself is folded under its header, in the local workspace file across
+restarts, never in the layout doc it shares with other machines and the phone.
+Changing the setting still reaches a band left as it started.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A done row's band comes
@@ -191,9 +203,13 @@ turn doesn't move it; when that earliest one finishes and another still works,
 the family moves down the working rows once. Otherwise it goes by the newest
 event among its sessions, so a child's finish brings the family up. Inside a
 family the top session comes first and its children follow by the same rule.
-The top row shows an **N asking** tag while children ask, and an **N
-working** tag while children work and it doesn't, since the children's own
-rows may be far below where you'd look. Viewing still moves nothing. Children don't close with their parent: closing a session takes its
+The top row shows a `? n` tag while children ask, and a `▶ n` tag while
+children work and it doesn't, written as the project header writes its counts,
+with the words ("1 asking") in each tag's tooltip, since the children's own
+rows may be far below where you'd look. A row's name keeps about four
+characters (`ROW_NAME_FLOOR_REMS`): when the sidebar is too narrow for the name,
+the tags and the row's own pill, the tags shrink first (`FAMILY_TAG_SHRINK`),
+then the pill, each clipped inside the row. Viewing still moves nothing. Children don't close with their parent: closing a session takes its
 files, not its child sessions, which become ordinary rows once it's gone,
 unless you choose Close with everything under it (below). A pinned session
 nests only under a pinned one.
@@ -257,8 +273,28 @@ the layout. Layout keeps its existing docked-pane list.
 In Recent work, a completion or blocked event newer than `last_attended_at`
 shows a dot and bold session label. Missing attendance means the event is
 unread. The mark survives subsequent state changes and clears only when the
-session is attended. Done and its age remain after attendance. Project headers
-show their unread count whether expanded or collapsed.
+session is attended. Done and its age remain after attendance.
+
+Each project header in Recent work shows how many of its sessions are asking
+(`? n`, in amber), working (`▶ n`) and unread (`• n`), each only when there
+are any, open or collapsed, so folding a project or a band never hides a
+question. The counts take in every row the project lists, nested and pinned
+ones included, by the state the sections place them by (`sidebar::row_counts`),
+so a session whose process isn't running is never working. Needs you's label
+counts the same asking sessions. Working's label counts only the working
+sessions under it, so a working child of an asking family counts on the header
+but sits under Needs you with its family.
+
+The PROJECTS heading carries the workspace's totals: asking, working and
+unread, in the project header's order. Clicking asking or unread focuses the next such session after the
+focused one, across projects in sidebar order, wrapping round
+(`sidebar::next_matching`), and opens whatever hid its row: a collapsed
+project and the folded band it sits in, both kept open as if clicked. A count
+of zero is disabled. Glyphs fit the default sidebar width; from 300 px the
+words are spelled out. **Focus next agent needing attention** (Ctrl+Shift+A)
+keeps its own order, blocked then unread finished, and in Recent work opens
+what hid its target the same way. Both switch to the target's project, as
+clicking its row does.
 
 `sidebar::is_unread` is the one read rule. The mark and the outline pill of a
 read Done both use it, and Recent work's order never does: the pill's test,

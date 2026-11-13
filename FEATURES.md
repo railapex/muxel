@@ -1761,7 +1761,8 @@ feature is added or changed, update the matching entry here in the same change**
   screen (the muxel mark, an **Add a project** folder picker, a **New remote
   project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
   the work area until the first project is added.
-- **Project list** — projects with live per-agent status rows; collapse a project.
+- **Project list** — projects with live per-agent status rows; collapse a
+  project, which stays collapsed across restarts.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
   each project, then **Needs you** (sessions asking a question, newest question
@@ -1772,8 +1773,13 @@ feature is added or changed, update the matching entry here in the same change**
   sessions never used last in each band, newest open first. A finish lands just
   under the working rows, never above them. A session whose process isn't
   running (put to sleep mid-turn, say) never counts as working: it sits with
-  the done rows by its latest event. Each section gets a thin label, with the
-  working count on Working, when a project's rows span more than one.
+  the done rows by its latest event. Needs you and Working get a thin label, with
+  its asking or working count, when a project's rows span more than one
+  section; each band always has one, with its row count. Click a band's label to
+  fold it: its rows go and the label stays, saying how many of them are unread.
+  Older starts folded (Settings → Appearance → **Older section starts**: Folded or
+  Open), and each project remembers the bands you fold or open across restarts.
+  Needs you and Working never fold.
   Reading, focusing or clicking a session never moves its row, and neither does
   another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that
@@ -1797,11 +1803,13 @@ feature is added or changed, update the matching entry here in the same change**
   under that session's row, and the family moves as one. A session spawned by a
   nested one nests under the same top session, so there are two levels at most:
   a session, its child sessions, and each one's files. While any of the family
-  asks a question, it sits in Needs you and the top row shows **N asking**, so
-  nothing that needs you is buried; otherwise, while any of it works, it sits
-  with the working rows by its earliest start, and a top session that isn't
-  working itself shows **N working**; otherwise it goes by its newest finish,
-  so a child's finish brings the family up. Drag a session onto another session's
+  asks a question, it sits in Needs you and the top row shows `? n` (asking),
+  so nothing that needs you is buried; otherwise, while any of it works, it
+  sits with the working rows by its earliest start, and a top session that
+  isn't working itself shows `▶ n` (working); otherwise it goes by its newest
+  finish, so a child's finish brings the family up. Each tag's tooltip says it
+  in words. A narrow sidebar shrinks the tags, then a row's own pill, before
+  its name drops under about four characters. Drag a session onto another session's
   row to nest it there, or onto its project's header to make it a row of its
   own. Closing a parent leaves its children open as ordinary rows, unless you
   choose Close with everything under it. A pinned session nests only under a
@@ -1834,11 +1842,19 @@ feature is added or changed, update the matching entry here in the same change**
   on. A clock that steps back can't mark a seen event unread or a new one read:
   attendance covers everything recorded before it, and a later event is stamped
   after it. A finish read by clicking its row before the status tick recorded
-  it stays read when the tick catches up. Project rows show the unread count
-  even when collapsed. Agent finishes and questions appear on these session
+  it stays read when the tick catches up. Project rows show their counts
+  even when collapsed (below). Agent finishes and questions appear on these session
   rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
   a row can't show, stays in the feed. App messages, desktop alerts, and tray
   notifications keep their usual behavior.
+- **Counts on project headers and the PROJECTS line** — in Recent work, each
+  project header shows `? n` asking (amber), `▶ n` working and `• n` unread,
+  open or collapsed, so a fold never hides a question. The PROJECTS heading
+  totals them for the workspace: click asking or unread to go to the next such
+  session across projects, which opens its collapsed project and folded band.
+  From 300 px wide the sidebar spells the words out. Ctrl+Shift+A opens what
+  hides its target the same way, and like the counts it switches to the
+  target's project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live), including a new repo's branch before its first
   commit, spelled as the switch-branch menu spells it. A local repo's branch
