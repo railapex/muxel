@@ -163,8 +163,27 @@ impl MuxelApp {
             .close_groups
             .iter()
             .any(|group| group.needs_decision && !group.undoing);
+        // While the button counts down, a thin line along the chip's foot
+        // shows the time left. It moves on the same refresh as the count.
+        let counting =
+            !decision && !latest.undoing && !latest.checking && !latest.syncing() && !multiple;
+        let time_line = counting.then(|| {
+            let left = latest
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f32()
+                / super::recoverable_close::CLOSE_GRACE.as_secs_f32();
+            div()
+                .absolute()
+                .left_0()
+                .bottom_0()
+                .h(px(2.0))
+                .w(relative(left.clamp(0.0, 1.0)))
+                .bg(cx.theme().primary)
+        });
         div()
             .id("recoverable-close-chip")
+            .relative()
             .flex()
             .items_center()
             .gap_1()
@@ -231,6 +250,7 @@ impl MuxelApp {
                         cx.notify();
                     }))
             }))
+            .children(time_line)
             .into_any_element()
     }
 

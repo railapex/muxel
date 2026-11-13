@@ -126,7 +126,8 @@ feature is added or changed, update the matching entry here in the same change**
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
 - **Recoverable terminal close** — a closed terminal stays alive, hidden, for
-  15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
+  15 seconds. The title-bar chip, which counts down with a thin line along its foot,
+  or Ctrl+Alt+Z restores its tabs and live process;
   a popped-out terminal returns to the main window. Busy or uncertain terminals
   ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
   binding, input and completion before expiry; changed work gets Close / Keep.
