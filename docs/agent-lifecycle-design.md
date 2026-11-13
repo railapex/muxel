@@ -82,7 +82,11 @@ Done and recency are different concepts.
   derived from the first transition into Blocked.
 
 V1 attendance remains explicit pane selection/focus. It is an acknowledgement
-action for notifications, not a lifecycle transition.
+action for notifications, not a lifecycle transition. Restoring keyboard focus
+records none, but a terminal focused before it has drawn (the pane in front
+when a project is restored at launch, or one picked while it starts) is owed
+the look: muxel records attendance once that terminal draws while it is the
+focused pane of the active window, as if it had been focused then.
 
 ### Evidence must remain honest
 

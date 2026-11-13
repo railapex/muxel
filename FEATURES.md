@@ -620,7 +620,10 @@ feature is added or changed, update the matching entry here in the same change**
   bright green; once you focus its pane, its sidebar and dashboard icons dim and
   its sidebar pill turns to a green outline, so unread finishes stand out. Filled
   sidebar pills are opaque, with labels at 4.5:1 contrast or better in every
-  bundled theme. Screen checks, markers included, skip
+  bundled theme. A pane in front when muxel restores a project, or picked while
+  it starts, counts as looked at once its terminal draws while its window is
+  active, so its saved finish doesn't stay unread in front of you. Screen
+  checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. The box is
   still found when Claude draws its usage notice into the box's top rule, and
