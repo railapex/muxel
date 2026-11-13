@@ -90,7 +90,7 @@ pub(super) fn with_app_drawing(
     // and its isolated storage scope disappear.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         app.update(&mut cx, |app, cx| {
-            for view in app.terminals.values() {
+            for view in app.terminals.values().chain(app.sleep_exits.values()) {
                 view.read(cx).session().kill();
             }
             for popout in app.popouts.values() {
