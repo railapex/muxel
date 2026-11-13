@@ -10,13 +10,19 @@
 //! Knowing the token is the whole of the authorization; anyone able to read it
 //! can exercise the enabled control authority.
 //!
+//! Several muxel windows (each its own process) can run at once. Each also
+//! publishes its endpoint as `<data dir>/workspaces/<id>/control.json` for the
+//! workspace it has open, and `ctl` run in a pane goes to the window holding that
+//! pane's workspace (see [`choose_endpoint`]). Other callers reach the window
+//! that wrote `control.json` last, as long as it has a workspace open.
+//!
 //! The protocol and the decisions in it live in `muxel_core::control`; the app
 //! answers requests in `app/control_api.rs`. This file is only sockets and files.
 
 use anyhow::{Context as _, Result};
 use muxel_core::control::{
-    self, AgentState, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Request,
-    Response, WaitOutcome,
+    self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Request, Response,
+    WaitOutcome,
 };
 use serde_json::{Value, json};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -32,11 +38,13 @@ const MAX_REQUEST_BYTES: u64 = 1 << 20;
 /// Connections served at once; more are dropped rather than queued.
 const MAX_CONNECTIONS: usize = 16;
 /// How long a connection waits for the app to answer.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Socket read/write timeout, so a stalled peer can't hold a thread.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often `wait` checks on the agent.
 const WAIT_POLL: Duration = Duration::from_secs(1);
+/// How long `new --prompt --wait-delivery` reads for its task to settle.
+const DELIVERY_WAIT: Duration = Duration::from_secs(90);
 
 const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open muxel and \
      turn on Settings > Outside control > \"Allow outside tools to control muxel\". (If it is \
@@ -48,6 +56,28 @@ pub struct Incoming {
     pub command: Command,
     pub caller_instance_id: Option<Uuid>,
     pub reply: std::sync::mpsc::Sender<Response>,
+    /// Set once nobody waits for the reply any more: the caller hung up, or
+    /// the connection's wait ran out. A `send --when-idle` checks it before
+    /// typing.
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// How long a connection waits for the app to answer `command`. A `send
+/// --when-idle` first waits for its pane, then has the usual time to send; a
+/// detached one is answered once it is queued.
+fn reply_timeout(command: &Command) -> Duration {
+    match command {
+        Command::Send {
+            when_idle: true,
+            detach: false,
+            timeout_secs,
+            ..
+        } => {
+            Duration::from_secs(timeout_secs.unwrap_or(control::WHEN_IDLE_TIMEOUT_SECS))
+                + REPLY_TIMEOUT
+        }
+        _ => REPLY_TIMEOUT,
+    }
 }
 
 /// The listening side, alive while outside control is on. Dropping it stops
@@ -57,6 +87,8 @@ pub struct Server {
     port: u16,
     path: PathBuf,
     token: String,
+    /// The open workspace this endpoint is also published for, and that file.
+    workspace: Option<(Uuid, PathBuf)>,
 }
 
 impl Server {
@@ -121,8 +153,54 @@ impl Server {
             port,
             path,
             token,
+            workspace: None,
         })
     }
+
+    /// Publish this endpoint in workspace `id`'s folder too (withdrawing it from
+    /// the previous one), so `ctl` from that workspace's panes finds this window
+    /// when other windows run. Cheap when nothing changed; called every tick.
+    pub fn set_workspace(&mut self, id: Option<Uuid>) {
+        if self.workspace.as_ref().map(|(current, _)| *current) == id {
+            return;
+        }
+        self.withdraw_workspace();
+        let Some(id) = id else { return };
+        let Some(path) = workspace_endpoint_path(&self.path, id) else {
+            return;
+        };
+        let endpoint = Endpoint {
+            version: PROTOCOL_VERSION,
+            port: self.port,
+            token: self.token.clone(),
+            pid: std::process::id(),
+            exe: Some(exe_path()),
+        };
+        // The workspace's folder exists while its lock is held.
+        if let Err(error) = write_endpoint(&path, &endpoint) {
+            log::warn!("couldn't write {}: {error:#}", path.display());
+        }
+        // Remembered even on failure, so a broken folder isn't retried every tick.
+        self.workspace = Some((id, path));
+    }
+
+    fn withdraw_workspace(&mut self) {
+        if let Some((_, path)) = self.workspace.take()
+            && read_endpoint(&path).is_some_and(|e| e.token == self.token)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Where the endpoint for workspace `id` goes, beside the main endpoint file.
+fn workspace_endpoint_path(main: &Path, id: Uuid) -> Option<PathBuf> {
+    Some(
+        main.parent()?
+            .join("workspaces")
+            .join(id.to_string())
+            .join(control::ENDPOINT_FILE),
+    )
 }
 
 impl Drop for Server {
@@ -137,6 +215,7 @@ impl Drop for Server {
         if read_endpoint(&self.path).is_some_and(|e| e.token == self.token) {
             let _ = std::fs::remove_file(&self.path);
         }
+        self.withdraw_workspace();
     }
 }
 
@@ -145,7 +224,7 @@ fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let response = match read_request(&stream) {
-        Ok(request) => dispatch(request, token, tx),
+        Ok(request) => dispatch_on(request, token, tx, Some(&stream)),
         Err(error) => Response::err(error),
     };
     let mut line = serde_json::to_string(&response)
@@ -162,7 +241,20 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     serde_json::from_str(&line).map_err(|e| format!("not a muxel ctl request: {e}"))
 }
 
+#[cfg(test)]
 fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>) -> Response {
+    dispatch_on(request, token, tx, None)
+}
+
+/// Hand `request` to the app and wait for its reply. A `send --when-idle` can
+/// wait many minutes, so while it does the `connection` is watched: once its
+/// caller hangs up, the send is cancelled before it types.
+fn dispatch_on(
+    request: Request,
+    token: &str,
+    tx: &async_channel::Sender<Incoming>,
+    connection: Option<&TcpStream>,
+) -> Response {
     if !same_secret(request.token.as_bytes(), token.as_bytes()) {
         return Response::err("wrong token: run `muxel ctl` as the user running muxel");
     }
@@ -174,6 +266,19 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
             request.version
         ));
     }
+    if let Err(error) = control::check_safe_send(&request.command) {
+        return Response::err(error);
+    }
+    // A detached send outlives its connection, so nothing watches it.
+    let queued = matches!(
+        &request.command,
+        Command::Send {
+            when_idle: true,
+            detach: false,
+            ..
+        }
+    );
+    let timeout = reply_timeout(&request.command);
     let status_poll = matches!(&request.command, Command::NewStatus { .. });
     let unavailable = |message: &str| {
         if status_poll {
@@ -183,17 +288,51 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
         }
     };
     let (reply, answer) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let incoming = Incoming {
         command: request.command,
         caller_instance_id: request.caller_instance_id,
         reply,
+        cancelled: cancelled.clone(),
     };
     if tx.send_blocking(incoming).is_err() {
         return unavailable("muxel is shutting down");
     }
-    answer
-        .recv_timeout(REPLY_TIMEOUT)
-        .unwrap_or_else(|_| unavailable("muxel didn't answer in time"))
+    let (Some(connection), true) = (connection, queued) else {
+        return answer.recv_timeout(timeout).unwrap_or_else(|_| {
+            cancelled.store(true, Ordering::Release);
+            unavailable("muxel didn't answer in time")
+        });
+    };
+    let deadline = Instant::now() + timeout;
+    let _ = connection.set_read_timeout(Some(Duration::from_millis(1)));
+    loop {
+        match answer.recv_timeout(Duration::from_millis(100)) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return unavailable("muxel stopped answering the waiting send");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline || caller_gone(connection) {
+            cancelled.store(true, Ordering::Release);
+            return unavailable("the waiting send ended without an answer");
+        }
+    }
+}
+
+/// Whether the caller closed its end of `connection`, read with the short
+/// timeout the waiting loop sets. Stray bytes after the request line are
+/// read and dropped, so they can't hide a later end of stream.
+fn caller_gone(mut connection: &TcpStream) -> bool {
+    match connection.read(&mut [0_u8; 64]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    }
 }
 
 /// Compare secrets without leaking, through timing, how much of a guess was right.
@@ -234,8 +373,9 @@ fn read_endpoint(path: &Path) -> Option<Endpoint> {
 pub fn run_cli(args: &[String]) -> i32 {
     let command = match control::parse_cli(args) {
         Ok(command) => command,
-        Err(error) => return fail(error.into(), 2),
+        Err(error) => return fail(error.into(), 2, Task::None),
     };
+    let mut task = task_of(&command);
     let result = match command {
         CliCommand::Help(command) => {
             emit(
@@ -255,6 +395,11 @@ pub fn run_cli(args: &[String]) -> i32 {
             text,
             force,
             launch_id,
+            session_id,
+            once,
+            when_idle,
+            detach,
+            timeout_secs,
         }) if text == "-" => {
             let mut text = String::new();
             match std::io::stdin().read_to_string(&mut text) {
@@ -263,9 +408,20 @@ pub fn run_cli(args: &[String]) -> i32 {
                     text: text.trim_end_matches(['\r', '\n']).to_string(),
                     force,
                     launch_id,
+                    session_id,
+                    once,
+                    when_idle,
+                    detach,
+                    timeout_secs,
                 }),
-                Ok(_) => return fail("`send AGENT -` read no text from stdin".into(), 2),
-                Err(e) => return fail(format!("reading stdin: {e}").into(), 2),
+                Ok(_) => {
+                    return fail(
+                        "`send AGENT -` read no text from stdin".into(),
+                        2,
+                        Task::None,
+                    );
+                }
+                Err(e) => return fail(format!("reading stdin: {e}").into(), 2, Task::None),
             }
         }
         CliCommand::Request(Command::New {
@@ -278,20 +434,23 @@ pub fn run_cli(args: &[String]) -> i32 {
                     Ok(_) if !text.trim().is_empty() => {
                         options.prompt = Some(text.trim_end_matches(['\r', '\n']).to_string())
                     }
-                    Ok(_) => return fail("`new --prompt -` read no text from stdin".into(), 2),
-                    Err(error) => return fail(format!("reading stdin: {error}").into(), 2),
+                    Ok(_) => {
+                        return fail(
+                            "`new --prompt -` read no text from stdin".into(),
+                            2,
+                            Task::None,
+                        );
+                    }
+                    Err(error) => {
+                        return fail(format!("reading stdin: {error}").into(), 2, Task::None);
+                    }
                 }
             }
             options.requesting_pane = std::env::var(control::INSTANCE_ID_ENV)
                 .ok()
                 .and_then(|id| id.parse().ok());
-            let no_wait = options.no_wait;
-            request(Command::New { project, options }).and_then(|value| {
-                if no_wait {
-                    Ok(value)
-                } else {
-                    wait_creation(value)
-                }
+            create(project, options, &mut task, request, || {
+                std::thread::sleep(WAIT_POLL)
             })
         }
         CliCommand::Request(command) => request(command),
@@ -299,7 +458,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             agent,
             timeout_secs,
             full,
-        } => wait(&agent, Duration::from_secs(timeout_secs), full),
+            turn,
+        } => wait(&agent, Duration::from_secs(timeout_secs), full, turn),
     };
     match result {
         Ok(value) => {
@@ -307,8 +467,85 @@ pub fn run_cli(args: &[String]) -> i32 {
             emit(&serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()));
             0
         }
-        Err(error) => fail(error, 1),
+        Err(error) => fail(error, 1, task),
     }
+}
+
+/// Where a failed command stood with the task (prompt text) it carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Task {
+    /// It carried none, so its failure reports no outcome.
+    None,
+    /// No request carrying it was admitted.
+    Unsent,
+    /// muxel admitted a creation carrying it, which can still deliver it.
+    Admitted,
+}
+
+/// `send` and `new --prompt` carry a task; nothing else does.
+fn task_of(command: &CliCommand) -> Task {
+    match command {
+        CliCommand::Request(Command::Send { .. }) => Task::Unsent,
+        CliCommand::Request(Command::New { options, .. }) if options.prompt.is_some() => {
+            Task::Unsent
+        }
+        _ => Task::None,
+    }
+}
+
+/// `new`: ask for the pane, wait out its approval and, with `--prompt`, read
+/// where its task stands. `task` becomes [`Task::Admitted`] once muxel has taken
+/// a request carrying one. By default that read is a single one: the reply
+/// comes once the pane exists, with the task delivered, refused or still
+/// pending. `--wait-delivery` keeps reading until the task settles, for up to
+/// [`DELIVERY_WAIT`].
+fn create(
+    project: String,
+    options: control::NewOptions,
+    task: &mut Task,
+    mut request: impl FnMut(Command) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    let no_wait = options.no_wait;
+    let wait = if options.wait_delivery {
+        DELIVERY_WAIT
+    } else {
+        Duration::ZERO
+    };
+    let has_prompt = options.prompt.is_some();
+    let mut value = request(Command::New { project, options })?;
+    if has_prompt {
+        *task = Task::Admitted;
+    }
+    if no_wait {
+        if has_prompt && value["pending"].as_bool() == Some(true) {
+            value["outcome"] = Value::Null;
+            value["prompt_pending"] = json!(true);
+            value["next"] = value["request_id"]
+                .as_str()
+                .map(|id| json!(format!("muxel ctl new-status {id}")))
+                .unwrap_or(Value::Null);
+        }
+        return Ok(value);
+    }
+    let created = wait_creation_with(
+        value,
+        |request_id| request(Command::NewStatus { request_id }),
+        &mut pause,
+    )?;
+    if !has_prompt {
+        return Ok(created);
+    }
+    wait_prompt_delivery_with(
+        created,
+        wait,
+        |agent| {
+            request(Command::Status {
+                agent: Some(agent.to_owned()),
+            })
+        },
+        pause,
+    )
 }
 
 /// Attach Windows GUI builds to the invoking shell's console so ctl can print.
@@ -345,14 +582,36 @@ pub fn attach_parent_console() {
     }
 }
 
-fn fail(error: control::Error, status: i32) -> i32 {
-    emit(&failure_body(error).to_string());
+fn fail(error: control::Error, status: i32, task: Task) -> i32 {
+    emit(&failure_body(error, task).to_string());
     status
 }
 
-fn failure_body(error: control::Error) -> Value {
-    let reply = serde_json::to_value(control::Response::err(error))
+/// A failed command's reply. One that carried a task adds the task's `outcome`:
+/// `not_delivered` only for a coded refusal before any input, and otherwise
+/// `unconfirmed`, since the task may have gone in or, for an admitted creation,
+/// may still go in once it's approved.
+pub(crate) fn failure_body(error: control::Error, task: Task) -> Value {
+    let refused = error.pasted != Some(true)
+        && match (task, error.code) {
+            (_, None) => false,
+            // A lost poll says nothing of the creation it was asking after.
+            (Task::Admitted, Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)) => false,
+            // The first send with this `--once` key is still running and may
+            // yet deliver the task.
+            (_, Some(ErrorCode::Busy)) if error.reason.as_deref() == Some("once_pending") => false,
+            (_, Some(_)) => true,
+        };
+    let mut reply = serde_json::to_value(control::Response::err(error))
         .expect("control errors have a JSON representation");
+    if task != Task::None {
+        reply["outcome"] = json!(if refused {
+            control::PromptOutcome::NotDelivered
+        } else {
+            control::PromptOutcome::Unconfirmed
+        });
+        reply["next"] = json!("muxel ctl panes");
+    }
     with_host(reply)
 }
 
@@ -487,18 +746,73 @@ fn process_alive(pid: u32) -> bool {
 fn request(command: Command) -> Result<Value, control::Error> {
     let path = endpoint_path()?
         .ok_or_else(|| control::Error::new(ErrorCode::HostUnavailable, "no data directory"))?;
-    request_at(&path, command)
+    // Chosen once per `ctl` run, so `wait`'s repeated checks stay on one window.
+    static CHOSEN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let path = CHOSEN.get_or_init(|| {
+        let caller = std::env::var(control::INSTANCE_ID_ENV)
+            .ok()
+            .and_then(|id| id.parse().ok());
+        choose_endpoint(&path, caller)
+    });
+    request_at(path, command)
 }
 
-/// Each poll owns a fresh socket; approvals never occupy a connection slot.
-fn wait_creation(value: Value) -> Result<Value, control::Error> {
-    wait_creation_with(
-        value,
-        |request_id| request(Command::NewStatus { request_id }),
-        || std::thread::sleep(WAIT_POLL),
-    )
+/// Which window's endpoint a request goes to, given the main endpoint file and
+/// the calling pane. A pane's request goes to the window holding the workspace
+/// that pane belongs to. Otherwise it goes to the main file's window while that
+/// runs with a workspace open, and failing that to the window that published
+/// most recently. So neither a new window still on the workspace selector nor
+/// closing the window that wrote the main file cuts the other windows off.
+fn choose_endpoint(main: &Path, caller: Option<Uuid>) -> PathBuf {
+    let Some(dir) = main.parent().map(|dir| dir.join("workspaces")) else {
+        return main.to_path_buf();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return main.to_path_buf();
+    };
+    let live: Vec<(PathBuf, Endpoint, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join(control::ENDPOINT_FILE);
+            let endpoint = read_endpoint(&path)?;
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            process_alive(endpoint.pid).then_some((path, endpoint, modified))
+        })
+        .collect();
+    let main_endpoint = read_endpoint(main).filter(|e| process_alive(e.pid));
+    // One window (or only the main one) running: nothing to choose between.
+    if live.iter().all(|(_, endpoint, _)| {
+        main_endpoint
+            .as_ref()
+            .is_some_and(|main| main.token == endpoint.token)
+    }) {
+        return main.to_path_buf();
+    }
+    if let Some(caller) = caller {
+        let owner = live.iter().find(|(path, _, _)| {
+            path.parent()
+                .map(|ws| ws.join("workspace.json"))
+                .and_then(|doc| muxel_store::load_workspace_from(&doc))
+                .is_some_and(|ws| ws.instances.iter().any(|i| i.id == caller))
+        });
+        if let Some((path, _, _)) = owner {
+            return path.clone();
+        }
+    }
+    let main_has_workspace = main_endpoint.as_ref().is_some_and(|main| {
+        live.iter()
+            .any(|(_, endpoint, _)| endpoint.token == main.token)
+    });
+    if main_has_workspace {
+        return main.to_path_buf();
+    }
+    live.into_iter()
+        .max_by_key(|(_, _, modified)| *modified)
+        .map_or_else(|| main.to_path_buf(), |(path, _, _)| path)
 }
 
+/// Poll a pending creation until muxel answers it. Each poll owns a fresh
+/// socket; approvals never occupy a connection slot.
 fn wait_creation_with(
     value: Value,
     mut status: impl FnMut(Uuid) -> Result<Value, control::Error>,
@@ -537,6 +851,60 @@ fn wait_creation_with(
     }
 }
 
+/// Read-only polls of the created UUID until its task settles or `wait` is up,
+/// whichever comes first; at least one. A task still pending then is reported
+/// as pending, with `status` as the next read. Creation and text are never
+/// reissued.
+fn wait_prompt_delivery_with(
+    mut created: Value,
+    wait: Duration,
+    mut status: impl FnMut(&str) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    let agent = created["uuid"]
+        .as_str()
+        .ok_or("muxel returned a creation without its pane UUID")?
+        .to_owned();
+    let started = Instant::now();
+    let mut unavailable = 0;
+    loop {
+        match status(&agent) {
+            Ok(info) => {
+                unavailable = 0;
+                if let Some(error) = info.get("startup_error") {
+                    created["startup_error"] = error.clone();
+                }
+                let Some(value) = info.get("prompt_delivery") else {
+                    let mut delivery =
+                        control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+                    delivery.submission_confirmed = None;
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                };
+                let delivery: control::PromptDelivery = serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid startup receipt: {error}; inspect `muxel ctl screen {agent}` before more input"))?;
+                if !delivery.prompt_pending || started.elapsed() >= wait {
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                }
+            }
+            Err(error) => {
+                unavailable += 1;
+                if unavailable > 3 {
+                    created["startup_error"] =
+                        json!(format!("Could not observe the startup task: {error}"));
+                    let mut delivery =
+                        control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+                    delivery.next = Some(format!("muxel ctl status {agent}"));
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                }
+            }
+        }
+        pause();
+    }
+}
+
 fn creation_poll_error(mut error: control::Error, request_id: Uuid) -> control::Error {
     error.message = format!(
         "{}; query this creation with `muxel ctl new-status {request_id}` when the host is available; do not repeat `new` because the original request may still be waiting",
@@ -563,7 +931,7 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| unavailable(NOT_RUNNING))?;
-    let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(reply_timeout(&command) + IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut line = serde_json::to_string(&Request {
         version: control::request_version(&command),
@@ -592,10 +960,11 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
 
 /// `wait`: check on the agent until its turn ends (it finishes, blocks on a
 /// question or exits) or `timeout` passes, then show it.
-fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Error> {
+fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value, control::Error> {
     let started = Instant::now();
     // Pin the agent by uuid: its name follows its title, which can change mid-turn.
     let mut target = agent.to_string();
+    let mut background: Value;
     let outcome = loop {
         let info = request(Command::Status {
             agent: Some(target.clone()),
@@ -603,13 +972,17 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
         if let Some(uuid) = info["uuid"].as_str() {
             target = uuid.to_string();
         }
-        let state: Option<AgentState> = serde_json::from_value(info["status"].clone()).ok();
+        let state = control::reported_live_state(&info);
         if state.is_none() {
             return Err(format!("'{agent}' is not a terminal pane").into());
         }
         let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        background = info["background"].clone();
         if info["startup_error"].is_string() {
             break WaitOutcome::SubmissionFailed;
+        }
+        if turn && info["turn_over"].as_bool().unwrap_or(false) {
+            break WaitOutcome::Finished;
         }
         if let Some(outcome) = control::wait_outcome(state, awaiting) {
             break outcome;
@@ -627,24 +1000,319 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
         "outcome": outcome,
         "waited_secs": started.elapsed().as_secs(),
     });
+    if !background.is_null() {
+        shown["wait"]["background"] = background;
+    }
     Ok(shown)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
-        wait_creation_with, write_endpoint,
+        DELIVERY_WAIT, Server, Task, choose_endpoint, create, dispatch, failure_body,
+        process_alive, read_endpoint, reply_timeout, request_at, same_secret, task_of,
+        wait_creation_with, wait_prompt_delivery_with, write_endpoint,
     };
-    use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
+    use muxel_core::control::{
+        self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
+    };
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// `muxel ctl new ARGS`, run against a muxel that answers each request
+    /// with `answer`: the reply, or the failure as the CLI prints it.
+    fn run_new(
+        args: &[&str],
+        mut answer: impl FnMut(Command) -> Result<serde_json::Value, control::Error>,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let args: Vec<String> = ["new", "proj"]
+            .iter()
+            .chain(args)
+            .map(|arg| arg.to_string())
+            .collect();
+        let CliCommand::Request(Command::New { project, options }) =
+            control::parse_cli(&args).unwrap()
+        else {
+            panic!("not a new command");
+        };
+        let mut task = task_of(&control::parse_cli(&args).unwrap());
+        create(project, options, &mut task, &mut answer, || {})
+            .map_err(|error| failure_body(error, task))
+    }
+
+    /// The failure `muxel ctl ARGS` prints when its first request fails.
+    fn first_request_failure(args: &[&str], error: control::Error) -> serde_json::Value {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        failure_body(error, task_of(&control::parse_cli(&args).unwrap()))
+    }
+
+    #[test]
+    fn only_send_and_new_with_a_task_report_an_outcome() {
+        let lost = || control::Error::new(ErrorCode::HostUnavailable, "no muxel");
+        for args in [
+            &["screen", "claude"][..],
+            &["status", "claude"],
+            &["wait", "claude"],
+            &["panes"],
+            &["keys", "claude", "enter"],
+            &["new", "proj"],
+        ] {
+            let reply = first_request_failure(args, lost());
+            assert!(reply.get("outcome").is_none(), "{args:?}: {reply}");
+            assert!(reply.get("next").is_none(), "{args:?}: {reply}");
+        }
+        for args in [
+            &["send", "claude", "hi"][..],
+            &["new", "proj", "--prompt", "hi"],
+        ] {
+            let reply = first_request_failure(args, lost());
+            assert_eq!(reply["outcome"], "not_delivered", "{args:?}");
+            assert_eq!(reply["code"], "host_unavailable", "{args:?}");
+        }
+    }
+
+    /// A repeated `--once` key types nothing itself, but the first send with
+    /// that key may still deliver: the task isn't known to be undelivered.
+    #[test]
+    fn a_repeat_of_a_running_once_send_is_unconfirmed_not_undelivered() {
+        let send = ["send", "claude", "hi", "--once", "d-1"];
+        let running =
+            control::Error::new(ErrorCode::Busy, "first still running").with_reason("once_pending");
+        assert_eq!(
+            first_request_failure(&send, running.clone())["outcome"],
+            "unconfirmed"
+        );
+        assert_eq!(
+            first_request_failure(&send, running.after_paste())["outcome"],
+            "unconfirmed"
+        );
+        for refused in [
+            control::Error::new(ErrorCode::Busy, "queued").with_reason("queued"),
+            control::Error::new(ErrorCode::DraftPresent, "draft"),
+            control::Error::new(ErrorCode::TimedOut, "late").with_reason("working"),
+        ] {
+            assert_eq!(
+                first_request_failure(&send, refused.clone())["outcome"],
+                "not_delivered",
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_admitted_task_is_unconfirmed_when_muxel_stops_answering_its_poll() {
+        let id = uuid::Uuid::new_v4();
+        let creation = |poll: control::Error| {
+            run_new(&["--prompt", "hi"], |command| match command {
+                Command::New { .. } => Ok(serde_json::json!({"pending":true,"request_id":id})),
+                _ => Err(poll.clone()),
+            })
+            .unwrap_err()
+        };
+        let lost = creation(control::Error::new(
+            ErrorCode::HostUnavailable,
+            "connection lost",
+        ));
+        assert_eq!(lost["outcome"], "unconfirmed", "{lost}");
+        assert_eq!(lost["code"], "host_unavailable");
+        let denied = creation(control::Error::new(ErrorCode::ApprovalDenied, "denied"));
+        assert_eq!(denied["outcome"], "not_delivered", "{denied}");
+    }
+
+    #[test]
+    fn new_with_a_task_answers_once_the_pane_exists() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = run_new(&["--prompt", "hi"], |command| match command {
+            Command::New { .. } => Ok(serde_json::json!({"uuid":id,"program":"codex"})),
+            Command::Status { agent } => {
+                assert_eq!(agent.as_deref(), Some(id.as_str()));
+                reads += 1;
+                Ok(serde_json::json!({"prompt_delivery":control::PromptDelivery::pending(&id)}))
+            }
+            _ => panic!("new reissued or polled something else"),
+        })
+        .unwrap();
+        assert_eq!(reads, 1, "one read of the created pane");
+        assert_eq!(reply["uuid"], id);
+        assert_eq!(reply["prompt_pending"], true);
+        assert!(
+            reply["outcome"].is_null(),
+            "pending isn't an outcome: {reply}"
+        );
+        assert_eq!(reply["next"], format!("muxel ctl status {id}"));
+    }
+
+    #[test]
+    fn wait_delivery_reads_the_created_uuid_until_a_terminal_receipt() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = run_new(
+            &["--prompt", "hi", "--wait-delivery"],
+            |command| match command {
+                Command::New { .. } => {
+                    Ok(serde_json::json!({"uuid":id,"program":"codex","args":[]}))
+                }
+                Command::Status { agent } => {
+                    assert_eq!(agent.as_deref(), Some(id.as_str()));
+                    reads += 1;
+                    let receipt = if reads == 1 {
+                        control::PromptDelivery::pending(&id)
+                    } else {
+                        control::PromptDelivery::new(&id, control::PromptOutcome::Submitted)
+                    };
+                    Ok(serde_json::json!({"prompt_delivery":receipt}))
+                }
+                _ => panic!("new reissued or polled something else"),
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(reply["outcome"], "submitted");
+        assert_eq!(reply["submission_confirmed"], true);
+        assert_eq!(reply["program"], "codex");
+        assert!(reply["next"].is_null());
+    }
+
+    #[test]
+    fn lost_startup_status_keeps_the_created_pane_and_never_recreates_it() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = wait_prompt_delivery_with(
+            serde_json::json!({"uuid":id}),
+            DELIVERY_WAIT,
+            |_| {
+                reads += 1;
+                Err("host unavailable".into())
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(reads, 4);
+        assert_eq!(reply["uuid"], id);
+        assert_eq!(reply["outcome"], "unconfirmed");
+        assert_eq!(reply["next"], format!("muxel ctl status {id}"));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// An endpoint file for a window with `token`, run by `pid`.
+    fn publish(path: &std::path::Path, token: &str, pid: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let endpoint = Endpoint {
+            version: PROTOCOL_VERSION,
+            port: 1,
+            token: token.into(),
+            pid,
+            exe: None,
+        };
+        write_endpoint(path, &endpoint).unwrap();
+    }
+
+    /// Workspace `ws` under `data`, holding the pane `instance`, published by
+    /// the window with `token`. Returns its endpoint file.
+    fn workspace_window(
+        data: &std::path::Path,
+        ws: uuid::Uuid,
+        instance: uuid::Uuid,
+        token: &str,
+    ) -> PathBuf {
+        let dir = data.join("workspaces").join(ws.to_string());
+        let mut pane = muxel_core::Instance::shell(uuid::Uuid::new_v4());
+        pane.id = instance;
+        let doc = muxel_core::Workspace {
+            instances: vec![pane],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        muxel_store::save_workspace_to(&dir.join("workspace.json"), &doc).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        publish(&path, token, std::process::id());
+        path
+    }
+
+    #[test]
+    fn a_pane_reaches_the_window_holding_its_workspace() {
+        let data = scratch("route");
+        let main = data.join(control::ENDPOINT_FILE);
+        let me = std::process::id();
+        // Nothing but the main file: it's used, as before.
+        publish(&main, "first", me);
+        assert_eq!(choose_endpoint(&main, Some(uuid::Uuid::new_v4())), main);
+
+        let (pane_a, pane_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let a = workspace_window(&data, uuid::Uuid::new_v4(), pane_a, "first");
+        // One window publishing under both names: still the main file.
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), main);
+
+        // A second window, which didn't write the main file, holds pane B.
+        let b = workspace_window(&data, uuid::Uuid::new_v4(), pane_b, "second");
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), b);
+        let to_a = choose_endpoint(&main, Some(pane_a));
+        assert_eq!(read_endpoint(&to_a).unwrap().token, "first");
+        // Outside tools and unknown panes go to the main file's window.
+        assert_eq!(choose_endpoint(&main, None), main);
+        assert_eq!(choose_endpoint(&main, Some(uuid::Uuid::new_v4())), main);
+
+        // A new window still on the workspace selector wrote the main file last:
+        // outside tools go to a window with a workspace open instead.
+        publish(&main, "selector", me);
+        let newest = choose_endpoint(&main, None);
+        assert!(newest == a || newest == b, "{}", newest.display());
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), b);
+        publish(&main, "first", me);
+
+        // The main file's window exited: the others are still reachable.
+        std::fs::remove_file(&main).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(choose_endpoint(&main, None), b);
+
+        // A window that died without cleaning up isn't chosen.
+        let dead = (1..)
+            .map(|n| u32::MAX / 2 - n)
+            .find(|pid| !process_alive(*pid))
+            .unwrap();
+        publish(&b, "second", dead);
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), main);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_server_publishes_for_the_open_workspace_and_withdraws_after() {
+        let data = scratch("publish-workspace");
+        let (one, two) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let file = |id: uuid::Uuid| {
+            data.join("workspaces")
+                .join(id.to_string())
+                .join(control::ENDPOINT_FILE)
+        };
+        for id in [one, two] {
+            std::fs::create_dir_all(file(id).parent().unwrap()).unwrap();
+        }
+        let (tx, _rx) = async_channel::unbounded();
+        let mut server = Server::start_in(&data, tx).unwrap();
+        let main = read_endpoint(&data.join(control::ENDPOINT_FILE)).unwrap();
+
+        server.set_workspace(Some(one));
+        assert_eq!(read_endpoint(&file(one)).unwrap(), main);
+        server.set_workspace(Some(two));
+        assert!(!file(one).exists());
+        assert_eq!(read_endpoint(&file(two)).unwrap().port, main.port);
+        server.set_workspace(None);
+        assert!(!file(two).exists());
+
+        server.set_workspace(Some(one));
+        drop(server);
+        assert!(!file(one).exists());
+        assert!(!data.join(control::ENDPOINT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
@@ -672,7 +1340,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, Some(ErrorCode::Closing));
         assert_eq!(error.undo_until, Some(deadline));
-        let json = failure_body(error);
+        let json = failure_body(error, Task::None);
         assert_eq!(json["ok"], false);
         assert_eq!(json["code"], "closing");
         assert_eq!(json["undo_until"], deadline);
@@ -693,7 +1361,7 @@ mod tests {
             control::Error::new(ErrorCode::Working, "busy"),
             control::Error::from("no match"),
         ] {
-            let reply = failure_body(error);
+            let reply = failure_body(error, Task::Unsent);
             assert!(reply.get("undo_until").is_none());
             assert!(reply.get("result").is_none());
         }
@@ -704,6 +1372,7 @@ mod tests {
         let busy = failure_body(
             control::Error::new(ErrorCode::Working, "prior turn is open")
                 .with_reason("just_submitted"),
+            Task::Unsent,
         );
         assert_eq!(busy["ok"], false);
         assert_eq!(busy["code"], "working");
@@ -713,9 +1382,11 @@ mod tests {
 
         let pasted = failure_body(
             control::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste(),
+            Task::Unsent,
         );
         assert_eq!(pasted["pasted"], true);
         assert_eq!(pasted["error"], "Enter withheld");
+        assert_eq!(pasted["outcome"], "unconfirmed");
     }
 
     #[test]
@@ -948,6 +1619,11 @@ mod tests {
             text: "hi".into(),
             force: false,
             launch_id: Some(uuid::Uuid::from_u128(42)),
+            session_id: None,
+            once: None,
+            when_idle: false,
+            detach: false,
+            timeout_secs: None,
         };
         let refused = request_at(&path, send()).unwrap_err();
         assert_eq!(refused.code, Some(ErrorCode::Working));
@@ -964,6 +1640,129 @@ mod tests {
         let gone = request_at(&path, Command::Projects).unwrap_err();
         assert_eq!(gone.code, Some(ErrorCode::HostUnavailable));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `send --when-idle` whose caller hangs up must not type later: the
+    /// connection notices, and tells the app before it can.
+    #[test]
+    fn a_waiting_send_is_cancelled_when_its_caller_hangs_up() {
+        use std::net::Shutdown;
+        let dir = scratch("queued-hangup");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        let mut stream =
+            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, server.port))).unwrap();
+        let command = Command::Send {
+            agent: "agent".into(),
+            text: "[wire v1 d-9f2a] unread mail".into(),
+            force: false,
+            launch_id: None,
+            session_id: None,
+            once: Some("d-9f2a".into()),
+            when_idle: true,
+            detach: false,
+            timeout_secs: Some(30),
+        };
+        let request = control::Request {
+            version: control::request_version(&command),
+            token: server.token.clone(),
+            caller_instance_id: None,
+            command,
+        };
+        writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        let incoming = rx.recv_blocking().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!incoming.cancelled.load(Ordering::Acquire));
+        stream.shutdown(Shutdown::Both).unwrap();
+        drop(stream);
+        let start = Instant::now();
+        while !incoming.cancelled.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the hang-up didn't cancel the waiting send"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The caller's read and the connection's wait both outlast the time a
+    /// `send --when-idle` may wait, so a send that waited long is never lost.
+    /// A detached send is answered once queued, so its caller waits as long
+    /// as for any other request.
+    #[test]
+    fn a_waiting_send_has_its_wait_on_top_of_the_reply_window() {
+        let send = |when_idle, timeout_secs| Command::Send {
+            agent: "a".into(),
+            text: "hi".into(),
+            force: false,
+            launch_id: None,
+            session_id: None,
+            once: None,
+            when_idle,
+            detach: false,
+            timeout_secs,
+        };
+        let mut detached = send(true, Some(control::DETACHED_TIMEOUT_SECS));
+        if let Command::Send { once, detach, .. } = &mut detached {
+            (*once, *detach) = (Some("d-1".into()), true);
+        }
+        assert_eq!(reply_timeout(&detached), super::REPLY_TIMEOUT);
+        assert_eq!(reply_timeout(&send(false, None)), super::REPLY_TIMEOUT);
+        assert_eq!(
+            reply_timeout(&send(true, None)),
+            Duration::from_secs(control::WHEN_IDLE_TIMEOUT_SECS) + super::REPLY_TIMEOUT
+        );
+        assert_eq!(
+            reply_timeout(&send(true, Some(45))),
+            Duration::from_secs(45) + super::REPLY_TIMEOUT
+        );
+        assert_eq!(reply_timeout(&Command::Projects), super::REPLY_TIMEOUT);
+    }
+
+    /// A raw JSON client gets the same option checks as the CLI.
+    #[test]
+    fn the_host_refuses_bad_once_and_when_idle_options_before_the_app() {
+        let (tx, rx) = async_channel::unbounded();
+        let key = || Some("k".to_owned());
+        for (once, when_idle, detach, force, timeout_secs) in [
+            (Some(String::new()), false, false, false, None),
+            (Some("k".repeat(129)), false, false, false, None),
+            (None, false, false, false, Some(5)),
+            (None, true, false, false, Some(0)),
+            (None, true, false, true, None),
+            // Only a waiting send with a key to report it by detaches.
+            (key(), false, true, false, None),
+            (None, true, true, false, None),
+            (
+                key(),
+                true,
+                true,
+                false,
+                Some(control::DETACHED_TIMEOUT_SECS + 1),
+            ),
+        ] {
+            let command = Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force,
+                launch_id: None,
+                session_id: None,
+                once,
+                when_idle,
+                detach,
+                timeout_secs,
+            };
+            let request = control::Request {
+                version: control::request_version(&command),
+                token: "test".into(),
+                caller_instance_id: None,
+                command,
+            };
+            assert!(!dispatch(request, "test", &tx).ok);
+        }
+        assert!(rx.try_recv().is_err(), "a refused option reached the app");
     }
 
     #[test]
@@ -1085,6 +1884,41 @@ mod tests {
                 text: "hi".into(),
                 force: false,
                 launch_id: Some(uuid::Uuid::from_u128(42)),
+                session_id: None,
+                once: None,
+                when_idle: false,
+                detach: false,
+                timeout_secs: None,
+            },
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                session_id: None,
+                once: Some("d-9f2a".into()),
+                when_idle: true,
+                detach: false,
+                timeout_secs: None,
+            },
+            Command::OnceStatus {
+                agent: "a".into(),
+                key: "d-9f2a".into(),
+            },
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                session_id: None,
+                once: Some("d-9f2b".into()),
+                when_idle: true,
+                detach: true,
+                timeout_secs: None,
+            },
+            Command::OnceCancel {
+                agent: "a".into(),
+                key: "d-9f2b".into(),
             },
             Command::New {
                 project: "repo".into(),
@@ -1108,7 +1942,20 @@ mod tests {
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line).unwrap();
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["version"], 2);
+                // Every one of them needs more than a v1 host can honor.
+                let version = request["version"].as_u64().unwrap();
+                let expected = if request["command"]["cmd"] == "once_cancel"
+                    || request["command"]["detach"] == true
+                {
+                    6
+                } else if request["command"]["cmd"] == "once_status"
+                    || request["command"]["once"].is_string()
+                {
+                    4
+                } else {
+                    2
+                };
+                assert_eq!(version, expected, "{request}");
                 stream
                     .write_all(b"{\"ok\":false,\"error\":\"legacy host rejects request v2\"}\n")
                     .unwrap();

@@ -6,11 +6,16 @@
 use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, RopeExt as _, TabSize};
+use gpui_component::input::{Input, InputEvent, InputState, Position, Rope, RopeExt as _, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
+use muxel_core::rescue::{BackupOffer, EditorBackup, FileStamp};
+use muxel_store::rescue::RescueDir;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime};
+use uuid::Uuid;
 
 /// Don't try to open files larger than this (treated as non-text).
 pub const MAX_EDITOR_BYTES: u64 = 8 * 1024 * 1024;
@@ -46,6 +51,8 @@ pub struct EditorView {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     dirty: bool,
+    /// Last clean buffer, for detecting edits accepted without InputEvent::Change.
+    clean_text: Rope,
     config: EditorConfig,
     /// Set for read-only diff panes: the directory whose `git diff` is shown.
     diff_dir: Option<PathBuf>,
@@ -55,10 +62,84 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// The rendered view's focus. The text input isn't drawn while the
+    /// rendered view shows, and GPUI sends the keys of a focused handle that
+    /// isn't drawn to the window root, past every binding in the pane.
+    view_focus: FocusHandle,
+    /// "Copy as rich text" just succeeded: the header shows a check briefly.
+    rich_copied: bool,
+    /// Counts copies, so an earlier copy's timer can't clear a later one's check.
+    rich_copy_count: u64,
+    /// A rich-text copy is converting in the background.
+    rich_copy_converting: bool,
     /// Latest external change that could not be applied without discarding edits.
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
     disk_stamp: Option<DiskStamp>,
+    /// Backups of unsaved changes, so a crash doesn't lose them.
+    rescue: EditorRescue,
+}
+
+/// An editor's backup of its unsaved changes: where it goes, the debounce,
+/// and a backup found when the editor opened.
+#[derive(Default)]
+struct EditorRescue {
+    target: Option<(RescueDir, Uuid)>,
+    last_edit: Option<Instant>,
+    pending: Option<Task<()>>,
+    /// The on-disk version the unsaved edits started from.
+    base: Option<FileStamp>,
+    /// A backup left by the last run, until it is restored or discarded.
+    offer: Option<(EditorBackup, BackupOffer)>,
+    /// Orders this pane's backup writes; an editor rebuilt in another window
+    /// keeps it.
+    lane: Arc<BackupLane>,
+    /// An input method's uncommitted text in the buffer: where it is and
+    /// what it says.
+    composing: Option<(std::ops::Range<usize>, String)>,
+    /// Background writes wait on this before they land (tests only).
+    #[cfg(all(test, windows))]
+    gate: Option<async_channel::Receiver<()>>,
+}
+
+/// One pane's backup writes, in order. A background write takes a ticket
+/// when it starts and lands only if no write or delete came after it, so an
+/// older snapshot never replaces a newer one or brings a deleted one back.
+#[derive(Debug, Default)]
+pub(crate) struct BackupLane {
+    /// Bumped by every write and delete.
+    generation: AtomicU64,
+    /// Held while a write lands or a delete runs.
+    order: std::sync::Mutex<()>,
+}
+
+impl BackupLane {
+    fn ticket(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Land a background write holding `ticket`, unless something came after.
+    fn land<T>(&self, ticket: u64, write: impl FnOnce() -> T) -> Option<T> {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        (self.generation.load(Ordering::SeqCst) == ticket).then(write)
+    }
+
+    /// Act now, after any write that is landing, and void those still on
+    /// their way.
+    fn barrier<T>(&self, act: impl FnOnce() -> T) -> T {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        act()
+    }
+}
+
+/// What an editor's backups carry when it is rebuilt in another window.
+#[derive(Clone, Default)]
+pub(crate) struct BackupState {
+    target: Option<(RescueDir, Uuid)>,
+    base: Option<FileStamp>,
+    offer: Option<(EditorBackup, BackupOffer)>,
+    lane: Arc<BackupLane>,
 }
 
 #[derive(Clone)]
@@ -102,6 +183,22 @@ pub(crate) fn read_disk_change(path: &Path, known: Option<DiskStamp>) -> Option<
     match std::fs::read_to_string(path) {
         Ok(content) => Some(DiskChange::Content { stamp, content }),
         Err(_) => Some(DiskChange::Unavailable { stamp }),
+    }
+}
+
+/// Whether a click on a rendered Markdown link opens it in the background: a
+/// middle-click or Ctrl+click (Cmd+click on macOS) does, and a plain click
+/// shows it without taking focus. `None` for a click that opens nothing, such
+/// as a right-click or a long press.
+fn link_in_background(event: &ClickEvent) -> Option<bool> {
+    match event {
+        ClickEvent::Mouse(click) => match click.up.button {
+            MouseButton::Left => Some(click.up.modifiers.secondary()),
+            MouseButton::Middle => Some(true),
+            _ => None,
+        },
+        ClickEvent::Keyboard(_) => Some(false),
+        ClickEvent::Touch(touch) => (!touch.long_press).then_some(false),
     }
 }
 
@@ -194,17 +291,31 @@ impl EditorView {
                 })
                 .default_value(content)
         });
-        // Mark dirty on edit; refresh the pane title's dirty dot once.
+        // IME cancellation can emit Change after restoring the clean text.
+        // Mark actual edits dirty; refresh the pane title's dirty dot once.
         cx.subscribe_in(
             &input,
             window,
-            |this: &mut Self, _input, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::Change) && !this.dirty {
+            |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change)
+                    && !this.dirty
+                    && input.read(cx).text() != &this.clean_text
+                {
                     this.dirty = true;
+                    this.rescue.base = this.disk_stamp.map(file_stamp);
                     cx.notify();
+                }
+                if matches!(ev, InputEvent::Change | InputEvent::Blur) {
+                    this.note_edit(cx);
                 }
             },
         )
+        .detach();
+        // An input method's uncommitted text changes the buffer without a
+        // Change event; only observers hear of it.
+        cx.observe_in(&input, window, |this: &mut Self, input, window, cx| {
+            this.note_composition(&input, window, cx)
+        })
         .detach();
         if let Some(pos) = cursor {
             input.update(cx, |s, cx| s.set_cursor_position(pos, window, cx));
@@ -212,30 +323,38 @@ impl EditorView {
         let stamp = path.as_deref().and_then(disk_stamp);
         let is_markdown = path.as_deref().is_some_and(is_markdown_path);
         let is_image = path.as_deref().is_some_and(is_image_path);
+        let clean_text = input.read(cx).text().clone();
         Self {
             input,
             path,
             dirty,
+            clean_text,
             config,
             diff_dir: None,
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            view_focus: cx.focus_handle(),
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: stamp,
+            rescue: EditorRescue::default(),
         }
     }
 
-    /// Create a read-only git-diff view of `dir`, syntax-highlighted via the
-    /// "diff" grammar (green additions / red deletions / `@@` hunks). The buffer
-    /// is never saved; `refresh_diff` re-runs `git diff`.
+    /// Create a read-only git-diff view of `dir` showing `content`,
+    /// syntax-highlighted via the "diff" grammar (green additions / red
+    /// deletions / `@@` hunks). The buffer is never saved. `git diff` runs off
+    /// the UI thread and arrives through `set_diff_content`.
     pub fn diff(
         dir: PathBuf,
+        content: String,
         config: EditorConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = crate::integrations::git_diff(&dir);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("diff")
@@ -248,13 +367,20 @@ impl EditorView {
             input,
             path: None,
             dirty: false,
+            // Read-only diffs never reload from a file or need a clean snapshot.
+            clean_text: Rope::new(),
             config,
             diff_dir: Some(dir),
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            view_focus: cx.focus_handle(),
+            rich_copied: false,
+            rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: None,
+            rescue: EditorRescue::default(),
         }
     }
 
@@ -284,12 +410,67 @@ impl EditorView {
         self.show_rendered
     }
 
-    /// Toggle between the rendered view (image/markdown) and the raw text editor.
-    pub fn toggle_rendered(&mut self, cx: &mut Context<Self>) {
+    /// Toggle between the rendered view (image/markdown) and the raw text
+    /// editor. Focus held in the view going away moves to the one shown.
+    pub fn toggle_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_renderable() {
+            let focused = self.focus_handle(cx).contains_focused(window, cx);
             self.show_rendered = !self.show_rendered;
+            if focused {
+                window.focus(&self.focus_handle(cx), cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Whether "Copy as rich text" is offered: rendered Markdown only.
+    pub fn can_copy_rich_text(&self) -> bool {
+        self.is_markdown && self.show_rendered
+    }
+
+    /// Whether a rich-text copy just succeeded (the header shows a check).
+    pub fn rich_text_copied(&self) -> bool {
+        self.rich_copied
+    }
+
+    /// Start a rich-text copy: the document to convert, or `None` while an
+    /// earlier copy is still converting, so a repeated click is ignored. An
+    /// earlier copy's check goes, so it can't sit beside this one's error.
+    pub fn begin_rich_copy(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if self.rich_copy_converting {
+            return None;
+        }
+        self.rich_copy_converting = true;
+        if self.rich_copied {
+            self.rich_copied = false;
+            cx.notify();
+        }
+        Some(self.text(cx))
+    }
+
+    /// The conversion `begin_rich_copy` started has finished.
+    pub fn end_rich_copy(&mut self) {
+        self.rich_copy_converting = false;
+    }
+
+    /// Show the copied check for a moment.
+    pub fn flash_rich_text_copied(&mut self, cx: &mut Context<Self>) {
+        self.rich_copy_count += 1;
+        let count = self.rich_copy_count;
+        self.rich_copied = true;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rich_copy_count == count {
+                    this.rich_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The directory a diff pane is showing (for dedup), if any.
@@ -297,27 +478,13 @@ impl EditorView {
         self.diff_dir.as_deref()
     }
 
-    /// Re-run `git diff` for a diff pane and replace the shown text (synchronous;
-    /// used by the manual refresh button and pop-out/restore).
-    pub fn refresh_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.diff_dir.clone() else {
-            return;
-        };
-        let content = crate::integrations::git_diff(&dir);
-        self.apply_diff_text(content, window, cx);
-    }
-
-    /// Replace a diff pane's text with already-computed `content` (used by the
-    /// periodic background refresh so `git diff` doesn't run on the UI thread).
+    /// Replace a diff pane's text with background-computed `content`, keeping
+    /// the user's scroll position. Does nothing when the text is unchanged (so an
+    /// idle diff never jumps) or when this isn't a diff pane.
     pub fn set_diff_content(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff_dir.is_some() {
-            self.apply_diff_text(content, window, cx);
+        if self.diff_dir.is_none() {
+            return;
         }
-    }
-
-    /// Swap in new diff text while keeping the user's scroll position. Does
-    /// nothing when the text is unchanged (so an idle diff never jumps).
-    fn apply_diff_text(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| {
             if &*s.value() == content.as_str() {
                 return;
@@ -369,14 +536,34 @@ impl EditorView {
         });
     }
 
-    /// Reload an unchanged local buffer from disk. Dirty source always wins.
+    fn is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.input.update(cx, |input, cx| {
+            input.marked_text_range(window, cx).is_some()
+        })
+    }
+
+    /// Unmarking IME text can commit it without emitting InputEvent::Change.
+    /// Compare only when deciding whether a disk reload may discard the buffer.
+    fn check_unreported_edits(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty && self.is_dirty(cx) {
+            self.dirty = true;
+            cx.notify();
+        }
+    }
+
+    /// Reload an unchanged local buffer from disk. Dirty source always wins,
+    /// and in-progress IME text stays in place until composition ends.
     pub fn reload_if_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.dirty || self.is_composing(window, cx) {
             return;
         }
         let Some(path) = self.path.clone() else {
             return;
         };
+        self.check_unreported_edits(cx);
+        if self.dirty {
+            return;
+        }
         let Some(content) = read_text_file(&path) else {
             return;
         };
@@ -395,6 +582,12 @@ impl EditorView {
     ) {
         match change {
             DiskChange::Content { stamp, content } => {
+                if self.is_composing(window, cx) {
+                    // Leave the old stamp so the next poll retries after the
+                    // composition commits or cancels, using current disk text.
+                    return;
+                }
+                self.check_unreported_edits(cx);
                 self.disk_stamp = Some(stamp);
                 if self.dirty {
                     self.external_change = Some(ExternalChange::Modified(content));
@@ -428,6 +621,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if &*self.input.read(cx).value() == content.as_str() {
+            self.clean_text = self.input.read(cx).text().clone();
             return;
         }
         self.input.update(cx, |s, cx| {
@@ -439,6 +633,7 @@ impl EditorView {
             // Restoring the cursor scrolls it into view once layout exists.
             s.set_scroll_offset(offset, cx);
         });
+        self.clean_text = self.input.read(cx).text().clone();
         self.dirty = false;
         cx.notify();
     }
@@ -446,8 +641,12 @@ impl EditorView {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        self.dirty || (self.diff_dir.is_none() && self.input.read(cx).text() != &self.clean_text)
+    }
+    #[cfg(all(test, windows))]
+    pub(crate) fn input_for_test(&self) -> Entity<InputState> {
+        self.input.clone()
     }
     pub(crate) fn external_change(&self) -> Option<ExternalChange> {
         self.external_change.clone()
@@ -497,6 +696,7 @@ impl EditorView {
     pub fn mark_saved(&mut self, cx: &mut Context<Self>) {
         let was_dirty = self.dirty;
         let changed = self.external_change.take().is_some();
+        self.clean_text = self.input.read(cx).text().clone();
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         if self.dirty {
             self.dirty = false;
@@ -504,16 +704,19 @@ impl EditorView {
         if was_dirty || changed {
             cx.notify();
         }
+        self.backup_clean(cx);
     }
 
     /// Replace the buffer contents (used after an async remote read), keeping the
     /// path/language, and clear the dirty flag.
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.clean_text = self.input.read(cx).text().clone();
         self.dirty = false;
         self.external_change = None;
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         cx.notify();
+        self.backup_clean(cx);
     }
 
     /// Point the editor at a new on-disk path (after Save As), re-detecting the
@@ -522,11 +725,29 @@ impl EditorView {
         let lang = language_for_path(&path).to_string();
         let stamp = disk_stamp(&path);
         self.input.update(cx, |s, cx| s.set_highlighter(lang, cx));
+        self.clean_text = self.input.read(cx).text().clone();
         self.path = Some(path);
         self.dirty = false;
         self.external_change = None;
         self.disk_stamp = stamp;
         cx.notify();
+        self.backup_clean(cx);
+    }
+
+    /// Explicit Reload discards all local text, including an active composition.
+    pub(crate) fn reload_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ExternalChange::Modified(content)) = self.external_change.take() else {
+            return;
+        };
+        // End composition even if the chosen disk text already equals the input.
+        self.input
+            .update(cx, |input, cx| input.unmark_text(window, cx));
+        self.replace_disk_content(content, window, cx);
+        self.dirty = false;
+        cx.notify();
+        // The buffer is clean again: what was backed up goes, after any
+        // backup write on its way.
+        self.backup_clean(cx);
     }
 
     fn render_external_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -546,13 +767,7 @@ impl EditorView {
                     .xsmall()
                     .label(t("Reload"))
                     .on_click(cx.listener(|this, _event, window, cx| {
-                        let Some(ExternalChange::Modified(content)) = this.external_change.take()
-                        else {
-                            return;
-                        };
-                        this.replace_disk_content(content, window, cx);
-                        this.dirty = false;
-                        cx.notify();
+                        this.reload_external_change(window, cx);
                     })),
             );
         }
@@ -590,14 +805,466 @@ impl EditorView {
     }
 }
 
-impl Focusable for EditorView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.read(cx).focus_handle(cx)
+/// A disk stamp as a backup records it.
+fn file_stamp(stamp: DiskStamp) -> FileStamp {
+    FileStamp {
+        modified_ms: stamp
+            .modified
+            .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_millis()).ok()),
+        len: stamp.len,
     }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// `HH:MM` for today, else the date as well: when rescued text was kept.
+pub(crate) fn rescue_time(ms: i64) -> String {
+    use chrono::TimeZone as _;
+    let Some(at) = chrono::Local.timestamp_millis_opt(ms).single() else {
+        return String::new();
+    };
+    if at.date_naive() == chrono::Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
+    }
+}
+
+/// Backing up unsaved changes. A dirty buffer (or one holding an input
+/// method's uncommitted text) is written about a second after edits stop,
+/// staged off the UI thread; saving, reloading from disk, or closing without
+/// saving deletes the backup. Deletes and the final write when an editor goes
+/// away (quit, workspace switch) run on the UI thread, after any write that
+/// is landing, and no earlier write lands after them.
+impl EditorView {
+    /// Back up this editor's unsaved changes to `target` (its workspace's
+    /// rescue directory and its pane); `None` stops, and no write already on
+    /// its way lands after it.
+    pub(crate) fn set_backup_target(&mut self, target: Option<(RescueDir, Uuid)>) {
+        if target.is_none() {
+            self.rescue.pending = None;
+            self.rescue.offer = None;
+            self.rescue.lane.barrier(|| ());
+        }
+        self.rescue.target = target;
+    }
+
+    /// Keep this editor's unsaved changes backed up under `target`; with
+    /// `offer`, first offer the backup a previous run left.
+    pub(crate) fn adopt_backup(
+        &mut self,
+        target: Option<(RescueDir, Uuid)>,
+        offer: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_backup_target(target);
+        if offer {
+            self.offer_backup(cx);
+        }
+        self.note_edit(cx);
+    }
+
+    /// What this editor's backups need to carry on in a rebuilt editor.
+    pub(crate) fn backup_state(&self) -> BackupState {
+        BackupState {
+            target: self.rescue.target.clone(),
+            base: self.rescue.base,
+            offer: self.rescue.offer.clone(),
+            lane: self.rescue.lane.clone(),
+        }
+    }
+
+    /// Carry on the backups of the editor this one was rebuilt from.
+    pub(crate) fn adopt_backup_state(&mut self, state: BackupState, cx: &mut Context<Self>) {
+        self.rescue.target = state.target;
+        self.rescue.base = state.base;
+        self.rescue.offer = state.offer;
+        self.rescue.lane = state.lane;
+        self.note_edit(cx);
+    }
+
+    /// Whether the buffer holds changes a backup must keep. Backups ask this
+    /// and nothing else about dirtiness. An input method's uncommitted text
+    /// counts once it changes the buffer; a backup can't bring back the
+    /// composition itself.
+    fn needs_backup(&self, cx: &App) -> bool {
+        self.diff_dir.is_none() && !self.is_image && self.is_dirty(cx)
+    }
+
+    /// The input notified: an input method's uncommitted text may have
+    /// changed, which no Change event reports. Back it up like an edit. When
+    /// the composition ends, the buffer is compared with its clean text: a
+    /// commit left changes (the buffer is dirty now, as an edit makes it), a
+    /// cancellation from a clean buffer left none, and the backup goes.
+    fn note_composition(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::EntityInputHandler as _;
+        use gpui_component::RopeExt as _;
+        let marked = input.update(cx, |state, cx| state.marked_text_range(window, cx));
+        let composing = marked.map(|utf16| {
+            let text = input.read(cx).text();
+            let start = text.offset_utf16_to_offset(utf16.start);
+            let bytes = start..text.offset_utf16_to_offset(utf16.end).max(start);
+            let marked = text.slice(bytes.clone()).to_string();
+            (bytes, marked)
+        });
+        if composing == self.rescue.composing {
+            return;
+        }
+        let ended = composing.is_none();
+        self.rescue.composing = composing;
+        if ended && !self.dirty && self.is_dirty(cx) {
+            self.dirty = true;
+            self.rescue.base = self.disk_stamp.map(file_stamp);
+            cx.notify();
+        }
+        if self.needs_backup(cx) {
+            self.note_edit(cx);
+        } else {
+            self.backup_clean(cx);
+        }
+    }
+
+    /// An edit (or the editor losing focus): restart the debounce.
+    fn note_edit(&mut self, cx: &mut Context<Self>) {
+        if self.rescue.target.is_none() || !self.needs_backup(cx) {
+            return;
+        }
+        self.rescue.last_edit = Some(Instant::now());
+        if self.rescue.pending.is_some() {
+            return;
+        }
+        self.rescue.pending = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let wait = this.update(cx, |this, _| {
+                    this.rescue
+                        .last_edit
+                        .and_then(|at| muxel_core::rescue::debounce_remaining(at.elapsed()))
+                });
+                match wait {
+                    Ok(Some(wait)) => cx.background_executor().timer(wait).await,
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.rescue.pending = None;
+                this.write_backup(false, cx);
+            });
+        }));
+    }
+
+    /// Write the backup, or delete it once the buffer is clean. A write is
+    /// staged in the background and lands only if nothing came after it;
+    /// `now` writes on this thread, for an editor about to be dropped. A
+    /// delete always runs now.
+    fn write_backup(&mut self, now: bool, cx: &mut Context<Self>) {
+        let Some((dir, iid)) = self.rescue.target.clone() else {
+            return;
+        };
+        let lane = self.rescue.lane.clone();
+        if !self.needs_backup(cx) {
+            self.rescue.base = None;
+            lane.barrier(|| dir.delete_editor_backup(iid));
+            return;
+        }
+        let text = self.text(cx);
+        if text.len() > muxel_core::rescue::MAX_EDITOR_BACKUP_BYTES {
+            log::warn!(
+                "editor {iid} is too large to back up ({} bytes)",
+                text.len()
+            );
+            return;
+        }
+        if self.rescue.base.is_none() {
+            self.rescue.base = self.disk_stamp.map(file_stamp);
+        }
+        let backup = EditorBackup {
+            path: self.path.clone(),
+            text,
+            base: self.rescue.base,
+            saved_at_ms: now_ms(),
+        };
+        if now {
+            if let Err(e) = lane.barrier(|| dir.save_editor_backup(iid, &backup)) {
+                log::warn!("couldn't back up editor {iid}: {e:#}");
+            }
+            return;
+        }
+        let ticket = lane.ticket();
+        #[cfg(all(test, windows))]
+        let gate = self.rescue.gate.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let started = Instant::now();
+                let staged = match dir.stage_editor_backup(iid, &backup) {
+                    Ok(staged) => staged,
+                    Err(e) => {
+                        log::warn!("couldn't back up editor {iid}: {e:#}");
+                        return;
+                    }
+                };
+                #[cfg(all(test, windows))]
+                if let Some(gate) = gate {
+                    let _ = gate.recv().await;
+                }
+                match lane.land(ticket, || staged.commit()) {
+                    Some(Ok(())) => log::debug!(
+                        "editor backup saved: {} bytes in {:?}",
+                        backup.text.len(),
+                        started.elapsed()
+                    ),
+                    Some(Err(e)) => log::warn!("couldn't back up editor {iid}: {e:#}"),
+                    None => log::debug!("editor backup superseded before it landed"),
+                }
+            })
+            .detach();
+    }
+
+    /// Back up unsaved changes now (quit, workspace switch).
+    pub(crate) fn flush_backup(&mut self, cx: &mut Context<Self>) {
+        self.rescue.pending = None;
+        if self.needs_backup(cx) {
+            self.write_backup(true, cx);
+        }
+    }
+
+    /// The buffer now matches the disk (saved, reloaded, replaced): its
+    /// backup has nothing left to keep. An offered backup stays offered.
+    fn backup_clean(&mut self, cx: &mut Context<Self>) {
+        self.rescue.pending = None;
+        self.write_backup(false, cx);
+    }
+
+    /// Offer the backup this pane left when muxel last ran, unless the file
+    /// already holds that text. Call once, after the buffer was loaded.
+    pub(crate) fn offer_backup(&mut self, cx: &mut Context<Self>) {
+        let Some((dir, iid)) = self.rescue.target.clone() else {
+            return;
+        };
+        let Some(backup) = dir.offer_editor_backup(iid) else {
+            return;
+        };
+        let current = self.path.as_deref().and_then(disk_stamp).map(file_stamp);
+        let loaded = self.text(cx);
+        let disk_text = current.is_some().then_some(loaded.as_str());
+        match muxel_core::rescue::backup_offer(&backup, current, disk_text) {
+            BackupOffer::Stale => dir.delete_editor_offer(iid),
+            offer => {
+                log::info!("editor {iid} offers unsaved changes ({offer:?})");
+                self.rescue.offer = Some((backup, offer));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Whether this editor is offering a backup: the crash notice's Review
+    /// visits it.
+    pub(crate) fn backup_offered(&self) -> bool {
+        self.rescue.offer.is_some()
+    }
+
+    /// Type `text` at the cursor, as a keystroke would. Only the Windows app
+    /// tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.input.update(cx, |s, cx| s.insert(text, window, cx));
+    }
+
+    /// Put `text` in the buffer as an input method's uncommitted composition
+    /// does; empty cancels it. Only the Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn compose_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, text, None, window, cx)
+        });
+    }
+
+    /// Commit the input method's uncommitted text as it stands, as an input
+    /// method does when it unmarks it: no Change event, and nothing else
+    /// until the input next notifies. Only the Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn commit_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| {
+            s.unmark_text(window, cx);
+            cx.notify();
+        });
+    }
+
+    /// Commit the input method's uncommitted text the way the pinned input
+    /// component does: `unmark_text` alone, which notifies nothing. Only the
+    /// Windows app tests use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn unmark_composition_silently(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::EntityInputHandler as _;
+        self.input.update(cx, |s, cx| s.unmark_text(window, cx));
+    }
+
+    /// Hold this editor's background backup writes just before they land,
+    /// until the returned sender sends or drops. Only the Windows app tests
+    /// use it.
+    #[cfg(all(test, windows))]
+    pub(crate) fn hold_backup_writes(&mut self) -> async_channel::Sender<()> {
+        let (release, gate) = async_channel::unbounded();
+        self.rescue.gate = Some(gate);
+        release
+    }
+
+    /// Restore the offered backup into the buffer, unsaved. Whether the file
+    /// changed is decided now, against the version the backup's edits started
+    /// from: a disk version newer than that (written before muxel started
+    /// again, or while the offer showed) is kept beside the restored changes.
+    /// The offer's file goes only once a live backup holds the restored text.
+    pub(crate) fn restore_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((backup, _)) = self.rescue.offer.take() else {
+            return;
+        };
+        let base = backup.base;
+        self.input
+            .update(cx, |s, cx| s.set_value(backup.text, window, cx));
+        self.dirty = true;
+        self.rescue.base = base;
+        if let Some(path) = self.path.clone() {
+            let now = disk_stamp(&path);
+            if base.is_some() && now.map(file_stamp) == base {
+                self.disk_stamp = now;
+            } else {
+                match read_disk_change(&path, None) {
+                    Some(change) => self.apply_disk_change(change, window, cx),
+                    None => {
+                        self.disk_stamp = None;
+                        self.external_change = Some(ExternalChange::Deleted);
+                    }
+                }
+            }
+        }
+        // Until now the offer was the only copy: write the live backup after
+        // any write on its way, and let the offer go once it's there.
+        if let Some((dir, iid)) = self.rescue.target.clone() {
+            self.rescue.pending = None;
+            let live = EditorBackup {
+                path: self.path.clone(),
+                text: self.text(cx),
+                base,
+                saved_at_ms: now_ms(),
+            };
+            match self
+                .rescue
+                .lane
+                .barrier(|| dir.save_editor_backup(iid, &live))
+            {
+                Ok(()) => dir.delete_editor_offer(iid),
+                Err(e) => log::warn!("couldn't back up editor {iid}; its offer stays: {e:#}"),
+            }
+        }
+        cx.notify();
+        self.note_edit(cx);
+    }
+
+    /// Discard the offered backup and its file. Edits made while it showed
+    /// are still backed up.
+    pub(crate) fn discard_backup(&mut self, cx: &mut Context<Self>) {
+        if self.rescue.offer.take().is_some()
+            && let Some((dir, iid)) = self.rescue.target.clone()
+        {
+            dir.delete_editor_offer(iid);
+        }
+        cx.notify();
+        self.note_edit(cx);
+    }
+
+    fn render_backup_offer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (backup, offer) = self.rescue.offer.as_ref()?;
+        let time = rescue_time(backup.saved_at_ms);
+        let label = match offer {
+            BackupOffer::ChangedOnDisk => tf(
+                "Restore unsaved changes from {time}? The file changed on disk since.",
+                &[("time", &time)],
+            ),
+            _ => tf("Restore unsaved changes from {time}?", &[("time", &time)]),
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().primary.opacity(0.12))
+                .text_color(cx.theme().foreground)
+                .text_xs()
+                .child(label)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Button::new("editor-backup-restore")
+                                .xsmall()
+                                .label(t("Restore"))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.restore_backup(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("editor-backup-discard")
+                                .ghost()
+                                .xsmall()
+                                .label(t("Discard"))
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.discard_backup(cx)
+                                    }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+impl Focusable for EditorView {
+    /// The handle of the view that's drawn: the rendered view's while it
+    /// shows, otherwise the text input's.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.show_rendered && self.is_renderable() {
+            self.view_focus.clone()
+        } else {
+            self.input.read(cx).focus_handle(cx)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times each editor view has rendered, for tests that need a
+    /// pane to have been drawn or not.
+    pub(crate) static TEST_RENDERS: std::cell::RefCell<std::collections::HashMap<gpui::EntityId, usize>> =
+        Default::default();
 }
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        TEST_RENDERS.with(|renders| *renders.borrow_mut().entry(cx.entity_id()).or_default() += 1);
+        let backup = self.render_backup_offer(cx);
         let notice = self
             .external_change
             .as_ref()
@@ -609,6 +1276,7 @@ impl Render for EditorView {
         {
             div()
                 .id("img-view")
+                .track_focus(&self.view_focus)
                 .size_full()
                 .overflow_scroll()
                 .flex()
@@ -622,11 +1290,34 @@ impl Render for EditorView {
         // edits made in raw mode show here when toggled back).
         } else if self.is_markdown && self.show_rendered {
             let src = self.input.read(cx).value().to_string();
+            let editor = cx.entity_id();
             div()
                 .id("md-view")
+                .debug_selector(|| "md-view".into())
+                .track_focus(&self.view_focus)
                 .size_full()
                 .bg(cx.theme().background)
-                .child(markdown(src).selectable(true).scrollable(true).p_4())
+                .child(
+                    markdown(src)
+                        .selectable(true)
+                        .scrollable(true)
+                        // Without a handler, gpui-component hands the raw href
+                        // to the OS, which can't place `other.md` and bypasses
+                        // muxel's browser.
+                        .on_link_click(move |href, event, _, cx| {
+                            if let Some(background) = link_in_background(event) {
+                                let href = href.to_string();
+                                // The click lands mid-render of this window,
+                                // which the open may need to update.
+                                cx.defer(move |cx| {
+                                    crate::app::MuxelApp::open_rendered_link(
+                                        editor, &href, background, cx,
+                                    );
+                                });
+                            }
+                        })
+                        .p_4(),
+                )
                 .into_any_element()
         } else {
             let family: SharedString = if self.config.font_family.trim().is_empty() {
@@ -634,7 +1325,13 @@ impl Render for EditorView {
             } else {
                 self.config.font_family.clone().into()
             };
-            Input::new(&self.input)
+            // Screen readers name the editor after its file.
+            let input = Input::new(&self.input);
+            let input = match self.path.as_deref().and_then(Path::file_name) {
+                Some(name) => input.aria_label(name.to_string_lossy().into_owned()),
+                None => input,
+            };
+            input
                 .h_full()
                 .bordered(false)
                 .focus_bordered(false)
@@ -646,6 +1343,7 @@ impl Render for EditorView {
             .size_full()
             .flex()
             .flex_col()
+            .children(backup)
             .children(notice)
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
@@ -999,5 +1697,265 @@ mod tests {
             (editor.input.read(cx).scroll_offset(), editor.cursor(cx))
         });
         assert_eq!(after, before, "disk reload moved the viewport or cursor");
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::{EditorConfig, EditorView, ExternalChange, read_disk_change};
+    use gpui::{Context, EntityInputHandler, TestAppContext, Window, WindowHandle};
+    use std::ops::Range;
+    use std::path::PathBuf;
+
+    struct ImeReload {
+        window: WindowHandle<EditorView>,
+        path: PathBuf,
+        cx: TestAppContext,
+    }
+
+    impl ImeReload {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "muxel-editor-ime-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, "one\n").unwrap();
+            let mut cx = TestAppContext::single();
+            cx.skip_drawing();
+            cx.update(gpui_component::init);
+            let window = cx.add_window(|window, cx| {
+                EditorView::open(Some(path.clone()), EditorConfig::default(), window, cx)
+            });
+            Self { window, path, cx }
+        }
+
+        fn update<R>(
+            &mut self,
+            run: impl FnOnce(&mut EditorView, &mut Window, &mut Context<EditorView>) -> R,
+        ) -> R {
+            self.window.update(&mut self.cx, run).unwrap()
+        }
+
+        fn compose(&mut self, text: &str) {
+            self.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(None, text, None, window, cx)
+                })
+            });
+        }
+
+        fn cancel_by_replacing_marked_text(&mut self, explicit_range: bool) {
+            self.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    let range = if explicit_range {
+                        input.marked_text_range(window, cx)
+                    } else {
+                        None
+                    };
+                    input.replace_text_in_range(range, "", window, cx);
+                })
+            });
+        }
+
+        fn text(&mut self) -> String {
+            self.update(|editor, _, cx| editor.text(cx))
+        }
+
+        fn marked_range(&mut self) -> Option<Range<usize>> {
+            self.update(|editor, window, cx| {
+                editor
+                    .input
+                    .update(cx, |input, cx| input.marked_text_range(window, cx))
+            })
+        }
+
+        fn poll(&mut self) {
+            let stamp = self.update(|editor, _, _| editor.disk_stamp());
+            if let Some(change) = read_disk_change(&self.path, stamp) {
+                self.update(|editor, window, cx| editor.apply_disk_change(change, window, cx));
+            }
+        }
+    }
+
+    impl Drop for ImeReload {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn automatic_reload_preserves_ime_text_until_composition_is_cancelled() {
+        for reopen in [false, true] {
+            let mut reload = ImeReload::new(if reopen { "reopen" } else { "poll" });
+            reload.compose("あ");
+            assert_eq!(reload.text(), "あone\n");
+            assert_eq!(reload.marked_range(), Some(0..1));
+            // Preedit still emits no Change event; the dirty query also checks text.
+            assert!(!reload.update(|editor, _, _| editor.dirty));
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            if reopen {
+                reload.update(|editor, window, cx| editor.reload_if_clean(window, cx));
+            } else {
+                reload.poll();
+                reload.poll();
+            }
+            assert_eq!(
+                reload.text(),
+                "あone\n",
+                "automatic reload discarded preedit"
+            );
+            assert_eq!(reload.marked_range(), Some(0..1));
+
+            // Cancellation restores the clean buffer; the next ordinary poll
+            // must still see the disk change, without another write to the file.
+            reload.compose("");
+            assert_eq!(reload.marked_range(), None);
+            reload.poll();
+            assert_eq!(reload.text(), "remote replacement\n");
+        }
+    }
+
+    #[test]
+    fn committed_ime_text_keeps_local_edits_and_offers_the_disk_version() {
+        for unmark in [false, true] {
+            let mut reload = ImeReload::new(if unmark { "unmark" } else { "commit" });
+            reload.compose("あ");
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "あone\n", "disk poll discarded preedit");
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    if unmark {
+                        input.unmark_text(window, cx);
+                    } else {
+                        input.replace_text_in_range(None, "あ", window, cx);
+                    }
+                })
+            });
+            reload.poll();
+            assert_eq!(reload.marked_range(), None);
+            assert_eq!(reload.text(), "あone\n");
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            assert!(reload.update(|editor, _, _| matches!(
+                editor.external_change(),
+                Some(ExternalChange::Modified(content)) if content == "remote replacement\n"
+            )));
+
+            // Saving accepts the composed text as the new clean version.
+            let saved_text = reload.text();
+            std::fs::write(&reload.path, saved_text).unwrap();
+            reload.update(|editor, _, cx| editor.mark_saved(cx));
+            std::fs::write(&reload.path, "later disk version\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "later disk version\n");
+        }
+    }
+
+    #[test]
+    fn explicit_reload_discards_ime_composition_with_other_local_edits() {
+        for same_text in [false, true] {
+            let mut reload = ImeReload::new(if same_text {
+                "explicit-equal"
+            } else {
+                "explicit"
+            });
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "local ", window, cx)
+                })
+            });
+            let disk_text = if same_text {
+                "local あone\n"
+            } else {
+                "remote replacement\n"
+            };
+            std::fs::write(&reload.path, disk_text).unwrap();
+            reload.poll();
+            reload.compose("あ");
+            assert!(reload.marked_range().is_some());
+            reload.update(|editor, window, cx| editor.reload_external_change(window, cx));
+            assert_eq!(reload.text(), disk_text);
+            assert_eq!(reload.marked_range(), None);
+            assert!(!reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            assert!(reload.update(|editor, _, _| editor.external_change().is_none()));
+
+            std::fs::write(&reload.path, "next disk version\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "next disk version\n");
+        }
+    }
+
+    fn assert_cancel_retries_pending_reload(explicit_range: bool) {
+        let mut reload = ImeReload::new(if explicit_range {
+            "cancel-explicit-range"
+        } else {
+            "cancel-implicit-range"
+        });
+        reload.compose("あ");
+        std::fs::write(&reload.path, "remote replacement\n").unwrap();
+        reload.poll();
+        assert_eq!(reload.text(), "あone\n");
+        reload.cancel_by_replacing_marked_text(explicit_range);
+        assert_eq!(reload.text(), "one\n");
+        assert_eq!(reload.marked_range(), None);
+        reload.poll();
+        assert_eq!(
+            reload.text(),
+            "remote replacement\n",
+            "cancelling unchanged text blocked the pending disk reload"
+        );
+        assert!(!reload.update(|editor, _, cx| editor.is_dirty(cx)));
+        assert!(reload.update(|editor, _, _| editor.external_change().is_none()));
+    }
+
+    #[test]
+    fn cancellation_with_implicit_range_retries_pending_reload() {
+        // Windows' empty-composition callback replaces the implicit marked range.
+        assert_cancel_retries_pending_reload(false);
+    }
+
+    #[test]
+    fn cancellation_with_explicit_range_retries_pending_reload() {
+        // Wayland's delete-preedit callback supplies the marked range explicitly.
+        assert_cancel_retries_pending_reload(true);
+    }
+
+    #[test]
+    fn cancellation_callbacks_preserve_existing_dirty_state() {
+        for explicit_range in [false, true] {
+            let mut reload = ImeReload::new(if explicit_range {
+                "dirty-cancel-explicit"
+            } else {
+                "dirty-cancel-implicit"
+            });
+            // An already-dirty editor stays dirty even if earlier edits were
+            // returned to their original text, matching ordinary edit behavior.
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "local ", window, cx)
+                })
+            });
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(Some(0..6), "", window, cx)
+                })
+            });
+            assert_eq!(reload.text(), "one\n");
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            reload.compose("あ");
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            reload.poll();
+            reload.cancel_by_replacing_marked_text(explicit_range);
+            reload.poll();
+            assert_eq!(reload.text(), "one\n");
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            assert!(reload.update(|editor, _, _| matches!(
+                editor.external_change(),
+                Some(ExternalChange::Modified(content)) if content == "remote replacement\n"
+            )));
+        }
     }
 }

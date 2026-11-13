@@ -245,6 +245,31 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(decoded.displayName, "Generated title")
     }
 
+    func testStartingLabelSurvivesWriteBackAndYieldsToAgentTitle() throws {
+        let json = #"{ "id": "aaaa", "project_id": "p", "title": "Claude", "label": "build 21246" }"#
+        var instance = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(instance.displayName, "build 21246")
+        instance.autoName = "Current agent topic"
+        XCTAssertEqual(instance.displayName, "Current agent topic")
+        let data = try MuxelJSON.encoder.encode(instance)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["label"] as? String, "build 21246")
+        let restored = try MuxelJSON.decoder.decode(Instance.self, from: data)
+        XCTAssertEqual(restored.label, "build 21246")
+        XCTAssertEqual(restored.displayName, "Current agent topic")
+        instance.customName = "Manual name"
+        XCTAssertEqual(instance.displayName, "Manual name")
+        instance.autoName = "A newer topic"
+        XCTAssertEqual(instance.displayName, "Manual name")
+
+        let legacy = try MuxelJSON.decoder.decode(Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Claude", "custom_name": "Old custom" }"#.utf8))
+        XCTAssertNil(legacy.label)
+        XCTAssertEqual(legacy.displayName, "Old custom")
+        let legacyData = try MuxelJSON.encoder.encode(legacy)
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        XCTAssertNil(legacyObject["label"])
+    }
+
     func testInstanceSessionPathRoundTrips() throws {
         // The desktop's saved Codex rollout path must survive an iOS write-back,
         // or the desktop's next restore has to look the conversation up again.
@@ -266,6 +291,35 @@ final class InteropTests: XCTestCase {
         let older = try MuxelJSON.decoder.decode(
             Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Codex" }"#.utf8))
         XCTAssertNil(older.sessionPath)
+    }
+
+    func testInstanceOpenTimeSurvivesWriteBackAndIsNewForAPaneIOSOpens() throws {
+        // Desktop Recent work places a never-used pane by when it was opened, so
+        // an iOS write-back must not strip it from the peer.
+        let json = """
+        { "id": "aaaa", "project_id": "p", "title": "Codex", "created_at": 1762600000123 }
+        """
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.createdAt, 1_762_600_000_123)
+        let data = try MuxelJSON.encoder.encode(decoded)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((object["created_at"] as? NSNumber)?.int64Value, 1_762_600_000_123)
+
+        // A desktop that predates the field writes none, and neither does iOS.
+        let older = try MuxelJSON.decoder.decode(
+            Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Codex" }"#.utf8))
+        XCTAssertNil(older.createdAt)
+        let olderObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: MuxelJSON.encoder.encode(older)) as? [String: Any])
+        XCTAssertNil(olderObject["created_at"])
+
+        // A pane iOS opens records when; a copy isn't as old as its source.
+        let before = Instance.openedNow()
+        let fresh = Instance(id: "cccc", projectId: "p", title: "Claude", program: "claude", args: [])
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(fresh.createdAt), before)
+        var copy = decoded
+        copy.resetConversationForDuplicate()
+        XCTAssertNil(copy.createdAt)
     }
 
     func testDuplicateResetClearsConversationStateAndAutoName() {

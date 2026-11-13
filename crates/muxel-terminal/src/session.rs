@@ -14,7 +14,7 @@ use crate::profile;
 use crate::program_status::{
     Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
 };
-use crate::replies::{ImmediateReplies, Replies};
+use crate::replies::{GridSize, ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{
@@ -23,6 +23,7 @@ use alacritty_terminal::term::{
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
 use muxel_core::path_paste::{PastePathError, PasteShell};
+use muxel_core::recoverable_close::ShellReading;
 use parking_lot::{Condvar, Mutex};
 #[cfg(unix)]
 use portable_pty::Child;
@@ -37,8 +38,12 @@ use uuid::Uuid;
 
 #[path = "input_hold.rs"]
 mod input_hold;
-pub(crate) use input_hold::InputGate;
+pub(crate) use input_hold::{Hold, InputGate};
 use input_hold::{ShellMarks, ShellPrompt};
+
+#[cfg(all(test, unix))]
+#[path = "unix_shell_idle_tests.rs"]
+mod unix_shell_idle_tests;
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -709,6 +714,9 @@ pub struct CommandSpec {
     /// to its tmux pane through tmux, never through the client. See
     /// [`crate::control_input`].
     pub tmux_input: Option<crate::TmuxInputRoute>,
+    /// What the child is to the pane's command: the command itself, or a
+    /// transport whose exit may not be the command's.
+    pub transport: muxel_core::PaneTransport,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -730,6 +738,12 @@ pub struct CommandSpec {
     /// Most memory, in bytes, each process in the pane's local tree may
     /// commit (Windows; see [`crate::pane_job`]). `None` = no limit.
     pub memory_limit: Option<u64>,
+    /// Argv that starts the program on Unix, put in front of it once the program
+    /// has been found: Linux's `systemd-run --user --scope … --` (see
+    /// `muxel_core::pane_scope`), which execs it in a scope of its own. The pane
+    /// still records the program itself as what it launched. Left off when the
+    /// program can't be found, so that failure reads as it always has.
+    pub launch_prefix: Vec<String>,
 }
 
 impl CommandSpec {
@@ -755,6 +769,7 @@ impl CommandSpec {
             startup_turn: None,
             title_source: None,
             tmux_input: None,
+            transport: muxel_core::PaneTransport::Direct,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -762,6 +777,7 @@ impl CommandSpec {
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,
+            launch_prefix: Vec::new(),
         }
     }
 
@@ -783,6 +799,7 @@ impl CommandSpec {
             startup_turn: None,
             title_source: None,
             tmux_input: None,
+            transport: muxel_core::PaneTransport::Direct,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -790,6 +807,7 @@ impl CommandSpec {
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,
+            launch_prefix: Vec::new(),
         }
     }
 
@@ -873,8 +891,19 @@ impl CommandSpec {
         self
     }
 
+    pub fn with_transport(mut self, transport: muxel_core::PaneTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
     pub fn with_memory_limit(mut self, bytes: Option<u64>) -> Self {
         self.memory_limit = bytes;
+        self
+    }
+
+    /// See [`Self::launch_prefix`]. Empty runs the program directly.
+    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.launch_prefix = prefix;
         self
     }
 }
@@ -900,22 +929,226 @@ struct QueuedWrite {
 }
 
 impl QueuedWrite {
+    /// Whether the writer may still write it: no close since it was queued. A
+    /// departure hold doesn't drop it.
     fn admitted(&self, gate: &InputGate) -> bool {
-        self.epoch.is_none_or(|epoch| gate.accepts(epoch))
+        self.epoch.is_none_or(|epoch| gate.current(epoch))
     }
+}
+
+/// What the PTY writer thread takes, in the order it was sent.
+enum PtyInput {
+    Write(QueuedWrite),
+    /// Answered once every write sent before it has been written, failed or
+    /// been dropped. If the writer stops first, the sender drops unanswered,
+    /// which means the same: nothing sent before it can be written any more.
+    Fence(async_channel::Sender<()>),
+    /// The session is going: write nothing more.
+    Stop,
+}
+
+/// The PTY writer thread: writes each queued write in turn and answers each
+/// fence once the writes before it are done. Returns when the session stops
+/// it, every sender is gone, or a write fails (the child is gone).
+fn write_queued(
+    queue: std::sync::mpsc::Receiver<PtyInput>,
+    pipe: &mut dyn Write,
+    gate: &InputGate,
+    closed: &AtomicBool,
+    profile: Option<Uuid>,
+) {
+    let mut prior_profiler_interval = None;
+    while let Ok(input) = queue.recv() {
+        let write = match input {
+            PtyInput::Write(write) => write,
+            PtyInput::Fence(done) => {
+                let _ = done.try_send(());
+                continue;
+            }
+            PtyInput::Stop => break,
+        };
+        if closed.load(Ordering::Acquire) {
+            break;
+        }
+        let queue_delay = write.queued_at.map(|queued_at| {
+            queue_delay_excluding_profiler(queued_at, Instant::now(), prior_profiler_interval)
+        });
+        let write_started = write.queued_at.map(|_| Instant::now());
+        if !write.admitted(gate) {
+            continue;
+        }
+        let result = pipe.write_all(&write.bytes);
+        if result.is_ok() {
+            let _ = pipe.flush();
+        }
+        if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
+            (profile, queue_delay, write_started)
+        {
+            let profile_started = Instant::now();
+            crate::profile::pty_write(
+                instance_id,
+                write.bytes.len(),
+                queue_delay,
+                write_started.elapsed(),
+            );
+            prior_profiler_interval = Some((profile_started, Instant::now()));
+        }
+        if result.is_err() {
+            break;
+        }
+    }
+}
+
+/// A departure's fence on one terminal's writers; see
+/// [`TerminalSession::hold_for_departure`].
+pub struct InputFence {
+    /// The PTY writer's. A writer that stops drops it unanswered, which is
+    /// settled too: it writes on its own thread, nothing it dropped can be
+    /// written later, and each write's facts were committed as it was queued.
+    pty: async_channel::Receiver<()>,
+    tmux: Option<crate::control_input::TmuxFence>,
+}
+
+/// A departure's fence couldn't confirm its writes: a writer died with input
+/// in hand, so what it was writing may still arrive or may never have been
+/// recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceUnknown(pub String);
+
+impl std::fmt::Display for FenceUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl InputFence {
+    /// Wait until every write admitted before the hold has been written or
+    /// has failed, or a writer has died with writes unaccounted for.
+    pub async fn acked(self) -> Result<(), FenceUnknown> {
+        let _ = self.pty.recv().await;
+        match self.tmux {
+            Some(tmux) => tmux.answered().await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// Hold `gate` for departure and queue a fence behind every write `writer`
+/// has queued. Both happen under `writer`'s lock, which every gated write
+/// takes to check the gate and queue its bytes, so each write is either ahead
+/// of the fence or refused.
+fn fence_pty(
+    writer: &Mutex<Box<dyn Write + Send>>,
+    gate: &InputGate,
+    queue: &std::sync::mpsc::Sender<PtyInput>,
+) -> async_channel::Receiver<()> {
+    let (done, acked) = async_channel::bounded(1);
+    let _writer = writer.lock();
+    gate.hold(Hold::Departure);
+    // A writer that has stopped drops this unanswered, which counts as done.
+    let _ = queue.send(PtyInput::Fence(done));
+    acked
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run on the writing thread after a gated write's bytes are queued and
+    /// before its facts are committed, so a test can pause it there.
+    static PAUSE_AFTER_ENQUEUE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 mod input_hold_queue_tests {
-    use super::{ChannelWriter, InputGate, QueuedWrite};
+    use super::{ChannelWriter, Hold, InputGate, PtyInput, fence_pty, write_queued};
+    use crate::test_wait::{joined, settle};
+    use parking_lot::Mutex;
     use std::io::Write;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
+    type Written = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// A PTY that keeps what it's written and, when `paced`, waits for a
+    /// permit before each write, as a child that has stopped reading does.
+    struct Pipe {
+        written: Written,
+        paced: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(permits) = &self.paced {
+                permits.recv().map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            }
+            self.written.lock().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pieces of a session's PTY input: its gate, its gated writer, and
+    /// its writer thread, writing to a [`Pipe`].
+    struct Input {
+        gate: Arc<InputGate>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        queue: mpsc::Sender<PtyInput>,
+        written: Written,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Input {
+        fn new(paced: Option<mpsc::Receiver<()>>) -> Self {
+            let gate = Arc::new(InputGate::default());
+            let closed = Arc::new(AtomicBool::new(false));
+            let (queue, rx) = mpsc::channel();
+            let written = Written::default();
+            let mut pipe = Pipe {
+                written: written.clone(),
+                paced,
+            };
+            let thread = std::thread::spawn({
+                let gate = gate.clone();
+                let closed = closed.clone();
+                move || write_queued(rx, &mut pipe, &gate, &closed, None)
+            });
+            let writer: Box<dyn Write + Send> = Box::new(ChannelWriter {
+                tx: queue.clone(),
+                profile: false,
+                closed,
+                gate: Some(gate.clone()),
+            });
+            Self {
+                gate,
+                writer: Arc::new(Mutex::new(writer)),
+                queue,
+                written,
+                thread,
+            }
+        }
+
+        fn write(&self, bytes: &[u8]) -> bool {
+            self.writer.lock().write_all(bytes).is_ok()
+        }
+
+        fn fence(&self) -> async_channel::Receiver<()> {
+            fence_pty(&self.writer, &self.gate, &self.queue)
+        }
+
+        fn stop(self) -> Vec<Vec<u8>> {
+            let _ = self.queue.send(PtyInput::Stop);
+            joined(self.thread, "the writer thread never stopped");
+            self.written.lock().clone()
+        }
+    }
 
     #[test]
     fn queued_ctl_writes_die_with_the_close_even_after_undo() {
         let gate = Arc::new(InputGate::default());
-        let (tx, rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (tx, rx) = mpsc::channel::<PtyInput>();
         let mut actor = ChannelWriter {
             tx: tx.clone(),
             profile: false,
@@ -930,18 +1163,102 @@ mod input_hold_queue_tests {
         };
         actor.write_all(b"queued keys").unwrap();
         actor.write_all(b"\r").unwrap();
-        gate.hold();
+        gate.hold(Hold::Close);
         assert!(actor.write_all(b"held").is_err());
         protocol.write_all(b"\x1b[0n").unwrap();
-        gate.resume();
+        gate.resume(Hold::Close);
         actor.write_all(b"new input").unwrap();
         let accepted: Vec<_> = rx
             .try_iter()
-            .flatten()
-            .filter(|write| write.admitted(&gate))
-            .map(|write| write.bytes)
+            .filter_map(|input| match input {
+                PtyInput::Write(write) => write.admitted(&gate).then_some(write.bytes),
+                _ => None,
+            })
             .collect();
         assert_eq!(accepted, [b"\x1b[0n".to_vec(), b"new input".to_vec()]);
+    }
+
+    /// Writers on other threads race a departure. Every write is either
+    /// refused or written before the fence answers, and none is written after.
+    #[test]
+    fn a_departure_fence_answers_after_every_admitted_write_and_before_any_other() {
+        const WRITERS: u8 = 4;
+        for round in 0..200 {
+            let input = Arc::new(Input::new(None));
+            let start = Arc::new(Barrier::new(usize::from(WRITERS) + 1));
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|id| {
+                    let input = input.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut admitted = Vec::new();
+                        for seq in 0u32.. {
+                            let mut bytes = vec![id];
+                            bytes.extend(seq.to_le_bytes());
+                            if !input.write(&bytes) {
+                                break;
+                            }
+                            admitted.push(bytes);
+                        }
+                        admitted
+                    })
+                })
+                .collect();
+            start.wait();
+            let fence = input.fence();
+            let _ = settle(fence.recv(), "the fence never answered");
+            let at_ack = input.written.lock().clone();
+            let mut admitted: Vec<_> = writers
+                .into_iter()
+                .flat_map(|writer| joined(writer, "a writer never stopped"))
+                .collect();
+            let input = Arc::into_inner(input).expect("the writers are done");
+            let written = input.stop();
+            assert_eq!(
+                written, at_ack,
+                "round {round}: written after the fence answered"
+            );
+            let mut sorted = written.clone();
+            sorted.sort();
+            admitted.sort();
+            assert_eq!(
+                sorted, admitted,
+                "round {round}: an admitted write went missing"
+            );
+        }
+    }
+
+    /// A fence that went unanswered, and whose departure gave up, can't answer
+    /// for the next one: each waits for the writes queued before itself.
+    #[test]
+    fn a_late_fence_answer_belongs_to_its_own_departure() {
+        let (permit, permits) = mpsc::channel();
+        let input = Input::new(Some(permits));
+        assert!(input.write(b"first"));
+        let first = input.fence();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            first.try_recv().is_err(),
+            "the first write is still blocked"
+        );
+        input.gate.resume(Hold::Departure);
+        assert!(
+            input.write(b"second"),
+            "input flows once the departure gives up"
+        );
+        let second = input.fence();
+        permit.send(()).unwrap();
+        settle(first.recv(), "the first fence never answered").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            second.try_recv().is_err(),
+            "the first fence's answer doesn't answer the second"
+        );
+        permit.send(()).unwrap();
+        settle(second.recv(), "the second fence never answered").unwrap();
+        assert!(!input.write(b"held"));
+        assert_eq!(input.stop(), [b"first".to_vec(), b"second".to_vec()]);
     }
 }
 
@@ -960,7 +1277,7 @@ fn queue_delay_excluding_profiler(
 }
 
 struct ChannelWriter {
-    tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    tx: std::sync::mpsc::Sender<PtyInput>,
     profile: bool,
     closed: Arc<AtomicBool>,
     gate: Option<Arc<InputGate>>,
@@ -987,7 +1304,7 @@ impl Write for ChannelWriter {
             ));
         }
         self.tx
-            .send(Some(QueuedWrite {
+            .send(PtyInput::Write(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
                 epoch,
@@ -1049,12 +1366,79 @@ struct ResizeState {
     since: Instant,
 }
 
-fn draft_after_input(previous: bool, submission_pending: bool, has_bytes: bool) -> bool {
-    if !has_bytes {
-        previous
-    } else {
-        !submission_pending
+/// What an input write submits. The write commits it together with its bytes
+/// (see [`TerminalSession::try_write_submission`]), so a refused write records
+/// no submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submission {
+    /// Text, keys or a paste that submit nothing. They latch the draft.
+    None,
+    /// A bare Enter, or a snippet's lone Enter. It can select a resume item,
+    /// so it carries no prompt intent.
+    Turn,
+    /// Enter, or text ending in one, whose caller supplied the prompt.
+    Prompt,
+    /// An Enter answering a dialog drawn over the input box (a permission
+    /// question): a turn's facts, not the box's. The draft parked in the box
+    /// stays saved, since the program shows it again afterwards.
+    Answer,
+}
+
+/// What a gated write tells the session besides its bytes.
+#[derive(Clone, Copy)]
+enum InputFacts {
+    /// Typed input, what it submits, and whether it puts text in front of the
+    /// program. Only text latches the draft: escape, arrows, control keys and
+    /// an answer to a question move the revision but leave the draft as it was.
+    Typed(Submission, bool),
+    /// A mouse or wheel report: input, but not text.
+    Pointer,
+}
+
+/// Whether raw input bytes put text in front of the program. Escape sequences
+/// (arrows, function keys, bracketed-paste markers, OSC and DCS strings) and
+/// C0 controls (Enter, Tab, Backspace, ctrl keys) don't, though their encodings
+/// can contain printable ASCII (`ESC [ A`). An ESC inside a sequence starts a
+/// new one, as it does for the terminal, so `keys esc down` in one write
+/// (`ESC ESC [ B`) is still no text.
+fn has_printable_input(data: &[u8]) -> bool {
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Ss3,
+        String,
     }
+    let mut state = State::Ground;
+    for &byte in data {
+        state = match state {
+            State::Ground if byte >= 0x20 && byte != 0x7f => return true,
+            _ if byte == 0x1b => State::Escape,
+            State::Ground => State::Ground,
+            // `ESC \` (the string terminator) lands here too, and ends.
+            State::Escape => match byte {
+                b'[' => State::Csi,
+                b'O' => State::Ss3,
+                b']' | b'P' | b'_' | b'^' | b'X' => State::String,
+                _ => State::Ground,
+            },
+            State::Csi if (0x40..=0x7e).contains(&byte) => State::Ground,
+            State::Csi => State::Csi,
+            State::Ss3 => State::Ground,
+            State::String if byte == 0x07 => State::Ground,
+            State::String => State::String,
+        };
+    }
+    false
+}
+
+/// Whether pasted `text` holds any text, whatever bytes its encoding uses.
+fn has_text(text: &str) -> bool {
+    text.chars().any(|ch| !ch.is_control())
+}
+
+fn draft_after_input(previous: bool, submitted: bool, has_bytes: bool) -> bool {
+    if !has_bytes { previous } else { !submitted }
 }
 
 /// The input word (see `TerminalSession::input_state`) after one non-empty
@@ -1068,6 +1452,133 @@ fn next_input_state(state: u64, submitted: Option<bool>) -> u64 {
         draft_after_input(previous_draft, submitted, true)
     });
     (revision << 1) | u64::from(draft)
+}
+
+fn advance_input_state(state: &AtomicU64, submitted: Option<bool>) {
+    let _ = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+        Some(next_input_state(state, submitted))
+    });
+}
+
+/// How long after input its terminal's output paints at the interactive
+/// cadence.
+const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
+
+fn mark_interactive_until(until: &Mutex<Option<Instant>>) {
+    *until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+}
+
+/// What committing a submission changes. It's shared, apart from the
+/// terminal, so the tmux input worker can commit a submission it delivered on
+/// its own thread; the terminal itself stays on the UI thread.
+pub(crate) struct SubmissionFacts {
+    evidence: Arc<Mutex<LifecycleEvidence>>,
+    turn_submitted: Arc<AtomicBool>,
+    input_state: Arc<AtomicU64>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    runtime_trigger: async_channel::Sender<()>,
+    draft: DraftSubmission,
+}
+
+/// What a submission changes in the draft watcher's state (see
+/// [`TerminalSession::read_draft`]). Part of [`SubmissionFacts`], so a
+/// submission tmux took is committed on the input worker with the rest of its
+/// facts, before the worker answers.
+struct DraftSubmission {
+    /// The terminal's grid, to copy the screen a submission was sent from.
+    term: Arc<Mutex<Term<MuxelListener>>>,
+    /// Through tmux, where other clients type too, what muxel typed is never
+    /// known.
+    tmux: bool,
+    paste_log: Arc<Mutex<muxel_core::rescue::PasteLog>>,
+    typed_draft: Arc<Mutex<muxel_core::rescue::TypedDraft>>,
+    sent_screen: Arc<Mutex<Option<crate::draft::DraftCapture>>>,
+    sent: Arc<AtomicBool>,
+    submitted: Arc<AtomicBool>,
+    epoch: Instant,
+    touched: Arc<AtomicU64>,
+    /// Wakes the draft watcher after user input or a submission. Capacity
+    /// one, so a burst of keys costs one failed `try_send` per key and nothing
+    /// when no watcher runs.
+    trigger: async_channel::Sender<()>,
+}
+
+impl DraftSubmission {
+    /// The visible screen, as a draft read copies it. Never call it with the
+    /// writer locked: the terminal parser holds the terminal lock while its
+    /// listener sends replies, which takes the reply-order lock and then the
+    /// writer.
+    fn screen(&self) -> crate::draft::DraftCapture {
+        crate::draft::DraftCapture::from_term(&self.term.lock())
+    }
+
+    /// Restart the draft watcher's debounce and wake it. One atomic store and
+    /// one non-blocking send: typing never waits on a draft save.
+    fn touch(&self) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.touched.store(ms, Ordering::Relaxed);
+        let _ = self.trigger.try_send(());
+    }
+
+    /// A submission was admitted, with `sent` the screen as it was: the
+    /// watcher drops the saved draft at once and reads the box again once
+    /// input stops. The pastes it sent can't stand for a later marker.
+    fn commit(&self, sent: crate::draft::DraftCapture) {
+        self.paste_log.lock().clear();
+        if !self.tmux {
+            self.typed_draft.lock().submitted();
+        }
+        *self.sent_screen.lock() = Some(sent);
+        self.sent.store(true, Ordering::Release);
+        self.submitted.store(true, Ordering::Release);
+        self.touch();
+    }
+}
+
+impl SubmissionFacts {
+    /// The facts an admitted submission records. A `prompt` one follows a
+    /// known prompt; any other is a bare Enter.
+    fn record(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        advance_input_state(&self.input_state, Some(true));
+    }
+
+    /// The facts of a submission tmux has delivered, with the view effects a
+    /// PTY submission has. The tmux input worker commits them once tmux has
+    /// taken the Enter, whether or not anyone still waits for the answer.
+    pub(crate) fn commit(&self, submitted_at: SystemTime, prompt: bool) {
+        self.record(submitted_at, prompt);
+        mark_interactive_until(&self.interactive_until);
+        let _ = self.runtime_trigger.try_send(());
+        // The screen as tmux took the Enter. The worker holds no lock here,
+        // so it may take the terminal's.
+        self.draft.commit(self.draft.screen());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_submitted(&self) -> bool {
+        self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
+
+    /// The draft watcher's view: a submission was committed and no read has
+    /// seen the box redrawn since.
+    #[cfg(test)]
+    pub(crate) fn draft_sent(&self) -> bool {
+        self.draft.sent.load(Ordering::Acquire)
+    }
 }
 
 /// A clickable link the pointer is ctrl-hovering: a span of columns on one
@@ -1254,13 +1765,21 @@ pub struct TerminalSession {
     input_closed: Arc<AtomicBool>,
     input_gate: Arc<InputGate>,
     shell_prompt: Arc<ShellPrompt>,
-    input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
-    /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
-    /// the terminal's foreground process group to tell whether the child is idle
-    /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
-    /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The PTY writer thread's queue, for its stop and departure fences. Input
+    /// goes through `writer`, which checks the gate.
+    input_queue: std::sync::mpsc::Sender<PtyInput>,
+    /// The PTY child's pid (the shell/agent), captured at spawn. Tells whether
+    /// the child is idle at its prompt vs. running a command (see
+    /// `is_idle_foreground`).
     child_pid: Option<u32>,
+    /// When the child started (a `FILETIME` tick), read right after spawn while
+    /// the child's handle still pins its pid. `is_idle_foreground` uses it to
+    /// tell this shell and its children from processes that reuse a pid.
+    #[cfg(windows)]
+    child_started: Option<u64>,
+    /// `exec` can replace the shell without changing its pid or foreground group.
+    #[cfg(unix)]
+    child_identity: Option<crate::process_tree_unix::ProcessIdentity>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
     /// Current root OSC 7501 report from this PTY launch. Child-id records do
@@ -1289,6 +1808,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// What the reader thread reports for `CSI 18 t`; see [`GridSize`].
+    grid_size: Arc<GridSize>,
     /// A resize away and back still invalidates a controller's input-frame proof.
     resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
@@ -1297,7 +1818,9 @@ pub struct TerminalSession {
     /// Remote handling for file/image uploads. See [`crate::LocalPaste`].
     local_paste: Mutex<Option<crate::LocalPasteHandler>>,
     path_paste_error: Mutex<Option<crate::PathPasteErrorHandler>>,
+    text_paste_error: Mutex<Option<crate::TextPasteErrorHandler>>,
     paste_shell: PasteShell,
+    control_paste: crate::control_paste::ControlPaste,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -1319,20 +1842,51 @@ pub struct TerminalSession {
     /// launch. Startup title activity alone is not evidence that a turn
     /// completed. The runtime reducer uses the submission recorded in
     /// `evidence` instead, which counts only within its provider binding.
-    turn_submitted: AtomicBool,
+    turn_submitted: Arc<AtomicBool>,
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
-    submission_pending: AtomicBool,
     /// The input revision and a conservative draft bit in one atomic word, so
     /// a reader never sees one write's revision paired with another write's
     /// draft bit. The low bit is the draft flag; the remaining bits are the
     /// revision, advanced for each input write (see [`Self::input_snapshot`]).
-    input_state: AtomicU64,
+    input_state: Arc<AtomicU64>,
     /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
     runtime_events: async_channel::Receiver<()>,
+    /// Recent pastes, so a provider's paste markers can be put back into a
+    /// saved draft. Bounded; see [`muxel_core::rescue::PasteLog`].
+    paste_log: Arc<Mutex<muxel_core::rescue::PasteLog>>,
+    draft_events: async_channel::Receiver<()>,
+    draft_epoch: Instant,
+    /// Milliseconds after `draft_epoch` of the last user input or submission.
+    draft_touch: Arc<AtomicU64>,
+    /// A submission was admitted since the draft watcher last looked.
+    draft_submitted: Arc<AtomicBool>,
+    /// A submission was admitted and the program hasn't been seen to redraw
+    /// its box since: the box may still show what was sent. Only a read
+    /// clears it, on evidence of a redraw (see [`Self::read_draft`]); a key
+    /// typed before the redraw doesn't.
+    draft_sent: Arc<AtomicBool>,
+    /// The screen when the last submission was admitted, to tell a redrawn
+    /// box from the one that was sent.
+    sent_screen: Arc<Mutex<Option<crate::draft::DraftCapture>>>,
+    /// What muxel typed into the box since it was last seen empty, and what
+    /// the last submission sent (see [`muxel_core::rescue::TypedDraft`]).
+    /// Never known in tmux, where other clients type too.
+    typed_draft: Arc<Mutex<muxel_core::rescue::TypedDraft>>,
+    /// Line breaks this terminal's input could have typed into a provider's
+    /// input box, counted as input is written (see
+    /// [`muxel_core::rescue::input_newlines`]).
+    draft_newlines: AtomicU64,
+    /// Inputs that could bring in text with any number of line breaks
+    /// (history recall, search, undo).
+    draft_recalls: AtomicU64,
+    /// Both counts as they stood when the box was last read empty: the box
+    /// holds at most `draft_newlines - floor` line breaks, while no recall
+    /// happened since. `None` when that can't be known.
+    draft_floor: Mutex<Option<(u64, u64)>>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -1346,15 +1900,21 @@ pub struct TerminalSession {
     /// to recent input. A TUI usually redraws rather than literally echoing the
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
-    interactive_until: Mutex<Option<Instant>>,
+    interactive_until: Arc<Mutex<Option<Instant>>>,
+    /// The submission facts above, shared with the tmux input worker.
+    submission: Arc<SubmissionFacts>,
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    transport: muxel_core::PaneTransport,
     /// The job this pane's local process tree runs in, when it has a memory
     /// limit (see [`crate::pane_job`]). Dropped after the child is killed;
     /// processes still in it keep running.
     #[cfg(windows)]
     pane_job: Option<crate::pane_job::PaneJob>,
+    /// Input admitted that can still be written later (see
+    /// [`crate::pending_ops`]).
+    pending_ops: Arc<crate::pending_ops::PendingOps>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1522,12 +2082,16 @@ impl TerminalSession {
     }
 
     fn spawn_inner(
-        spec: CommandSpec,
+        mut spec: CommandSpec,
         cols: u16,
         rows: u16,
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::spawns_refused() {
+            anyhow::bail!("this process refuses to start terminal programs");
+        }
         let launched_at = SystemTime::now();
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -1564,6 +2128,26 @@ impl TerminalSession {
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
         let program = spec.program_for_spawn()?;
+        let control_paste = crate::control_paste::ControlPaste::for_launch(
+            &spec.program,
+            &spec.args,
+            cfg!(windows),
+        );
+        let version = if control_paste != crate::control_paste::ControlPaste::Terminal
+            && (!spec.literal_argv
+                || control_paste == crate::control_paste::ControlPaste::WindowsCodexUnverified)
+        {
+            codex_control_version(&program)
+        } else {
+            None
+        };
+        let control_paste = crate::control_paste::ControlPaste::configure_launch(
+            &spec.program,
+            &mut spec.args,
+            cfg!(windows),
+            spec.literal_argv,
+            version.as_deref().unwrap_or_default(),
+        );
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1573,7 +2157,21 @@ impl TerminalSession {
                 0,
             );
         }
-        let mut builder = command_builder_for_spawn(&program, &spec.args);
+        // A local PowerShell prints OSC 133 marks around its prompt, saying
+        // whether it found work running inside itself, which is how a Windows
+        // pane knows its shell sits idle at the prompt. An exact argv the
+        // caller gave isn't touched.
+        #[cfg(windows)]
+        let args: std::borrow::Cow<'_, [String]> = match (!spec.literal_argv)
+            .then(|| muxel_core::prompt_marks::for_launch(&program, &spec.args))
+            .flatten()
+        {
+            Some(added) => [spec.args.as_slice(), added.as_slice()].concat().into(),
+            None => spec.args.as_slice().into(),
+        };
+        #[cfg(not(windows))]
+        let args = std::borrow::Cow::Borrowed(spec.args.as_slice());
+        let mut builder = command_builder_for_spawn(&program, &args);
         // Remembered for resolving relative file paths on ctrl+click.
         let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
         if let Some(cwd) = &spec.cwd {
@@ -1594,8 +2192,24 @@ impl TerminalSession {
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
         // program or argv that Muxel resolved.
-        apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
+        apply_windows_batch_runner_env(&mut builder, &program, &args);
 
+        // Use the PTY's PATH/cwd resolution before a startup command can exec
+        // something else; that replacement must not become the trusted image.
+        #[cfg(unix)]
+        let expected_executable = builder
+            .as_command()
+            .ok()
+            .and_then(|command| std::fs::canonicalize(command.get_program()).ok());
+        // Only a program that was found gets started through the prefix; the
+        // prefix execs it, so the PID and the executable it ends up running are
+        // the program's own.
+        #[cfg(unix)]
+        if !spec.launch_prefix.is_empty() && expected_executable.is_some() {
+            let argv = builder.get_argv_mut();
+            let prefix = spec.launch_prefix.iter().map(std::ffi::OsString::from);
+            argv.splice(0..0, prefix);
+        }
         // The job is created before the child so the child starts inside it.
         #[cfg(windows)]
         let pane_job = spec
@@ -1639,6 +2253,16 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
+        // `child` holds the process handle, so this pid can't be reused yet.
+        #[cfg(windows)]
+        let child_started = child_pid.and_then(crate::process_tree::process_start_time);
+        #[cfg(unix)]
+        let child_identity =
+            child_pid
+                .zip(expected_executable.as_deref())
+                .and_then(|(pid, expected)| {
+                    crate::process_tree_unix::ProcessIdentity::capture(pid, expected)
+                });
         let killer = Arc::new(Mutex::new(child.clone_killer()));
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let reader_wake = ReaderWake::new(&*pair.master, &tx.queue_state())?;
@@ -1654,7 +2278,7 @@ impl TerminalSession {
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<PtyInput>();
         let input_closed = Arc::new(AtomicBool::new(false));
         let input_gate = Arc::new(InputGate::default());
         let worker_gate = input_gate.clone();
@@ -1663,44 +2287,13 @@ impl TerminalSession {
         let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
-                // Exits when every sender is gone (session dropped) or the
-                // pipe breaks (child gone).
-                let mut prior_profiler_interval = None;
-                while let Ok(Some(write)) = write_rx.recv() {
-                    if worker_closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let queue_delay = write.queued_at.map(|queued_at| {
-                        queue_delay_excluding_profiler(
-                            queued_at,
-                            Instant::now(),
-                            prior_profiler_interval,
-                        )
-                    });
-                    let write_started = write.queued_at.map(|_| Instant::now());
-                    if !write.admitted(&worker_gate) {
-                        continue;
-                    }
-                    let result = pipe_writer.write_all(&write.bytes);
-                    if result.is_ok() {
-                        let _ = pipe_writer.flush();
-                    }
-                    if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
-                        (profile_writes, queue_delay, write_started)
-                    {
-                        let profile_started = Instant::now();
-                        crate::profile::pty_write(
-                            instance_id,
-                            write.bytes.len(),
-                            queue_delay,
-                            write_started.elapsed(),
-                        );
-                        prior_profiler_interval = Some((profile_started, Instant::now()));
-                    }
-                    if result.is_err() {
-                        break;
-                    }
-                }
+                write_queued(
+                    write_rx,
+                    &mut *pipe_writer,
+                    &worker_gate,
+                    &worker_closed,
+                    profile_writes,
+                )
             })
             .context("spawn pty writer thread")?;
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
@@ -1739,8 +2332,13 @@ impl TerminalSession {
         if matches!(&spec.binding, LaunchBinding::Known(_)) {
             program_status.lock().adopt_binding(1);
         }
-        let immediate_replies =
-            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
+        let grid_size = Arc::new(GridSize::new(cols, rows));
+        let immediate_replies = ImmediateReplies::new(
+            replies.clone(),
+            palette.clone(),
+            grid_size.clone(),
+            &term_config,
+        );
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1779,7 +2377,7 @@ impl TerminalSession {
                     let mut child = child;
                     let status = child.wait();
                     monitor_closed.store(true, Ordering::Release);
-                    let _ = monitor_stop.send(None);
+                    let _ = monitor_stop.send(PtyInput::Stop);
                     // Publish before close: the reader emits Exit only after
                     // draining all output produced before the child died.
                     let _ = exit_tx.send(status);
@@ -1790,7 +2388,7 @@ impl TerminalSession {
             monitor_spawn_result(monitor, &output_queue, || {
                 let _ = killer.lock().kill();
                 input_closed.store(true, Ordering::Release);
-                let _ = write_tx.send(None);
+                let _ = write_tx.send(PtyInput::Stop);
                 master.close();
             })
             .context("spawn PTY child monitor")?
@@ -1818,19 +2416,43 @@ impl TerminalSession {
             clipboard_store: clipboard_store.clone(),
         };
 
-        let term = Term::new(
+        let term = Arc::new(Mutex::new(Term::new(
             term_config,
             &TermSize::new(cols as usize, rows as usize),
             listener,
-        );
+        )));
 
         let (runtime_trigger, runtime_events) = async_channel::bounded(1);
+        let (draft_trigger, draft_events) = async_channel::bounded(1);
+        let submission = Arc::new(SubmissionFacts {
+            evidence: evidence.clone(),
+            turn_submitted: Arc::default(),
+            input_state: Arc::default(),
+            interactive_until: Arc::default(),
+            runtime_trigger: runtime_trigger.clone(),
+            draft: DraftSubmission {
+                term: term.clone(),
+                tmux: spec.tmux_input.is_some(),
+                paste_log: Arc::default(),
+                typed_draft: Arc::new(Mutex::new(if spec.tmux_input.is_none() {
+                    muxel_core::rescue::TypedDraft::default()
+                } else {
+                    muxel_core::rescue::TypedDraft::unknown()
+                })),
+                sent_screen: Arc::default(),
+                sent: Arc::default(),
+                submitted: Arc::default(),
+                epoch: Instant::now(),
+                touched: Arc::default(),
+                trigger: draft_trigger,
+            },
+        });
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
             launched_at,
             launch_resumed: spec.launch_resumed,
-            term: Arc::new(Mutex::new(term)),
+            term,
             processor: Mutex::new(Processor::new()),
             program_status_observer: Mutex::new(Observer::default()),
             program_status_generation: AtomicU64::new(0),
@@ -1844,8 +2466,12 @@ impl TerminalSession {
             input_closed,
             input_gate: input_gate.clone(),
             shell_prompt,
-            input_stop: write_tx,
+            input_queue: write_tx,
             child_pid,
+            #[cfg(windows)]
+            child_started,
+            #[cfg(unix)]
+            child_identity,
             title,
             evidence,
             program_status,
@@ -1859,6 +2485,7 @@ impl TerminalSession {
             mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
+            grid_size,
             resize: Mutex::new(ResizeState {
                 applied: (cols, rows),
                 target: (cols, rows),
@@ -1868,30 +2495,48 @@ impl TerminalSession {
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
+            text_paste_error: Mutex::new(None),
             paste_shell: spec.paste_shell,
+            control_paste,
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
-            turn_submitted: AtomicBool::new(false),
+            turn_submitted: submission.turn_submitted.clone(),
             last_user_input: Mutex::new(None),
-            submission_pending: AtomicBool::new(false),
-            input_state: AtomicU64::new(0),
+            input_state: submission.input_state.clone(),
             runtime_trigger,
             runtime_events,
+            paste_log: submission.draft.paste_log.clone(),
+            draft_events,
+            draft_epoch: submission.draft.epoch,
+            draft_touch: submission.draft.touched.clone(),
+            draft_submitted: submission.draft.submitted.clone(),
+            draft_sent: submission.draft.sent.clone(),
+            sent_screen: submission.draft.sent_screen.clone(),
+            typed_draft: submission.draft.typed_draft.clone(),
+            draft_newlines: AtomicU64::new(0),
+            draft_recalls: AtomicU64::new(0),
+            // A program muxel just started has an empty box. A tmux session
+            // may have outlived muxel with text in it, and other clients of
+            // it type where muxel can't count.
+            draft_floor: Mutex::new(spec.tmux_input.is_none().then_some((0, 0))),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
-            interactive_until: Mutex::new(None),
+            interactive_until: submission.interactive_until.clone(),
+            submission,
             // ctl input through tmux honours the same close hold.
             tmux_input: spec
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            transport: spec.transport,
             #[cfg(windows)]
             pane_job,
+            pending_ops: Arc::default(),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2175,8 +2820,7 @@ impl TerminalSession {
     /// interaction window, not echo detection: full-screen TUIs redraw in
     /// response to keys and streaming output may already be queued.
     fn mark_interactive(&self) {
-        const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
-        *self.interactive_until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
+        mark_interactive_until(&self.interactive_until);
     }
 
     /// Whether output should use the interactive paint cadence.
@@ -2259,14 +2903,146 @@ impl TerminalSession {
     }
 
     /// [`Self::write_input`], saying whether the bytes could be handed to the
-    /// PTY. An error means the terminal's writer is gone (its program exited and
-    /// a write has already failed); `Ok` only means the bytes were queued.
+    /// PTY. An error means the terminal is held for closing or its writer is
+    /// gone (its program exited and a write has already failed); `Ok` only means
+    /// the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.admit_input(!data.is_empty());
-        self.try_write_raw(data)?;
-        self.shell_prompt.submitted(data);
+        self.try_write_submission(data, Submission::None)
+    }
+
+    /// [`Self::try_write_input`], with `text` saying whether the bytes put text
+    /// in front of the program (and so latch the draft bit). An encoded paste
+    /// is text even when every byte of its encoding is an escape sequence.
+    fn try_write_input_as(&self, data: &[u8], text: bool) -> std::io::Result<()> {
+        self.try_write_with_facts(data, InputFacts::Typed(Submission::None, text))
+    }
+
+    /// [`Self::write_input`] for input that may submit something: a key the
+    /// user pressed, a snippet, a broadcast line. Its facts are committed with
+    /// the write; see [`Self::try_write_submission`].
+    pub fn write_submission(&self, data: &[u8], submission: Submission) {
+        let _ = self.try_write_submission(data, submission);
+    }
+
+    /// Write input and commit what it says, together: the input revision, the
+    /// draft bit, the shell prompt and, for a [`Submission::Turn`],
+    /// [`Submission::Prompt`] or [`Submission::Answer`], the submission
+    /// evidence (only a turn or prompt also sends the box's draft). A refused
+    /// write changes
+    /// none of them. Success means queued bytes, not confirmation that the child
+    /// consumed them.
+    pub fn try_write_submission(&self, data: &[u8], submission: Submission) -> std::io::Result<()> {
+        self.try_write_with_facts(
+            data,
+            InputFacts::Typed(submission, has_printable_input(data)),
+        )
+    }
+
+    /// Admit a complete submission after a known prompt (Enter, or text ending
+    /// in Enter). This is the API `paste_prompt` uses once it has checked the
+    /// pane and input revision. Keyboard Enter alone is a [`Submission::Turn`]:
+    /// it can't prove prompt intent.
+    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.try_write_submission(data, Submission::Prompt)
+    }
+
+    /// The one gated write. Under the writer lock it checks the input gate,
+    /// enqueues `data`, and only if that succeeded commits the facts the write
+    /// justifies. Whatever holds the writer lock (a hold, a fence) therefore
+    /// sees each write either with its facts or refused, never one without the
+    /// other. View effects (scroll, output priority, the runtime trigger) follow
+    /// after the lock is released.
+    fn try_write_with_facts(&self, data: &[u8], facts: InputFacts) -> std::io::Result<()> {
+        // The child can react as soon as the bytes are queued. Take the input
+        // time first, so a resume hook the Enter causes can't make that Enter
+        // belong to the replacement conversation.
+        let submitted_at = SystemTime::now();
+        // Whether the write sends the input box. An answer to a dialog drawn
+        // over the box submits a turn but leaves the draft parked in the box,
+        // so it records the submission without the box's draft facts.
+        let sends_box = !data.is_empty()
+            && matches!(
+                facts,
+                InputFacts::Typed(Submission::Turn | Submission::Prompt, _)
+            );
+        // The screen a submission was sent from, copied before the writer is
+        // locked (see [`Self::draft_screen`]).
+        let sent = sends_box.then(|| self.draft_screen());
+        {
+            let mut writer = self.writer.lock();
+            self.check_input_gate()?;
+            // Before the program can see the bytes, so a draft read that shows
+            // their effect also knows it. A pointer report types nothing.
+            if let InputFacts::Typed(..) = facts {
+                self.note_draft_input(data, sends_box);
+            }
+            writer.write_all(data)?;
+            writer.flush()?;
+            #[cfg(test)]
+            PAUSE_AFTER_ENQUEUE.with_borrow_mut(|pause| {
+                if let Some(pause) = pause.as_mut() {
+                    pause();
+                }
+            });
+            if !data.is_empty() {
+                match facts {
+                    InputFacts::Pointer => self.advance_input(None),
+                    InputFacts::Typed(Submission::None, text) => {
+                        self.advance_input(text.then_some(false))
+                    }
+                    InputFacts::Typed(Submission::Turn | Submission::Answer, _) => {
+                        self.record_submission(submitted_at, false)
+                    }
+                    InputFacts::Typed(Submission::Prompt, _) => {
+                        self.record_submission(submitted_at, true)
+                    }
+                }
+            }
+            if let InputFacts::Typed(..) = facts {
+                self.shell_prompt.submitted(data);
+            }
+            // With the submission's other facts, so a departure that fences
+            // the writer sees the draft watcher's state with them.
+            if let Some(sent) = sent {
+                self.draft_submission(sent);
+            }
+        }
+        if let InputFacts::Typed(submission, _) = facts {
+            self.scroll_input_to_bottom();
+            if !data.is_empty() {
+                // A TUI reaction will follow; prioritize output during this
+                // short interaction window even if stream output is queued.
+                self.mark_interactive();
+                if submission != Submission::None {
+                    self.trigger_runtime();
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Note what `data` can do to the input box before the program sees it,
+    /// so a read that shows its effect also knows it: the line breaks it can
+    /// type, and the typed text. `submitted`: `data` is the Enter of an
+    /// admitted submission, after which the box is empty.
+    fn note_draft_input(&self, data: &[u8], submitted: bool) {
+        match muxel_core::rescue::input_newlines(data) {
+            Some(0) => {}
+            Some(newlines) => {
+                self.draft_newlines.fetch_add(newlines, Ordering::AcqRel);
+            }
+            None => {
+                self.draft_recalls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if self.tmux_input.is_none() {
+            let mut typed = self.typed_draft.lock();
+            if submitted {
+                typed.submitted();
+            } else {
+                typed.feed(data);
+            }
+        }
     }
 
     /// Refuse input while the terminal is held for closing.
@@ -2281,68 +3057,10 @@ impl TerminalSession {
         }
     }
 
-    /// The bookkeeping every input write does before its bytes go anywhere.
-    fn admit_input(&self, nonempty: bool) {
-        self.scroll_input_to_bottom();
-        if nonempty {
-            let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
-            self.advance_input(Some(submitted_enter));
-            if submitted_enter {
-                self.trigger_runtime();
-            }
-            // A TUI reaction will follow; prioritize output during this short
-            // interaction window even if stream output is already queued.
-            self.mark_interactive();
-        }
-    }
-
-    /// Admit a complete submission (Enter, or text ending in Enter) and commit
-    /// its lifecycle facts together. Failed admission leaves the draft and
-    /// submission evidence unchanged, with no marker for a later key to consume.
-    /// Success means queued bytes, not confirmation that the child consumed them.
-    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
-        // This API admits a known prompt after `paste_prompt` has checked
-        // the pane and input revision. Generic keyboard Enter uses
-        // `mark_turn_submitted` and cannot prove prompt intent.
-        self.try_submit(data, true)
-    }
-
-    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
-    /// and a plain one otherwise.
-    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
-        self.check_input_gate()?;
-        self.scroll_input_to_bottom();
-        let mut writer = self.writer.lock();
-        // The child can react as soon as write_all publishes bytes. Keep the
-        // input time before any resume hook it causes, but commit no facts
-        // until writer admission succeeds.
-        let submitted_at = SystemTime::now();
-        self.submission_pending.store(false, Ordering::Release);
-        writer.write_all(data)?;
-        writer.flush()?;
-        self.shell_prompt.submitted(data);
-        if !data.is_empty() {
-            self.commit_submission(submitted_at, prompt);
-        }
-        Ok(())
-    }
-
-    /// The facts an admitted submission commits together. A `prompt` one
-    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
-    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
-        {
-            let mut evidence = self.evidence.lock();
-            if prompt {
-                evidence.record_prompt_submission(submitted_at);
-            } else {
-                evidence.record_submission(submitted_at);
-            }
-        }
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.advance_input(Some(true));
-        self.mark_interactive();
-        self.trigger_runtime();
+    /// The facts an admitted submission records (see
+    /// [`SubmissionFacts::record`]).
+    fn record_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        self.submission.record(submitted_at, prompt);
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
@@ -2351,55 +3069,138 @@ impl TerminalSession {
     /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
     /// [`Self::try_submit_input`]. Either way the input revision and draft bit
     /// move as for a PTY write, and a submit's facts are committed only once it
-    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    /// is admitted. Through tmux, that's when tmux has taken it: the input
+    /// worker commits them then, before it answers, and the write counts in
+    /// [`Self::pending_input_ops`] until it has.
     pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
             let written = match &input {
-                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Paste(text) => match self.control_paste.encode(text) {
+                    Ok(Some(encoded)) => {
+                        self.try_write_input_as(encoded.as_bytes(), has_text(text))
+                    }
+                    Ok(None) => self.try_paste(text),
+                    Err(why) => {
+                        return ControlWrite::done(Err(ControlWriteError::InvalidInput(why)));
+                    }
+                },
                 ControlInput::Keys { keys, app_cursor } => self.try_write_input(
                     &keys
                         .iter()
                         .flat_map(|key| key.bytes(*app_cursor))
                         .collect::<Vec<u8>>(),
                 ),
+                ControlInput::Answer(keys) => self.try_write_input_as(
+                    &keys
+                        .iter()
+                        .flat_map(|key| key.bytes(false))
+                        .collect::<Vec<u8>>(),
+                    false,
+                ),
                 ControlInput::Submit => self.try_submit_input(b"\r"),
-                ControlInput::SubmitKey => self.try_submit(b"\r", false),
+                ControlInput::SubmitKey => self.try_write_submission(b"\r", Submission::Turn),
             };
             return ControlWrite::done(
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
-        // Held for closing, the pane takes no ctl input by this route either.
-        // A write queued before the hold dies on the worker, even after Undo.
+        // Held, the pane takes no ctl input by this route either; the worker
+        // checks under the lock a departure fences with. A write queued
+        // before a close dies on the worker, even after Undo.
         let epoch = self.input_epoch();
-        if !self.accepts_input_epoch(epoch) {
-            return ControlWrite::done(Err(ControlWriteError::Closed(
-                "terminal is closing".into(),
-            )));
-        }
-        let submit = match &input {
+        // `typed`: the input moves the revision. `text`: it also latches the
+        // draft bit, which escape, arrows, control keys and an answer don't.
+        let (submit, typed, text) = match &input {
             ControlInput::Submit | ControlInput::SubmitKey => {
-                self.scroll_input_to_bottom();
-                self.submission_pending.store(false, Ordering::Release);
                 let prompt = input == ControlInput::Submit;
-                Some((self.clone(), SystemTime::now(), prompt))
+                let submit = crate::control_input::Submit {
+                    facts: self.submission.clone(),
+                    at: SystemTime::now(),
+                    prompt,
+                };
+                (Some(submit), false, false)
             }
             ControlInput::Paste(text) => {
-                self.admit_input(!text.is_empty());
-                None
+                // Logged before tmux can type it, as a PTY paste is, unless
+                // the pane is already held and will refuse it.
+                if self.accepts_input_epoch(epoch) {
+                    self.paste_log.lock().record(text);
+                }
+                (None, !text.is_empty(), has_text(text))
             }
-            ControlInput::Keys { keys, .. } => {
-                self.admit_input(!keys.is_empty());
-                None
-            }
+            ControlInput::Keys { keys, .. } => (
+                None,
+                !keys.is_empty(),
+                keys.iter()
+                    .any(|key| has_printable_input(&key.bytes(false))),
+            ),
+            ControlInput::Answer(keys) => (None, !keys.is_empty(), false),
         };
-        ControlWrite::queued(tmux.deliver(input, epoch), submit)
+        let mut queued = false;
+        let delivered = tmux.deliver(input, epoch, submit, self.begin_pending_op(), || {
+            // A paste or key press moves the input revision as it's queued;
+            // tmux reports delivery later, and this doesn't wait for it.
+            if typed {
+                self.advance_input(text.then_some(false));
+            }
+            queued = true;
+        });
+        if !queued {
+            // Refused as it was queued, and answered already: known at once,
+            // as a refused PTY write is.
+            return ControlWrite::done(delivered.try_recv().unwrap_or_else(|_| {
+                Err(ControlWriteError::Refused(
+                    "muxel's tmux input worker stopped".into(),
+                ))
+            }));
+        }
+        self.scroll_input_to_bottom();
+        if typed {
+            self.mark_interactive();
+        }
+        ControlWrite::queued(delivered)
+    }
+
+    /// How many pieces of admitted input can still reach this terminal's
+    /// program: ctl writes queued for tmux that it hasn't answered, and a
+    /// startup automation that hasn't made its last write. Each is counted until
+    /// its write and the facts that go with it are done.
+    pub fn pending_input_ops(&self) -> usize {
+        self.pending_ops.count()
+    }
+
+    pub(crate) fn begin_pending_op(&self) -> crate::pending_ops::PendingOp {
+        self.pending_ops.begin()
+    }
+
+    /// Interrupt this terminal's pending input for a confirmed departure, and
+    /// return how much there was. The startup automation stops at its next
+    /// stage and never resumes, even if the departure gives up; writes
+    /// already queued for tmux still go.
+    pub fn interrupt_pending_input(&self) -> usize {
+        self.pending_ops.interrupt_all()
+    }
+
+    /// Run `probe` with this terminal's submission facts each time its pending
+    /// input drops to none.
+    #[cfg(test)]
+    pub(crate) fn on_pending_input_drained(
+        &self,
+        probe: impl Fn(&SubmissionFacts) + Send + Sync + 'static,
+    ) {
+        let facts = self.submission.clone();
+        self.pending_ops.on_drained(move || probe(&facts));
     }
 
     /// Whether outside-control input reaches this terminal through tmux.
     pub fn delivers_through_tmux(&self) -> bool {
         self.tmux_input.is_some()
+    }
+
+    /// What the child is to the pane's command ([`CommandSpec::transport`]).
+    pub fn transport(&self) -> muxel_core::PaneTransport {
+        self.transport
     }
 
     /// The tmux pane id outside-control input goes to, once found.
@@ -2428,12 +3229,30 @@ impl TerminalSession {
 
     /// Hide-time cancellation: old queued input stays invalid after Undo.
     pub fn hold_input(&self) {
-        self.input_gate.hold();
-        self.submission_pending.store(false, Ordering::Release);
+        self.input_gate.hold(Hold::Close);
     }
 
+    /// Release the close hold. A departure hold, if any, stays.
     pub fn resume_input(&self) {
-        self.input_gate.resume();
+        self.input_gate.resume(Hold::Close);
+    }
+
+    /// Stop new input for quitting or restarting, and fence the writers: the
+    /// returned fence answers once every write admitted before the hold, by
+    /// PTY or through tmux, has been written or has failed, and reports a
+    /// writer that died with input unaccounted for. Unlike a close, input
+    /// already queued is still written. Each call makes its own fence, so an
+    /// answer that comes after its departure gave up can't answer a later one.
+    pub fn hold_for_departure(&self) -> InputFence {
+        InputFence {
+            pty: fence_pty(&self.writer, &self.input_gate, &self.input_queue),
+            tmux: self.tmux_input.as_ref().map(|tmux| tmux.fence()),
+        }
+    }
+
+    /// Release the departure hold. A close hold, if any, stays.
+    pub fn release_departure(&self) {
+        self.input_gate.resume(Hold::Departure);
     }
 
     pub fn input_epoch(&self) -> u64 {
@@ -2450,11 +3269,25 @@ impl TerminalSession {
         self.shell_prompt.at_prompt()
     }
 
+    /// Whether the shell is [`Self::shell_at_prompt`], not marked busy by
+    /// muxel's PowerShell wrapper ([`muxel_core::prompt_marks::BUSY_MARK`]),
+    /// with nothing typed since that could still run, read together with the
+    /// count of marks it has printed.
+    pub fn shell_reading(&self) -> ShellReading {
+        self.shell_prompt.reading()
+    }
+
     /// [`Self::write_input`] for input the user produced themselves — a key typed
     /// into the pane — so it counts as someone being at this machine.
     pub fn write_user_input(&self, data: &[u8]) {
+        self.write_user_submission(data, Submission::None);
+    }
+
+    /// [`Self::write_submission`] for a key the user pressed themselves, as
+    /// [`Self::write_user_input`] counts it.
+    pub fn write_user_submission(&self, data: &[u8], submission: Submission) {
         self.mark_user_input();
-        self.write_input(data);
+        self.write_submission(data, submission);
     }
 
     /// Note that the user just sent this terminal input themselves: a key, a
@@ -2462,6 +3295,188 @@ impl TerminalSession {
     /// auto-continue and outside control type on their own and never mark it.
     pub fn mark_user_input(&self) {
         *self.last_user_input.lock() = Some(Instant::now());
+        self.touch_draft();
+    }
+
+    /// Restart the draft watcher's debounce and wake it (see
+    /// [`DraftSubmission::touch`]).
+    fn touch_draft(&self) {
+        self.submission.draft.touch();
+    }
+
+    /// A submission was admitted, with `sent` the screen as it was (see
+    /// [`DraftSubmission::commit`]). Through tmux the input worker commits it.
+    fn draft_submission(&self, sent: crate::draft::DraftCapture) {
+        self.submission.draft.commit(sent);
+    }
+
+    /// A submission was admitted and no read has seen the box redrawn since,
+    /// so nothing was saved after it: whatever is saved was sent.
+    pub(crate) fn draft_sent(&self) -> bool {
+        self.draft_sent.load(Ordering::Acquire)
+    }
+
+    /// Whether the box, showing `text` after a submission, still shows what
+    /// was sent (see [`muxel_core::rescue::still_shows_sent`]): what `parse`
+    /// reads in the screen copied as the submission was admitted, or what
+    /// muxel typed before its Enter, which a program slow to draw its keys
+    /// shows only after it. Through tmux no typed copy is kept.
+    fn shows_sent(
+        &self,
+        text: &str,
+        parse: impl Fn(&crate::draft::DraftCapture) -> muxel_core::rescue::DraftRead,
+    ) -> bool {
+        use muxel_core::rescue::DraftRead;
+        let on_screen = match self.sent_screen.lock().as_ref().map(parse) {
+            Some(DraftRead::Text { text, .. }) => Some(text),
+            _ => None,
+        };
+        let typed = self.typed_draft.lock().sent().map(str::to_string);
+        muxel_core::rescue::still_shows_sent(text, on_screen.as_deref(), typed.as_deref())
+    }
+
+    /// The visible screen, as a draft read copies it. Never call it with the
+    /// writer locked.
+    pub(crate) fn draft_screen(&self) -> crate::draft::DraftCapture {
+        self.with_term(crate::draft::DraftCapture::from_term)
+    }
+
+    /// Whether the text before the cursor ends in a backslash, by what muxel
+    /// saw typed or by the screen: there, Enter in Claude Code starts a new
+    /// line instead of sending.
+    pub(crate) fn backslash_before_cursor(&self) -> bool {
+        let typed = self.tmux_input.is_none()
+            && self
+                .typed_draft
+                .lock()
+                .before_cursor()
+                .is_some_and(|before| before.ends_with('\\'));
+        typed
+            || self.with_term(|term| {
+                use alacritty_terminal::index::Column;
+                let grid = term.grid();
+                let cursor = grid.cursor.point;
+                term.mode().contains(TermMode::SHOW_CURSOR)
+                    && cursor.column.0 > 0
+                    && cursor.column.0 <= grid.columns()
+                    && grid[cursor.line][Column(cursor.column.0 - 1)].c == '\\'
+            })
+    }
+
+    /// How many line breaks the input box can hold, `None` when unknown.
+    fn draft_newline_budget(&self) -> Option<u64> {
+        if self.tmux_input.is_some() {
+            return None;
+        }
+        let (newlines, recalls) = self.draft_counts();
+        let (floor, recalls_then) = (*self.draft_floor.lock())?;
+        (recalls == recalls_then).then(|| newlines.saturating_sub(floor))
+    }
+
+    fn draft_counts(&self) -> (u64, u64) {
+        (
+            self.draft_newlines.load(Ordering::Acquire),
+            self.draft_recalls.load(Ordering::Acquire),
+        )
+    }
+
+    /// Wakeups for [`crate::draft::watch`]. Receivers share one queue.
+    pub(crate) fn draft_events(&self) -> async_channel::Receiver<()> {
+        self.draft_events.clone()
+    }
+
+    /// Time since the last user input or submission.
+    pub(crate) fn draft_idle_for(&self) -> Duration {
+        let touched = Duration::from_millis(self.draft_touch.load(Ordering::Relaxed));
+        self.draft_epoch.elapsed().saturating_sub(touched)
+    }
+
+    pub(crate) fn take_draft_submitted(&self) -> bool {
+        self.draft_submitted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Read the draft in agent `provider`'s input box. Copies the visible
+    /// screen under the terminal lock and parses it after the lock is released.
+    pub(crate) fn read_draft(
+        &self,
+        provider: crate::view::TitleProvider,
+    ) -> muxel_core::rescue::DraftRead {
+        use crate::view::TitleProvider;
+        use muxel_core::rescue::DraftRead;
+        // Counted before the screen is copied: input after this point may
+        // already show in the copy, so an empty box proves only these.
+        let counts_before = self.draft_counts();
+        let read = match provider {
+            TitleProvider::Claude | TitleProvider::Codex => {
+                let capture = self.draft_screen();
+                // Counted after the copy: everything it can show is in here.
+                let newlines = self.draft_newline_budget();
+                let typed = self.typed_draft.lock().text().map(str::to_string);
+                let parse = |capture: &crate::draft::DraftCapture, newlines, typed| {
+                    if provider == TitleProvider::Claude {
+                        crate::draft::claude(capture, newlines, typed)
+                    } else {
+                        crate::draft::codex(capture, newlines, typed)
+                    }
+                };
+                let read = parse(&capture, newlines, typed.as_deref());
+                if let DraftRead::Text { text, partial, .. } = &read
+                    && self.draft_sent()
+                {
+                    // After a submission the box shows what was sent until
+                    // the program redraws it: with what was typed since, or
+                    // with other text than was sent. Only the box's text
+                    // counts: a menu closing around it, a footer changing or
+                    // where the cursor sits says nothing.
+                    let typed_shown = !*partial
+                        && typed
+                            .as_deref()
+                            .is_some_and(|typed| !typed.is_empty() && typed == text);
+                    let redrawn =
+                        typed_shown || !self.shows_sent(text, |sent| parse(sent, None, None));
+                    if !redrawn {
+                        return DraftRead::Empty;
+                    }
+                }
+                read
+            }
+            _ => DraftRead::Unknown,
+        };
+        match read {
+            DraftRead::Text {
+                text,
+                partial,
+                clipped,
+            } => {
+                // Text is read only from a box redrawn since the last
+                // submission (a shell's is a new prompt), and may be saved:
+                // from here on what is saved wasn't sent.
+                self.draft_sent.store(false, Ordering::Release);
+                let mut pastes = self.paste_log.lock();
+                pastes.observe(&text);
+                let substituted = muxel_core::rescue::substitute_pastes(&text, &pastes);
+                DraftRead::Text {
+                    text: substituted.text,
+                    partial: partial || substituted.partial,
+                    clipped,
+                }
+            }
+            DraftRead::Empty => {
+                // Input that hasn't been drawn yet would make an empty box a
+                // false floor; a second without input rules that out.
+                if self.draft_idle_for() >= muxel_core::rescue::DRAFT_DEBOUNCE {
+                    *self.draft_floor.lock() = Some(counts_before);
+                    if self.tmux_input.is_none() {
+                        *self.typed_draft.lock() = muxel_core::rescue::TypedDraft::default();
+                    }
+                }
+                // The program redrew its box after the submission.
+                self.draft_sent.store(false, Ordering::Release);
+                self.paste_log.lock().observe("");
+                DraftRead::Empty
+            }
+            other => other,
+        }
     }
 
     /// Send pastes that name this machine's files — a clipboard image, copied or
@@ -2485,47 +3500,34 @@ impl TerminalSession {
         self.path_paste_error.lock().clone()
     }
 
+    /// Report a refused clipboard text paste on the UI thread.
+    pub fn set_text_paste_error_handler(&self, handler: Option<crate::TextPasteErrorHandler>) {
+        *self.text_paste_error.lock() = handler;
+    }
+
+    pub(crate) fn text_paste_error_handler(&self) -> Option<crate::TextPasteErrorHandler> {
+        self.text_paste_error.lock().clone()
+    }
+
     /// When the user last sent this terminal input themselves, if ever.
     pub fn last_user_input(&self) -> Option<Instant> {
         *self.last_user_input.lock()
     }
 
     fn advance_input(&self, submitted: Option<bool>) {
-        let _ = self
-            .input_state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
-                Some(next_input_state(state, submitted))
-            });
-    }
-
-    /// Announce that the next input write submits a turn. Call it just before
-    /// writing the Enter (or the text ending in one).
-    pub fn mark_turn_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        self.evidence.lock().record_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
-    }
-
-    /// Explicit prompt submission from a path that supplied the prompt text.
-    /// Keyboard Enter alone can select a resume item, even after arrow input.
-    pub fn mark_prompt_submitted(&self) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        let submitted_at = SystemTime::now();
-        let mut evidence = self.evidence.lock();
-        evidence.record_prompt_submission(submitted_at);
-        self.turn_submitted.store(true, Ordering::Relaxed);
-        self.submission_pending.store(true, Ordering::Release);
+        advance_input_state(&self.input_state, submitted);
     }
 
     /// Whether any turn was submitted in this launch, in any conversation.
     pub fn has_submitted_turn(&self) -> bool {
         self.turn_submitted.load(Ordering::Relaxed)
+    }
+
+    /// When the latest submission into this terminal went in: a person's
+    /// Enter, or a prompt muxel submitted. What it submitted (a prompt, a
+    /// `/clear`, a menu pick) isn't known.
+    pub fn last_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().last_submission_at()
     }
 
     /// Conversation observed before this launch's first submitted turn. None
@@ -2539,12 +3541,12 @@ impl TerminalSession {
         self.evidence.lock().initial_unbound_submission()
     }
 
-    /// The input revision and draft bit. Ordinary non-empty input writes (keys,
-    /// pastes, mouse and wheel reports) advance the revision before writer
-    /// admission; fallible submissions commit it after successful admission.
-    /// Focus reports and the terminal's own replies to the program don't count.
-    /// The draft bit is set
-    /// by typed input and cleared by a submission.
+    /// The input revision and draft bit. A non-empty input write (keys, pastes,
+    /// submissions, mouse and wheel reports) advances the revision only once
+    /// the writer has admitted it; a ctl write through tmux advances it when
+    /// queued. Focus reports and the terminal's own replies to the program
+    /// don't count. The draft bit is set by typed input and cleared by a
+    /// submission.
     pub fn input_snapshot(&self) -> (u64, bool) {
         let state = self.input_state.load(Ordering::Relaxed);
         (state >> 1, state & 1 != 0)
@@ -2582,12 +3584,20 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        let encoded = self
+            .control_paste
+            .clipboard(text)
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
+        self.paste_log.lock().record(text);
+        if let Some(encoded) = encoded {
+            return self.try_write_input_as(encoded.as_bytes(), has_text(text));
+        }
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
-        self.try_write_input(payload.as_bytes())
+        self.try_write_input_as(payload.as_bytes(), has_text(text))
     }
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
@@ -2606,7 +3616,8 @@ impl TerminalSession {
     pub fn paste_path_strings(&self, paths: &[&str]) -> Result<(), PastePathError> {
         let text = muxel_core::path_paste::format_paths(self.paste_shell, paths)?;
         if !text.is_empty() {
-            self.paste(&text);
+            self.try_paste(&text)
+                .map_err(|_| PastePathError::InputRefused)?;
         }
         Ok(())
     }
@@ -2615,13 +3626,7 @@ impl TerminalSession {
     /// advances the input revision, but it isn't text: the draft bit and the
     /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return;
-        }
-        if !data.is_empty() {
-            self.advance_input(None);
-        }
-        self.write_raw(data);
+        let _ = self.try_write_with_facts(data, InputFacts::Pointer);
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
@@ -2762,6 +3767,7 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
+        self.grid_size.set(cols, rows);
         if let Some(master) = self.master.inner.lock().as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -2942,13 +3948,32 @@ impl TerminalSession {
 
     /// Capture input geometry and modes with the same grid generation.
     pub(crate) fn startup_screen(&self) -> crate::startup::Screen {
+        self.capture_screen(false).0
+    }
+
+    /// Status also needs physical wrap boundaries; capture them under the same lock.
+    pub(crate) fn status_screen(&self) -> (crate::startup::Screen, Vec<bool>) {
+        self.capture_screen(true)
+    }
+
+    fn capture_screen(&self, with_wraps: bool) -> (crate::startup::Screen, Vec<bool>) {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
+        use alacritty_terminal::term::cell::Flags;
         self.with_term(|term| {
             let grid = term.grid();
             let rows = grid.screen_lines();
             let cols = grid.columns();
             let mut s = String::with_capacity(rows * (cols + 1));
+            let mut wrapped = Vec::with_capacity(if with_wraps { rows } else { 0 });
             for row in 0..rows {
+                if with_wraps {
+                    wrapped.push(
+                        cols > 0
+                            && grid[Line(row as i32)][Column(cols - 1)]
+                                .flags
+                                .contains(Flags::WRAPLINE),
+                    );
+                }
                 for col in 0..cols {
                     s.push(
                         grid[GridPoint {
@@ -2961,13 +3986,16 @@ impl TerminalSession {
                 s.push('\n');
             }
             let cursor = grid.cursor.point;
-            crate::startup::Screen {
-                text: s,
-                cursor_column: cursor.column.0,
-                cursor_row: cursor.line.0,
-                cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
-                bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
-            }
+            (
+                crate::startup::Screen {
+                    text: s,
+                    cursor_column: cursor.column.0,
+                    cursor_row: cursor.line.0,
+                    cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
+                    bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+                },
+                wrapped,
+            )
         })
     }
 
@@ -3089,6 +4117,14 @@ impl TerminalSession {
         self.process_output(data);
     }
 
+    /// [`Self::process_probe_output`] for a shell's output: the PTY reader's
+    /// prompt tracking sees the bytes first, as it does for real output.
+    #[doc(hidden)]
+    pub fn process_probe_shell_output(&self, data: &[u8]) {
+        ShellMarks::default().advance(data, &self.shell_prompt);
+        self.process_output(data);
+    }
+
     /// Latest OSC title plus its change generation. Unlike [`Self::title`], this
     /// lets lifecycle consumers observe a ResetTitle or a repeated title event.
     pub fn title_snapshot(&self) -> (u64, Option<String>) {
@@ -3102,6 +4138,11 @@ impl TerminalSession {
     /// rather than treating a cached spinner frame as permanent Working.
     pub fn title_age(&self) -> Option<Duration> {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_title_age_for_test(&self, age: Duration) {
+        *self.title_changed_at.lock() = Some(Instant::now() - age);
     }
 
     /// The running TUI switched provider conversations at some instant in
@@ -3151,9 +4192,35 @@ impl TerminalSession {
         self.session_id_hint.lock().clone()
     }
 
+    /// Whether this launch's own evidence names conversation `id` as its live
+    /// binding: it opened `id` (a pinned `--session-id` or `--resume`) and
+    /// nothing has switched since, or the provider's latest session-hint
+    /// title, recorded in the current binding, names it. The app's stored id
+    /// for the pane can lag behind a switch the terminal already saw.
+    pub fn binding_names(&self, id: &str) -> bool {
+        // The listener's lock order: hint, then evidence.
+        let hint = self.session_id_hint.lock();
+        self.evidence.lock().binding_names(id, hint.as_deref())
+    }
+
+    /// Whether the provider has named a conversation this terminal hasn't
+    /// bound yet: the program-status observer read its title inside a
+    /// synchronized update whose title callback VTE still holds. Until the
+    /// update ends, [`Self::binding_revision`] and [`Self::binding_names`]
+    /// still describe the conversation it replaced.
+    pub fn binding_pending(&self) -> bool {
+        let binding_rev = self.evidence.lock().binding_rev();
+        self.program_status.lock().binding_revision > binding_rev
+    }
+
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
+    }
+
+    /// Whether confirmation still observes the conversation that received its paste.
+    pub fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        self.evidence.lock().prompt_binding_is_current(captured)
     }
 
     /// The embedder owns vte's synchronized-update timeout. The view uses this
@@ -3310,16 +4377,41 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child is sitting idle at its prompt with no foreground command
-    /// running — i.e. the terminal's foreground process group *is* the child
-    /// itself. A shell that's running `vim`/`make`/etc. puts that command in a new
-    /// foreground group, so this returns `false`. Used to skip the close
-    /// confirmation for an untouched shell pane.
+    /// Whether the child is sitting idle at its prompt with nothing running.
+    /// Used to skip the close confirmation for an untouched shell pane.
     ///
-    /// `false` when it can't be determined — no foreground group, an unknown child
-    /// pid, or a platform without `tcgetpgrp` (Windows) — so callers stay safe and
-    /// confirm as usual.
+    /// On Unix the child must own the foreground group, have no children in
+    /// its own session and still run its original executable or another
+    /// interactive shell it exec'd into. Background jobs and other executable
+    /// changes keep the pane busy even if its prompt marks remain. A child in
+    /// a session of its own, on a terminal of its own, such as zsh's zpty
+    /// worker, doesn't count.
+    ///
+    /// Windows has no foreground group, so the child must be alive with no
+    /// live process of its own ([`muxel_core::recoverable_close::shell_is_idle`]);
+    /// a command it starts, `start /b` included, is its child. That alone isn't
+    /// idle on Windows, where cmd and PowerShell run batch files and cmdlets in
+    /// their own process: callers pair it with [`Self::shell_reading`].
+    /// The process snapshot may be up to 250 ms old and shared with other
+    /// panes ([`crate::process_tree::recent_process_parent_map`]), so one close
+    /// walks the process table once; [`Self::is_idle_foreground_now`] walks it
+    /// afresh.
+    ///
+    /// `false` when it can't be determined — no foreground group, an unknown
+    /// child pid or start time, an unverified executable, a failed snapshot or
+    /// child lookup, or another platform — so callers stay safe and confirm as
+    /// usual.
     pub fn is_idle_foreground(&self) -> bool {
+        self.idle_foreground(false)
+    }
+
+    /// [`Self::is_idle_foreground`] from a process table walked now, for the
+    /// last check before a close kills the shell.
+    pub fn is_idle_foreground_now(&self) -> bool {
+        self.idle_foreground(true)
+    }
+
+    fn idle_foreground(&self, #[cfg_attr(not(windows), allow(unused))] fresh: bool) -> bool {
         #[cfg(unix)]
         {
             match (
@@ -3330,14 +4422,45 @@ impl TerminalSession {
                     .and_then(|master| master.process_group_leader()),
                 self.child_pid,
             ) {
-                (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
+                (Some(fg), Some(pid)) => {
+                    fg == pid as libc::pid_t
+                        && crate::process_tree_unix::shell_has_no_session_children(pid)
+                        && self
+                            .child_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.still_matches(pid))
+                }
                 _ => false,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let (Some(pid), Some(started)) = (self.child_pid, self.child_started) else {
+                return false;
+            };
+            let parents = if fresh {
+                Arc::new(crate::process_tree::process_parent_map())
+            } else {
+                crate::process_tree::recent_process_parent_map()
+            };
+            muxel_core::recoverable_close::shell_is_idle(
+                parents.iter().map(|(&process, &parent)| (process, parent)),
+                pid,
+                started,
+                crate::process_tree::process_start_time,
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
+    }
+
+    /// [`Self::is_idle_foreground`] where the platform can check it; None on
+    /// Windows, which has no foreground group to ask. The close policy
+    /// (`shell_close_evidence`) decides what each means.
+    pub fn foreground_idle(&self) -> Option<bool> {
+        cfg!(unix).then(|| self.is_idle_foreground())
     }
 
     /// Kill the child process. On Unix this sends SIGHUP, at most once per
@@ -3489,6 +4612,22 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+/// The `--version` output of the Codex a launch runs, from
+/// [`crate::codex_version`]: asked once per executable, on its own thread.
+#[cfg(windows)]
+fn codex_control_version(program: &str) -> Option<String> {
+    let program = literal_program_for_spawn(program).ok()?;
+    crate::codex_version::version(
+        std::path::Path::new(&program),
+        crate::codex_version::LAUNCH_WAIT,
+    )
+}
+
+#[cfg(not(windows))]
+fn codex_control_version(_program: &str) -> Option<String> {
+    None
 }
 
 /// Resolve a literal launch without permitting a batch interpreter to reparse
@@ -3941,7 +5080,7 @@ fn appimage_env_fixups(
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         self.input_closed.store(true, Ordering::Release);
-        let _ = self.input_stop.send(None);
+        let _ = self.input_queue.send(PtyInput::Stop);
         // Release a reader parked on a full output queue before the `master`
         // field drops and closes the platform PTY; a receiver that outlives
         // the session must not hold that close hostage.
@@ -4199,7 +5338,7 @@ impl HangupChild {
 /// before reaping the child; OSC 133 evidence is observed before UI admission.
 struct InputShutdown {
     closed: Arc<AtomicBool>,
-    stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    stop: std::sync::mpsc::Sender<PtyInput>,
     shell_prompt: Arc<ShellPrompt>,
 }
 
@@ -4292,7 +5431,7 @@ fn read_loop(
         }
     }
     input_shutdown.closed.store(true, Ordering::Release);
-    let _ = input_shutdown.stop.send(None);
+    let _ = input_shutdown.stop.send(PtyInput::Stop);
     // The reader's master-fd dups are no longer needed; free them before the
     // (potentially long) reap below so closed sessions don't hold PTYs open.
     drop(reader);
@@ -5302,6 +6441,569 @@ mod profiler_transport_tests {
             ),
             Duration::from_millis(5)
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_shell_idle_tests {
+    use super::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
+    use crate::process_tree::RECENT;
+    use muxel_core::recoverable_close::{CloseEvidence, windows_shell_close_evidence};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    fn system32(leaf: &str) -> String {
+        std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join(leaf)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// cmd with AutoRun off, so it runs nothing the test didn't ask for.
+    fn cmd() -> (String, Vec<String>) {
+        (system32("cmd.exe"), vec!["/D".into()])
+    }
+
+    /// Windows PowerShell 5.1, on every Windows host.
+    fn powershell() -> (String, Vec<String>) {
+        (
+            system32(r"WindowsPowerShell\v1.0\powershell.exe"),
+            vec!["-NoLogo".into(), "-NoProfile".into()],
+        )
+    }
+
+    /// PowerShell 7, where it's installed; it ships `Start-ThreadJob`.
+    fn pwsh() -> Option<(String, Vec<String>)> {
+        let path = PathBuf::from(std::env::var_os("ProgramFiles")?).join(r"PowerShell\7\pwsh.exe");
+        path.is_file().then(|| {
+            (
+                path.to_string_lossy().into_owned(),
+                vec!["-NoLogo".into(), "-NoProfile".into()],
+            )
+        })
+    }
+
+    fn powershells() -> Vec<(String, Vec<String>)> {
+        let mut all = vec![powershell()];
+        match pwsh() {
+            Some(pwsh) => all.push(pwsh),
+            None => eprintln!("PowerShell 7 is not installed; testing 5.1 only"),
+        }
+        all
+    }
+
+    /// Work the test holds open: it runs while this file exists and ends by
+    /// itself once the file is gone. Dropping the hold releases it, so a
+    /// failed assertion leaves nothing running, and no test kills a process by
+    /// pid.
+    struct Hold(PathBuf);
+
+    impl Hold {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "muxel-shell-idle-{name}-{}.hold",
+                std::process::id()
+            ));
+            std::fs::write(&path, b"").expect("hold file");
+            Self(path)
+        }
+
+        /// PowerShell that waits while the hold lasts.
+        fn wait(&self) -> String {
+            format!(
+                "while (Test-Path -LiteralPath '{}') {{ Start-Sleep -Milliseconds 50 }}",
+                self.0.display()
+            )
+        }
+
+        fn release(&self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct Shell {
+        session: Arc<TerminalSession>,
+        rx: PtyReceiver,
+    }
+
+    impl Shell {
+        /// A shell as a pane launches it, with muxel's prompt marks.
+        fn start((program, args): (String, Vec<String>)) -> Self {
+            Self::spawn(CommandSpec::program(program, args))
+        }
+
+        fn spawn(spec: CommandSpec) -> Self {
+            let (session, rx) = TerminalSession::spawn(spec, 100, 30).expect("spawn shell");
+            Self { session, rx }
+        }
+
+        /// What a pane close reads on Windows (`close_facts`).
+        fn proves_idle(&self) -> bool {
+            windows_shell_close_evidence(
+                self.session.shell_reading(),
+                || self.session.is_idle_foreground(),
+                || self.session.shell_reading(),
+            ) == CloseEvidence::ShellPrompt
+        }
+
+        fn pump(&self) {
+            while let Ok(chunk) = self.rx.try_recv() {
+                match chunk {
+                    PtyChunk::Output(bytes) => self.session.process_output(&bytes),
+                    PtyChunk::Exit { .. } => {
+                        panic!("shell exited: {:?}", self.session.visible_text())
+                    }
+                }
+            }
+        }
+
+        fn until(&self, what: &str, mut done: impl FnMut(&Self) -> bool) {
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                self.pump();
+                if done(self) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no {what}: {:?}",
+                    self.session.visible_text()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn shows(&self, marker: &str) {
+            self.until(marker, |shell| {
+                shell.session.visible_text().contains(marker)
+            });
+        }
+
+        fn at_prompt(&self) {
+            self.until("a prompt", |shell| shell.session.shell_at_prompt());
+        }
+
+        fn becomes_idle(&self) {
+            self.until("idle prompt", Self::proves_idle);
+        }
+
+        /// Never idle at any millisecond until `marker` shows.
+        fn busy_until(&self, marker: &str) {
+            let deadline = Instant::now() + PATIENCE;
+            while !self.session.visible_text().contains(marker) {
+                self.pump();
+                assert!(
+                    !self.proves_idle(),
+                    "idle before {marker}: {:?}",
+                    self.session.visible_text()
+                );
+                assert!(Instant::now() < deadline, "no {marker}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Never idle at any check for a second.
+        fn stays_busy(&self, why: &str) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                self.pump();
+                assert!(
+                    !self.proves_idle(),
+                    "{why}: {:?}",
+                    self.session.visible_text()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn type_text(&self, text: &str) {
+            self.session.write_input(text.as_bytes());
+        }
+
+        /// Run `command` and wait for the prompt after it. `marker` is the
+        /// output to wait for, split in the command so its echo can't match.
+        fn run(&self, command: &str, marker: &str) {
+            let half = marker.len() / 2;
+            self.type_text(&format!(
+                "{command}; '{}' + '{}'\r",
+                &marker[..half],
+                &marker[half..]
+            ));
+            self.shows(marker);
+            self.at_prompt();
+        }
+
+        /// The last non-blank line on screen once output has settled.
+        fn settled_last_line(&self) -> String {
+            let (mut last, mut since) = (String::new(), Instant::now());
+            self.until("settled output", |shell| {
+                let text = shell.session.visible_text();
+                let line = text.lines().rev().find(|line| !line.trim().is_empty());
+                let line = line.unwrap_or_default().trim_end();
+                if line != last {
+                    (last, since) = (line.to_string(), Instant::now());
+                }
+                !last.is_empty() && since.elapsed() > Duration::from_millis(500)
+            });
+            last
+        }
+    }
+
+    impl Drop for Shell {
+        fn drop(&mut self) {
+            self.session.kill();
+        }
+    }
+
+    #[test]
+    fn an_idle_prompt_is_idle() {
+        for shell in powershells() {
+            Shell::start(shell).becomes_idle();
+        }
+    }
+
+    #[test]
+    fn the_marks_leave_the_prompt_looking_the_same() {
+        for (program, args) in powershells() {
+            let plain = Shell::spawn(CommandSpec::literal(&program, args.clone()));
+            let marked = Shell::start((program.clone(), args));
+            marked.becomes_idle();
+            assert_eq!(
+                marked.settled_last_line(),
+                plain.settled_last_line(),
+                "{program}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wrapped_prompt_still_sees_a_failed_command() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // Stand in for a profile prompt that shows the last command's status
+        // (oh-my-posh, starship). The wrapper calls the prompt it found at
+        // startup through this variable (muxel_core::prompt_marks).
+        shell.type_text("$global:__muxel_prompt = { 'STATUS=' + $? + '> ' }\r");
+        shell.becomes_idle();
+        shell.type_text("Get-Item C:\\muxel-no-such-path -ErrorAction SilentlyContinue\r");
+        shell.shows("STATUS=False>");
+    }
+
+    #[test]
+    fn a_profile_prompt_that_prints_its_own_marks_is_still_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // As oh-my-posh's shell integration does, inside the wrapper's marks.
+        shell.type_text(
+            "$global:__muxel_prompt = { \"$([char]27)]133;A$([char]7)PRO\" + \"FILE> $([char]27)]133;B$([char]7)\" }\r",
+        );
+        shell.shows("PROFILE>");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_prompt_set_after_launch_drops_the_marks_and_asks() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        shell.type_text("function global:prompt { 'MI' + 'NE> ' }\r");
+        shell.shows("MINE>");
+        shell.stays_busy("an unmarked prompt");
+    }
+
+    #[test]
+    fn cmd_asks_even_at_an_echoing_batch_pause() {
+        let shell = Shell::start(cmd());
+        shell.until("its prompt", |shell| {
+            shell.session.visible_text().trim_end().ends_with('>')
+        });
+        shell.stays_busy("cmd at its prompt");
+        // With echo on, cmd prints its prompt before each line of the batch,
+        // so a prompt can't tell a batch waiting at `pause` from cmd waiting
+        // for a command.
+        let script = std::env::temp_dir().join(format!("muxel-echo-{}.bat", std::process::id()));
+        std::fs::write(
+            &script,
+            "@echo on\r\necho BATCH_STARTED\r\npause\r\necho BATCH_FINISHED\r\n",
+        )
+        .expect("script");
+        shell.type_text(&format!("\"{}\"\r", script.display()));
+        shell.shows("BATCH_STARTED");
+        shell.stays_busy("an echoing batch at pause");
+        shell.type_text("\r");
+        shell.shows("BATCH_FINISHED");
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[test]
+    fn a_cmdlet_running_in_powershell_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // Inside PowerShell's own process, so no child to see.
+        let hold = Hold::new("cmdlet");
+        shell.type_text(&format!("{}; 'RELEASED' + 'CMDLET'\r", hold.wait()));
+        shell.stays_busy("a cmdlet running");
+        hold.release();
+        shell.shows("RELEASEDCMDLET");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_child_left_running_behind_the_prompt_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let hold = Hold::new("child");
+        let child = muxel_core::winshell::encoded_command(&hold.wait());
+        shell.run(
+            &format!(
+                "Start-Process -NoNewWindow -FilePath '{}' -ArgumentList '-NoProfile', '-EncodedCommand', '{child}'",
+                powershell().0
+            ),
+            "STARTED",
+        );
+        // A close may read a process table up to RECENT old; past that, any
+        // table read was taken after the child started.
+        std::thread::sleep(RECENT);
+        shell.stays_busy("a child behind the prompt");
+        // The prompt itself was idle; once the child ends, so is the shell.
+        hold.release();
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn work_inside_powershell_behind_the_prompt_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // An event action on a timer, which keeps printing.
+        shell.run(
+            "$t = New-Object Timers.Timer; $t.Interval = 200; $null = Register-ObjectEvent $t Elapsed -SourceIdentifier tick -Action { [Console]::Write('') }; $t.Start()",
+            "TIMED",
+        );
+        shell.stays_busy("an event action");
+        shell.run(
+            "$t.Stop(); Unregister-Event tick; Remove-Job -Name tick",
+            "UNTIMED",
+        );
+        shell.becomes_idle();
+        // A subscriber with no action, which runs no job.
+        shell.run(
+            "$quiet = New-Object Timers.Timer; Register-ObjectEvent $quiet Elapsed -SourceIdentifier muxel.test",
+            "SUBSCRIBED",
+        );
+        shell.stays_busy("an event subscriber");
+        shell.run("Unregister-Event muxel.test", "UNSUBSCRIBED");
+        shell.becomes_idle();
+        // Another runspace, as a thread job or a background pipeline makes.
+        let hold = Hold::new("runspace");
+        shell.run(
+            &format!(
+                "$ps = [powershell]::Create().AddScript(\"{}\"); $h = $ps.BeginInvoke()",
+                hold.wait().replace('"', "`\"")
+            ),
+            "BEGUN",
+        );
+        shell.stays_busy("a pipeline in another runspace");
+        hold.release();
+        shell.run("$null = $ps.EndInvoke($h); $ps.Dispose()", "ENDED");
+        shell.becomes_idle();
+        // A nested prompt, as a debugger stop opens.
+        shell.type_text("$host.EnterNestedPrompt()\r");
+        shell.at_prompt();
+        shell.stays_busy("a nested prompt");
+        shell.type_text("exit\r");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_thread_job_behind_the_prompt_is_not_idle() {
+        let Some(pwsh) = pwsh() else {
+            eprintln!("PowerShell 7 is not installed; skipping");
+            return;
+        };
+        let shell = Shell::start(pwsh);
+        shell.becomes_idle();
+        let hold = Hold::new("thread-job");
+        shell.run(
+            &format!("$j = Start-ThreadJob {{ {} }}", hold.wait()),
+            "JOBBED",
+        );
+        shell.stays_busy("a running thread job");
+        hold.release();
+        shell.run("$null = Wait-Job $j", "WAITED");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_draft_kept_through_a_redraw_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.run("Import-Module PSReadLine", "LOADED");
+        shell.becomes_idle();
+        shell.type_text("Write-Output UNSENT");
+        shell.stays_busy("a draft");
+        // Ctrl+L clears the screen and draws the prompt again, with the draft.
+        shell.type_text("\x0c");
+        shell.until("the redraw", |shell| {
+            !shell.session.visible_text().contains("LOADED")
+        });
+        shell.stays_busy("a draft after a redraw");
+        // Ctrl+C drops the draft; the prompt PowerShell draws next is idle.
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn the_unsent_last_line_of_a_paste_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        shell.session.paste("'FIRST' + 'LINE'\nUNSENT");
+        shell.shows("FIRSTLINE");
+        shell.at_prompt();
+        shell.stays_busy("the paste's unsent last line");
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn keys_typed_ahead_while_a_command_runs_are_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let hold = Hold::new("typeahead");
+        shell.type_text(&format!("{}; 'RELEASED' + 'TYPEAHEAD'\r", hold.wait()));
+        // Typed once the command is running, not while the prompt reads it.
+        std::thread::sleep(Duration::from_millis(500));
+        shell.type_text("Write-Output UNSENT");
+        hold.release();
+        shell.shows("RELEASEDTYPEAHEAD");
+        shell.at_prompt();
+        shell.stays_busy("a draft typed ahead");
+        shell.type_text("\x03");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_command_typed_ahead_is_not_idle_while_it_runs() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        let (first, second) = (Hold::new("first"), Hold::new("second"));
+        // The first command holds on until the second has reached the
+        // console's input, so it can't end before PowerShell could read it.
+        shell.type_text(&format!(
+            "'FIRST' + 'RUNNING'; while (-not [Console]::KeyAvailable) {{ Start-Sleep -Milliseconds 10 }}; 'SEEN' + 'AHEAD'; {}; 'FIRST' + 'DONE'\r",
+            first.wait()
+        ));
+        shell.shows("FIRSTRUNNING");
+        // Sent with Enter while the first runs. PowerShell reads it straight
+        // after the first's prompt, which must not read idle, even for the
+        // moment before the line editor returns it; nor may the pane while it
+        // runs.
+        shell.type_text(&format!(
+            "'SECOND' + 'STARTED'; {}; 'SECOND' + 'DONE'\r",
+            second.wait()
+        ));
+        shell.shows("SEENAHEAD");
+        first.release();
+        shell.busy_until("SECONDSTARTED");
+        shell.stays_busy("the command typed ahead");
+        second.release();
+        shell.shows("SECONDDONE");
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn each_command_of_a_multiline_paste_is_not_idle_while_it_runs() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.becomes_idle();
+            // PSReadLine reads a paste ahead into its own buffer, so the
+            // console's input is empty at the prompt the first command ends
+            // with, and the second runs from what PSReadLine holds.
+            let hold = Hold::new("pasted");
+            shell.session.paste(&format!(
+                "'FIRST' + 'PASTED'\n'SECOND' + 'STARTED'; {}; 'SECOND' + 'DONE'\n",
+                hold.wait()
+            ));
+            shell.shows("SECONDSTARTED");
+            shell.stays_busy("the paste's second command");
+            hold.release();
+            shell.shows("SECONDDONE");
+            shell.becomes_idle();
+        }
+    }
+
+    /// Enter as Starship's and oh-my-posh's transient prompts bind it: draw
+    /// the prompt again, which prints a fresh idle mark, then accept the line.
+    const TRANSIENT_ENTER: &str = "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt(); [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() }";
+
+    /// A command sent with [`TRANSIENT_ENTER`] stays busy until it ends.
+    fn runs_busy_after_a_redraw(shell: &Shell, tag: &str) {
+        let hold = Hold::new(&tag.to_ascii_lowercase());
+        shell.type_text(&format!(
+            "'{tag}' + 'STARTED'; {}; '{tag}' + 'DONE'\r",
+            hold.wait()
+        ));
+        shell.shows(&format!("{tag}STARTED"));
+        shell.stays_busy(&format!("{tag}: a command accepted after the redraw"));
+        hold.release();
+        shell.shows(&format!("{tag}DONE"));
+        shell.becomes_idle();
+    }
+
+    #[test]
+    fn a_command_is_not_idle_after_a_transient_prompt_redraw() {
+        for launch in powershells() {
+            let shell = Shell::start(launch);
+            shell.run(TRANSIENT_ENTER, "BOUND");
+            shell.becomes_idle();
+            runs_busy_after_a_redraw(&shell, "TRANSIENT");
+        }
+    }
+
+    #[test]
+    fn a_line_editor_replaced_or_hooked_after_launch_still_marks_each_line() {
+        let shell = Shell::start(powershell());
+        shell.run(TRANSIENT_ENTER, "BOUND");
+        // A line editor of its own, as a module loaded later might define.
+        shell.run(
+            "function global:PSConsoleHostReadLine { $global:reads++; [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($host.Runspace, $ExecutionContext) }",
+            "REPLACED",
+        );
+        shell.becomes_idle();
+        runs_busy_after_a_redraw(&shell, "REPLACEMENT");
+        // A hook that chains whatever is current, which is muxel's wrap.
+        shell.run(
+            "$global:prev = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:hooks++; & $global:prev }",
+            "HOOKED",
+        );
+        shell.becomes_idle();
+        runs_busy_after_a_redraw(&shell, "CHAINED");
+        // Each line went through the hook and the line editor once.
+        shell.run("$global:hooks = 0; $global:reads = 0", "RESET");
+        shell.type_text("'COUNTS=' + \"$global:hooks,$global:reads.\"\r");
+        shell.shows("COUNTS=1,1.");
+    }
+
+    #[test]
+    fn a_job_that_starts_no_runspace_is_not_idle() {
+        let shell = Shell::start(powershell());
+        shell.becomes_idle();
+        // A job type of a module's own can run without a runspace, a
+        // subscriber or a child process; only `Get-Job` shows it.
+        shell.run(
+            r#"Add-Type -TypeDefinition 'using System.Management.Automation; public class MuxelHeldJob : Job { public MuxelHeldJob() : base("held") { SetJobState(JobState.Running); } public override bool HasMoreData { get { return false; } } public override string Location { get { return ""; } } public override string StatusMessage { get { return ""; } } public override void StopJob() { SetJobState(JobState.Stopped); } }'; function Add-HeldJob { [CmdletBinding()] param() $job = [MuxelHeldJob]::new(); $PSCmdlet.JobRepository.Add($job); $job }; $held = Add-HeldJob"#,
+            "HELDJOB",
+        );
+        shell.stays_busy("a running job of a module's own type");
+        shell.run("$held.StopJob()", "STOPPED");
+        shell.becomes_idle();
     }
 }
 
@@ -6374,13 +8076,14 @@ mod windows_spawn_resolve {
 #[cfg(test)]
 mod runtime_fact_tests {
     use super::{
-        CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
+        CommandSpec, PAUSE_AFTER_ENQUEUE, PtyOutput, RESIZE_SETTLE, TerminalSession,
+        draft_after_input, next_input_state,
     };
     use crate::listener::SWITCH_SLACK;
+    use crate::test_wait::{joined, received, settle};
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant, SystemTime};
 
     #[test]
@@ -6407,6 +8110,62 @@ mod runtime_fact_tests {
         assert_eq!(next_input_state(state(4, false), None), state(5, false));
     }
 
+    /// `ctl send` refuses a pane whose draft bit is set, so only text may set
+    /// it. One `keys esc`, an arrow through a menu, or `answer 1` would
+    /// otherwise refuse every later automated send until the next Enter.
+    #[test]
+    fn escape_arrows_and_answers_type_no_draft_but_text_does() {
+        use super::{has_printable_input, has_text};
+        use crate::ControlInput;
+        use muxel_core::control::Key;
+        for keys in [
+            b"\x1b".as_slice(),
+            b"\x1b[A",
+            b"\x1bOB",
+            b"\x1b[3~",
+            b"\x1b[200~\x1b[201~",
+            b"\x1b]0;title\x07",
+            b"\x1b]0;title\x1b\\",
+            b"\x1b\x1b[B",
+            b"\x03",
+            b"\t",
+            b"\x7f",
+        ] {
+            assert!(!has_printable_input(keys), "{keys:?}");
+        }
+        assert!(has_printable_input(b"hello"));
+        assert!(has_printable_input(b"\x1b[200~hello\x1b[201~"));
+        assert!(has_printable_input("é".as_bytes()));
+        // A Windows Codex paste is all escape sequences, and still text.
+        assert!(has_text("hi") && !has_text("\r\n"));
+
+        #[cfg(windows)]
+        let spec = CommandSpec::program("cmd.exe", vec!["/d".into(), "/q".into(), "/k".into()]);
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        session.write_input(b"\x1b");
+        session.write_input(b"\x1b[B");
+        let answered = session.control_write(ControlInput::Answer(vec![Key::Char('1')]));
+        assert!(matches!(answered.ready(), Some(Ok(()))));
+        let pressed = session.control_write(ControlInput::Keys {
+            keys: vec![Key::Escape, Key::Down],
+            app_cursor: false,
+        });
+        assert!(matches!(pressed.ready(), Some(Ok(()))));
+        assert_eq!(session.input_snapshot(), (4, false));
+        session.write_input(b"draft");
+        assert_eq!(session.input_snapshot(), (5, true));
+        // Leaving and moving around the draft keeps it.
+        session.write_input(b"\x1b[D");
+        assert_eq!(session.input_snapshot(), (6, true));
+        session.write_submission(b"\r", super::Submission::Turn);
+        assert_eq!(session.input_snapshot(), (7, false));
+        session.paste("pasted");
+        assert_eq!(session.input_snapshot(), (8, true));
+        session.kill();
+    }
+
     #[test]
     fn runtime_invalidations_are_bounded_and_input_facts_are_atomic() {
         #[cfg(windows)]
@@ -6429,8 +8188,7 @@ mod runtime_fact_tests {
         session.write_input(b"\x1b\r");
         assert_eq!(session.input_snapshot(), (2, true));
 
-        session.mark_turn_submitted();
-        session.write_input(b"\r");
+        session.write_submission(b"\r", crate::Submission::Turn);
         assert_eq!(session.input_snapshot(), (3, false));
         assert_eq!(events.try_recv(), Ok(()));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
@@ -6700,7 +8458,7 @@ mod runtime_fact_tests {
     }
 
     #[test]
-    fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
+    fn failed_submission_admission_leaves_no_facts() {
         struct RefuseSubmission {
             on_flush: bool,
         }
@@ -6728,7 +8486,6 @@ mod runtime_fact_tests {
             assert!(!session.has_submitted_turn());
             assert_eq!(session.first_submission_at(), None);
             assert!(!session.runtime_evidence(None).submitted);
-            assert!(!session.submission_pending.load(Ordering::Acquire));
             assert!(events.is_empty());
 
             // A recovered writer must treat the next key as ordinary draft
@@ -6745,6 +8502,45 @@ mod runtime_fact_tests {
             assert_eq!(events.try_recv(), Ok(()));
             session.kill();
         }
+    }
+
+    /// The writer's own refusal is the one that decides: a hold that landed
+    /// after the caller looked, or a writer whose child is gone. A write it
+    /// refuses leaves every input fact as it was: no revision, no draft bit,
+    /// no submission evidence and no runtime event.
+    #[test]
+    fn a_write_the_writer_refuses_changes_no_input_facts() {
+        struct Refuse;
+        impl std::io::Write for Refuse {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "terminal is closing",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session = fixture();
+        session.paste("draft");
+        let before = session.input_snapshot();
+        let events = session.runtime_events();
+        *session.writer.lock() = Box::new(Refuse);
+
+        assert!(session.try_write_input(b"x").is_err());
+        session.write_pointer(b"\x1b[<0;1;1M");
+        for submission in [crate::Submission::Turn, crate::Submission::Prompt] {
+            assert!(session.try_write_submission(b"go\r", submission).is_err());
+        }
+
+        assert_eq!(session.input_snapshot(), before);
+        assert!(!session.has_submitted_turn());
+        assert_eq!(session.first_submission_at(), None);
+        assert!(!session.runtime_evidence(None).submitted);
+        assert!(events.is_empty());
+        session.kill();
     }
 
     #[test]
@@ -6808,6 +8604,63 @@ mod runtime_fact_tests {
         assert!(later_submitted, "a later Enter must still arm a turn");
     }
 
+    /// A departure that finds a write queued but its facts not yet committed
+    /// waits for them before it holds input: what quitting reads after the
+    /// hold includes every write the PTY was given.
+    #[test]
+    fn a_departure_waits_for_the_facts_of_a_write_already_queued() {
+        let session = fixture();
+        let before = session.input_snapshot();
+        let (paused, at_pause) = std::sync::mpsc::channel();
+        let (permit, permits) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                PAUSE_AFTER_ENQUEUE.set(Some(Box::new(move || {
+                    let _ = paused.send(());
+                    received(&permits, "the paused write was never let through");
+                })));
+                session.try_write_submission(b"go\r", crate::Submission::Turn)
+            })
+        };
+        received(&at_pause, "the write never queued");
+        // Paused, the write still holds the writer lock its facts commit
+        // under. A departure takes that lock to hold and fence, so it waits:
+        // this is the proof, and the timed wait below only watches for it.
+        assert!(
+            session.writer.try_lock().is_none(),
+            "the paused write let go of the writer lock before its facts"
+        );
+        let (held, at_hold) = std::sync::mpsc::channel();
+        let departure = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let fence = session.hold_for_departure();
+                let _ = held.send((
+                    session.input_snapshot(),
+                    session.has_submitted_turn(),
+                    session.draft_sent(),
+                ));
+                fence
+            })
+        };
+        assert!(
+            at_hold.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the departure held input while a queued write's facts were uncommitted"
+        );
+        permit.send(()).unwrap();
+        assert_eq!(
+            received(&at_hold, "the departure never held input"),
+            ((before.0 + 1, false), true, true),
+            "the departure read the write without its facts"
+        );
+        assert!(joined(writer, "the write never finished").is_ok());
+        let fence = joined(departure, "the departure never fenced");
+        assert_eq!(settle(fence.acked(), "the fence never answered"), Ok(()));
+        session.release_departure();
+        session.kill();
+    }
+
     fn fixture() -> std::sync::Arc<TerminalSession> {
         #[cfg(windows)]
         let spec = CommandSpec::program(
@@ -6834,6 +8687,41 @@ mod runtime_fact_tests {
         // the program.
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_eq!(session.input_snapshot(), (typed + 2, true));
+        session.kill();
+    }
+
+    /// The program-status observer reads titles before VTE, so inside an
+    /// unfinished synchronized update it sees the provider name another
+    /// conversation while the binding still describes the old one. The
+    /// binding is pending until the update ends.
+    #[test]
+    fn a_title_held_by_a_synchronized_update_leaves_the_binding_pending() {
+        let a = "01a1543c-9700-7000-8000-00000000000a";
+        let b = "01a1543c-9700-7000-8000-00000000000b";
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let spec = spec.with_binding(super::LaunchBinding::Known(Some(a.into())));
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        session.process_output(format!("\x1b]0;{a} | Ready\x07").as_bytes());
+        assert!(!session.binding_pending());
+        assert!(session.binding_names(a));
+        session.process_output(format!("\x1b[?2026h\x1b]0;{b} | Ready\x07").as_bytes());
+        assert!(session.binding_pending(), "the observer has seen B");
+        assert_eq!(session.binding_revision(), 1);
+        assert!(
+            session.binding_names(a),
+            "the binding alone still names A, so its readers must ask"
+        );
+        session.process_output(b"\x1b[?2026l");
+        assert!(!session.binding_pending());
+        assert_eq!(session.binding_revision(), 2);
+        assert!(session.binding_names(b));
+        assert!(!session.binding_names(a));
         session.kill();
     }
 }
@@ -7841,6 +9729,71 @@ mod startup_tests {
 }
 
 #[cfg(test)]
+mod clipboard_refusal_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::control_paste::ControlPaste;
+    use gpui::{ClipboardItem, TestAppContext};
+    use parking_lot::Mutex;
+    use std::{
+        io::{self, Write},
+        sync::Arc,
+    };
+
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_refusal_reports_error_without_any_write() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(not(windows))]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (mut session, _output) = TerminalSession::spawn(spec, 80, 24).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::get_mut(&mut session).expect("fresh session is not shared yet");
+        inner.control_paste = ControlPaste::WindowsCodex;
+        inner.writer = Arc::new(Mutex::new(Box::new(RecordingWriter(bytes.clone()))));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured = errors.clone();
+        session.set_text_paste_error_handler(Some(Arc::new(move |error, _| {
+            captured.lock().push(error)
+        })));
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        for control in ['\0', '\u{8}', '\u{7f}', '\u{85}'] {
+            cx.update(|cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("prefix{control}suffix")));
+                crate::paste_clipboard_into_session(&session, cx);
+            });
+        }
+        let written = bytes.lock().clone();
+        let refused = errors.lock().clone();
+        session.kill();
+        assert!(
+            written.is_empty(),
+            "none of a refused clipboard paste may reach the writer"
+        );
+        assert_eq!(
+            refused.len(),
+            4,
+            "each refusal must reach the user-facing error handler"
+        );
+        assert!(refused[0].contains("U+0000"));
+    }
+}
+
+#[cfg(test)]
 mod input_rev_tests {
     use super::{CommandSpec, TermMode, TerminalSession};
 
@@ -8096,5 +10049,196 @@ mod throughput_bench {
             report(name, &mut off, &mut on);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Reading Claude's input box around a submission.
+#[cfg(test)]
+mod draft_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::view::TitleProvider;
+    use muxel_core::rescue::DraftRead;
+    use std::sync::Arc;
+
+    /// An inert child, killed when the test ends. Its own output is never
+    /// parsed: the test plays the program with `process_probe_output`.
+    struct Pane(
+        Arc<TerminalSession>,
+        #[allow(dead_code)] Box<dyn std::any::Any>,
+    );
+
+    impl Drop for Pane {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    impl std::ops::Deref for Pane {
+        type Target = TerminalSession;
+        fn deref(&self) -> &TerminalSession {
+            &self.0
+        }
+    }
+
+    fn pane() -> Pane {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        Pane(session, Box::new(output))
+    }
+
+    /// Claude's screen with `draft` in its box and the cursor after it.
+    fn claude_box(session: &TerminalSession, draft: &str) {
+        let rule = "─".repeat(40);
+        let screen = format!(
+            "\x1b[?2004h\x1b[2J\x1b[H{rule}\r\n❯ {draft}\r\n{rule}\x1b[2;{}H",
+            3 + draft.chars().count()
+        );
+        session.process_probe_output(screen.as_bytes());
+    }
+
+    #[test]
+    fn a_sent_prompt_still_on_screen_is_not_read_as_a_new_draft() {
+        let session = pane();
+        claude_box(&session, "ship it");
+        assert!(matches!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text { .. }
+        ));
+        // Enter, before the program redraws its box.
+        session.write_submission(b"\r", crate::Submission::Turn);
+        assert_eq!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Empty,
+            "the box still shows what was sent: nothing unsent"
+        );
+        // A key after it starts a new draft, read as usual.
+        claude_box(&session, "ship it now");
+        session.write_input(b" now");
+        assert!(matches!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn a_key_typed_before_the_box_is_redrawn_does_not_bring_back_what_was_sent() {
+        let session = pane();
+        claude_box(&session, "ship it");
+        session.write_submission(b"\r", crate::Submission::Turn);
+        // A key, before the program redraws its box.
+        session.write_input(b"x");
+        assert!(
+            !matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { .. }
+            ),
+            "the box still shows what was sent"
+        );
+        // The program redraws its box, with the key in it.
+        claude_box(&session, "x");
+        assert_eq!(
+            session.read_draft(TitleProvider::Claude),
+            DraftRead::Text {
+                text: "x".into(),
+                partial: false,
+                clipped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn enter_after_a_backslash_in_claude_starts_a_new_line_and_keeps_the_draft() {
+        let session = pane();
+        claude_box(&session, "line one\\");
+        // Enter, as a pane's key handler sends it.
+        let submission = if crate::view::submits_turn(b"\r", TitleProvider::Claude, &session) {
+            crate::Submission::Turn
+        } else {
+            crate::Submission::None
+        };
+        session.write_user_submission(b"\r", submission);
+        assert!(!session.take_draft_submitted(), "the saved draft stays");
+        assert!(
+            matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { .. }
+            ),
+            "the box is still read"
+        );
+        // Without the backslash, Enter sends.
+        claude_box(&session, "line one");
+        assert!(crate::view::submits_turn(
+            b"\r",
+            TitleProvider::Claude,
+            &session
+        ));
+    }
+
+    /// Claude Code 2.1.322's permission question where its box was, as a raw
+    /// capture of a 120-column pane drew it: a rule, the request, the options,
+    /// and no bottom rule.
+    fn claude_question(session: &TerminalSession) {
+        let rule = "─".repeat(78);
+        let dashes = "╌".repeat(78);
+        let rows = [
+            "⏺ Pinging localhost three times",
+            "  ⎿  $ ping -n 3 127.0.0.1",
+            "",
+            &rule,
+            " Bash command",
+            " Ping localhost three times",
+            &dashes,
+            " ping -n 3 127.0.0.1",
+            &dashes,
+            " This command requires approval",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don’t ask again for: ping *",
+            "   3. Yes, and switch to auto mode",
+            "   4. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ];
+        let screen = format!("\x1b[?2004h\x1b[2J\x1b[H{}\x1b[13;4H", rows.join("\r\n"));
+        session.process_probe_output(screen.as_bytes());
+    }
+
+    #[test]
+    fn a_draft_parked_behind_a_dialog_survives_the_answer() {
+        let session = pane();
+        let draft = "remember the follow-up about tide pools";
+        session.write_input(draft.as_bytes());
+        claude_box(&session, draft);
+        // A permission question takes the box's place; Enter, as a pane's key
+        // handler sends it, picks the highlighted option.
+        claude_question(&session);
+        session.write_user_submission(
+            b"\r",
+            crate::view::key_submission(b"\r", TitleProvider::Claude, &session),
+        );
+        assert!(!session.take_draft_submitted(), "the saved draft stays");
+        // The turn goes on, and Claude draws its box again with the draft in
+        // it: still unsent, so still read.
+        claude_box(&session, draft);
+        assert!(
+            matches!(
+                session.read_draft(TitleProvider::Claude),
+                DraftRead::Text { text, .. } if text == draft
+            ),
+            "the draft is read again once the box is back"
+        );
+        // Enter on the box sends it.
+        session.write_user_submission(
+            b"\r",
+            crate::view::key_submission(b"\r", TitleProvider::Claude, &session),
+        );
+        assert!(session.take_draft_submitted());
     }
 }

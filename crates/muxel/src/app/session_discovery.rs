@@ -10,9 +10,12 @@ use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
     validated_codex_session_id,
 };
-use crate::binding_watch::ClaudeBindingWatch;
+#[cfg(windows)]
+use crate::file_watch::grok_registry;
+use crate::file_watch::{claude_records, muse_panes};
 use crate::{session_binding, ui_profile};
 use gpui::{App, AsyncApp, Context, WeakEntity};
+use muxel_core::file_watch::WatchSpec;
 use muxel_core::session_discovery::{
     LookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
@@ -706,6 +709,11 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let generation = this.session_discoveries.binding_generation(iid);
+                // The whole store was read without the saved rollout.
+                let gone = matches!(
+                    found,
+                    CodexRestoreFound::Resume(muxel_core::CodexResumePath::Missing)
+                );
                 // Hold bumps the binding generation, so the pre-hold answer
                 // stays stale even when Undo makes the pane visible again.
                 if this.codex_restore_lookups.finish(iid, generation)
@@ -714,6 +722,9 @@ impl MuxelApp {
                 {
                     this.bump_session_binding_generation(iid);
                     this.persist();
+                    if gone {
+                        this.report_conversation_gone(iid);
+                    }
                     cx.notify();
                 }
             });
@@ -852,15 +863,22 @@ impl MuxelApp {
             .iter()
             .filter_map(|instance| self.session_discovery_key_for_instance(instance, cx))
             .collect();
-        // Before the first Claude lookup, so none can miss a write the watcher
-        // would have reported.
-        if self.claude_binding_watch.is_none()
-            && keys
-                .iter()
-                .any(|key| key.provider == SessionProvider::Claude)
-            && let Some(data_dir) = data_dir.as_deref()
+        // Before a provider's first lookup, so none can miss a write the
+        // watcher would have reported.
+        if let Some(data_dir) = data_dir.as_deref() {
+            for provider in [SessionProvider::Claude, SessionProvider::Muse] {
+                if !self.provider_watches.contains_key(&provider)
+                    && keys.iter().any(|key| key.provider == provider)
+                {
+                    self.start_hook_watch(provider, data_dir, cx);
+                }
+            }
+        }
+        #[cfg(windows)]
+        if !self.provider_watches.contains_key(&SessionProvider::Grok)
+            && keys.iter().any(|key| key.provider == SessionProvider::Grok)
         {
-            self.start_claude_binding_watch(data_dir, cx);
+            self.start_grok_registry_watch(cx);
         }
         self.session_discoveries.reconcile(&self.workspace);
         let requests: Vec<_> = keys
@@ -881,25 +899,23 @@ impl MuxelApp {
             let home = home.clone();
             let data_dir = data_dir.clone();
             #[cfg(windows)]
-            let previous_grok_reads = requests
-                .iter()
-                .filter_map(|request| {
-                    self.grok_read_for(&request.key)
-                        .map(|read| (request.key.pane, (read.started, read.finished)))
-                })
-                .collect();
+            let grok = GrokInputs {
+                previous_reads: requests
+                    .iter()
+                    .filter_map(|request| {
+                        self.grok_read_for(&request.key)
+                            .map(|read| (request.key.pane, (read.started, read.finished)))
+                    })
+                    .collect(),
+                watched: self.session_discoveries.watched(SessionProvider::Grok),
+            };
             #[cfg(not(windows))]
-            let previous_grok_reads = HashMap::new();
+            let grok = GrokInputs::default();
             cx.spawn(async move |this, cx| {
                 let (batch, data_dir) = cx
                     .background_executor()
                     .spawn(async move {
-                        let batch = discover_sessions(
-                            requests,
-                            &home,
-                            data_dir.as_deref(),
-                            previous_grok_reads,
-                        );
+                        let batch = discover_sessions(requests, &home, data_dir.as_deref(), grok);
                         (batch, data_dir)
                     })
                     .await;
@@ -911,87 +927,57 @@ impl MuxelApp {
         }
     }
 
-    /// Watch the Claude hook directory, once. A write it reports runs
-    /// discovery at once instead of at the next tick. Failing to start leaves
-    /// Claude panes polling as they would without it.
-    fn start_claude_binding_watch(&mut self, data_dir: &Path, cx: &mut Context<Self>) {
-        let dir = session_binding::claude_binding_dir(data_dir);
-        let (watch, signal) = match ClaudeBindingWatch::start(&dir) {
-            Ok(started) => started,
-            Err(error) => {
-                log::warn!(
-                    "could not watch Claude session hook records in {}; polling instead: {error:#}",
-                    dir.display()
-                );
-                ui_profile::session_watch(SessionProvider::Claude, "failed");
-                self.claude_binding_watch = Some(None);
-                return;
-            }
+    /// Watch Grok's session registry, once it exists. A write it reports runs
+    /// every Grok pane's lookup at once; between writes they wait for the
+    /// fallback. Failing to watch leaves them polling as they would without
+    /// it. Grok's folder is its own to create, so until it does, the next
+    /// lookup tries again.
+    #[cfg(windows)]
+    fn start_grok_registry_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = super::grok_home_dir().filter(|dir| dir.is_dir()) else {
+            return;
         };
-        self.follow_claude_binding_watch(watch, signal, cx);
+        let watched = self.watch_provider(SessionProvider::Grok, || Ok(grok_registry(&dir)), cx);
+        if let Err(error) = watched {
+            log::warn!(
+                "could not watch Grok's session registry in {}; polling instead: {error:#}",
+                dir.display()
+            );
+        }
     }
 
-    /// Rely on `watch` for Claude panes, and apply its changes each time
-    /// `signal` fires.
-    fn follow_claude_binding_watch(
+    /// Watch `provider`'s hook directory, once. A write it reports runs
+    /// discovery at once instead of at the next tick. Failing to watch leaves
+    /// the provider's panes polling as they would without it.
+    fn start_hook_watch(
         &mut self,
-        watch: ClaudeBindingWatch,
-        signal: async_channel::Receiver<()>,
+        provider: SessionProvider,
+        data_dir: &Path,
         cx: &mut Context<Self>,
     ) {
-        self.claude_binding_watch = Some(Some(watch));
-        self.session_discoveries
-            .set_watched(SessionProvider::Claude, true);
-        ui_profile::session_watch(SessionProvider::Claude, "watching");
-        cx.spawn(async move |this, cx| {
-            while signal.recv().await.is_ok() {
-                if this
-                    .update(cx, |this, cx| this.apply_claude_binding_changes(cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            // The sender went with the watcher: dropped here after a failure,
-            // or by a backend that stopped without reporting an error.
-            let _ = this.update(cx, |this, cx| {
-                if matches!(this.claude_binding_watch, Some(Some(_))) {
-                    log::warn!("Claude session hook watcher stopped; polling instead");
-                    this.stop_trusting_claude_binding_watch(cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn apply_claude_binding_changes(&mut self, cx: &mut Context<Self>) {
-        let Some(Some(watch)) = &self.claude_binding_watch else {
-            return;
+        let (dir, spec): (_, fn(&Path) -> WatchSpec) = match provider {
+            SessionProvider::Claude => (
+                session_binding::claude_binding_dir(data_dir),
+                claude_records,
+            ),
+            SessionProvider::Muse => (session_binding::muse_binding_dir(data_dir), muse_panes),
+            SessionProvider::Codex | SessionProvider::Grok => return,
         };
-        let changes = watch.take();
-        for pane in changes.panes {
-            self.session_discoveries.wake(SessionProvider::Claude, pane);
+        // Created first, so the watch can resolve its canonical name.
+        let watched = self.watch_provider(
+            provider,
+            || {
+                std::fs::create_dir_all(&dir)?;
+                Ok(spec(&dir))
+            },
+            cx,
+        );
+        if let Err(error) = watched {
+            log::warn!(
+                "could not watch {provider:?} session hook records in {}; polling instead: {error:#}",
+                dir.display()
+            );
         }
-        if changes.failed {
-            self.stop_trusting_claude_binding_watch(cx);
-            return;
-        }
-        if changes.rescan {
-            self.session_discoveries
-                .wake_provider(SessionProvider::Claude);
-            ui_profile::session_watch(SessionProvider::Claude, "rescan");
-        }
-        self.sync_provider_session_ids(cx);
-    }
-
-    /// Not trusted again in this run: back to polling, and every quiet Claude
-    /// pane looks now.
-    fn stop_trusting_claude_binding_watch(&mut self, cx: &mut Context<Self>) {
-        self.claude_binding_watch = Some(None);
-        self.session_discoveries
-            .set_watched(SessionProvider::Claude, false);
-        ui_profile::session_watch(SessionProvider::Claude, "failed");
-        self.sync_provider_session_ids(cx);
     }
 
     fn apply_discovery_batch(
@@ -1448,6 +1434,10 @@ impl MuxelApp {
                 {
                     view.update(cx, |view, cx| view.set_muse_hook_state(&metadata, cx));
                 }
+                // After the switch: the adopted id names the binding the
+                // terminal is in now. Codex's title began that binding
+                // already, and this result was checked against it.
+                self.note_adopted_conversation(update.pane, cx);
             }
             cx.notify();
             true
@@ -1470,14 +1460,28 @@ impl MuxelApp {
     }
 }
 
+/// What a lookup batch's Grok panes carry from the UI. Grok is looked up only
+/// on Windows; elsewhere this is empty.
+#[derive(Default)]
+struct GrokInputs {
+    /// Each pane's previous registry read, as `(started, finished)`.
+    #[cfg(windows)]
+    previous_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
+    /// A watcher reports every registry write, so ancestry is reused longer.
+    #[cfg(windows)]
+    watched: bool,
+}
+
 fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-    previous_grok_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
+    grok: GrokInputs,
 ) -> DiscoveryBatch {
     #[cfg(not(windows))]
-    let _ = previous_grok_reads;
+    let _ = grok;
+    #[cfg(windows)]
+    let previous_grok_reads = grok.previous_reads;
     #[cfg(windows)]
     let mut grok_snapshot = None;
     #[cfg(windows)]
@@ -1588,7 +1592,8 @@ fn discover_sessions(
                                 started,
                                 finished: SystemTime::now(),
                             };
-                            let parents = grok_snapshot::process_snapshot(&grok_roots, &active);
+                            let parents =
+                                grok_snapshot::process_snapshot(&grok_roots, &active, grok.watched);
                             (read, active, parents)
                         });
                         let previous = previous_grok_reads
@@ -1760,8 +1765,10 @@ mod binding_regressions {
 #[cfg(all(test, windows))]
 mod grok_regressions {
     use super::super::{
-        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
-        PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopLaunch, LoopRun,
+        MuxelApp, PostRunAction,
+        conpty_test_support::{ChildHandle, ProcessTree},
+        grok_switch_interval,
         popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
@@ -1775,10 +1782,20 @@ mod grok_regressions {
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
 
+    /// Ends a fixture pane's processes when the test leaves, and waits until
+    /// they are gone. Killing the shell alone leaves `more` running until the
+    /// pseudoconsole closes, which the session's monitor thread does after the
+    /// shell exits. These tests run long and often finish last, so the test
+    /// binary could exit inside that gap and leave conhost and `more` behind
+    /// for good.
     struct StopChild(Arc<TerminalSession>);
     impl Drop for StopChild {
         fn drop(&mut self) {
+            let tree = self.0.child_pid().map(ProcessTree::open);
             self.0.kill();
+            if let Some(tree) = tree {
+                tree.wait_gone(Duration::from_secs(10));
+            }
         }
     }
 
@@ -2228,9 +2245,10 @@ mod grok_regressions {
                         .clone()
                         .unwrap();
                     session.process_probe_output(format!("\x1b]0;{old} | Ready\x07").as_bytes());
-                    session.mark_turn_submitted();
+                    session.write_submission(b"\r", muxel_terminal::Submission::Turn);
                     let revision = session.binding_revision();
                     let cached_done = TerminalRuntimeSnapshot {
+                        background: None,
                         status: AgentStatus::Done,
                         attributable: true,
                         reason: TerminalStatusReason::Quiet,
@@ -2245,7 +2263,7 @@ mod grok_regressions {
                     };
                     let mut run = LoopRun {
                         loop_id: Uuid::new_v4(),
-                        launch: Some(session.id),
+                        launch: LoopLaunch::Installed(session.id),
                         seen_working: true,
                         started: Instant::now(),
                         post_run: PostRunAction::Exit,
@@ -2285,6 +2303,7 @@ mod grok_regressions {
                             cached_done,
                             session.binding_revision(),
                             session.first_submission_binding(),
+                            true,
                             Duration::ZERO
                         ),
                         LoopCleanup::Abandon,
@@ -2403,14 +2422,61 @@ mod grok_regressions {
                 .unwrap();
         });
     }
+
+    /// Grok registers a conversation for a live pane's process. With the
+    /// registry watched, the pane binds with no discovery poll after the
+    /// write: the status tick is stopped, so only the watcher's wake can run
+    /// the lookup.
+    #[test]
+    fn a_registry_write_wakes_grok_panes() {
+        with_app(|cx, window| {
+            let home = muxel_store::data_dir().unwrap().join("grok-home");
+            let grok = home.join(".grok");
+            std::fs::create_dir_all(&grok).unwrap();
+            let _home = super::super::claude_test_home(Some(home));
+            let (id, session) = checked_update(window, cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.current_workspace = Some(Uuid::new_v4());
+                pane(app, window, cx)
+            });
+            let _stop = StopChild(session.clone());
+            // Nothing is registered yet; the first lookup starts the watcher.
+            checked_update(window, cx, |app, _, cx| app.sync_provider_session_ids(cx));
+            cx.run_until_parked();
+            let pid = session.child_pid().unwrap();
+            let next = Uuid::new_v4().to_string();
+            let rows = serde_json::json!([{
+                "session_id": next,
+                "pid": pid,
+                "opened_at": chrono::Utc::now().to_rfc3339(),
+            }]);
+            std::fs::write(grok.join(super::super::GROK_REGISTRY), rows.to_string()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let bound = loop {
+                cx.run_until_parked();
+                let bound = checked_update(window, cx, |app, _, _| {
+                    app.workspace.instance(id).unwrap().session_id.clone()
+                });
+                if bound.as_deref() == Some(next.as_str()) || Instant::now() >= deadline {
+                    break bound;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(
+                bound.as_deref(),
+                Some(next.as_str()),
+                "the registry write waited for a poll"
+            );
+        });
+    }
 }
 
 #[cfg(all(test, windows))]
 mod claude_watch_regressions {
     use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
     use super::{DiscoveryBatch, DiscoveryCandidate};
-    use crate::binding_watch::ClaudeBindingWatch;
-    use crate::binding_watch::test_backend::TestBackend;
+    use crate::file_watch::FileWatch;
+    use crate::file_watch::test_backend::TestBackend;
     use crate::session_binding;
     use gpui::{AppContext as _, TestAppContext, WindowHandle};
     use muxel_core::session_discovery::SessionProvider;
@@ -2441,7 +2507,7 @@ mod claude_watch_regressions {
                 app._status_timer = gpui::Task::ready(());
                 app.current_workspace = Some(Uuid::new_v4());
                 if watched {
-                    app.claude_binding_watch = Some(None);
+                    app.provider_watches.insert(SessionProvider::Claude, None);
                     app.session_discoveries
                         .set_watched(SessionProvider::Claude, true);
                 }
@@ -2539,22 +2605,16 @@ mod claude_watch_regressions {
         });
     }
 
-    /// Follow a watch on `backend`, a stand-in for notify's.
+    /// Make `backend`, a stand-in for notify's, the app's watcher. The first
+    /// lookup registers Claude with it, as it would with the real one.
     fn follow_test_backend(
         cx: &mut TestAppContext,
         window: WindowHandle<MuxelApp>,
-        data: &Path,
         backend: &TestBackend,
     ) {
-        let (watch, signal) =
-            ClaudeBindingWatch::start_with(&session_binding::claude_binding_dir(data), |handler| {
-                backend.build(handler)
-            })
-            .unwrap();
+        let (watch, signal) = FileWatch::start_with(|handler| backend.build(handler)).unwrap();
         window
-            .update(cx, |app, _, cx| {
-                app.follow_claude_binding_watch(watch, signal, cx)
-            })
+            .update(cx, |app, _, cx| app.follow_file_watch(watch, signal, cx))
             .unwrap();
     }
 
@@ -2578,7 +2638,7 @@ mod claude_watch_regressions {
             let _home = claude_test_home(Some(data.join("home")));
             let (pane, session, project) = claude_pane(cx, window, &data, false);
             let backend = TestBackend::default();
-            follow_test_backend(cx, window, &data, &backend);
+            follow_test_backend(cx, window, &backend);
             first_lookup(cx, window);
             let next = clear_hook(&data, &project, pane);
             backend.kill();
@@ -2600,7 +2660,7 @@ mod claude_watch_regressions {
             let _home = claude_test_home(Some(data.join("home")));
             let (pane, session, project) = claude_pane(cx, window, &data, false);
             let backend = TestBackend::default();
-            follow_test_backend(cx, window, &data, &backend);
+            follow_test_backend(cx, window, &backend);
             first_lookup(cx, window);
             let next = clear_hook(&data, &project, pane);
             backend.send(Err(notify::Error::generic("watch lost")));
@@ -2706,6 +2766,154 @@ mod claude_watch_regressions {
             let bound = bound_within(cx, window, pane, &next, Duration::from_secs(5), true);
             session.kill();
             assert_eq!(bound.as_deref(), Some(next.as_str()));
+        });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod muse_watch_regressions {
+    use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
+    use crate::session_binding;
+    use gpui::{AppContext as _, TestAppContext, WindowHandle};
+    use muxel_core::{Instance, Project};
+    use muxel_terminal::{AgentStatus, CommandSpec, TerminalLaunch, TerminalView};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// A live Muse pane launched with muxel's hooks, with the status tick
+    /// stopped, so only what a test does (or the watcher reports) runs
+    /// discovery. Returns the pane, its PTY session, its launch's nonce and
+    /// its session store.
+    fn muse_pane(
+        cx: &mut TestAppContext,
+        window: WindowHandle<MuxelApp>,
+        data: &Path,
+    ) -> (
+        Uuid,
+        std::sync::Arc<muxel_terminal::TerminalSession>,
+        Uuid,
+        PathBuf,
+    ) {
+        let share = data.join("share");
+        let env = [
+            ("XDG_CONFIG_HOME", data.join("muse-config")),
+            ("XDG_DATA_HOME", share.clone()),
+        ]
+        .map(|(key, path)| (key.to_string(), path.display().to_string()));
+        let (pane, session) = window
+            .update(cx, |app: &mut MuxelApp, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.current_workspace = Some(Uuid::new_v4());
+                let project_id = app.workspace.add_project(Project::new("muse", data));
+                let mut instance = Instance::shell(project_id);
+                instance.program = Some("muse".into());
+                let pane = instance.id;
+                app.workspace.add_instance(instance);
+                assert!(
+                    session_binding::prepare_muse_hooks(data, pane, &env, &[], None, false)
+                        .is_some()
+                );
+                let mut spec = CommandSpec::program(
+                    "cmd.exe",
+                    vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+                );
+                spec.status_program = Some("muse".into());
+                let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                let session = view.read(cx).session().clone();
+                app.terminals.insert(pane, view);
+                app.terminal_launches.insert(pane, (Instant::now(), false));
+                (pane, session)
+            })
+            .unwrap();
+        let launch: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                session_binding::muse_binding_dir(data)
+                    .join(pane.to_string())
+                    .join("launch.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let nonce = serde_json::from_value(launch["launch_id"].clone()).unwrap();
+        (pane, session, nonce, share.join("muse"))
+    }
+
+    /// Muse's hook for `conversation`, as it runs on `event`. The
+    /// conversation is in the session store, as Muse keeps it.
+    fn muse_hook(
+        data: &Path,
+        store: &Path,
+        pane: Uuid,
+        nonce: Uuid,
+        conversation: &str,
+        event: serde_json::Value,
+    ) {
+        let log = store.join(format!("sessions/2026/11/07/{conversation}"));
+        std::fs::create_dir_all(&log).unwrap();
+        std::fs::write(log.join("session.jsonl"), "").unwrap();
+        let mut event = event;
+        event["session_id"] = conversation.into();
+        event["cwd"] = data.display().to_string().into();
+        session_binding::write_muse_binding_from_reader(
+            data,
+            pane,
+            nonce,
+            conversation,
+            event.to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// Run the app until `done` holds or ten seconds pass, with no status
+    /// tick. Returns whether it held.
+    fn within(
+        cx: &mut TestAppContext,
+        window: WindowHandle<MuxelApp>,
+        done: impl Fn(&MuxelApp, &gpui::App) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let held = window.update(cx, |app, _, cx| done(app, cx)).unwrap();
+            if held || Instant::now() >= deadline {
+                return held;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A bound Muse pane's hook reports a permission prompt. Its status
+    /// shows it with no discovery poll after the write: the status tick is
+    /// stopped, so only the watcher's wake can run the lookup.
+    #[test]
+    fn a_muse_state_change_shows_without_a_poll() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let _home = claude_test_home(Some(data.join("home")));
+            let (pane, session, nonce, store) = muse_pane(cx, window, &data);
+            let conversation = Uuid::new_v4().to_string();
+            let started = serde_json::json!({"hook_event_name": "SessionStart"});
+            muse_hook(&data, &store, pane, nonce, &conversation, started);
+            // The first lookup binds the pane, and starts the watcher.
+            window
+                .update(cx, |app, _, cx| app.sync_provider_session_ids(cx))
+                .unwrap();
+            let bound = within(cx, window, |app, _| {
+                app.workspace.instance(pane).unwrap().session_id.as_deref()
+                    == Some(conversation.as_str())
+            });
+            let prompt = serde_json::json!({
+                "hook_event_name": "Notification", "notification_type": "permission_prompt",
+            });
+            muse_hook(&data, &store, pane, nonce, &conversation, prompt);
+            let blocked = within(cx, window, |app, cx| {
+                app.terminals[&pane].read(cx).status() == AgentStatus::Blocked
+            });
+            session.kill();
+            assert!(bound);
+            assert!(blocked, "the hook's state waited for a poll");
         });
     }
 }

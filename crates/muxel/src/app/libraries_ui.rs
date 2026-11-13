@@ -650,14 +650,8 @@ pub(super) fn active_loop_ids(running: &HashMap<Uuid, LoopRun>) -> HashSet<Uuid>
 
 /// Track a shared loop run as `fire_loop` does a private one; without it
 /// `post_run = exit` would never close the pane and runs would stack.
-pub(super) fn loop_run_for(fire: &SharedFire, launch: Option<Uuid>) -> LoopRun {
-    LoopRun {
-        loop_id: fire.run_id,
-        launch,
-        seen_working: false,
-        started: std::time::Instant::now(),
-        post_run: fire.content.post_run,
-    }
+pub(super) fn loop_run_for(fire: &SharedFire, launch: LoopLaunch) -> LoopRun {
+    LoopRun::new(fire.run_id, launch, fire.content.post_run)
 }
 
 /// Run `spec`, turning a panic into a failed git operation, so the job always
@@ -1276,6 +1270,10 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A confirmed Restart starts no run; it stays due for the new version.
+        if self.departing.is_some() {
+            return;
+        }
         let active = active_loop_ids(&self.running_loops);
         let workspace = &self.workspace;
         let outcome =
@@ -1305,11 +1303,9 @@ impl MuxelApp {
             return;
         };
         if let Some(iid) = self.spawn_loop_agent(&fire.to_runtime_loop(), &preset, window, cx) {
-            let launch = self
-                .terminals
-                .get(&iid)
-                .map(|view| view.read(cx).session().id);
-            self.running_loops.insert(iid, loop_run_for(&fire, launch));
+            if let Some(launch) = self.loop_launch(iid, cx) {
+                self.running_loops.insert(iid, loop_run_for(&fire, launch));
+            }
             let project = self
                 .workspace
                 .project(fire.project_id)
@@ -2877,7 +2873,7 @@ mod menu_tests {
 #[cfg(test)]
 mod shared_loop_tests {
     use super::{
-        LibMenuRow, LibraryDialog, LoopRowClick, RowAgent, SwitchOnAgent, SwitchOnOpen,
+        LibMenuRow, LibraryDialog, LoopLaunch, LoopRowClick, RowAgent, SwitchOnAgent, SwitchOnOpen,
         SwitchOnStep, active_loop_ids, agent_pick_hint_shown, confirm_switch_on, library_menu_rows,
         loop_row_click, loop_run_for, loop_toggle_label, open_switch_on, post_run_text,
         project_pick_hint_shown, shared_fire_preset, shared_loop_keys, shared_loop_off_event,
@@ -3603,9 +3599,9 @@ mod shared_loop_tests {
         assert_eq!(fire.content.prompt, "go");
         assert_eq!(fire.preset_id, id(C));
         let launch = id(0x1E);
-        let run = loop_run_for(&fire, Some(launch));
+        let run = loop_run_for(&fire, LoopLaunch::Installed(launch));
         assert_eq!(run.loop_id, fire.run_id);
-        assert_eq!(run.launch, Some(launch));
+        assert_eq!(run.launch, LoopLaunch::Installed(launch));
         assert_eq!(run.post_run, PostRunAction::Exit);
         assert!(!run.seen_working);
         running.insert(id(0x1D), run);

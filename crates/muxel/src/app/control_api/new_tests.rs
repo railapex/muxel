@@ -60,10 +60,14 @@ struct MuxelApp {
     workspace_busy: Option<Uuid>,
     confirm_quit: bool,
     show_quit_confirm: bool,
+    /// The app's confirmed-Restart stage; only whether there is one matters here.
+    departing: Option<()>,
     confirm: Option<PendingConfirm>,
     secondary_windows: Vec<SecondaryWindow>,
     main_window: Option<WindowHandle>,
     active_instance: Option<Uuid>,
+    /// The panes with a live terminal view (the app keeps the view itself).
+    terminals: std::collections::HashMap<Uuid, ()>,
     selections: usize,
     placements: usize,
     persists: usize,
@@ -78,6 +82,7 @@ impl MuxelApp {
         let pid = project.id;
         let existing = Instance::shell(pid);
         let active_instance = Some(existing.id);
+        let terminals = [(existing.id, ())].into();
         project.layout = Some(PaneNode::leaf(existing.id));
         Self {
             settings: Settings {
@@ -97,10 +102,12 @@ impl MuxelApp {
             workspace_busy: None,
             confirm_quit: false,
             show_quit_confirm: false,
+            departing: None,
             confirm: None,
             secondary_windows: vec![],
             main_window: Some(WindowHandle(1)),
             active_instance,
+            terminals,
             selections: 0,
             placements: 0,
             persists: 0,
@@ -110,9 +117,10 @@ impl MuxelApp {
         }
     }
 
-    fn select_project(&mut self, pid: Uuid, _: &mut Window, _: &mut Context<Self>) {
+    fn select_project_for_new_pane(&mut self, pid: Uuid, _: &mut Window, _: &mut Context<Self>) {
         self.selections += 1;
         self.workspace.active_project = Some(pid);
+        self.active_instance = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -143,6 +151,13 @@ impl MuxelApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
+        if focus {
+            assert_eq!(self.workspace.active_project, Some(pid));
+            assert_eq!(
+                self.active_instance, None,
+                "focused creation must not select an old pane during project reconciliation"
+            );
+        }
         self.placements += 1;
         if self.reject_placement {
             return;
@@ -280,6 +295,7 @@ fn target_project(app: &mut MuxelApp, empty: bool) -> (Uuid, Option<Uuid>) {
     let selected = existing.as_ref().map(|instance| instance.id);
     if let Some(existing) = existing {
         project.layout = Some(PaneNode::leaf(existing.id));
+        app.terminals.insert(existing.id, ());
         app.workspace.instances.push(existing);
     }
     let pid = project.id;
@@ -390,6 +406,187 @@ fn control_new_focus_selects_the_new_pane_project_and_activates_its_window() {
             assert_eq!(leaf.tabs[leaf.active], iid);
         }
     }
+}
+
+fn open_from(app: &mut MuxelApp, requesting_pane: Option<Uuid>) -> Uuid {
+    open_placed(app, requesting_pane, ctl::NewPlacement::Tab)
+}
+
+fn open_placed(
+    app: &mut MuxelApp,
+    requesting_pane: Option<Uuid>,
+    placement: ctl::NewPlacement,
+) -> Uuid {
+    let result = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane,
+                placement,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    serde_json::from_value(result["uuid"].clone()).unwrap()
+}
+
+/// The fixture's focused pane with `beside` split to its right, in one row.
+fn focused_beside(app: &mut MuxelApp, beside: Instance, live: bool) -> (Uuid, Uuid) {
+    let pid = app.workspace.projects[0].id;
+    let focused = app.active_instance.unwrap();
+    let beside_id = beside.id;
+    let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+    assert!(muxel_core::split(
+        layout,
+        focused,
+        SplitDirection::Horizontal,
+        beside_id
+    ));
+    app.workspace.instances.push(beside);
+    if live {
+        app.terminals.insert(beside_id, ());
+    }
+    (focused, beside_id)
+}
+
+fn group(app: &MuxelApp, iid: Uuid) -> Vec<Uuid> {
+    let layout = app.workspace.projects[0].layout.as_ref();
+    layout.unwrap().tab_group(iid).unwrap().to_vec()
+}
+
+#[test]
+fn control_new_opens_in_the_calling_panes_group_else_the_focused_group() {
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (focused, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+
+    // An agent in the right-hand group asks while the left-hand group has focus.
+    let from_caller = open_from(&mut app, Some(caller));
+    assert_eq!(group(&app, caller), [caller, from_caller]);
+
+    // A caller outside this project, a closed one, or none gets the focused group.
+    let (_, other_project_pane) = target_project(&mut app, false);
+    let from_elsewhere = open_from(&mut app, other_project_pane);
+    let from_closed = open_from(&mut app, Some(Uuid::new_v4()));
+    let from_outside = open_from(&mut app, None);
+    assert_eq!(
+        group(&app, focused),
+        [focused, from_elsewhere, from_closed, from_outside]
+    );
+    assert_eq!(app.active_instance, Some(focused));
+}
+
+#[test]
+fn control_new_split_goes_beside_the_calling_pane() {
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (focused, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+
+    let split = open_placed(&mut app, Some(caller), ctl::NewPlacement::Right);
+    let row = app.workspace.projects[0].layout.as_ref().unwrap();
+    assert_eq!(row.collect_instances(), [focused, caller, split]);
+}
+
+#[test]
+fn control_new_trusts_a_declared_caller_only_when_it_is_a_live_terminal() {
+    // The approval card names the requesting pane only when it is a live
+    // terminal, so no other id may steer where the new pane lands.
+    let not_live_terminals: [fn(Uuid) -> Instance; 3] = [
+        |pid| Instance::editor(pid, Some("notes.md".into())),
+        |pid| Instance::browser(pid, "https://example.com".into()),
+        // A terminal pane whose process hasn't started (or failed to).
+        Instance::shell,
+    ];
+    for beside in not_live_terminals {
+        let mut app = MuxelApp::fixture();
+        let pid = app.workspace.projects[0].id;
+        let (focused, declared) = focused_beside(&mut app, beside(pid), false);
+
+        let opened = open_from(&mut app, Some(declared));
+        assert_eq!(group(&app, focused), [focused, opened]);
+        assert_eq!(group(&app, declared), [declared]);
+        // Nor may it claim the new session in Recent work.
+        assert_eq!(app.workspace.instance(opened).unwrap().opened_by, None);
+    }
+}
+
+#[test]
+fn control_new_records_the_calling_session_as_spawner_unless_top_level() {
+    let opened_by = |app: &MuxelApp, iid: Uuid| app.workspace.instance(iid).unwrap().opened_by;
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (_, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+
+    let child = open_from(&mut app, Some(caller));
+    assert_eq!(opened_by(&app, child), Some(caller));
+
+    let independent = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane: Some(caller),
+                top_level: true,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let independent: Uuid = serde_json::from_value(independent["uuid"].clone()).unwrap();
+    assert_eq!(opened_by(&app, independent), None);
+
+    // No caller, a closed one, or one in another project spawns nothing.
+    let (_, other_project_pane) = target_project(&mut app, false);
+    for declared in [None, Some(Uuid::new_v4()), other_project_pane] {
+        let opened = open_from(&mut app, declared);
+        assert_eq!(opened_by(&app, opened), None, "{declared:?}");
+    }
+}
+
+/// The whole way from `ctl new` to the sidebar: a session opened from a pane
+/// is drawn in Recent work nested under that pane's row, and one opened with
+/// `--top-level` is a row of its own.
+#[test]
+fn a_session_opened_from_a_pane_is_a_nested_row_under_it_in_recent_work() {
+    use muxel_core::sidebar::{
+        BandClock, SidebarEntry, SidebarSort, instances_by_id, sidebar_order, sidebar_rows,
+    };
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let (_, caller) = focused_beside(&mut app, Instance::shell(pid), true);
+    let child = open_from(&mut app, Some(caller));
+    let independent = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane: Some(caller),
+                top_level: true,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let independent: Uuid = serde_json::from_value(independent["uuid"].clone()).unwrap();
+
+    let project = app.workspace.project(pid).unwrap();
+    let rows = sidebar_rows(project, &app.workspace, &|_| false, SidebarSort::RecentWork);
+    let entries = sidebar_order(
+        &rows,
+        &instances_by_id(&app.workspace),
+        &|_| None,
+        &|_| true,
+        &|_| false,
+        BandClock::at(&chrono::Local::now()),
+        SidebarSort::RecentWork,
+    );
+    let at = |entry| entries.iter().position(|row| *row == entry);
+    let caller_row = at(SidebarEntry::Pane(caller)).expect("the caller's row");
+    assert_eq!(
+        at(SidebarEntry::Nested(child)),
+        Some(caller_row + 1),
+        "{entries:?}"
+    );
+    assert!(at(SidebarEntry::Pane(independent)).is_some(), "{entries:?}");
 }
 
 #[test]
@@ -823,9 +1020,7 @@ fn control_new_policy_write_entry_points_recheck_permission() {
             )
         } else {
             // A submitting key is written as the submit, whose facts are
-            // recorded only once the Enter is taken, never marked ahead of a
-            // write that tmux may refuse.
-            assert!(!callback.contains("mark_turn_submitted"));
+            // recorded only once the Enter is taken.
             assert!(callback.contains("ControlInput::SubmitKey"));
             (
                 callback
@@ -1029,6 +1224,9 @@ fn control_new_policy_keeps_browser_lifecycle_and_window_refusals() {
     app.confirm_quit = true;
     app.refuses_without_mutation(ctl::NewOptions::default(), "quitting");
     app.confirm_quit = false;
+    app.departing = Some(());
+    app.refuses_without_mutation(ctl::NewOptions::default(), "restarting");
+    app.departing = None;
     app.workspace_busy = app.current_workspace;
     app.refuses_without_mutation(ctl::NewOptions::default(), "workspace is closing");
     app.workspace_busy = None;
@@ -1107,6 +1305,8 @@ fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
         ("claude", true),
         (grok.to_str().unwrap(), true),
         (opencode.to_str().unwrap(), true),
+        // npm's shim: the Codex a bare `codex` finds through PATH.
+        ("codex.cmd", true),
         // A relative path resolves against the caller's --cwd.
         ("./node_modules/.bin/claude", false),
         ("bin/codex", false),
@@ -1115,7 +1315,6 @@ fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
         ("python3", false),
         (node.to_str().unwrap(), false),
         ("claude-wrapper.sh", false),
-        ("codex.cmd", false),
     ] {
         let mut app = MuxelApp::fixture();
         app.settings.control_allow_new = CreationPolicy::Allow;

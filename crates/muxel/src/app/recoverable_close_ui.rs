@@ -3,7 +3,7 @@
 use super::*;
 
 fn countdown_label(deadline: Instant) -> SharedString {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(crate::scene_mode::now_instant());
     let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
     tf("Undo {seconds}", &[("seconds", &seconds.to_string())]).into()
 }
@@ -17,10 +17,30 @@ pub(super) fn close_alternative_label(action: &ConfirmAction) -> Option<SharedSt
 }
 
 impl MuxelApp {
+    /// The panes a group is named and counted by: its sessions. Files riding
+    /// with a session close and come back with it, unnamed.
+    fn close_group_sessions(&self, group: &CloseGroup) -> Vec<Uuid> {
+        let sessions: Vec<_> = group
+            .members
+            .iter()
+            .copied()
+            .filter(|iid| {
+                self.closing
+                    .get(iid)
+                    .is_none_or(|held| held.follows.is_none())
+            })
+            .collect();
+        if sessions.is_empty() {
+            group.members.clone()
+        } else {
+            sessions
+        }
+    }
+
     fn close_group_name(&self, group: &CloseGroup) -> SharedString {
-        if group.members.len() == 1 {
-            group
-                .members
+        let sessions = self.close_group_sessions(group);
+        if sessions.len() == 1 {
+            sessions
                 .first()
                 .and_then(|&iid| self.workspace.instance(iid))
                 .map(|instance| SharedString::from(instance.display_name().to_string()))
@@ -29,8 +49,8 @@ impl MuxelApp {
             tn(
                 "{n} terminal",
                 "{n} terminals",
-                group.members.len(),
-                &[("n", &group.members.len().to_string())],
+                sessions.len(),
+                &[("n", &sessions.len().to_string())],
             )
             .into()
         }
@@ -39,7 +59,7 @@ impl MuxelApp {
     fn close_decision_label(&self, group: &CloseGroup) -> SharedString {
         if group.layout_unread {
             t("Couldn't read the shared layout")
-        } else if group.members.len() == 1 {
+        } else if self.close_group_sessions(group).len() == 1 {
             tf(
                 "Review before closing {name}",
                 &[("name", self.close_group_name(group).as_ref())],
@@ -66,7 +86,7 @@ impl MuxelApp {
         let panes: usize = self
             .close_groups
             .iter()
-            .map(|group| group.members.len())
+            .map(|group| self.close_group_sessions(group).len())
             .sum();
         let multiple = panes > 1;
         let decision = !several && latest.needs_decision && !latest.undoing;
@@ -107,6 +127,9 @@ impl MuxelApp {
     fn render_close_check(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("recoverable-close-checking")
+            .role(Role::Status)
+            .accessibility_id("muxel.close-check")
+            .aria_label(t("Checking before close…"))
             .flex()
             .items_center()
             .gap_1()
@@ -119,6 +142,7 @@ impl MuxelApp {
             .child(div().text_xs().child(t("Checking before close…")))
             .child(
                 Button::new("close-check-cancel")
+                    .accessibility_id("muxel.close-check-cancel")
                     .ghost()
                     .xsmall()
                     .label(t("Cancel"))
@@ -153,7 +177,7 @@ impl MuxelApp {
         let multiple = self
             .close_groups
             .iter()
-            .map(|group| group.members.len())
+            .map(|group| self.close_group_sessions(group).len())
             .sum::<usize>()
             > 1;
         let (label, button) = self.close_chip_text(latest);
@@ -163,8 +187,52 @@ impl MuxelApp {
             .close_groups
             .iter()
             .any(|group| group.needs_decision && !group.undoing);
+        // While the button counts down, a thin line along the chip's foot
+        // shows the time left. It moves on the same refresh as the count.
+        let left = (latest
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32()
+            / super::recoverable_close::CLOSE_GRACE.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let counting = !decision
+            && !latest.undoing
+            && !latest.checking
+            && !latest.syncing()
+            && !multiple
+            && left > 0.0;
+        // The line is the bottom edge of an outline the chip's size, so it
+        // follows the chip's rounded corners; a clip the time left wide cuts
+        // its end square.
+        let time_line = counting.then(|| {
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(relative(left))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        // The chip's width again, measured from inside the clip.
+                        .w(relative(1.0 / left))
+                        // It sits inside the chip's 1 px border, so a radius one
+                        // less shares the border's curve.
+                        .rounded((cx.theme().radius - px(1.0)).max(px(0.0)))
+                        .border_b_2()
+                        .border_color(cx.theme().primary),
+                )
+        });
         div()
             .id("recoverable-close-chip")
+            .role(Role::Group)
+            .accessibility_id("muxel.pending-terminal-close-control")
+            .aria_label(label.clone())
+            .relative()
             .flex()
             .items_center()
             .gap_1()
@@ -199,6 +267,7 @@ impl MuxelApp {
             )
             .children(decision.then(|| {
                 Button::new("close-chip-finalize")
+                    .accessibility_id("muxel.finish-terminal-close")
                     .xsmall()
                     .danger()
                     .label(t("Close"))
@@ -206,6 +275,7 @@ impl MuxelApp {
             }))
             .child(
                 Button::new("close-chip-undo")
+                    .accessibility_id("muxel.undo-terminal-close")
                     .ghost()
                     .xsmall()
                     .label(button)
@@ -221,6 +291,7 @@ impl MuxelApp {
             )
             .children(multiple.then(|| {
                 Button::new("close-chip-list")
+                    .accessibility_id("muxel.close-list-toggle")
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronDown)
@@ -231,6 +302,7 @@ impl MuxelApp {
                         cx.notify();
                     }))
             }))
+            .children(time_line)
             .into_any_element()
     }
 
@@ -368,6 +440,7 @@ impl MuxelApp {
                     .child(
                         div().flex().justify_end().child(
                             Button::new("close-list-dismiss")
+                                .accessibility_id("muxel.close-list-dismiss")
                                 .ghost()
                                 .label(t("Done"))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -389,7 +462,7 @@ impl MuxelApp {
                 self.confirm = None;
                 self.accept_close_request(ids, true, cx);
             }
-            ConfirmAction::SaveEditorBeforeClose { iid, rest } => {
+            ConfirmAction::SaveEditorBeforeClose { iid, rest, .. } => {
                 self.confirm = None;
                 self.close_instance_inner(iid, "close (without saving)", cx);
                 self.continue_close_request(
@@ -482,6 +555,7 @@ impl PopoutView {
                                 .pt_2()
                                 .child(
                                     Button::new("popout-close-cancel")
+                                        .accessibility_id("muxel.popout-close-cancel")
                                         .ghost()
                                         .label(t("Cancel"))
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -490,6 +564,7 @@ impl PopoutView {
                                 )
                                 .children(alternate.map(|label| {
                                     Button::new("popout-close-alternative")
+                                        .accessibility_id("muxel.popout-close-alternate")
                                         .ghost()
                                         .label(label)
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -507,6 +582,7 @@ impl PopoutView {
                                 }))
                                 .child(
                                     Button::new("popout-close-ok")
+                                        .accessibility_id("muxel.popout-close-ok")
                                         .danger()
                                         .label(pending.confirm_label)
                                         .on_click(cx.listener(|this, _, window, cx| {

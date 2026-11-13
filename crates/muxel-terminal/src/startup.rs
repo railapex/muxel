@@ -20,7 +20,7 @@ pub(crate) enum AcceptanceAction {
 }
 
 /// How long after its Enter a task has to show provider evidence of acceptance.
-pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct Acceptance {
@@ -58,6 +58,10 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    launch: Option<uuid::Uuid>,
+    /// The automation's place in its terminal's pending input, held until it
+    /// stops; a departure's interrupt stops it.
+    pending: Option<crate::pending_ops::PendingOp>,
 }
 
 impl Guard {
@@ -68,6 +72,8 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            launch: None,
+            pending: None,
         }
     }
 
@@ -79,10 +85,46 @@ impl Guard {
         self
     }
 
+    pub(crate) fn with_pending(mut self, pending: crate::pending_ops::PendingOp) -> Self {
+        self.pending = Some(pending);
+        self
+    }
+
     pub(crate) fn submitted(&self, at: i64) {
         if let Some(owner) = &self.control_turn {
             owner.submitted(at);
         }
+    }
+
+    pub(crate) fn with_launch(mut self, launch: uuid::Uuid) -> Self {
+        self.launch = Some(launch);
+        self.record_guard();
+        self
+    }
+
+    fn record_guard(&self) {
+        if let (Some(owner), Some(launch)) = (&self.control_turn, self.launch) {
+            owner.record_guard(launch, self.expected_revision);
+        }
+    }
+
+    pub(crate) fn record_paste(&self, may_have_pasted: bool) {
+        if let Some(owner) = &self.control_turn {
+            owner.record_paste(may_have_pasted);
+        }
+    }
+
+    pub(crate) fn write_error(&self, error: String) {
+        if let Some(owner) = &self.control_turn {
+            owner.write_error(error);
+        }
+    }
+
+    pub(crate) fn blocked(&mut self, blocker: muxel_core::control::StartupBlocker) {
+        if let Some(owner) = &self.control_turn {
+            owner.blocked(blocker);
+        }
+        self.fail(Stop::NotReady);
     }
 
     pub(crate) fn enter_admitted(&mut self, at: i64) {
@@ -118,6 +160,10 @@ impl Guard {
             .as_ref()
             .is_some_and(|owner| !owner.is_pending())
             || revision != self.expected_revision
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(crate::pending_ops::PendingOp::interrupted)
         {
             Some(Stop::Interrupted)
         } else if self.deadline.is_some_and(|deadline| elapsed >= deadline) {
@@ -164,6 +210,7 @@ impl Guard {
             return Err(Stop::WriteFailed);
         }
         self.expected_revision = self.expected_revision.wrapping_add(1);
+        self.record_guard();
         Ok(())
     }
 }
@@ -292,6 +339,96 @@ struct CodexCtlDraft {
 }
 
 impl Screen {
+    pub(crate) fn startup_blocker(&self) -> Option<muxel_core::control::StartupBlocker> {
+        use muxel_core::control::{StartupBlocker, StartupBlockerKind};
+        if self.claude_status_context().is_some()
+            || self.codex_composer_context(true).is_some()
+            || self.codex_composer_context(false).is_some()
+        {
+            return None;
+        }
+        let lower = self.text.to_ascii_lowercase();
+        let (kind, marker) = if (lower.contains("trust this folder")
+            || lower.contains("trust the files in this folder")
+            || lower.contains("folder access"))
+            && (lower.contains("no,")
+                || lower.contains("exit")
+                || lower.contains("quit")
+                || lower.contains("back to agent command center"))
+        {
+            (StartupBlockerKind::FolderTrust, "trust")
+        } else if lower.contains("update available")
+            && lower.contains("update now")
+            && lower.contains("skip")
+        {
+            (StartupBlockerKind::CodexUpdate, "update available")
+        } else if (lower.contains("sign in with chatgpt")
+            && (lower.contains("api key") || lower.contains("device code")))
+            || (lower.contains("select login method")
+                && (lower.contains("console") || lower.contains("claude account")))
+        {
+            (
+                StartupBlockerKind::Login,
+                if lower.contains("sign in with chatgpt") {
+                    "sign in"
+                } else {
+                    "select login"
+                },
+            )
+        } else {
+            return None;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let start = rows
+            .iter()
+            .position(|row| row.to_ascii_lowercase().contains(marker))
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let excerpt = rows[start..]
+            .iter()
+            .map(|row| row.trim_end())
+            .skip_while(|row| row.is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(600)
+            .collect();
+        Some(StartupBlocker { kind, excerpt })
+    }
+
+    /// Status never reads the draft. Codex draws its real prompt at column zero;
+    /// pasted prompt glyphs are indented continuation rows inside that editor.
+    /// The independent model/shortcut footer bounds it even with a hidden cursor.
+    pub(crate) fn codex_status_context(&self, wrapped: &[bool]) -> Option<String> {
+        if !self.bracketed_paste {
+            return None;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let bottom = rows.iter().rposition(|row| codex_footer(row))?;
+        let top = rows[..bottom].iter().rposition(|row| {
+            row.strip_prefix('›')
+                .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        })?;
+        if self.cursor_visible {
+            let cursor = usize::try_from(self.cursor_row).ok()?;
+            if cursor < top || cursor >= bottom {
+                return None;
+            }
+        }
+        let mut context = String::new();
+        for (index, row) in rows[..top].iter().enumerate() {
+            if wrapped.get(index) == Some(&true) {
+                context.push_str(row);
+            } else {
+                context.push_str(row.trim_end());
+                context.push('\n');
+            }
+        }
+        context.push_str("›\n");
+        Some(context)
+    }
+
     // Master can render a model row followed by a shortcuts footer. The
     // generic composer scan uses the last footer; ctl's geometry proof pins
     // the earlier model row when both are present.
@@ -583,6 +720,31 @@ impl Screen {
         Some(top..bottom)
     }
 
+    /// Whether Codex's live editor holds text, when it is drawn: the cursor at
+    /// the prompt's start means empty (a placeholder suggestion may show there),
+    /// anywhere else in the editor means a draft. `None` when no editor is found.
+    pub(crate) fn codex_composer_draft(&self) -> Option<bool> {
+        let rows: Vec<_> = self.text.lines().collect();
+        if self.codex_composer_rows(&rows, true).is_some() {
+            Some(false)
+        } else if self.codex_composer_rows(&rows, false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::codex_composer_draft`] for Claude's framed input box.
+    pub(crate) fn claude_composer_draft(&self) -> Option<bool> {
+        if self.composer_rows(true).is_some() {
+            Some(false)
+        } else if self.composer_rows(false).is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
         if input.len() > self.text.len() {
             return false;
@@ -627,6 +789,44 @@ impl Screen {
         normalized(&text) == normalized(input)
     }
 
+    /// A strict pending proof cannot recover hard line breaks or Unicode cell
+    /// widths from rendered rows. Only a complete single ASCII row qualifies.
+    pub(crate) fn claude_exact_draft(&self, input: &str) -> bool {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Some(region) = self.composer_rows(false) else {
+            return false;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let top = region.start;
+        if usize::try_from(self.cursor_row).ok() != Some(top)
+            || rows[top + 1..region.end]
+                .iter()
+                .any(|row| !row.trim().is_empty())
+        {
+            return false;
+        }
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            + 2;
+        let end = prefix + input.len();
+        self.cursor_column == end
+            && rows[top]
+                .chars()
+                .skip(prefix)
+                .take(input.len())
+                .collect::<String>()
+                == input
+            && rows[top].chars().skip(end).all(char::is_whitespace)
+    }
+
     /// The cursor must belong to the live input region between two rules. A menu
     /// choice or a quoted prompt elsewhere in the viewport is not a composer.
     /// `empty` uses cursor position, allowing Claude's placeholder text to remain.
@@ -647,6 +847,20 @@ impl Screen {
     pub(crate) fn claude_status_context(&self) -> Option<String> {
         let composer = self.composer_rows_inner(None)?;
         Some(self.context_without_rows(composer))
+    }
+
+    /// Claude's input box rows, from its `❯` row to the row above its bottom
+    /// rule, wherever a repaint left the cursor. Used to read a draft.
+    pub(crate) fn claude_box_rows(&self) -> Option<std::ops::Range<usize>> {
+        self.composer_rows_inner(None)
+    }
+
+    /// Codex's live editor, from its `›` row to the row above its footer,
+    /// holding a draft or empty.
+    pub(crate) fn codex_editor_rows(&self) -> Option<std::ops::Range<usize>> {
+        let rows: Vec<_> = self.text.lines().collect();
+        self.codex_composer_rows(&rows, false)
+            .or_else(|| self.codex_composer_rows(&rows, true))
     }
 
     fn context_without_rows(&self, composer: std::ops::Range<usize>) -> String {
@@ -681,22 +895,16 @@ impl Screen {
             row.chars().count() >= 8 && row.chars().all(|ch| ch == '─' || ch == '━')
         };
         let (top, bottom) = if empty.is_some() {
-            let top = rows[..cursor].iter().rposition(|row| rule(row))?;
             let bottom = rows[cursor + 1..]
                 .iter()
                 .position(|row| rule(row))
                 .map(|offset| cursor + 1 + offset)?;
+            let top = claude_box_top(&rows, bottom).filter(|&top| top < cursor)?;
             (top, bottom)
         } else {
             // A repaint can leave the cursor anywhere, so take the final box.
-            // Its edges are the same full-width rule. Draft rows are drawn
-            // under the prompt, two columns in, so a rule typed into a draft
-            // never matches an edge and can't cut the box short.
             let bottom = rows.iter().rposition(|row| rule(row))?;
-            let edge = rows[bottom].trim_end();
-            let top = rows[..bottom]
-                .iter()
-                .rposition(|row| row.trim_end() == edge)?;
+            let top = claude_box_top(&rows, bottom)?;
             (top, bottom)
         };
         // The final framed region belongs to the composer, not an earlier turn.
@@ -709,6 +917,19 @@ impl Screen {
         if !after.starts_with(char::is_whitespace) {
             return None;
         }
+        // Rows under the prompt row are the draft's own, drawn two columns in.
+        // Anything at the edge's column means the two rules frame something
+        // else, such as a transcript above a permission form that has no box.
+        let indent = rows[bottom]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        if !rows[top + 2..bottom]
+            .iter()
+            .all(|row| row.chars().take(indent + 2).all(char::is_whitespace))
+        {
+            return None;
+        }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
         empty
             .is_none_or(|empty| cursor_at_start == empty)
@@ -716,39 +937,84 @@ impl Screen {
     }
 }
 
+/// Codex's reasoning efforts, which its status line prints after the model;
+/// `default` shows while a fresh session hasn't settled on one.
+const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+
+/// The hint Codex 0.167 adds to the end of its status line while the box is
+/// empty.
+const CODEX_AGENTS_HINT: &str = "← for agents";
+
+/// The top edge of Claude's input box whose bottom edge is `rows[bottom]`: the
+/// nearest row above it that starts with a rule at the edge's column. Claude
+/// can draw its usage notice into the right end of the top rule and then erase
+/// it with EL, so the top rule may be cut short, or carry text that ends at
+/// the edge's last column. Nearest keeps the match inside the box. Draft rows
+/// start two columns in, so a rule typed into a draft is never taken for it.
+fn claude_box_top(rows: &[&str], bottom: usize) -> Option<usize> {
+    let rule = |ch: char| ch == '─' || ch == '━';
+    let edge = rows[bottom].trim_end();
+    let indent = edge.chars().take_while(|ch| ch.is_whitespace()).count();
+    let top = rows[..bottom].iter().rposition(|row| {
+        row.chars().take_while(|ch| ch.is_whitespace()).count() == indent
+            && row.chars().nth(indent).is_some_and(rule)
+    })?;
+    let row = rows[top].trim_end();
+    let run = row.chars().skip(indent).take_while(|&ch| rule(ch)).count();
+    let (end, width) = (indent + run, edge.chars().count());
+    let whole = row.chars().count();
+    (run >= 8 && end <= width && (whole == end || whole == width)).then_some(top)
+}
+
 /// A row Codex draws below its live editor: its own shortcut hint or context
 /// meter (`? for shortcuts … 98% context left`), or a passive status line that
 /// opens with a model id (`gpt-5.4 high fast · scratch`, `o4-mini · …`, a custom
-/// provider's `llama3.1:8b · …`). A model name with no digit and no `gpt-` or
-/// `codex-` prefix is not recognised without one of the other two footers.
+/// provider's `llama3.1:8b · …`) or with a model's display name and its
+/// reasoning effort (`Daybreak Blue low · …`, `GPT-6.1-Sol high · …`). A
+/// display name with no digit and no effort after it is not recognised without
+/// one of the other two footers.
 /// Menus separate key hints with ` · ` as well (`enter continue · esc quit`),
 /// so a status line must open with a model-like token and no later segment may
-/// read as a key hint. A segment that merely is such a word (a project folder
-/// named `continue`) is not one.
+/// read as a key hint, except Codex's own trailing `← for agents`. A segment
+/// that merely is such a word (a project folder named `continue`) is not one.
 fn codex_footer(row: &str) -> bool {
     let row = row.trim();
     if row.starts_with("? for shortcuts") || row.contains("% context left") {
         return true;
     }
-    let mut segments = row.split(" · ");
-    let Some(id) = segments
-        .next()
-        .and_then(|model| model.split_whitespace().next())
-    else {
+    let segments: Vec<&str> = row.split(" · ").collect();
+    let Some((head, rest)) = segments.split_first() else {
         return false;
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let Some(&id) = words.first() else {
+        return false;
+    };
+    let token = |word: &str| {
+        word.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
     };
     let openai = ["gpt-", "codex-"].iter().any(|prefix| {
         id.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     });
-    let model_like = id.len() >= 2
-        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
-        && (openai || id.bytes().any(|b| b.is_ascii_digit()));
-    let mut rest = segments.peekable();
-    model_like && rest.peek().is_some() && !rest.any(key_hint)
+    let model_like =
+        id.len() >= 2 && token(id) && (openai || id.bytes().any(|b| b.is_ascii_digit()));
+    // `Daybreak Blue low`, `GPT-6.1-Sol high fast`: a name of up to four
+    // words, then an effort, then perhaps `fast`.
+    let words = words.strip_suffix(&["fast"]).unwrap_or(&words[..]);
+    let named = words.split_last().is_some_and(|(effort, name)| {
+        CODEX_EFFORTS.contains(effort)
+            && (1..=4).contains(&name.len())
+            && name.iter().copied().all(token)
+    });
+    let hinted = match rest.split_last() {
+        Some((last, before)) if last.trim() == CODEX_AGENTS_HINT => before,
+        _ => rest,
+    };
+    (model_like || named) && !rest.is_empty() && !hinted.iter().copied().any(key_hint)
 }
 
 /// `enter to confirm`, `esc quit`, `press enter …`, `ctrl+t transcript`,
@@ -858,6 +1124,30 @@ mod tests {
             Err(Stop::Interrupted)
         );
     }
+
+    /// A departure's interrupt stops a controlled startup at its next check,
+    /// whatever its input revision says, and its task is cancelled rather
+    /// than failed.
+    #[test]
+    fn a_departure_interrupt_stops_a_controlled_startup_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let ops = std::sync::Arc::<crate::pending_ops::PendingOps>::default();
+        let turn = StartupTurn::default();
+        let mut guard = Guard::new(0, None)
+            .with_control_turn(turn.claim())
+            .with_pending(ops.begin());
+        guard.write(ms(1), 0, || Ok(())).unwrap();
+        assert_eq!(ops.interrupt_all(), 1);
+        assert_eq!(
+            guard.write(ms(2), 1, || panic!("interrupted automation must not write")),
+            Err(Stop::Interrupted)
+        );
+        assert_eq!(guard.check(ms(3), 1), Err(Stop::Interrupted));
+        drop(guard);
+        assert_eq!(turn.state(), StartupTurnState::Cancelled);
+        assert_eq!(ops.count(), 0, "the stopped automation no longer counts");
+    }
+
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {
         let mut guard = Guard::new(0, Some(ms(30_000)));
@@ -885,13 +1175,50 @@ mod tests {
         assert_eq!(acceptance.observe(ms(5000), false, true), RetryEnter);
         assert_eq!(acceptance.observe(ms(5100), false, true), Observe);
         assert_eq!(acceptance.observe(ms(9999), false, true), Observe);
-        assert_eq!(acceptance.observe(ms(10_000), false, true), Failed);
+        assert_eq!(acceptance.observe(ms(60_000), false, true), Failed);
         let mut unsupported_retry = Acceptance::default();
         assert_eq!(unsupported_retry.observe(ms(5000), false, false), Observe);
         assert_eq!(unsupported_retry.observe(ms(6000), false, true), Observe);
-        assert_eq!(unsupported_retry.observe(ms(10_000), false, false), Failed);
+        assert_eq!(unsupported_retry.observe(ms(60_000), false, false), Failed);
         let mut accepted = Acceptance::default();
         assert_eq!(accepted.observe(ms(5000), true, true), Accepted);
+    }
+
+    #[test]
+    fn known_startup_blockers_are_named_without_treating_quoted_drafts_as_menus() {
+        use muxel_core::control::StartupBlockerKind;
+        for (text, kind) in [
+            (
+                "Trust this folder?\n› Yes, continue\n  No, quit\nEnter to confirm",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Accessing workspace\n❯ No, exit\n  Yes, I trust this folder",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Update available!\n1. Update now\n2. Skip until next version",
+                StartupBlockerKind::CodexUpdate,
+            ),
+            (
+                "Sign in with ChatGPT\nSign in with a device code\nUse an API key",
+                StartupBlockerKind::Login,
+            ),
+        ] {
+            let blocker = screen(text, 1, 2).startup_blocker().unwrap();
+            assert_eq!(blocker.kind, kind);
+            assert!(blocker.excerpt.chars().count() <= 600);
+        }
+        let quoted = screen(
+            "Claude Code\n────────────────\n❯ Explain: Trust this folder? No, exit\n────────────────\n? for shortcuts",
+            2,
+            42,
+        );
+        assert!(quoted.startup_blocker().is_none());
     }
 
     #[test]
@@ -953,6 +1280,45 @@ mod tests {
 
     fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
         ctl_screen_with_width(draft, consumed, 41)
+    }
+
+    /// `ctl send` refuses a pane whose composer holds text. A placeholder
+    /// suggestion drawn in an empty composer must not read as one.
+    #[test]
+    fn a_drawn_composer_says_whether_it_holds_a_draft() {
+        for placeholder in ["", "Ask Codex to do anything", "Write tests for @filename"] {
+            assert_eq!(
+                ctl_origin(placeholder).codex_composer_draft(),
+                Some(false),
+                "{placeholder:?}"
+            );
+        }
+        assert_eq!(
+            ctl_screen(&["half typed"], false).codex_composer_draft(),
+            Some(true)
+        );
+        assert_eq!(
+            ctl_screen(&["first line", "second"], false).codex_composer_draft(),
+            Some(true)
+        );
+        let mut hidden = ctl_screen(&["half typed"], false);
+        hidden.cursor_visible = false;
+        assert_eq!(hidden.codex_composer_draft(), None);
+
+        let rule = "─".repeat(12);
+        let claude = |prompt: &str, column| {
+            screen(&format!("header\n{rule}\n❯ {prompt}\n{rule}"), 2, column)
+        };
+        assert_eq!(claude("", 2).claude_composer_draft(), Some(false));
+        assert_eq!(
+            claude("Try \"refactor app.rs\"", 2).claude_composer_draft(),
+            Some(false)
+        );
+        assert_eq!(claude("half typed", 12).claude_composer_draft(), Some(true));
+        assert_eq!(
+            screen("a permission dialog, no input box", 0, 0).claude_composer_draft(),
+            None
+        );
     }
 
     fn ctl_origin(text: &str) -> Screen {
@@ -1203,9 +1569,80 @@ mod tests {
         assert!(sample.codex_ctl_origin().is_none(), "nonuniform grid");
     }
 
+    /// Every empty Codex box the cast harness recorded, cut from the casts'
+    /// screens: 0.164.0 on a display-name model (codex-0.164.0-windows-question,
+    /// `idle`), and 0.167.2 on the default and on that model
+    /// (codex-0.167.2-windows-composer-tour, `idle-first`), whose status line
+    /// ends with `← for agents` while the box is empty.
+    #[test]
+    fn every_recorded_empty_codex_box_is_found_and_reads_empty() {
+        let welcome = "
+  >_ OpenAI Codex (v0.167.2)
+     D:\\tmp\\cast\\demo
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+";
+        let recorded = [
+            (
+                "
+  >_ OpenAI Codex (v0.164.0)
+     D:\\dev\\cast-fixture-folder1\\.wip\\demo-project-000000000000000002\\project
+
+  Tip: Use the desktop app. Install it from https://chatgpt.com/codex?app-landing-page=true and run codex app.
+
+
+› Ask Codex to do anything
+
+  Daybreak Blue low · D:\\dev\\cast-fixture-folder1\\.wip\\demo-project-000000000000000002\\proj…  ⚠ 2 warnings · f2 to view
+"
+                .to_string(),
+                7,
+            ),
+            (
+                format!(
+                    "{welcome}› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 100% left · D:\\tmp\\cast\\demo · ← for agents\n"
+                ),
+                13,
+            ),
+            (
+                format!(
+                    "{welcome}› Ask Codex to do anything\n\n  Daybreak Blue low · Context 100% left · D:\\tmp\\cast\\demo · ← for agents\n"
+                ),
+                13,
+            ),
+        ];
+        for (text, row) in recorded {
+            let empty = screen(&text, row, 2);
+            assert!(empty.codex_composer_context(true).is_some(), "{text}");
+            assert!(empty.codex_composer_context(false).is_none(), "{text}");
+        }
+        // The same tour with a draft: the hint is gone.
+        let draft = screen(
+            &format!(
+                "{welcome}› fix the login bug\n\n  Daybreak Blue low · Context 100% left · D:\\tmp\\cast\\demo\n"
+            ),
+            13,
+            19,
+        );
+        assert!(draft.codex_draft_matches("fix the login bug"));
+    }
+
     #[test]
     fn codex_editor_accepts_non_gpt_models_and_the_shortcut_footer_but_no_menu() {
         for footer in [
+            "  Daybreak Blue low · scratch",
+            "  Daybreak Blue xhigh fast · scratch",
+            "  Daybreak Blue default · Context 100% left · D:\\tmp\\demo",
+            "  GPT-6.1-Sol high · Context 100% left · D:\\dev\\scratch · scratch · main",
+            "  GPT-6.1-Sol low · Context 100% left · D:\\tmp\\demo · ← for agents",
             "  o4-mini medium · scratch · Context 0% used",
             "  o3 · scratch",
             "  llama3.1:8b · ~/src/webapp",
@@ -1252,6 +1689,10 @@ mod tests {
             "  ⚠ 1 · f2",
             "  scratch · Context 0% used",
             "  sonnet · scratch",
+            "  Daybreak Blue · scratch",
+            "  Thinking high · esc to interrupt",
+            "  gpt-5.4 · ← back",
+            "  ← for agents",
             "  Press enter to confirm or esc to cancel",
         ] {
             let menu = screen(
@@ -1388,6 +1829,36 @@ mod tests {
         );
         // Neither status nor a hidden cursor grants startup input.
         assert!(!draft.claude_composer(false));
+    }
+    #[test]
+    fn box_under_a_usage_notice_or_its_cut_rule_is_still_found() {
+        // Claude 2.1.323 at 297 columns, from a recording: the usage notice
+        // drawn into the right end of the box's top rule, then the rule as EL
+        // left it when the notice went.
+        let bottom = "─".repeat(297);
+        let notice = format!(
+            "{}You've used 89% of your weekly limit · resets Nov 17, 1pm (America/Chicago)──",
+            "─".repeat(220)
+        );
+        assert_eq!(notice.chars().count(), 297);
+        for top in [notice, "─".repeat(220)] {
+            let footer = "  [>_>] · ▱▱▱▱▱▱▱▱▱▱ 450k · haiku med";
+            let text = format!(
+                "Claude Code v2.1.323\n\n{top}\n❯ reply with the word violet\n{bottom}\n\n{footer}"
+            );
+            let mut box_ = screen(&text, 3, 28);
+            assert!(box_.claude_composer(false), "{top}");
+            assert!(box_.claude_draft_matches("reply with the word violet"));
+            box_.cursor_row = 6;
+            box_.cursor_column = 0;
+            box_.cursor_visible = false;
+            assert_eq!(
+                box_.claude_status_context(),
+                Some(format!(
+                    "Claude Code v2.1.323\n\n{top}\n{bottom}\n\n{footer}"
+                ))
+            );
+        }
     }
     #[test]
     fn trust_choice_quoted_transcript_and_wrong_terminal_modes_are_not_ready() {

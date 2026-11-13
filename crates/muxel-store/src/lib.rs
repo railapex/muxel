@@ -11,6 +11,7 @@ use directories::ProjectDirs;
 use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
+pub mod rescue;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
@@ -172,7 +173,7 @@ const RENAME_RETRIES: u32 = 3;
 /// Pause between those retries.
 const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut retries = 0;
     loop {
         match std::fs::rename(from, to) {
@@ -209,17 +210,47 @@ pub fn workspace_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspace.json"))
 }
 
-/// Try to take the single-instance lock for one **workspace** (keyed by its id).
-/// Returns the locked file on success — **keep it alive while that workspace is
-/// open** (the OS releases the advisory lock when the file is dropped or the
-/// process exits, even on a crash, so no stale lock survives). `None` means
-/// another muxel already has *this* workspace open, so the caller should refuse
-/// to open it and not clobber its `workspace.json`. Locking is per-workspace, so
-/// two muxel processes can run side by side on different workspaces. A lock the
-/// platform can't support is treated as "available" rather than blocking the user.
-pub fn try_lock_workspace(id: Uuid) -> Option<std::fs::File> {
-    let dir = workspaces_dir()?.join(id.to_string());
-    try_lock_dir(&dir)
+/// What came of trying to lock a workspace to open it.
+#[derive(Debug)]
+pub enum WorkspaceLock {
+    /// Locked. **Keep the file alive while the workspace is open**: the OS
+    /// releases the advisory lock when the file is dropped or the process
+    /// exits, even on a crash, so no stale lock survives.
+    Held(std::fs::File),
+    /// Another muxel already has this workspace open: refuse to open it, and
+    /// don't clobber its `workspace.json`.
+    Busy,
+    /// The workspace was deleted, in another window after this one listed
+    /// it: it must not open again.
+    Deleted,
+}
+
+/// Try to take the single-instance lock for one **workspace** (keyed by its
+/// id). Locking is per-workspace, so two muxel processes can run side by side
+/// on different workspaces. A lock the platform can't support is treated as
+/// "available" rather than blocking the user.
+pub fn try_lock_workspace(id: Uuid) -> WorkspaceLock {
+    match workspaces_dir() {
+        Some(root) => lock_to_open(&root, id),
+        None => WorkspaceLock::Busy,
+    }
+}
+
+fn lock_to_open(root: &Path, id: Uuid) -> WorkspaceLock {
+    let dir = root.join(id.to_string());
+    let Some(lock) = try_lock_dir(&dir) else {
+        return WorkspaceLock::Busy;
+    };
+    // A deletion marks the workspace while holding this lock, so now that it
+    // is held here, either the marker is already there or no deletion
+    // can start until this window lets go.
+    if rescue::marked_deleted_in(root, id) {
+        drop(lock);
+        // Locking recreated the directory the deletion removed.
+        rescue::remove_tree(&dir);
+        return WorkspaceLock::Deleted;
+    }
+    WorkspaceLock::Held(lock)
 }
 
 /// Lock core, parameterized by the workspace dir for testability. Creates the dir
@@ -237,6 +268,32 @@ fn try_lock_dir(dir: &Path) -> Option<std::fs::File> {
         Ok(()) => Some(file),
         Err(std::fs::TryLockError::WouldBlock) => None,
         Err(std::fs::TryLockError::Error(_)) => Some(file),
+    }
+}
+
+/// How often [`wait_for_workspace_lock`] checks the lock.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait up to `limit` for whoever holds workspace `id`'s lock to release it.
+/// `true` once it's free, `false` if it's still held at `limit`. It doesn't
+/// keep the lock: the workspace is locked when it's opened, as on any launch.
+pub fn wait_for_workspace_lock(id: Uuid, limit: std::time::Duration) -> bool {
+    match workspaces_dir() {
+        Some(dir) => wait_for_lock_dir(&dir.join(id.to_string()), limit, LOCK_POLL),
+        None => true,
+    }
+}
+
+fn wait_for_lock_dir(dir: &Path, limit: std::time::Duration, poll: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if try_lock_dir(dir).is_some() {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(poll);
     }
 }
 
@@ -377,6 +434,56 @@ pub fn load_workspaces_index() -> WorkspacesIndex {
         .unwrap_or_default()
 }
 
+/// Change the workspaces index as it is on disk now, and save the result.
+///
+/// Every muxel window is its own process, and they share one index. Applying the
+/// change to a fresh read, under a lock, keeps one window's older copy from
+/// dropping a workspace another window has just created. `fallback` is used when
+/// the file is missing or unreadable, so a damaged index is replaced by what this
+/// window knows rather than by an empty one.
+pub fn update_workspaces_index(
+    fallback: &WorkspacesIndex,
+    change: impl FnOnce(&mut WorkspacesIndex),
+) -> Result<WorkspacesIndex> {
+    let path = workspaces_index_path().context("could not determine data directory")?;
+    update_workspaces_index_at(&path, fallback, change)
+}
+
+fn update_workspaces_index_at(
+    path: &Path,
+    fallback: &WorkspacesIndex,
+    change: impl FnOnce(&mut WorkspacesIndex),
+) -> Result<WorkspacesIndex> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating data dir {}", parent.display()))?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .with_context(|| format!("opening the lock beside {}", path.display()))?;
+    // Held until the save below is in place. A filesystem that can't lock still
+    // gets the fresh read, which is most of the protection.
+    let _ = lock.lock();
+    let mut index = try_load_workspaces_index_from(path).unwrap_or_else(|| fallback.clone());
+    change(&mut index);
+    save_workspaces_index_to(path, &index)?;
+    Ok(index)
+}
+
+/// The index at `path`, or `None` when it is missing or can't be parsed.
+fn try_load_workspaces_index_from(path: &Path) -> Option<WorkspacesIndex> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Whether another muxel window has workspace `id` open right now. Takes and
+/// releases the workspace's lock, so it's only a snapshot.
+pub fn workspace_in_use(id: Uuid) -> bool {
+    matches!(try_lock_workspace(id), WorkspaceLock::Busy)
+}
+
 /// Load a workspaces index from an explicit path.
 pub fn load_workspaces_index_from(path: &Path) -> WorkspacesIndex {
     match std::fs::read_to_string(path) {
@@ -432,7 +539,9 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let index_path = base.join("workspaces.json");
     if index_path.exists() {
-        return load_workspaces_index_from(&index_path);
+        let mut index = load_workspaces_index_from(&index_path);
+        forget_deleted(&mut index, &base.join("workspaces"));
+        return index;
     }
     let id = Uuid::new_v4();
     let index = WorkspacesIndex {
@@ -459,6 +568,21 @@ fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
     }
     let _ = save_workspaces_index_to(&index_path, &index);
     index
+}
+
+/// Leave out workspaces marked deleted: muxel stopped after marking one and
+/// before saving the index without it. What it kept goes with the next
+/// sweep (see [`rescue::sweep_deleted_workspaces`]).
+fn forget_deleted(index: &mut WorkspacesIndex, workspaces: &Path) {
+    index
+        .workspaces
+        .retain(|meta| !rescue::marked_deleted_in(workspaces, meta.id));
+    if index
+        .current
+        .is_some_and(|id| !index.workspaces.iter().any(|meta| meta.id == id))
+    {
+        index.current = index.workspaces.first().map(|meta| meta.id);
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +863,41 @@ mod tests {
     }
 
     #[test]
+    fn index_updates_apply_to_what_another_window_saved() {
+        let dir = std::env::temp_dir().join(format!("muxel-store-index-{}", Uuid::new_v4()));
+        let path = dir.join("workspaces.json");
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let meta = |id, name: &str| WorkspaceMeta {
+            id,
+            name: name.into(),
+        };
+        // This window loaded the index when only A existed.
+        let stale = WorkspacesIndex {
+            workspaces: vec![meta(a, "A")],
+            current: Some(a),
+        };
+        save_workspaces_index_to(&path, &stale).unwrap();
+        // Another window adds B.
+        update_workspaces_index_at(&path, &stale, |index| index.workspaces.push(meta(b, "B")))
+            .unwrap();
+        // This window adds C from its stale copy: B survives.
+        let merged =
+            update_workspaces_index_at(&path, &stale, |index| index.workspaces.push(meta(c, "C")))
+                .unwrap();
+        let ids: Vec<Uuid> = merged.workspaces.iter().map(|w| w.id).collect();
+        assert_eq!(ids, [a, b, c]);
+        assert_eq!(load_workspaces_index_from(&path).workspaces.len(), 3);
+
+        // A damaged file is replaced by what this window knows, not by nothing.
+        std::fs::write(&path, "{not json").unwrap();
+        let repaired =
+            update_workspaces_index_at(&path, &stale, |index| index.current = None).unwrap();
+        assert_eq!(repaired.workspaces.len(), 1);
+        assert_eq!(repaired.current, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn workspace_lock_is_per_workspace() {
         let base = std::env::temp_dir().join("muxel-store-test-lock");
         let _ = std::fs::remove_dir_all(&base);
@@ -759,6 +918,34 @@ mod tests {
         drop(lock_b);
         drop(lock_a2);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A restarted muxel waits while the old one holds the workspace, stops
+    /// waiting at its limit, goes on as soon as the lock is released, and
+    /// doesn't keep the lock itself.
+    #[test]
+    fn a_restart_waits_for_the_workspace_lock_and_no_longer() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("muxel-store-test-wait-{}", Uuid::new_v4()));
+        let poll = Duration::from_millis(20);
+        let held = try_lock_dir(&dir).expect("the old process holds the workspace");
+
+        let start = Instant::now();
+        assert!(!wait_for_lock_dir(&dir, Duration::from_millis(300), poll));
+        assert!(start.elapsed() >= Duration::from_millis(300));
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let start = Instant::now();
+        assert!(wait_for_lock_dir(&dir, Duration::from_secs(20), poll));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        release.join().unwrap();
+
+        let opened = try_lock_dir(&dir).expect("the wait left the workspace unlocked");
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -826,6 +1013,40 @@ mod tests {
 
         // Re-running is idempotent (index already exists).
         assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_workspace_marked_deleted_is_not_listed_again() {
+        let base = std::env::temp_dir().join(format!("muxel-store-test-marked-{}", Uuid::new_v4()));
+        let kept = Uuid::new_v4();
+        let doomed = Uuid::new_v4();
+        let index = WorkspacesIndex {
+            workspaces: vec![
+                WorkspaceMeta {
+                    id: kept,
+                    name: "kept".into(),
+                },
+                WorkspaceMeta {
+                    id: doomed,
+                    name: "doomed".into(),
+                },
+            ],
+            current: Some(doomed),
+        };
+        save_workspaces_index_to(&base.join("workspaces.json"), &index).unwrap();
+        // Deleting it got as far as its marker before muxel stopped.
+        std::fs::create_dir_all(base.join("workspaces").join(doomed.to_string())).unwrap();
+        std::fs::write(
+            base.join("workspaces").join(format!("{doomed}.deleted")),
+            "",
+        )
+        .unwrap();
+
+        let index = migrate_workspaces_at(&base);
+        let listed: Vec<Uuid> = index.workspaces.iter().map(|w| w.id).collect();
+        assert_eq!(listed, vec![kept], "the deleted workspace stays deleted");
+        assert_eq!(index.current, Some(kept));
         let _ = std::fs::remove_dir_all(&base);
     }
 

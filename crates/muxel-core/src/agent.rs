@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 mod claude_sessions;
+mod codex_background;
 mod codex_sessions;
 pub use claude_sessions::{
     ClaudeSession, ClaudeSessionRequest, discover_claude_sessions, stored_claude_session_path,
 };
+pub use codex_background::{CodexReadBudget, CodexSubagentSnapshot, CodexSubagents};
 pub use codex_sessions::{
     CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_latest_sessions,
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
@@ -570,28 +572,37 @@ impl AgentPreset {
     }
 }
 
+/// The name `program` runs under, for matching it against a provider: its
+/// basename without the directory, lowercased, with one trailing `.exe`, `.cmd`
+/// or `.bat` removed. Windows launches all three by bare name, so `codex`,
+/// `codex.exe` and npm's `codex.cmd` shim are the same program. `None` when
+/// nothing is left (`""`, `/opt/codex/`, `.exe`).
+pub fn program_stem(program: &str) -> Option<String> {
+    let program = program.trim();
+    let leaf = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let stem = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|suffix| leaf.strip_suffix(suffix))
+        .unwrap_or(&leaf);
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
 /// Whether `program` runs one of muxel's built-in agent providers — the program
-/// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
-/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
-/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
-/// user preset runs it.
+/// of a [`AgentPreset::builtin_agents`] preset — matched by [`program_stem`],
+/// so its directory, case and a `.exe`, `.cmd` or `.bat` suffix don't matter.
+/// Anything else (`ssh`, `wsl.exe`, `python`, a wrapper with its own name, a
+/// shell) is not, even if a user preset runs it.
 pub fn is_known_agent_program(program: Option<&str>) -> bool {
-    fn stem(program: &str) -> Option<String> {
-        let program = program.trim();
-        let leaf = program
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(program)
-            .to_ascii_lowercase();
-        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
-        (!stem.is_empty()).then(|| stem.to_string())
-    }
-    let Some(name) = program.and_then(stem) else {
+    let Some(name) = program.and_then(program_stem) else {
         return false;
     };
     AgentPreset::builtin_agents()
         .iter()
-        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .filter_map(|preset| preset.program.as_deref().and_then(program_stem))
         .any(|known| known == name)
 }
 
@@ -712,6 +723,10 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     if instance.program.as_deref().is_some_and(is_codex_program) {
         args.push("--config".to_string());
         args.push(codex_terminal_title_override().to_string());
+        if instance.control_prompt && startup_input.is_some() {
+            args.push("--config".to_string());
+            args.push("check_for_update_on_startup=false".to_string());
+        }
     }
 
     let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
@@ -761,6 +776,13 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     let id_flag = preset.session_id_flag.as_deref()?;
     let id = instance.session_id.as_deref()?;
     Some(vec![id_flag.to_string(), id.to_string()])
+}
+
+/// Whether a restart would resume this pane's conversation rather than start
+/// a new one: it has launched, its conversation id has been captured, and its
+/// preset resumes by id. What sleep relies on to bring the same work back.
+pub fn resume_trusted(preset: &AgentPreset, instance: &Instance) -> bool {
+    instance.session_started && session_resume_args(preset, instance).is_some()
 }
 
 /// Path to Claude's on-disk session transcript for an agent running in `cwd`:
@@ -1392,6 +1414,44 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// Windows launches a program by bare name through `.exe`, `.cmd` or
+    /// `.bat`, and npm installs agents as `.cmd` shims, so a pane's program can
+    /// name an agent in any of those forms, in any case, from any directory.
+    #[test]
+    fn known_agents_match_under_every_windows_launch_suffix_and_path_form() {
+        let names = [
+            "claude", "codex", "grok", "opencode", "amp", "muse", "hermes", "ollama", "pi",
+        ];
+        let suffixes = ["", ".exe", ".EXE", ".cmd", ".Cmd", ".bat", ".BAT"];
+        let forms = [
+            "{}",
+            "  {}  ",
+            r"C:\Users\me\AppData\Roaming\npm\{}",
+            r"\\host\share\tools\{}",
+            r".\bin\{}",
+            "/usr/local/bin/{}",
+        ];
+        for name in names {
+            for suffix in suffixes {
+                let file = format!("{name}{suffix}");
+                for form in forms {
+                    let program = form.replace("{}", &file);
+                    assert!(is_known_agent_program(Some(&program)), "{program}");
+                }
+                let upper = file.to_ascii_uppercase();
+                assert!(is_known_agent_program(Some(&upper)), "{upper}");
+                // Another program whose name only starts with the agent's.
+                let wrapper = format!("{name}-wrapper{suffix}");
+                assert!(!is_known_agent_program(Some(&wrapper)), "{wrapper}");
+            }
+            // Not a suffix muxel launches, or not the last one.
+            for other in [".ps1", ".sh", ".exe.bak", ".cmd.txt"] {
+                let program = format!("{name}{other}");
+                assert!(!is_known_agent_program(Some(&program)), "{program}");
+            }
+        }
+    }
+
     #[test]
     fn known_agents_are_the_builtin_agent_programs_by_basename() {
         for program in [
@@ -1421,7 +1481,6 @@ mod tests {
             Some("cmd.exe"),
             Some("pwsh"),
             Some("claude-wrapper"),
-            Some("codex.cmd"),
             Some("/opt/codex/"),
         ] {
             assert!(!is_known_agent_program(program), "{program:?}");
@@ -1504,6 +1563,51 @@ mod tests {
             session_resume_args(&preset, &pane),
             Some(vec!["resume".to_string(), session_id])
         );
+    }
+
+    #[test]
+    fn windows_settings_wait_for_verified_codec() {
+        let launch = resolve_launch(&instance(&AgentPreset::codex(), None));
+        assert!(
+            !launch
+                .args
+                .iter()
+                .any(|arg| arg.contains("disable_paste_burst")),
+            "pure launch resolution cannot verify the native codec; leave paste detection enabled"
+        );
+    }
+
+    #[test]
+    fn codex_control_launches_configure_input_without_changing_literal_argv() {
+        let mut pane = instance(&AgentPreset::codex(), Some("startup task"));
+        pane.control_prompt = true;
+        pane.auto_submit = true;
+        let launch = resolve_launch(&pane);
+        assert_eq!(launch.startup_input.as_deref(), Some("startup task"));
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "check_for_update_on_startup=false"] })
+        );
+        assert!(
+            !launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "disable_paste_burst=true"] })
+        );
+        let resumed = resolve_launch_for_session(&pane, true);
+        assert!(resumed.startup_input.is_none());
+        assert!(
+            !resumed
+                .args
+                .iter()
+                .any(|arg| arg == "check_for_update_on_startup=false")
+        );
+
+        pane.literal_argv = true;
+        pane.args = vec!["--config".into(), "disable_paste_burst=false".into()];
+        assert_eq!(resolve_launch(&pane).args, pane.args);
     }
 
     #[test]
@@ -1856,6 +1960,37 @@ mod tests {
         s.session_id = Some("abc".to_string());
         s.session_started = true;
         assert_eq!(session_resume_args(&shell, &s), None);
+    }
+
+    #[test]
+    fn only_a_launched_pane_with_a_captured_id_trusts_its_resume() {
+        // Sleep ends the program on this answer, so a pane that would start a
+        // new conversation instead (Claude's first launch passes --session-id,
+        // which resume args alone can't tell apart) must never pass.
+        for preset in AgentPreset::builtin_agents()
+            .into_iter()
+            .chain([AgentPreset::shell()])
+        {
+            let mut inst = instance(&preset, None);
+            inst.session_id = Some("abc".to_string());
+            assert!(!resume_trusted(&preset, &inst), "{} unstarted", preset.name);
+            inst.session_started = true;
+            assert_eq!(
+                resume_trusted(&preset, &inst),
+                preset.effective_resume_flag().is_some(),
+                "{} started",
+                preset.name
+            );
+            inst.session_id = None;
+            assert!(
+                !resume_trusted(&preset, &inst),
+                "{} without an id",
+                preset.name
+            );
+            inst.session_id = Some("abc".to_string());
+            inst.literal_argv = true;
+            assert!(!resume_trusted(&preset, &inst), "{} literal", preset.name);
+        }
     }
 
     #[test]

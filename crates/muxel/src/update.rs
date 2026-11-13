@@ -106,10 +106,42 @@ pub struct UpdateInfo {
 }
 
 /// What to run after an update is staged, to start the new version.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RelaunchPlan {
     pub program: PathBuf,
+    /// The launcher's own arguments.
     pub args: Vec<String>,
+    /// Arguments for the new muxel itself, added as the Restart starts it.
+    pub app_args: Vec<String>,
+    /// What separates the app's arguments from the launcher's: macOS `open`
+    /// keeps everything before `--args` for itself.
+    pub app_args_after: Option<&'static str>,
+    /// `program` is a launcher whose exit status says whether the new version
+    /// started, as macOS `open` does, rather than the new version itself.
+    pub wait_for_exit: bool,
+}
+
+impl RelaunchPlan {
+    /// Start the macOS app `bundle` as a new instance.
+    fn open_bundle(bundle: &Path) -> Self {
+        Self {
+            program: PathBuf::from("/usr/bin/open"),
+            args: vec!["-n".into(), bundle.to_string_lossy().into_owned()],
+            app_args: vec![],
+            app_args_after: Some("--args"),
+            wait_for_exit: true,
+        }
+    }
+
+    /// Every argument, the launcher's first and then the app's.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = self.args.clone();
+        if !self.app_args.is_empty() {
+            argv.extend(self.app_args_after.map(str::to_string));
+            argv.extend(self.app_args.iter().cloned());
+        }
+        argv
+    }
 }
 
 /// Compare dotted numeric versions; `true` iff `latest` is strictly newer than
@@ -230,12 +262,51 @@ pub fn download_and_apply(kind: InstallKind, asset_url: &str) -> Result<Relaunch
     result
 }
 
-/// Start the freshly-installed version and exit the current process.
-pub fn relaunch_and_exit(plan: &RelaunchPlan) -> ! {
-    let _ = muxel_core::child_env::command(&plan.program)
-        .args(&plan.args)
-        .spawn();
-    std::process::exit(0);
+/// The longest a Restart waits for a launcher to say whether the new version
+/// started. macOS `open` normally answers well inside a second.
+const LAUNCHER_WAIT: Duration = Duration::from_secs(10);
+
+/// Start the freshly-installed version. The caller quits once it has.
+///
+/// A launcher ([`RelaunchPlan::wait_for_exit`]) is waited for: macOS `open`
+/// exits once Launch Services has started the bundle or refused it, and only
+/// its exit status says which. A program that is the new version isn't.
+pub fn relaunch(plan: &RelaunchPlan) -> std::io::Result<()> {
+    let mut child = muxel_core::child_env::command(&plan.program)
+        .args(plan.argv())
+        .spawn()?;
+    if !plan.wait_for_exit {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + LAUNCHER_WAIT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return launcher_verdict(Some(status.code()));
+        }
+        if std::time::Instant::now() >= deadline {
+            return launcher_verdict(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a launcher's exit says about the new version: `None` if it hadn't
+/// exited by the deadline, else its exit code (`None` when a signal ended it).
+/// Only a clean exit means it started.
+fn launcher_verdict(exit: Option<Option<i32>>) -> std::io::Result<()> {
+    match exit {
+        Some(Some(0)) => Ok(()),
+        Some(Some(code)) => Err(std::io::Error::other(format!(
+            "its launcher exited with code {code}"
+        ))),
+        Some(None) => Err(std::io::Error::other(
+            "its launcher was stopped before it finished",
+        )),
+        None => Err(std::io::Error::other(format!(
+            "its launcher didn't finish within {} seconds",
+            LAUNCHER_WAIT.as_secs()
+        ))),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -252,14 +323,14 @@ fn apply_linux(url: &str, work: &Path) -> Result<RelaunchPlan> {
         overwrite_in_place(&dl, &appimage)?;
         Ok(RelaunchPlan {
             program: appimage,
-            args: vec![],
+            ..RelaunchPlan::default()
         })
     } else {
         let exe = std::env::current_exe().context("resolving current_exe")?;
         self_replace::self_replace(&dl).context("replacing the muxel binary")?;
         Ok(RelaunchPlan {
             program: exe,
-            args: vec![],
+            ..RelaunchPlan::default()
         })
     }
 }
@@ -272,7 +343,7 @@ fn apply_windows(url: &str, work: &Path) -> Result<RelaunchPlan> {
     let exe = std::env::current_exe().context("resolving current_exe")?;
     Ok(RelaunchPlan {
         program: exe,
-        args: vec![],
+        ..RelaunchPlan::default()
     })
 }
 
@@ -313,10 +384,7 @@ fn apply_macos(url: &str, work: &Path) -> Result<RelaunchPlan> {
         .arg(&bundle)
         .status();
 
-    Ok(RelaunchPlan {
-        program: PathBuf::from("/usr/bin/open"),
-        args: vec!["-n".into(), bundle.to_string_lossy().into_owned()],
-    })
+    Ok(RelaunchPlan::open_bundle(&bundle))
 }
 
 // ----------------------------------------------------------------------------
@@ -428,6 +496,64 @@ fn extract_all(zip_path: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The new version's own arguments reach it: straight after the program,
+    /// or after `--args` when macOS `open` launches the bundle.
+    #[test]
+    fn a_restart_hands_the_new_version_its_own_arguments() {
+        let app_args = vec!["--after-restart".to_string(), "id".to_string()];
+        let direct = RelaunchPlan {
+            program: "muxel".into(),
+            app_args: app_args.clone(),
+            ..RelaunchPlan::default()
+        };
+        assert_eq!(direct.argv(), app_args);
+        let mut open = RelaunchPlan::open_bundle(Path::new("/Applications/muxel.app"));
+        assert_eq!(open.argv(), ["-n", "/Applications/muxel.app"]);
+        open.app_args = app_args;
+        assert_eq!(
+            open.argv(),
+            [
+                "-n",
+                "/Applications/muxel.app",
+                "--args",
+                "--after-restart",
+                "id"
+            ]
+        );
+    }
+
+    /// A Restart through a launcher, as macOS `open` is, counts the new
+    /// version started only when the launcher exits cleanly. A shell stands in
+    /// for `open`; this hasn't run on a Mac.
+    #[test]
+    fn a_launcher_that_fails_fails_the_restart() {
+        assert!(RelaunchPlan::open_bundle(Path::new("/Applications/muxel.app")).wait_for_exit);
+        assert!(!RelaunchPlan::default().wait_for_exit);
+        let launcher = |code: u8| {
+            let (program, args) = if cfg!(windows) {
+                (
+                    "cmd.exe",
+                    vec!["/D".to_string(), "/C".into(), format!("exit {code}")],
+                )
+            } else {
+                ("sh", vec!["-c".to_string(), format!("exit {code}")])
+            };
+            RelaunchPlan {
+                program: program.into(),
+                args,
+                wait_for_exit: true,
+                ..RelaunchPlan::default()
+            }
+        };
+        let failed = relaunch(&launcher(3)).expect_err("a launcher that failed counted as a start");
+        assert!(failed.to_string().contains("code 3"), "{failed}");
+        relaunch(&launcher(0)).expect("a launcher that succeeded counted as a failure");
+        // Neither reachable with a shell: a launcher stopped by a signal, or
+        // one still running at the deadline.
+        assert!(launcher_verdict(Some(None)).is_err());
+        assert!(launcher_verdict(None).is_err());
+    }
 
     #[test]
     fn is_newer_compares_versions() {

@@ -56,7 +56,7 @@ pub(crate) struct OverviewSnapshot {
 /// Local wall-clock seconds (unix seconds + the local UTC offset): the clock the
 /// log's dates are written in.
 pub(crate) fn local_now_secs() -> i64 {
-    let now = chrono::Local::now();
+    let now = crate::scene_mode::now_local();
     now.timestamp() + i64::from(now.offset().local_minus_utc())
 }
 

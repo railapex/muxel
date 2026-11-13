@@ -7,6 +7,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Terminal backend (PTY + alacritty_terminal) and GPUI terminal element for muxel."
 
+[features]
+# Switches for test binaries (`test_support`); never enabled for the app.
+test-support = []
+
 [dependencies]
 gpui.workspace = true
 
@@ -16,6 +20,9 @@ portable-pty = "0.9"
 
 parking_lot = "0.12"
 async-channel = "2.3"
+# Racing the draft watcher's debounce timer against input. Already in the tree
+# via gpui's executor crates.
+futures-lite = "2"
 base64 = "0.22"
 libc = "0.2"
 
@@ -26,10 +33,14 @@ uuid.workspace = true
 serde_json.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

@@ -53,7 +53,7 @@ extension InstanceKind: Codable {
 /// Persisted metadata for one pane. Port of `Instance`
 /// (`crates/muxel-core/src/lib.rs`). Every field except `id`/`projectId`/`title`
 /// is `#[serde(default)]` in Rust, so decoding tolerates older documents missing
-/// them. Encoding writes all fields (Rust serializes all fields).
+/// them. Optional fields marked skip_serializing_if in Rust are omitted when absent.
 struct Instance: Codable, Equatable, Identifiable {
     var id: String
     var projectId: String
@@ -64,6 +64,8 @@ struct Instance: Codable, Equatable, Identifiable {
     /// preserves this so an iOS layout write-back doesn't strip it from the peer.
     var browserUrl: String?
     var customName: String?
+    /// Stable ctl alias used until the agent publishes its own title.
+    var label: String?
     /// Last program-supplied title. Preserved across remote-layout write-back;
     /// a manual custom name still wins.
     var autoName: String?
@@ -100,6 +102,16 @@ struct Instance: Codable, Equatable, Identifiable {
     /// preserves it so an iOS layout write-back doesn't strip it from the peer.
     var sessionPath: String?
     var sessionStarted: Bool = false
+    /// When the pane was opened, in Unix milliseconds. Desktop Recent work places
+    /// a pane that has never worked by it. iOS records it for the panes it opens
+    /// and preserves it so an iOS layout write-back doesn't strip it from the
+    /// peer. Written only when known, like Rust's `skip_serializing_if`.
+    var createdAt: Int64?
+
+    /// Now, in the Unix milliseconds `createdAt` uses.
+    static func openedNow() -> Int64 {
+        Int64((Date().timeIntervalSince1970 * 1000).rounded(.down))
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -108,6 +120,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case editorPath = "editor_path"
         case browserUrl = "browser_url"
         case customName = "custom_name"
+        case label
         case autoName = "auto_name"
         case program, args
         case literalArgv = "literal_argv"
@@ -134,6 +147,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case sessionId = "session_id"
         case sessionPath = "session_path"
         case sessionStarted = "session_started"
+        case createdAt = "created_at"
     }
 
     /// Build a fresh terminal instance the iOS app is about to launch. `sessionStarted`
@@ -145,6 +159,7 @@ struct Instance: Codable, Equatable, Identifiable {
         self.title = title
         self.program = program
         self.args = args
+        self.createdAt = Instance.openedNow()
     }
 
     init(from decoder: Decoder) throws {
@@ -156,6 +171,7 @@ struct Instance: Codable, Equatable, Identifiable {
         editorPath = try c.decodeIfPresent(String.self, forKey: .editorPath)
         browserUrl = try c.decodeIfPresent(String.self, forKey: .browserUrl)
         customName = try c.decodeIfPresent(String.self, forKey: .customName)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
         autoName = try c.decodeIfPresent(String.self, forKey: .autoName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
@@ -188,6 +204,7 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
         sessionPath = try c.decodeIfPresent(String.self, forKey: .sessionPath)
         sessionStarted = (try c.decodeIfPresent(Bool.self, forKey: .sessionStarted)) ?? false
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -199,6 +216,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(editorPath, forKey: .editorPath)
         try c.encode(browserUrl, forKey: .browserUrl)
         try c.encode(customName, forKey: .customName)
+        try c.encodeIfPresent(label, forKey: .label)
         try c.encode(autoName, forKey: .autoName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)
@@ -227,6 +245,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(sessionId, forKey: .sessionId)
         try c.encode(sessionPath, forKey: .sessionPath)
         try c.encode(sessionStarted, forKey: .sessionStarted)
+        try c.encodeIfPresent(createdAt, forKey: .createdAt)
     }
 
     /// The display label shown in the tab bar.
@@ -240,6 +259,9 @@ struct Instance: Codable, Equatable, Identifiable {
         {
             return autoName
         }
+        if let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return label
+        }
         return title
     }
 
@@ -249,6 +271,8 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionStarted = false
         autoName = nil
         controlCreated = false
+        // The copy is opened when it is added, not when its source was.
+        createdAt = nil
         // An unconsumed `ctl new --prompt` task belongs to the request that was
         // approved, never to a copy of its pane. Port of Rust's
         // `reset_conversation_for_duplicate`.

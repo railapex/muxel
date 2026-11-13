@@ -9,21 +9,26 @@
 
 mod accomplishments_view;
 mod app;
-mod binding_watch;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
 mod browser_storage;
+mod build_info;
 mod control;
 mod editor;
+mod file_watch;
 mod filetree;
 mod i18n;
 mod integrations;
 mod libraries;
+mod new_window;
+mod pane_scope;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod remote_paste;
+mod restart_handoff;
+mod scene_mode;
 mod secrets;
 mod session_binding;
 mod settings_view;
@@ -35,6 +40,7 @@ mod test_support;
 mod theme;
 mod tmux_install;
 mod tts;
+mod uat_root;
 mod ui_profile;
 mod update;
 mod user_data_dir;
@@ -205,6 +211,7 @@ fn cli_info(first_arg: Option<&str>) -> Option<String> {
             "muxel {version} — a multi-agent terminal multiplexer\n\
              \n\
              usage: muxel                  open the muxel window\n       \
+             muxel --new-window     open another window, on the workspace selector\n       \
              muxel ctl <command>    control the running muxel (`muxel ctl help`)\n       \
              muxel --version        print the version and exit\n       \
              muxel --help           print this help and exit"
@@ -230,20 +237,47 @@ pub(crate) fn window_options() -> WindowOptions {
 fn main() {
     // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
     // this process and all it starts. First, before any path is read or thread runs.
-    let args = match user_data_dir::configure(std::env::args_os().skip(1).collect()) {
+    // The private UAT alias is normalized before the public root policy runs.
+    let args = match uat_root::configure(std::env::args_os().skip(1).collect())
+        .and_then(user_data_dir::configure)
+    {
         Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(2);
         }
     };
-    // Answer version/help before GUI startup, after consuming isolation flags.
+    let (args, after_restart) = restart_handoff::take(args);
+    let identity = match muxel_core::build_identity::parse_identity_args(&args) {
+        Ok(command) => command,
+        Err(error) => {
+            #[cfg(windows)]
+            control::attach_parent_console();
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    // Validate identity arguments before version/help returns, after consuming
+    // isolation and restart flags and before any endpoint or GUI initialization.
     if let Some(text) = cli_info(args.first().and_then(|arg| arg.to_str())) {
         #[cfg(windows)]
         control::attach_parent_console();
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+        return;
+    }
+    if let Some(command) = identity {
+        #[cfg(windows)]
+        control::attach_parent_console();
+        match command {
+            muxel_core::build_identity::IdentityCommand::Json => {
+                println!("{}", build_info::json_value());
+            }
+            muxel_core::build_identity::IdentityCommand::Version => {
+                println!("muxel {}", build_info::compact_label());
+            }
+        }
         return;
     }
     // `muxel ctl …` talks to the running app and exits; it never opens a window.
@@ -281,11 +315,28 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // `--new-window` / `--workspace ID`, as New Window passes them. What's left
+    // is read again only by Linux's `--browser` below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let args = match new_window::configure(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     install_panic_reporter();
+    // Linux: find out now whether panes can run in systemd scopes of their own.
+    pane_scope::warm();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Started by a Restart: the version this one replaces releases its
+    // workspace first, before any window opens or outside control starts.
+    if let Some(workspace) = after_restart {
+        restart_handoff::wait(workspace);
+    }
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what
@@ -413,10 +464,14 @@ fn main() {
 
             let window_bounds = muxel_store::load_window_geom().and_then(|g| {
                 if g.width > 0.0 && g.height > 0.0 {
-                    let bounds = Bounds {
+                    let mut bounds = Bounds {
                         origin: point(px(g.x), px(g.y)),
                         size: size(px(g.width), px(g.height)),
                     };
+                    // New Window: beside the window that opened it, not on top.
+                    if new_window::launch_request().cascade {
+                        bounds = new_window::cascaded(bounds);
+                    }
                     Some(if g.maximized {
                         WindowBounds::Maximized(bounds)
                     } else {
@@ -442,7 +497,7 @@ fn main() {
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
                     // shows "Unknown" in the title bar / window switcher.
-                    window.set_window_title("muxel");
+                    window.set_window_title(&build_info::native_window_title());
                     let view = cx.new(|cx| MuxelApp::new(window, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
