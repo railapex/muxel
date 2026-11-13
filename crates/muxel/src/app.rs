@@ -140,6 +140,8 @@ mod restart_completion_tests;
 mod restart_guard;
 #[cfg(all(test, windows))]
 mod rich_copy_tests;
+#[cfg(test)]
+mod scenes;
 mod session_discovery;
 mod session_folders;
 #[cfg(all(test, windows))]
@@ -4279,9 +4281,7 @@ fn basename_of(command: &str) -> &str {
 
 /// A rough "how long ago", for an imported conversation's last use.
 fn ago_label(secs: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+    let now = crate::scene_mode::now_local().timestamp();
     let delta = (now - secs).max(0);
     match delta {
         d if d < 90 => t("just now").to_string(),
@@ -28242,7 +28242,11 @@ impl MuxelApp {
             .justify_center()
             .gap_2()
             .text_color(cx.theme().muted_foreground)
-            .child(Spinner::new().small().ease(linear))
+            .child(
+                Spinner::new()
+                    .small()
+                    .ease(crate::scene_mode::spinner_easing(linear)),
+            )
             .child(t("Starting terminal…"))
             .into_any_element()
     }
@@ -36332,7 +36336,7 @@ impl MuxelApp {
                 .justify_center()
                 .h(px(180.0))
                 .gap_3()
-                .child(Spinner::new())
+                .child(Spinner::new().ease(crate::scene_mode::spinner_easing(ease_in_out)))
                 .child(
                     div()
                         .text_sm()

@@ -1517,12 +1517,26 @@ pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
 /// profiling off this is `build().into_any_element()`.
 pub(crate) fn region<E: IntoElement>(region: Region, build: impl FnOnce() -> E) -> AnyElement {
     if !is_enabled() {
-        return build().into_any_element();
+        return scene_region(region, build().into_any_element());
     }
     let scope = frame::open(region, frame::Phase::Build);
     let inner = build().into_any_element();
     drop(scope);
-    frame::ProfiledRegion { inner, region }.into_any_element()
+    scene_region(
+        region,
+        frame::ProfiledRegion { inner, region }.into_any_element(),
+    )
+}
+
+/// In a test that draws a scene, note where `region` lands so a frame can be
+/// cropped to it. Otherwise `element` unchanged.
+fn scene_region(region: Region, element: AnyElement) -> AnyElement {
+    #[cfg(test)]
+    if let Some(name) = region.scene_name() {
+        return crate::scene_mode::region(name, element);
+    }
+    let _ = region;
+    element
 }
 
 /// Attribute build work up to the guard's drop to `region`, for code that
@@ -1538,9 +1552,12 @@ pub(crate) fn region_scope(region: Region) -> Option<frame::RegionScope> {
 pub(crate) fn wrap_region(region: Region, element: impl IntoElement) -> AnyElement {
     let inner = element.into_any_element();
     if !is_enabled() {
-        return inner;
+        return scene_region(region, inner);
     }
-    frame::ProfiledRegion { inner, region }.into_any_element()
+    scene_region(
+        region,
+        frame::ProfiledRegion { inner, region }.into_any_element(),
+    )
 }
 
 /// The next tab-group slot of the frame being built (leaf render order).

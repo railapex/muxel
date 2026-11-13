@@ -345,7 +345,11 @@ impl MuxelApp {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(Spinner::new().small())
+                        .child(
+                            Spinner::new()
+                                .small()
+                                .ease(crate::scene_mode::spinner_easing(ease_in_out)),
+                        )
                         .child(para(
                             tf("Installing with {manager}…", &[("manager", manager)]).into(),
                         )),
