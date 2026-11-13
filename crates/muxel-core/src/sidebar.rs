@@ -37,6 +37,9 @@ pub enum SidebarEntry {
     /// and rows.
     FoldedBand(BandLabel),
     Pane(Uuid),
+    /// A top-level row whose family is folded: drawn as [`Self::Pane`], with
+    /// what its hidden rows hold in place of them. Recent work only.
+    Folded(Uuid, FamilyFold),
     /// A row drawn one level in, under the top-level session row before it:
     /// a file, diff or page that session opened, or a session it spawned.
     /// Recent work only.
@@ -44,6 +47,29 @@ pub enum SidebarEntry {
     /// A file, diff or page drawn two levels in, under the nested session row
     /// before it, which opened it. Recent work only.
     NestedTwice(Uuid),
+}
+
+/// What can fold in Recent work: a band, or the family under a top-level
+/// session (by that session's id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fold {
+    Band(ActivityBand),
+    Family(Uuid),
+}
+
+/// What a folded family's top row says of the rows it hides: its child
+/// sessions by group, the files, diffs and pages under it or them, and how
+/// many of all those are unread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FamilyFold {
+    pub asking: usize,
+    pub working: usize,
+    /// Have worked and aren't running a turn.
+    pub done: usize,
+    /// Have never worked.
+    pub idle: usize,
+    pub files: usize,
+    pub unread: usize,
 }
 
 /// What a folded band's label says of the rows it hides.
@@ -584,13 +610,15 @@ pub fn sidebar_rows_each<'a>(
 /// (`running`). It labels Needs you and Working when the unpinned rows span
 /// more than one section, and every band always, since a band can fold: a band
 /// `folded` says is folded has a [`SidebarEntry::FoldedBand`] label in place
-/// of its label and rows. Nothing about reading or focus is an input.
+/// of its label and rows, and a top-level row with rows under it whose family
+/// `folded` says is folded is a [`SidebarEntry::Folded`] row without them.
+/// Nothing about reading or focus is an input.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
     instances: &InstancesById,
     shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
     running: &dyn Fn(Uuid) -> bool,
-    folded: &dyn Fn(ActivityBand) -> bool,
+    folded: &dyn Fn(Fold) -> bool,
     clock: BandClock,
     sort: SidebarSort,
 ) -> Vec<SidebarEntry> {
@@ -683,13 +711,47 @@ pub fn sidebar_order(
             })
             .unwrap_or_else(|| place(&id))
     };
+    let files_of = |session: &Uuid| files.get(session).into_iter().flatten().map(|(f, _)| *f);
+    let unread_id = |id: &Uuid| {
+        instances
+            .get(id)
+            .is_some_and(|instance| is_unread(&instance.activity))
+    };
     let row = |out: &mut Vec<SidebarEntry>, id: Uuid| {
+        let children = || sessions.get(&id).into_iter().flatten().copied();
+        let under =
+            files_of(&id).count() + children().map(|c| 1 + files_of(&c).count()).sum::<usize>();
+        if under > 0 && folded(Fold::Family(id)) {
+            let mut fold = FamilyFold::default();
+            for child in children() {
+                match place(&child).group {
+                    RecentGroup::Asking => fold.asking += 1,
+                    RecentGroup::Working => fold.working += 1,
+                    RecentGroup::Done => fold.done += 1,
+                    RecentGroup::Unused => fold.idle += 1,
+                }
+            }
+            let hidden = files_of(&id)
+                .chain(children().flat_map(|c| std::iter::once(c).chain(files_of(&c))));
+            for hidden in hidden {
+                if instances
+                    .get(&hidden)
+                    .is_some_and(|i| i.kind != InstanceKind::Terminal)
+                {
+                    fold.files += 1;
+                }
+                if unread_id(&hidden) {
+                    fold.unread += 1;
+                }
+            }
+            out.push(SidebarEntry::Folded(id, fold));
+            return;
+        }
         out.push(SidebarEntry::Pane(id));
-        let files_of = |session: &Uuid| files.get(session).into_iter().flatten().map(|(f, _)| *f);
         out.extend(files_of(&id).map(SidebarEntry::Nested));
-        for child in sessions.get(&id).into_iter().flatten() {
-            out.push(SidebarEntry::Nested(*child));
-            out.extend(files_of(child).map(SidebarEntry::NestedTwice));
+        for child in children() {
+            out.push(SidebarEntry::Nested(child));
+            out.extend(files_of(&child).map(SidebarEntry::NestedTwice));
         }
     };
     let placed = |ids: Vec<Uuid>| {
@@ -735,10 +797,13 @@ pub fn sidebar_order(
             row(rows, id);
         }
     }
+    // A row's own unread mark, and a folded family's hidden ones.
     let unread = |entry: &SidebarEntry| {
-        entry_id(entry)
-            .and_then(|id| instances.get(&id))
-            .is_some_and(|instance| is_unread(&instance.activity))
+        let own = entry_id(entry).is_some_and(|id| unread_id(&id)) as usize;
+        match entry {
+            SidebarEntry::Folded(_, fold) => own + fold.unread,
+            _ => own,
+        }
     };
     for (section, count, rows) in sections {
         match section {
@@ -751,11 +816,11 @@ pub fn sidebar_order(
                 }
                 out.extend(rows);
             }
-            RecentSection::Band(band) if folded(band) => {
+            RecentSection::Band(band) if folded(Fold::Band(band)) => {
                 out.push(SidebarEntry::FoldedBand(BandLabel {
                     band,
                     rows: count,
-                    unread: rows.iter().filter(|entry| unread(entry)).count(),
+                    unread: rows.iter().map(unread).sum(),
                 }));
             }
             RecentSection::Band(band) => {
@@ -770,9 +835,10 @@ pub fn sidebar_order(
 /// The row `entry` draws, if it is a row rather than a label.
 pub fn entry_id(entry: &SidebarEntry) -> Option<Uuid> {
     match entry {
-        SidebarEntry::Pane(id) | SidebarEntry::Nested(id) | SidebarEntry::NestedTwice(id) => {
-            Some(*id)
-        }
+        SidebarEntry::Pane(id)
+        | SidebarEntry::Folded(id, _)
+        | SidebarEntry::Nested(id)
+        | SidebarEntry::NestedTwice(id) => Some(*id),
         SidebarEntry::Worktree(_)
         | SidebarEntry::NeedsYou(_)
         | SidebarEntry::Working(_)
@@ -792,7 +858,7 @@ pub fn label_rows(entries: &[SidebarEntry], at: usize) -> usize {
         .iter()
         .skip(at + 1)
         .take_while(|entry| entry_id(entry).is_some())
-        .filter(|entry| matches!(entry, SidebarEntry::Pane(_)))
+        .filter(|entry| matches!(entry, SidebarEntry::Pane(_) | SidebarEntry::Folded(..)))
         .count()
 }
 
@@ -2277,15 +2343,85 @@ mod tests {
         let rows = sidebar_rows(project, workspace, &|_| false, SidebarSort::RecentWork);
         let index = instances_by_id(workspace);
         let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        let folded = |fold| matches!(fold, Fold::Band(band) if folded(band));
         sidebar_order(
             &rows,
             &index,
             &shown,
             &|_| true,
-            folded,
+            &folded,
             clock(),
             SidebarSort::RecentWork,
         )
+    }
+
+    #[test]
+    fn a_folded_family_is_one_row_that_says_what_it_hides() {
+        use AgentActivityState::{Blocked, Working};
+        use SidebarEntry::{Band, Folded, NeedsYou, Pane};
+        let (mut project, mut workspace, ids) =
+            fixture(vec![worked(NOW - HOUR), worked(NOW - 2 * HOUR)]);
+        let (top, other) = (ids[0], ids[1]);
+        let mut child = |activity| session(&mut workspace, &mut project, Some(top), activity);
+        let asker = child(worked(NOW - 3 * HOUR));
+        let worker = child(worked(NOW - 4 * HOUR));
+        let finisher = child(unread(NOW - 30 * MINUTE));
+        change(&mut workspace, asker, Blocked, NOW - 10 * MINUTE);
+        change(&mut workspace, worker, Working, NOW - 5 * MINUTE);
+        file(&mut workspace, &mut project, Some(top), NOW - 20 * MINUTE);
+        file(
+            &mut workspace,
+            &mut project,
+            Some(finisher),
+            NOW - 25 * MINUTE,
+        );
+        let rows = sidebar_rows(&project, &workspace, &|_| false, SidebarSort::RecentWork);
+        let index = instances_by_id(&workspace);
+        let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        let order = |folded: &dyn Fn(Fold) -> bool| {
+            sidebar_order(
+                &rows,
+                &index,
+                &shown,
+                &|_| true,
+                folded,
+                clock(),
+                SidebarSort::RecentWork,
+            )
+        };
+        // Two labels; top, its three children and two files; and the other row.
+        assert_eq!(
+            order(&|_| false).len(),
+            2 + 6 + 1,
+            "two labels and every row"
+        );
+        let folded = order(&|fold| fold == Fold::Family(top));
+        assert_eq!(
+            folded,
+            vec![
+                NeedsYou(1),
+                Folded(
+                    top,
+                    FamilyFold {
+                        asking: 1,
+                        working: 1,
+                        done: 1,
+                        idle: 0,
+                        files: 2,
+                        unread: 2,
+                    }
+                ),
+                Band(ActivityBand::Today),
+                Pane(other),
+            ],
+            "the family keeps its place, and its asking child its count"
+        );
+        assert_eq!(label_rows(&folded, 0), 1);
+        // A family with nothing under it has nothing to fold.
+        assert_eq!(
+            order(&|fold| fold == Fold::Family(other))[7..],
+            [Band(ActivityBand::Today), Pane(other)]
+        );
     }
 
     #[test]
@@ -2392,7 +2528,7 @@ mod tests {
         // Every third row's process has stopped.
         let stopped: HashSet<Uuid> = ids.iter().copied().step_by(3).collect();
         let running = |id: Uuid| !stopped.contains(&id);
-        let order = |folded: &dyn Fn(ActivityBand) -> bool| {
+        let order = |folded: &dyn Fn(Fold) -> bool| {
             sidebar_order(
                 &listed,
                 &index,
@@ -2412,28 +2548,57 @@ mod tests {
         });
         assert_eq!(needs_you, Some(counts.asking));
 
-        let folded = order(&|_| true);
-        let drawn: Vec<Uuid> = folded.iter().filter_map(entry_id).collect();
-        let drawn_in = |state| {
-            drawn
+        // What the rows drawn show plus what the folded labels and families
+        // say they hide, as (asking, working, unread).
+        let shown_and_said = |entries: &[SidebarEntry]| {
+            let drawn: Vec<Uuid> = entries.iter().filter_map(entry_id).collect();
+            let drawn_in = |state| {
+                drawn
+                    .iter()
+                    .filter(|&&id| row_state(id, &shown, &running) == Some(state))
+                    .count()
+            };
+            let said = |pick: fn(&FamilyFold) -> usize| -> usize {
+                entries
+                    .iter()
+                    .map(|entry| match entry {
+                        SidebarEntry::Folded(_, fold) => pick(fold),
+                        _ => 0,
+                    })
+                    .sum()
+            };
+            let unread_drawn = drawn
                 .iter()
-                .filter(|&&id| row_state(id, &shown, &running) == Some(state))
-                .count()
+                .filter(|&id| is_unread(&index[id].activity))
+                .count();
+            let unread_bands: usize = entries
+                .iter()
+                .map(|entry| match entry {
+                    SidebarEntry::FoldedBand(label) => label.unread,
+                    _ => 0,
+                })
+                .sum();
+            (
+                drawn_in(AgentActivityState::Blocked) + said(|fold| fold.asking),
+                drawn_in(AgentActivityState::Working) + said(|fold| fold.working),
+                unread_drawn + unread_bands + said(|fold| fold.unread),
+            )
         };
-        assert_eq!(drawn_in(AgentActivityState::Blocked), counts.asking);
-        assert_eq!(drawn_in(AgentActivityState::Working), counts.working);
-        let unread_drawn = drawn
-            .iter()
-            .filter(|&id| is_unread(&index[id].activity))
-            .count();
-        let unread_folded: usize = folded
-            .iter()
-            .map(|entry| match entry {
-                SidebarEntry::FoldedBand(label) => label.unread,
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(unread_drawn + unread_folded, counts.unread);
+        let all = (counts.asking, counts.working, counts.unread);
+        let bands_folded = order(&|fold| matches!(fold, Fold::Band(_)));
+        assert_eq!(shown_and_said(&bands_folded), all, "bands folded");
+        let everything_folded = order(&|_| true);
+        assert!(
+            everything_folded
+                .iter()
+                .any(|entry| matches!(entry, SidebarEntry::Folded(..))),
+            "some families fold"
+        );
+        assert_eq!(
+            shown_and_said(&everything_folded),
+            all,
+            "bands and families folded"
+        );
     }
 
     #[test]
