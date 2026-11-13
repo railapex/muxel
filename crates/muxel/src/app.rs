@@ -35,10 +35,10 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, FamilyTags, InstancesById, SelectClick, SidebarEntry, SidebarSort,
-    entry_id, family_tags, instances_by_id, is_unread, label_rows, nest_on_drop,
-    notification_in_feed, select_rows, sessions_under, sidebar_order, sidebar_rows_each,
-    unread_count,
+    ActivityBand, BandClock, FamilyTags, InstancesById, RowCounts, SelectClick, SidebarEntry,
+    SidebarSort, entry_id, family_tags, instances_by_id, is_unread, label_rows, nest_on_drop,
+    next_matching, notification_in_feed, row_counts, row_state, select_rows, sessions_under,
+    sidebar_order, sidebar_rows_each,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -1785,6 +1785,15 @@ fn pane_alert_sound(
     } else {
         status_alert_sound(status)
     }
+}
+
+/// Which rows a count on Recent work's workspace line jumps between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowJump {
+    /// Rows asking for something.
+    Asking,
+    /// Rows with a finish or question not yet seen.
+    Unread,
 }
 
 fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
@@ -23970,21 +23979,50 @@ impl MuxelApp {
         bands: BandClock,
         cx: &App,
     ) -> Vec<SidebarEntry> {
-        let shown = |iid: Uuid| {
-            let instance = placing.get(&iid).copied();
-            Some(activity_state(self.sidebar_status(iid, instance, cx)))
-        };
-        let running = |iid: Uuid| self.sidebar_running(iid);
         let folded = |band| project.band_folded(band, self.settings.older_starts_folded);
+        self.sidebar_entries_folded(pane_ids, placing, bands, &folded, cx)
+    }
+
+    /// [`Self::sidebar_entries`] with the bands `folded` says are folded.
+    fn sidebar_entries_folded(
+        &self,
+        pane_ids: &[Uuid],
+        placing: &InstancesById,
+        bands: BandClock,
+        folded: &dyn Fn(ActivityBand) -> bool,
+        cx: &App,
+    ) -> Vec<SidebarEntry> {
+        let shown = |iid: Uuid| self.sidebar_shown(iid, placing, cx);
+        let running = |iid: Uuid| self.sidebar_running(iid);
         sidebar_order(
             pane_ids,
             placing,
             &shown,
             &running,
-            &folded,
+            folded,
             bands,
             self.settings.sidebar_sort,
         )
+    }
+
+    /// The state sidebar row `iid` is placed by: the status it shows, like
+    /// its badge, from `placing` ([`with_pending`]).
+    fn sidebar_shown(
+        &self,
+        iid: Uuid,
+        placing: &InstancesById,
+        cx: &App,
+    ) -> Option<AgentActivityState> {
+        let instance = placing.get(&iid).copied();
+        Some(activity_state(self.sidebar_status(iid, instance, cx)))
+    }
+
+    /// How many of `pane_ids` ask, work and are unread ([`row_counts`]),
+    /// placed as [`Self::sidebar_entries`] places them.
+    fn sidebar_counts(&self, pane_ids: &[Uuid], placing: &InstancesById, cx: &App) -> RowCounts {
+        let shown = |iid: Uuid| self.sidebar_shown(iid, placing, cx);
+        let running = |iid: Uuid| self.sidebar_running(iid);
+        row_counts(pane_ids, placing, &shown, &running)
     }
 
     /// Whether a sidebar row's process may be running: a pane with no live
@@ -24755,7 +24793,88 @@ impl MuxelApp {
             .min_by_key(|(r, _)| *r)
             .map(|(_, i)| i);
         if let Some(iid) = target {
-            self.focus_instance(iid, window, cx);
+            self.reveal_row(iid, cx);
+            self.select_instance(iid, window, cx);
+        }
+    }
+
+    /// Focus the next sidebar row after the focused one that `jump` picks,
+    /// across projects in sidebar order, wrapping round, and open whatever
+    /// hides its row ([`Self::reveal_row`]). The workspace line's counts do this.
+    fn jump_to_next(&mut self, jump: RowJump, window: &mut Window, cx: &mut Context<Self>) {
+        let target = {
+            let instances = instances_by_id(&self.workspace);
+            let pending = self.pending_instances(cx);
+            let placing = with_pending(&instances, &pending);
+            let mut rows = self.sidebar_rows_each();
+            let order: Vec<Uuid> = self
+                .workspace
+                .projects
+                .iter()
+                .flat_map(|project| rows.remove(&project.id).unwrap_or_default())
+                .collect();
+            let shown = |iid: Uuid| self.sidebar_shown(iid, &placing, cx);
+            let running = |iid: Uuid| self.sidebar_running(iid);
+            let matches = |iid: Uuid| match jump {
+                RowJump::Asking => {
+                    row_state(iid, &shown, &running) == Some(AgentActivityState::Blocked)
+                }
+                RowJump::Unread => placing
+                    .get(&iid)
+                    .is_some_and(|instance| is_unread(&instance.activity)),
+            };
+            next_matching(&order, self.active_instance, &matches)
+        };
+        if let Some(iid) = target {
+            self.reveal_row(iid, cx);
+            self.select_instance(iid, window, cx);
+        }
+    }
+
+    /// In Recent work, open what hides row `iid`: its project when collapsed
+    /// and the folded band it sits in, both saved as if clicked, so a jump to
+    /// a row shows the row.
+    fn reveal_row(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.settings.sidebar_sort != SidebarSort::RecentWork {
+            return;
+        }
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return;
+        };
+        let band = {
+            let instances = instances_by_id(&self.workspace);
+            let pending = self.pending_instances(cx);
+            let open = self.sidebar_entries_folded(
+                &self.sidebar_rows_each().remove(&pid).unwrap_or_default(),
+                &with_pending(&instances, &pending),
+                BandClock::at(&chrono::Local::now()),
+                &|_| false,
+                cx,
+            );
+            // The label over the row: a band's, or Needs you's or Working's,
+            // which never fold; pinned rows have none.
+            open.iter()
+                .position(|entry| entry_id(entry) == Some(iid))
+                .and_then(|at| open[..at].iter().rev().find(|e| entry_id(e).is_none()))
+                .and_then(|label| match label {
+                    SidebarEntry::Band(band) => Some(*band),
+                    _ => None,
+                })
+        };
+        let older_folded = self.settings.older_starts_folded;
+        let Some(project) = self.workspace.project_mut(pid) else {
+            return;
+        };
+        let mut changed = std::mem::replace(&mut project.collapsed, false);
+        if let Some(band) = band
+            && project.band_folded(band, older_folded)
+        {
+            project.toggle_band(band, older_folded);
+            changed = true;
+        }
+        if changed {
+            self.persist();
+            cx.notify();
         }
     }
 
@@ -27748,6 +27867,73 @@ impl MuxelApp {
     /// with how many rows it heads (`rows`; Working says how many sessions
     /// work). A band's label has a chevron and folds or opens the band on a
     /// click; folded, it also says how many of the rows it hides are unread.
+    /// A project header's counts in Recent work: `? n` asking, in amber so a
+    /// collapsed project can't hide a question, `▶ n` working and `• n`
+    /// unread, each only when there are any.
+    fn project_counts(&self, counts: RowCounts, cx: &App) -> Div {
+        let count = |glyph: &str, n: usize, color: Hsla| {
+            (n > 0).then(|| div().text_color(color).child(format!("{glyph} {n}")))
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_xs()
+            .font_semibold()
+            .children(count("?", counts.asking, cx.theme().warning))
+            .children(count("▶", counts.working, cx.theme().muted_foreground))
+            .children(count("•", counts.unread, cx.theme().primary))
+    }
+
+    /// Recent work's workspace line, on the PROJECTS heading: how many rows
+    /// ask, are unread and work across every project. Asking and unread each
+    /// jump to the next such row ([`Self::jump_to_next`]). Glyphs fit the
+    /// default width; from 300 px the words are spelled out.
+    fn workspace_counts(&self, total: RowCounts, cx: &mut Context<Self>) -> AnyElement {
+        let wide = self.workspace.sidebar_width.unwrap_or(232.0) >= 300.0;
+        let text = |glyph: &str, n: usize, word: SharedString| {
+            if wide {
+                format!("{n} {word}")
+            } else {
+                format!("{glyph} {n}")
+            }
+        };
+        let muted = cx.theme().muted_foreground;
+        let shade = |n: usize, color: Hsla| if n > 0 { color } else { muted };
+        div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .font_normal()
+            .child(
+                Button::new("workspace-asking")
+                    .ghost()
+                    .xsmall()
+                    .label(text("?", total.asking, t("asking")))
+                    .text_color(shade(total.asking, cx.theme().warning))
+                    .disabled(total.asking == 0)
+                    .tooltip(t("Go to the next session asking"))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.jump_to_next(RowJump::Asking, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("workspace-unread")
+                    .ghost()
+                    .xsmall()
+                    .label(text("•", total.unread, t("unread")))
+                    .text_color(shade(total.unread, cx.theme().primary))
+                    .disabled(total.unread == 0)
+                    .tooltip(t("Go to the next unread session"))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.jump_to_next(RowJump::Unread, window, cx)
+                    })),
+            )
+            .child(div().px_1().child(text("▶", total.working, t("working"))))
+            .into_any_element()
+    }
+
     fn sidebar_section_label(
         &self,
         pid: Uuid,
@@ -27772,7 +27958,8 @@ impl MuxelApp {
                 Some((label.band, true)),
                 label.unread,
             ),
-            _ => (format!("{} · {rows}", t("Needs you")), None, 0),
+            SidebarEntry::NeedsYou(n) => (format!("{} · {n}", t("Needs you")), None, 0),
+            _ => return div().into_any_element(),
         };
         let label = div()
             .ml_4()
@@ -28635,6 +28822,31 @@ impl MuxelApp {
         let bands = BandClock::at(&chrono::Local::now());
         let sort = self.settings.sidebar_sort;
         let entity = cx.entity();
+        // Recent work counts each project's asking, working and unread rows for
+        // its header, and totals them on the PROJECTS line.
+        let counts: HashMap<Uuid, RowCounts> = if sort == SidebarSort::RecentWork {
+            rows.iter()
+                .map(|(&pid, pane_ids)| (pid, self.sidebar_counts(pane_ids, &placing, cx)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let projects_line = div()
+            .px_3()
+            .pt_3()
+            .pb_1()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .text_xs()
+            .font_semibold()
+            .text_color(cx.theme().muted_foreground)
+            .child(t("PROJECTS"))
+            .children(
+                (sort == SidebarSort::RecentWork)
+                    .then(|| self.workspace_counts(counts.values().copied().sum(), cx)),
+            );
         let mut list = div()
             .id("sidebar-scroll")
             .size_full()
@@ -28644,16 +28856,7 @@ impl MuxelApp {
             .bg(cx.theme().sidebar)
             // NOTIFICATIONS sits above PROJECTS.
             .child(self.render_notifications_section(cx))
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t("PROJECTS")),
-            );
+            .child(projects_line);
 
         for (ix, project) in self.workspace.projects.iter().enumerate() {
             let pid = project.id;
@@ -28664,11 +28867,7 @@ impl MuxelApp {
             // Popouts leave the layout but keep their session row in Recent
             // work, where their feed entry is folded away.
             let pane_ids = rows.remove(&pid).unwrap_or_default();
-            let unread = if sort == SidebarSort::RecentWork {
-                unread_count(&pane_ids, &instances)
-            } else {
-                0
-            };
+            let project_counts = counts.get(&pid).copied().unwrap_or_default();
             let renaming = self.rename == Some(RenameTarget::Project(pid))
                 && self.rename_origin == Some(RenameOrigin::ProjectSidebar);
             let name: SharedString = project.name.clone().into();
@@ -28799,14 +28998,7 @@ impl MuxelApp {
                                 },
                             )),
                     )
-                    .children((unread > 0).then(|| {
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(cx.theme().primary)
-                            .child(format!("{unread} {}", t("unread")))
-                    }))
+                    .child(self.project_counts(project_counts, cx))
                     .children(memory_on.then(|| {
                         div()
                             .flex_none()
@@ -29304,7 +29496,7 @@ impl MuxelApp {
                             list = list.child(self.sidebar_worktree_subheader(wid, &entity, cx));
                             continue;
                         }
-                        SidebarEntry::NeedsYou
+                        SidebarEntry::NeedsYou(_)
                         | SidebarEntry::Working(_)
                         | SidebarEntry::Band(_)
                         | SidebarEntry::FoldedBand(_) => {

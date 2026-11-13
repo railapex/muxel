@@ -39,8 +39,8 @@ The line between Working and the done rows is now. The newest start sits just
 above it and the newest finish just below, so a turn that finishes drops from
 the working rows to the first row under them, and a prompt to a done session
 lifts it to the bottom of the working rows. Needs you and Working have a label
-when a project's rows span more than one section: Needs you with how many rows
-it holds, Working with how many sessions in it are working. Every band always
+when a project's rows span more than one section: Needs you with how many
+sessions in it are asking, Working with how many in it are working. Every band always
 has one, with how many rows it holds (a family counts once), because a band
 folds.
 
@@ -267,8 +267,28 @@ the layout. Layout keeps its existing docked-pane list.
 In Recent work, a completion or blocked event newer than `last_attended_at`
 shows a dot and bold session label. Missing attendance means the event is
 unread. The mark survives subsequent state changes and clears only when the
-session is attended. Done and its age remain after attendance. Project headers
-show their unread count whether expanded or collapsed.
+session is attended. Done and its age remain after attendance.
+
+Each project header in Recent work shows how many of its sessions are asking
+(`? n`, in amber), working (`▶ n`) and unread (`• n`), each only when there
+are any, open or collapsed, so folding a project or a band never hides a
+question. The counts take in every row the project lists, nested and pinned
+ones included, by the state the sections place them by (`sidebar::row_counts`),
+so a session whose process isn't running is never working. Needs you's label
+counts the same asking sessions. Working's label counts only the working
+sessions under it, so a working child of an asking family counts on the header
+but sits under Needs you with its family.
+
+The PROJECTS heading carries the workspace's totals: asking, unread and
+working. Clicking asking or unread focuses the next such session after the
+focused one, across projects in sidebar order, wrapping round
+(`sidebar::next_matching`), and opens whatever hid its row: a collapsed
+project and the folded band it sits in, both kept open as if clicked. A count
+of zero is disabled. Glyphs fit the default sidebar width; from 300 px the
+words are spelled out. **Focus next agent needing attention** (Ctrl+Shift+A)
+keeps its own order, blocked then unread finished, and in Recent work opens
+what hid its target the same way. Both switch to the target's project, as
+clicking its row does.
 
 `sidebar::is_unread` is the one read rule. The mark and the outline pill of a
 read Done both use it, and Recent work's order never does: the pill's test,

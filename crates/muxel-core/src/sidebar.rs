@@ -25,8 +25,9 @@ pub enum ActivityBand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarEntry {
     Worktree(Uuid),
-    /// Recent work's label over the rows asking for something.
-    NeedsYou,
+    /// Recent work's label over the rows asking for something, with how many
+    /// sessions in them are asking.
+    NeedsYou(usize),
     /// Recent work's label over the working rows, with how many sessions in
     /// them are working.
     Working(usize),
@@ -710,13 +711,17 @@ pub fn sidebar_order(
         rest.iter()
             .any(|(_, place)| place.section() != first.section())
     });
-    // The working sessions under the Working label, nested ones included.
-    let working = rest
-        .iter()
-        .filter(|(_, place)| place.section() == RecentSection::Working)
-        .flat_map(|&(id, _)| members(id))
-        .filter(|member| place(member).group == RecentGroup::Working)
-        .count();
+    // The asking sessions under the Needs you label and the working ones under
+    // the Working label, nested ones included.
+    let in_section = |section: RecentSection, group: RecentGroup| {
+        rest.iter()
+            .filter(|(_, place)| place.section() == section)
+            .flat_map(|&(id, _)| members(id))
+            .filter(|member| place(member).group == group)
+            .count()
+    };
+    let asking = in_section(RecentSection::NeedsYou, RecentGroup::Asking);
+    let working = in_section(RecentSection::Working, RecentGroup::Working);
     // Each section's rows, with how many top-level rows it has; the rows are
     // sorted by section, so each section is one run.
     let mut sections: Vec<(RecentSection, usize, Vec<SidebarEntry>)> = Vec::new();
@@ -740,7 +745,7 @@ pub fn sidebar_order(
             RecentSection::NeedsYou | RecentSection::Working => {
                 if labelled {
                     out.push(match section {
-                        RecentSection::NeedsYou => SidebarEntry::NeedsYou,
+                        RecentSection::NeedsYou => SidebarEntry::NeedsYou(asking),
                         _ => SidebarEntry::Working(working),
                     });
                 }
@@ -769,7 +774,7 @@ pub fn entry_id(entry: &SidebarEntry) -> Option<Uuid> {
             Some(*id)
         }
         SidebarEntry::Worktree(_)
-        | SidebarEntry::NeedsYou
+        | SidebarEntry::NeedsYou(_)
         | SidebarEntry::Working(_)
         | SidebarEntry::Band(_)
         | SidebarEntry::FoldedBand(_) => None,
@@ -797,6 +802,86 @@ pub fn unread_count(pane_ids: &[Uuid], instances: &InstancesById) -> usize {
         .filter_map(|id| instances.get(id))
         .filter(|i| is_unread(&i.activity))
         .count()
+}
+
+/// What rows add up to, for a project header and the workspace line: how many
+/// ask, how many work and how many are unread. Nested rows count like any
+/// other, so a folded project or band can't hide a question.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCounts {
+    pub asking: usize,
+    pub working: usize,
+    pub unread: usize,
+}
+
+impl std::ops::Add for RowCounts {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            asking: self.asking + other.asking,
+            working: self.working + other.working,
+            unread: self.unread + other.unread,
+        }
+    }
+}
+
+impl std::iter::Sum for RowCounts {
+    fn sum<I: Iterator<Item = Self>>(rows: I) -> Self {
+        rows.fold(Self::default(), std::ops::Add::add)
+    }
+}
+
+/// Whether row `id` asks or works, by the state it is placed by
+/// ([`sidebar_order`]): `shown` and whether its process is `running`.
+pub fn row_state(
+    id: Uuid,
+    shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+    running: &dyn Fn(Uuid) -> bool,
+) -> Option<AgentActivityState> {
+    placed_state(shown(id), running(id))
+}
+
+/// [`RowCounts`] over `pane_ids`, placed the way [`sidebar_order`] places them,
+/// so the counts agree with the Needs you and Working sections.
+pub fn row_counts(
+    pane_ids: &[Uuid],
+    instances: &InstancesById,
+    shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
+    running: &dyn Fn(Uuid) -> bool,
+) -> RowCounts {
+    let mut counts = RowCounts::default();
+    for &id in pane_ids {
+        match row_state(id, shown, running) {
+            Some(AgentActivityState::Blocked) => counts.asking += 1,
+            Some(AgentActivityState::Working) => counts.working += 1,
+            _ => {}
+        }
+        if instances.get(&id).is_some_and(|i| is_unread(&i.activity)) {
+            counts.unread += 1;
+        }
+    }
+    counts
+}
+
+/// The first row of `order` after `current` that `matches`, wrapping round;
+/// `current` itself comes last, so a lone match is found again. With no
+/// `current`, or one not in `order`, the search starts at the top.
+pub fn next_matching(
+    order: &[Uuid],
+    current: Option<Uuid>,
+    matches: &dyn Fn(Uuid) -> bool,
+) -> Option<Uuid> {
+    let start = current
+        .and_then(|current| order.iter().position(|&id| id == current))
+        .map_or(0, |at| at + 1);
+    order
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(order.len())
+        .copied()
+        .find(|&id| matches(id))
 }
 
 #[cfg(test)]
@@ -1108,7 +1193,7 @@ mod tests {
         assert_eq!(
             lifted,
             vec![
-                NeedsYou,
+                NeedsYou(1),
                 Pane(b),
                 Nested(child),
                 Band(ActivityBand::Today),
@@ -1177,7 +1262,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
-                NeedsYou,
+                NeedsYou(1),
                 Pane(a),
                 Nested(child),
                 Band(ActivityBand::Today),
@@ -2276,6 +2361,101 @@ mod tests {
             recent(&project, &workspace),
             vec![Pane(ids[1]), Pane(ids[0])]
         );
+    }
+
+    /// Folding hides no count: with every band folded, every asking and
+    /// working row is still drawn and every unread row is drawn or counted on
+    /// a folded band's label, and Needs you's label counts every asking row,
+    /// over every lifecycle a row can be in, running or not, in families of
+    /// every shape.
+    #[test]
+    fn folding_hides_no_count_and_needs_you_counts_every_question() {
+        let rows = population();
+        let (project, mut workspace, ids) =
+            fixture(rows.iter().map(|(activity, _)| activity.clone()).collect());
+        for (row, (&id, (_, opened))) in ids.iter().zip(&rows).enumerate() {
+            let instance = workspace.instance_mut(id).unwrap();
+            instance.created_at = *opened;
+            // Every fourth row has been seen since its last event.
+            if row % 4 == 0 {
+                instance.activity.last_attended_at = Some(NOW);
+            }
+        }
+        for (row, pair) in ids.windows(2).enumerate() {
+            if row % 3 != 2 {
+                workspace.instance_mut(pair[1]).unwrap().opened_by = Some(pair[0]);
+            }
+        }
+        let listed = sidebar_rows(&project, &workspace, &|_| false, SidebarSort::RecentWork);
+        let index = instances_by_id(&workspace);
+        let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        // Every third row's process has stopped.
+        let stopped: HashSet<Uuid> = ids.iter().copied().step_by(3).collect();
+        let running = |id: Uuid| !stopped.contains(&id);
+        let order = |folded: &dyn Fn(ActivityBand) -> bool| {
+            sidebar_order(
+                &listed,
+                &index,
+                &shown,
+                &running,
+                folded,
+                clock(),
+                SidebarSort::RecentWork,
+            )
+        };
+        let counts = row_counts(&listed, &index, &shown, &running);
+        assert!(counts.asking > 0 && counts.working > 0 && counts.unread > 0);
+
+        let needs_you = order(&|_| false).into_iter().find_map(|entry| match entry {
+            SidebarEntry::NeedsYou(n) => Some(n),
+            _ => None,
+        });
+        assert_eq!(needs_you, Some(counts.asking));
+
+        let folded = order(&|_| true);
+        let drawn: Vec<Uuid> = folded.iter().filter_map(entry_id).collect();
+        let drawn_in = |state| {
+            drawn
+                .iter()
+                .filter(|&&id| row_state(id, &shown, &running) == Some(state))
+                .count()
+        };
+        assert_eq!(drawn_in(AgentActivityState::Blocked), counts.asking);
+        assert_eq!(drawn_in(AgentActivityState::Working), counts.working);
+        let unread_drawn = drawn
+            .iter()
+            .filter(|&id| is_unread(&index[id].activity))
+            .count();
+        let unread_folded: usize = folded
+            .iter()
+            .map(|entry| match entry {
+                SidebarEntry::FoldedBand(label) => label.unread,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(unread_drawn + unread_folded, counts.unread);
+    }
+
+    #[test]
+    fn the_next_match_comes_after_the_current_row_and_wraps() {
+        let [a, b, c, d] = [(); 4].map(|_| Uuid::new_v4());
+        let order = [a, b, c, d];
+        let even = |id: Uuid| id == b || id == d;
+        assert_eq!(next_matching(&order, None, &even), Some(b));
+        assert_eq!(next_matching(&order, Some(b), &even), Some(d));
+        assert_eq!(next_matching(&order, Some(c), &even), Some(d));
+        assert_eq!(next_matching(&order, Some(d), &even), Some(b), "wraps");
+        assert_eq!(
+            next_matching(&order, Some(Uuid::new_v4()), &even),
+            Some(b),
+            "an unlisted current row starts at the top"
+        );
+        assert_eq!(
+            next_matching(&order, Some(a), &|id| id == a),
+            Some(a),
+            "a lone match is found again"
+        );
+        assert_eq!(next_matching(&order, Some(a), &|_| false), None);
     }
 
     #[test]

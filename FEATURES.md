@@ -1439,7 +1439,7 @@ feature is added or changed, update the matching entry here in the same change**
   under the working rows, never above them. A session whose process isn't
   running (put to sleep mid-turn, say) never counts as working: it sits with
   the done rows by its latest event. Needs you and Working get a thin label, with
-  its row count or working count, when a project's rows span more than one
+  its asking or working count, when a project's rows span more than one
   section; each band always has one, with its row count. Click a band's label to
   fold it: its rows go and the label stays, saying how many of them are unread.
   Older starts folded (Settings → Appearance → **Older section starts**: Folded or
@@ -1505,11 +1505,19 @@ feature is added or changed, update the matching entry here in the same change**
   on. A clock that steps back can't mark a seen event unread or a new one read:
   attendance covers everything recorded before it, and a later event is stamped
   after it. A finish read by clicking its row before the status tick recorded
-  it stays read when the tick catches up. Project rows show the unread count
-  even when collapsed. Agent finishes and questions appear on these session
+  it stays read when the tick catches up. Project rows show their counts
+  even when collapsed (below). Agent finishes and questions appear on these session
   rows instead of duplicating them in NOTIFICATIONS; a job's exit code, which
   a row can't show, stays in the feed. App messages, desktop alerts, and tray
   notifications keep their usual behavior.
+- **Counts on project headers and the PROJECTS line** — in Recent work, each
+  project header shows `? n` asking (amber), `▶ n` working and `• n` unread,
+  open or collapsed, so a fold never hides a question. The PROJECTS heading
+  totals them for the workspace: click asking or unread to go to the next such
+  session across projects, which opens its collapsed project and folded band.
+  From 300 px wide the sidebar spells the words out. Ctrl+Shift+A opens what
+  hides its target the same way, and like the counts it switches to the
+  target's project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
