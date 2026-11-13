@@ -4971,19 +4971,22 @@ fn read_loop(
 // pure paint-priority logic is covered cross-platform in `view.rs` tests.
 #[cfg(all(test, unix))]
 mod content_damage_tests {
-    use super::{CommandSpec, ContentDamage, TerminalSession};
+    use super::{CommandSpec, ContentDamage, PtyReceiver, TerminalSession};
     use std::time::{Duration, Instant};
 
-    fn spawn_quiet() -> std::sync::Arc<TerminalSession> {
+    /// A `cat` session and its output receiver. Hold the receiver while the
+    /// test writes: dropping it ends the stream, so the reader hangs up the
+    /// child and the session refuses input from then on.
+    fn spawn_quiet() -> (std::sync::Arc<TerminalSession>, PtyReceiver) {
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        TerminalSession::spawn(spec, 80, 24).expect("spawn").0
+        TerminalSession::spawn(spec, 80, 24).expect("spawn")
     }
 
     /// Printable output records damage; interaction priority survives queued
     /// stream batches until its deadline.
     #[test]
     fn process_output_records_damage_during_interaction() {
-        let session = spawn_quiet();
+        let (session, _rx) = spawn_quiet();
         let _ = session.take_pending_damage();
         session.clear_pending_damage_for_test();
 
@@ -5005,7 +5008,7 @@ mod content_damage_tests {
     /// Stream + type: output batches do not consume recent-input priority.
     #[test]
     fn stream_then_type_stress() {
-        let session = spawn_quiet();
+        let (session, _rx) = spawn_quiet();
         let _ = session.take_pending_damage();
         session.clear_pending_damage_for_test();
 
@@ -5108,13 +5111,14 @@ mod content_damage_tests {
         )
     }
 
-    /// A shell idle at its prompt on row 23, under tmux's bar.
-    fn idle_shell_under_tmux() -> std::sync::Arc<TerminalSession> {
-        let session = spawn_quiet();
+    /// A shell idle at its prompt on row 23, under tmux's bar, and its
+    /// output receiver (see [`spawn_quiet`]).
+    fn idle_shell_under_tmux() -> (std::sync::Arc<TerminalSession>, PtyReceiver) {
+        let (session, rx) = spawn_quiet();
         session.process_output(b"\x1b[2J\x1b[23;1Huser@host:~$ ");
         session.process_output(tmux_status("14:50", false).as_bytes());
         session.set_idle_for_test(Duration::from_secs(6));
-        session
+        (session, rx)
     }
 
     /// tmux repaints its status bar in every pane when the minute turns. That
@@ -5123,7 +5127,7 @@ mod content_damage_tests {
     #[test]
     fn a_tmux_clock_tick_leaves_an_idle_shell_idle() {
         for via_newline in [false, true] {
-            let session = idle_shell_under_tmux();
+            let (session, _rx) = idle_shell_under_tmux();
             let content = session.content_generation();
             session.process_output(tmux_status("14:51", via_newline).as_bytes());
             assert!(
@@ -5145,7 +5149,7 @@ mod content_damage_tests {
             // A row away from the edges, with the cursor put back.
             "\x1b7\x1b[5;1Hhello\x1b8",
         ] {
-            let session = idle_shell_under_tmux();
+            let (session, _rx) = idle_shell_under_tmux();
             session.process_output(output.as_bytes());
             assert!(
                 session.idle_for() < Duration::from_secs(1),
@@ -7548,7 +7552,7 @@ mod windows_spawn_resolve {
 #[cfg(test)]
 mod runtime_fact_tests {
     use super::{
-        CommandSpec, PAUSE_AFTER_ENQUEUE, PtyOutput, RESIZE_SETTLE, TerminalSession,
+        CommandSpec, PAUSE_AFTER_ENQUEUE, PtyOutput, PtyReceiver, RESIZE_SETTLE, TerminalSession,
         draft_after_input, next_input_state,
     };
     use crate::listener::SWITCH_SLACK;
@@ -7638,7 +7642,7 @@ mod runtime_fact_tests {
     fn capacity_replay_keeps_new_title_and_bell_on_their_fresh_read() {
         const FILL: usize = 0x20_0000 - 2;
         for title_event in [true, false] {
-            let session = fixture();
+            let (session, _rx) = fixture();
             let first = uuid::Uuid::new_v4();
             let next = uuid::Uuid::new_v4();
             session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
@@ -7686,7 +7690,7 @@ mod runtime_fact_tests {
     #[test]
     fn capacity_replay_preserves_an_osc_that_started_in_the_old_frame() {
         const FILL: usize = 0x20_0000 - 2;
-        let session = fixture();
+        let (session, _rx) = fixture();
         let first = uuid::Uuid::new_v4();
         let stale = uuid::Uuid::new_v4();
         let fresh = uuid::Uuid::new_v4();
@@ -7734,7 +7738,7 @@ mod runtime_fact_tests {
     fn fresh_program_reports_survive_capacity_replay_of_an_old_frame() {
         const FILL: usize = 0x20_0000 - 2;
         for ending in [b"\x07".as_slice(), b"\x1b\\", b"\x1b"] {
-            let session = fixture();
+            let (session, _rx) = fixture();
             let first = uuid::Uuid::new_v4();
             session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
             let old = SystemTime::now() - Duration::from_secs(10);
@@ -7781,7 +7785,7 @@ mod runtime_fact_tests {
     fn capacity_replay_cannot_refresh_an_old_partial_program_report() {
         const FILL: usize = 0x20_0000 - 2;
         for ending in [b"\x07".as_slice(), b"\x1b\\"] {
-            let session = fixture();
+            let (session, _rx) = fixture();
             let first = uuid::Uuid::new_v4();
             session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
             let old = SystemTime::now() - Duration::from_secs(10);
@@ -7824,7 +7828,7 @@ mod runtime_fact_tests {
 
     #[test]
     fn queued_and_cross_boundary_reports_cannot_restore_a_retired_binding() {
-        let session = fixture();
+        let (session, _rx) = fixture();
         let now = SystemTime::now();
         let old = now - Duration::from_secs(10);
         let mut first = PtyOutput::default();
@@ -7892,7 +7896,7 @@ mod runtime_fact_tests {
         }
 
         for on_flush in [false, true] {
-            let session = fixture();
+            let (session, _rx) = fixture();
             session.paste("prompt");
             let pasted = session.input_snapshot();
             let events = session.runtime_events();
@@ -7939,7 +7943,7 @@ mod runtime_fact_tests {
             }
         }
 
-        let session = fixture();
+        let (session, _rx) = fixture();
         session.paste("draft");
         let before = session.input_snapshot();
         let events = session.runtime_events();
@@ -7985,7 +7989,7 @@ mod runtime_fact_tests {
             }
         }
 
-        let session = fixture();
+        let (session, _rx) = fixture();
         session.paste("/resume replacement");
         let pasted = session.input_snapshot();
         let hook_at = Arc::new(Mutex::new(None));
@@ -8025,7 +8029,7 @@ mod runtime_fact_tests {
     /// hold includes every write the PTY was given.
     #[test]
     fn a_departure_waits_for_the_facts_of_a_write_already_queued() {
-        let session = fixture();
+        let (session, _rx) = fixture();
         let before = session.input_snapshot();
         let (paused, at_pause) = std::sync::mpsc::channel();
         let (permit, permits) = std::sync::mpsc::channel::<()>();
@@ -8073,7 +8077,10 @@ mod runtime_fact_tests {
         session.kill();
     }
 
-    fn fixture() -> std::sync::Arc<TerminalSession> {
+    /// A session that echoes its input, and its output receiver. Hold the
+    /// receiver while the test writes: on Unix, dropping it ends the stream,
+    /// so the reader hangs up the child and the session refuses input.
+    fn fixture() -> (std::sync::Arc<TerminalSession>, PtyReceiver) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -8081,14 +8088,12 @@ mod runtime_fact_tests {
         );
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        TerminalSession::spawn(spec, 80, 24)
-            .expect("spawn fixture")
-            .0
+        TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
     }
 
     #[test]
     fn pointer_reports_advance_the_input_revision_but_not_the_draft() {
-        let session = fixture();
+        let (session, _rx) = fixture();
         session.write_input(b"x");
         let (typed, draft) = session.input_snapshot();
         assert!(draft);
