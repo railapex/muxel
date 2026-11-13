@@ -27,7 +27,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
-use muxel_core::input_box::{ClaudeBox, read_claude_box};
+use muxel_core::input_box::{ClaudeBox, CodexBox, read_claude_box, read_codex_box};
 use muxel_core::rescue::{
     DraftAction, DraftRead, DraftSource, DraftTracker, PromptDraft, RowWidths, debounce_remaining,
     has_paste_markers, join_rows, text_columns, typed_matches,
@@ -378,22 +378,17 @@ pub(crate) fn codex(
     // Blank rows under the cursor are the editor's padding.
     let keep = usize::try_from(capture.cursor_row).unwrap_or(first);
     let lines = capture.text_rows(rows, indent, keep);
-    // Codex's placeholder, in case it isn't drawn muted.
-    if lines.len() == 1
-        && lines[0] == "Ask Codex to do anything"
-        && capture.cursor_at(first, indent)
+    let widths = codex_widths(capture.columns, indent);
+    // Codex's placeholder when it isn't drawn muted (muted cells are already
+    // blank), unless muxel saw a person type those very words.
+    let shown: Vec<&str> = lines.iter().map(String::as_str).collect();
+    if read_codex_box(&shown) == CodexBox::Placeholder
+        && !typed.is_some_and(|typed| typed_matches(typed, &shown, widths))
     {
         return DraftRead::Empty;
     }
     text_read(
-        capture,
-        lines,
-        first,
-        indent,
-        codex_widths(capture.columns, indent),
-        clipped,
-        newlines,
-        typed,
+        capture, lines, first, indent, widths, clipped, newlines, typed,
     )
 }
 
@@ -671,6 +666,33 @@ mod tests {
             &[],
         );
         assert_eq!(super::codex(&empty, None, None), DraftRead::Empty);
+    }
+
+    /// Codex 0.167.2's empty box as a live pane showed it today (a config
+    /// warning puts its hint row under the status line), its placeholder not
+    /// muted. The shared reader goes by the text, not the cursor; muxel's
+    /// typed copy keeps a draft that is the placeholder's words.
+    #[test]
+    fn codex_placeholder_reads_empty_wherever_the_cursor_is_unless_it_was_typed() {
+        let rows = [
+            "• OK",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  GPT-6.1-Sol high · Context 100% left · D:\\tmp\\cast\\demo",
+            "  ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view",
+        ];
+        let at_start = capture(&rows, (2, 2), &[]);
+        assert_eq!(super::codex(&at_start, None, None), DraftRead::Empty);
+        assert_eq!(super::codex(&at_start, None, Some("")), DraftRead::Empty);
+        let at_end = capture(&rows, (2, 26), &[]);
+        assert_eq!(super::codex(&at_end, None, None), DraftRead::Empty);
+        let typed = "Ask Codex to do anything";
+        assert_eq!(super::codex(&at_end, None, Some(typed)), text(typed, false));
+        assert_eq!(
+            super::codex(&at_start, None, Some(typed)),
+            text(typed, false)
+        );
     }
 
     /// A long typed draft and the rows it wrapped into on a real 166-column

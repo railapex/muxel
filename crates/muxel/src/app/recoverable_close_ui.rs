@@ -187,11 +187,52 @@ impl MuxelApp {
             .close_groups
             .iter()
             .any(|group| group.needs_decision && !group.undoing);
+        // While the button counts down, a thin line along the chip's foot
+        // shows the time left. It moves on the same refresh as the count.
+        let left = (latest
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f32()
+            / super::recoverable_close::CLOSE_GRACE.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let counting = !decision
+            && !latest.undoing
+            && !latest.checking
+            && !latest.syncing()
+            && !multiple
+            && left > 0.0;
+        // The line is the bottom edge of an outline the chip's size, so it
+        // follows the chip's rounded corners; a clip the time left wide cuts
+        // its end square.
+        let time_line = counting.then(|| {
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(relative(left))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        // The chip's width again, measured from inside the clip.
+                        .w(relative(1.0 / left))
+                        // It sits inside the chip's 1 px border, so a radius one
+                        // less shares the border's curve.
+                        .rounded((cx.theme().radius - px(1.0)).max(px(0.0)))
+                        .border_b_2()
+                        .border_color(cx.theme().primary),
+                )
+        });
         div()
             .id("recoverable-close-chip")
             .role(Role::Group)
             .accessibility_id("muxel.pending-terminal-close-control")
             .aria_label(label.clone())
+            .relative()
             .flex()
             .items_center()
             .gap_1()
@@ -261,6 +302,7 @@ impl MuxelApp {
                         cx.notify();
                     }))
             }))
+            .children(time_line)
             .into_any_element()
     }
 
