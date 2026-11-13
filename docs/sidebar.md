@@ -279,8 +279,8 @@ counts the same asking sessions. Working's label counts only the working
 sessions under it, so a working child of an asking family counts on the header
 but sits under Needs you with its family.
 
-The PROJECTS heading carries the workspace's totals: asking, unread and
-working. Clicking asking or unread focuses the next such session after the
+The PROJECTS heading carries the workspace's totals: asking, working and
+unread, in the project header's order. Clicking asking or unread focuses the next such session after the
 focused one, across projects in sidebar order, wrapping round
 (`sidebar::next_matching`), and opens whatever hid its row: a collapsed
 project and the folded band it sits in, both kept open as if clicked. A count

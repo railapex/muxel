@@ -27887,7 +27887,8 @@ impl MuxelApp {
     }
 
     /// Recent work's workspace line, on the PROJECTS heading: how many rows
-    /// ask, are unread and work across every project. Asking and unread each
+    /// ask, work and are unread across every project, in the project header's
+    /// order. Asking and unread each
     /// jump to the next such row ([`Self::jump_to_next`]). Glyphs fit the
     /// default width; from 300 px the words are spelled out.
     fn workspace_counts(&self, total: RowCounts, cx: &mut Context<Self>) -> AnyElement {
@@ -27918,6 +27919,7 @@ impl MuxelApp {
                         this.jump_to_next(RowJump::Asking, window, cx)
                     })),
             )
+            .child(div().px_1().child(text("▶", total.working, t("working"))))
             .child(
                 Button::new("workspace-unread")
                     .ghost()
@@ -27930,7 +27932,6 @@ impl MuxelApp {
                         this.jump_to_next(RowJump::Unread, window, cx)
                     })),
             )
-            .child(div().px_1().child(text("▶", total.working, t("working"))))
             .into_any_element()
     }
 
