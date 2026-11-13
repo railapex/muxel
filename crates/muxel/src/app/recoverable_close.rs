@@ -280,6 +280,35 @@ impl MuxelApp {
         }
     }
 
+    /// Each tmux pane's attached client count, read off the UI thread, for a
+    /// close of `ids` to decide on: `None` when none of them runs in tmux.
+    /// Unknown or extra clients make a pane busy, so record the counts in
+    /// `close_client_counts` before deciding.
+    pub(super) fn close_client_probe(
+        &self,
+        ids: &[Uuid],
+        cx: &App,
+    ) -> Option<impl std::future::Future<Output = Vec<(Uuid, ClientCount)>> + use<>> {
+        let jobs: Vec<_> = ids
+            .iter()
+            .filter_map(|&id| {
+                self.close_tmux_site(id)
+                    .map(|(loc, target)| (id, loc, target))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return None;
+        }
+        Some(close_probes::collect(
+            cx.background_executor().clone(),
+            jobs,
+            |(iid, loc, target)| async move {
+                let count = integrations::attached_tmux_clients(&loc, &target).ok();
+                (iid, ClientCount { target, count })
+            },
+        ))
+    }
+
     /// A close someone just asked for. It replaces any request these panes were
     /// part of, and a file answer given for that request ends with it.
     pub(super) fn request_recoverable_close(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
@@ -297,17 +326,10 @@ impl MuxelApp {
         if ids.is_empty() {
             return;
         }
-        let jobs: Vec<_> = ids
-            .iter()
-            .filter_map(|&id| {
-                self.close_tmux_site(id)
-                    .map(|(loc, target)| (id, loc, target))
-            })
-            .collect();
-        if jobs.is_empty() {
+        let Some(probe) = self.close_client_probe(&ids, cx) else {
             self.plan_close_request(ids, cx);
             return;
-        }
+        };
         let token = Uuid::new_v4();
         for &iid in &ids {
             self.close_requests.insert(iid, token);
@@ -315,15 +337,7 @@ impl MuxelApp {
         cx.notify();
         let workspace = self.current_workspace;
         cx.spawn(async move |this, cx| {
-            let counts = close_probes::collect(
-                cx.background_executor().clone(),
-                jobs,
-                |(iid, loc, target)| async move {
-                    let count = integrations::attached_tmux_clients(&loc, &target).ok();
-                    (iid, ClientCount { target, count })
-                },
-            )
-            .await;
+            let counts = probe.await;
             let _ = this.update(cx, |this, cx| {
                 // A member closed another way, or taken over by a newer request,
                 // leaves this batch; the others still get their decision. Cancel
@@ -481,6 +495,40 @@ impl MuxelApp {
             };
             steps.push((iid, step));
         }
+        self.apply_close_steps(steps, None, cx);
+    }
+
+    /// A `ctl close` someone outside muxel decided, pane by pane: `None` closes
+    /// now, `Some(forced)` holds it for the countdown, named as `caller`'s.
+    /// It replaces any request these panes were part of, as a close made in
+    /// muxel does. Returns the hold's group, if any pane is held.
+    pub(super) fn accept_control_close(
+        &mut self,
+        steps: Vec<(Uuid, Option<bool>)>,
+        caller: String,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
+        let ids: Vec<_> = steps.iter().map(|&(iid, _)| iid).collect();
+        self.drop_unaccepted_worktree_answers(&ids);
+        let steps = steps
+            .into_iter()
+            .map(|(iid, step)| {
+                let step = match step {
+                    None => AcceptedClose::Now,
+                    Some(forced) => AcceptedClose::Hold { forced },
+                };
+                (iid, step)
+            })
+            .collect();
+        self.apply_close_steps(steps, Some(caller), cx)
+    }
+
+    fn apply_close_steps(
+        &mut self,
+        steps: Vec<(Uuid, AcceptedClose)>,
+        caller: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         self.settle_worktree_answers(&steps);
         let mut holds = Vec::new();
         for (iid, step) in steps {
@@ -490,7 +538,7 @@ impl MuxelApp {
                 AcceptedClose::Stays => {}
             }
         }
-        self.hold_closes(holds, None, cx);
+        self.hold_closes(holds, caller, cx)
     }
 
     /// A file answer covers a close only if that close takes every pane it counted.

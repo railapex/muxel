@@ -26,13 +26,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 type CtlResult<T> = Result<T, ctl::Error>;
 
 mod approval;
+mod close;
 mod new;
 mod safe_send;
 mod send_journal;
 pub(super) use approval::PreparedCreation;
+use close::CloseRequest;
 use safe_send::QueueRequest;
 pub(super) use safe_send::{OnceKeys, QueuedSend};
 pub(super) use send_journal::JournalWriter;
+#[cfg(all(test, windows))]
+mod close_tests;
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
@@ -210,6 +214,8 @@ pub(super) enum Answer {
     Queue(QueueRequest),
     Focus(Uuid),
     Wake(Uuid),
+    /// `close`: read the panes' tmux clients, then close them or refuse.
+    Close(CloseRequest),
     Open {
         project: String,
         options: ctl::NewOptions,
@@ -1053,6 +1059,7 @@ impl MuxelApp {
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
+            Answer::Close(request) => self.control_close(request, reply, cx),
             Answer::Now(result) => {
                 let _ = reply.send(respond(result));
             }
@@ -1196,6 +1203,7 @@ impl MuxelApp {
                 | Command::Send { .. }
                 | Command::Answer { .. }
                 | Command::Keys { .. }
+                | Command::Close { .. }
         ) && !self.settings.control_enabled
         {
             return Answer::Now(Err(ctl::creation_refusal(ErrorCode::ControlDisabled)));
@@ -1349,6 +1357,9 @@ impl MuxelApp {
                 self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
+            Command::Close { agents, force } => {
+                self.control_close_request(agents, force, caller_instance_id, cx)
+            }
         }
     }
 
@@ -1802,6 +1813,12 @@ impl MuxelApp {
             }),
             focused: self.active_instance == Some(inst.id),
             pane,
+            closing: self
+                .closing_control_error(inst.id)
+                .map(|error| ctl::Closing {
+                    reason: error.reason.unwrap_or_else(|| "counting_down".into()),
+                    undo_until: error.undo_until,
+                }),
             worktree_branch: inst.worktree_branch.clone(),
             cwd,
             remote: project.is_some_and(|p| p.remote.is_some()),
