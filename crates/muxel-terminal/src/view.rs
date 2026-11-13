@@ -259,10 +259,61 @@ pub struct TerminalRuntimeSnapshot {
     pub background: Option<BackgroundWork>,
 }
 
+/// Why `ctl send` won't type a prompt into a pane without `--force`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendRefusal {
+    /// The status can't be attributed to this conversation: a provider switch
+    /// is settling, or the screen is held after one.
+    Unattributable,
+    /// A turn is running.
+    Working,
+    /// The agent is waiting on a question.
+    Blocked,
+    /// No prompt is showing to type into: a picker, menu or startup card
+    /// covers it, or the agent hasn't drawn it yet.
+    PromptHidden,
+}
+
 impl TerminalRuntimeSnapshot {
     /// A switch invalidates the cached facts before its queued reconciliation.
     pub fn is_attributable_to(&self, binding_rev: u64) -> bool {
         self.attributable && self.binding_rev == binding_rev
+    }
+
+    /// The foreground turn on this binding is over while work it started runs
+    /// on: held at Working for that work, or Idle or Done beside a listing.
+    pub fn background_turn_over(&self, binding_rev: u64) -> bool {
+        self.binding_rev == binding_rev
+            && ((self.status == AgentStatus::Working
+                && self.reason == TerminalStatusReason::BackgroundWork)
+                || (matches!(self.status, AgentStatus::Idle | AgentStatus::Done)
+                    && self.background.is_some_and(|work| !work.is_empty())))
+    }
+
+    /// Whether a background turn end also frees the prompt for `ctl send`. A
+    /// listing says nothing about whose prompt is showing, so while a switch
+    /// settles, or the screen is held after one, input stays refused as for any
+    /// unattributable status.
+    pub fn background_send_admitted(&self, binding_rev: u64) -> bool {
+        self.is_attributable_to(binding_rev) && self.background_turn_over(binding_rev)
+    }
+
+    /// Why `ctl send`, without `--force`, refuses to type into this pane now,
+    /// given whether a prompt is showing; `None` when it would type. A turn
+    /// held only for its background work is over, so its prompt is free. The
+    /// app adds what only it knows: `--force`, a control turn just submitted,
+    /// the launch, and panes it holds as failed, starting or exited.
+    pub fn send_refusal(&self, binding_rev: u64, prompt_hidden: bool) -> Option<SendRefusal> {
+        if !self.is_attributable_to(binding_rev) {
+            return Some(SendRefusal::Unattributable);
+        }
+        match self.status {
+            AgentStatus::Working if !self.background_send_admitted(binding_rev) => {
+                Some(SendRefusal::Working)
+            }
+            AgentStatus::Blocked => Some(SendRefusal::Blocked),
+            _ => prompt_hidden.then_some(SendRefusal::PromptHidden),
+        }
     }
 }
 
@@ -2582,6 +2633,17 @@ fn prompt_hidden(provider: TitleProvider, screen: &crate::startup::Screen) -> bo
     }
 }
 
+/// [`TerminalRuntimeSnapshot::send_refusal`], with whether a prompt is
+/// showing read from `screen`.
+fn send_refusal(
+    runtime: &TerminalRuntimeSnapshot,
+    binding_rev: u64,
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+) -> Option<SendRefusal> {
+    runtime.send_refusal(binding_rev, prompt_hidden(provider, screen))
+}
+
 fn startup_empty_composer(provider: TitleProvider, screen: &crate::startup::Screen) -> bool {
     match provider {
         TitleProvider::Claude => screen.claude_composer_context(true).is_some(),
@@ -4115,6 +4177,17 @@ impl TerminalView {
     /// card covers the screen, or Claude's input box isn't there.
     pub fn prompt_hidden(&self) -> bool {
         prompt_hidden(self.title_provider, &self.session.startup_screen())
+    }
+
+    /// Why `ctl send` without `--force` would refuse to type into this pane
+    /// now, from its status and one read of its screen.
+    pub fn send_refusal(&self) -> Option<SendRefusal> {
+        send_refusal(
+            &self.runtime_snapshot(),
+            self.session.binding_revision(),
+            self.title_provider,
+            &self.session.startup_screen(),
+        )
     }
 
     /// A complete live draft, never a clipped prefix or collapsed paste marker.
