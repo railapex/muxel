@@ -3326,6 +3326,16 @@ mod tests {
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{\"session_id\":").unwrap();
+        // Written after the binding, as a real end is. Linux dates files by a
+        // coarser clock than SystemTime::now(), so a write straight after the
+        // launch can carry an earlier time; the record is dated explicitly.
+        let written = pane.since + std::time::Duration::from_millis(50);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
         let end = read_claude_end(&pane.data, pane.pane, &conversation)
             .unwrap()
             .unwrap();
