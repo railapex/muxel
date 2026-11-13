@@ -89,6 +89,8 @@ mod diff_panes;
 #[cfg(test)]
 mod diff_refresh_tests;
 #[cfg(all(test, windows))]
+mod ended_exit_tests;
+#[cfg(all(test, windows))]
 mod first_prompt_size_tests;
 #[cfg(all(test, windows))]
 mod hidden_paint_tests;
@@ -4016,6 +4018,17 @@ fn preset_icon(preset: &AgentPreset, size: Pixels, color: Hsla) -> Svg {
 /// A preset's icon as a gpui-component [`Icon`] (kind-aware).
 fn preset_icon_obj(preset: &AgentPreset) -> Icon {
     Icon::empty().path(preset_icon_path(preset))
+}
+
+/// The label of a pane whose program ended abnormally: "ended", with the age a
+/// done label would show.
+fn ended_label(activity: &AgentActivity, now: i64) -> String {
+    let label = agent_activity_label(activity_state(AgentStatus::Done), activity, now);
+    // New key: catalogs fall back to English until regenerated.
+    match label.split_once(" · ") {
+        Some((_, age)) => format!("{} · {age}", t("ended")),
+        None => t("ended").to_string(),
+    }
 }
 
 /// Fixed worktree color palette (Tailwind 400s). Deliberately avoids blue/green/
@@ -16291,7 +16304,7 @@ impl MuxelApp {
             )
             .times(times)
             .recorded(ahead);
-            let effect = apply_status_sample(
+            let mut effect = apply_status_sample(
                 &mut record,
                 self.workspace
                     .instance_mut(iid)
@@ -16299,6 +16312,12 @@ impl MuxelApp {
                 sample,
                 now_epoch,
             );
+            // An abnormal exit is reported once, as "exited unexpectedly"
+            // below. The Done it leaves isn't a finished turn to announce: no
+            // "finished" entry, desktop notification or chime.
+            if exited && exit_code != Some(0) {
+                effect.notify = effect.notify.filter(|kind| *kind != NotifKind::Done);
+            }
             if let Some(record) = record {
                 self.last_status.insert(iid, record);
             }
@@ -25585,6 +25604,62 @@ impl MuxelApp {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
+    /// Whether `iid`'s program ended abnormally: it exited with a non-zero
+    /// code, a signal or no code at all. Its sidebar row and dashboard card both
+    /// ask this, through [`Self::pane_status_label`] and
+    /// [`Self::pane_status_color`], so the two read amber "ended" together where
+    /// its status would read Done. A clean exit stays Done, and so does a tmux
+    /// pane muxel is reconnecting: between retries it keeps its dead client's
+    /// view, and its bar says it is reconnecting.
+    fn pane_ended(&self, iid: Uuid, cx: &App) -> bool {
+        !self.reconnecting.contains_key(&iid)
+            && self.terminal_view(iid).is_some_and(|view| {
+                let view = view.read(cx);
+                view.exited() && view.exit_code() != Some(0)
+            })
+    }
+
+    /// The words of `iid`'s status on its sidebar row and dashboard card:
+    /// "ended" with the age of its ending when its program ended abnormally,
+    /// otherwise its activity label.
+    fn pane_status_label(
+        &self,
+        iid: Uuid,
+        status: AgentStatus,
+        activity: &AgentActivity,
+        cx: &App,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp_millis();
+        if self.pane_ended(iid, cx) {
+            return ended_label(activity, now);
+        }
+        let background = self
+            .terminal_view(iid)
+            .and_then(|view| view.read(cx).background_work());
+        localized_activity_label(status, activity, background, now)
+    }
+
+    /// The color of `iid`'s status on its sidebar row and dashboard card: amber
+    /// when its program ended abnormally, otherwise its status color. Either
+    /// dims once its finish has been read.
+    fn pane_status_color(
+        &self,
+        iid: Uuid,
+        status: AgentStatus,
+        activity: Option<&AgentActivity>,
+        cx: &App,
+    ) -> Hsla {
+        if !self.pane_ended(iid, cx) {
+            return pane_status_hsla(status, activity, cx);
+        }
+        let color = cx.theme().warning;
+        if done_is_read(status, activity) {
+            color.opacity(READ_DONE_OPACITY)
+        } else {
+            color
+        }
+    }
+
     /// `iid`'s activity with its live terminal's current sample applied as the
     /// status tick would apply it, recording nothing. The sidebar places rows
     /// by it, so a row sits where the next tick leaves it. `None` when the
@@ -29704,7 +29779,7 @@ impl MuxelApp {
                     )
                 });
                 let color = status
-                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
+                    .map(|s| self.pane_status_color(iid, s, inst.map(|i| &i.activity), cx))
                     .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
@@ -29737,13 +29812,11 @@ impl MuxelApp {
                                     status
                                         .zip(inst)
                                         .map(|(status, instance)| {
-                                            localized_activity_label(
+                                            self.pane_status_label(
+                                                iid,
                                                 status,
                                                 &instance.activity,
-                                                self.terminal_view(iid).and_then(|view| {
-                                                    view.read(cx).background_work()
-                                                }),
-                                                chrono::Utc::now().timestamp_millis(),
+                                                cx,
                                             )
                                         })
                                         .unwrap_or_else(|| status_label(status).to_string()),
@@ -31541,7 +31614,7 @@ impl MuxelApp {
                     } else if asleep {
                         self.asleep_icon_color(iid, finish_unread, cx)
                     } else {
-                        pane_status_hsla(status, inst.map(|i| &i.activity), cx)
+                        self.pane_status_color(iid, status, inst.map(|i| &i.activity), cx)
                     };
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
@@ -31696,13 +31769,7 @@ impl MuxelApp {
                     } else {
                         let label = inst
                             .map(|instance| {
-                                localized_activity_label(
-                                    status,
-                                    &instance.activity,
-                                    self.terminal_view(iid)
-                                        .and_then(|view| view.read(cx).background_work()),
-                                    chrono::Utc::now().timestamp_millis(),
-                                )
+                                self.pane_status_label(iid, status, &instance.activity, cx)
                             })
                             .unwrap_or_else(|| status_label(Some(status)).to_string());
                         // An asleep row's pill is a moon and an age; the words
@@ -31719,7 +31786,14 @@ impl MuxelApp {
                         } else if asleep {
                             self.asleep_pill(iid, cx).into_any_element()
                         } else {
-                            let tag = status_tag(status, label);
+                            let tag = status_tag(
+                                if self.pane_ended(iid, cx) {
+                                    AgentStatus::Blocked
+                                } else {
+                                    status
+                                },
+                                label,
+                            );
                             // A read finish keeps its green as an outline, so
                             // the label stays legible on the sidebar.
                             let tag = if read_done { tag.outline() } else { tag };

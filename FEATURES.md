@@ -615,15 +615,19 @@ feature is added or changed, update the matching entry here in the same change**
   and screen activity. Binding switches and exits clear old activity. A retained
   Done badge does not change the live facts used for sending or waiting.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
-  or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. A **done** you haven't looked at stays
+  or **done**, color-coded (blue / gray / amber / green) on its sidebar row,
+  dashboard card and notification dots. A **done** you haven't looked at stays
   bright green; once you focus its pane, its sidebar and dashboard icons dim and
   its sidebar pill turns to a green outline, so unread finishes stand out. Filled
   sidebar pills are opaque, with labels at 4.5:1 contrast or better in every
   bundled theme. A pane in front when muxel restores a project, or picked while
   it starts, counts as looked at once its terminal draws while its window is
-  active, so its saved finish doesn't stay unread in front of you. Screen
-  checks, markers included, skip
+  active, so its saved finish doesn't stay unread in front of you. A pane
+  whose program ended abnormally (a non-zero exit, a signal or no exit code)
+  shows amber **ended**, with the age of its ending, in place of **done** on both
+  its sidebar row and its dashboard card, and dims the same way once seen; a
+  clean exit stays **done**, and so does a tmux pane while muxel reconnects it.
+  Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. The box is
   still found when Claude draws its usage notice into the box's top rule, and
@@ -1584,7 +1588,9 @@ feature is added or changed, update the matching entry here in the same change**
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
   (plus a desktop notification when unattended), and Restart relaunches in place
-  (resuming a resume-capable agent's conversation).
+  (resuming a resume-capable agent's conversation). That error is the only
+  report: the ending isn't also announced as a finished turn, with no "finished"
+  entry, desktop notification or chime. A clean exit still announces one.
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
   is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
