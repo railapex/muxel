@@ -712,6 +712,10 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     if instance.program.as_deref().is_some_and(is_codex_program) {
         args.push("--config".to_string());
         args.push(codex_terminal_title_override().to_string());
+        if instance.control_prompt && startup_input.is_some() {
+            args.push("--config".to_string());
+            args.push("check_for_update_on_startup=false".to_string());
+        }
     }
 
     let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
@@ -761,6 +765,13 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     let id_flag = preset.session_id_flag.as_deref()?;
     let id = instance.session_id.as_deref()?;
     Some(vec![id_flag.to_string(), id.to_string()])
+}
+
+/// Whether a restart would resume this pane's conversation rather than start
+/// a new one: it has launched, its conversation id has been captured, and its
+/// preset resumes by id. What sleep relies on to bring the same work back.
+pub fn resume_trusted(preset: &AgentPreset, instance: &Instance) -> bool {
+    instance.session_started && session_resume_args(preset, instance).is_some()
 }
 
 /// Path to Claude's on-disk session transcript for an agent running in `cwd`:
@@ -1507,6 +1518,51 @@ mod tests {
     }
 
     #[test]
+    fn windows_settings_wait_for_verified_codec() {
+        let launch = resolve_launch(&instance(&AgentPreset::codex(), None));
+        assert!(
+            !launch
+                .args
+                .iter()
+                .any(|arg| arg.contains("disable_paste_burst")),
+            "pure launch resolution cannot verify the native codec; leave paste detection enabled"
+        );
+    }
+
+    #[test]
+    fn codex_control_launches_configure_input_without_changing_literal_argv() {
+        let mut pane = instance(&AgentPreset::codex(), Some("startup task"));
+        pane.control_prompt = true;
+        pane.auto_submit = true;
+        let launch = resolve_launch(&pane);
+        assert_eq!(launch.startup_input.as_deref(), Some("startup task"));
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "check_for_update_on_startup=false"] })
+        );
+        assert!(
+            !launch
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--config", "disable_paste_burst=true"] })
+        );
+        let resumed = resolve_launch_for_session(&pane, true);
+        assert!(resumed.startup_input.is_none());
+        assert!(
+            !resumed
+                .args
+                .iter()
+                .any(|arg| arg == "check_for_update_on_startup=false")
+        );
+
+        pane.literal_argv = true;
+        pane.args = vec!["--config".into(), "disable_paste_burst=false".into()];
+        assert_eq!(resolve_launch(&pane).args, pane.args);
+    }
+
+    #[test]
     fn codex_session_id_is_extracted_from_semantic_title() {
         let id = Uuid::new_v4().to_string();
         for title in [
@@ -1856,6 +1912,37 @@ mod tests {
         s.session_id = Some("abc".to_string());
         s.session_started = true;
         assert_eq!(session_resume_args(&shell, &s), None);
+    }
+
+    #[test]
+    fn only_a_launched_pane_with_a_captured_id_trusts_its_resume() {
+        // Sleep ends the program on this answer, so a pane that would start a
+        // new conversation instead (Claude's first launch passes --session-id,
+        // which resume args alone can't tell apart) must never pass.
+        for preset in AgentPreset::builtin_agents()
+            .into_iter()
+            .chain([AgentPreset::shell()])
+        {
+            let mut inst = instance(&preset, None);
+            inst.session_id = Some("abc".to_string());
+            assert!(!resume_trusted(&preset, &inst), "{} unstarted", preset.name);
+            inst.session_started = true;
+            assert_eq!(
+                resume_trusted(&preset, &inst),
+                preset.effective_resume_flag().is_some(),
+                "{} started",
+                preset.name
+            );
+            inst.session_id = None;
+            assert!(
+                !resume_trusted(&preset, &inst),
+                "{} without an id",
+                preset.name
+            );
+            inst.session_id = Some("abc".to_string());
+            inst.literal_argv = true;
+            assert!(!resume_trusted(&preset, &inst), "{} literal", preset.name);
+        }
     }
 
     #[test]

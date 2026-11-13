@@ -16,10 +16,29 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Work an agent's screen says is still running beside its turn. Read from the
+/// screen every time, so it is never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundWork {
+    pub shells: u32,
+    pub monitors: u32,
+    /// Running subagents, which the agent's screen may name without a count.
+    pub subagents: bool,
+}
+
+impl BackgroundWork {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 mod new;
 pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
 pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
+mod delivery;
+pub use delivery::{PromptDelivery, PromptOutcome, StartupBlocker, StartupBlockerKind};
 mod card;
 pub use card::{CardPrompt, card_lines, card_prompt, card_value, is_hidden_char};
 mod approval;
@@ -94,7 +113,8 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
-    /// Open a terminal in a project's active tab group.
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
     New {
         project: String,
         #[serde(flatten)]
@@ -107,6 +127,10 @@ pub enum Command {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// Deliberately open an existing pane, waking it if asleep.
+    Focus { agent: String },
+    /// Wake an asleep pane in the background, without focusing it.
+    Wake { agent: String },
     /// An agent's last prompt, last reply and pending question.
     Show {
         agent: String,
@@ -299,11 +323,15 @@ pub enum ErrorCode {
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
+    /// The provider cannot insert these characters literally. Nothing was typed.
+    UnsupportedInput,
     /// A pane behind tmux takes ctl input only through tmux, at the agent's own
     /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
     TmuxPaneUnresolved,
     /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
     TmuxPaneInMode,
+    /// tmux refused the input, or couldn't be run. Nothing was typed.
+    TmuxRefused,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -414,7 +442,7 @@ pub fn check_self_target(caller: Option<Uuid>, target: Uuid, force: bool) -> Res
 /// A successful send receipt, created only after the paste was admitted to the
 /// PTY writer. Admission does not confirm delivery to or consumption by the agent.
 pub fn pasted_prompt_receipt(pane: Uuid, launch: Uuid) -> Value {
-    json!({ "sent": true, "pasted": true, "agent": short_id(pane), "launch_id": launch })
+    json!({ "sent": true, "pasted": true, "agent": short_id(pane), "uuid": pane, "launch_id": launch })
 }
 
 /// What an agent pane is doing, as `muxel ctl` reports it.
@@ -460,6 +488,16 @@ pub struct AgentInfo {
     /// `None` for editors and browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentState>,
+    /// Why a terminal is not running. `dormant` and `sleeping` mean it starts
+    /// when woken (Enter or typing in it, Wake, `focus` or `wake`); selecting
+    /// it in muxel only shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_running_reason: Option<String>,
+    /// For an asleep agent: whether waking it resumes its conversation
+    /// (`false` when the saved conversation is gone), checked
+    /// when asked. Absent while it runs, or when muxel can't tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<bool>,
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
@@ -474,10 +512,20 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// What the agent's own screen says is still running beside its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// The foreground turn is over with background work still listed. Only
+    /// subagents hold the pane Working; shells and monitors remain metadata.
+    /// `wait --turn` stops here even during a subagent hold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_over: bool,
     /// A startup task that failed before provider acceptance. The terminal itself
     /// may still be running, for example at a folder-trust menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivery: Option<PromptDelivery>,
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
@@ -489,6 +537,9 @@ pub struct AgentInfo {
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Current Git branch from the launch folder's background cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Runs on a remote host over SSH.
     pub remote: bool,
 }
@@ -500,14 +551,7 @@ pub fn short_id(id: Uuid) -> String {
 
 /// The latest lifecycle transition an agent has recorded (unix ms).
 pub fn status_since(activity: &AgentActivity) -> Option<i64> {
-    [
-        activity.work_started_at,
-        activity.completed_at,
-        activity.blocked_at,
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    activity.last_work_at()
 }
 
 /// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has
@@ -577,7 +621,8 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits), a name, or `project/name` when names repeat.
+/// four or more hex digits), a name, `project/name` when names repeat, or an id
+/// prefixed by `pane` that no agent's name matches.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -592,13 +637,21 @@ pub fn resolve_agent(
             .filter(|id| agents.iter().any(|a| a.id == *id))
             .ok_or_else(|| "no pane is focused".into());
     }
-    if id_like(query) {
-        let hits: Vec<&AgentEntry> = agents.iter().filter(|a| id_matches(a.id, query)).collect();
+    let by_id = |id_query: &str| -> Option<Result<Uuid, String>> {
+        let hits: Vec<&AgentEntry> = agents
+            .iter()
+            .filter(|a| id_matches(a.id, id_query))
+            .collect();
         match hits.as_slice() {
-            [one] => return Ok(one.id),
-            [] => {}
-            many => return Err(ambiguous(query, many)),
+            [one] => Some(Ok(one.id)),
+            [] => None,
+            many => Some(Err(ambiguous(query, many))),
         }
+    };
+    if id_like(query)
+        && let Some(found) = by_id(query)
+    {
+        return found;
     }
     let (project, name) = match query.split_once('/') {
         Some((project, name)) => (Some(normalize(project)), normalize(name)),
@@ -611,9 +664,16 @@ pub fn resolve_agent(
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.id),
-        [] => Err(format!(
-            "no agent matches '{query}' — run `muxel ctl panes` to list them"
-        )),
+        // `pane<ID>` only once no agent has that name.
+        [] => query
+            .strip_prefix("pane")
+            .filter(|id| id_like(id))
+            .and_then(&by_id)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "no agent matches '{query}' — run `muxel ctl panes` to list them"
+                ))
+            }),
         many => Err(ambiguous(query, many)),
     }
 }
@@ -1251,6 +1311,8 @@ pub enum CliCommand {
         agent: String,
         timeout_secs: u64,
         full: bool,
+        /// Stop when the turn ends, even with background work still running.
+        turn: bool,
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
@@ -1267,26 +1329,35 @@ usage: muxel ctl <command> [args]
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
   new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--focus] [--top-level] [--prompt TEXT [--wait-delivery]] [--from LABEL]
+              [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
-                                 --background is a compatibility no-op; --prompt - reads stdin
+                                 from a pane, nests under its session in Recent work
+                                 unless --top-level; --background is a compatibility
+                                 no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
+  focus AGENT                    open a pane; wake it if asleep
+  wake AGENT                     wake an asleep pane, without focus
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal
-  wait AGENT [--timeout SECS] [--full]
-                                 wait for the turn to end, then show it
+  wait AGENT [--timeout SECS] [--full] [--turn]
+                                 wait for the agent to finish, then show it;
+                                 --turn stops at an observable turn end, even
+                                 with background work; a provider still
+                                 reporting Working keeps waiting
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
   skill                          instructions for an orchestrating agent
   help [COMMAND]                 show general or command-specific help
 
-AGENT is an id from `panes`, a name, project/name, or `focused`.
+AGENT is an id from `panes` (also pane<ID>), a name, project/name, or `focused`.
+Never re-send text after an uncertain receipt. Follow the read-only `next` command to inspect the current pane; a pending_in_composer receipt does not authorize a later Enter.
 send, answer and keys refuse the caller's own pane unless --force is explicit.
 Everything after `--` is taken literally (for text that starts with -).
 Input to a pane kept in tmux goes to its tmux pane through tmux, never through the tmux client; agent panes need no shell grant.
@@ -1305,6 +1376,8 @@ Ask returns a pending request id immediately; the CLI polls once per second unti
 Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
 Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
 `--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+With --prompt the reply comes once the pane exists: its task submitted, refused, or prompt_pending with `status` as next.
+`--wait-delivery` keeps reading until the task settles, for up to 90 seconds.
 `--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
 All three grants default off; upgrades do not infer creation permission from the older grants.
@@ -1332,13 +1405,17 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--top-level] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. Opened from a pane, it nests under that pane's session in Recent work; --top-level opens it as a session of its own. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
         }
         "status" => {
             "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
+        }
+        "focus" => "usage: muxel ctl focus AGENT\nOpen an existing pane, waking it if asleep.",
+        "wake" => {
+            "usage: muxel ctl wake AGENT\nWake an asleep pane in the background; focus stays where it is."
         }
         "show" => {
             "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
@@ -1347,10 +1424,10 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
@@ -1376,6 +1453,8 @@ fn unknown_command_error(command: &str) -> String {
             "new",
             "new-status",
             "status",
+            "focus",
+            "wake",
             "show",
             "screen",
             "send",
@@ -1454,6 +1533,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
+    let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
     let mut lines: Option<usize> = None;
@@ -1466,6 +1546,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 break;
             }
             "--full" => full = true,
+            "--turn" => turn = true,
             "--force" => force = true,
             "--launch-id" => {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
@@ -1510,6 +1591,18 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             at_most(1)?;
             Command::Status {
                 agent: words.first().cloned(),
+            }
+        }
+        "focus" => {
+            at_most(1)?;
+            Command::Focus {
+                agent: agent(&words)?,
+            }
+        }
+        "wake" => {
+            at_most(1)?;
+            Command::Wake {
+                agent: agent(&words)?,
             }
         }
         "show" => {
@@ -1569,6 +1662,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 agent: agent(&words)?,
                 timeout_secs: timeout.unwrap_or(WAIT_TIMEOUT_SECS),
                 full,
+                turn,
             });
         }
         "skill" => return Ok(CliCommand::Skill),
@@ -1707,9 +1801,24 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl focus AGENT` - deliberately select and raise an existing pane,
+  waking it through normal restore if asleep. This changes keyboard focus. A
+  pane it wakes sleeps again after 30 idle minutes unless the user looks at it.
+- `muxel ctl wake AGENT` - wake an asleep pane in the background on
+  its saved conversation, leaving focus, the window and the active tab alone.
+  Replies `{woken: true, status: "starting"}`, or `{woken: false,
+  already_running: true, status}` when it already runs, so a retry is harmless.
+  Until the user looks at it, the pane sleeps again after 30 idle minutes,
+  counted from the wake or its latest work, so deliver what you woke it for.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
-  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  [--focus] [--top-level] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
+  Run from one of the project's panes, the new session nests under your session
+  in the sidebar's Recent work order, so the user sees it as your work; a
+  question it asks lifts your row with it. Pass `--top-level` for a session that
+  is independent work. Nesting never closes it with you.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
   or id; omitting both launch choices uses the toolbar's preset for that project.
@@ -1831,7 +1940,7 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   retrying. A `working` error with `reason: just_submitted` means the prior
   control turn is still in its grace on a pane with provider status or configured
   screen markers; `wait` for its reply. Activity-only panes allow a later send.
-  Codex, Claude and Grok sends also observe provider acceptance for about ten
+  Codex, Claude and Grok sends also observe provider acceptance for up to sixty
   seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
   false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
   `input_changed` (other input arrived; no further Enter is sent),
@@ -1850,13 +1959,31 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   and an added blank cursor line proving that the first Enter was consumed;
   a pending Enter never authorizes another.
   An unconfirmed receipt requires inspecting `screen` before more input.
-- `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints.
+  `outcome` is `submitted` only with provider acceptance, `pending_in_composer`
+  only with the complete retained draft and current guards, or `not_delivered`
+  when input was refused before delivery. `unconfirmed` preserves uncertainty,
+  including clipped or collapsed drafts. Follow the exact command in `next`.
+  Never re-send the text. `next` inspects the current pane; a pending receipt
+  cannot guard a later Enter after the draft or launch changes. Switch and
+  input protection covers muxel-observed changes; another tmux client's input
+  is untracked.
+  Native Windows Codex launches disable heuristic paste bursts only after a
+  version probe verifies the matching codec. Configured Codex 0.167+ preserves
+  line breaks and Unicode; CRLF becomes one newline. Unsupported controller
+  characters, including tabs, are refused before typing. Its clipboard encoder
+  also refuses unsupported controls before writing and reports the refusal.
+- `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
+  turn and any subagent hold have finished (or it blocks on a question, or exits),
+  then print what `show` prints. Shell and monitor listings do not delay completion;
+  they remain visible in `wait.background`. Subagents hold a finished turn for at
+  most three hours. `--turn` stops at an observable foreground turn end instead,
+  even during a subagent hold; it cannot override a provider still reporting
+  Working. Either way `wait.background` lists anything still running.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
   our Enter. Codex may receive one extra Enter only while its exact task remains
   on one exact ASCII row in its live idle editor, with no new user row. Wrapped
   or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
-  within ten seconds, failed readiness or unsupported provider sets
+  within sixty seconds, failed readiness or unsupported provider sets
   `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
   before sending another task; do not repeat creation. Muse and other providers
   without a verified startup protocol receive no task input.
@@ -1896,7 +2023,7 @@ a round trip. That legacy path has a small race if the user enters copy mode
 between the check and Enter; stock 2.2/2.3 use it too (server version reporting
 arrived in 2.4). There is no new tmux version requirement.
 
-AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
+AGENT is an agent's `id` from `panes` (like `1a2b3c4d`, also `pane1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
 at. PROJECT is a project's id or name. muxels on different computers that share
 a project usually show its agents under the same ids, but each command only
@@ -1914,8 +2041,23 @@ hosts ignore this caller ID, so check the target when driving one.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; the user has
-  to open it in muxel.
+  start. `not_running` - the pane hasn't been started this session; selecting it
+  in muxel only shows it, so the user wakes it there (Enter, typing or Wake) or
+  you call `focus` or `wake`.
+
+Old local sessions may open asleep, and idle ones may be put to sleep: `status`
+and `panes` report `status: "not_running"` with `not_running_reason: "dormant"`
+(asleep since launch) or `"sleeping"` (put to sleep by the user or the idle
+timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
+refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
+and resumes the session; `wake` resumes it without focusing it, then `status`
+moves from `starting` to idle with a new `launch_id`.
+For an asleep agent, `status` and `panes` also report `resumes`,
+checked on disk when you ask: `true` when a wake brings its conversation back,
+`false` when it will start a new one (the provider deleted the saved
+conversation, or muxel never captured one). It is left out when muxel can't tell
+(Grok, whose files muxel can't locate) and while the agent runs.
+An approved `new --focus` also leaves other asleep sessions alone.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to
@@ -1939,6 +2081,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
+- `unsupported_input` - the native provider cannot insert the supplied control
+  characters or its multiline protocol could not be verified. Nothing was typed.
 - `tmux_pane_unresolved` - the agent's tmux pane, which takes its input, is
   gone or couldn't be found; nothing was typed. Check `screen`; the user may
   need to restart the agent.
@@ -1946,6 +2090,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   `screen` before pressing any again.
 - `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
   copy mode before retrying. A failure after a paste instead has `pasted: true`.
+- `tmux_refused` - tmux refused the input or couldn't be run; nothing was
+  typed. Check `screen` before retrying.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -1982,6 +2128,20 @@ also withhold Enter and return an error without a code; inspect the input first.
 
 - One prompt at a time per agent. Never `send` to an agent that is `working` or
   `blocked`.
+- Never re-send prompt text after a pasted or uncertain receipt. Follow the
+  read-only `next` command to inspect the current screen. `pending_in_composer`
+  describes an observed draft; it does not guard or authorize a later Enter.
+  `not_delivered` means nothing was typed; resolve its refusal before
+  sending the task. Never repeat `new`; use its existing pane. `new --prompt`
+  replies once the pane exists, with the task `submitted`, refused, or still
+  `prompt_pending` with `status` as `next`; `--wait-delivery` reads until it
+  settles, for up to 90 seconds. `--no-wait` replies before approval, with
+  `new-status` as `next`. A failed `send` or `new --prompt` has an `outcome`
+  too: `not_delivered` only for a coded refusal before any input, otherwise
+  `unconfirmed`, as when `new`'s approval poll is lost while the task can
+  still arrive. Other commands' failures carry no outcome. `status` and
+  `show.agent` include `prompt_delivery`. A folder trust, update or login blocker
+  reports `blocked_by` and `screen_excerpt`; leave trust decisions to the user.
 - Only type into shell panes (`"is_agent": false`) when the user asks; muxel
   refuses unless the user has also allowed it in its settings.
 - To stop an agent mid-turn press `esc` (`keys AGENT esc`). Don't send `ctrl-c`
@@ -2232,6 +2392,7 @@ mod tests {
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
             (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
+            (ErrorCode::TmuxRefused, "tmux_refused"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
@@ -2322,6 +2483,27 @@ mod tests {
     }
 
     #[test]
+    fn cached_branch_is_additive_and_separate_from_worktree_creation_branch() {
+        let mut old_response = serde_json::json!({
+            "id": "11111111", "uuid": id(7), "name": "shell",
+            "project": "repo", "project_id": "22222222", "kind": "terminal",
+            "preset": "Shell", "is_agent": false, "awaiting_reply": false,
+            "focused": false, "remote": false, "cwd": "/repo/env",
+            "worktree_branch": "original-at-creation"
+        });
+        let old: AgentInfo = serde_json::from_value(old_response.clone()).unwrap();
+        assert_eq!(old.branch, None);
+        assert!(serde_json::to_value(old).unwrap().get("branch").is_none());
+        old_response["branch"] = serde_json::json!("checked-out-now");
+        let current: AgentInfo = serde_json::from_value(old_response).unwrap();
+        assert_eq!(current.branch.as_deref(), Some("checked-out-now"));
+        assert_eq!(
+            current.worktree_branch.as_deref(),
+            Some("original-at-creation")
+        );
+    }
+
+    #[test]
     fn an_agent_shows_its_launch_id_only_while_it_runs() {
         let mut info = AgentInfo {
             id: short_id(id(7)),
@@ -2335,14 +2517,20 @@ mod tests {
             model: None,
             is_agent: true,
             status: Some(AgentState::NotRunning),
+            not_running_reason: None,
+            resumes: None,
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            background: None,
+            turn_over: false,
             startup_error: None,
+            prompt_delivery: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,
             cwd: None,
+            branch: None,
             remote: false,
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -2450,6 +2638,52 @@ mod tests {
         assert!(resolve_agent("9f00", &agents, None).is_err());
         assert_eq!(resolve_agent("9f000", &agents, None), Ok(b));
         assert!(resolve_agent("gemini", &agents, None).is_err());
+    }
+
+    #[test]
+    fn ctl_ergonomics_accepts_pane_ids_without_changing_name_or_ambiguity_rules() {
+        let a = id(0x1a2b3c4d_0000_0000_0000_000000000001);
+        let b = id(0x1a2bffff_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: a,
+                name: "panebench",
+                project: "sample",
+            },
+            AgentEntry {
+                id: b,
+                name: "other",
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1a2b3c4d", &agents, None), Ok(a));
+        assert_eq!(resolve_agent(&format!("pane{a}"), &agents, None), Ok(a));
+        assert!(
+            resolve_agent("pane1a2b", &agents, None)
+                .unwrap_err()
+                .contains("more than one")
+        );
+        assert_eq!(resolve_agent("panebench", &agents, None), Ok(a));
+    }
+
+    #[test]
+    fn a_name_spelled_like_a_pane_id_resolves_to_its_own_agent() {
+        let named = id(0x0000aaaa_0000_0000_0000_000000000001);
+        let other = id(0x12340000_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: named,
+                name: "pane1234",
+                project: "sample",
+            },
+            AgentEntry {
+                id: other,
+                name: "other",
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1234", &agents, None), Ok(named));
+        assert_eq!(resolve_agent("pane12340000", &agents, None), Ok(other));
     }
 
     #[test]
@@ -2747,6 +2981,29 @@ Steps:
     fn cli_parses_commands_flags_and_literal_text() {
         assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
         assert_eq!(
+            parse_cli(&words(&["focus", "old-session"])),
+            Ok(CliCommand::Request(Command::Focus {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["focus"])).is_err());
+        assert!(parse_cli(&words(&["focus", "a", "b"])).is_err());
+        assert_eq!(
+            parse_cli(&words(&["wake", "old-session"])),
+            Ok(CliCommand::Request(Command::Wake {
+                agent: "old-session".into()
+            }))
+        );
+        assert!(parse_cli(&words(&["wake"])).is_err());
+        assert!(parse_cli(&words(&["wake", "a", "b"])).is_err());
+        // Wire sends the wire form directly.
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"cmd":"wake","agent":"abcd1234"}"#).unwrap(),
+            Command::Wake {
+                agent: "abcd1234".into()
+            }
+        );
+        assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
         );
@@ -2780,7 +3037,17 @@ Steps:
             Ok(CliCommand::Wait {
                 agent: "a1b2".into(),
                 timeout_secs: 30,
-                full: false
+                full: false,
+                turn: false
+            })
+        );
+        assert_eq!(
+            parse_cli(&words(&["wait", "a1b2", "--turn"])),
+            Ok(CliCommand::Wait {
+                agent: "a1b2".into(),
+                timeout_secs: crate::control::WAIT_TIMEOUT_SECS,
+                full: false,
+                turn: true
             })
         );
         assert_eq!(
