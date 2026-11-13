@@ -1105,9 +1105,9 @@ pub fn backup_offer(
 
 /// The panes the crash notice's Review visits, in `order` (the workspace's
 /// projects and their layouts): the panes in `working` (mid-turn at the last
-/// save), then the panes in `unsent` (holding an unsent prompt) not already
-/// visited. A pane no longer in `order` is skipped.
-pub fn review_order(order: &[Uuid], working: &[Uuid], unsent: &[Uuid]) -> Vec<Uuid> {
+/// save), then the panes in `kept` (holding an unsent prompt, or an editor's
+/// kept changes) not already visited. A pane no longer in `order` is skipped.
+pub fn review_order(order: &[Uuid], working: &[Uuid], kept: &[Uuid]) -> Vec<Uuid> {
     let mut steps: Vec<Uuid> = order
         .iter()
         .copied()
@@ -1117,7 +1117,7 @@ pub fn review_order(order: &[Uuid], working: &[Uuid], unsent: &[Uuid]) -> Vec<Uu
         order
             .iter()
             .copied()
-            .filter(|iid| unsent.contains(iid) && !working.contains(iid)),
+            .filter(|iid| kept.contains(iid) && !working.contains(iid)),
     );
     steps
 }

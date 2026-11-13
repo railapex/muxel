@@ -894,22 +894,28 @@ impl MuxelApp {
     }
 
     /// The panes Review visits, in project and layout order: those working
-    /// at the last save, then those holding an unsent prompt.
-    pub(super) fn crash_review_steps(&self, notice: &CrashNotice) -> Vec<Uuid> {
+    /// at the last save, then those holding an unsent prompt or an editor's
+    /// kept changes, the two kinds the notice counts.
+    pub(super) fn crash_review_steps(&self, notice: &CrashNotice, cx: &App) -> Vec<Uuid> {
         let order: Vec<Uuid> = self
             .workspace
             .projects
             .iter()
             .flat_map(|project| project.instances())
             .collect();
-        let unsent: Vec<Uuid> = self
+        let unsent = self
             .rescue
             .offers
             .iter()
             .filter(|(_, offers)| !offers.is_empty())
-            .map(|(&iid, _)| iid)
-            .collect();
-        muxel_core::rescue::review_order(&order, &notice.mid_turn, &unsent)
+            .map(|(&iid, _)| iid);
+        let unsaved = self
+            .editors
+            .iter()
+            .filter(|(_, editor)| editor.read(cx).backup_offered())
+            .map(|(&iid, _)| iid);
+        let kept: Vec<Uuid> = unsent.chain(unsaved).collect();
+        muxel_core::rescue::review_order(&order, &notice.mid_turn, &kept)
     }
 
     /// Take Review's next step: focus the next pane not yet visited. The
@@ -918,7 +924,7 @@ impl MuxelApp {
         let Some(notice) = self.rescue.crash.as_ref() else {
             return;
         };
-        let steps = self.crash_review_steps(notice);
+        let steps = self.crash_review_steps(notice, cx);
         let next = steps
             .iter()
             .copied()
@@ -938,7 +944,7 @@ impl MuxelApp {
     /// The crash notice in the title bar, until dismissed or reviewed.
     fn render_crash_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let notice = self.rescue.crash.as_ref()?;
-        let steps = self.crash_review_steps(notice);
+        let steps = self.crash_review_steps(notice, cx);
         let seen = steps
             .iter()
             .filter(|iid| self.rescue.reviewed.contains(iid))

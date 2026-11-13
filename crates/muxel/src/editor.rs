@@ -1051,9 +1051,8 @@ impl EditorView {
         }
     }
 
-    /// Whether this editor is offering a backup. Only the Windows app tests
-    /// use it.
-    #[cfg(all(test, windows))]
+    /// Whether this editor is offering a backup: the crash notice's Review
+    /// visits it.
     pub(crate) fn backup_offered(&self) -> bool {
         self.rescue.offer.is_some()
     }
