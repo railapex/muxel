@@ -52,7 +52,7 @@ impl ProcessTree {
     /// it started no earlier than its parent: Windows reuses PIDs, so an older
     /// process can still name `root`'s PID as its long-gone parent.
     pub(super) fn open(root: u32) -> Self {
-        let parents = super::process_parent_map();
+        let parents = muxel_terminal::process_parent_map();
         let mut handles = Vec::new();
         let mut seen = HashSet::new();
         let mut pending = vec![(root, 0)];
