@@ -20,10 +20,13 @@ mod filetree;
 mod i18n;
 mod integrations;
 mod libraries;
+mod new_window;
+mod pane_scope;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod remote_paste;
+mod restart_handoff;
 mod secrets;
 mod session_binding;
 mod settings_view;
@@ -205,6 +208,7 @@ fn cli_info(first_arg: Option<&str>) -> Option<String> {
             "muxel {version} — a multi-agent terminal multiplexer\n\
              \n\
              usage: muxel                  open the muxel window\n       \
+             muxel --new-window     open another window, on the workspace selector\n       \
              muxel ctl <command>    control the running muxel (`muxel ctl help`)\n       \
              muxel --version        print the version and exit\n       \
              muxel --help           print this help and exit"
@@ -237,6 +241,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let (args, after_restart) = restart_handoff::take(args);
     // Answer version/help before GUI startup, after consuming isolation flags.
     if let Some(text) = cli_info(args.first().and_then(|arg| arg.to_str())) {
         #[cfg(windows)]
@@ -281,11 +286,28 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // `--new-window` / `--workspace ID`, as New Window passes them. What's left
+    // is read again only by Linux's `--browser` below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let args = match new_window::configure(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     install_panic_reporter();
+    // Linux: find out now whether panes can run in systemd scopes of their own.
+    pane_scope::warm();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Started by a Restart: the version this one replaces releases its
+    // workspace first, before any window opens or outside control starts.
+    if let Some(workspace) = after_restart {
+        restart_handoff::wait(workspace);
+    }
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what
@@ -413,10 +435,14 @@ fn main() {
 
             let window_bounds = muxel_store::load_window_geom().and_then(|g| {
                 if g.width > 0.0 && g.height > 0.0 {
-                    let bounds = Bounds {
+                    let mut bounds = Bounds {
                         origin: point(px(g.x), px(g.y)),
                         size: size(px(g.width), px(g.height)),
                     };
+                    // New Window: beside the window that opened it, not on top.
+                    if new_window::launch_request().cascade {
+                        bounds = new_window::cascaded(bounds);
+                    }
                     Some(if g.maximized {
                         WindowBounds::Maximized(bounds)
                     } else {

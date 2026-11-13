@@ -8,14 +8,22 @@
 // master isn't `Sync`). Same trade-off gpui-component makes for its entities.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(windows)]
+mod codex_version;
 mod colors;
 mod control_input;
+mod control_paste;
 mod element;
 mod keymap;
 mod links;
 mod listener;
 mod pane_job;
+mod pending_ops;
 mod present_flag;
+#[cfg(windows)]
+mod process_tree;
+#[cfg(unix)]
+mod process_tree_unix;
 mod profile;
 mod profile_idle;
 pub mod profile_log;
@@ -24,6 +32,8 @@ mod replies;
 mod search;
 mod session;
 mod startup;
+#[cfg(test)]
+mod test_wait;
 mod view;
 
 pub use colors::TerminalPalette;
@@ -33,17 +43,19 @@ pub use control_input::{
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};
+#[cfg(windows)]
+pub use process_tree::process_parent_map;
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{
-    CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
-    PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource,
-    literal_program_for_spawn, muse_config_supported,
+    CommandSpec, FenceUnknown, InputFence, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY,
+    PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk, PtyOutputQueueStats, PtyReceiver, Submission,
+    TerminalSession, TitleSource, literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
     AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    TextPasteErrorHandler, clean_agent_title, pane_grid, paste_clipboard_into_session,
 };

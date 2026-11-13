@@ -8,9 +8,10 @@ fn countdown_label(deadline: Instant) -> SharedString {
     tf("Undo {seconds}", &[("seconds", &seconds.to_string())]).into()
 }
 
+/// The plain confirm's third button. A close's own choice, closing only the
+/// idle panes, is the leaving question's.
 pub(super) fn close_alternative_label(action: &ConfirmAction) -> Option<SharedString> {
     match action {
-        ConfirmAction::CloseBatch(ids) if ids.len() > 1 => Some(t("Close only the idle ones")),
         ConfirmAction::SaveEditorBeforeClose { .. } => Some(t("Don't Save")),
         _ => None,
     }
@@ -407,6 +408,27 @@ fn main_app(cx: &App) -> Option<Entity<MuxelApp>> {
     cx.try_global::<MuxelHandle>()?.0.upgrade()
 }
 
+/// An answer to the confirm a pop-out shows for its pane `iid`, while it is
+/// still that pane's.
+fn answer_popout_confirm(
+    iid: Uuid,
+    answer: muxel_core::leaving::Answer,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(app) = main_app(cx) {
+        app.update(cx, |app, cx| {
+            if app
+                .confirm
+                .as_ref()
+                .is_some_and(|pending| pending.action.pane_instance() == Some(iid))
+            {
+                app.answer_confirm(answer, window, cx);
+            }
+        });
+    }
+}
+
 impl PopoutView {
     pub(super) fn central_close_confirm(&self, _cx: &App) -> Option<PendingConfirm> {
         // Initial window drawing can run inside the app update that opens it.
@@ -414,39 +436,66 @@ impl PopoutView {
         self.close_confirm.clone()
     }
 
-    fn cancel_central_close_confirm(&self, cx: &mut Context<Self>) {
-        if let Some(app) = main_app(cx) {
-            app.update(cx, |app, cx| {
-                if app
-                    .confirm
-                    .as_ref()
-                    .is_some_and(|pending| pending.action.pane_instance() == Some(self.iid))
-                {
-                    app.cancel_confirm(cx);
-                }
-            });
+    /// Enter, Esc and I for the confirm this pop-out shows, ahead of its
+    /// pane, as [`MuxelApp::dialog_key`] does for the other windows.
+    pub(super) fn central_close_confirm_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.central_close_confirm(cx) else {
+            return;
+        };
+        // The question is modal: no key reaches the pane behind it.
+        cx.stop_propagation();
+        let keys = &event.keystroke.modifiers;
+        if keys.control || keys.alt || keys.platform || keys.function || keys.shift {
+            return;
         }
-        cx.notify();
+        let idle = pending
+            .leave
+            .as_ref()
+            .is_some_and(|leave| leave.idle.is_some());
+        if let Some(answer) = muxel_core::leaving::answer(event.keystroke.key.as_str(), idle) {
+            answer_popout_confirm(self.iid, answer, window, cx);
+            cx.notify();
+        }
     }
 
     pub(super) fn render_central_close_confirm(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        use muxel_core::leaving::Answer;
         let pending = self.central_close_confirm(cx)?;
+        let iid = self.iid;
+        // The observer built the leaving question's view, pills as they are
+        // now; the app can't be read from here.
+        let leave = self
+            .app_state
+            .as_ref()
+            .and_then(|state| state.confirm.as_ref())
+            .and_then(|confirm| confirm.leave.as_ref());
+        if let Some(leave) = leave {
+            return Some(leave_question::render_leave_dialog(
+                "popout-close",
+                pending.title.clone(),
+                leave,
+                None,
+                pending.confirm_label.clone(),
+                move |answer, window, cx| answer_popout_confirm(iid, answer, window, cx),
+                cx,
+            ));
+        }
         let alternate = close_alternative_label(&pending.action);
+        // Saving is the safe way forward; not saving is what loses work.
+        let saves = matches!(pending.action, ConfirmAction::SaveEditorBeforeClose { .. });
         Some(
             modal_backdrop()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.cancel_central_close_confirm(cx)),
-                )
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.cancel_central_close_confirm(cx);
-                        cx.stop_propagation();
-                    }
-                }))
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    answer_popout_confirm(iid, Answer::Cancel, window, cx)
+                })
                 .child(
                     div()
                         .w(px(480.0))
@@ -484,44 +533,35 @@ impl PopoutView {
                                     Button::new("popout-close-cancel")
                                         .ghost()
                                         .label(t("Cancel"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_central_close_confirm(cx)
-                                        })),
+                                        .child(leave_question::key_hint("Esc"))
+                                        .on_click(move |_, window, cx| {
+                                            answer_popout_confirm(iid, Answer::Cancel, window, cx)
+                                        }),
                                 )
                                 .children(alternate.map(|label| {
-                                    Button::new("popout-close-alternative")
-                                        .ghost()
-                                        .label(label)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(app) = main_app(cx) {
-                                                app.update(cx, |app, cx| {
-                                                    if app.confirm.as_ref().is_some_and(|pending| {
-                                                        pending.action.pane_instance()
-                                                            == Some(this.iid)
-                                                    }) {
-                                                        app.run_close_alternative(cx);
-                                                    }
-                                                });
-                                            }
-                                        }))
+                                    let alternative =
+                                        Button::new("popout-close-alternative").label(label);
+                                    if saves {
+                                        alternative.danger()
+                                    } else {
+                                        alternative.ghost()
+                                    }
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            answer_popout_confirm(iid, Answer::IdleOnly, window, cx)
+                                        },
+                                    )
                                 }))
-                                .child(
-                                    Button::new("popout-close-ok")
-                                        .danger()
+                                .child({
+                                    let ok = Button::new("popout-close-ok")
                                         .label(pending.confirm_label)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            if let Some(app) = main_app(cx) {
-                                                app.update(cx, |app, cx| {
-                                                    if app.confirm.as_ref().is_some_and(|pending| {
-                                                        pending.action.pane_instance()
-                                                            == Some(this.iid)
-                                                    }) {
-                                                        app.run_confirm(window, cx);
-                                                    }
-                                                });
-                                            }
-                                        })),
-                                ),
+                                        .child(leave_question::key_hint("Enter"));
+                                    if saves { ok.primary() } else { ok.danger() }.on_click(
+                                        move |_, window, cx| {
+                                            answer_popout_confirm(iid, Answer::Confirm, window, cx)
+                                        },
+                                    )
+                                }),
                         ),
                 )
                 .into_any_element(),

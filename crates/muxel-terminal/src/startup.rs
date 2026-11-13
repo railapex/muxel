@@ -20,7 +20,7 @@ pub(crate) enum AcceptanceAction {
 }
 
 /// How long after its Enter a task has to show provider evidence of acceptance.
-pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct Acceptance {
@@ -58,6 +58,10 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    launch: Option<uuid::Uuid>,
+    /// The automation's place in its terminal's pending input, held until it
+    /// stops; a departure's interrupt stops it.
+    pending: Option<crate::pending_ops::PendingOp>,
 }
 
 impl Guard {
@@ -68,6 +72,8 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            launch: None,
+            pending: None,
         }
     }
 
@@ -79,10 +85,46 @@ impl Guard {
         self
     }
 
+    pub(crate) fn with_pending(mut self, pending: crate::pending_ops::PendingOp) -> Self {
+        self.pending = Some(pending);
+        self
+    }
+
     pub(crate) fn submitted(&self, at: i64) {
         if let Some(owner) = &self.control_turn {
             owner.submitted(at);
         }
+    }
+
+    pub(crate) fn with_launch(mut self, launch: uuid::Uuid) -> Self {
+        self.launch = Some(launch);
+        self.record_guard();
+        self
+    }
+
+    fn record_guard(&self) {
+        if let (Some(owner), Some(launch)) = (&self.control_turn, self.launch) {
+            owner.record_guard(launch, self.expected_revision);
+        }
+    }
+
+    pub(crate) fn record_paste(&self, may_have_pasted: bool) {
+        if let Some(owner) = &self.control_turn {
+            owner.record_paste(may_have_pasted);
+        }
+    }
+
+    pub(crate) fn write_error(&self, error: String) {
+        if let Some(owner) = &self.control_turn {
+            owner.write_error(error);
+        }
+    }
+
+    pub(crate) fn blocked(&mut self, blocker: muxel_core::control::StartupBlocker) {
+        if let Some(owner) = &self.control_turn {
+            owner.blocked(blocker);
+        }
+        self.fail(Stop::NotReady);
     }
 
     pub(crate) fn enter_admitted(&mut self, at: i64) {
@@ -118,6 +160,10 @@ impl Guard {
             .as_ref()
             .is_some_and(|owner| !owner.is_pending())
             || revision != self.expected_revision
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(crate::pending_ops::PendingOp::interrupted)
         {
             Some(Stop::Interrupted)
         } else if self.deadline.is_some_and(|deadline| elapsed >= deadline) {
@@ -164,6 +210,7 @@ impl Guard {
             return Err(Stop::WriteFailed);
         }
         self.expected_revision = self.expected_revision.wrapping_add(1);
+        self.record_guard();
         Ok(())
     }
 }
@@ -292,6 +339,64 @@ struct CodexCtlDraft {
 }
 
 impl Screen {
+    pub(crate) fn startup_blocker(&self) -> Option<muxel_core::control::StartupBlocker> {
+        use muxel_core::control::{StartupBlocker, StartupBlockerKind};
+        if self.claude_status_context().is_some()
+            || self.codex_composer_context(true).is_some()
+            || self.codex_composer_context(false).is_some()
+        {
+            return None;
+        }
+        let lower = self.text.to_ascii_lowercase();
+        let (kind, marker) = if (lower.contains("trust this folder")
+            || lower.contains("trust the files in this folder")
+            || lower.contains("folder access"))
+            && (lower.contains("no,")
+                || lower.contains("exit")
+                || lower.contains("quit")
+                || lower.contains("back to agent command center"))
+        {
+            (StartupBlockerKind::FolderTrust, "trust")
+        } else if lower.contains("update available")
+            && lower.contains("update now")
+            && lower.contains("skip")
+        {
+            (StartupBlockerKind::CodexUpdate, "update available")
+        } else if (lower.contains("sign in with chatgpt")
+            && (lower.contains("api key") || lower.contains("device code")))
+            || (lower.contains("select login method")
+                && (lower.contains("console") || lower.contains("claude account")))
+        {
+            (
+                StartupBlockerKind::Login,
+                if lower.contains("sign in with chatgpt") {
+                    "sign in"
+                } else {
+                    "select login"
+                },
+            )
+        } else {
+            return None;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let start = rows
+            .iter()
+            .position(|row| row.to_ascii_lowercase().contains(marker))
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let excerpt = rows[start..]
+            .iter()
+            .map(|row| row.trim_end())
+            .skip_while(|row| row.is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(600)
+            .collect();
+        Some(StartupBlocker { kind, excerpt })
+    }
+
     // Master can render a model row followed by a shortcuts footer. The
     // generic composer scan uses the last footer; ctl's geometry proof pins
     // the earlier model row when both are present.
@@ -627,6 +732,44 @@ impl Screen {
         normalized(&text) == normalized(input)
     }
 
+    /// A strict pending proof cannot recover hard line breaks or Unicode cell
+    /// widths from rendered rows. Only a complete single ASCII row qualifies.
+    pub(crate) fn claude_exact_draft(&self, input: &str) -> bool {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Some(region) = self.composer_rows(false) else {
+            return false;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let top = region.start;
+        if usize::try_from(self.cursor_row).ok() != Some(top)
+            || rows[top + 1..region.end]
+                .iter()
+                .any(|row| !row.trim().is_empty())
+        {
+            return false;
+        }
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            + 2;
+        let end = prefix + input.len();
+        self.cursor_column == end
+            && rows[top]
+                .chars()
+                .skip(prefix)
+                .take(input.len())
+                .collect::<String>()
+                == input
+            && rows[top].chars().skip(end).all(char::is_whitespace)
+    }
+
     /// The cursor must belong to the live input region between two rules. A menu
     /// choice or a quoted prompt elsewhere in the viewport is not a composer.
     /// `empty` uses cursor position, allowing Claude's placeholder text to remain.
@@ -858,6 +1001,30 @@ mod tests {
             Err(Stop::Interrupted)
         );
     }
+
+    /// A departure's interrupt stops a controlled startup at its next check,
+    /// whatever its input revision says, and its task is cancelled rather
+    /// than failed.
+    #[test]
+    fn a_departure_interrupt_stops_a_controlled_startup_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let ops = std::sync::Arc::<crate::pending_ops::PendingOps>::default();
+        let turn = StartupTurn::default();
+        let mut guard = Guard::new(0, None)
+            .with_control_turn(turn.claim())
+            .with_pending(ops.begin());
+        guard.write(ms(1), 0, || Ok(())).unwrap();
+        assert_eq!(ops.interrupt_all(), 1);
+        assert_eq!(
+            guard.write(ms(2), 1, || panic!("interrupted automation must not write")),
+            Err(Stop::Interrupted)
+        );
+        assert_eq!(guard.check(ms(3), 1), Err(Stop::Interrupted));
+        drop(guard);
+        assert_eq!(turn.state(), StartupTurnState::Cancelled);
+        assert_eq!(ops.count(), 0, "the stopped automation no longer counts");
+    }
+
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {
         let mut guard = Guard::new(0, Some(ms(30_000)));
@@ -885,13 +1052,50 @@ mod tests {
         assert_eq!(acceptance.observe(ms(5000), false, true), RetryEnter);
         assert_eq!(acceptance.observe(ms(5100), false, true), Observe);
         assert_eq!(acceptance.observe(ms(9999), false, true), Observe);
-        assert_eq!(acceptance.observe(ms(10_000), false, true), Failed);
+        assert_eq!(acceptance.observe(ms(60_000), false, true), Failed);
         let mut unsupported_retry = Acceptance::default();
         assert_eq!(unsupported_retry.observe(ms(5000), false, false), Observe);
         assert_eq!(unsupported_retry.observe(ms(6000), false, true), Observe);
-        assert_eq!(unsupported_retry.observe(ms(10_000), false, false), Failed);
+        assert_eq!(unsupported_retry.observe(ms(60_000), false, false), Failed);
         let mut accepted = Acceptance::default();
         assert_eq!(accepted.observe(ms(5000), true, true), Accepted);
+    }
+
+    #[test]
+    fn known_startup_blockers_are_named_without_treating_quoted_drafts_as_menus() {
+        use muxel_core::control::StartupBlockerKind;
+        for (text, kind) in [
+            (
+                "Trust this folder?\n› Yes, continue\n  No, quit\nEnter to confirm",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Accessing workspace\n❯ No, exit\n  Yes, I trust this folder",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Update available!\n1. Update now\n2. Skip until next version",
+                StartupBlockerKind::CodexUpdate,
+            ),
+            (
+                "Sign in with ChatGPT\nSign in with a device code\nUse an API key",
+                StartupBlockerKind::Login,
+            ),
+        ] {
+            let blocker = screen(text, 1, 2).startup_blocker().unwrap();
+            assert_eq!(blocker.kind, kind);
+            assert!(blocker.excerpt.chars().count() <= 600);
+        }
+        let quoted = screen(
+            "Claude Code\n────────────────\n❯ Explain: Trust this folder? No, exit\n────────────────\n? for shortcuts",
+            2,
+            42,
+        );
+        assert!(quoted.startup_blocker().is_none());
     }
 
     #[test]
