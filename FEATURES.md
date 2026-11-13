@@ -622,7 +622,9 @@ feature is added or changed, update the matching entry here in the same change**
   sidebar pills are opaque, with labels at 4.5:1 contrast or better in every
   bundled theme. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
-  status, while permission forms and hints outside the box still do. A draft can
+  status, while permission forms and hints outside the box still do. The box is
+  still found when Claude draws its usage notice into the box's top rule, and
+  after the notice leaves that rule cut short. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
   below it, a draft line that lands on the box's edge, or bash mode's `!` prompt.
   Grok's unanswered question card reports **blocked** in a pane without a tmux
