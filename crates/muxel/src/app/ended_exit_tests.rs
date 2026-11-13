@@ -1,4 +1,5 @@
-//! A program that ends abnormally is reported once, as "exited unexpectedly".
+//! A program that ends abnormally is reported once: a session as "exited
+//! unexpectedly", a command job as its own notice with the exit code.
 //! Its exit also leaves the pane Done, but that isn't a finished turn: the feed
 //! gets no "finished" entry for it, while a clean exit still gets one. Its
 //! sidebar row and dashboard card read "ended" where a clean exit reads "done".
@@ -62,13 +63,13 @@ fn an_abnormal_exit_is_reported_once_and_a_clean_exit_still_finishes() {
                     .notifications
                     .iter()
                     .filter(|n| {
-                        n.kind == NotifKind::Error && n.title.contains("exited unexpectedly")
+                        n.kind == NotifKind::Error
+                            && (n.instance == Some(crashed) || n.title.contains("crashed fixture"))
                     })
                     .count();
                 assert_eq!(crash_reports, 1, "the abnormal exit is reported once");
-                assert_eq!(
-                    entries(crashed),
-                    Vec::<NotifKind>::new(),
+                assert!(
+                    !entries(crashed).contains(&NotifKind::Done),
                     "an abnormal exit is no finished turn"
                 );
                 assert_eq!(
