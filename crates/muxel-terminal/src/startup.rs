@@ -20,7 +20,7 @@ pub(crate) enum AcceptanceAction {
 }
 
 /// How long after its Enter a task has to show provider evidence of acceptance.
-pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct Acceptance {
@@ -58,6 +58,7 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    launch: Option<uuid::Uuid>,
 }
 
 impl Guard {
@@ -68,6 +69,7 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            launch: None,
         }
     }
 
@@ -83,6 +85,37 @@ impl Guard {
         if let Some(owner) = &self.control_turn {
             owner.submitted(at);
         }
+    }
+
+    pub(crate) fn with_launch(mut self, launch: uuid::Uuid) -> Self {
+        self.launch = Some(launch);
+        self.record_guard();
+        self
+    }
+
+    fn record_guard(&self) {
+        if let (Some(owner), Some(launch)) = (&self.control_turn, self.launch) {
+            owner.record_guard(launch, self.expected_revision);
+        }
+    }
+
+    pub(crate) fn record_paste(&self, may_have_pasted: bool) {
+        if let Some(owner) = &self.control_turn {
+            owner.record_paste(may_have_pasted);
+        }
+    }
+
+    pub(crate) fn write_error(&self, error: String) {
+        if let Some(owner) = &self.control_turn {
+            owner.write_error(error);
+        }
+    }
+
+    pub(crate) fn blocked(&mut self, blocker: muxel_core::control::StartupBlocker) {
+        if let Some(owner) = &self.control_turn {
+            owner.blocked(blocker);
+        }
+        self.fail(Stop::NotReady);
     }
 
     pub(crate) fn enter_admitted(&mut self, at: i64) {
@@ -164,6 +197,7 @@ impl Guard {
             return Err(Stop::WriteFailed);
         }
         self.expected_revision = self.expected_revision.wrapping_add(1);
+        self.record_guard();
         Ok(())
     }
 }
@@ -292,6 +326,64 @@ struct CodexCtlDraft {
 }
 
 impl Screen {
+    pub(crate) fn startup_blocker(&self) -> Option<muxel_core::control::StartupBlocker> {
+        use muxel_core::control::{StartupBlocker, StartupBlockerKind};
+        if self.claude_status_context().is_some()
+            || self.codex_composer_context(true).is_some()
+            || self.codex_composer_context(false).is_some()
+        {
+            return None;
+        }
+        let lower = self.text.to_ascii_lowercase();
+        let (kind, marker) = if (lower.contains("trust this folder")
+            || lower.contains("trust the files in this folder")
+            || lower.contains("folder access"))
+            && (lower.contains("no,")
+                || lower.contains("exit")
+                || lower.contains("quit")
+                || lower.contains("back to agent command center"))
+        {
+            (StartupBlockerKind::FolderTrust, "trust")
+        } else if lower.contains("update available")
+            && lower.contains("update now")
+            && lower.contains("skip")
+        {
+            (StartupBlockerKind::CodexUpdate, "update available")
+        } else if (lower.contains("sign in with chatgpt")
+            && (lower.contains("api key") || lower.contains("device code")))
+            || (lower.contains("select login method")
+                && (lower.contains("console") || lower.contains("claude account")))
+        {
+            (
+                StartupBlockerKind::Login,
+                if lower.contains("sign in with chatgpt") {
+                    "sign in"
+                } else {
+                    "select login"
+                },
+            )
+        } else {
+            return None;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let start = rows
+            .iter()
+            .position(|row| row.to_ascii_lowercase().contains(marker))
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let excerpt = rows[start..]
+            .iter()
+            .map(|row| row.trim_end())
+            .skip_while(|row| row.is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(600)
+            .collect();
+        Some(StartupBlocker { kind, excerpt })
+    }
+
     // Master can render a model row followed by a shortcuts footer. The
     // generic composer scan uses the last footer; ctl's geometry proof pins
     // the earlier model row when both are present.
@@ -627,6 +719,44 @@ impl Screen {
         normalized(&text) == normalized(input)
     }
 
+    /// A strict pending proof cannot recover hard line breaks or Unicode cell
+    /// widths from rendered rows. Only a complete single ASCII row qualifies.
+    pub(crate) fn claude_exact_draft(&self, input: &str) -> bool {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Some(region) = self.composer_rows(false) else {
+            return false;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let top = region.start;
+        if usize::try_from(self.cursor_row).ok() != Some(top)
+            || rows[top + 1..region.end]
+                .iter()
+                .any(|row| !row.trim().is_empty())
+        {
+            return false;
+        }
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            + 2;
+        let end = prefix + input.len();
+        self.cursor_column == end
+            && rows[top]
+                .chars()
+                .skip(prefix)
+                .take(input.len())
+                .collect::<String>()
+                == input
+            && rows[top].chars().skip(end).all(char::is_whitespace)
+    }
+
     /// The cursor must belong to the live input region between two rules. A menu
     /// choice or a quoted prompt elsewhere in the viewport is not a composer.
     /// `empty` uses cursor position, allowing Claude's placeholder text to remain.
@@ -681,22 +811,16 @@ impl Screen {
             row.chars().count() >= 8 && row.chars().all(|ch| ch == '─' || ch == '━')
         };
         let (top, bottom) = if empty.is_some() {
-            let top = rows[..cursor].iter().rposition(|row| rule(row))?;
             let bottom = rows[cursor + 1..]
                 .iter()
                 .position(|row| rule(row))
                 .map(|offset| cursor + 1 + offset)?;
+            let top = claude_box_top(&rows, bottom).filter(|&top| top < cursor)?;
             (top, bottom)
         } else {
             // A repaint can leave the cursor anywhere, so take the final box.
-            // Its edges are the same full-width rule. Draft rows are drawn
-            // under the prompt, two columns in, so a rule typed into a draft
-            // never matches an edge and can't cut the box short.
             let bottom = rows.iter().rposition(|row| rule(row))?;
-            let edge = rows[bottom].trim_end();
-            let top = rows[..bottom]
-                .iter()
-                .rposition(|row| row.trim_end() == edge)?;
+            let top = claude_box_top(&rows, bottom)?;
             (top, bottom)
         };
         // The final framed region belongs to the composer, not an earlier turn.
@@ -709,11 +833,45 @@ impl Screen {
         if !after.starts_with(char::is_whitespace) {
             return None;
         }
+        // Rows under the prompt row are the draft's own, drawn two columns in.
+        // Anything at the edge's column means the two rules frame something
+        // else, such as a transcript above a permission form that has no box.
+        let indent = rows[bottom]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        if !rows[top + 2..bottom]
+            .iter()
+            .all(|row| row.chars().take(indent + 2).all(char::is_whitespace))
+        {
+            return None;
+        }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
         empty
             .is_none_or(|empty| cursor_at_start == empty)
             .then_some(top + 1..bottom)
     }
+}
+
+/// The top edge of Claude's input box whose bottom edge is `rows[bottom]`: the
+/// nearest row above it that starts with a rule at the edge's column. Claude
+/// can draw its usage notice into the right end of the top rule and then erase
+/// it with EL, so the top rule may be cut short, or carry text that ends at
+/// the edge's last column. Nearest keeps the match inside the box. Draft rows
+/// start two columns in, so a rule typed into a draft is never taken for it.
+fn claude_box_top(rows: &[&str], bottom: usize) -> Option<usize> {
+    let rule = |ch: char| ch == '─' || ch == '━';
+    let edge = rows[bottom].trim_end();
+    let indent = edge.chars().take_while(|ch| ch.is_whitespace()).count();
+    let top = rows[..bottom].iter().rposition(|row| {
+        row.chars().take_while(|ch| ch.is_whitespace()).count() == indent
+            && row.chars().nth(indent).is_some_and(rule)
+    })?;
+    let row = rows[top].trim_end();
+    let run = row.chars().skip(indent).take_while(|&ch| rule(ch)).count();
+    let (end, width) = (indent + run, edge.chars().count());
+    let whole = row.chars().count();
+    (run >= 8 && end <= width && (whole == end || whole == width)).then_some(top)
 }
 
 /// A row Codex draws below its live editor: its own shortcut hint or context
@@ -885,13 +1043,50 @@ mod tests {
         assert_eq!(acceptance.observe(ms(5000), false, true), RetryEnter);
         assert_eq!(acceptance.observe(ms(5100), false, true), Observe);
         assert_eq!(acceptance.observe(ms(9999), false, true), Observe);
-        assert_eq!(acceptance.observe(ms(10_000), false, true), Failed);
+        assert_eq!(acceptance.observe(ms(60_000), false, true), Failed);
         let mut unsupported_retry = Acceptance::default();
         assert_eq!(unsupported_retry.observe(ms(5000), false, false), Observe);
         assert_eq!(unsupported_retry.observe(ms(6000), false, true), Observe);
-        assert_eq!(unsupported_retry.observe(ms(10_000), false, false), Failed);
+        assert_eq!(unsupported_retry.observe(ms(60_000), false, false), Failed);
         let mut accepted = Acceptance::default();
         assert_eq!(accepted.observe(ms(5000), true, true), Accepted);
+    }
+
+    #[test]
+    fn known_startup_blockers_are_named_without_treating_quoted_drafts_as_menus() {
+        use muxel_core::control::StartupBlockerKind;
+        for (text, kind) in [
+            (
+                "Trust this folder?\n› Yes, continue\n  No, quit\nEnter to confirm",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Accessing workspace\n❯ No, exit\n  Yes, I trust this folder",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back",
+                StartupBlockerKind::FolderTrust,
+            ),
+            (
+                "Update available!\n1. Update now\n2. Skip until next version",
+                StartupBlockerKind::CodexUpdate,
+            ),
+            (
+                "Sign in with ChatGPT\nSign in with a device code\nUse an API key",
+                StartupBlockerKind::Login,
+            ),
+        ] {
+            let blocker = screen(text, 1, 2).startup_blocker().unwrap();
+            assert_eq!(blocker.kind, kind);
+            assert!(blocker.excerpt.chars().count() <= 600);
+        }
+        let quoted = screen(
+            "Claude Code\n────────────────\n❯ Explain: Trust this folder? No, exit\n────────────────\n? for shortcuts",
+            2,
+            42,
+        );
+        assert!(quoted.startup_blocker().is_none());
     }
 
     #[test]
@@ -1388,6 +1583,36 @@ mod tests {
         );
         // Neither status nor a hidden cursor grants startup input.
         assert!(!draft.claude_composer(false));
+    }
+    #[test]
+    fn box_under_a_usage_notice_or_its_cut_rule_is_still_found() {
+        // Claude 2.1.323 at 297 columns, from a recording: the usage notice
+        // drawn into the right end of the box's top rule, then the rule as EL
+        // left it when the notice went.
+        let bottom = "─".repeat(297);
+        let notice = format!(
+            "{}You've used 89% of your weekly limit · resets Nov 17, 1pm (America/Chicago)──",
+            "─".repeat(220)
+        );
+        assert_eq!(notice.chars().count(), 297);
+        for top in [notice, "─".repeat(220)] {
+            let footer = "  [>_>] · ▱▱▱▱▱▱▱▱▱▱ 450k · haiku med";
+            let text = format!(
+                "Claude Code v2.1.323\n\n{top}\n❯ reply with the word violet\n{bottom}\n\n{footer}"
+            );
+            let mut box_ = screen(&text, 3, 28);
+            assert!(box_.claude_composer(false), "{top}");
+            assert!(box_.claude_draft_matches("reply with the word violet"));
+            box_.cursor_row = 6;
+            box_.cursor_column = 0;
+            box_.cursor_visible = false;
+            assert_eq!(
+                box_.claude_status_context(),
+                Some(format!(
+                    "Claude Code v2.1.323\n\n{top}\n{bottom}\n\n{footer}"
+                ))
+            );
+        }
     }
     #[test]
     fn trust_choice_quoted_transcript_and_wrong_terminal_modes_are_not_ready() {
