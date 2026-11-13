@@ -272,6 +272,9 @@ pub enum SendRefusal {
     /// No prompt is showing to type into: a picker, menu or startup card
     /// covers it, or the agent hasn't drawn it yet.
     PromptHidden,
+    /// The composer already holds text, a person's half-typed prompt or one an
+    /// earlier send pasted without its Enter: a prompt would be added to it.
+    Draft,
 }
 
 impl TerminalRuntimeSnapshot {
@@ -299,11 +302,18 @@ impl TerminalRuntimeSnapshot {
     }
 
     /// Why `ctl send`, without `--force`, refuses to type into this pane now,
-    /// given whether a prompt is showing; `None` when it would type. A turn
-    /// held only for its background work is over, so its prompt is free. The
-    /// app adds what only it knows: `--force`, a control turn just submitted,
-    /// the launch, and panes it holds as failed, starting or exited.
-    pub fn send_refusal(&self, binding_rev: u64, prompt_hidden: bool) -> Option<SendRefusal> {
+    /// given whether a prompt is showing and whether its composer holds a
+    /// draft; `None` when it would type. A turn held only for its background
+    /// work is over, so its prompt is free. A missing prompt outranks a draft:
+    /// a draft read off a covered screen isn't the composer's. The app adds
+    /// what only it knows: `--force`, a control turn just submitted, the
+    /// launch, and panes it holds as failed, starting or exited.
+    pub fn send_refusal(
+        &self,
+        binding_rev: u64,
+        prompt_hidden: bool,
+        draft: bool,
+    ) -> Option<SendRefusal> {
         if !self.is_attributable_to(binding_rev) {
             return Some(SendRefusal::Unattributable);
         }
@@ -312,7 +322,8 @@ impl TerminalRuntimeSnapshot {
                 Some(SendRefusal::Working)
             }
             AgentStatus::Blocked => Some(SendRefusal::Blocked),
-            _ => prompt_hidden.then_some(SendRefusal::PromptHidden),
+            _ if prompt_hidden => Some(SendRefusal::PromptHidden),
+            _ => draft.then_some(SendRefusal::Draft),
         }
     }
 }
@@ -2623,15 +2634,38 @@ fn prompt_hidden(provider: TitleProvider, screen: &crate::startup::Screen) -> bo
     }
 }
 
+/// Whether the agent's composer holds text, for `ctl send`'s draft refusal.
+/// Claude and Codex are read from their drawn composer while it can be found,
+/// so a placeholder suggestion is not a draft and a draft deleted back to empty
+/// is none. Any other program, or a composer that can't be found, falls back to
+/// `typed_since_enter`: text typed into the pane since the last Enter.
+fn composer_has_draft(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    typed_since_enter: bool,
+) -> bool {
+    let drawn = match provider {
+        TitleProvider::Claude => screen.claude_composer_draft(),
+        TitleProvider::Codex => screen.codex_composer_draft(),
+        _ => None,
+    };
+    drawn.unwrap_or(typed_since_enter)
+}
+
 /// [`TerminalRuntimeSnapshot::send_refusal`], with whether a prompt is
-/// showing read from `screen`.
+/// showing and whether the composer holds a draft read from `screen`.
 fn send_refusal(
     runtime: &TerminalRuntimeSnapshot,
     binding_rev: u64,
     provider: TitleProvider,
     screen: &crate::startup::Screen,
+    typed_since_enter: bool,
 ) -> Option<SendRefusal> {
-    runtime.send_refusal(binding_rev, prompt_hidden(provider, screen))
+    runtime.send_refusal(
+        binding_rev,
+        prompt_hidden(provider, screen),
+        composer_has_draft(provider, screen, typed_since_enter),
+    )
 }
 
 fn startup_empty_composer(provider: TitleProvider, screen: &crate::startup::Screen) -> bool {
@@ -4163,18 +4197,14 @@ impl TerminalView {
         self.exited
     }
 
-    /// Whether the agent's composer holds text, for `ctl send`'s draft refusal.
-    /// Claude and Codex are read from their drawn composer while it can be
-    /// found, so a placeholder suggestion is not a draft and a draft deleted
-    /// back to empty is none. Any other program, or a composer that can't be
-    /// found, falls back to the draft bit: text typed since the last Enter.
+    /// Whether the agent's composer holds text, for `ctl send`'s draft refusal
+    /// (the free function `composer_has_draft` says how it's read).
     pub fn composer_has_draft(&self) -> bool {
-        let drawn = match self.title_provider {
-            TitleProvider::Claude => self.session.startup_screen().claude_composer_draft(),
-            TitleProvider::Codex => self.session.startup_screen().codex_composer_draft(),
-            _ => None,
-        };
-        drawn.unwrap_or_else(|| self.session.input_snapshot().1)
+        composer_has_draft(
+            self.title_provider,
+            &self.session.startup_screen(),
+            self.session.input_snapshot().1,
+        )
     }
 
     /// Whether no prompt is showing for `ctl send` to type into: a startup
@@ -4184,13 +4214,15 @@ impl TerminalView {
     }
 
     /// Why `ctl send` without `--force` would refuse to type into this pane
-    /// now, from its status and one read of its screen.
+    /// now, from its status, one read of its screen and the text typed since
+    /// the last Enter.
     pub fn send_refusal(&self) -> Option<SendRefusal> {
         send_refusal(
             &self.runtime_snapshot(),
             self.session.binding_revision(),
             self.title_provider,
             &self.session.startup_screen(),
+            self.session.input_snapshot().1,
         )
     }
 

@@ -402,8 +402,6 @@ struct SendAdmission {
     /// no prompt is showing; `control_writable` answers for the rest of it.
     refusal: Option<SendRefusal>,
     just_submitted: bool,
-    /// The agent's composer holds text (see [`TerminalView::composer_has_draft`]).
-    draft_present: bool,
     force: bool,
 }
 
@@ -505,39 +503,30 @@ fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
         .with_reason("just_submitted"));
     }
     match admission.refusal {
-        None => {}
-        Some(SendRefusal::Unattributable | SendRefusal::Working) => {
-            return Err(ctl::Error::new(
-                ErrorCode::Working,
-                "the agent is working: `wait` for it to finish (or pass --force to \
-                 type the prompt anyway)",
-            ));
-        }
-        Some(SendRefusal::Blocked) => {
-            return Err(ctl::Error::new(
-                ErrorCode::Blocked,
-                "the agent is waiting on a question: see `show`, then `answer` it or \
-                 press `keys`",
-            ));
-        }
-        Some(SendRefusal::PromptHidden) => {
-            return Err(ctl::Error::new(
-                ErrorCode::Blocked,
-                "no prompt is showing to type into: a picker, menu or startup card covers it, \
-                 or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send \
-                 again once the prompt is back (or pass --force)",
-            )
-            .with_reason("prompt_hidden"));
-        }
-    }
-    if admission.draft_present {
-        return Err(ctl::Error::new(
+        None => Ok(()),
+        Some(SendRefusal::Unattributable | SendRefusal::Working) => Err(ctl::Error::new(
+            ErrorCode::Working,
+            "the agent is working: `wait` for it to finish (or pass --force to \
+             type the prompt anyway)",
+        )),
+        Some(SendRefusal::Blocked) => Err(ctl::Error::new(
+            ErrorCode::Blocked,
+            "the agent is waiting on a question: see `show`, then `answer` it or \
+             press `keys`",
+        )),
+        Some(SendRefusal::PromptHidden) => Err(ctl::Error::new(
+            ErrorCode::Blocked,
+            "no prompt is showing to type into: a picker, menu or startup card covers it, \
+             or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send \
+             again once the prompt is back (or pass --force)",
+        )
+        .with_reason("prompt_hidden")),
+        Some(SendRefusal::Draft) => Err(ctl::Error::new(
             ErrorCode::DraftPresent,
             "the agent's composer already holds text, so a prompt would be added to it: \
              nothing was typed. Leave it to the user (or pass --force to type anyway)",
-        ));
+        )),
     }
-    Ok(())
 }
 
 impl MuxelApp {
@@ -2146,20 +2135,23 @@ impl MuxelApp {
             })
         });
         // A live pane's state comes from its runtime, which decides. One the app
-        // holds as failed, starting or exited is checked for a prompt only.
-        let refusal = self.terminal_view(iid).and_then(|view| {
-            let view = view.read(cx);
-            match state {
-                Some(
-                    AgentState::Working | AgentState::Idle | AgentState::Blocked | AgentState::Done,
-                ) => view.send_refusal(),
-                _ => view.prompt_hidden().then_some(SendRefusal::PromptHidden),
+        // holds as failed, starting or exited is checked for a prompt and a
+        // draft only.
+        let refusal = view.and_then(|view| match state {
+            Some(
+                AgentState::Working | AgentState::Idle | AgentState::Blocked | AgentState::Done,
+            ) => view.send_refusal(),
+            _ => {
+                if view.prompt_hidden() {
+                    Some(SendRefusal::PromptHidden)
+                } else {
+                    view.composer_has_draft().then_some(SendRefusal::Draft)
+                }
             }
         });
         SendAdmission {
             refusal,
             just_submitted,
-            draft_present: view.is_some_and(TerminalView::composer_has_draft),
             force,
         }
     }
@@ -3627,7 +3619,6 @@ mod prompt_submission_tests {
         let admission = SendAdmission {
             refusal: None,
             just_submitted: false,
-            draft_present: false,
             force: false,
         };
         let launch = |launch| super::Pins {
@@ -3685,7 +3676,6 @@ mod prompt_submission_tests {
         let admission = SendAdmission {
             refusal: None,
             just_submitted: false,
-            draft_present: false,
             force: true,
         };
         let pinned = super::Pins {
@@ -4058,7 +4048,6 @@ mod prompt_submission_tests {
             SendAdmission {
                 refusal: Some(muxel_terminal::SendRefusal::Working),
                 just_submitted: false,
-                draft_present: false,
                 force: false,
             },
         )
@@ -5205,9 +5194,8 @@ mod runtime_control_tests {
                 ..runtime
             };
             let result = check_send_state(SendAdmission {
-                refusal: runtime.send_refusal(binding, false),
+                refusal: runtime.send_refusal(binding, false, false),
                 just_submitted: false,
-                draft_present: false,
                 force: false,
             });
             assert_eq!(result.is_ok(), binding == 1 && attributable);
@@ -5244,9 +5232,8 @@ mod runtime_control_tests {
                     ..runtime
                 };
                 let result = check_send_state(SendAdmission {
-                    refusal: runtime.send_refusal(1, false),
+                    refusal: runtime.send_refusal(1, false, false),
                     just_submitted: false,
-                    draft_present: false,
                     force: false,
                 });
                 // A listing can't vouch for a prompt a switch may have left.
@@ -5290,9 +5277,8 @@ mod runtime_control_tests {
     fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
         let send = |runtime: TerminalRuntimeSnapshot, binding_rev, force| {
             check_send_state(SendAdmission {
-                refusal: runtime.send_refusal(binding_rev, false),
+                refusal: runtime.send_refusal(binding_rev, false, false),
                 just_submitted: false,
-                draft_present: false,
                 force,
             })
         };
@@ -5395,7 +5381,6 @@ mod runtime_control_tests {
         let error = check_send_state(SendAdmission {
             refusal: None,
             just_submitted: true,
-            draft_present: false,
             force: false,
         })
         .unwrap_err();
@@ -5407,7 +5392,6 @@ mod runtime_control_tests {
         let working = SendAdmission {
             refusal: Some(SendRefusal::Working),
             just_submitted: true,
-            draft_present: false,
             force: false,
         };
         assert_eq!(
@@ -5428,7 +5412,6 @@ mod runtime_control_tests {
         let hidden = SendAdmission {
             refusal: Some(SendRefusal::PromptHidden),
             just_submitted: false,
-            draft_present: false,
             force: false,
         };
         let error = check_send_state(hidden).unwrap_err();
@@ -5440,7 +5423,7 @@ mod runtime_control_tests {
                 reason: TerminalStatusReason::ProviderScreen,
                 ..held_snapshot()
             }
-            .send_refusal(1, true),
+            .send_refusal(1, true, false),
             ..hidden
         })
         .unwrap_err();
@@ -5467,10 +5450,12 @@ mod runtime_control_tests {
             "the agent is waiting on a question: see `show`, then `answer` it or press `keys`";
         const HIDDEN: &str = "no prompt is showing to type into: a picker, menu or startup card covers it, or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send again once the prompt is back (or pass --force)";
         const JUST: &str = "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)";
+        const DRAFT: &str = "the agent's composer already holds text, so a prompt would be added to it: nothing was typed. Leave it to the user (or pass --force to type anyway)";
         let working = serde_json::json!({"ok": false, "code": "working", "error": WORKING});
         let blocked = serde_json::json!({"ok": false, "code": "blocked", "error": BLOCKED});
         let hidden = serde_json::json!({"ok": false, "code": "blocked", "reason": "prompt_hidden", "error": HIDDEN});
         let just = serde_json::json!({"ok": false, "code": "working", "reason": "just_submitted", "error": JUST});
+        let draft = serde_json::json!({"ok": false, "code": "draft_present", "error": DRAFT});
         let sent = serde_json::Value::Null;
         // The pane's current binding is 1.
         let live = |status| TerminalRuntimeSnapshot {
@@ -5489,14 +5474,14 @@ mod runtime_control_tests {
             ..runtime
         };
         // The live pane's path: `TerminalView::send_refusal`, then `check_send_state`.
-        let reply = |runtime: TerminalRuntimeSnapshot, prompt_hidden, just_submitted, force| {
-            check_send_state(SendAdmission {
-                refusal: runtime.send_refusal(1, prompt_hidden),
-                just_submitted,
-                draft_present: false,
-                force,
-            })
-        };
+        let reply =
+            |runtime: TerminalRuntimeSnapshot, prompt_hidden, has_draft, just_submitted, force| {
+                check_send_state(SendAdmission {
+                    refusal: runtime.send_refusal(1, prompt_hidden, has_draft),
+                    just_submitted,
+                    force,
+                })
+            };
         // (what the pane shows, its runtime, no prompt showing, a control turn
         // just sent, the reply without --force)
         let rows = [
@@ -5530,9 +5515,31 @@ mod runtime_control_tests {
             ("blocked, turn just sent", live(Blocked), false, true, &just),
             ("no prompt, turn just sent", live(Idle), true, true, &just),
         ];
-        for (shows, runtime, prompt_hidden, just_submitted, want) in rows {
+        // The same with text in the composer: a draft refuses only a pane that
+        // would otherwise take the prompt.
+        let with_draft = [
+            ("idle, draft", live(Idle), false, false, &draft),
+            ("done, draft", live(Done), false, false, &draft),
+            ("held, draft", held, false, false, &draft),
+            ("working, draft", live(Working), false, false, &working),
+            ("blocked, draft", live(Blocked), false, false, &blocked),
+            ("no prompt, draft", live(Idle), true, false, &hidden),
+            (
+                "idle, switch settling, draft",
+                settling(live(Idle)),
+                false,
+                false,
+                &working,
+            ),
+            ("draft, turn just sent", live(Idle), false, true, &just),
+        ];
+        let rows = rows
+            .into_iter()
+            .map(|row| (false, row))
+            .chain(with_draft.into_iter().map(|row| (true, row)));
+        for (has_draft, (shows, runtime, prompt_hidden, just_submitted, want)) in rows {
             let body = |force| {
-                reply(runtime, prompt_hidden, just_submitted, force)
+                reply(runtime, prompt_hidden, has_draft, just_submitted, force)
                     .err()
                     .map_or(serde_json::Value::Null, |error| {
                         serde_json::to_value(ctl::Response::err(error)).unwrap()
