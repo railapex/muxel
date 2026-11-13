@@ -582,7 +582,10 @@ feature is added or changed, update the matching entry here in the same change**
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays
   bright green; once you focus its pane, its sidebar and dashboard icons dim and
-  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
+  its sidebar pill turns to a green outline, so unread finishes stand out. A pane
+  in front when muxel restores a project, or picked while it starts, counts as
+  looked at once its terminal draws while its window is active, so its saved finish
+  doesn't stay unread in front of you. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
@@ -792,7 +795,20 @@ feature is added or changed, update the matching entry here in the same change**
   or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy. Cleanup requires current attributable evidence from the launch and
+  copy. A loop whose agent starts through a deferred launch (Claude's launch
+  check) is tracked from the moment it fires and adopts only the terminal that
+  launch installs; if the pane is relaunched first or the launch starts
+  nothing, the run ends without closing anything. A launch that fails and
+  leaves a fallback shell showing the error holds the loop until the runtime
+  cap, so a missing program can't open a pane at every fire. A run finishes
+  once the agent has been seen working after the loop's prompt (checked every
+  second) and is idle again, so a short turn closes an Exit pane at the next
+  loop check and later scheduled runs can fire. Working already under way when
+  the prompt goes in, such as an agent still starting up, doesn't count until
+  it stops. A terminal whose work shows only as output is checked at each loop
+  check rather than every second, since a command can print and then run
+  silently. A turn shorter than about a second, or one that runs inside
+  startup's working, can go unseen and then waits for the cap. Cleanup requires current attributable evidence from the launch and
   conversation known before the first submitted turn: the one muxel launched
   the pane into (a Claude loop's minted session id), or the first one an agent
   such as Codex names. A later first identity cannot establish which
@@ -899,6 +915,9 @@ feature is added or changed, update the matching entry here in the same change**
   failures report once per cause, not on every autosave). Agent rows are
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
+  Click the NOTIFICATIONS header to collapse the section to one line showing how
+  many notifications it holds, so incoming notifications stop pushing PROJECTS
+  down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
 - **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
@@ -1327,6 +1346,22 @@ feature is added or changed, update the matching entry here in the same change**
   under its limit. A child that asks to break away from the job, and processes a
   remote host or tmux server runs, aren't covered. If Windows can't apply the
   limit, the pane starts without one and the reason is logged.
+- **Per-pane memory limit (Linux)** — each local pane runs in a systemd scope of
+  its own, and the same Settings → Behavior choice (16 GB by default) limits how
+  much memory the pane's processes use together, plus up to a quarter of that in
+  swap. When they reach it, Linux stops the largest of them and the rest of the
+  pane, its agent included, keeps running. Even with the limit off, a process
+  stopped because the whole computer ran out of memory takes nothing else with
+  it: previously systemd could stop everything sharing its group, such as the
+  tmux server's scope or the desktop session muxel was started from. The
+  notifications feed reports each such stop and whether the pane's limit or the
+  computer ran out. A change applies to panes started after it. It needs a
+  systemd user session; without one (or with `MUXEL_PANE_SCOPE=0`) panes start
+  as before. A pane on a remote Linux host (from the desktop or the iOS app)
+  also runs in a scope of its own there when the host has a systemd user
+  session, so a process killed there for memory no longer takes the agent and
+  its tmux session with it; the limit and the feed report apply only to local
+  panes.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -1531,7 +1566,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
-  tab, if there is one.
+  tab, if there is one. While it's on screen, docked or popped out, it refreshes
+  every 1.5 s and keeps your scroll position. A pane hidden behind another tab,
+  another view or a maximized pane runs no git, and refreshes as soon as it's
+  shown. The ↻ button, reopening and popping out never wait on git.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
