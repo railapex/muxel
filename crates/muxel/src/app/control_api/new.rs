@@ -116,7 +116,7 @@ impl MuxelApp {
             .workspace
             .project(pid)
             .ok_or("the project has closed")?;
-        let cwd = instance.launch_dir.as_ref().expect("new always sets cwd");
+        let cwd = instance.launch_dir.clone().expect("new always sets cwd");
         if instance.literal_argv {
             let program = instance
                 .program
@@ -134,21 +134,35 @@ impl MuxelApp {
                     .map_err(|error| error.to_string())?,
             );
         }
-        let target = self
-            .active_instance
-            .filter(|iid| {
-                project
-                    .layout
-                    .as_ref()
-                    .is_some_and(|l| l.leaf_containing(*iid).is_some())
-            })
+        // A pane's own request opens in its group, where the agent asking can
+        // be seen beside what it started; any other caller gets the group the
+        // user has focused. The caller's id is declared, not verified, so it
+        // counts only as the approval card shows it, a live terminal, and only
+        // among this project's own groups.
+        let in_project = |iid: &Uuid| {
+            project
+                .layout
+                .as_ref()
+                .is_some_and(|l| l.leaf_containing(*iid).is_some())
+        };
+        let caller = options
+            .requesting_pane
+            .filter(|iid| self.terminals.contains_key(iid) && in_project(iid));
+        let target = caller
+            .or_else(|| self.active_instance.filter(in_project))
             .or_else(|| project.preferred_instance());
+        // The same caller is the new session's spawner: Recent work nests it
+        // under the caller's session unless it asked for a top-level pane.
+        instance.record_opener(
+            caller.filter(|_| !options.top_level),
+            chrono::Utc::now().timestamp_millis(),
+        );
         let iid = instance.id;
         // Taking focus moves the user's keystrokes (a password, say) into the
         // new pane, so only a request the user just clicked to approve may.
         // Under Allow, `--focus` opens it in the background like any other.
         let focused = options.focus && approved;
-        let result = json!({
+        let mut result = json!({
             "id": ctl::short_id(iid), "uuid": iid,
             "project": project.name, "project_id": pid,
             "focused": focused,
@@ -156,6 +170,9 @@ impl MuxelApp {
             "program": instance.program.clone().unwrap_or_else(|| CommandSpec::shell().program),
             "args": instance.args,
         });
+        if options.prompt.is_some() {
+            ctl::PromptDelivery::pending(&iid.to_string()).apply(&mut result);
+        }
         let placement = match options.placement {
             ctl::NewPlacement::Tab => PlacementMode::Tab,
             ctl::NewPlacement::Right => PlacementMode::Split(SplitDirection::Horizontal),
@@ -179,7 +196,9 @@ impl MuxelApp {
                 cx,
             );
         } else {
-            self.select_project(pid, window, cx);
+            // Keep reconciliation before placement, without selecting the old
+            // preferred session while the requested new pane does not exist.
+            self.select_project_for_new_pane(pid, window, cx);
             self.place_and_spawn(
                 pid,
                 instance,
@@ -189,7 +208,9 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            window.activate_window();
+            if self.workspace.instance(iid).is_some() {
+                window.activate_window();
+            }
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);

@@ -289,6 +289,34 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
                 let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 assert!(app.workspace.instance(pane).unwrap().session_started);
+                // An unreadable store proves nothing gone, so nothing is said.
+                assert!(!conversation_gone_notice(app));
+            })
+            .unwrap();
+    });
+}
+
+fn conversation_gone_notice(app: &MuxelApp) -> bool {
+    app.notifications
+        .iter()
+        .any(|n| n.title.ends_with(": started fresh"))
+}
+
+/// A rollout Codex deleted, or one the whole store was read without finding,
+/// starts a new conversation; the user is told, since the pane comes back empty.
+#[test]
+fn codex_rollout_gone_before_resume_starts_anew_and_says_so() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let _stat = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Missing)));
+        window
+            .update(cx, |app, _, _| {
+                app.workspace.instance_mut(pane).unwrap().session_id =
+                    Some("01a1543c-9700-7000-8000-000000000001".into());
+                assert_eq!(app.session_resume_for(pane).unwrap(), None);
+                let instance = app.workspace.instance(pane).unwrap();
+                assert!(instance.session_id.is_none() && !instance.session_started);
+                assert!(conversation_gone_notice(app));
             })
             .unwrap();
     });
