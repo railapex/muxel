@@ -61,6 +61,8 @@ use uuid::Uuid;
 
 mod accomplishments_ui;
 #[cfg(all(test, windows))]
+mod attention_focus_tests;
+#[cfg(all(test, windows))]
 mod claude_capture_tests;
 mod claude_launch;
 #[cfg(all(test, windows))]
@@ -24586,7 +24588,8 @@ impl MuxelApp {
     }
 
     /// Focus the next agent that needs attention — blocked panes first (they're
-    /// waiting on the user), then done. Cycles past the currently active one.
+    /// waiting on the user), then done — switching to its project. Cycles past
+    /// the currently active one.
     fn focus_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // All instances across projects, in a stable order.
         let order: Vec<Uuid> = self
@@ -24622,8 +24625,10 @@ impl MuxelApp {
             .filter_map(|i| rank(i).map(|r| (r, *i)))
             .min_by_key(|(r, _)| *r)
             .map(|(_, i)| i);
+        // As a sidebar click does: focusing alone would leave another
+        // project's pane focused but not on screen.
         if let Some(iid) = target {
-            self.focus_instance(iid, window, cx);
+            self.select_instance(iid, window, cx);
         }
     }
 

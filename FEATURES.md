@@ -1902,7 +1902,8 @@ feature is added or changed, update the matching entry here in the same change**
   the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
   focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
   switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
-  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
+  done) and show its project, and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any
+  focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
