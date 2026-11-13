@@ -35,10 +35,10 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, FamilyTags, InstancesById, RowCounts, SelectClick, SidebarEntry,
-    SidebarSort, entry_id, family_tags, instances_by_id, is_unread, label_rows, nest_on_drop,
-    next_matching, notification_in_feed, row_counts, row_state, select_rows, sessions_under,
-    sidebar_order, sidebar_rows_each,
+    ActivityBand, BandClock, FamilyFold, FamilyTags, Fold, InstancesById, RowCounts, SelectClick,
+    SidebarEntry, SidebarSort, entry_id, family_tags, instances_by_id, is_unread, label_rows,
+    nest_on_drop, next_matching, notification_in_feed, row_counts, row_state, select_rows,
+    sessions_under, sidebar_order, sidebar_rows_each,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -24018,17 +24018,21 @@ impl MuxelApp {
         bands: BandClock,
         cx: &App,
     ) -> Vec<SidebarEntry> {
-        let folded = |band| project.band_folded(band, self.settings.older_starts_folded);
+        let folded = |fold| match fold {
+            Fold::Band(band) => project.band_folded(band, self.settings.older_starts_folded),
+            Fold::Family(top) => project.family_folded(top),
+        };
         self.sidebar_entries_folded(pane_ids, placing, bands, &folded, cx)
     }
 
-    /// [`Self::sidebar_entries`] with the bands `folded` says are folded.
+    /// [`Self::sidebar_entries`] with the bands and families `folded` says are
+    /// folded.
     fn sidebar_entries_folded(
         &self,
         pane_ids: &[Uuid],
         placing: &InstancesById,
         bands: BandClock,
-        folded: &dyn Fn(ActivityBand) -> bool,
+        folded: &dyn Fn(Fold) -> bool,
         cx: &App,
     ) -> Vec<SidebarEntry> {
         let shown = |iid: Uuid| self.sidebar_shown(iid, placing, cx);
@@ -24870,9 +24874,9 @@ impl MuxelApp {
         }
     }
 
-    /// In Recent work, open what hides row `iid`: its project when collapsed
-    /// and the folded band it sits in, both saved as if clicked, so a jump to
-    /// a row shows the row.
+    /// In Recent work, open what hides row `iid`: its project when collapsed,
+    /// the folded band it sits in and the folded family it is under, all saved
+    /// as if clicked, so a jump to a row shows the row.
     fn reveal_row(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         if self.settings.sidebar_sort != SidebarSort::RecentWork {
             return;
@@ -24880,7 +24884,7 @@ impl MuxelApp {
         let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
             return;
         };
-        let band = {
+        let (band, family) = {
             let instances = instances_by_id(&self.workspace);
             let pending = self.pending_instances(cx);
             let open = self.sidebar_entries_folded(
@@ -24890,15 +24894,31 @@ impl MuxelApp {
                 &|_| false,
                 cx,
             );
+            let at = open.iter().position(|entry| entry_id(entry) == Some(iid));
+            let before = |at: usize| open[..at].iter().rev();
             // The label over the row: a band's, or Needs you's or Working's,
             // which never fold; pinned rows have none.
-            open.iter()
-                .position(|entry| entry_id(entry) == Some(iid))
-                .and_then(|at| open[..at].iter().rev().find(|e| entry_id(e).is_none()))
+            let band = at
+                .and_then(|at| before(at).find(|e| entry_id(e).is_none()))
                 .and_then(|label| match label {
                     SidebarEntry::Band(band) => Some(*band),
                     _ => None,
+                });
+            // The top row of the family a nested row is under.
+            let family = at
+                .filter(|&at| {
+                    matches!(
+                        open[at],
+                        SidebarEntry::Nested(_) | SidebarEntry::NestedTwice(_)
+                    )
                 })
+                .and_then(|at| {
+                    before(at).find_map(|entry| match entry {
+                        SidebarEntry::Pane(top) => Some(*top),
+                        _ => None,
+                    })
+                });
+            (band, family)
         };
         let older_folded = self.settings.older_starts_folded;
         let Some(project) = self.workspace.project_mut(pid) else {
@@ -24910,6 +24930,9 @@ impl MuxelApp {
         {
             project.toggle_band(band, older_folded);
             changed = true;
+        }
+        if let Some(top) = family {
+            changed |= project.folded_families.remove(&top);
         }
         if changed {
             self.persist();
@@ -25112,6 +25135,17 @@ impl MuxelApp {
     fn toggle_collapse(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         if let Some(project) = self.workspace.project_mut(pid) {
             project.collapsed = !project.collapsed;
+            self.persist();
+        }
+        cx.notify();
+    }
+
+    /// Fold the family under session `top` in project `pid`'s Recent work to
+    /// its row, or open it, and keep the choice across restarts.
+    fn toggle_family(&mut self, pid: Uuid, top: Uuid, cx: &mut Context<Self>) {
+        let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
+        if let Some(project) = self.workspace.project_mut(pid) {
+            project.toggle_family(top, &|id| live.contains(&id));
             self.persist();
         }
         cx.notify();
@@ -27906,6 +27940,66 @@ impl MuxelApp {
     /// with how many rows it heads (`rows`; Working says how many sessions
     /// work). A band's label has a chevron and folds or opens the band on a
     /// click; folded, it also says how many of the rows it hides are unread.
+    /// The line under a folded family's row in Recent work: what its hidden
+    /// rows hold, asking in amber, and how many of them are unread. Clicking it
+    /// opens the family.
+    fn family_summary(
+        &self,
+        pid: Uuid,
+        top: Uuid,
+        fold: FamilyFold,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let parts = [
+            (fold.asking, t("asking"), cx.theme().warning),
+            (fold.working, t("working"), muted),
+            (fold.done, t("done"), muted),
+            (fold.idle, t("idle"), muted),
+            (
+                fold.files,
+                if fold.files == 1 {
+                    t("file")
+                } else {
+                    t("files")
+                },
+                muted,
+            ),
+        ];
+        let mut line = div()
+            .id(SharedString::from(format!(
+                "family-summary-{}",
+                top.simple()
+            )))
+            .ml(rems(2.0))
+            .mr_1()
+            .px_2()
+            .pb_1()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_1()
+            .text_xs()
+            .text_color(muted)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _e, _w, cx| this.toggle_family(pid, top, cx)));
+        for (at, (n, word, color)) in parts.into_iter().filter(|(n, ..)| *n > 0).enumerate() {
+            if at > 0 {
+                line = line.child("·");
+            }
+            line = line.child(div().text_color(color).child(format!("{n} {word}")));
+        }
+        if fold.unread > 0 {
+            line = line.child(
+                div()
+                    .font_semibold()
+                    .text_color(cx.theme().primary)
+                    .child(format!("• {}", fold.unread)),
+            );
+        }
+        line.into_any_element()
+    }
+
     /// A project header's counts in Recent work: `? n` asking, in amber so a
     /// collapsed project can't hide a question, `▶ n` working and `• n`
     /// unread, each only when there are any.
@@ -29545,11 +29639,22 @@ impl MuxelApp {
                             list = list.child(self.sidebar_section_label(pid, entry, rows, cx));
                             continue;
                         }
-                        SidebarEntry::Pane(iid) => (iid, 0.0),
+                        SidebarEntry::Pane(iid) | SidebarEntry::Folded(iid, _) => (iid, 0.0),
                         // Under the session that opened or spawned it, one step
                         // further in; a child session's files, two.
                         SidebarEntry::Nested(iid) => (iid, 1.0),
                         SidebarEntry::NestedTwice(iid) => (iid, 2.0),
+                    };
+                    // A family's top row, open with its rows after it, or
+                    // folded with what they hold: it takes a chevron.
+                    let family: Option<Option<FamilyFold>> = match entry {
+                        SidebarEntry::Folded(_, fold) => Some(Some(fold)),
+                        SidebarEntry::Pane(_)
+                            if matches!(entries.get(at + 1), Some(SidebarEntry::Nested(_))) =>
+                        {
+                            Some(None)
+                        }
+                        _ => None,
                     };
                     let inst = instances.get(&iid).copied();
                     let popped_out = self.popouts.contains_key(&iid);
@@ -29613,7 +29718,8 @@ impl MuxelApp {
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
                         .id(SharedString::from(format!("inst-row-{}", iid.simple())))
-                        .ml(rems(1.0 + depth))
+                        // A family's chevron takes the top row's indent.
+                        .ml(rems(if family.is_some() { 0.0 } else { 1.0 + depth }))
                         .mr_1()
                         .px_2()
                         .py_1()
@@ -29893,7 +29999,43 @@ impl MuxelApp {
                         })
                         .into_any_element()
                     };
+                    let row = match family {
+                        Some(fold) => div()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("family-{}", iid.simple())))
+                                    .w(rems(1.0))
+                                    .flex_none()
+                                    .flex()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, _w, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_family(pid, iid, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        Icon::new(if fold.is_some() {
+                                            IconName::ChevronRight
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .xsmall(),
+                                    ),
+                            )
+                            .child(div().flex_1().min_w_0().child(row))
+                            .into_any_element(),
+                        None => row,
+                    };
                     list = list.child(row);
+                    if let Some(Some(fold)) = family {
+                        list = list.child(self.family_summary(pid, iid, fold, cx));
+                    }
                 }
 
                 // Kept (detached) worktrees: a subheader with no instances.

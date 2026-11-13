@@ -73,7 +73,7 @@ pub use url::{normalize_url, same_resource_url};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 pub use uuid::Uuid;
 
@@ -1233,6 +1233,11 @@ pub struct Project {
     /// view state, never part of the synced layout doc.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub band_folds: BTreeMap<sidebar::ActivityBand, bool>,
+    /// The top-level sessions whose families Recent work shows folded to their
+    /// row in this project's sidebar. Local view state, never part of the
+    /// synced layout doc.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub folded_families: BTreeSet<Uuid>,
 }
 
 /// One agent in a project's saved startup set.
@@ -1264,7 +1269,23 @@ impl Project {
             layout_synced: None,
             collapsed: false,
             band_folds: BTreeMap::new(),
+            folded_families: BTreeSet::new(),
         }
+    }
+
+    /// Whether the family under session `top` is folded in this project's
+    /// sidebar. Families start open.
+    pub fn family_folded(&self, top: Uuid) -> bool {
+        self.folded_families.contains(&top)
+    }
+
+    /// Fold the family under `top` if it is open, or open it if folded, and
+    /// forget every other fold whose session `live` no longer has.
+    pub fn toggle_family(&mut self, top: Uuid, live: &dyn Fn(Uuid) -> bool) {
+        if !self.folded_families.remove(&top) {
+            self.folded_families.insert(top);
+        }
+        self.folded_families.retain(|&id| id == top || live(id));
     }
 
     /// Whether Recent work's `band` is folded in this project's sidebar: as it
@@ -1443,6 +1464,22 @@ mod band_fold_tests {
         let restored: Project = serde_json::from_value(old).unwrap();
         assert!(!restored.band_folded(Today, true));
         assert!(!restored.collapsed);
+    }
+
+    #[test]
+    fn a_family_fold_is_saved_and_a_gone_sessions_fold_is_forgotten() {
+        let mut project = Project::new("repo", "/repo");
+        let [kept, gone] = [(); 2].map(|_| uuid::Uuid::new_v4());
+        project.toggle_family(gone, &|_| true);
+        project.toggle_family(kept, &|_| true);
+        let json = serde_json::to_value(&project).unwrap();
+        let restored: Project = serde_json::from_value(json).unwrap();
+        assert!(restored.family_folded(kept) && restored.family_folded(gone));
+        // Opening `kept` once `gone` has closed forgets `gone`'s fold too.
+        project.toggle_family(kept, &|id| id == kept);
+        assert!(project.folded_families.is_empty());
+        let json = serde_json::to_value(&project).unwrap();
+        assert!(json.get("folded_families").is_none(), "no folds, no field");
     }
 }
 
