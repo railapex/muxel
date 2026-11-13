@@ -2487,10 +2487,12 @@ hosts ignore this caller ID, so check the target when driving one.
 - `blocked` - waiting on a permission or choice prompt; `show` has the `question`.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
-- `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; selecting it
-  in muxel only shows it, so the user wakes it there (Enter, typing or Wake) or
-  you call `focus` or `wake`.
+- `starting` - launching, or running but nothing drawn on screen yet (for at
+  most a minute after launch). Nothing is typed into it, even with `--force`.
+  `exited` - the program ended. `failed` - it couldn't start. `not_running` -
+  the pane hasn't been started this session; selecting it in muxel only shows
+  it, so the user wakes it there (Enter, typing or Wake) or you call `focus` or
+  `wake`.
 
 Old local sessions may open asleep, and idle ones may be put to sleep: `status`
 and `panes` report `status: "not_running"` with `not_running_reason: "dormant"`
