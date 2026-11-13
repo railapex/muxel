@@ -16352,7 +16352,7 @@ impl MuxelApp {
             )
             .times(times)
             .recorded(ahead);
-            let mut effect = apply_status_sample(
+            let effect = apply_status_sample(
                 &mut record,
                 self.workspace
                     .instance_mut(iid)
@@ -16360,12 +16360,6 @@ impl MuxelApp {
                 sample,
                 now_epoch,
             );
-            // An abnormal exit is reported once, as "exited unexpectedly"
-            // below. The Done it leaves isn't a finished turn to announce: no
-            // "finished" entry, desktop notification or chime.
-            if exited && exit_code != Some(0) {
-                effect.notify = effect.notify.filter(|kind| *kind != NotifKind::Done);
-            }
             if let Some(record) = record {
                 self.last_status.insert(iid, record);
             }

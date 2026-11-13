@@ -1590,7 +1590,8 @@ feature is added or changed, update the matching entry here in the same change**
   (plus a desktop notification when unattended), and Restart relaunches in place
   (resuming a resume-capable agent's conversation). That error is the only
   report: the ending isn't also announced as a finished turn, with no "finished"
-  entry, desktop notification or chime. A clean exit still announces one.
+  entry, desktop notification or chime. A command job's clean exit still
+  announces its finish; a session's exit finishes nothing either way.
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
   is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
