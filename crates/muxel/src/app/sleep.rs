@@ -56,6 +56,8 @@ pub(super) enum WakeCause {
     CtlFocus,
     /// `ctl wake`, which starts it in the background for a script.
     CtlWake,
+    /// A `ctl send --when-idle` waiting to type into it.
+    CtlSend,
 }
 
 impl WakeCause {
@@ -66,6 +68,7 @@ impl WakeCause {
             Self::Pin => "pin",
             Self::CtlFocus => "ctl focus",
             Self::CtlWake => "ctl wake",
+            Self::CtlSend => "ctl send",
         }
     }
 
@@ -76,7 +79,7 @@ impl WakeCause {
             // Everything through ctl. If someone is at the window, their first
             // look at the live pane makes it theirs; if nobody is, a script
             // shouldn't buy an agent the whole threshold.
-            Self::CtlFocus | Self::CtlWake => Waker::Machine,
+            Self::CtlFocus | Self::CtlWake | Self::CtlSend => Waker::Machine,
         }
     }
 }
@@ -133,6 +136,7 @@ impl MuxelApp {
             focused: self.pane_focused(iid),
             popped_out: self.popouts.contains_key(&iid),
             unsent_text: runtime.is_some_and(|runtime| runtime.draft_latched),
+            send_waiting: self.control_queue.contains_key(&iid),
             pinned: inst.pinned,
             // Counts the last wake: see `start_dormant`.
             last_active_at: inst.activity.last_active_at(),
@@ -967,6 +971,7 @@ pub(super) fn sleep_refusal_label(refusal: SleepRefusal) -> String {
         SleepRefusal::Asking => t("asking"),
         SleepRefusal::Background => t("background work"),
         SleepRefusal::UnsentText => t("unsent prompt"),
+        SleepRefusal::SendWaiting => t("a send is waiting"),
         SleepRefusal::PoppedOut => t("popped out"),
         SleepRefusal::Focused => t("you're in it"),
         SleepRefusal::RecentlyActive => t("recently active"),

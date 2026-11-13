@@ -36,6 +36,8 @@ which starts whatever its age (see [dormant restore](dormant-restore.md)).
   (subagents or background shells its provider reports, or a loop run muxel
   is still watching);
 - a pane with text typed into its input and not yet submitted;
+- a pane a `ctl send --when-idle` is waiting to type into ("a send is
+  waiting"), attached or detached;
 - the pane you're in (the focused pane, or the one a project window shows),
   except by its own Sleep, and a popped-out pane;
 - a pane whose resume can't be trusted: it hasn't launched, its conversation
@@ -95,8 +97,8 @@ pinning) gets the whole threshold: the pane runs at least N hours before the tim
 sleep it again, even if nobody types into it, and a restart in that time
 starts it rather than leaving it asleep.
 
-Anything through ctl (`ctl wake`, `ctl focus`) is a machine's wake, for one
-job, so until someone looks at the pane it sleeps after 30 idle minutes (or N hours, if shorter), counted from the
+Anything through ctl (`ctl wake`, `ctl focus`, or a `ctl send --when-idle`
+that wakes the pane to type into it) is a machine's wake, for one job, so until someone looks at the pane it sleeps after 30 idle minutes (or N hours, if shorter), counted from the
 later of the wake and its last work. Holding an agent's memory for four hours
 after every scripted wake would cost hours of it each time. The first time the
 user focuses the live pane, it becomes an ordinary pane on the whole
@@ -150,6 +152,8 @@ A deliberate act wakes it:
 - pinning it.
 - `ctl focus`, which opens the pane on purpose, and `ctl wake`, which starts it
   in the background.
+- `ctl send --when-idle`, which starts it in the background the way `ctl wake`
+  does and types once it is up (see below).
 
 While the program starts, the pane keeps its face, saying "Waking…", until
 the terminal draws its first frame, in place of the startup spinner.
@@ -159,7 +163,21 @@ the terminal draws its first frame, in place of the startup spinner.
 `muxel ctl status AGENT` and `panes` report `status: "not_running"` with
 `not_running_reason: "sleeping"` for a pane put to sleep (`"dormant"` remains
 the reason for a pane deferred at launch). `show` includes the reason; `screen`,
-`send`, `keys` and `answer` refuse with code `not_running` and that reason.
+`send`, `keys` and `answer` refuse with code `not_running` and that reason,
+except `send --when-idle`, which wakes it.
+
+`send --when-idle` (attached or detached) wakes an asleep pane once, as a
+machine's wake with the cause `ctl send`, waits while it starts (`waiting_on:
+"waking"`, then `"starting"`), and types at its first idle with every ordinary
+check, so a caller with something to deliver needn't wake the pane first.
+muxel wakes at most two panes for waiting sends at a time; a third send waits
+(`waiting_on: "waking"`) until one of them is up. A wake that fails (its launch
+refused, or no muxel window to start it in) drops the send untyped with
+`not_running`. `--no-wake` (protocol v8) refuses an asleep pane as a plain send
+does, and so does a send pinned with `--launch-id`, since the woken pane is a
+new launch. A detached send restored after a restart wakes a pane that came
+back asleep the same way. While a send waits on a pane, the pane doesn't
+sleep.
 
 For an asleep agent, `status` and `panes` also report `resumes`,
 made from the same look as the sleep rule each time they are asked: `true`

@@ -66,9 +66,15 @@ pub const DETACHED_SEND_VERSION: u32 = 6;
 /// `send --detach` must be refused by hosts that would forget the send, and
 /// its `--once` key, if muxel restarted before it typed.
 pub const PERSISTED_SEND_VERSION: u32 = 7;
+/// `send --no-wake` must be refused by hosts that would ignore it and wake an
+/// asleep pane anyway.
+pub const NO_WAKE_VERSION: u32 = 8;
 /// The newest version this host accepts, which `status` and `panes` report as
 /// `protocol` so a client can learn it without sending anything.
-pub const NEWEST_VERSION: u32 = PERSISTED_SEND_VERSION;
+pub const NEWEST_VERSION: u32 = NO_WAKE_VERSION;
+/// How many asleep panes waiting sends may be waking at once, so a burst of
+/// sends (mail after a restart) can't start every agent together.
+pub const MAX_SEND_WAKES: usize = 2;
 /// How long `send --when-idle` waits for a safe moment by default, and at most.
 pub const WHEN_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const WHEN_IDLE_TIMEOUT_MAX_SECS: u64 = 3600;
@@ -93,6 +99,7 @@ pub fn check_safe_send(command: &Command) -> Result<(), String> {
         once,
         when_idle,
         detach,
+        no_wake,
         timeout_secs,
         ..
     } = command
@@ -103,6 +110,10 @@ pub fn check_safe_send(command: &Command) -> Result<(), String> {
     // way to learn how it went.
     if *detach && (!when_idle || once.is_none()) {
         return Err("--detach requires --when-idle and --once KEY".into());
+    }
+    // Only a waiting send wakes an asleep pane; a plain one refuses it.
+    if *no_wake && !when_idle {
+        return Err("--no-wake requires --when-idle: a plain send never wakes a pane".into());
     }
     if once.as_deref().is_some_and(|key| !valid_once_key(key)) {
         return Err("--once KEY must be 1-128 bytes without control characters".into());
@@ -248,6 +259,10 @@ pub enum Command {
         /// send in muxel with nobody waiting for it; `once-status` reports it.
         #[serde(default, skip_serializing_if = "is_false")]
         detach: bool,
+        /// With `when_idle`: refuse an asleep pane, as a plain send does,
+        /// instead of waking it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_wake: bool,
         /// How long `when_idle` waits, in seconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
@@ -280,6 +295,9 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(command, Command::Send { no_wake: true, .. }) {
+        return NO_WAKE_VERSION;
+    }
     if matches!(command, Command::Send { detach: true, .. }) {
         return PERSISTED_SEND_VERSION;
     }
@@ -1626,12 +1644,13 @@ usage: muxel ctl <command> [args]
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY]
-       [--when-idle [--detach] [--timeout SECS]]
+       [--when-idle [--detach] [--no-wake] [--timeout SECS]]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal;
                                  --session-id refuses another conversation;
                                  --once never types the same KEY twice;
-                                 --when-idle waits until the agent can take it;
+                                 --when-idle waits until the agent can take it,
+                                 waking it if asleep (--no-wake refuses);
                                  --detach answers at once and muxel keeps it
   once-status AGENT KEY          what became of a send --once KEY
   once-cancel AGENT KEY          withdraw a detached send that hasn't typed
@@ -1714,7 +1733,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--detach] [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed. --detach (with --when-idle and --once KEY) answers queued at once and muxel keeps the send with nobody waiting (a day by default, --timeout up to 86400); read its outcome with once-status. A detached send and its key survive a muxel restart."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--detach] [--no-wake] [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed. It wakes an asleep agent once and waits for it to start; --no-wake refuses an asleep agent instead. --detach (with --when-idle and --once KEY) answers queued at once and muxel keeps the send with nobody waiting (a day by default, --timeout up to 86400); read its outcome with once-status. A detached send and its key survive a muxel restart."
         }
         "once-status" => {
             "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, queued (a detached send waiting), typing, done with the first reply as result, or dropped (a detached send that ended without typing, its refusal as result)."
@@ -1838,6 +1857,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let mut once: Option<String> = None;
     let mut when_idle = false;
     let mut detach = false;
+    let mut no_wake = false;
     let mut lines: Option<usize> = None;
     let mut timeout: Option<u64> = None;
     let mut it = rest.iter();
@@ -1852,6 +1872,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             "--force" => force = true,
             "--when-idle" => when_idle = true,
             "--detach" => detach = true,
+            "--no-wake" => no_wake = true,
             "--once" => {
                 let key = it.next().ok_or("--once needs a KEY")?;
                 if once.replace(key.clone()).is_some() {
@@ -1882,8 +1903,8 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     if session_id.is_some() && cmd != "send" {
         return Err("--session-id is only valid with send".into());
     }
-    if (once.is_some() || when_idle || detach) && cmd != "send" {
-        return Err("--once, --when-idle and --detach are only valid with send".into());
+    if (once.is_some() || when_idle || detach || no_wake) && cmd != "send" {
+        return Err("--once, --when-idle, --detach and --no-wake are only valid with send".into());
     }
     let agent = |words: &[String]| -> Result<String, String> {
         words
@@ -1956,6 +1977,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 once,
                 when_idle,
                 detach,
+                no_wake,
                 timeout_secs: timeout,
             };
             check_safe_send(&send)?;
@@ -2155,6 +2177,7 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   already_running: true, status}` when it already runs, so a retry is harmless.
   Until the user looks at it, the pane sleeps again after 30 idle minutes,
   counted from the wake or its latest work, so deliver what you woke it for.
+  To wake a pane only to send it something, `send --when-idle` does both.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
   [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
   new tab: in your own pane's group when you run it from one of that project's
@@ -2366,8 +2389,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   shows a `/clear`), for up to three seconds. Then it sends with every check above, and
   the reply adds `waited_ms`. It waits 600 seconds by default, `--timeout SECS` up to 3600,
   then fails with `timed_out` and `reason` naming what it was still waiting on
-  (`working`, `blocked`, `prompt_hidden`, `starting`, `just_submitted`,
-  `send_in_flight`, `draft_present`, `tmux_clients` or
+  (`working`, `blocked`, `prompt_hidden`, `starting`, `waking`,
+  `just_submitted`, `send_in_flight`, `draft_present`, `tmux_clients` or
   `conversation_unconfirmed`). The agent
   exiting, closing or being replaced ends the wait with that refusal; a
   conversation change fails with `launch_mismatch`, `reason:
@@ -2376,6 +2399,14 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   queue_full`). Closing the connection cancels a waiting send before it types;
   once typing starts the send finishes, and its `--once` key records the result.
   `--when-idle` and `--force` don't combine. These options need protocol v4.
+  An asleep agent (`not_running` with `reason: sleeping` or `dormant`) is
+  woken once, as `ctl wake` wakes it, and the send waits for it
+  (`waiting_on: waking`, then `starting`) and types at its first safe moment.
+  At most two sends wake agents at a time; the others wait `waking` for a
+  turn. A wake that fails ends the send with the wake's `not_running`
+  refusal. A send with `--launch-id`, which no new launch matches, or with
+  `--no-wake` (protocol v8) refuses an asleep agent with `not_running` and its
+  reason, as a plain send does. While a send waits, its agent doesn't sleep.
   `--detach` (with `--when-idle` and `--once KEY`) lets the caller go: muxel
   checks the send as above, answers at once with `{"queued": true, "agent",
   "uuid", "once", "expires_at"}` (Unix milliseconds), and keeps it with nobody
@@ -2385,8 +2416,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   before the paste. It waits a day by default, `--timeout SECS` up to 86400.
   Read its outcome with `once-status KEY`; a repeat while it waits or types
   returns the same reply with `duplicate: true`. Anything that ends it untyped
-  (a conversation change, the agent replaced, exiting, closing or put to
-  sleep, the timeout, a workspace switch) leaves it `dropped` with that
+  (a conversation change, the agent replaced, exiting or closing, a failed
+  wake, the timeout, a workspace switch) leaves it `dropped` with that
   refusal. A closed pane takes its sends with it. A detached send and its
   key survive a muxel restart: muxel writes each to disk beside the
   workspace (its text too, when the send is pinned) before it answers
@@ -2394,7 +2425,9 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   (`--session-id`, no `--launch-id`) that was waiting waits on through its
   pane's relaunch until its `expires_at`, typing into the first launch it
   sees once its conversation checks out; `once-status` adds `restored:
-  true`, and `waiting_on: not_running` while the pane isn't running. One
+  true`. A pane that came back asleep is woken as above; one that isn't
+  running yet (its project not opened since the restart) gives
+  `waiting_on: not_running` until it is. One
   that had reached its paste is never typed again: it is `done` with
   `outcome: interrupted` and `pasted: null`, since muxel can't know whether
   the paste went in. An unpinned or `--launch-id` send is `dropped` with
@@ -2402,8 +2435,9 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   muxel was closed with `timed_out`, `reason: restarted`. The `queued` reply,
   `once-status` and `status` carry `boot_id`, which is new each time muxel
   starts. Detached sends don't count toward the eight per muxel, but still
-  take their pane's one place. A pane that isn't running refuses it: wake it
-  first. It needs protocol v7.
+  take their pane's one place. An asleep pane is woken as above; one that
+  isn't running for another reason (stopped, failed to start, or not started
+  this session) refuses it. It needs protocol v7.
 - `muxel ctl once-status AGENT KEY` - what became of `send --once KEY` to the
   agent, typing nothing: `state` is `unused` (no send with it typed, so it can
   be sent), `pending` (waiting or about to type), `queued` (a detached send
@@ -2500,7 +2534,9 @@ and `panes` report `status: "not_running"` with `not_running_reason: "dormant"`
 timer). `show` includes this reason; `screen`, `send`, `keys`, and `answer`
 refuse with `not_running` and that `reason`, even with `--force`. `focus` opens
 and resumes the session; `wake` resumes it without focusing it, then `status`
-moves from `starting` to idle with a new `launch_id`.
+moves from `starting` to idle with a new `launch_id`. `send --when-idle` wakes
+it and types once it is up, so a caller with something to deliver needn't wake
+it first.
 For an asleep agent, `status` and `panes` also report `resumes`,
 checked on disk when you ask: `true` when a wake brings its conversation back,
 `false` when it will start a new one (the provider deleted the saved
@@ -2764,6 +2800,7 @@ mod tests {
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             }
         );
@@ -2916,6 +2953,7 @@ mod tests {
             once: None,
             when_idle: false,
             detach: false,
+            no_wake: false,
             timeout_secs: None,
         };
         assert_eq!(super::request_version(&send), 1);
@@ -2955,6 +2993,7 @@ mod tests {
                 once: Some("d-9f2a".into()),
                 when_idle: true,
                 detach: false,
+                no_wake: false,
                 timeout_secs: Some(47),
             }
         );
@@ -3094,6 +3133,7 @@ mod tests {
             &send,
             Command::Send {
                 detach: true,
+                no_wake: false,
                 when_idle: true,
                 once: Some(_),
                 timeout_secs: Some(86_400),
@@ -3101,7 +3141,6 @@ mod tests {
             }
         ));
         assert_eq!(super::request_version(&send), super::PERSISTED_SEND_VERSION);
-        assert_eq!(super::NEWEST_VERSION, super::PERSISTED_SEND_VERSION);
         assert!(
             serde_json::to_string(&send)
                 .unwrap()
@@ -3151,6 +3190,58 @@ mod tests {
         }
     }
 
+    /// A host from before v8 ignores `no_wake` and would wake the asleep pane
+    /// anyway, so only the version makes it refuse. Waking is the default:
+    /// leaving the field out keeps every other send on its own version.
+    #[test]
+    fn a_send_that_must_not_wake_needs_protocol_v8() {
+        let Ok(CliCommand::Request(send)) = parse_cli(&words(&[
+            "send",
+            "a",
+            "hi",
+            "--when-idle",
+            "--detach",
+            "--once",
+            "d-1",
+            "--no-wake",
+        ])) else {
+            panic!("--no-wake parses");
+        };
+        assert!(matches!(
+            &send,
+            Command::Send {
+                no_wake: true,
+                detach: true,
+                ..
+            }
+        ));
+        assert_eq!(super::request_version(&send), super::NO_WAKE_VERSION);
+        assert_eq!(super::NEWEST_VERSION, super::NO_WAKE_VERSION);
+        let raw: Command = serde_json::from_str(
+            r#"{"cmd":"send","agent":"a","text":"hi","when_idle":true,"no_wake":true}"#,
+        )
+        .unwrap();
+        assert_eq!(super::request_version(&raw), super::NO_WAKE_VERSION);
+        let Ok(CliCommand::Request(waking)) =
+            parse_cli(&words(&["send", "a", "hi", "--when-idle"]))
+        else {
+            panic!("a waking send parses");
+        };
+        assert!(!serde_json::to_string(&waking).unwrap().contains("no_wake"));
+        assert_eq!(super::request_version(&waking), super::SAFE_SEND_VERSION);
+        // A plain send never wakes, so there is nothing for it to turn off.
+        for args in [
+            words(&["send", "a", "hi", "--no-wake"]),
+            words(&["status", "a", "--no-wake"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
+        let plain: Command =
+            serde_json::from_str(r#"{"cmd":"send","agent":"a","text":"hi","no_wake":true}"#)
+                .unwrap();
+        assert!(super::check_safe_send(&plain).is_err());
+    }
+
     #[test]
     fn send_receipt_identifies_the_admitted_launch_and_paste() {
         let receipt = super::pasted_prompt_receipt(id(7), id(42));
@@ -3181,6 +3272,7 @@ mod tests {
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             }))
         );
@@ -3210,6 +3302,7 @@ mod tests {
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             }))
         );
@@ -3785,6 +3878,7 @@ Steps:
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             }))
         );
@@ -3799,6 +3893,7 @@ Steps:
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             }))
         );

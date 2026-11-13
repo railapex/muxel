@@ -92,7 +92,8 @@ feature is added or changed, update the matching entry here in the same change**
   work history, and the pane awake in front when muxel quit always start (one
   asleep then stays asleep); SSH and local tmux
   restores keep their existing behavior. `ctl status`/`panes` expose
-  `not_running_reason: "dormant"`; typing commands refuse without waking it.
+  `not_running_reason: "dormant"`; typing commands refuse without waking it,
+  except `send --when-idle`, which wakes it and types once it is up.
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
   put to sleep: its program quits (Ctrl+C twice, then ended by PID after five
   seconds) and its pane stays, asleep, and resumes the same conversation when
@@ -108,12 +109,14 @@ feature is added or changed, update the matching entry here in the same change**
   Behavior do it after N hours idle (on, 4 hours, by default); every wake
   restarts that clock, and a pane woken through ctl sleeps again after 30
   idle minutes unless you look at it. Working, asking,
-  background-held, pinned and drafting agents, the focused agent (unless its
+  background-held, pinned and drafting agents, agents a `ctl send --when-idle`
+  is waiting on, the focused agent (unless its
   own Sleep is chosen), agents without a saved
   conversation (or whose provider deleted its file), shells, and remote or tmux
   panes stay running. `ctl status` reports `not_running_reason: "sleeping"` and
   whether a wake `resumes` the conversation, and `ctl wake AGENT` resumes one
-  without moving focus. A wake that finds the saved conversation deleted
+  without moving focus; `ctl send --when-idle` wakes one to type into it. A
+  wake that finds the saved conversation deleted
   starts a new one in the same folder, and Notifications says "started fresh ·
   no history".
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
@@ -1222,6 +1225,11 @@ feature is added or changed, update the matching entry here in the same change**
   launch, `conversation_changed`); a caller that disconnects before typing
   cancels it. Each pane holds one waiting send (`busy`, `queued`) and muxel at
   most eight (`queue_full`). Every refusal says whether anything was pasted.
+  An asleep agent is woken once, in the background like `ctl wake`, and the
+  send waits while it starts (`waiting_on: waking`, then `starting`); muxel
+  wakes at most two at a time for waiting sends, and a failed wake drops the
+  send untyped with `not_running`. `--no-wake` (protocol v8) and a send pinned
+  with `--launch-id` refuse an asleep agent instead, as a plain send does.
 - **Conversation-pinned sends** — `status` and `panes` show each agent's
   `session_id`, the provider's id for the conversation it is in, and
   `protocol`, the newest control protocol the running muxel accepts. A running
@@ -1270,7 +1278,8 @@ feature is added or changed, update the matching entry here in the same change**
   muxel writes them to the workspace's data folder before it answers `queued`
   and again before the paste. After a restart a send pinned with
   `--session-id` waits on through its pane's relaunch, until its deadline,
-  and types only if the pane is still in that conversation; one that was
+  and types only if the pane is still in that conversation, waking it if it
+  came back asleep; one that was
   pasting when muxel stopped is never typed again and reads `done` with
   `outcome: interrupted`; an unpinned one is dropped (`reason: restarted`).
   Replies carry a `boot_id` that is new each time muxel starts. Closing the
