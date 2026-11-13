@@ -1587,7 +1587,11 @@ feature is added or changed, update the matching entry here in the same change**
   fold it: its rows go and the label stays, saying how many of them are unread.
   Older starts folded (Settings → Appearance → **Older section starts**: Folded or
   Open), and each project remembers the bands you fold or open across restarts.
-  Needs you and Working never fold.
+  Needs you and Working never fold. Status pills are a glyph and an age by
+  default (`▶ 3m` working, `? 1m` asking, `✓ 2h` finished, `☾ 20h` asleep,
+  with the words in the pill's tooltip, and a family's `? 1` / `▶ 1`), or
+  words with **Status pills: Words**, where an asleep row says `asleep · 20h`.
+  Layout order keeps its words.
   Reading, focusing or clicking a session never moves its row, and neither does
   another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that

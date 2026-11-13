@@ -302,6 +302,18 @@ keeps its own order, blocked then unread finished, and in Recent work opens
 what hid its target the same way. Both switch to the target's project, as
 clicking its row does.
 
+Recent work writes a row's pill as a glyph and an age by default (Settings,
+Appearance: "Status pills", Icons or Words; `sidebar::pill_text`). Working is
+`▶` and how long the turn has run, asking `?` and how long it has asked,
+finished `✓` and how long ago, each "now" under a minute, and asleep the moon
+and the age of its last work. Idle keeps its words. The pill's tooltip holds
+the words a glyph leaves out, the background work included. A family's top
+row counts the sessions under it that ask or work as the project header does,
+`? 1` and `▶ 1`. Words keeps the words, and an asleep row says
+`asleep · 20h` (and "no history") where a finished one says done. Layout order
+takes no style: words for a running row, the moon for an asleep one. Loading
+and stopped stay words in both.
+
 `sidebar::is_unread` is the one read rule. The mark and the outline pill of a
 read Done both use it, and Recent work's order never does: the pill's test,
 `AgentActivity::has_unattended_completion`, is `is_unread` restricted to a Done

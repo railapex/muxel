@@ -15,6 +15,79 @@ pub enum SidebarSort {
     RecentWork,
 }
 
+/// How Recent work writes a row's status pill (`Settings::sidebar_pills`).
+/// Layout order keeps its words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PillStyle {
+    /// A glyph and an age, as the project header counts: `▶ 3m` working,
+    /// `? 1m` asking, `✓ 2h` finished, `☾ 20h` asleep. Idle keeps its words.
+    #[default]
+    Icons,
+    /// Words: `working`, `blocked · 1m`, `done · 2h`, and `asleep · 20h`
+    /// where a finished row says done.
+    Words,
+}
+
+/// What a row's status pill says ([`pill_text`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PillText {
+    /// The state's glyph and how long it has been in that state, `None`
+    /// under a minute (drawn "now").
+    Glyph {
+        glyph: &'static str,
+        age: Option<String>,
+    },
+    /// The state's words ([`crate::agent_activity_label`]).
+    Words,
+    /// An asleep row's moon and the age of its last work.
+    AsleepMoon,
+    /// An asleep row in words: "asleep" and the age of its last work.
+    AsleepWords,
+}
+
+/// What a row's pill says in sidebar order `sort` with pill style `style`,
+/// for a row in `state`, asleep or not. Only Recent work takes the style:
+/// Layout keeps words for a running row and the moon for an asleep one.
+pub fn pill_text(
+    sort: SidebarSort,
+    style: PillStyle,
+    state: AgentActivityState,
+    asleep: bool,
+    activity: &AgentActivity,
+    now: i64,
+) -> PillText {
+    let style = match sort {
+        SidebarSort::RecentWork => style,
+        SidebarSort::Layout if asleep => PillStyle::Icons,
+        SidebarSort::Layout => PillStyle::Words,
+    };
+    let (glyph, at) = match (asleep, style, state) {
+        (true, PillStyle::Icons, _) => return PillText::AsleepMoon,
+        (true, PillStyle::Words, _) => return PillText::AsleepWords,
+        (false, PillStyle::Words, _) | (false, PillStyle::Icons, AgentActivityState::Idle) => {
+            return PillText::Words;
+        }
+        (false, PillStyle::Icons, AgentActivityState::Working) => ("▶", activity.work_started_at),
+        (false, PillStyle::Icons, AgentActivityState::Blocked) => ("?", activity.blocked_at),
+        (false, PillStyle::Icons, AgentActivityState::Done) => ("✓", activity.completed_at),
+    };
+    PillText::Glyph {
+        glyph,
+        age: at
+            .map(|at| now.saturating_sub(at).max(0))
+            .filter(|&age| age >= crate::MINUTE_MS)
+            .map(|age| {
+                if age < crate::HOUR_MS {
+                    format!("{}m", age / crate::MINUTE_MS)
+                } else if age < crate::DAY_MS {
+                    format!("{}h", age / crate::HOUR_MS)
+                } else {
+                    format!("{}d", age / crate::DAY_MS)
+                }
+            }),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ActivityBand {
     Today,
@@ -964,6 +1037,52 @@ mod tests {
 
     fn clock() -> BandClock {
         BandClock::at(&Utc.timestamp_millis_opt(NOW).unwrap())
+    }
+
+    #[test]
+    fn icon_pills_are_a_glyph_and_the_age_of_the_state_in_recent_work_only() {
+        use AgentActivityState::{Blocked, Done, Idle, Working};
+        // Each state's own time differs, so a pill aged by the wrong one shows.
+        let activity = AgentActivity {
+            work_started_at: Some(NOW - 3 * MINUTE),
+            blocked_at: Some(NOW - 30_000),
+            completed_at: Some(NOW - 2 * HOUR - 5 * MINUTE),
+            ..AgentActivity::default()
+        };
+        let glyph = |glyph, age: Option<&str>| PillText::Glyph {
+            glyph,
+            age: age.map(str::to_owned),
+        };
+        let pill =
+            |sort, style, state, asleep| pill_text(sort, style, state, asleep, &activity, NOW);
+        let (recent, layout) = (SidebarSort::RecentWork, SidebarSort::Layout);
+        // The mock's Icons: ▶ working, ? asking, ✓ finished, ☾ asleep, each
+        // with how long it has been so; idle keeps its words.
+        let icons = PillStyle::Icons;
+        assert_eq!(pill(recent, icons, Working, false), glyph("▶", Some("3m")));
+        assert_eq!(pill(recent, icons, Blocked, false), glyph("?", None));
+        assert_eq!(pill(recent, icons, Done, false), glyph("✓", Some("2h")));
+        assert_eq!(pill(recent, icons, Idle, false), PillText::Words);
+        let days = AgentActivity {
+            completed_at: Some(NOW - 3 * DAY - HOUR),
+            ..activity.clone()
+        };
+        assert_eq!(
+            pill_text(recent, icons, Done, false, &days, NOW),
+            glyph("✓", Some("3d"))
+        );
+        for state in [Working, Blocked, Done, Idle] {
+            assert_eq!(pill(recent, icons, state, true), PillText::AsleepMoon);
+            // Words says asleep where a finished row says done.
+            let words = PillStyle::Words;
+            assert_eq!(pill(recent, words, state, false), PillText::Words);
+            assert_eq!(pill(recent, words, state, true), PillText::AsleepWords);
+            // Layout takes no style: words awake, the moon asleep.
+            for style in [icons, words] {
+                assert_eq!(pill(layout, style, state, false), PillText::Words);
+                assert_eq!(pill(layout, style, state, true), PillText::AsleepMoon);
+            }
+        }
     }
 
     /// A turn that finished at `at` and has been read.
