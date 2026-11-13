@@ -116,13 +116,24 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
     ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.323-windows-first-send-drop#enter-before-first-frame", "takes_prompt/send_state_copy", "send admitted=true", SEND_UNDRAWN),
+    ("claude-2.1.323-windows-first-send-drop#first-frame-draft", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.323-windows-first-send-drop#notice-on-rule", "composer", "no box", CLAUDE_RULE_NOTICE),
+    ("claude-2.1.323-windows-first-send-drop#notice-on-rule", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.323-windows-first-send-drop#draft-stays", "composer", "no box", CLAUDE_RULE_NOTICE),
+    ("claude-2.1.323-windows-first-send-drop#draft-stays", "takes_prompt/send_state_copy", "send admitted=true", SEND_DRAFT),
 ];
 
 const SEND_DRAFT: &str = "ctl send doesn't read the composer, so it adds to a draft";
 const SEND_COVERED: &str =
     "ctl send doesn't read the composer, so it types while a picker or card covers it";
+const SEND_UNDRAWN: &str = "ctl send admits a Claude pane before its first frame; Claude keeps \
+    the text and drops the Enter, so the prompt is left as a draft";
 const HOME_DRAFT: &str =
     "a draft with its cursor at Home reads as an empty composer (Claude, Codex)";
+const CLAUDE_RULE_NOTICE: &str = "Claude writes notices into the right end of its box's top rule \
+    and erases them, leaving the rule short; the box reader wants the top rule to match the bottom \
+    one, so status loses the box while a notice shows and after it";
 const CODEX_FOOTER: &str = "the Codex composer reader needs a footer it knows; 0.164.0's status \
     line opens with the model's display name, which here has no digit, and the first frame has \
     no footer yet";
