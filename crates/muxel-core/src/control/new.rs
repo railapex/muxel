@@ -38,6 +38,10 @@ pub struct NewOptions {
     pub from: Option<String>,
     /// Caller-supplied pane UUID; displayed only when it names a live pane.
     pub requesting_pane: Option<Uuid>,
+    /// `--top-level`: the new session doesn't nest under the requesting pane's
+    /// session in Recent work.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub top_level: bool,
     /// Client behavior only; the host always returns admission immediately.
     #[serde(skip)]
     pub no_wait: bool,
@@ -261,6 +265,7 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
             "--from" => options.from = Some(value()?),
             "--no-wait" => options.no_wait = true,
             "--focus" => options.focus = true,
+            "--top-level" => options.top_level = true,
             "--background" => {} // accepted for existing callers; background is the default
             "--tab" | "--split" => {
                 if placement_seen {
