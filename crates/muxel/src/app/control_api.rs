@@ -14,7 +14,9 @@ use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
 use muxel_core::tmux::ClaimWrite;
-use muxel_terminal::{ControlInput, ControlWrite, ControlWriteError, TerminalStatusCoverage};
+use muxel_terminal::{
+    ControlInput, ControlWrite, ControlWriteError, SendRefusal, TerminalStatusCoverage,
+};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,8 +71,7 @@ impl ControlTurn {
     fn startup_error(&self) -> Option<String> {
         self.startup
             .as_ref()
-            .and_then(ctl::StartupTurn::failure)
-            .map(|failure| failure.message().to_owned())
+            .and_then(ctl::StartupTurn::startup_error)
     }
 
     fn startup(prompt: String) -> Self {
@@ -315,7 +316,10 @@ impl Drop for SendInFlight {
 
 #[derive(Clone, Copy)]
 struct SendAdmission {
-    state: Option<AgentState>,
+    /// Why the pane refuses a prompt now ([`muxel_terminal::TerminalView::send_refusal`]).
+    /// A pane the app holds as failed, starting or exited is refused only when
+    /// no prompt is showing; `control_writable` answers for the rest of it.
+    refusal: Option<SendRefusal>,
     just_submitted: bool,
     force: bool,
 }
@@ -341,7 +345,15 @@ const SUBMIT_DELAY_MS: u64 = 400;
 /// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
 /// sleeping before a pipe write cannot establish that. Retry only visible proof.
 const SUBMISSION_RETRY_MS: u64 = 5_000;
+/// How long a send watches for its receipt, holding its ctl connection.
+/// A provider can take in a large paste slowly (Windows Codex receives two
+/// console input records per character), so the window grows with the text
+/// by [`SUBMISSION_CONFIRM_PER_KCHAR_MS`] for each thousand characters past
+/// the first, up to [`SUBMISSION_CONFIRM_MAX_MS`]. That rate is an
+/// allowance, not a measured provider speed.
 const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_CONFIRM_PER_KCHAR_MS: u64 = 1_000;
+const SUBMISSION_CONFIRM_MAX_MS: u64 = 60_000;
 const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
 const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
@@ -383,34 +395,52 @@ fn runtime_control_state(
     }
 }
 
-fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
-    if !admission.force {
-        if admission.just_submitted {
-            return Err(ctl::Error::new(
-                ErrorCode::Working,
-                "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)",
-            )
-            .with_reason("just_submitted"));
-        }
-        match admission.state {
-            Some(AgentState::Working) => {
-                return Err(ctl::Error::new(
-                    ErrorCode::Working,
-                    "the agent is working: `wait` for it to finish (or pass --force to \
-                     type the prompt anyway)",
-                ));
-            }
-            Some(AgentState::Blocked) => {
-                return Err(ctl::Error::new(
-                    ErrorCode::Blocked,
-                    "the agent is waiting on a question: see `show`, then `answer` it or \
-                     press `keys`",
-                ));
-            }
-            _ => {}
-        }
+/// A turn held at Working for its background work is over, and its prompt is free.
+fn send_admission_state(
+    state: Option<AgentState>,
+    reason: Option<muxel_terminal::TerminalStatusReason>,
+) -> Option<AgentState> {
+    if state == Some(AgentState::Working)
+        && reason == Some(muxel_terminal::TerminalStatusReason::BackgroundWork)
+    {
+        return Some(AgentState::Done);
     }
-    Ok(())
+    state
+}
+
+/// The one place a refusal becomes the code, reason and text `ctl send` replies
+/// with. A status that can't be attributed is reported as working.
+fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
+    if admission.force {
+        return Ok(());
+    }
+    if admission.just_submitted {
+        return Err(ctl::Error::new(
+            ErrorCode::Working,
+            "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)",
+        )
+        .with_reason("just_submitted"));
+    }
+    match admission.refusal {
+        None => Ok(()),
+        Some(SendRefusal::Unattributable | SendRefusal::Working) => Err(ctl::Error::new(
+            ErrorCode::Working,
+            "the agent is working: `wait` for it to finish (or pass --force to \
+             type the prompt anyway)",
+        )),
+        Some(SendRefusal::Blocked) => Err(ctl::Error::new(
+            ErrorCode::Blocked,
+            "the agent is waiting on a question: see `show`, then `answer` it or \
+             press `keys`",
+        )),
+        Some(SendRefusal::PromptHidden) => Err(ctl::Error::new(
+            ErrorCode::Blocked,
+            "no prompt is showing to type into: a picker, menu or startup card covers it, \
+             or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send \
+             again once the prompt is back (or pass --force)",
+        )
+        .with_reason("prompt_hidden")),
+    }
 }
 
 impl MuxelApp {
@@ -459,6 +489,12 @@ impl MuxelApp {
                 self.control = None;
                 self.control_task = None;
             }
+        }
+        // Also published for the open workspace, so its panes' `ctl` finds this
+        // window when other muxel windows run.
+        let workspace = self.current_workspace;
+        if let Some(server) = &mut self.control {
+            server.set_workspace(workspace);
         }
     }
 
@@ -1182,10 +1218,26 @@ impl MuxelApp {
                 .control_turns
                 .get(&inst.id)
                 .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+            background: self
+                .terminal_view(inst.id)
+                .and_then(|view| view.read(cx).background_work()),
+            turn_over: self.control_turn_over(inst, now, cx),
             startup_error: self
                 .control_turns
                 .get(&inst.id)
                 .and_then(ControlTurn::startup_error),
+            prompt_delivery: self.control_turns.get(&inst.id).and_then(|turn| {
+                let startup = turn.startup.as_ref()?;
+                let exact_draft = self.terminal_view(inst.id).is_some_and(|view| {
+                    let view = view.read(cx);
+                    startup.can_inspect_draft(view.session().id, view.session().input_rev())
+                        && turn
+                            .prompt
+                            .as_deref()
+                            .is_some_and(|text| view.prompt_in_composer(text))
+                });
+                Some(startup.delivery(&inst.id.to_string(), exact_draft))
+            }),
             focused: self.active_instance == Some(inst.id),
             pane,
             worktree_branch: inst.worktree_branch.clone(),
@@ -1451,7 +1503,7 @@ impl MuxelApp {
             input,
             turn,
             site: self.control_claim_site(inst),
-            state: self.control_state(inst, cx),
+            state: self.control_admission_state(inst, cx),
             activity: inst.activity.clone(),
             force,
             launch_id: None,
@@ -1460,9 +1512,36 @@ impl MuxelApp {
         })
     }
 
+    /// A current-binding foreground turn beside listed work is over, unless a prompt
+    /// sent since then hasn't started yet, whose reply this would pass off as the previous one.
+    fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
+        self.terminal_view(inst.id).is_some_and(|view| {
+            let view = view.read(cx);
+            view.runtime_snapshot()
+                .background_turn_over(view.session().binding_revision())
+        }) && !self
+            .control_turns
+            .get(&inst.id)
+            .is_some_and(|turn| turn.awaiting_reply(Some(AgentState::Done), &inst.activity, now))
+    }
+
+    /// The state a prompt is admitted against, here and by a peer sharing the pane.
+    fn control_admission_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        send_admission_state(
+            self.control_state(inst, cx),
+            self.terminal_view(inst.id)
+                .filter(|view| {
+                    let view = view.read(cx);
+                    view.runtime_snapshot()
+                        .background_send_admitted(view.session().binding_revision())
+                })
+                .map(|_| muxel_terminal::TerminalStatusReason::BackgroundWork),
+        )
+    }
+
     fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
         let inst = self.workspace.instance(iid);
-        let state = inst.and_then(|inst| self.control_state(inst, cx));
+        let state = inst.and_then(|inst| self.control_admission_state(inst, cx));
         let coverage = self
             .terminal_view(iid)
             .map(|view| view.read(cx).runtime_snapshot().coverage);
@@ -1471,8 +1550,19 @@ impl MuxelApp {
                 just_submitted_turn(turn, coverage, state, &inst.activity, now_ms())
             })
         });
+        // A live pane's state comes from its runtime, which decides. One the app
+        // holds as failed, starting or exited is checked for a prompt only.
+        let refusal = self.terminal_view(iid).and_then(|view| {
+            let view = view.read(cx);
+            match state {
+                Some(
+                    AgentState::Working | AgentState::Idle | AgentState::Blocked | AgentState::Done,
+                ) => view.send_refusal(),
+                _ => view.prompt_hidden().then_some(SendRefusal::PromptHidden),
+            }
+        });
         SendAdmission {
-            state,
+            refusal,
             just_submitted,
             force,
         }
@@ -1711,7 +1801,7 @@ impl MuxelApp {
                         return Ok(reply);
                     };
                     let started = std::time::Instant::now();
-                    let mut confirmation = PromptConfirmation::default();
+                    let mut confirmation = PromptConfirmation::new(&text);
                     let mut retries = 0_u8;
                     loop {
                         let action = this
@@ -1771,6 +1861,20 @@ impl MuxelApp {
                             Err(stop) => Err(stop),
                         };
                         submission_receipt(&mut reply, Some(outcome), retries);
+                        if outcome == Err(Unconfirmed::TimedOut) && retries == 0 {
+                            let retained = this.update(cx, |app, cx| {
+                                session.accepts_input_epoch(input_epoch)
+                                    && confirmation_verdict(app.control_writable(iid, cx), &session, revision, session.input_rev()).is_ok()
+                                    && app.terminal_view(iid).is_some_and(|view| {
+                                        let view = view.read(cx);
+                                            view.observe_prompt_submission(&attempt) == muxel_terminal::PromptSubmissionState::Retryable
+                                            && view.prompt_in_composer(&text)
+                                    })
+                            }).unwrap_or(false);
+                            if retained {
+                                ctl::PromptDelivery::new(&iid.to_string(), ctl::PromptOutcome::PendingInComposer).apply(&mut reply);
+                            }
+                        }
                         return Ok(reply);
                     }
                 })
@@ -1903,12 +2007,24 @@ enum PromptConfirmationAction {
     Unconfirmed,
 }
 
-#[derive(Default)]
 struct PromptConfirmation {
+    confirm: Duration,
     retried_at: Option<Duration>,
 }
 
 impl PromptConfirmation {
+    /// Watching for the receipt of `text`.
+    fn new(text: &str) -> Self {
+        let past_first = (text.chars().count() as u64).saturating_sub(1_000);
+        let extra = past_first.div_ceil(1_000) * SUBMISSION_CONFIRM_PER_KCHAR_MS;
+        Self {
+            confirm: Duration::from_millis(
+                (SUBMISSION_CONFIRM_MS + extra).min(SUBMISSION_CONFIRM_MAX_MS),
+            ),
+            retried_at: None,
+        }
+    }
+
     fn observe(
         &mut self,
         elapsed: Duration,
@@ -1919,7 +2035,7 @@ impl PromptConfirmation {
             return PromptConfirmationAction::Confirmed;
         }
         // A late retry still gets time to show its receipt.
-        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let confirm = self.confirm;
         let deadline = self.retried_at.map_or(confirm, |at| {
             confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
         });
@@ -1983,6 +2099,17 @@ fn submission_receipt(
     outcome: Option<Result<(), Unconfirmed>>,
     enter_retries: u8,
 ) {
+    let agent = reply["uuid"].as_str().or_else(|| reply["agent"].as_str());
+    let proven = if outcome == Some(Ok(())) {
+        ctl::PromptOutcome::Submitted
+    } else {
+        ctl::PromptOutcome::Unconfirmed
+    };
+    let mut delivery = ctl::PromptDelivery::new(agent.unwrap_or(""), proven);
+    if agent.is_none() && proven != ctl::PromptOutcome::Submitted {
+        delivery.next = Some("muxel ctl panes".into());
+    }
+    delivery.apply(reply);
     reply["submission_confirmed"] = outcome.map_or(Value::Null, |outcome| json!(outcome.is_ok()));
     reply["enter_retries"] = json!(enter_retries);
     if let Some(Err(reason)) = outcome {
@@ -2084,6 +2211,7 @@ async fn finish_prompt_enter(
 fn paste_failed(error: ControlWriteError) -> ctl::Error {
     let typed = error.may_have_typed();
     let failed: ctl::Error = match error {
+        ControlWriteError::InvalidInput(why) => ctl::Error::new(ErrorCode::UnsupportedInput, why),
         ControlWriteError::Closed(why) => format!(
             "couldn't finish pasting the prompt ({why}); input may be partial: check its `screen`"
         )
@@ -2093,9 +2221,10 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
             format!("{why}. Nothing was typed"),
         ),
         ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
-        ControlWriteError::Refused(_) => {
-            format!("couldn't paste the prompt through tmux: {error}").into()
-        }
+        ControlWriteError::Refused(_) => ctl::Error::new(
+            ErrorCode::TmuxRefused,
+            format!("couldn't paste the prompt through tmux: {error}"),
+        ),
         ControlWriteError::Unknown(_) | ControlWriteError::Partial(_) => format!(
             "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
@@ -2108,6 +2237,7 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
 /// fails with `pasted: true`.
 fn enter_failed(error: ControlWriteError) -> ctl::Error {
     ctl::Error::from(match error {
+        ControlWriteError::InvalidInput(why) => why,
         ControlWriteError::Closed(why) => {
             format!("the prompt was pasted but Enter couldn't be admitted ({why}): check its `screen`")
         }
@@ -2149,6 +2279,7 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
     let typed = pressed_before > 0 || error.may_have_typed();
     let failed = if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
         let then = match error {
+            ControlWriteError::InvalidInput(why) => why,
             ControlWriteError::Refused(why)
             | ControlWriteError::Unresolved(why)
             | ControlWriteError::InMode(why) => {
@@ -2172,6 +2303,10 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
                 ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why)
             }
             ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
+            ControlWriteError::Refused(_) => ctl::Error::new(
+                ErrorCode::TmuxRefused,
+                format!("couldn't press a key through tmux: {error}"),
+            ),
             ControlWriteError::Closed(why) => {
                 format!("couldn't admit a key to the PTY writer: {why}").into()
             }
@@ -2642,6 +2777,24 @@ mod prompt_submission_tests {
         }
     }
 
+    /// A turn held for its background work is over, so a prompt goes in. A turn
+    /// actually running still refuses.
+    #[test]
+    fn send_goes_to_a_turn_held_only_for_its_background_work() {
+        use muxel_terminal::TerminalStatusReason as Reason;
+        let state =
+            |reason| super::send_admission_state(Some(super::AgentState::Working), Some(reason));
+        assert_eq!(state(Reason::BackgroundWork), Some(super::AgentState::Done));
+        assert_eq!(
+            state(Reason::ProgramStatus(None)),
+            Some(super::AgentState::Working)
+        );
+        assert_eq!(
+            state(Reason::ProviderScreen),
+            Some(super::AgentState::Working)
+        );
+    }
+
     #[test]
     fn the_tmux_match_model_is_fnmatch_not_equality() {
         assert!(tmux_matches("v1|me|*|*|*|n*", "v1|me|h|1|2|n"));
@@ -2712,7 +2865,7 @@ mod prompt_submission_tests {
         let pane = Uuid::new_v4();
         let before = session.input_rev();
         let admission = SendAdmission {
-            state: Some(super::AgentState::Idle),
+            refusal: None,
             just_submitted: false,
             force: false,
         };
@@ -2777,11 +2930,19 @@ mod prompt_submission_tests {
         }
 
         let refused = paste_failed(ControlWriteError::Refused("target pane has exited".into()));
-        assert_eq!(refused.code, None);
         assert!(
             refused.message.contains("nothing was typed"),
             "{}",
             refused.message
+        );
+        let reply = crate::control::failure_body(refused, crate::control::Task::Unsent);
+        assert_eq!(
+            reply["outcome"], "not_delivered",
+            "a paste tmux refused typed nothing: {reply}"
+        );
+        assert_eq!(
+            keys_failed(ControlWriteError::Refused("lost server".into()), 0).code,
+            Some(ErrorCode::TmuxRefused)
         );
         let unknown = paste_failed(ControlWriteError::Unknown(
             "no answer within 10 seconds".into(),
@@ -3069,7 +3230,7 @@ mod prompt_submission_tests {
             "late prompt",
             None,
             SendAdmission {
-                state: Some(super::AgentState::Working),
+                refusal: Some(muxel_terminal::SendRefusal::Working),
                 just_submitted: false,
                 force: false,
             },
@@ -3255,6 +3416,53 @@ mod prompt_submission_tests {
             let sent = sent.try_recv().expect("the send finished");
             assert!(sent.is_ok(), "{sent:?}");
             assert!(SendInFlight::begin(pane, false).is_ok());
+        });
+    }
+
+    /// Every send's admission asks the pane whether a prompt is showing: a
+    /// Claude pane whose input box isn't drawn has none, and a shell always does.
+    #[cfg(windows)]
+    #[test]
+    fn send_admission_reads_whether_the_pane_shows_a_prompt() {
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::time::Instant;
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir()
+                        .unwrap()
+                        .join("control-prompt-shown");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    let mut hidden = |status_program: Option<&str>| {
+                        let mut instance = Instance::shell(project);
+                        instance.program = Some("cmd.exe".into());
+                        instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                        let pane = instance.id;
+                        let spec = CommandSpec::program("cmd.exe", instance.args.clone())
+                            .with_status_program(status_program.map(str::to_owned));
+                        app.workspace.add_instance(instance);
+                        let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                        let view = cx
+                            .new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                        app.terminals.insert(pane, view);
+                        app.control_send_admission(pane, false, cx).refusal
+                    };
+                    assert_eq!(
+                        hidden(Some("claude")),
+                        Some(muxel_terminal::SendRefusal::PromptHidden),
+                        "no Claude input box is drawn"
+                    );
+                    assert_ne!(
+                        hidden(None),
+                        Some(muxel_terminal::SendRefusal::PromptHidden),
+                        "a shell's prompt is never covered"
+                    );
+                })
+                .unwrap();
         });
     }
 
@@ -3981,7 +4189,7 @@ mod prompt_submission_tests {
     fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
         use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
             confirm.observe(Duration::from_millis(4_999), Retryable),
             Observe
@@ -4001,7 +4209,7 @@ mod prompt_submission_tests {
             confirm.observe(Duration::from_secs(10), Accepted),
             Confirmed
         );
-        let mut fast = PromptConfirmation::default();
+        let mut fast = PromptConfirmation::new("fix the pager");
         assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
     }
 
@@ -4009,7 +4217,7 @@ mod prompt_submission_tests {
     fn a_late_retry_keeps_time_to_confirm() {
         use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
             confirm.observe(Duration::from_millis(9_900), Retryable),
             RetryEnter
@@ -4018,6 +4226,27 @@ mod prompt_submission_tests {
         assert_eq!(
             confirm.observe(Duration::from_millis(12_900), Unknown),
             Unconfirmed
+        );
+    }
+
+    #[test]
+    fn an_ordinary_send_holds_its_connection_no_longer_than_on_master() {
+        use PromptSubmissionState::Unconfirmed as Unknown;
+        let mut confirm = PromptConfirmation::new(&"word ".repeat(200));
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "a thousand characters get master's ten seconds"
+        );
+        let mut largest = PromptConfirmation::new(&"x".repeat(1_000_000));
+        assert_eq!(
+            largest.observe(Duration::from_secs(59), Unknown),
+            PromptConfirmationAction::Observe
+        );
+        assert_eq!(
+            largest.observe(Duration::from_secs(60), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "no send watches longer than a minute"
         );
     }
 
@@ -4056,13 +4285,36 @@ mod prompt_submission_tests {
     }
 
     #[test]
+    fn ctl_ergonomics_unconfirmed_receipt_names_inspection_without_repasting() {
+        let mut reply = json!({"pasted": true, "agent": "abcd1234"});
+        submission_receipt(&mut reply, Some(Err(Unconfirmed::Interrupted)), 0);
+        assert_eq!(reply["outcome"], "unconfirmed");
+        assert_eq!(reply["next"], "muxel ctl screen abcd1234");
+        assert_eq!(reply["pasted"], true);
+    }
+
+    #[test]
+    fn ctl_ergonomics_large_paste_can_finish_after_twenty_seconds() {
+        let mut confirmation = PromptConfirmation::new(&"x".repeat(30_000));
+        assert_eq!(
+            confirmation.observe(Duration::from_secs(20), PromptSubmissionState::Unconfirmed),
+            PromptConfirmationAction::Observe,
+            "a large provider paste must not be reported unconfirmed while it is still processing"
+        );
+        assert_eq!(
+            confirmation.observe(Duration::from_secs(30), PromptSubmissionState::Accepted),
+            PromptConfirmationAction::Confirmed
+        );
+    }
+
+    #[test]
     fn checking_after_enter_only_ever_extends_the_success_receipt() {
         let pasted = json!({"pasted": true, "launch_id": "L"});
         let mut unwatched = pasted.clone();
         submission_receipt(&mut unwatched, None, 0);
         assert_eq!(
             unwatched,
-            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0})
+            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0, "outcome": "unconfirmed", "next": "muxel ctl panes"})
         );
         let mut confirmed = pasted.clone();
         submission_receipt(&mut confirmed, Some(Ok(())), 1);
@@ -4087,8 +4339,8 @@ mod prompt_submission_tests {
 #[cfg(test)]
 mod runtime_control_tests {
     use super::{
-        AgentState, AgentStatus, SendAdmission, check_send_state, ctl, runtime_control_state,
-        turn_has_reply_evidence,
+        AgentState, AgentStatus, SendAdmission, SendRefusal, check_send_state, ctl,
+        runtime_control_state, turn_has_reply_evidence,
     };
     use muxel_core::AgentActivity;
     use muxel_terminal::{
@@ -4097,11 +4349,119 @@ mod runtime_control_tests {
     };
     use std::time::SystemTime;
 
+    fn held_snapshot() -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            background: Some(ctl::BackgroundWork {
+                shells: 1,
+                ..Default::default()
+            }),
+            status: AgentStatus::Working,
+            attributable: true,
+            reason: TerminalStatusReason::BackgroundWork,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: uuid::Uuid::nil(),
+            binding_rev: 1,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: false,
+            completion_revision: 0,
+        }
+    }
+
+    #[test]
+    fn background_hold_send_requires_current_binding() {
+        let runtime = held_snapshot();
+        for (binding, attributable) in [(1, true), (2, true), (1, false)] {
+            let runtime = TerminalRuntimeSnapshot {
+                attributable,
+                ..runtime
+            };
+            let result = check_send_state(SendAdmission {
+                refusal: runtime.send_refusal(binding, false),
+                just_submitted: false,
+                force: false,
+            });
+            assert_eq!(result.is_ok(), binding == 1 && attributable);
+        }
+    }
+
+    #[test]
+    fn background_hold_turn_end_requires_current_binding() {
+        let runtime = held_snapshot();
+        assert!(runtime.background_turn_over(1));
+        assert!(!runtime.background_turn_over(2));
+        assert!(
+            TerminalRuntimeSnapshot {
+                attributable: false,
+                ..runtime
+            }
+            .background_turn_over(1)
+        );
+    }
+
+    #[test]
+    fn pr136_shared_released_foreground_keeps_current_binding_admission() {
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                attributable: false,
+                reason: TerminalStatusReason::ProviderTitle,
+                ..held_snapshot()
+            };
+            assert!(runtime.background_turn_over(1));
+            for (attributable, admitted) in [(true, true), (false, false)] {
+                let runtime = TerminalRuntimeSnapshot {
+                    attributable,
+                    ..runtime
+                };
+                let result = check_send_state(SendAdmission {
+                    refusal: runtime.send_refusal(1, false),
+                    just_submitted: false,
+                    force: false,
+                });
+                // A listing can't vouch for a prompt a switch may have left.
+                assert_eq!(result.is_ok(), admitted, "attributable: {attributable}");
+            }
+            assert!(
+                !runtime.background_turn_over(2),
+                "an old binding never authorizes input"
+            );
+            assert!(
+                !TerminalRuntimeSnapshot {
+                    background: None,
+                    ..runtime
+                }
+                .background_turn_over(1),
+                "an ordinary unattributed idle pane stays guarded"
+            );
+            assert!(
+                !TerminalRuntimeSnapshot {
+                    background: Some(ctl::BackgroundWork::default()),
+                    ..runtime
+                }
+                .background_turn_over(1),
+                "an empty listing supplies no foreground evidence"
+            );
+        }
+        for status in [AgentStatus::Working, AgentStatus::Blocked] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                reason: TerminalStatusReason::ProviderScreen,
+                ..held_snapshot()
+            };
+            assert!(
+                !runtime.background_turn_over(1),
+                "foreground evidence keeps its refusal"
+            );
+        }
+    }
+
     #[test]
     fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
-        let send = |state, force| {
+        let send = |runtime: TerminalRuntimeSnapshot, binding_rev, force| {
             check_send_state(SendAdmission {
-                state: Some(state),
+                refusal: runtime.send_refusal(binding_rev, false),
                 just_submitted: false,
                 force,
             })
@@ -4117,6 +4477,7 @@ mod runtime_control_tests {
         let revision = session.binding_revision();
         let activity = AgentActivity::default();
         let cached = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Done,
             attributable: true,
             reason: TerminalStatusReason::Quiet,
@@ -4133,11 +4494,12 @@ mod runtime_control_tests {
         session.provider_switched(now, now);
         for old_status in [AgentStatus::Idle, AgentStatus::Done] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status: old_status,
                 ..cached
             };
             let before = runtime_control_state(runtime, revision);
-            assert!(send(before, false).is_ok());
+            assert!(send(runtime, revision, false).is_ok());
             assert_eq!(
                 ctl::wait_outcome(Some(before), false),
                 Some(ctl::WaitOutcome::Finished)
@@ -4147,8 +4509,8 @@ mod runtime_control_tests {
             // even before the runtime event has been processed.
             let state = runtime_control_state(runtime, session.binding_revision());
             assert_eq!(state, AgentState::Working);
-            assert!(send(state, false).is_err());
-            assert!(send(state, true).is_ok());
+            assert!(send(runtime, session.binding_revision(), false).is_err());
+            assert!(send(runtime, session.binding_revision(), true).is_ok());
             let awaiting = ctl::awaiting_reply(
                 Some(100),
                 ctl::REPLY_GRACE_MS,
@@ -4167,13 +4529,14 @@ mod runtime_control_tests {
             AgentStatus::Idle,
         ] {
             let runtime = TerminalRuntimeSnapshot {
+                background: None,
                 status,
                 attributable: false,
                 binding_rev: session.binding_revision(),
                 ..cached
             };
             let state = runtime_control_state(runtime, session.binding_revision());
-            assert!(send(state, false).is_err());
+            assert!(send(runtime, session.binding_revision(), false).is_err());
             assert_eq!(ctl::wait_outcome(Some(state), false), None);
         }
         let fresh = TerminalRuntimeSnapshot {
@@ -4182,7 +4545,7 @@ mod runtime_control_tests {
         };
         let state = runtime_control_state(fresh, session.binding_revision());
         assert_eq!(state, AgentState::Done);
-        assert!(send(state, false).is_ok());
+        assert!(send(fresh, session.binding_revision(), false).is_ok());
         assert_eq!(
             ctl::wait_outcome(Some(state), false),
             Some(ctl::WaitOutcome::Finished)
@@ -4200,7 +4563,7 @@ mod runtime_control_tests {
         let activity = AgentActivity::default();
         assert!(turn.awaiting_reply(Some(AgentState::Idle), &activity, 101));
         let error = check_send_state(SendAdmission {
-            state: Some(AgentState::Idle),
+            refusal: None,
             just_submitted: true,
             force: false,
         })
@@ -4211,7 +4574,7 @@ mod runtime_control_tests {
             "just_submitted"
         );
         let working = SendAdmission {
-            state: Some(AgentState::Working),
+            refusal: Some(SendRefusal::Working),
             just_submitted: true,
             force: false,
         };
@@ -4226,6 +4589,124 @@ mod runtime_control_tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_send_with_no_prompt_showing_is_refused_as_blocked() {
+        let hidden = SendAdmission {
+            refusal: Some(SendRefusal::PromptHidden),
+            just_submitted: false,
+            force: false,
+        };
+        let error = check_send_state(hidden).unwrap_err();
+        assert_eq!(error.code, Some(ctl::ErrorCode::Blocked));
+        assert_eq!(error.reason.as_deref(), Some("prompt_hidden"));
+        // A working agent is still reported as working.
+        let working = check_send_state(SendAdmission {
+            refusal: TerminalRuntimeSnapshot {
+                reason: TerminalStatusReason::ProviderScreen,
+                ..held_snapshot()
+            }
+            .send_refusal(1, true),
+            ..hidden
+        })
+        .unwrap_err();
+        assert_eq!(working.code, Some(ctl::ErrorCode::Working));
+        assert_eq!(working.reason, None);
+        assert!(
+            check_send_state(SendAdmission {
+                force: true,
+                ..hidden
+            })
+            .is_ok()
+        );
+    }
+
+    /// The reply `ctl send` gives a live pane for everything the pane can show,
+    /// as the client reads it. The queued line maps these codes to its waiting
+    /// reasons, so moving the decision must leave every row as it is; only
+    /// `reply`, the path from the pane to the reply, may change.
+    #[test]
+    fn every_send_refusal_keeps_its_code_reason_and_message() {
+        use AgentStatus::{Blocked, Done, Idle, Working};
+        const WORKING: &str = "the agent is working: `wait` for it to finish (or pass --force to type the prompt anyway)";
+        const BLOCKED: &str =
+            "the agent is waiting on a question: see `show`, then `answer` it or press `keys`";
+        const HIDDEN: &str = "no prompt is showing to type into: a picker, menu or startup card covers it, or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send again once the prompt is back (or pass --force)";
+        const JUST: &str = "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)";
+        let working = serde_json::json!({"ok": false, "code": "working", "error": WORKING});
+        let blocked = serde_json::json!({"ok": false, "code": "blocked", "error": BLOCKED});
+        let hidden = serde_json::json!({"ok": false, "code": "blocked", "reason": "prompt_hidden", "error": HIDDEN});
+        let just = serde_json::json!({"ok": false, "code": "working", "reason": "just_submitted", "error": JUST});
+        let sent = serde_json::Value::Null;
+        // The pane's current binding is 1.
+        let live = |status| TerminalRuntimeSnapshot {
+            status,
+            reason: TerminalStatusReason::ProviderScreen,
+            background: None,
+            ..held_snapshot()
+        };
+        let held = held_snapshot();
+        let settling = |runtime: TerminalRuntimeSnapshot| TerminalRuntimeSnapshot {
+            attributable: false,
+            ..runtime
+        };
+        let old = |runtime: TerminalRuntimeSnapshot| TerminalRuntimeSnapshot {
+            binding_rev: 2,
+            ..runtime
+        };
+        // The live pane's path: `TerminalView::send_refusal`, then `check_send_state`.
+        let reply = |runtime: TerminalRuntimeSnapshot, prompt_hidden, just_submitted, force| {
+            check_send_state(SendAdmission {
+                refusal: runtime.send_refusal(1, prompt_hidden),
+                just_submitted,
+                force,
+            })
+        };
+        // (what the pane shows, its runtime, no prompt showing, a control turn
+        // just sent, the reply without --force)
+        let rows = [
+            ("idle", live(Idle), false, false, &sent),
+            ("done", live(Done), false, false, &sent),
+            ("idle, no prompt", live(Idle), true, false, &hidden),
+            ("done, no prompt", live(Done), true, false, &hidden),
+            ("working", live(Working), false, false, &working),
+            ("working, no prompt", live(Working), true, false, &working),
+            ("blocked", live(Blocked), false, false, &blocked),
+            ("blocked, no prompt", live(Blocked), true, false, &blocked),
+            (
+                "idle, switch settling",
+                settling(live(Idle)),
+                false,
+                false,
+                &working,
+            ),
+            ("done, old binding", old(live(Done)), false, false, &working),
+            ("held for background work", held, false, false, &sent),
+            ("held, no prompt", held, true, false, &hidden),
+            (
+                "held, switch settling",
+                settling(held),
+                false,
+                false,
+                &working,
+            ),
+            ("held, old binding", old(held), false, false, &working),
+            ("idle, turn just sent", live(Idle), false, true, &just),
+            ("blocked, turn just sent", live(Blocked), false, true, &just),
+            ("no prompt, turn just sent", live(Idle), true, true, &just),
+        ];
+        for (shows, runtime, prompt_hidden, just_submitted, want) in rows {
+            let body = |force| {
+                reply(runtime, prompt_hidden, just_submitted, force)
+                    .err()
+                    .map_or(serde_json::Value::Null, |error| {
+                        serde_json::to_value(ctl::Response::err(error)).unwrap()
+                    })
+            };
+            assert_eq!(&body(false), want, "{shows}");
+            assert_eq!(body(true), sent, "{shows}, --force");
+        }
     }
 
     #[test]
