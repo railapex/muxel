@@ -5101,6 +5101,7 @@ mod startup_readiness_tests {
             },
             cursor_visible: true,
             bracketed_paste: true,
+            typed: false,
         }
     }
 
@@ -5698,6 +5699,7 @@ mod startup_readiness_tests {
             },
             cursor_visible: true,
             bracketed_paste: true,
+            typed: false,
         }
     }
 
@@ -6108,6 +6110,7 @@ mod startup_readiness_tests {
                 cursor_row: 1,
                 cursor_visible: true,
                 bracketed_paste: true,
+                typed: false,
             };
             if provider == TitleProvider::Claude {
                 assert!(startup_pending_draft_matches(
@@ -6231,7 +6234,7 @@ mod startup_readiness_tests {
     #[test]
     fn grok_task_quoting_codex_trust_text_does_not_block_its_own_first_enter() {
         let screen = Screen { text: "Grok\n› Explain Trust this folder? and Folder access and enter continue · esc quit\n".into(),
-            cursor_row: 1, cursor_column: 80, cursor_visible: true, bracketed_paste: true };
+            cursor_row: 1, cursor_column: 80, cursor_visible: true, bracketed_paste: true, typed: false };
         assert!(startup_ready(
             TitleProvider::Grok,
             &screen,
@@ -6251,6 +6254,7 @@ mod startup_readiness_tests {
             cursor_row,
             cursor_visible,
             bracketed_paste: true,
+            typed: false,
         };
         let rule = "─".repeat(40);
         let grok_card = "  ≡ main project\n\n      Do you trust the contents of this directory?\n          project\n\n   Grok Build may run or modify contents in this directory,\n           posing security risks.\n\n          Yes, proceed        y\n          No, quit            n\n";
@@ -6334,6 +6338,7 @@ mod startup_readiness_tests {
                 cursor_row,
                 cursor_visible: true,
                 bracketed_paste: true,
+                typed: false,
             };
             let markers = vec!["Do you want to proceed".into()];
             assert!(claude_startup_ready(&screen, None, &markers, false));
@@ -6351,7 +6356,7 @@ mod startup_readiness_tests {
         // footer. Its occupied composer must admit the first CR, never a retry.
         let screen = Screen {
             text: "Claude Code v2.1.304\n  ❯ /b12-ready  Reply exactly B12_READY. Do not use tools,\n                 read or write files, or call other agents…\n────────────────────────────────────────\n❯\u{a0}/b12-ready\n────────────────────────────────────────\n  Friday 0%\n  ⏵⏵ auto mode on (shift+tab to cycle)".into(),
-            cursor_column: 12, cursor_row: 4, cursor_visible: true, bracketed_paste: true,
+            cursor_column: 12, cursor_row: 4, cursor_visible: true, bracketed_paste: true, typed: false,
         };
         assert!(claude_startup_ready(
             &screen,
@@ -6378,7 +6383,7 @@ mod startup_readiness_tests {
     fn permission_chrome_vetoes_an_old_composer_even_with_idle_title() {
         let screen = Screen {
             text: "────────────────\n❯ task\n────────────────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel".into(),
-            cursor_column: 6, cursor_row: 1, cursor_visible: true, bracketed_paste: true,
+            cursor_column: 6, cursor_row: 1, cursor_visible: true, bracketed_paste: true, typed: false,
         };
         assert!(!claude_startup_ready(
             &screen,
@@ -8915,6 +8920,7 @@ mod provider_switch_tests {
                 cursor_column: 15,
                 cursor_visible: false,
                 bracketed_paste: true,
+                typed: false,
             };
             let context = status_screen_context(TitleProvider::Claude, &screen);
             assert!(!context.contains("Do you want to proceed"));

@@ -1382,6 +1382,10 @@ pub struct TerminalSession {
     /// draft bit. The low bit is the draft flag; the remaining bits are the
     /// revision, advanced for each input write (see [`Self::input_snapshot`]).
     input_state: AtomicU64,
+    /// A key or a paste reached the program since the last Enter, text or
+    /// not. The draft bit counts text only; Codex's box reader needs to know
+    /// that keys such as Up and Home may have put a draft there.
+    keyed: AtomicBool,
     /// Coalesced wakeup for the view's runtime reducer. Capacity one makes a
     /// burst of keys/resizes one reconciliation request instead of an event log.
     runtime_trigger: async_channel::Sender<()>,
@@ -1976,6 +1980,7 @@ impl TerminalSession {
             last_user_input: Mutex::new(None),
             submission_pending: AtomicBool::new(false),
             input_state: AtomicU64::new(0),
+            keyed: AtomicBool::new(false),
             runtime_trigger,
             runtime_events,
             content_gen: AtomicU64::new(1),
@@ -2392,6 +2397,7 @@ impl TerminalSession {
         self.scroll_input_to_bottom();
         if nonempty {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
+            self.keyed.store(!submitted_enter, Ordering::Relaxed);
             self.advance_input(if submitted_enter {
                 Some(true)
             } else if text {
@@ -3126,6 +3132,7 @@ impl TerminalSession {
                 cursor_row: cursor.line.0,
                 cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
                 bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+                typed: self.keyed.load(Ordering::Relaxed),
             }
         })
     }
@@ -8261,6 +8268,16 @@ mod input_rev_tests {
         session.process_probe_output(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h");
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_ne!(session.input_rev(), wheeled);
+        // The screen Codex's input box is read from carries the draft bit:
+        // typed since the last Enter, and not once an Enter goes in.
+        assert!(session.startup_screen().typed);
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert!(!session.startup_screen().typed);
+        // A key that types nothing counts too: Up can recall a draft.
+        session.write_input(b"\x1b[A");
+        assert!(session.startup_screen().typed);
+        assert!(!session.input_snapshot().1, "Up typed no text");
         session.kill();
     }
 }

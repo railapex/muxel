@@ -750,7 +750,11 @@ feature is added or changed, update the matching entry here in the same change**
   it). Claude's composer counts as empty only while it shows nothing typed, or
   just its `Try "…"` suggestion: a draft with its cursor moved Home is a draft,
   and the suggestion is told by its text, so a Claude run with `NO_COLOR` reads
-  the same. Readiness failure leaves the provider running and reports
+  the same. Codex's editor counts as empty when it shows nothing or its
+  placeholder, and a draft with its cursor at Home is a draft. One row with the
+  cursor at its start still counts as empty while no key has reached the pane
+  since the last Enter, in case Codex shows a placeholder muxel doesn't know.
+  Readiness failure leaves the provider running and reports
   `startup_error` through `ctl status` and `show`.
   Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
@@ -1159,7 +1163,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Safe automated sends** — `send` refuses with `draft_present` when the
   agent's composer already holds text, so a prompt never merges into a message
   the user is writing; `--force` types anyway. Claude and Codex composers are
-  read from the screen (a placeholder suggestion is not a draft); other panes
+  read from the screen (a placeholder suggestion is not a draft, and a draft
+  with its cursor at Home is); other panes
   count text typed since the last Enter, and arrows, Escape and `answer` digits
   don't count. `send --once KEY` types a given key at most once per pane: a
   repeat returns the first receipt with `duplicate: true`, a `duplicate` error

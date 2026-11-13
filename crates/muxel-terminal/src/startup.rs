@@ -1,6 +1,6 @@
 //! Guards for a startup turn. PTY silence is not an application's input-ready signal.
 
-use muxel_core::input_box::{ClaudeBox, read_claude_box};
+use muxel_core::input_box::{ClaudeBox, CodexBox, read_claude_box, read_codex_box};
 use std::{io, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +303,10 @@ pub(crate) struct Screen {
     pub cursor_row: i32,
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    /// A key or a paste reached the pane since its last Enter, text or not.
+    /// Codex draws a placeholder and a draft with its cursor at Home the same
+    /// way; this tells them apart where its text can't.
+    pub typed: bool,
 }
 
 /// An empty-looking, unclipped one-row origin, captured before ctl paste.
@@ -528,6 +532,13 @@ impl Screen {
         if !matches!(content, "" | "Ask Codex to do anything") {
             return None;
         }
+        // The proof starts with the cursor at the prompt's start. A blank row
+        // with the cursor further along holds typed spaces.
+        if usize::try_from(self.cursor_row).ok() != Some(region.start)
+            || self.cursor_column != indent + 2
+        {
+            return None;
+        }
         Some(CodexCtlOrigin {
             columns,
             rows: rows.len(),
@@ -697,7 +708,23 @@ impl Screen {
             .chars()
             .take_while(|ch| ch.is_whitespace())
             .count();
-        if (cursor == top && self.cursor_column == prefix + 2) != empty {
+        // The editor ends above the status footer, which can take two rows.
+        let end = Self::codex_ctl_footer(rows, bottom)?.max(top + 1);
+        let below = &rows[top + 1..end];
+        // One row with the cursor at its start is empty unless a key or paste
+        // reached the pane since the last Enter, since Codex may show a
+        // placeholder muxel doesn't know there. Otherwise the text decides, so
+        // a draft with its cursor at Home (typed, or recalled with Up) is
+        // still a draft.
+        let at_start = cursor == top
+            && self.cursor_column == prefix + 2
+            && below.iter().all(|row| row.trim().is_empty());
+        let first = rows[top].trim_start().strip_prefix('›').unwrap_or_default();
+        let text: Vec<&str> = std::iter::once(first)
+            .chain(below.iter().copied())
+            .collect();
+        let is_empty = (at_start && !self.typed) || read_codex_box(&text) != CodexBox::Typed;
+        if is_empty != empty {
             return None;
         }
         Some(top..bottom)
@@ -979,6 +1006,7 @@ mod tests {
             cursor_row: row,
             cursor_visible: true,
             bracketed_paste: true,
+            typed: false,
         }
     }
 
@@ -1159,6 +1187,39 @@ mod tests {
         assert!(!residual_menu.codex_draft_matches("task"));
     }
 
+    /// Codex draws a draft whose cursor is at Home where it draws a
+    /// placeholder: text from the prompt row's start, the cursor before it
+    /// (Codex 0.167.2, "fix the login bug" then Home). Keys tell them apart:
+    /// a draft takes keys or a paste since the last Enter, typed or recalled.
+    /// One row with none is empty whatever it says, since Codex may show a
+    /// placeholder muxel doesn't know. Several rows are read by their text.
+    #[test]
+    fn a_codex_draft_with_its_cursor_at_home_is_a_draft() {
+        let at_home = |draft: &[&str], typed| {
+            let mut sample = ctl_screen(draft, false);
+            sample.cursor_row -= draft.len() as i32 - 1;
+            sample.cursor_column = 2;
+            sample.typed = typed;
+            sample
+        };
+        let one = ["fix the login bug"];
+        let two = ["fix the login bug", "and the logout one"];
+        for (draft, typed) in [(&one[..], true), (&two[..], true), (&two[..], false)] {
+            let sample = at_home(draft, typed);
+            assert!(sample.codex_composer_context(true).is_none(), "{draft:?}");
+            assert!(sample.codex_composer_context(false).is_some(), "{draft:?}");
+        }
+        for (text, typed) in [
+            ("Write tests for @filename", false),
+            ("Ask Codex to do anything", true),
+            ("", true),
+        ] {
+            let sample = at_home(&[text], typed);
+            assert!(sample.codex_composer_context(true).is_some(), "{text:?}");
+            assert!(sample.codex_composer_context(false).is_none(), "{text:?}");
+        }
+    }
+
     fn ctl_screen_with_width(draft: &[&str], consumed: bool, width: usize) -> Screen {
         let mut rows = vec![String::new(); 51];
         rows[0] = "OpenAI Codex".into();
@@ -1207,6 +1268,10 @@ mod tests {
             ctl_screen(&["first line", "second"], false).codex_composer_draft(),
             Some(true)
         );
+        // A draft with its cursor at Home, after the keys that put it there.
+        let mut home = ctl_origin("fix the login bug");
+        home.typed = true;
+        assert_eq!(home.codex_composer_draft(), Some(true));
         let mut hidden = ctl_screen(&["half typed"], false);
         hidden.cursor_visible = false;
         assert_eq!(hidden.codex_composer_draft(), None);
