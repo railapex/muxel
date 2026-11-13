@@ -102,6 +102,8 @@ mod restart_guard;
 mod session_discovery;
 #[cfg(all(test, windows))]
 mod sidebar_fold_tests;
+#[cfg(all(test, windows))]
+mod sidebar_row_tests;
 mod sound_alerts;
 #[cfg(test)]
 mod transcript_read_tests;
@@ -795,6 +797,43 @@ const READ_DONE_OPACITY: f32 = 0.45;
 /// navigation: a Done that `attention_rank` would still visit is unread.
 fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
     status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
+}
+
+/// The least a sidebar row's name keeps, about four characters at its text
+/// size. A row too narrow for its name, tags and pill shrinks the family's
+/// tags first, then its own pill, each clipped inside the row.
+const ROW_NAME_FLOOR_REMS: f32 = 2.5;
+
+/// How much faster a family tag shrinks than its row's own pill. Flex shrinks
+/// each item by its factor times its width, so at this weight the tags take
+/// all but a sliver of a pixel until they are gone.
+const FAMILY_TAG_SHRINK: f32 = 1000.0;
+
+/// The slot for sidebar row `iid`'s own pill. It gives way after the family's
+/// tags ([`FAMILY_TAG_SHRINK`]), clipped inside the row, and never takes the
+/// name's floor.
+fn row_pill(iid: Uuid) -> Div {
+    div()
+        .debug_selector(move || format!("inst-badge-{}", iid.simple()))
+        .min_w_0()
+        .overflow_hidden()
+}
+
+/// A family's tag on its top row, `? n` or `▶ n` as the project header writes
+/// counts, with the words in its tooltip. It is the first thing to shrink,
+/// clipped, when the row is too narrow ([`ROW_NAME_FLOOR_REMS`]).
+fn family_tag(id: String, status: AgentStatus, label: String, words: String) -> impl IntoElement {
+    let words = SharedString::from(words);
+    let mut tag = div()
+        .debug_selector(|| id.clone())
+        .id(SharedString::from(id))
+        .min_w_0()
+        .overflow_hidden();
+    tag.style().flex_shrink = Some(FAMILY_TAG_SHRINK);
+    tag.child(status_tag(status, label))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(words.clone()).build(window, cx)
+        })
 }
 
 /// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
@@ -28850,6 +28889,7 @@ impl MuxelApp {
             );
         let mut list = div()
             .id("sidebar-scroll")
+            .debug_selector(|| "sidebar-scroll".into())
             .size_full()
             .overflow_y_scroll()
             .flex()
@@ -29680,8 +29720,9 @@ impl MuxelApp {
                             }))
                             .child(
                                 div()
+                                    .debug_selector(move || format!("inst-name-{}", iid.simple()))
                                     .flex_1()
-                                    .min_w_0()
+                                    .min_w(rems(ROW_NAME_FLOOR_REMS))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
@@ -29701,18 +29742,24 @@ impl MuxelApp {
                             // it ask, or work while it doesn't: the family sorts
                             // as Asking, or else as Working, meanwhile.
                             .children((tags_below.asking > 0).then(|| {
-                                div().flex_none().child(status_tag(
+                                let n = tags_below.asking.to_string();
+                                family_tag(
+                                    format!("inst-asking-{}", iid.simple()),
                                     AgentStatus::Blocked,
-                                    tf("{n} asking", &[("n", &tags_below.asking.to_string())]),
-                                ))
+                                    format!("? {n}"),
+                                    tf("{n} asking", &[("n", &n)]),
+                                )
                             }))
                             .children((tags_below.working > 0).then(|| {
-                                div().flex_none().child(status_tag(
+                                let n = tags_below.working.to_string();
+                                family_tag(
+                                    format!("inst-working-{}", iid.simple()),
                                     AgentStatus::Working,
-                                    tf("{n} working", &[("n", &tags_below.working.to_string())]),
-                                ))
+                                    format!("▶ {n}"),
+                                    tf("{n} working", &[("n", &n)]),
+                                )
                             }))
-                            .child(div().flex_none().child(if loading {
+                            .child(row_pill(iid).child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())

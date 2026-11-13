@@ -201,9 +201,13 @@ turn doesn't move it; when that earliest one finishes and another still works,
 the family moves down the working rows once. Otherwise it goes by the newest
 event among its sessions, so a child's finish brings the family up. Inside a
 family the top session comes first and its children follow by the same rule.
-The top row shows an **N asking** tag while children ask, and an **N
-working** tag while children work and it doesn't, since the children's own
-rows may be far below where you'd look. Viewing still moves nothing. Children don't close with their parent: closing a session takes its
+The top row shows a `? n` tag while children ask, and a `▶ n` tag while
+children work and it doesn't, written as the project header writes its counts,
+with the words ("1 asking") in each tag's tooltip, since the children's own
+rows may be far below where you'd look. A row's name keeps about four
+characters (`ROW_NAME_FLOOR_REMS`): when the sidebar is too narrow for the name,
+the tags and the row's own pill, the tags shrink first (`FAMILY_TAG_SHRINK`),
+then the pill, each clipped inside the row. Viewing still moves nothing. Children don't close with their parent: closing a session takes its
 files, not its child sessions, which become ordinary rows once it's gone,
 unless you choose Close with everything under it (below). A pinned session
 nests only under a pinned one.
