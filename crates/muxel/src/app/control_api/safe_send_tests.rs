@@ -154,6 +154,58 @@ fn once_status(
     status
 }
 
+/// `once-cancel KEY` for `pane`. A withdrawal is answered once it is on
+/// disk, by a job off the UI thread, which runs here.
+fn once_cancel(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+    key: &str,
+) -> serde_json::Value {
+    let answer = window
+        .update(cx, |app, _, cx| {
+            app.control_command(
+                Command::OnceCancel {
+                    agent: pane.to_string(),
+                    key: key.into(),
+                },
+                None,
+                cx,
+            )
+        })
+        .unwrap();
+    match answer {
+        Answer::Now(Ok(answer)) => answer,
+        Answer::Later(write) => write().expect("the withdrawal is on disk"),
+        _ => panic!("once-cancel answers without an error"),
+    }
+}
+
+/// Where the open workspace's detached sends are kept.
+fn journal_path(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> std::path::PathBuf {
+    window
+        .update(cx, |app, _, _| {
+            muxel_store::send_journal_path(app.current_workspace.unwrap()).unwrap()
+        })
+        .unwrap()
+}
+
+/// What a muxel restart leaves: no sends or keys in memory, only the open
+/// workspace's record of its detached sends, read back as it opens. (The
+/// pane keeps its terminal here; a real restart relaunches it.)
+fn restart(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    cx.run_until_parked();
+    window
+        .update(cx, |app, _, cx| {
+            app.control_queue.clear();
+            app.control_once.clear();
+            let workspace = app.current_workspace.unwrap();
+            app.restore_control_sends(workspace, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
 /// `command`, a send, pinned to conversation `sid` (`--session-id`).
 fn pinned(mut command: Command, sid: &str) -> Command {
     if let Command::Send { session_id, .. } = &mut command {
@@ -1228,24 +1280,7 @@ fn once_cancel_withdraws_a_waiting_detached_send() {
             })
             .unwrap();
         assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
-        let cancel = |cx: &mut TestAppContext, key: &str| {
-            let answer = window
-                .update(cx, |app, _, cx| {
-                    app.control_command(
-                        Command::OnceCancel {
-                            agent: pane.to_string(),
-                            key: key.into(),
-                        },
-                        None,
-                        cx,
-                    )
-                })
-                .unwrap();
-            let Answer::Now(Ok(answer)) = answer else {
-                panic!("once-cancel answers at once, without an error");
-            };
-            answer
-        };
+        let cancel = |cx: &mut TestAppContext, key: &str| once_cancel(cx, window, pane, key);
         let withdrawn = cancel(cx, "d-22");
         assert_eq!(withdrawn["cancelled"], true, "{withdrawn}");
         assert_eq!(withdrawn["state"], "dropped");
@@ -1301,6 +1336,182 @@ fn detached_sends_dont_count_toward_the_waiting_cap() {
     });
 }
 
+/// A pinned doorbell waits behind a draft when muxel restarts. It is on disk
+/// before its caller hears `queued`, comes back still waiting with its key,
+/// answers a repeat without typing, and types once the draft clears. Its
+/// finish is on disk too: the next restart finds it done.
+#[test]
+fn a_restart_carries_a_pinned_detached_send_on_and_it_types_once() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-restart");
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        session.write_input(b"half typed");
+        let doorbell = || {
+            pinned(
+                detached(send(pane, "echo rung", Some("d-30"), true, false)),
+                CONVERSATION_A,
+            )
+        };
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(), cx))
+            .unwrap();
+        let queued = reply(cx, &queued).into_result().unwrap();
+        assert!(queued["boot_id"].is_string(), "{queued}");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(journal_path(cx, window)).unwrap()).unwrap();
+        let kept = &on_disk["keys"][0];
+        assert_eq!(kept["key"], "d-30", "{on_disk}");
+        assert_eq!(kept["state"], "queued");
+        assert_eq!(kept["send"]["text"], "echo rung");
+        assert_eq!(kept["send"]["session_id"], CONVERSATION_A);
+        restart(cx, window);
+        let status = once_status(cx, window, pane, "d-30");
+        assert_eq!(status["state"], "queued", "{status}");
+        assert_eq!(status["restored"], true);
+        assert_eq!(status["expires_at"], queued["expires_at"]);
+        assert_eq!(status["boot_id"], queued["boot_id"]);
+        let (retry, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell(), cx))
+            .unwrap();
+        let retry = reply(cx, &retry).into_result().unwrap();
+        assert_eq!(retry["queued"], true);
+        assert_eq!(retry["duplicate"], true);
+        submit_draft(&session);
+        let status = until_settled(cx, window, pane, "d-30");
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["result"]["result"]["sent"], true);
+        let typed = status["result"].clone();
+        // Found as it finished, not as it was at its paste (`interrupted`).
+        restart(cx, window);
+        let status = once_status(cx, window, pane, "d-30");
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["result"], typed);
+        session.kill();
+    });
+}
+
+/// A detached send types only once it is on disk. One muxel can't record is
+/// refused with nothing typed: at its enqueue, its caller is told and its key
+/// stays unused; before its paste, it is dropped untyped.
+#[test]
+fn a_detached_send_muxel_cant_record_types_nothing() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-detach-unrecorded");
+        session.write_input(b"half typed");
+        let path = journal_path(cx, window);
+        // A folder where the record goes: no write can replace it.
+        std::fs::create_dir_all(&path).unwrap();
+        let doorbell = |key: &str| detached(send(pane, "echo rung", Some(key), true, false));
+        let (refused, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell("d-31"), cx))
+            .unwrap();
+        let refused = reply(cx, &refused).into_result().unwrap_err();
+        assert!(refused.message.contains("couldn't record"), "{refused:?}");
+        assert_eq!(once_status(cx, window, pane, "d-31")["state"], "unused");
+        window
+            .update(cx, |app, _, _| assert!(app.control_queue.is_empty()))
+            .unwrap();
+        // Recorded as it queues, then not before its paste.
+        std::fs::remove_dir(&path).unwrap();
+        let (queued, _) = window
+            .update(cx, |app, _, cx| ask(app, doorbell("d-32"), cx))
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        submit_draft(&session);
+        let submitted = session.input_rev();
+        let status = until_settled(cx, window, pane, "d-32");
+        assert_eq!(status["state"], "dropped", "{status}");
+        assert!(
+            status["result"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("before typing it")),
+            "{status}"
+        );
+        assert_eq!(
+            session.input_rev(),
+            submitted,
+            "it typed without being recorded"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        session.kill();
+    });
+}
+
+/// A pinned doorbell to a fresh pane, queued behind a draft, and muxel
+/// restarted under it.
+fn restored_doorbell(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+    key: &str,
+) -> (Uuid, Arc<TerminalSession>) {
+    let (pane, _view, session) = shell_pane(cx, window, name);
+    adopt_conversation(cx, window, pane, CONVERSATION_A);
+    session.write_input(b"half typed");
+    let doorbell = pinned(
+        detached(send(pane, "echo rung", Some(key), true, false)),
+        CONVERSATION_A,
+    );
+    let (queued, _) = window
+        .update(cx, |app, _, cx| ask(app, doorbell, cx))
+        .unwrap();
+    assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+    restart(cx, window);
+    assert_eq!(once_status(cx, window, pane, key)["restored"], true);
+    (pane, session)
+}
+
+/// The draft clears, and the pane is given time to take a send: nothing types.
+fn nothing_types(cx: &mut TestAppContext, session: &TerminalSession) {
+    submit_draft(session);
+    let submitted = session.input_rev();
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+    assert_eq!(session.input_rev(), submitted, "the send typed");
+}
+
+/// `once-cancel` withdraws a send muxel restored as it withdraws any other,
+/// and the next restart doesn't bring it back.
+#[test]
+fn once_cancel_withdraws_a_restored_send() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = restored_doorbell(cx, window, "control-restore-cancel", "d-33");
+        let withdrawn = once_cancel(cx, window, pane, "d-33");
+        assert_eq!(withdrawn["cancelled"], true, "{withdrawn}");
+        assert_eq!(withdrawn["result"]["code"], "cancelled");
+        // On disk by the time the caller hears it, before anything else runs.
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(journal_path(cx, window)).unwrap()).unwrap();
+        assert_eq!(on_disk["keys"][0]["state"], "dropped", "{on_disk}");
+        restart(cx, window);
+        assert_eq!(once_status(cx, window, pane, "d-33")["state"], "dropped");
+        nothing_types(cx, &session);
+        session.kill();
+    });
+}
+
+/// A pane that comes back from a restart in another conversation drops the
+/// send pinned to the old one, untyped.
+#[test]
+fn a_restored_send_is_dropped_when_its_pane_comes_back_in_another_conversation() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = restored_doorbell(cx, window, "control-restore-moved", "d-34");
+        adopt_conversation(cx, window, pane, CONVERSATION_B);
+        window
+            .update(cx, |app, _, cx| app.pump_control_queue(cx))
+            .unwrap();
+        let moved = once_status(cx, window, pane, "d-34");
+        assert_eq!(moved["state"], "dropped", "{moved}");
+        assert_eq!(moved["result"]["reason"], "conversation_changed");
+        nothing_types(cx, &session);
+        session.kill();
+    });
+}
+
 /// A workspace switch takes the waiting send's pane away: it is refused,
 /// having typed nothing.
 #[test]
@@ -1315,7 +1526,7 @@ fn a_workspace_switch_refuses_waiting_sends() {
             .unwrap();
         cx.run_until_parked();
         window
-            .update(cx, |app, _, _| app.refuse_control_queue())
+            .update(cx, |app, _, cx| app.refuse_control_queue(cx))
             .unwrap();
         let refused = reply(cx, &waiting).into_result().unwrap_err();
         assert_eq!(refused.code, Some(ErrorCode::Exited));

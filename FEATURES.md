@@ -1170,8 +1170,8 @@ feature is added or changed, update the matching entry here in the same change**
   repeat returns the first receipt with `duplicate: true`, a `duplicate` error
   carrying the first failure when that one may have typed, or `busy` while it
   runs; a send refused before typing leaves the key free for a retry.
-  `ctl once-status AGENT KEY` reads what became of a key without typing. Keys
-  live in memory, 64 per pane. `send --when-idle [--timeout SECS]` waits in
+  `ctl once-status AGENT KEY` reads what became of a key without typing. Each
+  pane keeps 64 keys; a detached send's are kept on disk (see Detached sends). `send --when-idle [--timeout SECS]` waits in
   muxel (ten minutes by default, at most an hour) while the agent is working,
   starting, asking a question, holding a draft, taking another send, or has
   another tmux client attached, and after someone else submits (a person's
@@ -1229,8 +1229,15 @@ feature is added or changed, update the matching entry here in the same change**
   (with what it waits on), `typing`, `done`, or `dropped` with the refusal
   that ended it untyped (conversation change, replaced or stopped agent,
   timeout), which frees the key. `ctl once-cancel AGENT KEY` withdraws one
-  that hasn't typed. Detached sends live in memory: closing the pane or
-  quitting muxel drops them.
+  that hasn't typed. A detached send and its key survive a muxel restart:
+  muxel writes them to the workspace's data folder before it answers `queued`
+  and again before the paste. After a restart a send pinned with
+  `--session-id` waits on through its pane's relaunch, until its deadline,
+  and types only if the pane is still in that conversation; one that was
+  pasting when muxel stopped is never typed again and reads `done` with
+  `outcome: interrupted`; an unpinned one is dropped (`reason: restarted`).
+  Replies carry a `boot_id` that is new each time muxel starts. Closing the
+  pane drops its sends. Attached sends and their keys live in memory.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
