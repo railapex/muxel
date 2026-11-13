@@ -1907,6 +1907,9 @@ feature is added or changed, update the matching entry here in the same change**
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
   **cleanly** (an abnormal exit always leaves a tombstone pane instead).
+  Every confirmation (a close, Remove project, a deletion, Quit) is modal:
+  while one shows, no key reaches the pane behind it. Enter answers it and Esc
+  backs out, in a pop-out too.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

@@ -87,6 +87,9 @@ mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+mod question_keys;
+#[cfg(all(test, windows))]
+mod question_keys_tests;
 mod recoverable_close;
 #[cfg(all(test, windows))]
 mod recoverable_close_tests;
@@ -7680,6 +7683,9 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.central_close_confirm_key(event, window, cx)
+            }))
             .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
                 if let Some(app) = cx
                     .try_global::<MuxelHandle>()
@@ -7688,13 +7694,19 @@ impl Render for PopoutView {
                     app.update(cx, |app, cx| app.undo_latest_close(window, cx));
                 }
             }))
+            // Tab is an action, dispatched ahead of the key listeners, so the
+            // close question's own check keeps it from the pane behind.
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
+                if let PaneView::Terminal(v) = &this.view
+                    && this.central_close_confirm(cx).is_none()
+                {
                     v.read(cx).session().write_user_input(b"\t");
                 }
             }))
             .on_action(cx.listener(|this, _: &SendBackTab, _w, cx| {
-                if let PaneView::Terminal(v) = &this.view {
+                if let PaneView::Terminal(v) = &this.view
+                    && this.central_close_confirm(cx).is_none()
+                {
                     v.read(cx).session().write_user_input(b"\x1b[Z");
                 }
             }))
@@ -22025,6 +22037,11 @@ impl MuxelApp {
     /// open main-window-only chrome raise the main window first.
     fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el
+            // A question this window shows is modal: Enter and Esc answer it,
+            // and no key reaches the panes behind it.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.question_key(event, window, cx)
+            }))
             // While a tab/pane is dragged, this fires first (capture phase) each
             // move and clears the drop indicators; the element under the cursor
             // then sets the right one. So indicators vanish over no pane, and the
@@ -22075,10 +22092,18 @@ impl MuxelApp {
                 this.activate_main_window(window, cx);
                 this.toggle_settings(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SendTab, _w, cx| this.send_to_active(b"\t", cx)))
-            .on_action(
-                cx.listener(|this, _: &SendBackTab, _w, cx| this.send_to_active(b"\x1b[Z", cx)),
-            )
+            // Tab is an action, dispatched ahead of the key listeners, so a
+            // question showing here has to keep it from the pane itself.
+            .on_action(cx.listener(|this, _: &SendTab, w, cx| {
+                if this.question_shown(w.window_handle()).is_none() {
+                    this.send_to_active(b"\t", cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SendBackTab, w, cx| {
+                if this.question_shown(w.window_handle()).is_none() {
+                    this.send_to_active(b"\x1b[Z", cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &GlobalSearch, window, cx| {
                 this.activate_main_window(window, cx);
                 this.open_search_palette(window, cx)
@@ -22279,6 +22304,7 @@ impl MuxelApp {
                 .into_any_element()
         };
 
+        self.focus_root_for_question(root_focus, window, cx);
         let root = div()
             .size_full()
             .flex()
@@ -33598,10 +33624,7 @@ impl MuxelApp {
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| {
-                    this.show_quit_confirm = false;
-                    cx.notify();
-                }),
+                cx.listener(|this, _ev, _w, cx| this.cancel_quit_question(cx)),
             )
             .child(
                 div()
@@ -33679,8 +33702,7 @@ impl MuxelApp {
                                     .ghost()
                                     .label(t("Cancel"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.show_quit_confirm = false;
-                                        cx.notify();
+                                        this.cancel_quit_question(cx)
                                     })),
                             )
                             .child(
@@ -33688,9 +33710,7 @@ impl MuxelApp {
                                     .danger()
                                     .label(t("Quit"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.kill_checked_tmux_sessions();
-                                        this.confirm_quit = true;
-                                        this.quit_after_closes(cx);
+                                        this.confirm_quit_question(cx)
                                     })),
                             ),
                     ),
@@ -36742,6 +36762,11 @@ impl Render for MuxelApp {
                 .flex()
                 .flex_col()
                 .bg(cx.theme().background)
+                // Enter and Esc for a confirm over the selector, such as
+                // deleting a workspace.
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.question_key(event, window, cx)
+                }))
                 .child(self.render_minimal_titlebar(cx))
                 .child(
                     div()
@@ -37048,6 +37073,7 @@ impl Render for MuxelApp {
             body
         };
 
+        self.focus_root_for_question(&self.focus_handle, window, cx);
         let root = div()
             .size_full()
             .flex()
