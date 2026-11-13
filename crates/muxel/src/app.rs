@@ -29998,8 +29998,17 @@ impl MuxelApp {
                 }
             }))
             .child(
+                // TitleBar's own row never shrinks below its children's width, so
+                // a full-width row here pushed the window buttons off a narrow
+                // window. Taffy counts a clipped item at its flex basis, so a zero
+                // basis keeps this row out of that minimum: it takes the room the
+                // window leaves, and the name and close chip shrink inside it.
                 div()
-                    .w_full()
+                    .flex_grow_1()
+                    .flex_basis(px(0.0))
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
                     .px_2()
                     .flex()
                     .items_center()
@@ -30017,13 +30026,21 @@ impl MuxelApp {
                     ))
                     .child(div().font_semibold().child(t("muxel")))
                     .child(
+                        // Gives way first in a narrow window: the weight takes
+                        // nearly all the shrinking until the name is gone, and only
+                        // then does the close chip's label ellipsize.
                         div()
+                            .min_w_0()
+                            .flex_shrink(64.0)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(workspace_name),
                     )
                     .child(div().flex_1())
-                    .child(nodrag(self.render_close_chip(cx)))
+                    .child(nodrag(self.render_close_chip(cx)).min_w_0())
                     .child(nodrag(
                         Button::new("global-search")
                             .ghost()

@@ -2020,6 +2020,10 @@ feature is added or changed, update the matching entry here in the same change**
   bar, window controls, resize border, and shadow (client-side decorations), so an
   X11 window manager or a decorating Wayland compositor (such as KDE) doesn't add a
   second title bar above muxel's.
+- **Window buttons stay in a narrow window** — in a window too narrow for the
+  whole title bar, such as one snapped to half a laptop screen, the workspace
+  name gives way first, then the close chip's words shorten; minimise, maximise
+  and close stay in view.
 - **macOS menu bar** — the **muxel** application menu has Services, Hide muxel
   (`Cmd+H`), Hide Others (`Option+Cmd+H`), Show All, and Quit muxel (`Cmd+Q`).
   Quit asks for confirmation just like `Cmd+Q`, raising the window first so the
