@@ -27,6 +27,17 @@ fn tmux_pane(
     window: WindowHandle<MuxelApp>,
     name: &str,
 ) -> (Uuid, Arc<TerminalSession>, Arc<AtomicBool>) {
+    tmux_pane_reading(cx, window, name, None)
+}
+
+/// [`tmux_pane`], with its terminal reading status and screens as
+/// `status_program`'s would.
+fn tmux_pane_reading(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+    status_program: Option<&str>,
+) -> (Uuid, Arc<TerminalSession>, Arc<AtomicBool>) {
     let typed = Arc::new(AtomicBool::new(false));
     let saw = typed.clone();
     let route = muxel_terminal::TmuxInputRoute::new(
@@ -59,7 +70,13 @@ fn tmux_pane(
             })
         },
     );
-    let (pane, _view, session) = pane_with(cx, window, name, |spec| spec.with_tmux_input(route));
+    let (pane, _view, session) = pane_with(cx, window, name, |spec| {
+        let spec = spec.with_tmux_input(route);
+        match status_program {
+            Some(program) => spec.with_status_program(Some(program.to_owned())),
+            None => spec,
+        }
+    });
     assert!(session.delivers_through_tmux());
     (pane, session, typed)
 }
@@ -412,6 +429,92 @@ fn a_send_refuses_a_composer_that_holds_a_draft() {
             .is_ok()
         );
         session.kill();
+    });
+}
+
+/// Claude's screen as a send finds it: its idle title, and its input box
+/// between two rules with the cursor in it, after whatever `draft` holds.
+fn claude_box(session: &TerminalSession, draft: &str) {
+    let rule = "─".repeat(40);
+    let column = 3 + draft.chars().count();
+    session.process_probe_output(
+        format!(
+            "\x1b]0;✳ Claude Code\x07\x1b[?2004h\x1b[?25h\x1b[2J\x1b[H\
+             {rule}\r\n❯ {draft}\r\n{rule}\r\n  ? for shortcuts\x1b[2;{column}H"
+        )
+        .as_bytes(),
+    );
+}
+
+/// The reply to a send into a Claude pane behind a fake tmux that takes the
+/// prompt and its Enter, while Claude's box shows `after` once anything is
+/// typed and never reports a turn.
+fn claude_send_reply(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    name: &str,
+    prompt: &str,
+    after: &str,
+) -> serde_json::Value {
+    let (pane, session, typed) = tmux_pane_reading(cx, window, name, Some("claude.exe"));
+    // Drawn again on every pass, so the console's own startup output can't
+    // land on top of it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        claude_box(&session, "");
+        let refusal = window
+            .update(cx, |app, _, cx| app.control_send_admission(pane, false, cx))
+            .unwrap()
+            .refusal;
+        if refusal.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Claude never took a send: {refusal:?}"
+        );
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (answer, _) = window
+        .update(cx, |app, _, cx| {
+            claude_box(&session, "");
+            ask(app, send(pane, prompt, None, false, false), cx)
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        if typed.load(Ordering::Acquire) {
+            claude_box(&session, after);
+        }
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        if let Ok(response) = answer.try_recv() {
+            break response;
+        }
+        assert!(Instant::now() < deadline, "no reply");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(typed.load(Ordering::Acquire), "nothing was typed");
+    session.kill();
+    response.into_result().unwrap()
+}
+
+/// A Claude that drops a send's Enter, as a fresh one does, keeps the prompt
+/// in its box. The send can't confirm a turn, and says the prompt is waiting
+/// there unsent rather than only that it's unconfirmed. A box that empties
+/// proves nothing either way, so that send is only unconfirmed.
+#[test]
+fn a_claude_send_whose_prompt_stays_in_its_box_is_pending_in_the_composer() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let prompt = "reply with the word violet";
+        let kept = claude_send_reply(cx, window, "control-claude-kept", prompt, prompt);
+        assert_eq!(kept["outcome"], "pending_in_composer", "{kept}");
+        assert_eq!(kept["submission_confirmed"], false, "{kept}");
+        let emptied = claude_send_reply(cx, window, "control-claude-emptied", prompt, "");
+        assert_eq!(emptied["outcome"], "unconfirmed", "{emptied}");
+        assert_eq!(emptied["submission_confirmed"], false, "{emptied}");
     });
 }
 

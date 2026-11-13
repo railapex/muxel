@@ -1191,7 +1191,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Delivery outcomes and next commands** — `send` and `new --prompt` report
   `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
   `next` command when more action is needed. Existing receipt fields remain.
-  All unsubmitted outcomes recommend read-only screen inspection. A pending
+  A Claude send whose Enter goes unconfirmed while its whole prompt still sits
+  in its ready box reports `pending_in_composer`; Codex reports it only with
+  the proof its retry Enter needs. All unsubmitted outcomes recommend read-only screen inspection. A pending
   receipt describes the draft observed at that time and cannot guard a later
   Enter; never paste the task again after uncertain delivery. Startup pending
   proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed

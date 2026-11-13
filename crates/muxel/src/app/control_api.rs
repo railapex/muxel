@@ -2561,9 +2561,7 @@ impl MuxelApp {
                                 session.accepts_input_epoch(input_epoch)
                                     && confirmation_verdict(app.control_writable(iid, cx), &session, revision, session.input_rev()).is_ok()
                                     && app.terminal_view(iid).is_some_and(|view| {
-                                        let view = view.read(cx);
-                                            view.observe_prompt_submission(&attempt) == muxel_terminal::PromptSubmissionState::Retryable
-                                            && view.prompt_in_composer(&text)
+                                        view.read(cx).prompt_pending_in_composer(&attempt, &text)
                                     })
                             }).unwrap_or(false);
                             if retained {
