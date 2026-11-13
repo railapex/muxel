@@ -58,7 +58,7 @@ Replay runs on a `TerminalSession` with no child process (`TerminalSession::repl
 | `draft` | startup input's empty-composer reading, and the text in the rows the box reader chose |
 | `takes_prompt` | `startup_ready` (would startup input type now) and `ctl send`'s admission without `--force` |
 
-A disagreement fails the test unless it is listed in `EXPECTED_GAPS` with the finding it belongs to. A listed gap that closes also fails, so a fix shows up as an entry to delete. Failures name `file#mark`, the key, the truth, the verdict, and the screen rows the reader used.
+A disagreement fails the test unless it is listed in `EXPECTED_GAPS` with the reader's wrong answer, exactly, and the finding it belongs to. A different wrong answer fails too, since another fault may stand behind the listed one. A listed gap that closes fails, so a fix shows up as an entry to delete, and a listed gap no check reaches fails as lost coverage, not as a fix. Failures name `file#mark`, the key, the truth, the verdict, and the screen rows the reader used.
 
 Status scans the screen at most every 50 ms; at a mark the replay takes a fresh scan, as the view would moments later. Verdicts that depend on age (a title going stale, the quiet and settling fallbacks) read the real clock inside the session and aren't reproducible by replay yet, so no mark's truth depends on a wait. Each `in` is typed into the session at its time, as a pane's keyboard types it (an Enter on its own announces a turn first), so readers that track what was typed since the last Enter see it. `reply`, `focus` and `hook` are carried but not replayed. A `resize` stops the replay: the session settles a resize on the real clock, so replay can't apply one yet.
 

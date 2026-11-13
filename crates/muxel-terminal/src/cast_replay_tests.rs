@@ -28,84 +28,89 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Known disagreements between a cast's truth and muxel's readers, keyed by
-/// `file#mark` and the compared key, each with the finding it belongs to. A
-/// listed gap that closes fails the test until its entry is removed, so a fix
-/// on the branch that owns it shows up here.
+/// A known disagreement: `file#mark`, the compared key, the wrong answer the
+/// reader gives there (its `read`, exactly), and the finding it belongs to.
+type Gap = (&'static str, &'static str, &'static str, &'static str);
+
+/// Known disagreements between a cast's truth and muxel's readers. A gap holds
+/// only its own wrong answer: a different wrong answer fails, as a different
+/// fault may hide behind the listed one. A gap that closes fails until its
+/// entry is removed, so a fix on the branch that owns it shows up here, and a
+/// gap no comparison reaches fails as lost coverage.
 #[rustfmt::skip]
-const EXPECTED_GAPS: &[(&str, &str, &str)] = &[
-    ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#idle-first", "draft/empty", HELPER_CPR),
-    ("claude-2.1.322-windows-composer-tour#idle-first", "takes_prompt/startup", HELPER_CPR),
-    ("claude-2.1.322-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-home", "draft/empty", HOME_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/startup", HOME_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-composer-tour#model-picker", "takes_prompt/send", SEND_COVERED),
-    ("claude-2.1.322-windows-composer-tour#slash-menu-ex", "takes_prompt/send", SEND_DRAFT),
-    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "draft/empty", HELPER_CPR),
-    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "takes_prompt/startup", HELPER_CPR),
-    ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.164.0-windows-command-approval#idle", "composer", CODEX_FOOTER),
-    ("codex-0.164.0-windows-command-approval#idle", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", CODEX_TITLE_UNSET),
-    ("codex-0.164.0-windows-question#idle", "composer", CODEX_FOOTER),
-    ("codex-0.164.0-windows-question#idle", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", CODEX_TITLE_UNSET),
-    ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", SEND_COVERED),
-    ("codex-0.164.0-windows-turn#idle", "composer", CODEX_FOOTER),
-    ("codex-0.164.0-windows-turn#idle", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "composer", CODEX_FOOTER),
-    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "draft/empty", CODEX_FOOTER),
-    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "takes_prompt/startup", CODEX_TITLE_UNSET),
-    ("codex-0.167.2-windows-composer-tour#idle-first", "composer", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#idle-first", "draft/empty", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#idle-first", "takes_prompt/startup", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-home", "draft/empty", HOME_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/startup", HOME_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "composer", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "draft/empty", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "takes_prompt/startup", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "composer", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "draft/empty", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "takes_prompt/startup", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#after-turn", "composer", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#after-turn", "draft/empty", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#after-turn", "takes_prompt/startup", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#up-recall", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#slash-menu-open", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
-    ("codex-0.167.2-windows-composer-tour#idle-last", "composer", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#idle-last", "draft/empty", CODEX_AGENTS_HINT),
-    ("codex-0.167.2-windows-composer-tour#idle-last", "takes_prompt/startup", CODEX_AGENTS_HINT),
-    ("grok-1.0.70-windows-question#idle", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.70-windows-question#idle", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.70-windows-question#blocked", "overlay", GROK_OPTIONS),
-    ("grok-1.0.70-windows-trust-card#trust-card", "overlay", GROK_TRUST),
-    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/startup", GROK_TRUST),
-    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send", SEND_COVERED),
-    ("grok-1.0.77-windows-composer-tour#trust-card", "overlay", GROK_TRUST),
-    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/startup", GROK_TRUST),
-    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/send", SEND_COVERED),
-    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#turn-running", "turn", GROK_SPINNER),
-    ("grok-1.0.77-windows-composer-tour#after-turn", "finished", GROK_SPINNER),
-    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send", SEND_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/startup", GROK_DRAFT),
-    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send", SEND_DRAFT),
+const EXPECTED_GAPS: &[Gap] = &[
+    ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#idle-first", "draft/empty", "not empty", HELPER_CPR),
+    ("claude-2.1.322-windows-composer-tour#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
+    ("claude-2.1.322-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "draft/empty", "empty", HOME_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", HOME_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-composer-tour#model-picker", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("claude-2.1.322-windows-composer-tour#slash-menu-ex", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "draft/empty", "not empty", HELPER_CPR),
+    ("claude-2.1.322-windows-permission-parked-draft#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
+    ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.164.0-windows-command-approval#idle", "composer", "no box", CODEX_FOOTER),
+    ("codex-0.164.0-windows-command-approval#idle", "draft/empty", "not empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
+    ("codex-0.164.0-windows-question#idle", "composer", "no box", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "draft/empty", "not empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
+    ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("codex-0.164.0-windows-turn#idle", "composer", "no box", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#idle", "draft/empty", "not empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "composer", "no box", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "draft/empty", "not empty", CODEX_FOOTER),
+    ("codex-0.164.0-windows-turn#post-turn-idle-candidate", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "composer", "no box", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "draft/empty", "not empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-first", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "draft/empty", "empty", HOME_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", HOME_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "composer", "no box", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "draft/empty", "not empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#draft-backspaced", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "composer", "no box", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "draft/empty", "not empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#ctrl-u-cleared", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "composer", "no box", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "draft/empty", "not empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#after-turn", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#up-recall", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-open", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "composer", "no box", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "draft/empty", "not empty", CODEX_AGENTS_HINT),
+    ("codex-0.167.2-windows-composer-tour#idle-last", "takes_prompt/startup", "startup_ready=false", CODEX_AGENTS_HINT),
+    ("grok-1.0.70-windows-question#idle", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.70-windows-question#idle", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.70-windows-question#blocked", "overlay", "question with 0 options", GROK_OPTIONS),
+    ("grok-1.0.70-windows-trust-card#trust-card", "overlay", "none", GROK_TRUST),
+    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/startup", "startup_ready=true", GROK_TRUST),
+    ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "overlay", "none", GROK_TRUST),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/startup", "startup_ready=true", GROK_TRUST),
+    ("grok-1.0.77-windows-composer-tour#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
+    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-end", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-home", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#draft-mid", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#turn-running", "turn", "Idle (ProviderTitle)", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#after-turn", "finished", "Idle", GROK_SPINNER),
+    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#up-recall", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-open", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
+    ("grok-1.0.77-windows-composer-tour#slash-menu-model", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
 ];
 
 const SEND_DRAFT: &str = "ctl send doesn't read the composer, so it adds to a draft";
@@ -472,6 +477,79 @@ struct Check {
     agrees: bool,
 }
 
+/// One check at one mark (`file#mark`), with the screen rows the verdict came
+/// from for a failure report.
+struct Compared {
+    at: String,
+    check: Check,
+    rows: String,
+}
+
+/// How a run's checks stand against the known gaps.
+#[derive(Debug, Default)]
+struct Ledger {
+    agree: usize,
+    /// Disagreements that match a gap's wrong answer exactly.
+    known: usize,
+    /// Disagreements no gap lists.
+    unexpected: Vec<String>,
+    /// Listed gaps whose reader now gives a different wrong answer.
+    changed: Vec<String>,
+    /// Listed gaps whose reader now agrees: a fix, so remove the entry.
+    closed: Vec<String>,
+    /// Listed gaps no check reached: lost coverage, not a fix.
+    uncompared: Vec<String>,
+}
+
+impl Ledger {
+    fn clean(&self) -> bool {
+        self.unexpected.is_empty()
+            && self.changed.is_empty()
+            && self.closed.is_empty()
+            && self.uncompared.is_empty()
+    }
+}
+
+/// Holds every check against `gaps`: a gap covers only its own mark, key and
+/// wrong answer.
+fn judge(compared: &[Compared], gaps: &[Gap]) -> Ledger {
+    let mut ledger = Ledger::default();
+    let mut reached = vec![false; gaps.len()];
+    for Compared { at, check, rows } in compared {
+        let gap = gaps
+            .iter()
+            .position(|(gap_at, key, _, _)| gap_at == at && *key == check.key);
+        if let Some(index) = gap {
+            reached[index] = true;
+        }
+        let (key, truth, read) = (check.key, &check.truth, &check.read);
+        match (check.agrees, gap.map(|index| gaps[index])) {
+            (true, None) => ledger.agree += 1,
+            (true, Some((_, _, _, finding))) => {
+                ledger.agree += 1;
+                ledger
+                    .closed
+                    .push(format!("{at} {key}: reads {read} ({finding})"));
+            }
+            (false, None) => ledger
+                .unexpected
+                .push(format!("{at} {key}: truth {truth}, read {read}\n{rows}")),
+            (false, Some((_, _, wrong, _))) if wrong == read => ledger.known += 1,
+            (false, Some((_, _, wrong, finding))) => ledger.changed.push(format!(
+                "{at} {key}: truth {truth}, the gap expects {wrong:?}, read {read:?} ({finding})\n{rows}"
+            )),
+        }
+    }
+    for (index, (at, key, wrong, finding)) in gaps.iter().enumerate() {
+        if !reached[index] {
+            ledger
+                .uncompared
+                .push(format!("{at} {key}: expected {wrong:?} ({finding})"));
+        }
+    }
+    ledger
+}
+
 /// Each truth key the readers can answer. Keys with no reader for this
 /// provider are left out, never guessed.
 fn compare(provider: TitleProvider, truth: &Map<String, Value>, v: &Verdicts) -> Vec<Check> {
@@ -678,9 +756,8 @@ fn muxel_answers_claudes_cursor_query_with_where_the_cursor_is() {
 
 #[test]
 fn every_mark_in_every_cast_agrees_with_the_readers() {
-    let mut unexpected = Vec::new();
-    let mut seen_gaps = Vec::new();
-    let (mut casts, mut marks, mut checked) = (0, 0, 0);
+    let mut compared = Vec::new();
+    let (mut casts, mut marks) = (0, 0);
     for cast in repo_casts() {
         casts += 1;
         let provider =
@@ -693,44 +770,69 @@ fn every_mark_in_every_cast_agrees_with_the_readers() {
         } in replay(&cast)
         {
             marks += 1;
-            for Check {
-                key,
-                truth: want,
-                read: got,
-                agrees,
-            } in compare(provider, &truth, &verdicts)
-            {
-                checked += 1;
-                let at = format!("{}#{id}", cast.name);
-                let gap = EXPECTED_GAPS
-                    .iter()
-                    .find(|(gap_at, gap_key, _)| *gap_at == at && *gap_key == key);
-                match (agrees, gap) {
-                    (true, _) => {}
-                    (false, Some(gap)) => seen_gaps.push(*gap),
-                    (false, None) => {
-                        unexpected.push(format!("{at} {key}: truth {want}, read {got}\n{rows}"))
-                    }
-                }
+            let at = format!("{}#{id}", cast.name);
+            for check in compare(provider, &truth, &verdicts) {
+                compared.push(Compared {
+                    at: at.clone(),
+                    check,
+                    rows: rows.clone(),
+                });
             }
         }
     }
-    let closed: Vec<_> = EXPECTED_GAPS
-        .iter()
-        .filter(|gap| !seen_gaps.contains(gap))
-        .map(|(at, key, finding)| format!("{at} {key} ({finding})"))
-        .collect();
+    let ledger = judge(&compared, EXPECTED_GAPS);
     eprintln!(
-        "{casts} casts, {marks} marks, {checked} checks: {} agree, {} known gaps",
-        checked - seen_gaps.len() - unexpected.len(),
-        seen_gaps.len(),
+        "{casts} casts, {marks} marks, {} checks: {} agree, {} known gaps",
+        compared.len(),
+        ledger.agree,
+        ledger.known,
     );
     assert!(
-        unexpected.is_empty() && closed.is_empty(),
-        "{checked} comparisons.\n\nDisagreements not in EXPECTED_GAPS:\n{}\nGaps that closed (remove them from EXPECTED_GAPS):\n{}",
-        unexpected.join("\n"),
-        closed.join("\n"),
+        ledger.clean(),
+        "{} comparisons.\n\n\
+         Disagreements not in EXPECTED_GAPS:\n{}\n\
+         Known gaps whose wrong answer changed (another fault may stand behind the listed \
+         one; update the entry only once you know which):\n{}\n\
+         Gaps that closed: the reader agrees now (remove them):\n{}\n\
+         Gaps no check reached: lost coverage, not a fix:\n{}",
+        compared.len(),
+        ledger.unexpected.join("\n"),
+        ledger.changed.join("\n"),
+        ledger.closed.join("\n"),
+        ledger.uncompared.join("\n"),
     );
+}
+
+/// A gap holds its mark, key and wrong answer and nothing else, and the four
+/// ways a gap can stand are told apart.
+#[test]
+fn a_gap_holds_only_its_own_wrong_answer() {
+    const GAPS: &[Gap] = &[("cast#mark", "turn", "Idle (ProviderTitle)", "a finding")];
+    let one = |at: &str, agrees, read: &str| {
+        vec![Compared {
+            at: at.to_string(),
+            check: Check {
+                key: "turn",
+                truth: "running".to_string(),
+                read: read.to_string(),
+                agrees,
+            },
+            rows: String::new(),
+        }]
+    };
+    let known = judge(&one("cast#mark", false, "Idle (ProviderTitle)"), GAPS);
+    assert!(known.clean() && known.known == 1);
+    let changed = judge(&one("cast#mark", false, "Done (ProviderTitle)"), GAPS);
+    assert_eq!((changed.changed.len(), changed.known), (1, 0));
+    let closed = judge(&one("cast#mark", true, "Working (ProviderTitle)"), GAPS);
+    assert_eq!((closed.closed.len(), closed.agree), (1, 1));
+    let elsewhere = judge(&one("cast#other", false, "Idle (ProviderTitle)"), GAPS);
+    assert_eq!(
+        (elsewhere.unexpected.len(), elsewhere.uncompared.len()),
+        (1, 1)
+    );
+    let unreached = judge(&[], GAPS);
+    assert_eq!((unreached.uncompared.len(), unreached.closed.len()), (1, 0));
 }
 
 /// The format's own promises, so a hand edit or a converter bug can't slip a
