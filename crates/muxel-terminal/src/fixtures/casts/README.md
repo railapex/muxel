@@ -54,7 +54,7 @@ Replay runs on a `TerminalSession` with no child process (`TerminalSession::repl
 | truth key | reader |
 |---|---|
 | `turn` | the runtime status (`Idle`, `Working`, `Blocked`, `Done`) |
-| `finished` | muxel's completion count for whatever owns the status, exactly (`finished/count`): while a 7501 report owns it, the count the completion pulse reads (`program`); otherwise the launch's count of finishes from titles, markers and hooks, which the held close reads (`launch`). Between turns, the Done badge too (`finished/done`) |
+| `finished` | muxel's completion count for whatever owns the status, exactly (`finished/count`): while a 7501 report owns it, the count the completion pulse reads (`program`); otherwise the launch's count of finishes from titles, markers and hooks, which the held close reads (`launch`). The launch count isn't a count of turns while 7501 reports arrive: it also counts Codex's Working report while it starts, and one more after Claude's `/clear` (cause not traced yet), which is why it isn't read then. Between turns, the Done badge too (`finished/done`) |
 | `overlay` | the startup blocker `ctl new` reports; the numbered options `ctl show` and `ctl answer` read while Blocked |
 | `options` | those options, each key, label and (when the truth records it) cursor |
 | `composer` | the provider's input box as status finds it (Claude, Codex) |
