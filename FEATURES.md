@@ -1426,7 +1426,8 @@ feature is added or changed, update the matching entry here in the same change**
   screen (the muxel mark, an **Add a project** folder picker, a **New remote
   project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
   the work area until the first project is added.
-- **Project list** — projects with live per-agent status rows; collapse a project.
+- **Project list** — projects with live per-agent status rows; collapse a
+  project, which stays collapsed across restarts.
 - **Sidebar order** — Settings → Appearance → **Sidebar order** offers **Layout**
   (the default) or **Recent work**. Recent work lists pinned sessions first in
   each project, then **Needs you** (sessions asking a question, newest question
@@ -1437,8 +1438,13 @@ feature is added or changed, update the matching entry here in the same change**
   sessions never used last in each band, newest open first. A finish lands just
   under the working rows, never above them. A session whose process isn't
   running (put to sleep mid-turn, say) never counts as working: it sits with
-  the done rows by its latest event. Each section gets a thin label, with the
-  working count on Working, when a project's rows span more than one.
+  the done rows by its latest event. Needs you and Working get a thin label, with
+  its row count or working count, when a project's rows span more than one
+  section; each band always has one, with its row count. Click a band's label to
+  fold it: its rows go and the label stays, saying how many of them are unread.
+  Older starts folded (Settings → Appearance → **Older section starts**: Folded or
+  Open), and each project remembers the bands you fold or open across restarts.
+  Needs you and Working never fold.
   Reading, focusing or clicking a session never moves its row, and neither does
   another session's work; only a change in its own work or a new day does. A command job's
   exit is its finish; an interactive session's isn't, though an agent that

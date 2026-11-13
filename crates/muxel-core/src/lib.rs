@@ -73,6 +73,7 @@ pub use url::{normalize_url, same_resource_url};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 pub use uuid::Uuid;
 
@@ -1223,6 +1224,15 @@ pub struct Project {
     /// bookkeeping, never part of the synced layout doc.
     #[serde(default)]
     pub layout_synced: Option<String>,
+    /// Whether the project's rows are folded under its sidebar header. Local
+    /// view state, never part of the synced layout doc.
+    #[serde(default)]
+    pub collapsed: bool,
+    /// Recent work's bands this project's sidebar has folded or opened by hand,
+    /// where that differs from the default ([`Project::band_folded`]). Local
+    /// view state, never part of the synced layout doc.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub band_folds: BTreeMap<sidebar::ActivityBand, bool>,
 }
 
 /// One agent in a project's saved startup set.
@@ -1252,6 +1262,30 @@ impl Project {
             layout_updated_at: None,
             closed_sessions: Vec::new(),
             layout_synced: None,
+            collapsed: false,
+            band_folds: BTreeMap::new(),
+        }
+    }
+
+    /// Whether Recent work's `band` is folded in this project's sidebar: as it
+    /// was last folded or opened by hand, else Older when `older_folded` (the
+    /// setting) says so, and every other band open.
+    pub fn band_folded(&self, band: sidebar::ActivityBand, older_folded: bool) -> bool {
+        self.band_folds
+            .get(&band)
+            .copied()
+            .unwrap_or(band == sidebar::ActivityBand::Older && older_folded)
+    }
+
+    /// Fold `band` if it is open, or open it if it is folded. Only a choice
+    /// that differs from the default is kept, so changing the setting still
+    /// reaches a band left as it started.
+    pub fn toggle_band(&mut self, band: sidebar::ActivityBand, older_folded: bool) {
+        let folded = !self.band_folded(band, older_folded);
+        if folded == (band == sidebar::ActivityBand::Older && older_folded) {
+            self.band_folds.remove(&band);
+        } else {
+            self.band_folds.insert(band, folded);
         }
     }
 
@@ -1373,6 +1407,42 @@ mod project_focus_tests {
             .remove("last_focused_instance");
         let restored: Project = serde_json::from_value(json).unwrap();
         assert_eq!(restored.last_focused_instance, None);
+    }
+}
+
+#[cfg(test)]
+mod band_fold_tests {
+    use super::Project;
+    use crate::sidebar::ActivityBand::{Older, Today};
+
+    #[test]
+    fn a_band_keeps_only_a_fold_that_differs_from_the_setting() {
+        let mut project = Project::new("repo", "/repo");
+        assert!(project.band_folded(Older, true));
+        assert!(!project.band_folded(Older, false));
+        assert!(!project.band_folded(Today, true));
+
+        // Opened by hand, Older stays open whatever the setting says.
+        project.toggle_band(Older, true);
+        assert!(!project.band_folded(Older, true));
+        assert!(!project.band_folded(Older, false));
+        // Folded again, it is back to the setting's choice.
+        project.toggle_band(Older, true);
+        assert!(project.band_folds.is_empty());
+        assert!(!project.band_folded(Older, false));
+
+        // A fold survives a save; a project saved before folds loads open.
+        project.toggle_band(Today, true);
+        let json = serde_json::to_value(&project).unwrap();
+        let restored: Project = serde_json::from_value(json.clone()).unwrap();
+        assert!(restored.band_folded(Today, true));
+        let mut old = json;
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("band_folds");
+        fields.remove("collapsed");
+        let restored: Project = serde_json::from_value(old).unwrap();
+        assert!(!restored.band_folded(Today, true));
+        assert!(!restored.collapsed);
     }
 }
 
@@ -2776,6 +2846,10 @@ pub struct Settings {
     /// Sidebar presentation only; navigation and pane layout keep their order.
     #[serde(default)]
     pub sidebar_sort: sidebar::SidebarSort,
+    /// Recent work's Older band starts folded in each project's sidebar, until
+    /// it is opened by hand there.
+    #[serde(default = "default_true")]
+    pub older_starts_folded: bool,
     /// New local panes run in a persistent tmux session by default (gated on
     /// tmux actually being installed — see `MuxelApp::tmux_available`).
     #[serde(default = "default_true")]
@@ -3319,6 +3393,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             sidebar_sort: sidebar::SidebarSort::default(),
+            older_starts_folded: true,
             default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,

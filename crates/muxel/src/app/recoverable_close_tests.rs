@@ -3576,6 +3576,7 @@ fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
                     &instances_by_id(&app.workspace),
                     &|_| None,
                     &|_| true,
+                    &|_| false,
                     BandClock::at(&chrono::Local::now()),
                     SidebarSort::RecentWork,
                 );

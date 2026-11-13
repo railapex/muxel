@@ -15,7 +15,7 @@ pub enum SidebarSort {
     RecentWork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ActivityBand {
     Today,
     ThisWeek,
@@ -30,7 +30,11 @@ pub enum SidebarEntry {
     /// Recent work's label over the working rows, with how many sessions in
     /// them are working.
     Working(usize),
+    /// Recent work's label over an open band's rows.
     Band(ActivityBand),
+    /// Recent work's label for a folded band, in place of the band's label
+    /// and rows.
+    FoldedBand(BandLabel),
     Pane(Uuid),
     /// A row drawn one level in, under the top-level session row before it:
     /// a file, diff or page that session opened, or a session it spawned.
@@ -39,6 +43,16 @@ pub enum SidebarEntry {
     /// A file, diff or page drawn two levels in, under the nested session row
     /// before it, which opened it. Recent work only.
     NestedTwice(Uuid),
+}
+
+/// What a folded band's label says of the rows it hides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BandLabel {
+    pub band: ActivityBand,
+    /// The band's top-level rows; a family counts once.
+    pub rows: usize,
+    /// How many of the band's rows, nested ones included, are unread.
+    pub unread: usize,
 }
 
 pub type InstancesById<'a> = HashMap<Uuid, &'a Instance>;
@@ -566,13 +580,16 @@ pub fn sidebar_rows_each<'a>(
 /// Both sorts are stable; only recent work pulls pins into a leading block.
 /// Recent work places every row, pinned or not, by [`RecentPlace`], from the
 /// state each row shows (`shown`) and whether its process is running
-/// (`running`), and labels each section when the unpinned rows span more than
-/// one. Nothing about reading or focus is an input.
+/// (`running`). It labels Needs you and Working when the unpinned rows span
+/// more than one section, and every band always, since a band can fold: a band
+/// `folded` says is folded has a [`SidebarEntry::FoldedBand`] label in place
+/// of its label and rows. Nothing about reading or focus is an input.
 pub fn sidebar_order(
     pane_ids: &[Uuid],
     instances: &InstancesById,
     shown: &dyn Fn(Uuid) -> Option<AgentActivityState>,
     running: &dyn Fn(Uuid) -> bool,
+    folded: &dyn Fn(ActivityBand) -> bool,
     clock: BandClock,
     sort: SidebarSort,
 ) -> Vec<SidebarEntry> {
@@ -700,20 +717,78 @@ pub fn sidebar_order(
         .flat_map(|&(id, _)| members(id))
         .filter(|member| place(member).group == RecentGroup::Working)
         .count();
-    let mut current = None;
+    // Each section's rows, with how many top-level rows it has; the rows are
+    // sorted by section, so each section is one run.
+    let mut sections: Vec<(RecentSection, usize, Vec<SidebarEntry>)> = Vec::new();
     for (id, place) in rest {
         let section = place.section();
-        if labelled && current != Some(section) {
-            out.push(match section {
-                RecentSection::NeedsYou => SidebarEntry::NeedsYou,
-                RecentSection::Working => SidebarEntry::Working(working),
-                RecentSection::Band(band) => SidebarEntry::Band(band),
-            });
+        if sections.last().is_none_or(|(last, _, _)| *last != section) {
+            sections.push((section, 0, Vec::new()));
         }
-        current = Some(section);
-        row(&mut out, id);
+        if let Some((_, count, rows)) = sections.last_mut() {
+            *count += 1;
+            row(rows, id);
+        }
+    }
+    let unread = |entry: &SidebarEntry| {
+        entry_id(entry)
+            .and_then(|id| instances.get(&id))
+            .is_some_and(|instance| is_unread(&instance.activity))
+    };
+    for (section, count, rows) in sections {
+        match section {
+            RecentSection::NeedsYou | RecentSection::Working => {
+                if labelled {
+                    out.push(match section {
+                        RecentSection::NeedsYou => SidebarEntry::NeedsYou,
+                        _ => SidebarEntry::Working(working),
+                    });
+                }
+                out.extend(rows);
+            }
+            RecentSection::Band(band) if folded(band) => {
+                out.push(SidebarEntry::FoldedBand(BandLabel {
+                    band,
+                    rows: count,
+                    unread: rows.iter().filter(|entry| unread(entry)).count(),
+                }));
+            }
+            RecentSection::Band(band) => {
+                out.push(SidebarEntry::Band(band));
+                out.extend(rows);
+            }
+        }
     }
     out
+}
+
+/// The row `entry` draws, if it is a row rather than a label.
+pub fn entry_id(entry: &SidebarEntry) -> Option<Uuid> {
+    match entry {
+        SidebarEntry::Pane(id) | SidebarEntry::Nested(id) | SidebarEntry::NestedTwice(id) => {
+            Some(*id)
+        }
+        SidebarEntry::Worktree(_)
+        | SidebarEntry::NeedsYou
+        | SidebarEntry::Working(_)
+        | SidebarEntry::Band(_)
+        | SidebarEntry::FoldedBand(_) => None,
+    }
+}
+
+/// How many top-level rows the label at `at` heads in `entries`: the rows up
+/// to the next label, a family counting once. A folded band's label says its
+/// own count.
+pub fn label_rows(entries: &[SidebarEntry], at: usize) -> usize {
+    if let Some(SidebarEntry::FoldedBand(label)) = entries.get(at) {
+        return label.rows;
+    }
+    entries
+        .iter()
+        .skip(at + 1)
+        .take_while(|entry| entry_id(entry).is_some())
+        .filter(|entry| matches!(entry, SidebarEntry::Pane(_)))
+        .count()
 }
 
 pub fn unread_count(pane_ids: &[Uuid], instances: &InstancesById) -> usize {
@@ -794,6 +869,7 @@ mod tests {
             &index,
             &shown,
             &|_| true,
+            &|_| false,
             clock,
             SidebarSort::RecentWork,
         )
@@ -957,6 +1033,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(a),
                 Pane(b),
                 Nested(page),
@@ -977,6 +1054,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(b),
                 Nested(page),
                 Nested(older),
@@ -1068,7 +1146,12 @@ mod tests {
         change(&mut workspace, child, Done, NOW - 1);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(b), Nested(child), Pane(a)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(b),
+                Nested(child),
+                Pane(a)
+            ]
         );
     }
 
@@ -1192,6 +1275,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(parent),
                 Nested(plan),
                 Nested(child),
@@ -1209,7 +1293,11 @@ mod tests {
         unlist(&mut project, &[parent, plan]);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(child), Nested(notes)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(child),
+                Nested(notes)
+            ]
         );
     }
 
@@ -1229,6 +1317,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(top),
                 Nested(child),
                 Nested(grandchild),
@@ -1240,14 +1329,24 @@ mod tests {
         unlist(&mut project, &[top]);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(child), Nested(grandchild), NestedTwice(notes)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(child),
+                Nested(grandchild),
+                NestedTwice(notes)
+            ]
         );
 
         // Spawners that loop back on each other nest no session.
         workspace.instance_mut(child).unwrap().opened_by = Some(grandchild);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(child), Pane(grandchild), Nested(notes)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(child),
+                Pane(grandchild),
+                Nested(notes)
+            ]
         );
     }
 
@@ -1289,6 +1388,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(a),
                 Nested(plan),
                 Nested(x),
@@ -1301,7 +1401,14 @@ mod tests {
         workspace.instance_mut(child).unwrap().opened_by = None;
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(a), Nested(plan), Nested(x), Nested(mine), Pane(child)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(a),
+                Nested(plan),
+                Nested(x),
+                Nested(mine),
+                Pane(child)
+            ]
         );
     }
 
@@ -1317,7 +1424,12 @@ mod tests {
         // dropping it back on B changes nothing.
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(child), Pane(a), Pane(b)]
+            vec![
+                Pane(child),
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(a),
+                Pane(b)
+            ]
         );
         let listed: HashSet<Uuid> = project.instances().into_iter().collect();
         assert_eq!(
@@ -1328,7 +1440,12 @@ mod tests {
         workspace.instance_mut(b).unwrap().pinned = true;
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(b), Nested(child), Pane(a)]
+            vec![
+                Pane(b),
+                Nested(child),
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(a)
+            ]
         );
     }
 
@@ -1433,6 +1550,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(a),
                 Nested(notes),
                 Nested(plan),
@@ -1451,6 +1569,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(b),
                 Nested(page),
                 Pane(a),
@@ -1468,6 +1587,7 @@ mod tests {
         assert_eq!(
             recent(&project, &workspace),
             vec![
+                SidebarEntry::Band(ActivityBand::Today),
                 Pane(b),
                 Nested(plan),
                 Nested(page),
@@ -1481,7 +1601,8 @@ mod tests {
             .instance_mut(plan)
             .unwrap()
             .record_opener(None, 40);
-        assert_eq!(recent(&project, &workspace)[1], Nested(plan));
+        // Under Today's label and B's row.
+        assert_eq!(recent(&project, &workspace)[2], Nested(plan));
         // Closing A takes only what A opened last; B took the plan.
         assert_eq!(
             closes_with(SidebarSort::RecentWork, &[a], &workspace.instances),
@@ -1495,6 +1616,7 @@ mod tests {
                 &instances_by_id(&workspace),
                 &|_| None,
                 &|_| true,
+                &|_| false,
                 clock(),
                 SidebarSort::Layout
             ),
@@ -1513,7 +1635,12 @@ mod tests {
         let page = file(&mut workspace, &mut project, Some(old), 10);
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(old), Nested(page), Pane(recent_session)]
+            vec![
+                Pane(old),
+                Nested(page),
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(recent_session)
+            ]
         );
         workspace.instance_mut(old).unwrap().pinned = false;
         assert_eq!(
@@ -1539,13 +1666,23 @@ mod tests {
         // B isn't pinned, so the plan leads the list on its own pin.
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(plan), Pane(a), Pane(b)]
+            vec![
+                Pane(plan),
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(a),
+                Pane(b)
+            ]
         );
         // Pin B as well and the plan nests under it inside the pinned block.
         workspace.instance_mut(b).unwrap().pinned = true;
         assert_eq!(
             recent(&project, &workspace),
-            vec![Pane(b), Nested(plan), Pane(a)]
+            vec![
+                Pane(b),
+                Nested(plan),
+                SidebarEntry::Band(ActivityBand::Today),
+                Pane(a)
+            ]
         );
     }
 
@@ -1577,7 +1714,11 @@ mod tests {
         let orphan = file(&mut workspace, &mut project, Some(session), 10);
         assert_eq!(
             recent(&project, &workspace),
-            vec![SidebarEntry::Pane(ids[0]), SidebarEntry::Pane(orphan)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                SidebarEntry::Pane(ids[0]),
+                SidebarEntry::Pane(orphan)
+            ]
         );
     }
 
@@ -1886,7 +2027,11 @@ mod tests {
         );
         assert_eq!(
             recent(&project, &workspace),
-            vec![SidebarEntry::Pane(flicker), SidebarEntry::Pane(read)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                SidebarEntry::Pane(flicker),
+                SidebarEntry::Pane(read)
+            ]
         );
         change(
             &mut workspace,
@@ -1914,7 +2059,11 @@ mod tests {
         let (project, workspace, ids) = fixture(vec![worked(NOW - 3 * HOUR), shell]);
         assert_eq!(
             recent(&project, &workspace),
-            vec![SidebarEntry::Pane(ids[1]), SidebarEntry::Pane(ids[0])]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                SidebarEntry::Pane(ids[1]),
+                SidebarEntry::Pane(ids[0])
+            ]
         );
     }
 
@@ -1943,7 +2092,11 @@ mod tests {
         );
         assert_eq!(
             order_at(&project, &workspace, &no_terminal, clock()),
-            vec![SidebarEntry::Pane(saved), SidebarEntry::Pane(read)]
+            vec![
+                SidebarEntry::Band(ActivityBand::Today),
+                SidebarEntry::Pane(saved),
+                SidebarEntry::Pane(read)
+            ]
         );
         // Its terminal comes up still working: it leads as a working row.
         assert_eq!(pane_order(&project, &workspace), vec![saved, read]);
@@ -1984,6 +2137,7 @@ mod tests {
                 &index,
                 &shown,
                 running,
+                &|_| false,
                 clock(),
                 SidebarSort::RecentWork,
             );
@@ -2025,6 +2179,102 @@ mod tests {
                 ],
                 0
             )
+        );
+    }
+
+    /// Recent work over `project`'s rows, each showing its saved state, with
+    /// the bands `folded` says are folded.
+    fn order_folded(
+        project: &Project,
+        workspace: &Workspace,
+        folded: &dyn Fn(ActivityBand) -> bool,
+    ) -> Vec<SidebarEntry> {
+        let rows = sidebar_rows(project, workspace, &|_| false, SidebarSort::RecentWork);
+        let index = instances_by_id(workspace);
+        let shown = |id: Uuid| index.get(&id).and_then(|i| live(i));
+        sidebar_order(
+            &rows,
+            &index,
+            &shown,
+            &|_| true,
+            folded,
+            clock(),
+            SidebarSort::RecentWork,
+        )
+    }
+
+    #[test]
+    fn a_folded_band_lists_none_of_its_rows_and_says_what_it_hides() {
+        use ActivityBand::{Older, Today};
+        use SidebarEntry::{Band, FoldedBand, Nested, Pane};
+        // Today: a read finish. Older: a read finish, and an unread one whose
+        // spawned session also finished unread.
+        let (mut project, mut workspace, ids) = fixture(vec![
+            worked(NOW - HOUR),
+            worked(NOW - 9 * DAY),
+            unread(NOW - 10 * DAY),
+        ]);
+        let child = session(
+            &mut workspace,
+            &mut project,
+            Some(ids[2]),
+            unread(NOW - 11 * DAY),
+        );
+        let open = order_folded(&project, &workspace, &|_| false);
+        assert_eq!(
+            open,
+            vec![
+                Band(Today),
+                Pane(ids[0]),
+                Band(Older),
+                Pane(ids[1]),
+                Pane(ids[2]),
+                Nested(child),
+            ]
+        );
+        assert_eq!(label_rows(&open, 2), 2, "a family counts once");
+        let folded = order_folded(&project, &workspace, &|band| band == Older);
+        assert_eq!(
+            folded,
+            vec![
+                Band(Today),
+                Pane(ids[0]),
+                FoldedBand(BandLabel {
+                    band: Older,
+                    rows: 2,
+                    unread: 2,
+                }),
+            ],
+            "the unread count takes in the nested session"
+        );
+        assert_eq!(label_rows(&folded, 0), 1);
+        assert_eq!(label_rows(&folded, 2), 2);
+    }
+
+    #[test]
+    fn a_band_has_its_label_even_alone_so_it_can_fold() {
+        use ActivityBand::Today;
+        use SidebarEntry::{Band, Pane};
+        let (project, workspace, ids) = fixture(vec![worked(NOW - HOUR), worked(NOW - 2 * HOUR)]);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Band(Today), Pane(ids[0]), Pane(ids[1])]
+        );
+        // Asking rows alone need no label: Needs you never folds.
+        let asked = |at: i64| {
+            let mut activity = AgentActivity::default();
+            activity.observe(None, AgentActivityState::Working, at - MINUTE);
+            activity.observe(
+                Some(AgentActivityState::Working),
+                AgentActivityState::Blocked,
+                at,
+            );
+            activity
+        };
+        let (project, workspace, ids) = fixture(vec![asked(NOW - 2 * MINUTE), asked(NOW - MINUTE)]);
+        assert_eq!(
+            recent(&project, &workspace),
+            vec![Pane(ids[1]), Pane(ids[0])]
         );
     }
 
@@ -2262,6 +2512,7 @@ mod tests {
                 &index,
                 &shown,
                 &|_| true,
+                &|_| false,
                 clock(),
                 SidebarSort::Layout
             ),

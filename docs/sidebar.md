@@ -38,10 +38,22 @@ Each project's rows sit in sections, top to bottom (`sidebar::RecentPlace`):
 The line between Working and the done rows is now. The newest start sits just
 above it and the newest finish just below, so a turn that finishes drops from
 the working rows to the first row under them, and a prompt to a done session
-lifts it to the bottom of the working rows. A label heads each section (Needs
-you, Working with how many sessions in it are working, then each band) when a
-project's rows span more than one; a project whose rows all sit in one section
-needs none.
+lifts it to the bottom of the working rows. Needs you and Working have a label
+when a project's rows span more than one section: Needs you with how many rows
+it holds, Working with how many sessions in it are working. Every band always
+has one, with how many rows it holds (a family counts once), because a band
+folds.
+
+Clicking a band's label folds it: the label stays, with a chevron, and its rows
+go until it is clicked again. A folded band's label also says how many of the
+rows it hides are unread, nested ones included. Needs you and Working never
+fold, so a question or a running turn is never hidden; a row that starts
+working leaves its folded band by itself. Older starts folded in every project
+(Settings, Appearance: "Older section starts", Folded or Open). Each project
+keeps the bands folded or opened by hand that differ from that, and whether the
+project itself is folded under its header, in the local workspace file across
+restarts, never in the layout doc it shares with other machines and the phone.
+Changing the setting still reaches a band left as it started.
 
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A done row's band comes

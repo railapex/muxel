@@ -564,6 +564,7 @@ fn a_session_opened_from_a_pane_is_a_nested_row_under_it_in_recent_work() {
         &instances_by_id(&app.workspace),
         &|_| None,
         &|_| true,
+        &|_| false,
         BandClock::at(&chrono::Local::now()),
         SidebarSort::RecentWork,
     );
