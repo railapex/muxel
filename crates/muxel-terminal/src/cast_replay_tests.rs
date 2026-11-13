@@ -131,9 +131,12 @@ const SEND_UNDRAWN: &str = "ctl send admits a Claude pane before its first frame
     the text and drops the Enter, so the prompt is left as a draft";
 const HOME_DRAFT: &str =
     "a draft with its cursor at Home reads as an empty composer (Claude, Codex)";
-const CLAUDE_RULE_NOTICE: &str = "Claude writes notices into the right end of its box's top rule \
-    and erases them, leaving the rule short; the box reader wants the top rule to match the bottom \
-    one, so status loses the box while a notice shows and after it";
+/// Claude normally draws the notice on the row above its box; here it landed
+/// on the top rule, cause unknown (the early draft, the late status line and
+/// the width are all candidates).
+const CLAUDE_RULE_NOTICE: &str = "Claude's usage notice lands in the right end of the box's top \
+    rule and is erased with EL, leaving the rule short; the box reader wants the top rule to match \
+    the bottom one, so status loses the box while the notice shows and after it";
 const CODEX_FOOTER: &str = "the Codex composer reader needs a footer it knows; 0.164.0's status \
     line opens with the model's display name, which here has no digit, and the first frame has \
     no footer yet";
