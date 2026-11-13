@@ -22,6 +22,7 @@ pub mod memory;
 pub mod muse;
 pub mod outage;
 mod pane;
+pub mod pane_scope;
 pub mod path_paste;
 pub mod placement;
 pub mod readaloud;
@@ -1445,6 +1446,9 @@ pub struct Workspace {
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
+    /// Whether the sidebar's NOTIFICATIONS section is collapsed to its header.
+    #[serde(default)]
+    pub notifications_collapsed: bool,
     /// Named git worktrees, referenced by instances via `Instance.worktree_id`.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1458,6 +1462,26 @@ pub struct Workspace {
     /// one pane whatever its idle age (`sleep::opens_dormant`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awake_focus: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod workspace_notifications_tests {
+    use super::Workspace;
+
+    #[test]
+    fn notifications_collapsed_defaults_off_and_round_trips() {
+        let old: Workspace =
+            serde_json::from_str(r#"{"projects":[],"active_project":null,"instances":[]}"#)
+                .unwrap();
+        assert!(!old.notifications_collapsed);
+
+        let ws = Workspace {
+            notifications_collapsed: true,
+            ..Workspace::default()
+        };
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(back.notifications_collapsed);
+    }
 }
 
 /// Where a project's dedicated window lives: which monitor (stable UUID) and
@@ -3072,9 +3096,11 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
-    /// Most memory, in GB, each process a local pane starts may commit
-    /// (Windows only; 0 = no limit). A process that asks for more is refused,
-    /// which usually stops it.
+    /// The memory limit for local panes, in GB (0 = no limit). On Windows it
+    /// is how much each process a pane starts may commit: a process that asks
+    /// for more is refused, which usually stops it. On Linux it is how much the
+    /// pane's processes may use together (a systemd scope's `MemoryMax`): when
+    /// they reach it, the kernel kills the largest. Elsewhere it does nothing.
     #[serde(default = "default_pane_memory_limit_gb")]
     pub pane_memory_limit_gb: u32,
 }
@@ -3099,7 +3125,7 @@ fn default_pane_memory_limit_gb() -> u32 {
 }
 
 impl Settings {
-    /// The per-process limit for new local panes, in bytes; `None` when off.
+    /// The memory limit for new local panes, in bytes; `None` when off.
     pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
         (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
     }
