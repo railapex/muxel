@@ -107,6 +107,7 @@ fn send(agent: Uuid, text: &str, once: Option<&str>, when_idle: bool, force: boo
         once: once.map(str::to_owned),
         when_idle,
         detach: false,
+        no_wake: false,
         timeout_secs: None,
     }
 }
@@ -1509,6 +1510,185 @@ fn a_restored_send_is_dropped_when_its_pane_comes_back_in_another_conversation()
         assert_eq!(moved["result"]["reason"], "conversation_changed");
         nothing_types(cx, &session);
         session.kill();
+    });
+}
+
+/// Put `pane` to sleep as sleep leaves it: its program ended, its terminal
+/// gone, the pane asleep. Waking it starts its saved program (cmd.exe here)
+/// through the restore path.
+fn put_to_sleep(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+    session: &TerminalSession,
+) {
+    session.kill();
+    window
+        .update(cx, |app, _, _| {
+            app.terminals.remove(&pane);
+            app.workspace.instance_mut(pane).unwrap().asleep_since = Some(wall_ms());
+            app.dormant_instances.insert(pane);
+            assert_eq!(app.dormant_reason(pane), Some("sleeping"));
+        })
+        .unwrap();
+}
+
+/// The terminal a woken pane runs now.
+fn woken_session(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pane: Uuid,
+) -> Arc<TerminalSession> {
+    window
+        .read_with(cx, |app, cx| {
+            app.terminal_view(pane)
+                .expect("the pane runs again")
+                .read(cx)
+                .session()
+                .clone()
+        })
+        .unwrap()
+}
+
+/// A waiting send wakes an asleep pane and types once it is up, so its caller
+/// needn't wake it first. The wake is a machine's, from `ctl send`.
+#[test]
+fn a_waiting_send_wakes_an_asleep_pane_and_types_once_it_is_up() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-wake-send");
+        put_to_sleep(cx, window, pane, &session);
+        let (queued, _) = window
+            .update(cx, |app, _, cx| {
+                ask(
+                    app,
+                    detached(send(pane, "echo rung", Some("d-40"), true, false)),
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(reply(cx, &queued).into_result().unwrap()["queued"], true);
+        let status = until_settled(cx, window, pane, "d-40");
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["result"]["result"]["sent"], true);
+        let woken = woken_session(cx, window, pane);
+        window
+            .read_with(cx, |app, _| {
+                assert!(!app.is_dormant(pane));
+                let activity = &app.workspace.instance(pane).unwrap().activity;
+                assert_eq!(activity.woken_by, Some(muxel_core::Waker::Machine));
+            })
+            .unwrap();
+        let log = std::fs::read_to_string(muxel_store::event_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(&format!("[{pane}] by ctl send (machine)")),
+            "{log}"
+        );
+        woken.kill();
+    });
+}
+
+/// At most two waiting sends wake panes at once. A third waits, `waking`,
+/// until one of theirs is up, then wakes its own, and all three type.
+#[test]
+fn at_most_two_waiting_sends_wake_panes_at_once() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let panes: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let (pane, _view, session) = shell_pane(cx, window, &format!("control-wake-{i}"));
+                put_to_sleep(cx, window, pane, &session);
+                pane
+            })
+            .collect();
+        let answers = window
+            .update(cx, |app, _, cx| {
+                let answers: Vec<_> = panes
+                    .iter()
+                    .map(|&pane| ask(app, send(pane, "echo rung", None, true, false), cx).0)
+                    .collect();
+                // Nothing has started yet: the wakes run after this update.
+                assert_eq!(app.control_wakes.len(), ctl::MAX_SEND_WAKES);
+                let held: Vec<&Uuid> = panes
+                    .iter()
+                    .filter(|pane| !app.control_wakes.contains(pane))
+                    .collect();
+                assert_eq!(held.len(), 1);
+                assert_eq!(app.queued_waiting_on_for_test(*held[0]), Some("waking"));
+                answers
+            })
+            .unwrap();
+        for answer in &answers {
+            let sent = reply(cx, answer).into_result().unwrap();
+            assert_eq!(sent["sent"], true, "{sent}");
+        }
+        for &pane in &panes {
+            woken_session(cx, window, pane).kill();
+        }
+    });
+}
+
+/// `--no-wake` leaves an asleep pane asleep and refuses as a plain send does,
+/// and so does a send naming a launch, which no launch after a wake matches.
+/// Either key stays unused.
+#[test]
+fn a_send_that_mustnt_wake_an_asleep_pane_is_refused() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, _view, session) = shell_pane(cx, window, "control-no-wake");
+        let launch = session.id;
+        put_to_sleep(cx, window, pane, &session);
+        let mut no_wake = detached(send(pane, "echo rung", Some("d-41"), true, false));
+        if let Command::Send { no_wake: flag, .. } = &mut no_wake {
+            *flag = true;
+        }
+        let mut launch_pinned = detached(send(pane, "echo rung", Some("d-42"), true, false));
+        if let Command::Send { launch_id, .. } = &mut launch_pinned {
+            *launch_id = Some(launch);
+        }
+        for (command, key) in [(no_wake, "d-41"), (launch_pinned, "d-42")] {
+            let (refused, _) = window
+                .update(cx, |app, _, cx| ask(app, command, cx))
+                .unwrap();
+            let refused = reply(cx, &refused).into_result().unwrap_err();
+            assert_eq!(refused.code, Some(ErrorCode::NotRunning), "{refused:?}");
+            assert_eq!(refused.reason.as_deref(), Some("sleeping"));
+            assert_eq!(once_status(cx, window, pane, key)["state"], "unused");
+        }
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.is_dormant(pane));
+                assert!(app.control_queue.is_empty());
+                assert!(app.control_wakes.is_empty());
+            })
+            .unwrap();
+    });
+}
+
+/// A send muxel restored after a restart wakes the pane that came back
+/// asleep, and types into it once the conversation it was pinned to checks
+/// out.
+#[test]
+fn a_restored_send_wakes_the_pane_that_came_back_asleep() {
+    super::super::popout_lifecycle_tests::with_app(|cx, window| {
+        let (pane, session) = restored_doorbell(cx, window, "control-restore-asleep", "d-43");
+        put_to_sleep(cx, window, pane, &session);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while window
+            .update(cx, |app, _, cx| {
+                app.pump_control_queue(cx);
+                app.terminal_view(pane).is_none()
+            })
+            .unwrap()
+        {
+            assert!(Instant::now() < deadline, "the pane never woke");
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The resumed conversation, as session discovery adopts it.
+        adopt_conversation(cx, window, pane, CONVERSATION_A);
+        let status = until_settled(cx, window, pane, "d-43");
+        assert_eq!(status["state"], "done", "{status}");
+        assert_eq!(status["restored"], true);
+        woken_session(cx, window, pane).kill();
     });
 }
 

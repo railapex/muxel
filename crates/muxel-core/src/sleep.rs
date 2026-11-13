@@ -72,6 +72,8 @@ pub struct SleepFacts {
     pub popped_out: bool,
     /// Text typed into the agent's input that hasn't been submitted.
     pub unsent_text: bool,
+    /// A `ctl send --when-idle` waits to type into it.
+    pub send_waiting: bool,
     pub pinned: bool,
     /// The latest work, completion, question, attendance or wake (Unix ms).
     pub last_active_at: Option<i64>,
@@ -93,6 +95,8 @@ pub enum SleepRefusal {
     Asking,
     Background,
     UnsentText,
+    /// A waiting send hasn't typed yet: it would only wake the pane again.
+    SendWaiting,
     /// Sleep can't reach a popped-out pane's terminal until it is docked.
     PoppedOut,
     /// The bulk and automatic paths only: the user is in the pane.
@@ -115,6 +119,7 @@ impl SleepRefusal {
             Self::Asking => "asking",
             Self::Background => "background",
             Self::UnsentText => "unsent_text",
+            Self::SendWaiting => "send_waiting",
             Self::PoppedOut => "popped_out",
             Self::Focused => "focused",
             Self::RecentlyActive => "recently_active",
@@ -210,6 +215,10 @@ pub fn sleep_refusal(facts: &SleepFacts, request: SleepRequest) -> Option<SleepR
             SleepStatus::Working => SleepRefusal::Working,
             SleepStatus::Asking => SleepRefusal::Asking,
             SleepStatus::Idle | SleepStatus::Done if facts.unsent_text => SleepRefusal::UnsentText,
+            // Every way in, its own Sleep too: the send is about to type.
+            SleepStatus::Idle | SleepStatus::Done if facts.send_waiting => {
+                SleepRefusal::SendWaiting
+            }
             SleepStatus::Idle | SleepStatus::Done if facts.popped_out => SleepRefusal::PoppedOut,
             // Only a pane's own Sleep names it; the others leave the pane the
             // user is in.
@@ -295,6 +304,7 @@ mod tests {
             focused: false,
             popped_out: false,
             unsent_text: false,
+            send_waiting: false,
             pinned: false,
             last_active_at: Some(0),
             machine_woken: false,
@@ -362,7 +372,7 @@ mod tests {
             after_hours: 4,
             now: 9 * HOUR_MS,
         };
-        let cases: [(SleepFacts, SleepRefusal); 10] = [
+        let cases: [(SleepFacts, SleepRefusal); 12] = [
             (
                 SleepFacts {
                     agent: false,
@@ -433,6 +443,24 @@ mod tests {
                     ..sleepy()
                 },
                 SleepRefusal::UnsentText,
+            ),
+            (
+                SleepFacts {
+                    send_waiting: true,
+                    ..sleepy()
+                },
+                SleepRefusal::SendWaiting,
+            ),
+            // The pane the user is in, named by its own Sleep, still waits
+            // for the send.
+            (
+                SleepFacts {
+                    send_waiting: true,
+                    focused: true,
+                    status: SleepStatus::Done,
+                    ..sleepy()
+                },
+                SleepRefusal::SendWaiting,
             ),
         ];
         for (facts, refusal) in cases {

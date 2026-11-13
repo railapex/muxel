@@ -6465,6 +6465,9 @@ pub struct MuxelApp {
     control_journal: control_api::JournalWriter,
     /// `send --when-idle` calls waiting for their pane, one per pane.
     control_queue: HashMap<Uuid, control_api::QueuedSend>,
+    /// Asleep panes a waiting send has woken and that haven't come up yet:
+    /// at most [`muxel_core::control::MAX_SEND_WAKES`] at once.
+    control_wakes: std::collections::HashSet<Uuid>,
     /// The terminal binding each pane's stored conversation id was adopted
     /// in, so `ctl` vouches for that id only while the binding lasts.
     control_conversations: HashMap<Uuid, control_api::AdoptedConversation>,
@@ -8739,6 +8742,7 @@ impl MuxelApp {
             control_once: Default::default(),
             control_journal: Default::default(),
             control_queue: HashMap::new(),
+            control_wakes: Default::default(),
             control_conversations: HashMap::new(),
             claude_ends: HashMap::new(),
             claude_end_hook_missed: Default::default(),

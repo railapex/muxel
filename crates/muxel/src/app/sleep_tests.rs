@@ -930,6 +930,40 @@ fn its_own_sleep_takes_the_focused_agent_and_sleep_idle_agents_leaves_it() {
     });
 }
 
+/// A pane a `ctl send --when-idle` waits for doesn't sleep by any way in, its
+/// own Sleep included: the send would only wake it again. Once the send has
+/// gone, it sleeps.
+#[test]
+fn an_agent_a_send_waits_for_doesnt_sleep() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (agent, view, _child) = pane(cx, window, pid, "awaited agent", true);
+        wait_ready(cx, window, &view);
+        window
+            .update(cx, |app, _, cx| {
+                app.queue_attached_send_for_test(agent);
+                let auto = SleepRequest::Auto {
+                    after_hours: 4,
+                    now: chrono::Utc::now().timestamp_millis() + 9 * HOUR_MS,
+                };
+                for request in [SleepRequest::Pane, SleepRequest::Project, auto] {
+                    assert_eq!(
+                        app.sleep_refusal_for(agent, request, cx),
+                        Some(SleepRefusal::SendWaiting),
+                        "{request:?}"
+                    );
+                }
+                assert_eq!(
+                    app.sleep_menu_state(agent, cx),
+                    Some(Err(sleep_refusal_label(SleepRefusal::SendWaiting)))
+                );
+                app.control_queue.clear();
+                assert_eq!(app.sleep_menu_state(agent, cx), Some(Ok(())));
+            })
+            .unwrap();
+    });
+}
+
 fn bounds(cx: &mut VisualTestContext, what: &str, iid: Uuid) -> Bounds<Pixels> {
     let selector: &'static str = Box::leak(format!("{what}-{}", iid.simple()).into_boxed_str());
     cx.debug_bounds(selector)
@@ -1109,6 +1143,7 @@ fn selecting_an_asleep_pane_shows_it_and_enter_typing_or_ctl_focus_wakes_it() {
                         },
                         caller_instance_id: None,
                         reply,
+                        cancelled: Default::default(),
                     },
                     cx,
                 );

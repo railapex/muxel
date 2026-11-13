@@ -9,6 +9,7 @@
 
 use super::send_journal::{self, Journal, JournalKey, JournalState, SendRecord, Snapshot};
 use super::*;
+use crate::app::sleep::WakeCause;
 use std::collections::VecDeque;
 
 /// `--once` keys each pane keeps, newest last.
@@ -517,6 +518,27 @@ pub(in crate::app) struct QueuedSend {
     /// It came back from disk when muxel started, so its pane may not be
     /// running yet.
     restored: bool,
+    /// Whether it wakes its pane if it finds it asleep.
+    wake: Wake,
+}
+
+/// A waiting send's one wake of an asleep pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// `--no-wake`, or `--launch-id`, which no launch after a wake matches:
+    /// an asleep pane refuses it.
+    Never,
+    /// It may wake its pane, once.
+    Once,
+    /// It has asked for its wake; the pane is coming up, or the wake failed
+    /// and the send is ending.
+    Asked,
+}
+
+/// A pane put to sleep, or one muxel deferred at launch: a wake starts it.
+fn asleep(error: &ctl::Error) -> bool {
+    error.code == Some(ErrorCode::NotRunning)
+        && matches!(error.reason.as_deref(), Some("sleeping" | "dormant"))
 }
 
 impl QueuedSend {
@@ -550,6 +572,8 @@ impl QueuedSend {
             checking_end: false,
             recorded: true,
             restored: true,
+            // Only a pinned send without a launch id is restored.
+            wake: Wake::Once,
         }
     }
 }
@@ -566,6 +590,8 @@ const SUBMISSION_SETTLE_MS: i64 = 3_000;
 #[derive(Debug, PartialEq)]
 enum Verdict {
     Wait(&'static str),
+    /// Its pane is asleep and it may wake it: it does once a wake is free.
+    Wake,
     Send,
     Refuse(ctl::Error),
 }
@@ -612,6 +638,11 @@ fn verdict(queued: &QueuedSend, facts: PaneFacts) -> Verdict {
         Ok(current) => current,
         Err(error) if error.code == Some(ErrorCode::Starting) => {
             return Verdict::Wait("starting");
+        }
+        // An asleep pane is one more state it waits out: it wakes it, once.
+        Err(error) if asleep(&error) && queued.wake == Wake::Once => return Verdict::Wake,
+        Err(error) if asleep(&error) && queued.wake == Wake::Asked => {
+            return Verdict::Wait("waking");
         }
         // After a restart a pane can stay closed until someone opens it.
         Err(error) if queued.restored && error.code == Some(ErrorCode::NotRunning) => {
@@ -670,6 +701,7 @@ pub(in crate::app) struct QueueRequest {
     pub(super) session_id: Option<String>,
     pub(super) once: Option<String>,
     pub(super) detach: bool,
+    pub(super) no_wake: bool,
     pub(super) timeout_secs: Option<u64>,
 }
 
@@ -689,6 +721,7 @@ impl MuxelApp {
             session_id,
             once,
             detach,
+            no_wake,
             timeout_secs,
         } = request;
         let refuse = |app: &mut Self, error: ctl::Error| {
@@ -749,7 +782,15 @@ impl MuxelApp {
                 Some(session.id)
             }
             Err(error) if error.code == Some(ErrorCode::Starting) => launch_id,
+            // An asleep pane is woken for it, unless the caller said not to or
+            // named a launch, which no launch after a wake can match.
+            Err(error) if asleep(&error) && !no_wake && launch_id.is_none() => None,
             Err(error) => return refuse(self, error),
+        };
+        let wake = if no_wake || launch_id.is_some() {
+            Wake::Never
+        } else {
+            Wake::Once
         };
         let (queued_at, queued_ms) = (Instant::now(), now_ms());
         let wait = Duration::from_secs(timeout_secs.unwrap_or(if detach {
@@ -818,6 +859,7 @@ impl MuxelApp {
                 checking_end: false,
                 recorded,
                 restored: false,
+                wake,
             },
         );
         self.pump_control_queue(cx);
@@ -1049,6 +1091,12 @@ impl MuxelApp {
                     }
                 }
                 Verdict::Wait(reason) => queued.waiting_on = reason,
+                // A detached send wakes nothing before it is on disk, and at
+                // most a few panes wake for sends at once.
+                Verdict::Wake if not_yet || self.control_wakes.len() >= ctl::MAX_SEND_WAKES => {
+                    queued.waiting_on = "waking";
+                }
+                Verdict::Wake => self.wake_for_queued_send(iid, cx),
                 Verdict::Send if not_yet => {}
                 Verdict::Send => {
                     let site = self
@@ -1119,6 +1167,13 @@ impl MuxelApp {
                 }
             }
         }
+        // A woken pane holds its wake until it is up: past starting, whatever
+        // its send waits on next, or its send gone.
+        self.control_wakes.retain(|iid| {
+            self.control_queue.get(iid).is_some_and(|queued| {
+                queued.wake == Wake::Asked && matches!(queued.waiting_on, "waking" | "starting")
+            })
+        });
     }
 
     /// Send a waiting send whose pane is still ready, through the same path
@@ -1130,11 +1185,15 @@ impl MuxelApp {
         let facts = self.queued_send_facts(iid, &queued, cx);
         match verdict(&queued, facts) {
             Verdict::Send => {}
-            Verdict::Wait(reason) => {
+            decided @ (Verdict::Wait(_) | Verdict::Wake) => {
+                let waiting_on = match decided {
+                    Verdict::Wait(reason) => reason,
+                    _ => "waking",
+                };
                 self.control_queue.insert(
                     iid,
                     QueuedSend {
-                        waiting_on: reason,
+                        waiting_on,
                         ..queued
                     },
                 );
@@ -1189,7 +1248,7 @@ impl MuxelApp {
     /// An attached waiting send to `pane`, which needn't exist, holding a
     /// place under the cap until the next pump refuses it.
     #[cfg(all(test, windows))]
-    pub(super) fn queue_attached_send_for_test(&mut self, pane: Uuid) {
+    pub(in crate::app) fn queue_attached_send_for_test(&mut self, pane: Uuid) {
         let now = Instant::now();
         self.control_queue.insert(
             pane,
@@ -1211,13 +1270,23 @@ impl MuxelApp {
                 checking_end: false,
                 recorded: true,
                 restored: false,
+                wake: Wake::Never,
             },
         );
+    }
+
+    /// What `pane`'s waiting send waits on, if one waits.
+    #[cfg(all(test, windows))]
+    pub(super) fn queued_waiting_on_for_test(&self, pane: Uuid) -> Option<&'static str> {
+        self.control_queue
+            .get(&pane)
+            .map(|queued| queued.waiting_on)
     }
 
     /// A workspace switch ends every waiting send: its pane is gone. The
     /// detached ones are recorded so, in the workspace they leave.
     pub(in crate::app) fn refuse_control_queue(&mut self, cx: &App) {
+        self.control_wakes.clear();
         for (iid, queued) in std::mem::take(&mut self.control_queue) {
             self.finish_queued_send(
                 iid,
@@ -1230,11 +1299,91 @@ impl MuxelApp {
             );
         }
     }
+
+    /// Wake asleep pane `iid` for its waiting send, the way `ctl wake` does: in
+    /// the window that would show it, selecting and raising nothing. The send
+    /// counts against the wakes in flight until its pane is up.
+    fn wake_for_queued_send(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let Some(queued) = self.control_queue.get_mut(&iid) else {
+            return;
+        };
+        queued.wake = Wake::Asked;
+        queued.waiting_on = "waking";
+        self.control_wakes.insert(iid);
+        let app = cx.weak_entity();
+        let workspace = self.current_workspace;
+        let handle = self
+            .workspace
+            .instance(iid)
+            .and_then(|inst| self.window_showing(inst.project_id))
+            .or(self.main_window);
+        cx.defer(move |cx| {
+            let ran = handle.and_then(|handle| {
+                Self::update_in_window(&app, handle, cx, |this, window, cx| {
+                    this.wake_queued_pane(iid, workspace, window, cx);
+                })
+            });
+            if ran.is_none() {
+                let _ = app.update(cx, |this, cx| {
+                    this.queued_wake_failed(iid, "no muxel window is open to wake it in", cx);
+                });
+            }
+        });
+    }
+
+    fn wake_queued_pane(
+        &mut self,
+        iid: Uuid,
+        workspace: Option<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A switch or a finish since the wake was asked for ended the send.
+        if self.current_workspace != workspace
+            || !self
+                .control_queue
+                .get(&iid)
+                .is_some_and(|queued| queued.wake == Wake::Asked)
+        {
+            self.control_wakes.remove(&iid);
+            return;
+        }
+        // Someone else woke it meanwhile, or it wakes now.
+        if !self.is_dormant(iid) || self.wake_instance(iid, WakeCause::CtlSend, window, cx) {
+            self.pump_control_queue(cx);
+        } else {
+            self.queued_wake_failed(
+                iid,
+                "its launch was refused: open it in muxel to see why",
+                cx,
+            );
+        }
+    }
+
+    /// The wake a waiting send asked for didn't happen: the send ends untyped.
+    fn queued_wake_failed(&mut self, iid: Uuid, why: &str, cx: &mut Context<Self>) {
+        self.control_wakes.remove(&iid);
+        let Some(queued) = self.control_queue.remove(&iid) else {
+            return;
+        };
+        let name = self
+            .workspace
+            .instance(iid)
+            .map(|inst| inst.display_name().to_string())
+            .unwrap_or_default();
+        let error = ctl::Error::new(
+            ErrorCode::NotRunning,
+            format!("'{name}' is asleep and couldn't be woken ({why}): nothing was typed"),
+        )
+        .with_reason(self.dormant_reason(iid).unwrap_or("sleeping"));
+        self.finish_queued_send(iid, queued, Err(error), cx);
+        self.pump_control_queue(cx);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OnceKeys, PaneFacts, QueuedSend, SendRecord, Verdict, verdict};
+    use super::{OnceKeys, PaneFacts, QueuedSend, SendRecord, Verdict, Wake, verdict};
     use crate::app::control_api::send_journal::Journal;
     use muxel_core::control::{self as ctl, ErrorCode};
     use serde_json::{Value, json};
@@ -1568,6 +1717,47 @@ mod tests {
         );
     }
 
+    /// An asleep pane is one more state a waiting send waits out: it wakes it
+    /// once, then waits for it to start. One that mustn't wake it is refused
+    /// as a plain send is, and a pane that isn't running for another reason
+    /// isn't asleep.
+    #[test]
+    fn a_waiting_send_wakes_an_asleep_pane_once() {
+        let asleep = |reason: &str| PaneFacts {
+            writable: Err(ctl::Error::new(ErrorCode::NotRunning, "asleep").with_reason(reason)),
+            ..ready(Uuid::new_v4())
+        };
+        let with = |wake| QueuedSend {
+            wake,
+            ..queued(None, Some("conversation"))
+        };
+        for reason in ["sleeping", "dormant"] {
+            assert_eq!(verdict(&with(Wake::Once), asleep(reason)), Verdict::Wake);
+            assert_eq!(
+                verdict(&with(Wake::Asked), asleep(reason)),
+                Verdict::Wait("waking")
+            );
+            assert!(matches!(
+                verdict(&with(Wake::Never), asleep(reason)),
+                Verdict::Refuse(error) if error.reason.as_deref() == Some(reason)
+            ));
+        }
+        // A send restored after a restart wakes the pane that came back asleep.
+        let restored = QueuedSend {
+            restored: true,
+            ..queued(None, Some("conversation"))
+        };
+        assert_eq!(verdict(&restored, asleep("dormant")), Verdict::Wake);
+        let failed = PaneFacts {
+            writable: Err(ctl::Error::new(ErrorCode::NotRunning, "failed").with_reason("failed")),
+            ..ready(Uuid::new_v4())
+        };
+        assert!(matches!(
+            verdict(&with(Wake::Once), failed),
+            Verdict::Refuse(error) if error.reason.as_deref() == Some("failed")
+        ));
+    }
+
     #[test]
     fn each_pane_keeps_its_last_64_finished_keys_and_every_running_one() {
         let (pane, mut keys) = (Uuid::new_v4(), OnceKeys::default());
@@ -1607,6 +1797,11 @@ mod tests {
             checking_end: false,
             recorded: true,
             restored: false,
+            wake: if launch.is_some() {
+                Wake::Never
+            } else {
+                Wake::Once
+            },
         }
     }
 

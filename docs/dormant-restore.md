@@ -31,7 +31,8 @@ one costs no memory. A deliberate act starts it: Enter or a typed character
 while it is selected (the key itself is dropped, since nothing may reach a
 booting program), the pane's Wake button, hovering its sidebar row and
 clicking the Wake button its pill turns into, Wake in the row menu, pinning,
-or `ctl focus`/`ctl wake`. Shortcuts, arrows, Tab and Escape leave it asleep.
+or `ctl focus`/`ctl wake`/`ctl send --when-idle`. Shortcuts, arrows, Tab and
+Escape leave it asleep.
 Each wake uses the ordinary restore path, including the saved provider session
 id and existing session discovery, and the pane keeps its face (saying
 "Waking…") until the terminal draws, in place of the startup spinner. Repeated
@@ -55,7 +56,10 @@ timestamps remain available as `status_since`; no `launch_id` exists yet.
 with code `not_running` and reason `dormant`.
 
 `send`, `keys` and `answer` also refuse with code `not_running` and reason
-`dormant`, including with `--force`. These commands never start a pane.
+`dormant`, including with `--force`, and never start a pane. The exception is
+`send --when-idle`, which wakes it in the background as `ctl wake` does and
+types once it is up, unless `--no-wake` or `--launch-id` is given (see
+[Outside control](agent-sleep.md#outside-control) for asleep panes).
 `muxel ctl focus AGENT` deliberately selects and raises it, changing keyboard
 focus, and starts it, after which normal startup and input rules apply. It is
 the one selection that wakes, because the caller asked to open the pane.

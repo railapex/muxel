@@ -1289,6 +1289,7 @@ impl MuxelApp {
                 once,
                 when_idle,
                 detach,
+                no_wake,
                 timeout_secs,
             } => {
                 let iid = match self.control_resolve(&agent) {
@@ -1314,6 +1315,7 @@ impl MuxelApp {
                                 session_id,
                                 once: once.clone(),
                                 detach,
+                                no_wake,
                                 timeout_secs,
                             }));
                         }
@@ -2011,7 +2013,10 @@ impl MuxelApp {
         if let Some(reason) = self.dormant_reason(iid) {
             return Err(ctl::Error::new(
                 ErrorCode::NotRunning,
-                format!("'{name}' is asleep; wake it in muxel, or use ctl wake or ctl focus"),
+                format!(
+                    "'{name}' is asleep; wake it in muxel, use ctl wake or ctl focus, or send \
+                     --when-idle, which wakes it"
+                ),
             )
             .with_reason(reason));
         }

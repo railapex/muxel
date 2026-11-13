@@ -70,6 +70,7 @@ fn reply_timeout(command: &Command) -> Duration {
         Command::Send {
             when_idle: true,
             detach: false,
+            no_wake: false,
             timeout_secs,
             ..
         } => {
@@ -275,6 +276,7 @@ fn dispatch_on(
         Command::Send {
             when_idle: true,
             detach: false,
+            no_wake: false,
             ..
         }
     );
@@ -399,6 +401,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             once,
             when_idle,
             detach,
+            no_wake,
             timeout_secs,
         }) if text == "-" => {
             let mut text = String::new();
@@ -412,6 +415,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     once,
                     when_idle,
                     detach,
+                    no_wake,
                     timeout_secs,
                 }),
                 Ok(_) => {
@@ -1623,6 +1627,7 @@ mod tests {
             once: None,
             when_idle: false,
             detach: false,
+            no_wake: false,
             timeout_secs: None,
         };
         let refused = request_at(&path, send()).unwrap_err();
@@ -1661,6 +1666,7 @@ mod tests {
             once: Some("d-9f2a".into()),
             when_idle: true,
             detach: false,
+            no_wake: false,
             timeout_secs: Some(30),
         };
         let request = control::Request {
@@ -1702,6 +1708,7 @@ mod tests {
             once: None,
             when_idle,
             detach: false,
+            no_wake: false,
             timeout_secs,
         };
         let mut detached = send(true, Some(control::DETACHED_TIMEOUT_SECS));
@@ -1752,6 +1759,7 @@ mod tests {
                 once,
                 when_idle,
                 detach,
+                no_wake: false,
                 timeout_secs,
             };
             let request = control::Request {
@@ -1762,6 +1770,26 @@ mod tests {
             };
             assert!(!dispatch(request, "test", &tx).ok);
         }
+        // `--no-wake` means something only to a waiting send.
+        let command = Command::Send {
+            agent: "a".into(),
+            text: "hi".into(),
+            force: false,
+            launch_id: None,
+            session_id: None,
+            once: None,
+            when_idle: false,
+            detach: false,
+            no_wake: true,
+            timeout_secs: None,
+        };
+        let request = control::Request {
+            version: control::request_version(&command),
+            token: "test".into(),
+            caller_instance_id: None,
+            command,
+        };
+        assert!(!dispatch(request, "test", &tx).ok);
         assert!(rx.try_recv().is_err(), "a refused option reached the app");
     }
 
@@ -1888,6 +1916,7 @@ mod tests {
                 once: None,
                 when_idle: false,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             },
             Command::Send {
@@ -1899,6 +1928,7 @@ mod tests {
                 once: Some("d-9f2a".into()),
                 when_idle: true,
                 detach: false,
+                no_wake: false,
                 timeout_secs: None,
             },
             Command::OnceStatus {
@@ -1914,11 +1944,24 @@ mod tests {
                 once: Some("d-9f2b".into()),
                 when_idle: true,
                 detach: true,
+                no_wake: false,
                 timeout_secs: None,
             },
             Command::OnceCancel {
                 agent: "a".into(),
                 key: "d-9f2b".into(),
+            },
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+                session_id: None,
+                once: Some("d-9f2c".into()),
+                when_idle: true,
+                detach: false,
+                no_wake: true,
+                timeout_secs: None,
             },
             Command::New {
                 project: "repo".into(),
@@ -1944,7 +1987,9 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 // Every one of them needs more than a v1 host can honor.
                 let version = request["version"].as_u64().unwrap();
-                let expected = if request["command"]["detach"] == true {
+                let expected = if request["command"]["no_wake"] == true {
+                    8
+                } else if request["command"]["detach"] == true {
                     7
                 } else if request["command"]["cmd"] == "once_cancel" {
                     6
