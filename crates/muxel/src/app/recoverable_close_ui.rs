@@ -429,6 +429,41 @@ impl PopoutView {
         cx.notify();
     }
 
+    fn run_central_close_confirm(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(app) = main_app(cx) {
+            app.update(cx, |app, cx| {
+                if app
+                    .confirm
+                    .as_ref()
+                    .is_some_and(|pending| pending.action.pane_instance() == Some(self.iid))
+                {
+                    app.run_confirm(window, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Keys for the close question this pop-out shows, ahead of its pane, as
+    /// [`MuxelApp::question_key`] does for the other windows: none reaches
+    /// the pane, and Enter or Esc answers.
+    pub(super) fn central_close_confirm_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.central_close_confirm(cx).is_none() {
+            return;
+        }
+        cx.stop_propagation();
+        match question_keys::answer(&event.keystroke) {
+            Some(question_keys::Answer::Confirm) => self.run_central_close_confirm(window, cx),
+            Some(question_keys::Answer::Cancel) => self.cancel_central_close_confirm(cx),
+            None => {}
+        }
+    }
+
     pub(super) fn render_central_close_confirm(
         &self,
         cx: &mut Context<Self>,
@@ -441,12 +476,6 @@ impl PopoutView {
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.cancel_central_close_confirm(cx)),
                 )
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.cancel_central_close_confirm(cx);
-                        cx.stop_propagation();
-                    }
-                }))
                 .child(
                     div()
                         .w(px(480.0))
@@ -510,16 +539,7 @@ impl PopoutView {
                                         .danger()
                                         .label(pending.confirm_label)
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            if let Some(app) = main_app(cx) {
-                                                app.update(cx, |app, cx| {
-                                                    if app.confirm.as_ref().is_some_and(|pending| {
-                                                        pending.action.pane_instance()
-                                                            == Some(this.iid)
-                                                    }) {
-                                                        app.run_confirm(window, cx);
-                                                    }
-                                                });
-                                            }
+                                            this.run_central_close_confirm(window, cx)
                                         })),
                                 ),
                         ),

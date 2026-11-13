@@ -601,3 +601,90 @@ fn actual_popout_lifecycle_restart_kills_old_pty_and_installs_one_docked_replace
         }
     });
 }
+
+/// A close question over a pop-out is modal too: while it shows, no key
+/// pressed in the pop-out reaches its terminal, Tab included. Esc backs out,
+/// and Enter closes the pane.
+#[test]
+fn a_key_pressed_in_a_popout_under_its_close_question_never_reaches_its_terminal() {
+    use gpui::Focusable;
+    with_app_drawing(true, |cx, window| {
+        let (pane, view, _child) = popout_fixture(cx, window);
+        let popout = window
+            .update(cx, |app, _, _| app.popouts[&pane].window)
+            .unwrap();
+        popout
+            .update(cx, |_, window, cx| {
+                view.read(cx).focus_handle(cx).focus(window, cx)
+            })
+            .unwrap();
+        // Tab reaches a terminal as an action, bound as the app binds it.
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "tab",
+                super::SendTab,
+                Some("Terminal"),
+            )])
+        });
+        cx.run_until_parked();
+        let session = view.read_with(cx, |view, _| view.session().clone());
+        // The control: with nothing showing, a key and Tab reach the terminal.
+        cx.simulate_keystrokes(popout.into(), "x");
+        let typed = session.last_user_input();
+        assert!(typed.is_some(), "the pop-out's terminal never got the key");
+        std::thread::sleep(Duration::from_millis(2));
+        cx.simulate_keystrokes(popout.into(), "tab");
+        assert_ne!(
+            session.last_user_input(),
+            typed,
+            "the pop-out's terminal never got Tab"
+        );
+        let typed = session.last_user_input();
+        let ask = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.confirm = Some(super::PendingConfirm {
+                        title: "Close pane?".into(),
+                        message: "".into(),
+                        confirm_label: "Close".into(),
+                        details: Vec::new(),
+                        action: super::ConfirmAction::CloseBatch(vec![pane]),
+                    });
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        ask(cx);
+        for key in ["x", "tab", "escape"] {
+            std::thread::sleep(Duration::from_millis(2));
+            cx.simulate_keystrokes(popout.into(), key);
+            assert_eq!(
+                session.last_user_input(),
+                typed,
+                "{key} reached the terminal"
+            );
+        }
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.confirm.is_none(), "Esc didn't back out")
+            })
+            .unwrap();
+
+        ask(cx);
+        std::thread::sleep(Duration::from_millis(2));
+        cx.simulate_keystrokes(popout.into(), "enter");
+        assert_eq!(
+            session.last_user_input(),
+            typed,
+            "enter reached the terminal"
+        );
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.confirm.is_none(), "Enter didn't answer");
+                assert!(app.is_closing(pane), "Enter didn't close the pane");
+            })
+            .unwrap();
+    });
+}
