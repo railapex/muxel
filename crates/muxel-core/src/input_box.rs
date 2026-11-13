@@ -2,7 +2,8 @@
 //!
 //! Colour can't decide it. A Claude started with `NO_COLOR` set (agent tool
 //! shells set it, and panes inherit it) draws the suggestion in its empty box
-//! in the same colour as typed text.
+//! in the same colour as typed text. Codex's placeholder is read by its text
+//! too, so a caller that blanks dim cells first and one that doesn't agree.
 
 /// What Claude's input box holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,9 +49,77 @@ pub fn read_claude_box(rows: &[&str], cursor_at_start: bool) -> ClaudeBox {
     }
 }
 
+/// What Codex's input box holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexBox {
+    /// Nothing visible in the box.
+    Blank,
+    /// Only the placeholder Codex draws in an empty box.
+    Placeholder,
+    /// Anything else: text a person or a paste put there.
+    Typed,
+}
+
+/// The placeholder in every empty Codex box recorded (Codex 0.164.0 and
+/// 0.167.2, default model).
+const CODEX_PLACEHOLDER: &str = "Ask Codex to do anything";
+
+/// What Codex's input box holds, from its text alone.
+///
+/// `rows` are the editor's rows from the `›` prompt row down to the row above
+/// its footer, with the glyph removed. Whitespace around each row and blank
+/// rows are ignored. The cursor isn't consulted: a draft with its cursor at
+/// Home sits where the placeholder's cursor does, and is still a draft.
+///
+/// A draft that is exactly the placeholder's text reads as the placeholder;
+/// only a record of what was typed can tell the two apart. Any other
+/// placeholder reads as typed.
+pub fn read_codex_box(rows: &[&str]) -> CodexBox {
+    let mut text = rows
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty());
+    match (text.next(), text.next()) {
+        (None, _) => CodexBox::Blank,
+        (Some(CODEX_PLACEHOLDER), None) => CodexBox::Placeholder,
+        _ => CodexBox::Typed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeBox, read_claude_box};
+    use super::{ClaudeBox, CodexBox, read_claude_box, read_codex_box};
+
+    /// Editor rows as recorded (casts on Codex 0.164.0 and the 0.167.2
+    /// composer tour), glyph removed.
+    #[test]
+    fn codex_box_reads_blank_placeholder_or_typed_from_text() {
+        use CodexBox::{Blank, Placeholder, Typed};
+        for (rows, expected) in [
+            // idle-first, draft-backspaced, ctrl-u-cleared, after-turn, idle-last
+            (&["  Ask Codex to do anything"][..], Placeholder),
+            (&["  Ask Codex to do anything", ""], Placeholder),
+            // a placeholder whose dim cells were blanked by the reader's caller
+            (&[""], Blank),
+            (&["", "   "], Blank),
+            // draft-end, draft-mid and draft-home: the same text, any cursor
+            (&[" fix the login bug"], Typed),
+            // up-recall
+            (&[" Reply with the single word ok."], Typed),
+            // slash-menu-open and slash-menu-model
+            (&[" /"], Typed),
+            (&[" /mo"], Typed),
+            // a draft over more than one row
+            (&[" fix the login bug and", "then the signup form"], Typed),
+            // drafts that open with the placeholder's words
+            (&[" Ask Codex to do anything else"], Typed),
+            (&[" Ask Codex to do anything", "and then stop"], Typed),
+            // another placeholder is not on the list
+            (&[" Explain this codebase"], Typed),
+        ] {
+            assert_eq!(read_codex_box(rows), expected, "{rows:?}");
+        }
+    }
 
     /// Box rows as recorded (casts on Claude Code 2.1.310, 2.1.312 and 2.1.322,
     /// colourless, and muxel's own spawn under `NO_COLOR`), glyph removed.
