@@ -2816,6 +2816,26 @@ fn prompt_submission_state(
     }
 }
 
+/// Whether a send whose Enter went unconfirmed left its prompt in the
+/// composer, unsent, from what the submission check made of the pane and
+/// whether the composer, ready for input, shows exactly that prompt. Codex
+/// keeps the strict proof its Enter retry already needs. Claude clears its
+/// box when it takes a prompt and muxel never presses Enter for it again, so
+/// its box showing the prompt is the proof: a fresh Claude that dropped the
+/// Enter leaves the prompt there as a draft.
+fn prompt_left_in_composer(
+    provider: TitleProvider,
+    observed: PromptSubmissionState,
+    in_composer: bool,
+) -> bool {
+    in_composer
+        && match observed {
+            PromptSubmissionState::Retryable => true,
+            PromptSubmissionState::Unconfirmed => provider == TitleProvider::Claude,
+            PromptSubmissionState::Accepted | PromptSubmissionState::Interrupted => false,
+        }
+}
+
 /// Existing panes may deliberately publish only their thread name. A strict
 /// ctl editor proof does not require a semantic Idle title, but positive work,
 /// permission and menu evidence must still veto the retry.
@@ -4223,6 +4243,17 @@ impl TerminalView {
             self.title_provider,
             &self.session.startup_screen(),
             self.session.input_snapshot().1,
+        )
+    }
+
+    /// Whether the prompt a send typed is still in the composer, unsent, now
+    /// that its Enter went unconfirmed (the free `prompt_left_in_composer`
+    /// says when that's proven).
+    pub fn prompt_pending_in_composer(&self, attempt: &PromptSubmission, text: &str) -> bool {
+        prompt_left_in_composer(
+            self.title_provider,
+            self.observe_prompt_submission(attempt),
+            self.prompt_in_composer(text),
         )
     }
 
