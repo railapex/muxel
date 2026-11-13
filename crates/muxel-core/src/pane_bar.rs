@@ -67,17 +67,46 @@ impl BarLine {
             BarLine::Unsent { .. } => Urgency::Waiting,
         }
     }
+
+    /// Whether this line says the pane's program isn't running, so no other
+    /// line's action can work until it runs again.
+    pub fn halts(&self) -> bool {
+        matches!(self, BarLine::Ended(_) | BarLine::Reconnecting)
+    }
+}
+
+/// A line in its place in the bar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub line: BarLine,
+    /// The bar's one primary button is on its top line.
+    pub primary: bool,
+    /// The line's action needs the program running, and it isn't.
+    pub blocked: bool,
 }
 
 /// A pane shows at most this many lines, so the bar never buries its screen.
 pub const MAX_LINES: usize = 3;
 
-/// The lines a pane shows: most urgent first, lines of equal urgency in the
-/// order given, at most [`MAX_LINES`].
-pub fn arrange(mut lines: Vec<BarLine>) -> Vec<BarLine> {
-    lines.sort_by_key(BarLine::urgency);
+/// The lines a pane shows. A line saying its program isn't running comes
+/// first, since every other line's action waits on that; then the most
+/// urgent, lines of equal urgency in the order given; at most [`MAX_LINES`].
+/// Only the top line has a primary button, so while the program is down
+/// the primary is its restart, the button Enter presses, and the other
+/// lines' actions are blocked.
+pub fn arrange(mut lines: Vec<BarLine>) -> Vec<Placed> {
+    lines.sort_by_key(|line| (!line.halts(), line.urgency()));
     lines.truncate(MAX_LINES);
+    let halted = lines.iter().any(BarLine::halts);
     lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| Placed {
+            primary: index == 0,
+            blocked: halted && !line.halts(),
+            line,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -97,21 +126,6 @@ mod tests {
         assert_eq!(Ending::from_exit(false, None, Some(0)), Ending::Clean);
         assert_eq!(Ending::from_exit(false, None, Some(3)), Ending::Code(3));
         assert_eq!(Ending::from_exit(false, None, None), Ending::Unknown);
-    }
-
-    #[test]
-    fn the_bar_puts_a_loss_first_and_keeps_three_lines() {
-        let lines = arrange(vec![
-            BarLine::Reconnecting,
-            BarLine::Unsent { count: 2 },
-            BarLine::Ended(Ending::Clean),
-            BarLine::Ended(Ending::Code(1)),
-        ]);
-        assert_eq!(lines.len(), MAX_LINES);
-        assert_eq!(lines[0], BarLine::Ended(Ending::Code(1)));
-        assert_eq!(lines[1], BarLine::Unsent { count: 2 });
-        // Equal urgency keeps the order given; the last info line is cut.
-        assert_eq!(lines[2], BarLine::Reconnecting);
         // Only a clean exit is no loss.
         for ending in [
             Ending::Code(1),
@@ -121,5 +135,44 @@ mod tests {
         ] {
             assert_eq!(BarLine::Ended(ending).urgency(), Urgency::Loss);
         }
+    }
+
+    #[test]
+    fn a_stopped_program_leads_the_bar_and_blocks_the_other_lines() {
+        let unsent = BarLine::Unsent { count: 1 };
+        // A clean exit is only worth knowing and an unsent prompt waits on
+        // you, but the prompt can't go back until the program runs again.
+        for stopped in [BarLine::Ended(Ending::Clean), BarLine::Reconnecting] {
+            let bar = arrange(vec![unsent.clone(), stopped.clone()]);
+            assert_eq!(bar[0].line, stopped);
+            assert!(bar[0].primary && !bar[0].blocked);
+            assert_eq!(bar[1].line, unsent);
+            assert!(!bar[1].primary && bar[1].blocked);
+        }
+        // Running, the unsent line is the top one and its action is live.
+        let bar = arrange(vec![unsent.clone()]);
+        assert!(bar[0].primary && !bar[0].blocked);
+    }
+
+    #[test]
+    fn the_bar_puts_a_loss_first_and_keeps_three_lines() {
+        let bar = arrange(vec![
+            BarLine::Unsent { count: 1 },
+            BarLine::Unsent { count: 2 },
+            BarLine::Unsent { count: 3 },
+            BarLine::Ended(Ending::Code(1)),
+        ]);
+        let lines: Vec<_> = bar.iter().map(|placed| placed.line.clone()).collect();
+        // Equal urgency keeps the order given; the last line is cut.
+        assert_eq!(
+            lines,
+            [
+                BarLine::Ended(Ending::Code(1)),
+                BarLine::Unsent { count: 1 },
+                BarLine::Unsent { count: 2 },
+            ]
+        );
+        assert_eq!(lines.len(), MAX_LINES);
+        assert_eq!(bar.iter().filter(|placed| placed.primary).count(), 1);
     }
 }

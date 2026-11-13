@@ -1452,8 +1452,11 @@ feature is added or changed, update the matching entry here in the same change**
   of its own and it would otherwise be indistinguishable from `exit(1)`.
 - **Pane bar** — the row under a terminal pane for how its program ended and what
   waits for it: the Ended line, a remote pane's reconnecting line, and unsent
-  prompts. A loss comes first, then what waits on you, then the rest, three lines
-  at most. It pushes the screen up rather than covering it.
+  prompts. A line saying the program isn't running comes first, then a loss, then
+  what waits on you, then the rest, three lines at most. Only the top line has a
+  primary button, so an ended pane's is Restart, and its unsent prompt's
+  **Restore** waits until it runs again (**Restart first**). It pushes the screen
+  up rather than covering it.
 - **Event log** — pane lifecycle events (every exit with its code and signal, every
   close, auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
   (rotated at 1 MB), so "why did this pane disappear?" is answerable even when

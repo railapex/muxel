@@ -5,12 +5,13 @@
 //! pane's screen up rather than drawing over it, so browser panes need no
 //! overlay flag for it.
 
+use super::rescue::RestoreButton;
 use super::*;
-use muxel_core::pane_bar::{BarLine, Ending, Urgency, arrange};
+use muxel_core::pane_bar::{BarLine, Ending, Placed, Urgency, arrange};
 
 impl MuxelApp {
-    /// What pane `iid`'s bar shows, most urgent first.
-    pub(super) fn pane_bar_lines(&self, iid: Uuid, cx: &App) -> Vec<BarLine> {
+    /// What pane `iid`'s bar shows, in its order, with its one primary.
+    pub(super) fn pane_bar_lines(&self, iid: Uuid, cx: &App) -> Vec<Placed> {
         let mut lines = Vec::new();
         if let Some(view) = self.terminals.get(&iid) {
             let view = view.read(cx);
@@ -54,11 +55,22 @@ impl MuxelApp {
             .border_t_1()
             .border_color(border);
         let mut first = true;
-        for line in &lines {
-            let row = match line {
-                BarLine::Ended(ending) => Some(self.render_ended_line(iid, ending, cx)),
+        for placed in &lines {
+            let row = match &placed.line {
+                BarLine::Ended(ending) => {
+                    Some(self.render_ended_line(iid, ending, placed.primary, cx))
+                }
                 BarLine::Reconnecting => Some(Self::render_reconnecting_line(cx)),
-                BarLine::Unsent { .. } => self.render_draft_offer(iid, cx),
+                BarLine::Unsent { .. } => {
+                    let restore = if placed.blocked {
+                        RestoreButton::Blocked
+                    } else if placed.primary {
+                        RestoreButton::Primary
+                    } else {
+                        RestoreButton::Plain
+                    };
+                    self.render_draft_offer(iid, restore, cx)
+                }
             };
             if let Some(row) = row {
                 bar = bar.child(if first {
@@ -112,8 +124,15 @@ impl MuxelApp {
     /// `■ Ended · exit 1  [Restart]`: the program ended and the pane keeps its
     /// last screen. Restart (or Enter in the pane) starts it again; a literal
     /// command runs again instead. Tinted red when the exit cut work off,
-    /// muted for a clean one.
-    fn render_ended_line(&self, iid: Uuid, ending: &Ending, cx: &mut Context<Self>) -> AnyElement {
+    /// muted for a clean one. Its button is the bar's primary when the line
+    /// is on top, which an ended pane's always is.
+    fn render_ended_line(
+        &self,
+        iid: Uuid,
+        ending: &Ending,
+        primary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let label: SharedString = match ending {
             Ending::ReadFailed => t("Ended · terminal read failed"),
             Ending::Signal(signal) => {
@@ -144,7 +163,6 @@ impl MuxelApp {
         } else {
             Button::new(format!("pane-bar-restart-{iid}"))
                 .xsmall()
-                .primary()
                 .label(t("Restart"))
                 .tooltip(t("Enter"))
                 .disabled(!self.launch_permitted(iid, muxel_core::TerminalLaunchReason::Restart))
@@ -152,6 +170,7 @@ impl MuxelApp {
                     cx.listener(move |this, _, window, cx| this.restart_agent(iid, window, cx)),
                 )
         };
+        let action = if primary { action.primary() } else { action };
         Self::bar_line(bg, fg, "■", label, Some(action.into_any_element()))
     }
 

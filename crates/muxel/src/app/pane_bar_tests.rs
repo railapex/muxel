@@ -149,14 +149,18 @@ fn an_ended_pane_shows_ended_and_its_unsent_prompt_and_enter_restarts_only_it() 
                         },
                     }],
                 );
-                // The loss first, then what waits; a running pane says nothing.
+                // How it ended first, then what waits; a running pane says
+                // nothing. The prompt can't go back until the program runs.
+                let bar = app.pane_bar_lines(ended, cx);
+                let lines: Vec<_> = bar.iter().map(|placed| placed.line.clone()).collect();
                 assert_eq!(
-                    app.pane_bar_lines(ended, cx),
-                    vec![
+                    lines,
+                    [
                         BarLine::Ended(Ending::Code(3)),
                         BarLine::Unsent { count: 1 }
                     ]
                 );
+                assert!(bar[0].primary && bar[1].blocked);
                 assert!(app.pane_bar_lines(running, cx).is_empty());
                 app.focus_instance(running, window, cx);
             })

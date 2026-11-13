@@ -672,28 +672,35 @@ impl MuxelApp {
     }
 
     /// Restore and Discard for offered draft `path`, the `index`th newest.
+    /// Discard always works; Restore looks as `restore` says.
     fn offer_buttons(
         iid: Uuid,
         index: usize,
         path: &std::path::Path,
+        restore: RestoreButton,
         cx: &mut Context<Self>,
     ) -> Div {
-        let restore = path.to_path_buf();
+        let restore_path = path.to_path_buf();
         let discard = path.to_path_buf();
+        let restore_button = Button::new(format!("draft-restore-{iid}-{index}"))
+            .xsmall()
+            .label(t("Restore"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.restore_offer(iid, &restore_path, window, cx)
+            }));
+        let restore_button = match restore {
+            RestoreButton::Primary => restore_button.primary(),
+            RestoreButton::Plain => restore_button,
+            // Restoring types into the program's input box; an ended one
+            // has none, and the paste fails.
+            RestoreButton::Blocked => restore_button.disabled(true).tooltip(t("Restart first")),
+        };
         div()
             .flex_none()
             .flex()
             .items_center()
             .gap_1()
-            .child(
-                Button::new(format!("draft-restore-{iid}-{index}"))
-                    .primary()
-                    .xsmall()
-                    .label(t("Restore"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_offer(iid, &restore, window, cx)
-                    })),
-            )
+            .child(restore_button)
             .child(
                 Button::new(format!("draft-discard-{iid}-{index}"))
                     .ghost()
@@ -716,6 +723,7 @@ impl MuxelApp {
     pub(super) fn render_draft_offer(
         &self,
         iid: Uuid,
+        restore: RestoreButton,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let offers = self.rescue.offers.get(&iid)?;
@@ -777,7 +785,9 @@ impl MuxelApp {
             .justify_between()
             .gap_2()
             .child(title)
-            .children((!open || !many).then(|| Self::offer_buttons(iid, 0, &newest.path, cx)));
+            .children(
+                (!open || !many).then(|| Self::offer_buttons(iid, 0, &newest.path, restore, cx)),
+            );
         let row = div()
             .flex_none()
             .flex()
@@ -837,7 +847,13 @@ impl MuxelApp {
                         .gap_2()
                         .text_color(muted)
                         .child(div().truncate().child(Self::offer_label(offer)))
-                        .child(Self::offer_buttons(iid, index, &offer.path, cx)),
+                        .child(Self::offer_buttons(
+                            iid,
+                            index,
+                            &offer.path,
+                            restore.listed(),
+                            cx,
+                        )),
                 )
             } else {
                 item
@@ -1094,5 +1110,24 @@ impl MuxelApp {
         }
         strip = strip.child(list);
         Some(strip.into_any_element())
+    }
+}
+
+/// How an unsent line's Restore looks: the bar's one primary, a plain button,
+/// or blocked while the pane's program isn't running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestoreButton {
+    Primary,
+    Plain,
+    Blocked,
+}
+
+impl RestoreButton {
+    /// For each prompt in the opened list: never the primary, still blocked.
+    fn listed(self) -> Self {
+        match self {
+            RestoreButton::Blocked => RestoreButton::Blocked,
+            RestoreButton::Primary | RestoreButton::Plain => RestoreButton::Plain,
+        }
     }
 }
