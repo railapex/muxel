@@ -304,6 +304,7 @@ fn popout_renders_its_title_status_close_confirmation_and_theme_updates() {
             super::ConfirmAction::SaveEditorBeforeClose {
                 iid: pane,
                 rest: vec![other],
+                rides_with: None,
             },
         ] {
             reset();
