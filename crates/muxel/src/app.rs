@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -98,6 +99,9 @@ mod restart_guard;
 #[cfg(all(test, windows))]
 mod rich_copy_tests;
 mod session_discovery;
+mod sleep;
+#[cfg(all(test, windows))]
+mod sleep_tests;
 mod sound_alerts;
 mod strip_button;
 #[cfg(test)]
@@ -2427,6 +2431,15 @@ mod activity_label_tests {
                 "{status:?} without background work must retain its label"
             );
         }
+    }
+}
+
+fn saved_activity_status(activity: &AgentActivity) -> AgentStatus {
+    match activity.current_state() {
+        Some(AgentActivityState::Working) => AgentStatus::Working,
+        Some(AgentActivityState::Blocked) => AgentStatus::Blocked,
+        Some(AgentActivityState::Done) => AgentStatus::Done,
+        _ => AgentStatus::Idle,
     }
 }
 
@@ -6101,6 +6114,26 @@ pub struct MuxelApp {
     last_activity_labels: HashMap<Uuid, String>,
     /// Restored panes whose CLI bootstrap status must not rewrite durable age.
     restoring_activity: HashSet<Uuid>,
+    /// Old local PTYs awaiting an explicit open. No terminal or history lookup.
+    dormant_instances: HashSet<Uuid>,
+    /// The loaded workspace's `awake_focus`: the pane awake in front when it
+    /// was last saved, which starts whatever its idle age. Kept from the load
+    /// because every save rewrites the workspace's own copy, and a project
+    /// opened later still needs the one it was saved with.
+    relaunch_focus: Option<Uuid>,
+    /// Asleep agents whose saved conversation was gone at the last look (on
+    /// load, project open, sleep, wake, and once a minute): their row and pane
+    /// say "no history". Outside control's `resumes` looks afresh instead.
+    conversations_gone: HashSet<Uuid>,
+    /// Panes whose current launch is a wake: until their terminal draws, the
+    /// pane keeps its asleep face (saying "Waking…") in place of the spinner.
+    /// Every new launch clears it (`reset_terminal_runtime`), and so does the
+    /// pane's first look once it draws (`record_woken_look`).
+    wake_launches: HashSet<Uuid>,
+    /// Terminals put to sleep whose program is still quitting (see `sleep`).
+    sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
+    /// When the idle timer last looked for agents to sleep.
+    auto_sleep_checked: Option<Instant>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -8640,6 +8673,12 @@ impl MuxelApp {
             last_status: HashMap::new(),
             last_activity_labels: HashMap::new(),
             restoring_activity: HashSet::new(),
+            dormant_instances: HashSet::new(),
+            relaunch_focus: None,
+            conversations_gone: HashSet::new(),
+            wake_launches: HashSet::new(),
+            sleep_exits: HashMap::new(),
+            auto_sleep_checked: None,
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
@@ -8836,6 +8875,22 @@ impl MuxelApp {
         let repaired =
             workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
+        self.relaunch_focus = self.workspace.awake_focus;
+        let now = chrono::Utc::now().timestamp_millis();
+        self.dormant_instances = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| {
+                instance.kind == InstanceKind::Terminal
+                    && !instance.use_tmux
+                    && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
+                    && local.contains(&instance.project_id)
+                    && self.pane_opens_dormant(instance, now)
+            })
+            .map(|instance| instance.id)
+            .collect();
+        self.refresh_conversations_gone();
         if repaired {
             self.persist();
         }
@@ -9404,6 +9459,8 @@ impl MuxelApp {
         let resume_cwd = recovered_cwd;
         // `codex resume <id>` without a rollout this check could confirm.
         let mut unconfirmed_resume = false;
+        // The saved conversation's file is gone, so this launch starts anew.
+        let mut conversation_gone = false;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
@@ -9439,6 +9496,7 @@ impl MuxelApp {
                         inst.session_id = None;
                         inst.session_path = None;
                         inst.session_started = false;
+                        conversation_gone = true;
                     }
                     Ok(muxel_core::CodexResumePath::Unknown) => unconfirmed_resume = true,
                     // An unreadable store does not prove an exact identity expired.
@@ -9457,9 +9515,13 @@ impl MuxelApp {
                 inst.session_id = None;
                 inst.session_path = None;
                 inst.session_started = false;
+                conversation_gone = true;
             }
         }
         let snapshot = inst.clone();
+        if conversation_gone {
+            self.report_conversation_gone(iid);
+        }
         // `command_for` keeps this only for a launch that starts a new tmux
         // session (`arms_tmux_resume_recovery`).
         if unconfirmed_resume {
@@ -9848,6 +9910,9 @@ impl MuxelApp {
     fn reset_terminal_runtime(&mut self, iid: Uuid) {
         // A respawn replaces any exited view; its next exit is a fresh event.
         self.exit_logged.remove(&iid);
+        // Only a wake marks its own launch (after this reset); a restart or
+        // recovery shows the ordinary spinner.
+        self.wake_launches.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
         self.size_claimed.remove(&iid);
         self.size_claim_failures.remove(&iid);
@@ -9871,6 +9936,18 @@ impl MuxelApp {
 
     fn launch_permitted(&self, iid: Uuid, reason: muxel_core::TerminalLaunchReason) -> bool {
         if self.is_closing(iid) {
+            return false;
+        }
+        // Focus removes dormancy before requesting Restore. Background restore,
+        // Undo and recovery must not wake other old sessions as a side effect.
+        if self.is_dormant(iid)
+            && !matches!(
+                reason,
+                muxel_core::TerminalLaunchReason::NewPane
+                    | muxel_core::TerminalLaunchReason::RunAgain
+                    | muxel_core::TerminalLaunchReason::Restart
+            )
+        {
             return false;
         }
         self.workspace.instance(iid).is_some_and(|i| {
@@ -9899,6 +9976,7 @@ impl MuxelApp {
         if !self.launch_permitted(instance_id, reason) {
             return;
         }
+        self.end_pending_sleep(instance_id, cx);
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
         // An explicit/immediate spawn supersedes a deferred launch still creating
         // its PTY. Its token will fail validation and dropping it kills the child.
@@ -10038,6 +10116,8 @@ impl MuxelApp {
             }
             return None;
         }
+        // A wake during a sleep's quit grace: never run beside the old process.
+        self.end_pending_sleep(instance_id, cx);
         if reason != muxel_core::TerminalLaunchReason::NewPane {
             self.cancel_control_startup(instance_id);
         }
@@ -10607,10 +10687,10 @@ impl MuxelApp {
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
-        if let Some(inst) = self.workspace.instance_mut(instance_id)
-            && inst.consume_runner_prompt()
-        {
-            state_changed = true;
+        if let Some(inst) = self.workspace.instance_mut(instance_id) {
+            // Any launch that lands wakes a sleeping pane, whatever started it.
+            state_changed |= inst.asleep_since.take().is_some();
+            state_changed |= inst.consume_runner_prompt();
         }
         state_changed |= self.mark_terminal_session_started(instance_id);
         if state_changed {
@@ -10792,6 +10872,33 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         let _phase = ui_profile::phase("activation", "ensure-project", None);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(project) = self.workspace.project(pid)
+            && !project.is_remote()
+        {
+            let panes: HashSet<_> = project.instances().into_iter().collect();
+            for instance in self
+                .workspace
+                .instances
+                .iter()
+                .filter(|instance| panes.contains(&instance.id))
+            {
+                let iid = instance.id;
+                let dormant = instance.kind == InstanceKind::Terminal
+                    && !instance.use_tmux
+                    && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
+                    && !self.terminals.contains_key(&iid)
+                    && !self.terminal_launching.contains_key(&iid)
+                    && !self.failed_launches.contains_key(&iid)
+                    && self.pane_opens_dormant(instance, now);
+                if dormant {
+                    self.dormant_instances.insert(iid);
+                } else {
+                    self.dormant_instances.remove(&iid);
+                }
+            }
+            self.refresh_conversations_gone();
+        }
         // Make sure the shared memory file/gitignore exist (once per session) —
         // handles fresh clones where `.muxel/` was git-ignored away.
         if self
@@ -11629,7 +11736,10 @@ impl MuxelApp {
             self.workspace
                 .project(pid)
                 .map(|p| p.instances())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|iid| !self.is_dormant(*iid))
+                .collect(),
             self.active_instance,
             |iid| self.workspace.instance(iid).map(|i| i.kind) == Some(InstanceKind::Terminal),
         );
@@ -12139,6 +12249,9 @@ impl MuxelApp {
 
     fn spawn_project_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let _phase = ui_profile::phase("activation", "spawn-project-pane", Some(iid));
+        if self.is_dormant(iid) {
+            return;
+        }
         // A workspace can change while a deferred activation task is yielding.
         // UUIDs from the old document must become no-ops, never fallback shells.
         let Some((kind, pid)) = self.workspace.instance(iid).map(|i| (i.kind, i.project_id)) else {
@@ -12218,6 +12331,7 @@ impl MuxelApp {
         let Some(path) = muxel_store::workspace_doc_path(id) else {
             return false;
         };
+        self.workspace.awake_focus = self.awake_focus();
         let durable =
             (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
         match muxel_store::save_workspace_to(&path, durable.as_ref().unwrap_or(&self.workspace)) {
@@ -12390,6 +12504,7 @@ impl MuxelApp {
         self.maximized = None;
         self.workspace = Workspace::default();
         self.active_instance = None;
+        self.relaunch_focus = None;
 
         self.current_workspace = Some(id);
         {
@@ -12914,6 +13029,28 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_project_with_pane_focus(pid, attend_first_pane, true, window, cx);
+    }
+
+    /// Creation will select its new pane. Reconcile the project as usual without
+    /// opening its old preferred dormant session on the way there.
+    fn select_project_for_new_pane(
+        &mut self,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_project_with_pane_focus(pid, false, false, window, cx);
+    }
+
+    fn select_project_with_pane_focus(
+        &mut self,
+        pid: Uuid,
+        attend_first_pane: bool,
+        focus_first_pane: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let _phase = ui_profile::phase("workspace", "select-project", None);
         // Multi-window routing: a project shown in another window is RAISED, not
         // stolen (one project renders in exactly one window at a time).
@@ -12950,12 +13087,17 @@ impl MuxelApp {
         {
             self.current_preset = idx;
         }
-        self.active_instance = self
-            .workspace
-            .project(pid)
-            .and_then(|p| p.preferred_instance());
+        self.active_instance = if focus_first_pane {
+            self.workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance())
+        } else {
+            None
+        };
         if let Some(iid) = self.active_instance {
             self.focus_instance_with_attendance(iid, attend_first_pane, window, cx);
+        } else if !focus_first_pane {
+            window.focus(&self.focus_handle, cx);
         }
         self.ensure_project_terminals_deferred(pid, window, cx);
         // Keep the file browser, and a per-project hotbar view, pointed at the
@@ -13016,6 +13158,9 @@ impl MuxelApp {
         let _phase = ui_profile::phase("workspace", "focus-pane", Some(iid));
         ui_profile::focus_action(reason, Some(iid), window);
         self.active_instance = Some(iid);
+        // Selecting an asleep pane shows it and leaves it asleep: a wake is a
+        // deliberate act (Enter or typing in it, Wake, pinning, `ctl focus`),
+        // so clicking through rows or cycling tabs starts nothing.
         if attend {
             // Deliberately selecting a pane clears its pending notification.
             self.clear_notifications_for(iid);
@@ -14625,6 +14770,8 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
+        self.record_woken_look(cx);
+        self.auto_sleep_pass(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
@@ -14710,7 +14857,7 @@ impl MuxelApp {
             .collect();
 
         let mut to_close = Vec::new();
-        let mut to_recover: Vec<(Uuid, String)> = Vec::new();
+        let mut to_recover: Vec<Uuid> = Vec::new();
         // Agents that just finished, whose replies auto-read should speak.
         let mut to_read_aloud: Vec<Uuid> = Vec::new();
         // (instance, title, signal name) — panes to reattach to a live tmux session.
@@ -14977,7 +15124,7 @@ impl MuxelApp {
                     exit_recover,
                 )
             {
-                to_recover.push((iid, title));
+                to_recover.push(iid);
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
             } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
@@ -15104,9 +15251,10 @@ impl MuxelApp {
             self.spawn_terminal(iid, window, cx);
             dirty = true;
         }
-        for (iid, title) in to_recover {
+        for iid in to_recover {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
+            // The new launch is not a resume, so it can't fail this way again.
             self.bump_session_binding_generation(iid);
             let agent_minted = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
@@ -15115,11 +15263,7 @@ impl MuxelApp {
                 inst.session_started = false;
             }
             self.persist();
-            self.add_event(
-                NotifKind::Success,
-                tf("{title}: session expired", &[("title", &title)]),
-                t("Started a fresh session.").to_string(),
-            );
+            self.report_conversation_gone(iid);
             self.spawn_terminal(iid, window, cx);
         }
         for (iid, title) in to_close {
@@ -15695,6 +15839,27 @@ impl MuxelApp {
         subtitle: impl Into<String>,
     ) {
         self.put_event(Uuid::new_v4(), kind, title, subtitle);
+    }
+
+    /// Tell the user pane `iid` is starting a new conversation because its
+    /// saved one is gone: the provider deleted the file a resume reads (Claude
+    /// removes transcripts older than `cleanupPeriodDays`), or the resume
+    /// itself reported it missing. Without this the pane silently comes back
+    /// empty.
+    pub(super) fn report_conversation_gone(&mut self, iid: Uuid) {
+        let title = self
+            .workspace
+            .instance(iid)
+            .map(|inst| inst.display_name().to_string())
+            .unwrap_or_default();
+        muxel_store::append_event_log(&format!(
+            "resume: \"{title}\" [{iid}] saved conversation gone, starting a new one"
+        ));
+        self.add_event(
+            NotifKind::Success,
+            tf("{title}: started fresh", &[("title", &title)]),
+            t("no history"),
+        );
     }
 
     /// Show event `id` in the feed as its newest entry, replacing the earlier
@@ -18174,6 +18339,7 @@ impl MuxelApp {
         closed_worktree: muxel_core::tmux::ClosedWorktree,
         cx: &mut Context<Self>,
     ) {
+        self.dormant_instances.remove(&iid);
         if let muxel_core::WorktreeCleanup::Registered(wid) = &worktree_cleanup {
             let ends_answer = self
                 .deferred_worktree_dispose
@@ -18952,6 +19118,7 @@ impl MuxelApp {
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
+        self.end_pending_sleep(iid, cx);
         if let Some(popout) = self.popouts.remove(&iid) {
             if let PaneView::Terminal(view) = &popout.view {
                 view.read(cx).session().kill();
@@ -24134,9 +24301,12 @@ impl MuxelApp {
 
     /// Toggle a tab's pinned flag, then re-order its pane so pinned tabs stay in
     /// the leftmost block (stable within each group).
-    fn toggle_pin(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+    fn toggle_pin(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(inst) = self.workspace.instance_mut(iid) {
             inst.pinned = !inst.pinned;
+        }
+        if self.tab_is_pinned(iid) {
+            self.start_dormant(iid, sleep::WakeCause::Pin, window, cx);
         }
         self.reflow_pins(iid);
         self.persist();
@@ -24328,6 +24498,11 @@ impl MuxelApp {
         if let Some(pid) = target_pid
             && self.workspace.active_project != Some(pid)
         {
+            // Stage the requested pane itself. Opening a different project must
+            // not wake its old preferred session on the way to this target.
+            if target_in_layout && let Some(project) = self.workspace.project_mut(pid) {
+                project.last_focused_instance = Some(iid);
+            }
             // The target pane is attended below. Do not consume the first pane's
             // unseen completion merely because project selection stages it first.
             self.select_project_with_attendance(pid, false, window, cx);
@@ -25514,6 +25689,81 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn is_dormant(&self, iid: Uuid) -> bool {
+        self.dormant_instances.contains(&iid)
+            && !self.terminals.contains_key(&iid)
+            && !self.terminal_launching.contains_key(&iid)
+    }
+
+    /// An asleep pane's face: who it is, how long it has slept, and Wake.
+    /// Selecting the pane shows this without starting anything. While a wake
+    /// starts the program, the same face says "Waking…" until the terminal
+    /// draws, in place of the startup spinner.
+    fn terminal_dormant(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let inst = self.workspace.instance(iid);
+        let waking = !self.is_dormant(iid);
+        // Waking starts a new conversation: the words say "no history".
+        let gone = !waking && self.conversations_gone.contains(&iid);
+        let folder = inst.and_then(Instance::working_directory).or_else(|| {
+            inst.and_then(|i| self.workspace.project(i.project_id))
+                .map(|p| p.root_path.as_path())
+        });
+        let action = if waking {
+            div()
+                .debug_selector(move || format!("pane-waking-{}", iid.simple()))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new().small().ease(linear))
+                .child(t("Waking…"))
+                .into_any_element()
+        } else {
+            Button::new(format!("start-dormant-{iid}"))
+                .label(if gone { t("Start fresh") } else { t("Wake") })
+                // Typing in the pane wakes it too.
+                .tooltip(t("Enter"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.wake_and_show(iid, sleep::WakeCause::Button, window, cx)
+                }))
+                .into_any_element()
+        };
+        div()
+            .id(format!("terminal-dormant-{iid}"))
+            .debug_selector(move || format!("terminal-dormant-{}", iid.simple()))
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                inst.map(|i| i.display_name().to_string())
+                    .unwrap_or_default(),
+            )
+            .children(inst.and_then(|i| i.auto_name.clone()))
+            .child(self.asleep_words(iid))
+            .child(
+                folder
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .child(action)
+            .into_any_element()
+    }
+
+    /// A starting pane: the asleep face, waking, when a wake started it (so
+    /// the pane doesn't flash a spinner between its face and its terminal),
+    /// else the startup spinner.
+    fn terminal_starting_or_waking(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        if self.wake_launches.contains(&iid) {
+            self.terminal_dormant(iid, cx)
+        } else {
+            self.terminal_starting(iid, cx)
+        }
+    }
+
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         // gpui-component defaults to ease-in-out, which visibly accelerates and
         // decelerates every 800 ms. Terminal startup wants a steady activity cue.
@@ -25694,8 +25944,9 @@ impl MuxelApp {
                     } else if !v.has_visible_content() && self.terminal_is_loading(iid, cx) {
                         // The spinner animates the whole window every frame, so
                         // it gets the sidebar's startup window: a program that
-                        // never prints shows its blank screen after that.
-                        self.terminal_starting(iid, cx)
+                        // never prints shows its blank screen after that. A
+                        // wake keeps the asleep face up instead.
+                        self.terminal_starting_or_waking(iid, cx)
                     } else {
                         terminal_pane_element(view, !is_active, shown, cx)
                     }
@@ -25731,6 +25982,8 @@ impl MuxelApp {
                     && !self.terminal_launching.contains_key(&iid)
                 {
                     self.literal_stopped(iid, cx)
+                } else if self.is_dormant(iid) {
+                    self.terminal_dormant(iid, cx)
                 } else if let Some(err) = self.failed_launches.get(&iid) {
                     // The launch failed completely (fallback shell included):
                     // show the error in place; the toolbar Restart retries.
@@ -25762,7 +26015,7 @@ impl MuxelApp {
                         )
                         .into_any_element()
                 } else {
-                    self.terminal_starting(iid, cx)
+                    self.terminal_starting_or_waking(iid, cx)
                 };
                 drop(content_scope);
                 let content = ui_profile::wrap_region(ui_profile::Region::Content(group), content);
@@ -26136,7 +26389,11 @@ impl MuxelApp {
                             .gap_1()
                             .px_1()
                             .h_full()
-                            .max_w(px(180.0));
+                            // A dormant pill also carries saved status/age. Keep
+                            // a name budget instead of letting that badge take
+                            // the ordinary 180px pill's entire width.
+                            .max_w(px(if self.is_dormant(tab) { 320.0 } else { 180.0 }))
+                            .when(self.is_dormant(tab), |pill| pill.flex_none());
                         // The active tab gets a themed (accent) underline so the
                         // selection is obvious at a glance without an oversized box;
                         // the others keep just the right divider between pills.
@@ -26229,7 +26486,9 @@ impl MuxelApp {
                                                 .icon(Icon::empty().path("icons/pin.svg"))
                                                 .on_click(window.listener_for(
                                                     &entity,
-                                                    move |this, _, _w, cx| this.toggle_pin(tab, cx),
+                                                    move |this, _, window, cx| {
+                                                        this.toggle_pin(tab, window, cx)
+                                                    },
                                                 )),
                                         );
                                     // Relaunch on the saved conversation (resume-capable
@@ -26375,6 +26634,15 @@ impl MuxelApp {
                                     .flex_none()
                                     .text_color(cx.theme().muted_foreground)
                             }))
+                            // An asleep tab is a moon and its muted title; the
+                            // sidebar row carries the age.
+                            .children(self.is_dormant(tab).then(|| {
+                                svg()
+                                    .path("icons/moon.svg")
+                                    .size(px(10.0))
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground)
+                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -26383,6 +26651,9 @@ impl MuxelApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
+                                    .when(self.is_dormant(tab), |title| {
+                                        title.text_color(cx.theme().muted_foreground)
+                                    })
                                     .child(tab_title),
                             )
                             // A tab being read aloud says so — even when another tab
@@ -28390,6 +28661,19 @@ impl MuxelApp {
                                         )),
                                 );
                             }
+                            // Only local plain terminals can sleep.
+                            if is_local {
+                                menu = menu.item(
+                                    PopupMenuItem::new(t("Sleep idle agents"))
+                                        .icon(Icon::empty().path("icons/pause.svg"))
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.sleep_idle_agents(pid, cx)
+                                            },
+                                        )),
+                                );
+                            }
                             // Git actions (only when the project is a repo).
                             if is_repo {
                                 menu = menu.separator();
@@ -28666,11 +28950,31 @@ impl MuxelApp {
                     } else if let Some(bv) = self.browsers.get(&iid) {
                         (bv.read(cx).tab_title(), AgentStatus::Idle)
                     } else {
-                        (meta, AgentStatus::Idle)
+                        (
+                            meta,
+                            if self.is_dormant(iid) {
+                                inst.map(|i| saved_activity_status(&i.activity))
+                                    .unwrap_or(AgentStatus::Idle)
+                            } else {
+                                AgentStatus::Idle
+                            },
+                        )
                     };
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
+                    // An asleep row keeps the running row's single line, and
+                    // recedes (muted name, dimmed icon) unless a finish there
+                    // is unread.
+                    let asleep = self.is_dormant(iid);
+                    let finish_unread = status == AgentStatus::Done && !read_done;
+                    let icon_color = if loading {
+                        pane_status_hsla(AgentStatus::Working, inst.map(|i| &i.activity), cx)
+                    } else if asleep {
+                        self.asleep_icon_color(iid, finish_unread, cx)
+                    } else {
+                        pane_status_hsla(status, inst.map(|i| &i.activity), cx)
+                    };
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -28683,8 +28987,11 @@ impl MuxelApp {
                         && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
                     let hover_col = cx.theme().sidebar_accent.opacity(0.45);
                     let drop_hl = cx.theme().primary.opacity(0.3);
+                    let row_group = SharedString::from(format!("inst-row-{}", iid.simple()));
                     let mut base = div()
-                        .id(SharedString::from(format!("inst-row-{}", iid.simple())))
+                        .id(row_group.clone())
+                        .group(row_group.clone())
+                        .debug_selector(move || format!("inst-row-{}", iid.simple()))
                         .ml_4()
                         .mr_1()
                         .px_2()
@@ -28698,19 +29005,7 @@ impl MuxelApp {
                         } else {
                             cx.theme().sidebar
                         })
-                        .child(agent_icon(
-                            program.as_deref(),
-                            px(15.0),
-                            pane_status_hsla(
-                                if loading {
-                                    AgentStatus::Working
-                                } else {
-                                    status
-                                },
-                                inst.map(|i| &i.activity),
-                                cx,
-                            ),
-                        ))
+                        .child(agent_icon(program.as_deref(), px(15.0), icon_color))
                         // Worktree dot (matches the pane outline color).
                         .children(
                             self.instance_worktree_color(iid)
@@ -28733,6 +29028,82 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
+                        let label = inst
+                            .map(|instance| {
+                                localized_activity_label(
+                                    status,
+                                    &instance.activity,
+                                    self.terminal_view(iid)
+                                        .and_then(|view| view.read(cx).background_work()),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                            })
+                            .unwrap_or_else(|| status_label(Some(status)).to_string());
+                        // An asleep row's pill is a moon and an age; the words
+                        // go to the tooltip.
+                        let asleep_tip = asleep.then(|| self.asleep_words(iid));
+                        let badge = if loading {
+                            status_tag(AgentStatus::Working, t("loading").to_string())
+                        } else if stopped {
+                            status_tag(AgentStatus::Idle, t("stopped").to_string())
+                        } else if asleep {
+                            self.asleep_pill(iid, cx)
+                        } else {
+                            let tag = status_tag(status, label);
+                            // A read finish keeps its green as an outline, so
+                            // the label stays legible on the sidebar.
+                            if read_done { tag.outline() } else { tag }
+                        };
+                        let name_color = if asleep && !finish_unread {
+                            cx.theme().muted_foreground
+                        } else {
+                            cx.theme().sidebar_foreground
+                        };
+                        let details = div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(name_color)
+                                    .child(display),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("inst-badge-{}", iid.simple())))
+                                    .debug_selector(move || format!("inst-badge-{}", iid.simple()))
+                                    .flex_none()
+                                    .relative()
+                                    // Hovering an asleep row turns its pill
+                                    // into a Wake button in the same place.
+                                    .child(
+                                        div()
+                                            .when(asleep, |pill| {
+                                                pill.group_hover(row_group.clone(), |s| {
+                                                    s.invisible()
+                                                })
+                                            })
+                                            .child(badge),
+                                    )
+                                    .when(asleep, |slot| {
+                                        slot.child(self.asleep_wake_button(iid, row_group, cx))
+                                    })
+                                    .when_some(asleep_tip, |badge, tip| {
+                                        let tip = SharedString::from(tip);
+                                        badge.tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tip.clone())
+                                                .build(window, cx)
+                                        })
+                                    }),
+                            );
                         base.cursor_pointer()
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
@@ -28751,39 +29122,7 @@ impl MuxelApp {
                                     this.select_instance(iid, window, cx);
                                 }
                             }))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(cx.theme().sidebar_foreground)
-                                    .child(display),
-                            )
-                            .child(div().flex_none().child(if loading {
-                                status_tag(AgentStatus::Working, t("loading").to_string())
-                            } else if stopped {
-                                status_tag(AgentStatus::Idle, t("stopped").to_string())
-                            } else {
-                                let tag = status_tag(
-                                    status,
-                                    inst.map(|instance| {
-                                        localized_activity_label(
-                                            status,
-                                            &instance.activity,
-                                            self.terminal_view(iid)
-                                                .and_then(|view| view.read(cx).background_work()),
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                );
-                                // A read finish keeps its green as an outline, so
-                                // the label stays legible on the sidebar.
-                                if read_done { tag.outline() } else { tag }
-                            }))
+                            .child(details)
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
                                 let label = ghost_label.clone();
                                 cx.new(move |_| DragGhost { label, offset })
@@ -28796,34 +29135,71 @@ impl MuxelApp {
                             .drag_over::<DragInstance>(move |s, _, _, _| s.bg(drop_hl))
                             .context_menu({
                                 let entity = entity.clone();
-                                move |menu, window, _cx| {
-                                    menu.item(
-                                        PopupMenuItem::new(t("Rename"))
-                                            .icon(Icon::empty().path("icons/pencil.svg"))
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.start_rename_instance(
-                                                        iid,
-                                                        RenameOrigin::InstanceSidebar,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            )),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t("Duplicate"))
-                                            .icon(IconName::Copy)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.duplicate_instance(iid, window, cx)
-                                                },
-                                            )),
-                                    )
-                                    .separator()
-                                    .item(
+                                move |menu, window, cx| {
+                                    // Read when the menu opens, not at render: a
+                                    // pane's state moves between the two.
+                                    let sleep = entity.read(cx).sleep_menu_state(iid, cx);
+                                    let wake = entity.read(cx).is_dormant(iid);
+                                    let menu = menu
+                                        .item(
+                                            PopupMenuItem::new(t("Rename"))
+                                                .icon(Icon::empty().path("icons/pencil.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.start_rename_instance(
+                                                            iid,
+                                                            RenameOrigin::InstanceSidebar,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new(t("Duplicate"))
+                                                .icon(IconName::Copy)
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.duplicate_instance(iid, window, cx)
+                                                    },
+                                                )),
+                                        );
+                                    let menu = match sleep {
+                                        Some(Ok(())) => menu.item(
+                                            PopupMenuItem::new(t("Sleep"))
+                                                .icon(Icon::empty().path("icons/pause.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.sleep_from_menu(iid, window, cx)
+                                                    },
+                                                )),
+                                        ),
+                                        Some(Err(why)) => menu.item(
+                                            PopupMenuItem::new(why)
+                                                .icon(Icon::empty().path("icons/pause.svg"))
+                                                .disabled(true),
+                                        ),
+                                        None if wake => menu.item(
+                                            PopupMenuItem::new(t("Wake"))
+                                                .icon(Icon::empty().path("icons/moon.svg"))
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.wake_and_show(
+                                                            iid,
+                                                            sleep::WakeCause::Button,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        ),
+                                        None => menu,
+                                    };
+                                    menu.separator().item(
                                         PopupMenuItem::new(t("Kill"))
                                             .icon(IconName::CircleX)
                                             .on_click(window.listener_for(
@@ -34186,6 +34562,10 @@ impl MuxelApp {
     }
 
     fn render_settings_behavior(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dormant_days = match self.settings.dormant_after_days {
+            0 => 3,
+            days => days,
+        };
         let global_default = self
             .presets
             .iter()
@@ -34207,6 +34587,31 @@ impl MuxelApp {
         v_flex()
             .gap_3()
             .max_w(px(520.0))
+            .child(self.check_row(
+                Checkbox::new("b-dormant")
+                    .checked(self.settings.dormant_after_days > 0)
+                    .on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                        this.settings.dormant_after_days = if *checked { 3 } else { 0 };
+                        this.persist_settings();
+                        cx.notify();
+                    })),
+                &tf("Leave sessions not worked on in {days} days asleep", &[("days", &dormant_days.to_string())]),
+            ))
+            .child(div().flex().items_center().gap_2()
+                .child(Button::new("dormant-days-less").small().label("−")
+                    .disabled(self.settings.dormant_after_days <= 1)
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.settings.dormant_after_days = this.settings.dormant_after_days.saturating_sub(1).max(1);
+                        this.persist_settings(); cx.notify();
+                    })))
+                .child(tf("{days} days (applies on next project open or launch)", &[("days", &dormant_days.to_string())]))
+                .child(Button::new("dormant-days-more").small().label("+")
+                    .disabled(self.settings.dormant_after_days == 0)
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.settings.dormant_after_days = this.settings.dormant_after_days.saturating_add(1);
+                        this.persist_settings(); cx.notify();
+                    }))))
+            .child(self.render_sleep_setting(cx))
             .child(
                 self.check_row(
                     Checkbox::new("b-notif")
@@ -36489,6 +36894,13 @@ impl Render for MuxelApp {
             // Focus target for "deselect pane": focusing this (a non-Terminal
             // context) routes muxel shortcuts (incl. Ctrl+P) to the root handlers.
             .track_focus(&self.focus_handle)
+            // An asleep pane has no terminal, so the root holds the keyboard
+            // while it is selected: Enter or a typed key wakes it.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if this.wake_on_key(&ev.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
         let actions = ui_profile::region_scope(ui_profile::Region::Actions);

@@ -716,6 +716,11 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let generation = this.session_discoveries.binding_generation(iid);
+                // The whole store was read without the saved rollout.
+                let gone = matches!(
+                    found,
+                    CodexRestoreFound::Resume(muxel_core::CodexResumePath::Missing)
+                );
                 // Hold bumps the binding generation, so the pre-hold answer
                 // stays stale even when Undo makes the pane visible again.
                 if this.codex_restore_lookups.finish(iid, generation)
@@ -724,6 +729,9 @@ impl MuxelApp {
                 {
                     this.bump_session_binding_generation(iid);
                     this.persist();
+                    if gone {
+                        this.report_conversation_gone(iid);
+                    }
                     cx.notify();
                 }
             });

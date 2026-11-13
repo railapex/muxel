@@ -189,7 +189,9 @@ impl MuxelApp {
                 cx,
             );
         } else {
-            self.select_project(pid, window, cx);
+            // Keep reconciliation before placement, without selecting the old
+            // preferred session while the requested new pane does not exist.
+            self.select_project_for_new_pane(pid, window, cx);
             self.place_and_spawn(
                 pid,
                 instance,
@@ -199,7 +201,9 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            window.activate_window();
+            if self.workspace.instance(iid).is_some() {
+                window.activate_window();
+            }
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);
