@@ -3,9 +3,9 @@
 use super::{Answer, SendAdmission, check_send_state};
 use crate::app::MuxelApp;
 use gpui::{AppContext as _, Context, Entity, TestAppContext, WindowHandle};
-use muxel_core::control::{self as ctl, AgentState, Command, ErrorCode};
+use muxel_core::control::{self as ctl, Command, ErrorCode};
 use muxel_core::{Instance, PaneNode, Project};
-use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
+use muxel_terminal::{CommandSpec, SendRefusal, TerminalLaunch, TerminalSession, TerminalView};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -379,28 +379,35 @@ fn reply(
 fn a_send_refuses_a_composer_that_holds_a_draft() {
     super::super::popout_lifecycle_tests::with_app(|cx, window| {
         let (pane, _view, session) = shell_pane(cx, window, "control-draft");
-        let draft = |cx: &mut TestAppContext| {
+        let admission = |cx: &mut TestAppContext| {
             window
                 .update(cx, |app, _, cx| app.control_send_admission(pane, false, cx))
                 .unwrap()
         };
-        assert!(!draft(cx).draft_present);
+        // Wait for the shell's prompt: nothing refuses a send there.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while admission(cx).refusal.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never took a send: {:?}",
+                admission(cx).refusal
+            );
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         session.write_input(b"\x1b[A");
-        assert!(!draft(cx).draft_present, "an arrow key isn't a draft");
+        assert_eq!(admission(cx).refusal, None, "an arrow key isn't a draft");
         session.write_input(b"half typed");
-        let admission = draft(cx);
-        assert!(admission.draft_present);
-        let idle = SendAdmission {
-            state: Some(AgentState::Idle),
-            ..admission
-        };
-        let refused = check_send_state(idle).unwrap_err();
+        let drafted = admission(cx);
+        assert_eq!(drafted.refusal, Some(SendRefusal::Draft));
+        let refused = check_send_state(drafted).unwrap_err();
         assert_eq!(refused.code, Some(ErrorCode::DraftPresent));
         assert_eq!(refused.pasted, None);
         assert!(
             check_send_state(SendAdmission {
                 force: true,
-                ..idle
+                ..drafted
             })
             .is_ok()
         );
