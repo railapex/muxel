@@ -73,32 +73,7 @@ impl Default for SpeakOptions {
 /// finishes. A shell "finishes" every command it runs, and its output is not a
 /// reply; `None` is the user's default shell.
 pub fn is_agent_program(program: Option<&str>) -> bool {
-    const SHELLS: &[&str] = &[
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "dash",
-        "ksh",
-        "tcsh",
-        "csh",
-        "nu",
-        "elvish",
-        "xonsh",
-        "pwsh",
-        "powershell",
-        "cmd",
-    ];
-    let Some(program) = program.map(str::trim).filter(|p| !p.is_empty()) else {
-        return false;
-    };
-    let name = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    !SHELLS.contains(&name)
+    !crate::launch::is_shell_program(program)
 }
 
 // --- The reply, from a Claude transcript -------------------------------------
