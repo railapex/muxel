@@ -401,7 +401,7 @@
 [12347,"out","\u001b[J"]
 [12347,"out","\u001b[?25l"]
 [12347,"out","\u001b[11;2H\u001b[0m\u001b[K\u001b[12;2H\u001b[0m\u001b[K\u001b[13;30H\u001b[0m\u001b[K\u001b[14;42H\u001b[0m\u001b[K\u001b[15;2H\u001b[0m\u001b[K\u001b[16;119H\u001b[0m\u001b[K\u001b[17;58H\u001b[0m\u001b[K\u001b[18;67H\u001b[0m\u001b[K\u001b[19;2H\u001b[0m\u001b[K\u001b[20;63H\u001b[0m\u001b[K\u001b[21;2H\u001b[0m\u001b[K\u001b[11;1H \u001b[12;1H \u001b[13;1H  \u001b[2mQuestion 1/1 (1 unanswered)\u001b[14;1H\u001b[22m  Would you like to choose Alpha or Beta?\u001b[15;1H \u001b[16;1H  \u001b[7m\u001b[1m› 1. Alpha (Recommended)  \u001b[22mChoose Alpha for this request.\u001b[1m                                                            \u001b[17;1H\u001b[27m\u001b[22m    2. Beta                 \u001b[2mChoose Beta for this request.\u001b[18;1H\u001b[22m    3. None of the above    \u001b[2mOptionally, add details in notes (tab)\u001b[19;1H\u001b[22m \u001b[20;1H  \u001b[1mtab\u001b[22m to add notes\u001b[2m | \u001b[22m\u001b[1menter\u001b[22m to submit answer\u001b[2m | \u001b[22m\u001b[1mesc\u001b[22m to interrupt\u001b[21;1H \u001b[0m"]
-[12347,"mark",{"id":"blocked","by":"hand","truth":{"turn":"waiting","overlay":"question","composer":"hidden","takes_prompt":false}}]
+[12347,"mark",{"id":"blocked","by":"hand","truth":{"turn":"waiting","overlay":"question","composer":"hidden","takes_prompt":false,"options":[{"key":"1","label":"Alpha (Recommended)","selected":true},{"key":"2","label":"Beta"},{"key":"3","label":"None of the above"}]}}]
 [12350,"out","\u001b[?2026l"]
 [13367,"out","\u001b]0;Choose Alpha or Beta\u0007"]
 [13369,"out","\u001b[?2026h\u001b[0m"]

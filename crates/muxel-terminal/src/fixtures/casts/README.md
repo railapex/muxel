@@ -45,6 +45,7 @@ Truth keys, version 1. Every key is optional; an absent key claims nothing.
 | `draft` | the unsent text, exact; `""` is empty. It stands while the composer is hidden: a parked draft |
 | `cursor` | character offset of the cursor in `draft` |
 | `takes_prompt` | would text plus Enter, now, become exactly one new message and do nothing else |
+| `options` | a question or permission card's choices, in order: `{"key", "label", "selected"?}`. `label` is the choice's name as drawn on its row, without a description column or line; `selected` marks the one the cursor is on, and is left out of every option when the screen doesn't show the cursor |
 
 ## Replay
 
@@ -54,6 +55,7 @@ Replay runs on a `TerminalSession` with no child process (`TerminalSession::repl
 |---|---|
 | `turn`, `finished` | the runtime status (`Idle`, `Working`, `Blocked`, `Done`) |
 | `overlay` | the startup blocker `ctl new` reports; the numbered options `ctl show` and `ctl answer` read while Blocked |
+| `options` | those options, each key, label and (when the truth records it) cursor |
 | `composer` | the provider's input box as status finds it (Claude, Codex) |
 | `draft` | startup input's empty-composer reading, and the text in the rows the box reader chose |
 | `takes_prompt` | `startup_ready` (would startup input type now) and `ctl send`'s admission without `--force` |

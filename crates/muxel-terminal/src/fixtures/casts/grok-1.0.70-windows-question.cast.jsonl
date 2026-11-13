@@ -228,5 +228,5 @@
 [44077,"out","\u001b[?2026h\u001b[m\u001b[m\u001b[m\u001b[0m\u001b]0;⠸ - Running: Ask: Which option do you want? - Ask User to Choose Alpha or Beta - grok\u0007\u001b[?2026l"]
 [44453,"out","\u001b[?2026h\u001b[m\u001b[m\u001b[m\u001b[0m\u001b]0;⠼ - Running: Ask: Which option do you want? - Ask User to Choose Alpha or Beta - grok\u0007\u001b[?2026l"]
 [44823,"out","\u001b[?2026h\u001b[m\u001b[m\u001b[m\u001b[0m\u001b]0;⠴ - Running: Ask: Which option do you want? - Ask User to Choose Alpha or Beta - grok\u0007\u001b[?2026l"]
-[44823,"mark",{"id":"blocked","by":"hand","truth":{"turn":"waiting","overlay":"question","composer":"hidden","takes_prompt":false}}]
+[44823,"mark",{"id":"blocked","by":"hand","truth":{"turn":"waiting","overlay":"question","composer":"hidden","takes_prompt":false,"options":[{"key":"1","label":"Alpha (Recommended)"},{"key":"2","label":"Beta"},{"key":"z","label":"Type your answer here"}]}}]
 [45039,"out","\u001b[?1004l\u001b[?9001l"]

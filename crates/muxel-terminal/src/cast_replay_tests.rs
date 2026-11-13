@@ -22,7 +22,7 @@ use super::{
 use crate::session::{
     ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, ReplayFeed, ReplayWrites, TerminalSession,
 };
-use muxel_core::control::StartupBlockerKind;
+use muxel_core::control::{QuestionOption, StartupBlockerKind};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ type Gap = (&'static str, &'static str, &'static str, &'static str);
 /// gap no comparison reaches fails as lost coverage.
 #[rustfmt::skip]
 const EXPECTED_GAPS: &[Gap] = &[
+    ("claude-2.1.310-windows-question#blocked", "overlay/options", "4 Chat about this", CLAUDE_QUESTION_RULE),
     ("claude-2.1.312-windows-clear#slash-menu-clear", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
     ("claude-2.1.322-windows-composer-tour#idle-first", "draft/empty", "not empty", HELPER_CPR),
     ("claude-2.1.322-windows-composer-tour#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
@@ -53,12 +54,14 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("claude-2.1.322-windows-permission-parked-draft#idle-first", "draft/empty", "not empty", HELPER_CPR),
     ("claude-2.1.322-windows-permission-parked-draft#idle-first", "takes_prompt/startup", "startup_ready=false", HELPER_CPR),
     ("claude-2.1.322-windows-permission-parked-draft#after-answer", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
+    ("claude-2.1.322-windows-question#question-card", "overlay/options", "4 Chat about this", CLAUDE_QUESTION_RULE),
     ("codex-0.164.0-windows-command-approval#idle", "composer", "no box", CODEX_FOOTER),
     ("codex-0.164.0-windows-command-approval#idle", "draft/empty", "not empty", CODEX_FOOTER),
     ("codex-0.164.0-windows-command-approval#idle", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
     ("codex-0.164.0-windows-question#idle", "composer", "no box", CODEX_FOOTER),
     ("codex-0.164.0-windows-question#idle", "draft/empty", "not empty", CODEX_FOOTER),
     ("codex-0.164.0-windows-question#idle", "takes_prompt/startup", "startup_ready=false", CODEX_TITLE_UNSET),
+    ("codex-0.164.0-windows-question#blocked", "overlay/options", "1 Alpha (Recommended)  Choose Alpha for this request. (selected) | 2 Beta                 Choose Beta for this request. | 3 None of the above    Optionally, add details in notes (tab)", CODEX_OPTION_DESCRIPTION),
     ("codex-0.164.0-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
     ("codex-0.164.0-windows-turn#idle", "composer", "no box", CODEX_FOOTER),
     ("codex-0.164.0-windows-turn#idle", "draft/empty", "not empty", CODEX_FOOTER),
@@ -91,6 +94,7 @@ const EXPECTED_GAPS: &[Gap] = &[
     ("grok-1.0.70-windows-question#idle", "takes_prompt/startup", "startup_ready=true", GROK_DRAFT),
     ("grok-1.0.70-windows-question#idle", "takes_prompt/send", "send admitted=true", SEND_DRAFT),
     ("grok-1.0.70-windows-question#blocked", "overlay", "question with 0 options", GROK_OPTIONS),
+    ("grok-1.0.70-windows-question#blocked", "overlay/options", "", GROK_OPTIONS),
     ("grok-1.0.70-windows-trust-card#trust-card", "overlay", "none", GROK_TRUST),
     ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/startup", "startup_ready=true", GROK_TRUST),
     ("grok-1.0.70-windows-trust-card#trust-card", "takes_prompt/send", "send admitted=true", SEND_COVERED),
@@ -125,6 +129,11 @@ const CODEX_AGENTS_HINT: &str = "while its box is empty, Codex 0.167.2 ends the 
     `· ← for agents`; the footer check takes that segment for a key hint and rejects the line, \
     and no other footer matches, so an empty Codex box is never found";
 const GROK_DRAFT: &str = "Grok has no composer reader, so startup input can't see a draft";
+const CLAUDE_QUESTION_RULE: &str = "Claude draws a rule between a question's choices and \
+    `Chat about this`, and the option reader stops at it: ctl show lists only `4 Chat about this`, \
+    and `ctl answer 1` is refused";
+const CODEX_OPTION_DESCRIPTION: &str = "a Codex option's label runs on into its description \
+    column; ctl answer picks by key, so only the label ctl show lists and the reply echoes is wrong";
 const GROK_OPTIONS: &str =
     "ctl show and ctl answer find no numbered options in Grok's question rows (`1 (○) Alpha`)";
 const GROK_TRUST: &str = "Grok's trust card (`Do you trust the contents of this directory?`, \
@@ -224,8 +233,8 @@ struct Verdicts {
     /// `ctl send`'s admission without `--force`: an attributable Idle or Done,
     /// or a turn held only for background work.
     send_admitted: bool,
-    /// Numbered options `ctl show`/`ctl answer` read while the status is Blocked.
-    question_options: Option<usize>,
+    /// The options `ctl show`/`ctl answer` read while the status is Blocked.
+    question_options: Option<Vec<QuestionOption>>,
     /// The startup blocker `ctl new` reports (folder trust, login, update).
     blocker: Option<String>,
     /// The provider's input box as status finds it: its row range and the text
@@ -397,7 +406,7 @@ impl Replay {
         let question_options = (snapshot.status == AgentStatus::Blocked)
             .then(|| muxel_core::control::pending_question(&self.session.visible_text()))
             .flatten()
-            .map(|question| question.options.len());
+            .map(|question| question.options);
         let blocker = screen.startup_blocker().map(|blocker| match blocker.kind {
             StartupBlockerKind::FolderTrust => "folder_trust".to_string(),
             other => format!("{other:?}"),
@@ -599,18 +608,50 @@ fn compare(provider: TitleProvider, truth: &Map<String, Value>, v: &Verdicts) ->
         // takes_prompt keys say whether muxel would type into one.
         && !matches!(overlay, "picker" | "slash_menu" | "other")
     {
-        let read = match (&v.blocker, v.question_options) {
+        let read = match (&v.blocker, &v.question_options) {
             (Some(blocker), _) => blocker.clone(),
-            (None, Some(options)) => format!("question with {options} options"),
+            (None, Some(options)) => format!("question with {} options", options.len()),
             (None, None) => "none".to_string(),
         };
         let agrees = match overlay {
             "none" => v.blocker.is_none() && v.question_options.is_none(),
             "trust" => v.blocker.as_deref() == Some("folder_trust"),
-            "question" | "permission" => v.question_options.is_some_and(|options| options > 0),
+            "question" | "permission" => v
+                .question_options
+                .as_ref()
+                .is_some_and(|options| !options.is_empty()),
             other => panic!("unknown overlay {other:?}"),
         };
         check("overlay", overlay.to_string(), read, agrees);
+    }
+    // `ctl answer` picks an option by its key, so every option must be read:
+    // its key, its label, and which one the cursor is on. A truth that can't
+    // see the cursor records no `selected`, and then selection isn't compared.
+    if let Some(want) = truth.get("options") {
+        let want: Vec<QuestionOption> =
+            serde_json::from_value(want.clone()).expect("options truth is [{key, label}]");
+        let with_cursor = want.iter().any(|option| option.selected);
+        let listed = |options: &[QuestionOption]| {
+            options
+                .iter()
+                .map(|option| {
+                    let cursor = if with_cursor && option.selected {
+                        " (selected)"
+                    } else {
+                        ""
+                    };
+                    format!("{} {}{cursor}", option.key, option.label.trim())
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let read = v
+            .question_options
+            .as_deref()
+            .map_or_else(|| "no question".to_string(), listed);
+        let truth = listed(&want);
+        let agrees = read == truth;
+        check("overlay/options", truth, read, agrees);
     }
     if matches!(provider, TitleProvider::Claude | TitleProvider::Codex) {
         if let Some(composer) = truth.get("composer").and_then(Value::as_str) {
@@ -833,6 +874,75 @@ fn a_gap_holds_only_its_own_wrong_answer() {
     );
     let unreached = judge(&[], GAPS);
     assert_eq!((unreached.uncompared.len(), unreached.closed.len()), (1, 0));
+}
+
+/// Every option counts: one dropped, one relabelled or the cursor on another
+/// disagrees, though the overlay still reads as a question.
+#[test]
+fn a_question_agrees_only_with_all_its_options() {
+    let option = |key: &str, label: &str, selected| QuestionOption {
+        key: key.to_string(),
+        label: label.to_string(),
+        selected,
+    };
+    let shown = vec![
+        option("1", "Alpha", true),
+        option("2", "Beta", false),
+        option("3", "Type something.", false),
+    ];
+    let checks = |truth: Value, read: Vec<QuestionOption>| {
+        let truth: Map<String, Value> = serde_json::from_value(truth).expect("truth");
+        let verdicts = Verdicts {
+            status: AgentStatus::Blocked,
+            reason: TerminalStatusReason::BlockedMarker,
+            send_admitted: false,
+            question_options: Some(read),
+            blocker: None,
+            composer: None,
+            composer_text: None,
+            empty_composer: false,
+            ready: false,
+        };
+        let found = compare(TitleProvider::Claude, &truth, &verdicts);
+        let agrees = |key| {
+            found
+                .iter()
+                .find(|check| check.key == key)
+                .map(|c| c.agrees)
+        };
+        (agrees("overlay"), agrees("overlay/options"))
+    };
+    let truth = serde_json::json!({
+        "overlay": "question",
+        "options": [
+            { "key": "1", "label": "Alpha", "selected": true },
+            { "key": "2", "label": "Beta" },
+            { "key": "3", "label": "Type something." },
+        ],
+    });
+    assert_eq!(
+        checks(truth.clone(), shown.clone()),
+        (Some(true), Some(true))
+    );
+    assert_eq!(
+        checks(truth.clone(), shown[..2].to_vec()),
+        (Some(true), Some(false))
+    );
+    let mut relabelled = shown.clone();
+    relabelled[1].label = "Gamma".to_string();
+    assert_eq!(checks(truth.clone(), relabelled), (Some(true), Some(false)));
+    let mut moved = shown.clone();
+    (moved[0].selected, moved[1].selected) = (false, true);
+    assert_eq!(checks(truth, moved.clone()), (Some(true), Some(false)));
+    // A truth that can't see the cursor doesn't compare it.
+    let unseen = serde_json::json!({
+        "options": [
+            { "key": "1", "label": "Alpha" },
+            { "key": "2", "label": "Beta" },
+            { "key": "3", "label": "Type something." },
+        ],
+    });
+    assert_eq!(checks(unseen, moved), (None, Some(true)));
 }
 
 /// The format's own promises, so a hand edit or a converter bug can't slip a
