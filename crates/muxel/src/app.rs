@@ -26619,9 +26619,16 @@ impl MuxelApp {
                                 Some(
                                     div()
                                         .id(SharedString::from(format!("folder-chip-{iid}")))
+                                        // GPUI exposes an id only on an element
+                                        // with a role; the chip names the folder.
+                                        .role(Role::Label)
                                         .accessibility_id(SharedString::from(format!(
                                             "muxel.folder-chip.{iid}"
                                         )))
+                                        .aria_label(label.clone())
+                                        // AccessKit names a Label from its
+                                        // value (UIA Name), not its label.
+                                        .aria_value(label.clone())
                                         .w_full()
                                         .min_w_0()
                                         .overflow_hidden()
