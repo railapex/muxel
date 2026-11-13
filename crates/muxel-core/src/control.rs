@@ -1180,6 +1180,10 @@ pub fn key_submits(key: &str) -> bool {
 pub struct QuestionOption {
     pub key: String,
     pub label: String,
+    /// What the prompt prints beside the label, after a run of spaces (Codex's
+    /// `1. Alpha (Recommended)  Choose Alpha for this request.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// The option the prompt's cursor is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub selected: bool,
@@ -1236,10 +1240,18 @@ fn option_line(line: &str) -> Option<QuestionOption> {
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let label = rest.trim();
+    let rest = rest.trim();
+    // Codex sets each option's description in a column beside its label, two or
+    // more spaces on. A label with a double space of its own is cut short there,
+    // which only shortens what `show` lists: an answer goes by key.
+    let (label, description) = match rest.find("  ") {
+        Some(at) => (&rest[..at], Some(rest[at..].trim_start().to_string())),
+        None => (rest, None),
+    };
     (!label.is_empty()).then(|| QuestionOption {
         key: digits,
         label: label.to_string(),
+        description,
         selected,
     })
 }
@@ -1260,9 +1272,14 @@ pub fn pending_question(screen: &str) -> Option<Question> {
     let mut first = None;
     if let Some(last) = last {
         let mut gap = 0;
+        // Rule and blank lines crossed since the last option.
+        let mut divider = (0, 0);
         let mut expect: Option<u32> = None;
         for i in (reach..=last).rev() {
-            match option_line(lines[i]) {
+            let line = lines[i];
+            let blank = line.trim().is_empty();
+            let beside_rule = |j: usize| lines.get(j).is_some_and(|l| is_rule(l));
+            match option_line(line) {
                 Some(opt) => {
                     let n: u32 = opt.key.parse().unwrap_or(0);
                     if expect.is_some_and(|e| n != e) {
@@ -1270,14 +1287,29 @@ pub fn pending_question(screen: &str) -> Option<Question> {
                     }
                     options.push(opt);
                     first = Some(i);
-                    gap = 0;
+                    (gap, divider) = (0, (0, 0));
                     if n <= 1 {
                         break;
                     }
                     expect = Some(n - 1);
                 }
                 // A label wrapped onto the next line, or a hint under an option.
-                None if gap < 2 && !lines[i].trim().is_empty() && !is_rule(lines[i]) => gap += 1,
+                None if gap < 2 && !blank && !is_rule(line) => gap += 1,
+                // Claude's question card draws a rule between its choices and
+                // `Chat about this`. One rule, with a blank beside it, doesn't
+                // end the options: the next one up must still carry on the
+                // count, or nothing is added.
+                None if expect.is_some() && gap == 0 && is_rule(line) && divider.0 == 0 => {
+                    divider.0 += 1;
+                }
+                None if expect.is_some()
+                    && gap == 0
+                    && blank
+                    && divider.1 == 0
+                    && (beside_rule(i + 1) || i.checked_sub(1).is_some_and(beside_rule)) =>
+                {
+                    divider.1 += 1;
+                }
                 None => break,
             }
         }
@@ -2288,7 +2320,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   read without erasing Done. `activity` is absent when no current source supplies it.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
-  blocked, the `question` it's asking with its numbered `options`. `controller`
+  blocked, the `question` it's asking with its numbered `options` (each a `key`,
+  a `label`, and the `description` some prompts print beside it). `controller`
   says which computer's muxel last typed into the agent through `muxel ctl`
   (`this_muxel` is true when it was this one) and whether that turn is still open.
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
@@ -3586,6 +3619,108 @@ mod tests {
         assert_eq!(pending_question("\n  \n"), None);
         // A screen that ends in a rule (a composer's frame) holds no question.
         assert_eq!(pending_question("⏺ Done.\n────────\n"), None);
+    }
+
+    /// Claude's AskUserQuestion card, as Claude Code 2.1.310 drew it (2.1.322
+    /// draws the same rows), puts a rule between its choices and `Chat about
+    /// this`. The choices above the rule are still the question's.
+    #[test]
+    fn a_rule_between_a_cards_choices_doesnt_end_them() {
+        let rule = "─".repeat(120);
+        let card = |between: &str| {
+            format!(
+                "❯ Use AskUserQuestion now to ask me to choose Alpha or Beta. Do not answer the \
+                 question yourself. Do not use any other\n  tool.\n{rule}\n ☐ Choice\n\nWhich do \
+                 you choose: Alpha or Beta?\n\n❯ 1. Alpha\n     Choose Alpha.\n  2. Beta\n     \
+                 Choose Beta.\n  3. Type something.\n{between}  4. Chat about this\n\nEnter to \
+                 select · ↑/↓ to navigate · Esc to cancel\n\n\n"
+            )
+        };
+        let read = |screen: &str| {
+            let q = pending_question(screen).unwrap();
+            let options: Vec<(String, String, bool)> = q
+                .options
+                .into_iter()
+                .map(|o| (o.key, o.label, o.selected))
+                .collect();
+            (q.text, options)
+        };
+        let choices = vec![
+            ("1".into(), "Alpha".into(), true),
+            ("2".into(), "Beta".into(), false),
+            ("3".into(), "Type something.".into(), false),
+            ("4".into(), "Chat about this".into(), false),
+        ];
+        let text = "☐ Choice\n\nWhich do you choose: Alpha or Beta?".to_string();
+        assert_eq!(
+            read(&card(&format!("{rule}\n"))),
+            (text.clone(), choices.clone())
+        );
+        // A blank beside the rule, either side, doesn't end them either.
+        assert_eq!(
+            read(&card(&format!("{rule}\n\n"))),
+            (text.clone(), choices.clone())
+        );
+        assert_eq!(read(&card(&format!("\n{rule}\n"))), (text, choices));
+        // Two rules, or a blank with no rule, still end the options.
+        for between in [format!("{rule}\n{rule}\n"), "\n".to_string()] {
+            let (_, options) = read(&card(&between));
+            assert_eq!(options.len(), 1, "{between:?}");
+        }
+        // So does a numbered list above a rule that doesn't carry the count on.
+        let reply = format!("Steps:\n1. Build\n2. Test\n{rule}\n  4. Chat about this\n");
+        let (_, options) = read(&reply);
+        assert_eq!(options, [("4".into(), "Chat about this".into(), false)]);
+    }
+
+    /// Codex 0.164.0's question overlay sets each option's description in a
+    /// column beside its label. The rows are as Codex drew them.
+    #[test]
+    fn a_codex_options_description_is_not_its_label() {
+        let screen = "  Question 1/1 (1 unanswered)\n  Would you like to choose Alpha or Beta?\n\n  \
+                      › 1. Alpha (Recommended)  Choose Alpha for this request.\n    2. Beta                 \
+                      Choose Beta for this request.\n    3. None of the above    Optionally, add details \
+                      in notes (tab)\n\n  tab to add notes · enter to submit answer · esc to interrupt\n";
+        let q = pending_question(screen).unwrap();
+        let options: Vec<(&str, &str, Option<&str>, bool)> = q
+            .options
+            .iter()
+            .map(|o| {
+                let description = o.description.as_deref();
+                (o.key.as_str(), o.label.as_str(), description, o.selected)
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                (
+                    "1",
+                    "Alpha (Recommended)",
+                    Some("Choose Alpha for this request."),
+                    true
+                ),
+                ("2", "Beta", Some("Choose Beta for this request."), false),
+                (
+                    "3",
+                    "None of the above",
+                    Some("Optionally, add details in notes (tab)"),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            q.text,
+            "Question 1/1 (1 unanswered)\nWould you like to choose Alpha or Beta?"
+        );
+        // A label with no column beside it has no description, and `show` says
+        // nothing about one.
+        let claude = pending_question(" Continue?\n ❯ 1. Yes\n   2. No").unwrap();
+        assert_eq!(claude.options[0].description, None);
+        let shown = serde_json::to_value(&claude.options[0]).unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!({"key": "1", "label": "Yes", "selected": true})
+        );
     }
 
     #[test]
