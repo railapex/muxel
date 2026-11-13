@@ -868,6 +868,10 @@ pub fn key_submits(key: &str) -> bool {
 pub struct QuestionOption {
     pub key: String,
     pub label: String,
+    /// What the prompt prints beside the label, after a run of spaces (Codex's
+    /// `1. Alpha (Recommended)  Choose Alpha for this request.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// The option the prompt's cursor is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub selected: bool,
@@ -924,10 +928,18 @@ fn option_line(line: &str) -> Option<QuestionOption> {
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let label = rest.trim();
+    let rest = rest.trim();
+    // Codex sets each option's description in a column beside its label, two or
+    // more spaces on. A label with a double space of its own is cut short there,
+    // which only shortens what `show` lists: an answer goes by key.
+    let (label, description) = match rest.find("  ") {
+        Some(at) => (&rest[..at], Some(rest[at..].trim_start().to_string())),
+        None => (rest, None),
+    };
     (!label.is_empty()).then(|| QuestionOption {
         key: digits,
         label: label.to_string(),
+        description,
         selected,
     })
 }
@@ -1885,7 +1897,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl status [AGENT]` - one agent's status, or every agent's.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
-  blocked, the `question` it's asking with its numbered `options`. `controller`
+  blocked, the `question` it's asking with its numbered `options` (each a `key`,
+  a `label`, and the `description` some prompts print beside it). `controller`
   says which computer's muxel last typed into the agent through `muxel ctl`
   (`this_muxel` is true when it was this one) and whether that turn is still open.
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
@@ -2784,6 +2797,56 @@ mod tests {
         let reply = format!("Steps:\n1. Build\n2. Test\n{rule}\n  4. Chat about this\n");
         let (_, options) = read(&reply);
         assert_eq!(options, [("4".into(), "Chat about this".into(), false)]);
+    }
+
+    /// Codex 0.164.0's question overlay sets each option's description in a
+    /// column beside its label. The rows are as Codex drew them.
+    #[test]
+    fn a_codex_options_description_is_not_its_label() {
+        let screen = "  Question 1/1 (1 unanswered)\n  Would you like to choose Alpha or Beta?\n\n  \
+                      › 1. Alpha (Recommended)  Choose Alpha for this request.\n    2. Beta                 \
+                      Choose Beta for this request.\n    3. None of the above    Optionally, add details \
+                      in notes (tab)\n\n  tab to add notes · enter to submit answer · esc to interrupt\n";
+        let q = pending_question(screen).unwrap();
+        let options: Vec<(&str, &str, Option<&str>, bool)> = q
+            .options
+            .iter()
+            .map(|o| {
+                let description = o.description.as_deref();
+                (o.key.as_str(), o.label.as_str(), description, o.selected)
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                (
+                    "1",
+                    "Alpha (Recommended)",
+                    Some("Choose Alpha for this request."),
+                    true
+                ),
+                ("2", "Beta", Some("Choose Beta for this request."), false),
+                (
+                    "3",
+                    "None of the above",
+                    Some("Optionally, add details in notes (tab)"),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            q.text,
+            "Question 1/1 (1 unanswered)\nWould you like to choose Alpha or Beta?"
+        );
+        // A label with no column beside it has no description, and `show` says
+        // nothing about one.
+        let claude = pending_question(" Continue?\n ❯ 1. Yes\n   2. No").unwrap();
+        assert_eq!(claude.options[0].description, None);
+        let shown = serde_json::to_value(&claude.options[0]).unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!({"key": "1", "label": "Yes", "selected": true})
+        );
     }
 
     #[test]
