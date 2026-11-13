@@ -1,12 +1,13 @@
 //! A program that ends abnormally is reported once, as "exited unexpectedly".
 //! Its exit also leaves the pane Done, but that isn't a finished turn: the feed
-//! gets no "finished" entry for it, while a clean exit still gets one.
+//! gets no "finished" entry for it, while a clean exit still gets one. Its
+//! sidebar row and dashboard card read "ended" where a clean exit reads "done".
 
 use super::popout_lifecycle_tests::with_app;
 use super::recoverable_close_tests::{project, terminal, wait_for_view};
 use super::{MuxelApp, NotifKind};
 use gpui::{TestAppContext, WindowHandle};
-use muxel_terminal::TerminalView;
+use muxel_terminal::{AgentStatus, TerminalView};
 use uuid::Uuid;
 
 /// Two waiting cmd panes, seen alive by a tick and then ended with exit code 2
@@ -74,6 +75,40 @@ fn an_abnormal_exit_is_reported_once_and_a_clean_exit_still_finishes() {
                     entries(clean),
                     vec![NotifKind::Done],
                     "a clean exit still finishes"
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn an_abnormal_exit_reads_ended_and_a_clean_exit_done() {
+    with_app(|cx, window| {
+        let (crashed, clean) = end_two_panes(cx, window);
+        window
+            .update(cx, |app, _, cx| {
+                // Both panes sit at Done. The sidebar row and the dashboard
+                // card both take their words from pane_status_label.
+                let label = |pane| {
+                    let activity = &app.workspace.instance(pane).unwrap().activity;
+                    app.pane_status_label(pane, AgentStatus::Done, activity, cx)
+                };
+                let crashed_label = label(crashed);
+                assert!(
+                    crashed_label.starts_with("ended"),
+                    "an abnormal exit reads ended, got {crashed_label:?}"
+                );
+                let clean_label = label(clean);
+                assert!(
+                    clean_label.starts_with("done"),
+                    "a clean exit still reads done, got {clean_label:?}"
+                );
+                // A tmux pane muxel is reconnecting keeps its dead client's view
+                // between retries, and its bar says it is reconnecting.
+                app.reconnecting.insert(crashed, 1);
+                assert!(
+                    !app.pane_ended(crashed, cx),
+                    "a reconnecting pane isn't ended"
                 );
             })
             .unwrap();
