@@ -922,6 +922,7 @@ final class AppState: ObservableObject {
         // (a worktree can back several panes) but gets a fresh, not-yet-started
         // session so it doesn't collide on `--resume`.
         copy.resetConversationForDuplicate()
+        copy.createdAt = Instance.openedNow()
         await enqueueLayoutWrite { [self] in
             do {
                 let conn = connection(for: host)

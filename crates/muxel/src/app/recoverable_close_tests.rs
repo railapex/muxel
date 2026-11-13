@@ -2,12 +2,15 @@
 
 use super::popout_lifecycle_tests::with_app;
 use super::{
-    ConfirmAction, EditorSnapshot, Instance, MuxelApp, NotifKind, Project, SaveTarget, Workspace,
-    WorkspaceMeta,
+    ConfirmAction, EditorSnapshot, EditorView, Instance, MuxelApp, NotifKind, Project, SaveTarget,
+    Workspace, WorkspaceMeta,
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::{PaneNode, Worktree, add_tab};
+use muxel_core::sidebar::{
+    BandClock, SelectClick, SidebarEntry, SidebarSort, instances_by_id, sidebar_order,
+};
+use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab, split};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
 };
@@ -997,6 +1000,120 @@ fn review_close_dirty_worktree_keep_preserves_the_busy_agent_and_undo() {
 }
 
 #[test]
+fn ime_text_requires_confirmation_before_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for unmark in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            window
+                .update(cx, |app, window, cx| {
+                    let path = app.workspace.project(pid).unwrap().root_path.join("ime.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx.new(|cx| {
+                        crate::editor::EditorView::open(Some(path), config, window, cx)
+                    });
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    let input = editor.read(cx).input_for_test();
+                    input.update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        if unmark {
+                            input.unmark_text(window, cx);
+                        }
+                    });
+                    app.request_close_instance(iid, cx);
+                    assert!(
+                        matches!(app.confirm.as_ref().map(|p| &p.action),
+                            Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid),
+                        "closing discarded IME text without an unsaved-changes choice"
+                    );
+                    assert_eq!(editor.read(cx).text(cx), "あone\n");
+                    assert!(app.workspace.instance(iid).is_some());
+                    app.cancel_confirm(cx);
+
+                    // Pop-out rebuilds from this snapshot without a marked range.
+                    let snapshot = EditorSnapshot::capture(&editor, cx);
+                    assert!(snapshot.dirty, "pop-out captured composing text as clean");
+                    assert_eq!(snapshot.text, "あone\n");
+
+                    if !unmark {
+                        input.update(cx, |input, cx| {
+                            input.replace_and_mark_text_in_range(None, "", None, window, cx);
+                        });
+                        app.request_close_instance(iid, cx);
+                        assert!(app.confirm.is_none(), "cancelled composition is clean");
+                        assert!(app.workspace.instance(iid).is_none());
+                    }
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[test]
+fn cancellation_callbacks_allow_clean_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for explicit_range in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (iid, editor) = window
+                .update(cx, |app, window, cx| {
+                    let path = app
+                        .workspace
+                        .project(pid)
+                        .unwrap()
+                        .root_path
+                        .join("cancel.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx
+                        .new(|cx| crate::editor::EditorView::open(Some(path), config, window, cx));
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    editor.read(cx).input_for_test().update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        let range = if explicit_range {
+                            input.marked_text_range(window, cx)
+                        } else {
+                            None
+                        };
+                        input.replace_text_in_range(range, "", window, cx);
+                    });
+                    (iid, editor)
+                })
+                .unwrap();
+            // Deliver Change before closing, as separate input and close events do.
+            cx.run_until_parked();
+            let (asked, exists, text) = window
+                .update(cx, |app, _, cx| {
+                    app.request_close_instance(iid, cx);
+                    (
+                        app.confirm.is_some(),
+                        app.workspace.instance(iid).is_some(),
+                        editor.read(cx).text(cx),
+                    )
+                })
+                .unwrap();
+            assert_eq!(text, "one\n");
+            assert!(
+                !asked,
+                "cancelled unchanged text caused a false save prompt"
+            );
+            assert!(!exists, "the clean editor did not close");
+        });
+    }
+}
+
+#[test]
 fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
     with_app(|cx, window| {
         let pid = project(cx, window);
@@ -1015,7 +1132,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             assert!(matches!(app.confirm.as_ref().map(|p| &p.action), Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid));
             app.cancel_confirm(cx);
             assert!(app.workspace.instance(iid).is_some());
-            assert!(editor.read(cx).is_dirty());
+            assert!(editor.read(cx).is_dirty(cx));
             assert_eq!(editor.read(cx).text(cx), "unsaved draft");
             app.request_close_instance(iid, cx);
             app.run_confirm(window, cx);
@@ -1045,7 +1162,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             .update(cx, |app, _, cx| {
                 assert!(app.workspace.instance(iid).is_some());
                 assert_eq!(app.editors.get(&iid), Some(&editor));
-                assert!(editor.read(cx).is_dirty());
+                assert!(editor.read(cx).is_dirty(cx));
                 assert_eq!(editor.read(cx).text(cx), "unsaved draft");
                 assert!(!app.is_closing(iid));
                 app.request_close_instance(iid, cx);
@@ -3276,5 +3393,1393 @@ fn removing_a_project_leaves_the_files_of_an_answered_close() {
                 assert!(app.workspace.worktree(wid).is_some());
             })
             .unwrap();
+    });
+}
+
+/// An editor split beside `pid`'s first pane, opened by `session` (or by none).
+fn opened_file(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    session: Option<Uuid>,
+    dirty: bool,
+) -> (Uuid, Entity<EditorView>) {
+    window
+        .update(cx, |app, window, cx| {
+            let mut instance = Instance::editor(pid, None);
+            instance.record_opener(session, chrono::Utc::now().timestamp_millis());
+            let iid = instance.id;
+            let snapshot = EditorSnapshot {
+                text: "draft".into(),
+                path: None,
+                language: "text".into(),
+                cursor: None,
+                dirty,
+                external_change: None,
+                disk_stamp: None,
+                show_rendered: false,
+                diff_dir: None,
+            };
+            let editor = snapshot.build(app.editor_config(), window, cx);
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            let anchor = project.first_instance().unwrap();
+            assert!(split(
+                &mut project.layout,
+                anchor,
+                SplitDirection::Horizontal,
+                iid
+            ));
+            app.editors.insert(iid, editor.clone());
+            (iid, editor)
+        })
+        .unwrap()
+}
+
+#[test]
+fn closing_a_session_in_recent_work_takes_its_files_into_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, child) = terminal(cx, window, pid);
+        let (other, _, _other_child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        let (shared, _) = opened_file(cx, window, pid, Some(session), false);
+        let (loose, _) = opened_file(cx, window, pid, None, false);
+        window
+            .update(cx, |app, window, cx| {
+                // The other session opened `shared` again: the last opener wins.
+                app.workspace
+                    .instance_mut(shared)
+                    .unwrap()
+                    .record_opener(Some(other), chrono::Utc::now().timestamp_millis());
+                // Busy closes count down without asking, so no prompt intervenes.
+                app.settings.confirm_close_terminal = false;
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                // Layout order: the session closes alone.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                app.request_close_instance(session, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan));
+                app.undo_latest_close(window, cx);
+
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert_eq!(app.close_groups.len(), 1);
+                assert_eq!(app.close_groups[0].members, vec![session, plan]);
+                let shown: Vec<_> = before
+                    .iter()
+                    .copied()
+                    .filter(|id| ![session, plan].contains(id))
+                    .collect();
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), shown);
+                assert!(!app.is_closing(shared) && !app.is_closing(loose));
+                assert!(
+                    app.editors.contains_key(&plan),
+                    "a held file keeps its buffer"
+                );
+                let (label, button) = app.close_chip_text(&app.close_groups[0]);
+                let name = app.workspace.instance(session).unwrap().display_name();
+                assert_eq!(
+                    label.as_ref(),
+                    super::tf("Closed {name}", &[("name", name)]),
+                    "the chip names the session, not its files"
+                );
+                assert!(button.chars().any(|c| c.is_ascii_digit()), "{button}");
+
+                // One Undo brings both back where they were.
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(!app.is_closing(session) && !app.is_closing(plan));
+                assert!(app.close_groups.is_empty());
+                assert!(!child.exited());
+
+                // Left to finish, the file goes when its session does.
+                app.request_close_instance(session, cx);
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.workspace.instance(session).is_none());
+                assert!(app.workspace.instance(plan).is_none());
+                assert!(!app.editors.contains_key(&plan));
+                assert!(app.workspace.instance(shared).is_some());
+                assert!(app.workspace.instance(loose).is_some());
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+/// Close with everything under it: a session, the sessions it spawned and the
+/// files any of them owns go as one request, so one Undo brings them all back.
+/// The menu's count is what the click closes.
+#[test]
+fn closing_a_session_with_everything_under_it_takes_its_children_into_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (parent, _, _parent_child) = terminal(cx, window, pid);
+        let (spawned, _, _spawned_child) = terminal(cx, window, pid);
+        let (other, _, _other_child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(parent), false);
+        let (notes, _) = opened_file(cx, window, pid, Some(spawned), false);
+        window
+            .update(cx, |app, window, cx| {
+                app.workspace
+                    .instance_mut(spawned)
+                    .unwrap()
+                    .record_opener(Some(parent), chrono::Utc::now().timestamp_millis());
+                // Busy closes count down without asking, so no prompt intervenes.
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                assert_eq!(app.close_with_everything_under_count(parent), Some(4));
+                // A nested session has only its files under it; a session with
+                // nothing under it gets no such item.
+                assert_eq!(app.close_with_everything_under_count(spawned), Some(2));
+                assert_eq!(app.close_with_everything_under_count(other), None);
+
+                app.close_with_everything_under(parent, cx);
+                assert_eq!(app.close_groups.len(), 1);
+                let mut members = app.close_groups[0].members.clone();
+                members.sort();
+                let mut family = vec![parent, spawned, plan, notes];
+                family.sort();
+                assert_eq!(members, family);
+                assert!(!app.is_closing(other));
+
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(app.close_groups.is_empty());
+
+                // Layout order nests nothing, so there's nothing under it.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                assert_eq!(app.close_with_everything_under_count(parent), None);
+            })
+            .unwrap();
+    });
+}
+
+/// Rows picked with Ctrl- and Shift-click close as one request, so what's
+/// held comes back with one Undo. Only a picked row offers Close selected.
+#[test]
+fn closing_selected_rows_holds_them_in_one_undo() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let _children: Vec<_> = (0..4).map(|_| terminal(cx, window, pid).2).collect();
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                let order: Vec<Uuid> = app
+                    .sidebar_entries_now(pid, cx)
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        SidebarEntry::Pane(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(order.len(), 4);
+                let before = app.workspace.project(pid).unwrap().instances();
+
+                // Ctrl-click the first row, Shift-click the third, and Ctrl-
+                // click the fourth on and off again: the first three.
+                app.select_sidebar_row(order[0], SelectClick::Toggle, &order, cx);
+                app.select_sidebar_row(order[2], SelectClick::Range, &order, cx);
+                app.select_sidebar_row(order[3], SelectClick::Toggle, &order, cx);
+                app.select_sidebar_row(order[3], SelectClick::Toggle, &order, cx);
+                assert_eq!(app.sidebar_selection_to_close(order[3]), None);
+                assert_eq!(
+                    app.sidebar_selection_to_close(order[1]),
+                    Some(order[..3].to_vec())
+                );
+
+                app.close_sidebar_selection(order[1], cx);
+                assert_eq!(app.close_groups.len(), 1);
+                let mut members = app.close_groups[0].members.clone();
+                members.sort();
+                let mut picked = order[..3].to_vec();
+                picked.sort();
+                assert_eq!(members, picked);
+                assert!(!app.is_closing(order[3]));
+                assert!(app.sidebar_selection.is_empty());
+
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), before);
+                assert!(app.close_groups.is_empty());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_file_riding_with_a_session_waits_for_its_decision() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                // A quiet hold whose session can't show it is still quiet at
+                // the deadline becomes Close / Keep. Its file must not go first.
+                app.hold_closes_with(vec![(session, false)], vec![(plan, session)], None, cx)
+                    .unwrap();
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.close_groups[0].needs_decision);
+                assert!(app.is_closing(plan));
+                assert!(app.workspace.instance(plan).is_some());
+                app.undo_latest_close(window, cx);
+                assert!(
+                    app.workspace
+                        .project(pid)
+                        .unwrap()
+                        .instances()
+                        .contains(&plan)
+                );
+                assert!(!app.is_closing(plan));
+                assert!(
+                    app.terminal_view(plan).is_none(),
+                    "Keep never launches a file"
+                );
+                assert!(!child.exited());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn cancel_on_an_unsaved_file_keeps_it_open_while_its_session_closes() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (draft, editor) = opened_file(cx, window, pid, Some(session), true);
+        window
+            .update(cx, |app, window, cx| {
+                app.workspace.instance_mut(session).unwrap().custom_name = Some("Claude".into());
+                app.workspace.instance_mut(draft).unwrap().custom_name = Some("plan.md".into());
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert!(matches!(
+                    app.confirm.as_ref().map(|pending| &pending.action),
+                    Some(ConfirmAction::SaveEditorBeforeClose {
+                        iid,
+                        rides_with: Some(rider),
+                        ..
+                    }) if *iid == draft && *rider == session
+                ));
+                // The user clicked the session's ×, not the file's: the
+                // question says which file and why it is closing.
+                let pending = app.confirm.as_ref().unwrap();
+                assert!(pending.title.contains("plan.md"), "{}", pending.title);
+                assert!(
+                    pending.message.contains("plan.md") && pending.message.contains("Claude"),
+                    "{}",
+                    pending.message
+                );
+                assert!(!app.is_closing(session), "the save question comes first");
+                app.cancel_confirm(cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(draft));
+                assert!(editor.read(cx).is_dirty(cx));
+                assert_eq!(editor.read(cx).text(cx), "draft");
+                // Kept, it no longer rides with the session, even after Undo.
+                app.undo_latest_close(window, cx);
+                let project = app.workspace.project(pid).unwrap();
+                let rows = sidebar_order(
+                    &project.instances(),
+                    &instances_by_id(&app.workspace),
+                    &|_| None,
+                    &|_| true,
+                    &|_| false,
+                    BandClock::at(&chrono::Local::now()),
+                    SidebarSort::RecentWork,
+                );
+                assert!(rows.contains(&SidebarEntry::Pane(draft)), "{rows:?}");
+                app.request_close_instance(session, cx);
+                assert!(app.confirm.is_none());
+                assert!(!app.is_closing(draft));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn closing_the_other_tabs_keeps_a_file_that_shares_its_sessions_pane() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                // Opened beside another session, then reopened from this one:
+                // the file is a tab in its own session's pane.
+                let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                assert!(muxel_core::remove(layout, plan));
+                assert!(add_tab(layout, session, plan));
+                app.settings.confirm_close_terminal = false;
+                let now = chrono::Utc::now().timestamp_millis();
+
+                // Layout order has no riders, so the owner is left alone.
+                app.settings.sidebar_sort = SidebarSort::Layout;
+                app.close_other_tabs(plan, window, cx);
+                assert!(app.is_closing(session) && !app.is_closing(plan));
+                assert_eq!(
+                    app.workspace.instance(plan).unwrap().opened_by,
+                    Some(session)
+                );
+                app.undo_latest_close(window, cx);
+
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.close_other_tabs(plan, window, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan), "the tab the user kept stays open");
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), vec![plan]);
+                assert_eq!(app.workspace.instance(plan).unwrap().opened_by, None);
+                app.undo_latest_close(window, cx);
+
+                // Closing the tabs to its left keeps it the same way.
+                app.workspace
+                    .instance_mut(plan)
+                    .unwrap()
+                    .record_opener(Some(session), now);
+                app.close_tabs_side(plan, false, window, cx);
+                assert!(app.is_closing(session));
+                assert!(!app.is_closing(plan));
+                app.undo_latest_close(window, cx);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_held_page_is_not_reused_while_its_session_counts_down() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, window, cx| {
+                let url = "https://example.com/plan";
+                let mut page = Instance::browser(pid, url.into());
+                page.record_opener(Some(session), chrono::Utc::now().timestamp_millis());
+                let page_id = page.id;
+                app.workspace.add_instance(page);
+                let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                assert!(split(layout, session, SplitDirection::Horizontal, page_id));
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                assert_eq!(app.browser_to_reuse(pid, url), Some(page_id));
+
+                app.request_close_instance(session, cx);
+                assert_eq!(app.close_groups[0].members, vec![session, page_id]);
+                // A held page has left the layout, so the same link opens a
+                // fresh page and the held one still goes with its session.
+                assert_eq!(app.browser_to_reuse(pid, url), None);
+                app.undo_latest_close(window, cx);
+                assert_eq!(app.browser_to_reuse(pid, url), Some(page_id));
+            })
+            .unwrap();
+    });
+}
+
+/// An exited session closes at once, with no countdown. In Recent work its
+/// files still go with it.
+#[test]
+fn a_session_that_closes_at_once_takes_its_files() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, view, child) = terminal(cx, window, pid);
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        let (loose, _) = opened_file(cx, window, pid, None, false);
+        child.terminate(0);
+        wait_for_view(cx, window, &view, TerminalView::exited);
+        window
+            .update(cx, |app, _, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert!(app.close_groups.is_empty(), "an exited session has no hold");
+                assert!(app.workspace.instance(session).is_none());
+                assert!(
+                    app.workspace.instance(plan).is_none(),
+                    "its file closes with it"
+                );
+                assert!(!app.editors.contains_key(&plan));
+                assert!(app.workspace.instance(loose).is_some());
+            })
+            .unwrap();
+    });
+}
+
+/// The worktree question shows first, the file is edited while it does, and
+/// the session's close then asks about the file. Cancel keeps the file; the
+/// session's close goes on with the answer already given, without asking again.
+#[test]
+fn cancel_on_a_riding_file_keeps_the_worktree_answer_its_session_has() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (session, _, _child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, session);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+        window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.settings.confirm_close_terminal = false;
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                app.request_close_instance(session, cx);
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                // Edited while the worktree question showed.
+                let edited = EditorSnapshot {
+                    text: "edited".into(),
+                    path: None,
+                    language: "text".into(),
+                    cursor: None,
+                    dirty: true,
+                    external_change: None,
+                    disk_stamp: None,
+                    show_rendered: false,
+                    diff_dir: None,
+                }
+                .build(app.editor_config(), window, cx);
+                app.editors.insert(plan, edited);
+                app.dispose_worktree_discard(cx);
+                assert!(matches!(
+                    app.confirm.as_ref().map(|pending| &pending.action),
+                    Some(ConfirmAction::SaveEditorBeforeClose {
+                        iid,
+                        rides_with: Some(rider),
+                        ..
+                    }) if *iid == plan && *rider == session
+                ));
+                app.cancel_confirm(cx);
+                assert!(app.is_closing(session), "the session's close goes on");
+                assert!(!app.is_closing(plan));
+                assert!(
+                    app.pending_worktree_dispose.is_empty(),
+                    "the worktree asked again"
+                );
+                assert!(
+                    app.deferred_worktree_dispose
+                        .get(&pid)
+                        .and_then(|answers| answers.get(&wid))
+                        .is_some_and(|answer| answer.accepted),
+                    "the answer was dropped"
+                );
+                app.undo_latest_close(window, cx);
+            })
+            .unwrap();
+    });
+}
+
+/// A file held with its session is one more close in geometry's replay, in
+/// the order it left. Here that order decides who gets the space: the session
+/// has no pane it was split from, so its space goes to its neighbour, its own
+/// file, which then hands everything to the pane it was split from. Two holds
+/// come back exactly, sizes included, whichever is undone first.
+#[test]
+fn a_file_held_with_its_session_comes_back_exactly_beside_another_hold() {
+    for session_first in [true, false] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (session, _, _session_child) = terminal(cx, window, pid);
+            let (other, _, _other_child) = terminal(cx, window, pid);
+            let (plan, _) = opened_file(cx, window, pid, Some(session), false);
+            let (left, _) = opened_file(cx, window, pid, None, false);
+            let (right, _) = opened_file(cx, window, pid, None, false);
+            window
+                .update(cx, |app, window, cx| {
+                    app.settings.confirm_close_terminal = false;
+                    app.settings.sidebar_sort = SidebarSort::RecentWork;
+                    let beside = Uuid::new_v4();
+                    let leaf = |pane_id, tab, split_from| {
+                        PaneNode::Leaf(LeafData {
+                            pane_id,
+                            tabs: vec![tab],
+                            active: 0,
+                            split_from,
+                        })
+                    };
+                    let before = Some(PaneNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        sizes: vec![0.1, 0.2, 0.3, 0.25, 0.15],
+                        children: vec![
+                            leaf(Uuid::new_v4(), session, None),
+                            leaf(Uuid::new_v4(), plan, Some(beside)),
+                            leaf(Uuid::new_v4(), left, None),
+                            leaf(beside, right, None),
+                            leaf(Uuid::new_v4(), other, None),
+                        ],
+                    });
+                    app.workspace.project_mut(pid).unwrap().layout = before.clone();
+                    app.request_close_instance(session, cx);
+                    app.request_close_instance(other, cx);
+                    assert_eq!(app.close_groups.len(), 2);
+                    assert_eq!(app.close_groups[0].members, vec![session, plan]);
+                    let (first, second) = if session_first {
+                        (app.close_groups[0].id, app.close_groups[1].id)
+                    } else {
+                        (app.close_groups[1].id, app.close_groups[0].id)
+                    };
+                    app.undo_close(first, window, cx);
+                    app.undo_close(second, window, cx);
+                    let after = &app.workspace.project(pid).unwrap().layout;
+                    assert!(
+                        after
+                            .as_ref()
+                            .zip(before.as_ref())
+                            .is_some_and(|(after, before)| after.same_layout(before)),
+                        "session first {session_first}: {after:?} != {before:?}"
+                    );
+                })
+                .unwrap();
+        });
+    }
+}
+
+/// A plain shell pane whose command prints a line and rings the bell, then
+/// waits: a finish its terminal shows (Done, from the bell) with no provider.
+fn bell_terminal(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+) -> (Uuid, Entity<TerminalView>, OwnedChild) {
+    window
+        .update(cx, |app, window, cx| {
+            let root = app.workspace.project(pid).unwrap().root_path.clone();
+            let filename = format!("bell-{}.cmd", Uuid::new_v4());
+            std::fs::write(root.join(&filename), "@echo finished\x07\r\n@more\r\n").unwrap();
+            // As `title_terminal`: a plain cwd and a `.\` local filename.
+            let directory = root.to_string_lossy();
+            let directory = directory
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&directory)
+                .to_string();
+            let args = vec![
+                "/d".into(),
+                "/q".into(),
+                "/c".into(),
+                format!(r".\{filename}"),
+            ];
+            let mut instance = Instance::shell(pid);
+            instance.program = Some("cmd.exe".into());
+            let iid = instance.id;
+            let launch = TerminalLaunch::spawn(
+                CommandSpec::program("cmd.exe", args).with_cwd(directory),
+                (80, 24),
+            )
+            .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            let child = OwnedChild::new(view.read(cx).session().clone());
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view, child)
+        })
+        .unwrap()
+}
+
+/// A pane named `name` running `cmd /d /c "exit <code>"`, as a literal
+/// command job, or (`job` false) as the default shell, standing for
+/// `exit <code>` typed into it.
+fn spawn_exit_fixture(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    name: &str,
+    code: i32,
+    job: bool,
+) -> (Uuid, Entity<TerminalView>) {
+    use muxel_core::LaunchPurpose;
+    let exit_args = || -> Vec<String> { vec!["/d".into(), "/c".into(), format!("exit {code}")] };
+    window
+        .update(cx, |app, window, cx| {
+            let mut instance = Instance::shell(pid);
+            instance.custom_name = Some(name.into());
+            if job {
+                instance.program = Some("cmd.exe".into());
+                instance.args = exit_args();
+                instance.literal_argv = true;
+            }
+            let expected = if job {
+                LaunchPurpose::Job
+            } else {
+                LaunchPurpose::Session
+            };
+            assert_eq!(instance.launch_purpose(), expected, "{name}");
+            let iid = instance.id;
+            let launch =
+                TerminalLaunch::spawn(CommandSpec::program("cmd.exe", exit_args()), (80, 24))
+                    .unwrap();
+            let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+            app.workspace.add_instance(instance);
+            let project = app.workspace.project_mut(pid).unwrap();
+            if let Some(anchor) = project.first_instance() {
+                assert!(add_tab(&mut project.layout, anchor, iid));
+            } else {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            app.terminals.insert(iid, view.clone());
+            (iid, view)
+        })
+        .unwrap()
+}
+
+/// `iid`'s notifications, and every unexpected-exit report's title.
+fn exit_notices(app: &MuxelApp, iid: Uuid) -> (Vec<(NotifKind, String)>, Vec<String>) {
+    let mine = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.instance == Some(iid))
+        .map(|notice| (notice.kind, notice.subtitle.clone()))
+        .collect();
+    let unexpected = app
+        .notifications
+        .iter()
+        .filter(|notice| notice.title.contains("exited unexpectedly"))
+        .map(|notice| notice.title.clone())
+        .collect();
+    (mine, unexpected)
+}
+
+/// Both exit 3 through `cmd /c`. The job's instance runs that command; the
+/// session's is the default shell, standing for `exit 3` typed into it.
+#[test]
+fn a_failing_command_job_finishes_failed_and_a_shell_exiting_does_not_finish() {
+    use muxel_core::AgentActivityState;
+    use muxel_core::sidebar::is_unread;
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                // Unattended, without desktop toasts from the test.
+                app.window_active = false;
+                app.notifications_enabled = false;
+            })
+            .unwrap();
+        let (job, job_view) = spawn_exit_fixture(cx, window, pid, "job fixture", 3, true);
+        let (shell, shell_view) = spawn_exit_fixture(cx, window, pid, "shell fixture", 3, false);
+        for view in [&job_view, &shell_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                assert_eq!(job_view.read(cx).exit_code(), Some(3));
+                app.tick(window, cx);
+                let job_activity = &app.workspace.instance(job).unwrap().activity;
+                assert_eq!(job_activity.current_state(), Some(AgentActivityState::Done));
+                assert!(job_activity.completed_at.is_some());
+                assert!(is_unread(job_activity));
+                let job_notices: Vec<_> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.instance == Some(job))
+                    .collect();
+                assert_eq!(job_notices.len(), 1, "one notice for the job");
+                assert!(matches!(job_notices[0].kind, NotifKind::Error));
+                assert!(
+                    job_notices[0].subtitle.starts_with("exited with code 3"),
+                    "{}",
+                    job_notices[0].subtitle
+                );
+
+                let shell_activity = &app.workspace.instance(shell).unwrap().activity;
+                assert_eq!(shell_activity.completed_at, None);
+                assert!(!is_unread(shell_activity));
+                assert!(
+                    !app.notifications
+                        .iter()
+                        .any(|notice| notice.instance == Some(shell))
+                );
+                // The unexpected-exit report is the shell's alone: the job's
+                // failure is its own notice.
+                let unexpected: Vec<&str> = app
+                    .notifications
+                    .iter()
+                    .filter(|notice| notice.title.contains("exited unexpectedly"))
+                    .map(|notice| notice.title.as_str())
+                    .collect();
+                assert_eq!(unexpected, ["shell fixture: process exited unexpectedly"]);
+            })
+            .unwrap();
+    });
+}
+
+/// A job's failing exit is reported on its own: after a Done the tick already
+/// sampled (no transition left for the exit), and while the pane is watched
+/// (no notification for a finish the user sees).
+#[test]
+fn a_jobs_failing_exit_is_reported_after_a_sampled_finish_and_while_watched() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::AgentActivityState;
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        window
+            .update(cx, |app, _, _| app.notifications_enabled = false)
+            .unwrap();
+        let (sampled, sampled_view) = spawn_exit_fixture(cx, window, pid, "sampled job", 3, true);
+        let (watched, watched_view) = spawn_exit_fixture(cx, window, pid, "watched job", 4, true);
+        for view in [&sampled_view, &watched_view] {
+            wait_for_view(cx, window, view, TerminalView::exited);
+        }
+        window
+            .update(cx, |app, window, cx| {
+                // `sampled` already reported Done and the tick sampled and
+                // announced it, as its badge still shows.
+                let runtime = sampled_view.read(cx).runtime_snapshot();
+                assert_eq!(runtime.status, AgentStatus::Done);
+                app.last_status.insert(
+                    sampled,
+                    SeenStatus {
+                        status: AgentStatus::Done,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        sampled_at: chrono::Utc::now().timestamp_millis(),
+                        held: false,
+                    },
+                );
+                let activity = &mut app.workspace.instance_mut(sampled).unwrap().activity;
+                activity.observe(None, AgentActivityState::Working, 100);
+                activity.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    200,
+                );
+                app.add_notification(sampled, NotifKind::Done, "sampled job", "fixture");
+                // `watched` is the focused pane of the active window.
+                app.window_active = true;
+                app.active_instance = Some(watched);
+                // Recent work's feed leaves out what a row shows.
+                app.settings.sidebar_sort = muxel_core::sidebar::SidebarSort::RecentWork;
+                app.tick(window, cx);
+
+                for (iid, code) in [(sampled, 3), (watched, 4)] {
+                    let (mine, unexpected) = exit_notices(app, iid);
+                    assert_eq!(mine.len(), 1, "{code}: {mine:?}");
+                    assert!(matches!(mine[0].0, NotifKind::Error), "{code}");
+                    assert!(
+                        mine[0].1.starts_with(&format!("exited with code {code}")),
+                        "{}",
+                        mine[0].1
+                    );
+                    assert!(unexpected.is_empty(), "{unexpected:?}");
+                    // The row shows Done; the sidebar's feed shows the code.
+                    assert!(
+                        app.feed_notifications().any(|notice| {
+                            notice.instance == Some(iid)
+                                && notice
+                                    .subtitle
+                                    .starts_with(&format!("exited with code {code}"))
+                        }),
+                        "the feed hides exit code {code}"
+                    );
+                }
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn clicking_a_finish_the_tick_has_not_recorded_moves_no_row() {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarEntry, SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        // A has no live terminal (a pane not reopened since a restart), so it
+        // shows what it saved and its place can't change under the test.
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // A finished a minute ago, and it has been read.
+                let mut finished = AgentActivity::default();
+                finished.observe(None, AgentActivityState::Working, now - 90_000);
+                finished.observe(
+                    Some(AgentActivityState::Working),
+                    AgentActivityState::Done,
+                    now - 60_000,
+                );
+                finished.attend(now - 60_000);
+                app.workspace.instance_mut(a).unwrap().activity = finished;
+                // B started a turn two minutes ago, which the tick recorded.
+                // Its bell has rung since; no tick has read it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev,
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: 0,
+                        sampled_at: now - 120_000,
+                        held: false,
+                    },
+                );
+                let panes = |entries: &[SidebarEntry]| -> Vec<Uuid> {
+                    entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            SidebarEntry::Pane(iid) => Some(*iid),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // B's row already sits by its finish, newer than A's.
+                let before = app.sidebar_entries_now(pid, cx);
+                assert_eq!(panes(&before), [b, a]);
+
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.sidebar_entries_now(pid, cx),
+                    before,
+                    "the click moved a row"
+                );
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(activity), "the click read the finish");
+                let recorded = activity.completed_at;
+                assert!(recorded.is_some_and(|at| at > now - 120_000 && at <= now));
+
+                // Focusing it again records nothing new and moves nothing.
+                app.focus_instance_from_pointer(b, window, cx);
+                assert_eq!(
+                    app.workspace.instance(b).unwrap().activity.completed_at,
+                    recorded
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), before);
+            })
+            .unwrap();
+    });
+}
+
+/// A finish the tick hasn't recorded, in a conversation the pane switched to
+/// since its last sample, read by a click: render and the next tick sample
+/// it again behind the tick's record, and must not record it again after the
+/// look. This drives the focus marker's plumbing (kept by the click, read by
+/// render, taken by the tick) through the switch branch (`record_switch`). A
+/// protocol completion's replay is the completion branch
+/// (`record_completion`), which a PTY here can't raise; the reducer test
+/// `a_sample_a_focus_recorded_is_not_recorded_again` drives that.
+#[test]
+fn a_finish_read_by_a_click_stays_read_through_the_next_tick() {
+    click_a_finish_then_tick(false);
+}
+
+/// As above, when the activity already holds exactly what the sample would
+/// record: a completion whose time the floor makes equal to the stored one
+/// after a clock correction, say. The click changes no stored value, and
+/// must still keep the sample's identity for the tick.
+#[test]
+fn a_finish_read_by_a_click_stays_read_when_it_left_the_activity_as_it_was() {
+    click_a_finish_then_tick(true);
+}
+
+fn click_a_finish_then_tick(already_stored: bool) {
+    use super::{SeenStatus, StatusBinding};
+    use muxel_core::sidebar::{SidebarSort, is_unread};
+    use muxel_core::{AgentActivity, AgentActivityState};
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let a = window
+            .update(cx, |app, _, _| {
+                let instance = Instance::shell(pid);
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                iid
+            })
+            .unwrap();
+        let (b, b_view, _b_child) = bell_terminal(cx, window, pid);
+        wait_for_view(cx, window, &b_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::Bell
+                && view.status() == AgentStatus::Done
+                && view.has_visible_content()
+        });
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.sidebar_sort = SidebarSort::RecentWork;
+                let now = chrono::Utc::now().timestamp_millis();
+                // B's previous conversation was working when the tick last
+                // sampled it.
+                let mut working = AgentActivity::default();
+                working.observe(None, AgentActivityState::Working, now - 120_000);
+                app.workspace.instance_mut(b).unwrap().activity = working;
+                let runtime = b_view.read(cx).runtime_snapshot();
+                app.last_status.insert(
+                    b,
+                    SeenStatus {
+                        status: AgentStatus::Working,
+                        binding: StatusBinding {
+                            launch: runtime.launch_id,
+                            rev: runtime.binding_rev.wrapping_add(1),
+                        },
+                        coverage: runtime.coverage,
+                        completion_revision: runtime.completion_revision,
+                        sampled_at: now - 120_000,
+                        held: false,
+                    },
+                );
+                if already_stored {
+                    let instance = app.workspace.instance(b).unwrap();
+                    let stored = app.pending_activity(instance, now, cx).unwrap();
+                    app.workspace.instance_mut(b).unwrap().activity = stored;
+                    let instance = app.workspace.instance(b).unwrap();
+                    assert!(
+                        app.pending_activity(instance, now, cx).is_none(),
+                        "the sample still changes the activity"
+                    );
+                }
+                app.focus_instance_from_pointer(b, window, cx);
+                let read = app.workspace.instance(b).unwrap().activity.clone();
+                assert_eq!(read.current_state(), Some(AgentActivityState::Done));
+                assert!(!is_unread(&read), "the click read the finish");
+                let order = app.sidebar_entries_now(pid, cx);
+
+                // Then the user looks at A, and the tick samples B.
+                app.window_active = true;
+                app.active_instance = Some(a);
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+                app.tick(window, cx);
+                let activity = &app.workspace.instance(b).unwrap().activity;
+                assert_eq!(activity, &read, "the tick recorded the finish again");
+                assert!(!is_unread(activity));
+                assert!(
+                    app.notifications
+                        .iter()
+                        .all(|notice| notice.instance != Some(b)),
+                    "the finish that was read notified"
+                );
+                assert_eq!(app.sidebar_entries_now(pid, cx), order);
+
+                // The tick has caught up: the pane's next finish is new.
+                assert!(!app.recorded_ahead.contains_key(&b));
+            })
+            .unwrap();
+    });
+}
+
+/// Four equal 400 px columns A, Y, X, B in a project of their own, with live
+/// terminals. Y was split off B; the others have no recorded origin, so X gives
+/// its width to Y beside it.
+struct Row {
+    pid: Uuid,
+    a: Uuid,
+    y: Uuid,
+    x: Uuid,
+    b: Uuid,
+    /// Each pane's name in assertions, including any a test adds.
+    names: Vec<(Uuid, char)>,
+    _children: Vec<OwnedChild>,
+}
+
+impl Row {
+    fn new(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Self {
+        let pid = project(cx, window);
+        let mut ids = [Uuid::nil(); 4];
+        let mut children = Vec::new();
+        for id in &mut ids {
+            let (iid, _, child) = terminal(cx, window, pid);
+            *id = iid;
+            children.push(child);
+        }
+        let [a, y, x, b] = ids;
+        window
+            .update(cx, |app, _, _| {
+                let panes = ids.map(|iid| (iid, Uuid::new_v4()));
+                let from_b = panes[3].1;
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0; 4],
+                    children: panes
+                        .iter()
+                        .map(|&(iid, pane_id)| {
+                            PaneNode::Leaf(LeafData {
+                                pane_id,
+                                tabs: vec![iid],
+                                active: 0,
+                                split_from: (iid == y).then_some(from_b),
+                            })
+                        })
+                        .collect(),
+                });
+            })
+            .unwrap();
+        Self {
+            pid,
+            a,
+            y,
+            x,
+            b,
+            names: vec![(a, 'A'), (y, 'Y'), (x, 'X'), (b, 'B')],
+            _children: children,
+        }
+    }
+
+    fn name(&self, iid: Uuid) -> char {
+        self.names
+            .iter()
+            .find(|(id, _)| *id == iid)
+            .expect("a pane of the row")
+            .1
+    }
+
+    /// The row's columns by name, in whole pixels.
+    fn columns(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = layout
+        else {
+            panic!("expected a row: {layout:?}");
+        };
+        children
+            .iter()
+            .zip(sizes)
+            .map(|(child, size)| {
+                (
+                    self.name(child.first_instance().unwrap()),
+                    size.round() as i32,
+                )
+            })
+            .collect()
+    }
+
+    fn live(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        self.columns(&app.workspace.project(self.pid).unwrap().layout)
+    }
+
+    /// The row as the saved and shared document holds it.
+    fn durable(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        let durable = app.workspace_with_closes_restored();
+        self.columns(&durable.project(self.pid).unwrap().layout)
+    }
+
+    /// Every pane in `layout` by name, sorted, and the row's total width to
+    /// three places: what any undo must keep, however it puts panes back.
+    fn panes_and_width(&self, layout: &Option<PaneNode>) -> (Vec<char>, String) {
+        let Some(root @ PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let mut panes: Vec<_> = root
+            .collect_instances()
+            .into_iter()
+            .map(|iid| self.name(iid))
+            .collect();
+        panes.sort_unstable();
+        (panes, format!("{:.3}", sizes.iter().sum::<f32>()))
+    }
+
+    /// Each column's share of the row, in thousandths.
+    fn shares(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let width: f32 = sizes.iter().sum();
+        self.columns(layout)
+            .into_iter()
+            .zip(sizes)
+            .map(|((name, _), size)| (name, (size / width * 1000.0).round() as i32))
+            .collect()
+    }
+}
+
+/// How the second of two closed panes goes for good while the first is held.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SecondLeaves {
+    /// Both closed together, and its countdown finishes before the other's.
+    FinalFromTheSameClose,
+    /// Closed afterwards in a close of its own, which goes final.
+    FinalFromALaterClose,
+    /// Closed at once with no hold, as a dead pane is.
+    ClosedAtOnce,
+}
+
+#[test]
+fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
+    with_app(|cx, window| {
+        let mut got = Vec::new();
+        for way in [
+            SecondLeaves::FinalFromTheSameClose,
+            SecondLeaves::FinalFromALaterClose,
+            SecondLeaves::ClosedAtOnce,
+        ] {
+            let row = Row::new(cx, window);
+            let (x, y) = (row.x, row.y);
+            window
+                .update(cx, |app, window, cx| {
+                    let held = match way {
+                        SecondLeaves::FinalFromTheSameClose => {
+                            let group = app
+                                .hold_closes(vec![(x, false), (y, false)], None, cx)
+                                .unwrap();
+                            // As `finish_close_expiry` does for a member ready
+                            // before the rest of its close.
+                            app.close_instance_inner(y, "close (countdown)", cx);
+                            group
+                        }
+                        SecondLeaves::FinalFromALaterClose => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                            app.finalize_close_group(later, cx);
+                            group
+                        }
+                        SecondLeaves::ClosedAtOnce => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            app.close_instance_inner(y, "close", cx);
+                            group
+                        }
+                    };
+                    let live = row.live(app);
+                    let saved = row.durable(app);
+                    app.undo_close(held, window, cx);
+                    got.push((way, live, saved, row.live(app)));
+                })
+                .unwrap();
+        }
+        // Y's 400 went back to B, the pane it was split from. X has its own 400.
+        let back = vec![('A', 400), ('X', 400), ('B', 800)];
+        let want: Vec<_> = got
+            .iter()
+            .map(|&(way, ..)| {
+                (
+                    way,
+                    vec![('A', 400), ('B', 1200)],
+                    back.clone(),
+                    back.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+    });
+}
+
+#[test]
+fn undoing_the_newest_close_puts_back_the_row_it_hid() {
+    with_app(|cx, window| {
+        let row = Row::new(cx, window);
+        let (a, y, x, b) = (row.a, row.y, row.x, row.b);
+        window
+            .update(cx, |app, window, cx| {
+                let mut got = Vec::new();
+                let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                app.finalize_close_group(later, cx);
+                got.push(("Y final, X held", row.live(app)));
+                let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                assert_eq!(app.workspace.project(row.pid).unwrap().instances(), [b]);
+                got.push(("saved, X and A held", row.durable(app)));
+                app.undo_close(newest, window, cx);
+                got.push(("A undone", row.live(app)));
+                got.push(("saved, X held", row.durable(app)));
+                app.undo_close(older, window, cx);
+                got.push(("X undone", row.live(app)));
+                // Undoing A puts back the row from just before A closed. Y's
+                // 400 went back to B, the pane it was split from.
+                assert_eq!(
+                    got,
+                    [
+                        ("Y final, X held", vec![('A', 400), ('B', 1200)]),
+                        (
+                            "saved, X and A held",
+                            vec![('A', 400), ('X', 400), ('B', 800)]
+                        ),
+                        ("A undone", vec![('A', 400), ('B', 1200)]),
+                        ("saved, X held", vec![('A', 400), ('X', 400), ('B', 800)]),
+                        ("X undone", vec![('A', 400), ('X', 400), ('B', 800)]),
+                    ]
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn two_held_closes_undone_straight_away_restore_exactly_in_either_order() {
+    with_app(|cx, window| {
+        for newest_first in [true, false] {
+            let row = Row::new(cx, window);
+            let (y, x) = (row.y, row.x);
+            window
+                .update(cx, |app, window, cx| {
+                    let mut got = Vec::new();
+                    let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                    let newer = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                    got.push(row.durable(app));
+                    let (first, second) = if newest_first {
+                        (newer, older)
+                    } else {
+                        (older, newer)
+                    };
+                    app.undo_close(first, window, cx);
+                    got.push(row.live(app));
+                    app.undo_close(second, window, cx);
+                    got.push(row.live(app));
+                    let all = vec![('A', 400), ('Y', 400), ('X', 400), ('B', 400)];
+                    let between = if newest_first {
+                        // X's 400 went to Y beside it.
+                        vec![('A', 400), ('Y', 800), ('B', 400)]
+                    } else {
+                        // Y's 400 went back to B, the pane it was split from.
+                        vec![('A', 400), ('X', 400), ('B', 800)]
+                    };
+                    assert_eq!(
+                        got,
+                        [all.clone(), between, all],
+                        "newest first: {newest_first}"
+                    );
+                })
+                .unwrap();
+        }
+    });
+}
+
+/// How the row changes while closes are held, so undo can't put back the
+/// layout a close hid and rebuilds it from the saved one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edit {
+    /// Drag the divider between the two columns left once Y goes final.
+    DragADivider,
+    /// Split B, the one column left, into B and a new pane C.
+    SplitTheSurvivor,
+}
+
+#[test]
+fn undo_after_the_row_changed_keeps_every_pane_once_and_the_width() {
+    with_app(|cx, window| {
+        let mut got = Vec::new();
+        let mut shares = Vec::new();
+        for edit in [Edit::DragADivider, Edit::SplitTheSurvivor] {
+            for newest_first in [true, false] {
+                let mut row = Row::new(cx, window);
+                // `terminal` opens C as a tab beside the row's first pane.
+                let added = (edit == Edit::SplitTheSurvivor).then(|| terminal(cx, window, row.pid));
+                let c = added.as_ref().map(|(c, ..)| *c);
+                row.names.extend(c.map(|c| (c, 'C')));
+                let (a, y, x, b, pid) = (row.a, row.y, row.x, row.b, row.pid);
+                window
+                    .update(cx, |app, window, cx| {
+                        if let Some(c) = c {
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::remove(layout, c));
+                        }
+                        let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                        let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                        app.finalize_close_group(later, cx);
+                        if edit == Edit::DragADivider {
+                            // [A400, B1200] becomes [A700, B900].
+                            let Some(PaneNode::Split { sizes, .. }) =
+                                &mut app.workspace.project_mut(pid).unwrap().layout
+                            else {
+                                panic!("expected a row");
+                            };
+                            *sizes = vec![700.0, 900.0];
+                        }
+                        let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                        if let Some(c) = c {
+                            // B is all that's left, so splitting it gives [B1, C1].
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::split(layout, b, SplitDirection::Horizontal, c));
+                        }
+                        let saved = app.workspace_with_closes_restored();
+                        let saved = row.panes_and_width(&saved.project(pid).unwrap().layout);
+                        let (first, second) = if newest_first {
+                            (newest, older)
+                        } else {
+                            (older, newest)
+                        };
+                        app.undo_close(first, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        let between = row.panes_and_width(live);
+                        if c.is_some() {
+                            shares.push((newest_first, row.shares(live)));
+                        }
+                        app.undo_close(second, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        got.push((
+                            edit,
+                            newest_first,
+                            saved,
+                            between,
+                            row.panes_and_width(live),
+                        ));
+                    })
+                    .unwrap();
+            }
+        }
+        // Sizes after an edit are approximate. No pane may be lost or doubled,
+        // and the row keeps its width: 1600 after the drag, and 2 once B's
+        // split made a new row of its own.
+        let row = |panes: &[char], width: &str| (panes.to_vec(), width.to_string());
+        assert_eq!(
+            got,
+            [
+                (
+                    Edit::DragADivider,
+                    true,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['A', 'B'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::DragADivider,
+                    false,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['B', 'X'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    true,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    false,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+            ]
+        );
+        // The first pane back takes its saved share of the place B now fills,
+        // and B and C keep their 1:1. A, with X still held, had 400 against B's
+        // 800, so a third. X had 400 against B's 400, so half.
+        assert_eq!(
+            shares,
+            [
+                (true, vec![('A', 333), ('B', 333), ('C', 333)]),
+                (false, vec![('X', 500), ('B', 250), ('C', 250)]),
+            ]
+        );
     });
 }
