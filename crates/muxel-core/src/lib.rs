@@ -30,6 +30,7 @@ pub mod refresh_gate;
 pub mod remote_ops;
 pub mod rich_copy;
 pub mod session_discovery;
+pub mod session_folder;
 mod shell;
 pub mod sidebar;
 pub mod sleep;

@@ -756,8 +756,9 @@ pub fn push_remote_layout(loc: &RepoLoc, json: &str) -> Result<()> {
     write_remote_file(loc, &remote_layout_abs(root), json)
 }
 
-/// `git <args>` at `loc`; trimmed single-line stdout on success, else `None`.
+/// A display-only Git read at `loc`; trimmed stdout on success, else `None`.
 fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
+    // git_output is the shared lock-free display read, local and remote.
     let out = git_output(loc, args).ok().filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
@@ -5450,6 +5451,47 @@ mod tests {
             |_, _| panic!("kill reached the replacement after the original generation was gone"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn repo_branch_covers_unborn_checkout_and_detached_head() {
+        let repo = lib_temp_dir();
+        let git = |args: &[&str]| {
+            let out = command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "initial"]);
+        let loc = RepoLoc::Local(repo.clone());
+        assert_eq!(
+            repo_current_branch(&loc).as_deref(),
+            Some("initial"),
+            "an unborn branch is still the current branch"
+        );
+        git(&[
+            "-c",
+            "user.name=Muxel Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("topic"));
+        git(&["checkout", "-q", "--detach", "HEAD"]);
+        assert_eq!(repo_current_branch(&loc), None);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

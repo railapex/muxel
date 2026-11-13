@@ -1676,7 +1676,16 @@ feature is added or changed, update the matching entry here in the same change**
   commit, spelled as the switch-branch menu spells it. A local repo's branch
   comes from the git run that lists its branches, which runs when its HEAD or
   branch files change and otherwise every five minutes (every minute where
-  those files can't show what git reads, as with `GIT_DIR` set).
+  those files can't show what git reads, as with `GIT_DIR` set). Long labels
+  ellipsize within the header; hover for the full branch name.
+- **Session folder chips** — terminal rows show their launch folder's short name
+  when it differs from the project root, plus its current Git branch when known.
+  Root sessions stay single-line unless their known branch differs from the
+  project header; then they show the branch only. Right-click a row to show only
+  sessions in that folder or on that known branch; **Show all sessions** on the
+  same row or the project's clear button resets.
+  Background refresh supplies the sidebar and `ctl panes` / `status` `branch`
+  field. Running programs' later directory changes are not tracked.
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its

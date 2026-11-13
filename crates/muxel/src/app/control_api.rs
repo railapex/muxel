@@ -1344,6 +1344,9 @@ impl MuxelApp {
             pane,
             worktree_branch: inst.worktree_branch.clone(),
             cwd,
+            branch: project
+                .and_then(|p| self.session_branch(p, inst))
+                .map(str::to_owned),
             remote: project.is_some_and(|p| p.remote.is_some()),
         }
     }
