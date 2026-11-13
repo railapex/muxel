@@ -7310,13 +7310,19 @@ pub struct MuxelApp {
     /// Local midnight when the sidebar last checked its bands, in Unix
     /// milliseconds. When the day changes, Recent work redraws.
     band_day: i64,
+    /// The loaded workspace's `awake_focus`: the pane awake in front when it
+    /// was last saved, which starts whatever its idle age. Kept from the load
+    /// because every save rewrites the workspace's own copy, and a project
+    /// opened later still needs the one it was saved with.
+    relaunch_focus: Option<Uuid>,
     /// Asleep agents whose saved conversation was gone at the last look (on
     /// load, project open, sleep, wake, and once a minute): their row and pane
     /// say "no history". Outside control's `resumes` looks afresh instead.
     conversations_gone: HashSet<Uuid>,
     /// Panes whose current launch is a wake: until their terminal draws, the
     /// pane keeps its asleep face (saying "Waking…") in place of the spinner.
-    /// Every new launch clears it (`reset_terminal_runtime`).
+    /// Every new launch clears it (`reset_terminal_runtime`), and so does the
+    /// pane's first look once it draws (`record_woken_look`).
     wake_launches: HashSet<Uuid>,
     /// Terminals put to sleep whose program is still quitting (see `sleep`).
     sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
@@ -9898,6 +9904,7 @@ impl MuxelApp {
             restoring_activity: HashSet::new(),
             dormant_instances: HashSet::new(),
             band_day: 0,
+            relaunch_focus: None,
             conversations_gone: HashSet::new(),
             wake_launches: HashSet::new(),
             sleep_exits: HashMap::new(),
@@ -10130,6 +10137,7 @@ impl MuxelApp {
         let repaired =
             workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
+        self.relaunch_focus = self.workspace.awake_focus;
         if repaired {
             self.persist();
         }
@@ -10150,12 +10158,7 @@ impl MuxelApp {
                     && !instance.use_tmux
                     && instance.permits_launch(muxel_core::TerminalLaunchReason::Restore)
                     && local_projects.contains(&instance.project_id)
-                    && muxel_core::sleep::opens_dormant(
-                        instance,
-                        self.instance_resume_trusted(instance),
-                        &self.settings,
-                        now,
-                    )
+                    && self.pane_opens_dormant(instance, now)
             })
             .map(|instance| instance.id)
             .collect();
@@ -12244,12 +12247,7 @@ impl MuxelApp {
                     && !self.terminals.contains_key(&iid)
                     && !self.terminal_launching.contains_key(&iid)
                     && !self.failed_launches.contains_key(&iid)
-                    && muxel_core::sleep::opens_dormant(
-                        instance,
-                        self.instance_resume_trusted(instance),
-                        &self.settings,
-                        now,
-                    );
+                    && self.pane_opens_dormant(instance, now);
                 if dormant {
                     self.dormant_instances.insert(iid);
                 } else {
@@ -13715,6 +13713,7 @@ impl MuxelApp {
         let Some(path) = self.workspace_doc_path(id) else {
             return false;
         };
+        self.workspace.awake_focus = self.awake_focus();
         let durable =
             (!self.close_groups.is_empty()).then(|| self.workspace_with_closes_restored());
         let saved =
@@ -13922,6 +13921,7 @@ impl MuxelApp {
         self.maximized = None;
         self.workspace = Workspace::default();
         self.active_instance = None;
+        self.relaunch_focus = None;
 
         self.current_workspace = Some(id);
         {
@@ -16064,6 +16064,7 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
+        self.record_woken_look(cx);
         self.auto_sleep_pass(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
@@ -26458,7 +26459,7 @@ impl MuxelApp {
             inst.pinned = !inst.pinned;
         }
         if self.tab_is_pinned(iid) {
-            self.start_dormant(iid, window, cx);
+            self.start_dormant(iid, sleep::WakeCause::Pin, window, cx);
         }
         self.reflow_pins(iid);
         self.persist();
@@ -27881,9 +27882,9 @@ impl MuxelApp {
                 .label(if gone { t("Start fresh") } else { t("Wake") })
                 // Typing in the pane wakes it too.
                 .tooltip(t("Enter"))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.wake_and_show(iid, window, cx)),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.wake_and_show(iid, sleep::WakeCause::Button, window, cx)
+                }))
                 .into_any_element()
         };
         div()
@@ -31919,7 +31920,12 @@ impl MuxelApp {
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
-                                                    this.wake_and_show(iid, window, cx)
+                                                    this.wake_and_show(
+                                                        iid,
+                                                        sleep::WakeCause::Button,
+                                                        window,
+                                                        cx,
+                                                    )
                                                 },
                                             )),
                                     ),

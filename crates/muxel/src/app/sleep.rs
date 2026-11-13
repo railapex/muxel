@@ -6,6 +6,7 @@
 //! it; Enter or typing in it, Wake, pinning and `ctl focus`/`wake` start it.
 
 use super::*;
+use muxel_core::Waker;
 use muxel_core::control::{self as ctl, AgentState, ErrorCode};
 use muxel_core::sleep::{
     ResumeFile, SleepFacts, SleepRefusal, SleepRequest, SleepStatus, sleep_refusal,
@@ -38,6 +39,44 @@ impl SleepCause {
             Self::Pane => "pane menu",
             Self::IdleAgents => "sleep idle agents",
             Self::Timer => "idle timer",
+        }
+    }
+}
+
+/// What woke an asleep pane: who it counts as, for the idle clock, and what
+/// the event log says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WakeCause {
+    /// Enter or a typed character in the pane.
+    Key,
+    /// A Wake (or Start fresh) button: the pane's, its row's, or the row menu's.
+    Button,
+    Pin,
+    /// `ctl focus`, which puts the pane in front of whoever is at the window.
+    CtlFocus,
+    /// `ctl wake`, which starts it in the background for a script.
+    CtlWake,
+}
+
+impl WakeCause {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Button => "wake button",
+            Self::Pin => "pin",
+            Self::CtlFocus => "ctl focus",
+            Self::CtlWake => "ctl wake",
+        }
+    }
+
+    fn waker(self) -> Waker {
+        match self {
+            // The person's own input in muxel.
+            Self::Key | Self::Button | Self::Pin => Waker::User,
+            // Everything through ctl. If someone is at the window, their first
+            // look at the live pane makes it theirs; if nobody is, a script
+            // shouldn't buy an agent the whole threshold.
+            Self::CtlFocus | Self::CtlWake => Waker::Machine,
         }
     }
 }
@@ -97,6 +136,7 @@ impl MuxelApp {
             pinned: inst.pinned,
             // Counts the last wake: see `start_dormant`.
             last_active_at: inst.activity.last_active_at(),
+            machine_woken: inst.activity.machine_woken_unattended(),
         })
     }
 
@@ -463,14 +503,16 @@ impl MuxelApp {
 
     /// Start dormant pane `iid` through the restore path: every wake (Enter or
     /// typing in it, Wake, pinning, `ctl focus` and `ctl wake`) lands here. The
-    /// wake restarts its idle clock, so it gets the whole threshold before the
-    /// timer can stop it again, even if nobody types into it, and the pane
-    /// keeps its asleep face until the terminal draws. `false` when it wasn't
-    /// dormant or its launch was refused; a refused launch leaves it out of
-    /// `dormant_instances`, where its failure shows.
+    /// wake restarts its idle clock, so the timer can't stop it again at once,
+    /// even if nobody types into it: the user's wake gets the whole threshold,
+    /// a machine's 30 minutes until someone looks (`muxel_core::sleep`). The
+    /// pane keeps its asleep face until the terminal draws. `false` when it
+    /// wasn't dormant or its launch was refused; a refused launch leaves it out
+    /// of `dormant_instances`, where its failure shows.
     pub(super) fn start_dormant(
         &mut self,
         iid: Uuid,
+        cause: WakeCause,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -483,19 +525,67 @@ impl MuxelApp {
             return false;
         }
         self.wake_launches.insert(iid);
+        let waker = cause.waker();
         if let Some(inst) = self.workspace.instance_mut(iid) {
             inst.activity.woken_at = Some(chrono::Utc::now().timestamp_millis());
+            inst.activity.woken_by = Some(waker);
+            // Whether a machine-woken pane gets a second job after its short
+            // limit is what this line lets anyone count.
+            muxel_store::append_event_log(&format!(
+                "wake: \"{}\" [{iid}] by {} ({})",
+                inst.display_name(),
+                cause.word(),
+                match waker {
+                    Waker::User => "user",
+                    Waker::Machine => "machine",
+                }
+            ));
         }
         self.persist();
         cx.notify();
         true
     }
 
-    /// Wake asleep pane `iid` and show it: the pane's Wake button and the
-    /// sidebar's. Selecting alone never starts a pane.
-    pub(super) fn wake_and_show(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// A woken pane that draws live while it is the focused pane of the active
+    /// window has been looked at. Focus records a look only at a pane showing
+    /// something, and a woken pane is usually focused before it draws (the
+    /// one `ctl focus` put in front of someone, or one woken by Enter), so
+    /// without this its first look would wait for the user to focus it again.
+    /// A pane that draws in an inactive window gets its look once that window
+    /// is active with the pane still in front.
+    pub(super) fn record_woken_look(&mut self, cx: &App) {
+        let Some(iid) = self.active_instance else {
+            return;
+        };
+        if !self.wake_launches.contains(&iid)
+            || !self.instance_window_active(iid)
+            || !self
+                .terminals
+                .get(&iid)
+                .is_some_and(|view| view.read(cx).has_visible_content())
+        {
+            return;
+        }
+        self.wake_launches.remove(&iid);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(inst) = self.workspace.instance_mut(iid)
+            && inst.activity.attend(now)
+        {
+            self.persist();
+        }
+    }
+
+    /// Wake asleep pane `iid` and show it: the Wake buttons (pane, row, row
+    /// menu) and `ctl focus`. Selecting alone never starts a pane.
+    pub(super) fn wake_and_show(
+        &mut self,
+        iid: Uuid,
+        cause: WakeCause,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_instance(iid, window, cx);
-        self.start_dormant(iid, window, cx);
+        self.start_dormant(iid, cause, window, cx);
     }
 
     /// Enter or a typed character in the asleep pane the user is in wakes it.
@@ -514,24 +604,27 @@ impl MuxelApp {
             return false;
         }
         match self.active_instance {
-            Some(iid) if self.is_dormant(iid) => self.start_dormant(iid, window, cx),
+            Some(iid) if self.is_dormant(iid) => {
+                self.start_dormant(iid, WakeCause::Key, window, cx)
+            }
             _ => false,
         }
     }
 
-    /// Start a sleeping or dormant pane through the ordinary restore path,
-    /// leaving focus, windows and the active tab alone. `false` when it isn't
-    /// dormant or its launch was refused (it is then left dormant).
+    /// Wake an asleep pane through the ordinary restore path, leaving focus,
+    /// windows and the active tab alone. `false` when it isn't asleep or its
+    /// launch was refused (it is then left asleep).
     pub(super) fn wake_instance(
         &mut self,
         iid: Uuid,
+        cause: WakeCause,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.is_dormant(iid) {
             return false;
         }
-        if self.start_dormant(iid, window, cx) {
+        if self.start_dormant(iid, cause, window, cx) {
             return true;
         }
         self.dormant_instances.insert(iid);
@@ -565,7 +658,7 @@ impl MuxelApp {
         }
         let agent = ctl::short_id(iid);
         if self.is_dormant(iid) {
-            return if self.wake_instance(iid, window, cx) {
+            return if self.wake_instance(iid, WakeCause::CtlWake, window, cx) {
                 Ok(serde_json::json!({
                     "woken": true,
                     "agent": agent,
@@ -755,7 +848,7 @@ impl MuxelApp {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 // The row under it would only select.
                 cx.stop_propagation();
-                this.wake_and_show(iid, window, cx);
+                this.wake_and_show(iid, WakeCause::Button, window, cx);
             }))
     }
 
@@ -763,6 +856,31 @@ impl MuxelApp {
         self.workspace
             .instance(iid)
             .is_some_and(|inst| inst.asleep_since.is_some())
+    }
+
+    /// Whether saved pane `instance` opens asleep instead of starting, on load
+    /// and when its project opens (`sleep::opens_dormant`).
+    pub(super) fn pane_opens_dormant(&self, instance: &Instance, now: i64) -> bool {
+        muxel_core::sleep::opens_dormant(
+            instance,
+            self.relaunch_focus,
+            self.instance_resume_trusted(instance),
+            &self.settings,
+            now,
+        )
+    }
+
+    /// The pane with keyboard focus while it is awake (running, starting, or
+    /// woken and starting): what a relaunch starts whatever its idle age. A
+    /// pane asleep in front, put to sleep or opened asleep and only looked at,
+    /// gives none.
+    pub(super) fn awake_focus(&self) -> Option<Uuid> {
+        self.active_instance.filter(|&iid| {
+            self.workspace
+                .instance(iid)
+                .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
+                && !self.is_dormant(iid)
+        })
     }
 }
 

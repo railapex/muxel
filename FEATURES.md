@@ -88,8 +88,9 @@ feature is added or changed, update the matching entry here in the same change**
   Old local PTY panes retain their name, lifecycle status and age and open
   asleep, without starting a process. Selecting
   one only shows it; Enter or typing in it, Wake, pinning or `ctl focus`
-  resumes it through the normal restore path. Pinned panes and panes with no
-  work history always start; SSH and local tmux
+  resumes it through the normal restore path. Pinned panes, panes with no
+  work history, and the pane awake in front when muxel quit always start (one
+  asleep then stays asleep); SSH and local tmux
   restores keep their existing behavior. `ctl status`/`panes` expose
   `not_running_reason: "dormant"`; typing commands refuse without waking it.
 - **[Sleeping idle agents](docs/agent-sleep.md)** — a running local agent can be
@@ -97,14 +98,16 @@ feature is added or changed, update the matching entry here in the same change**
   seconds) and its pane stays, asleep, and resumes the same conversation when
   woken, across restarts too. Asleep and dormant panes look the same: a muted
   one-line row with an outlined moon-and-age pill (plus `∅`, "no history" and
-  **Start fresh** when the saved conversation is gone) and a moon on the tab. Selecting one shows it without starting it, so clicking through
+  **Start fresh** when the saved conversation is gone) and a moon on the tab.
+  Selecting one shows it without starting it, so clicking through
   sleeping rows costs nothing; Enter or typing in it, its Wake button, the
   Wake its row's pill turns into on hover, or Wake in the row menu starts it,
   and its face stays up ("Waking…") until the terminal draws. A pane's own
   Sleep leaves you in it, on its face. Sleep a pane from its sidebar
   menu, a whole project's idle agents from the project menu, or let Settings →
   Behavior do it after N hours idle (on, 4 hours, by default); every wake
-  restarts that clock. Working, asking,
+  restarts that clock, and a pane woken through ctl sleeps again after 30
+  idle minutes unless you look at it. Working, asking,
   background-held, pinned and drafting agents, the focused agent (unless its
   own Sleep is chosen), agents without a saved
   conversation (or whose provider deleted its file), shells, and remote or tmux
