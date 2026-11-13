@@ -4647,6 +4647,99 @@ mod runtime_control_tests {
         );
     }
 
+    /// The reply `ctl send` gives a live pane for everything the pane can show,
+    /// as the client reads it. The queued line maps these codes to its waiting
+    /// reasons, so moving the decision must leave every row as it is; only
+    /// `reply`, the path from the pane to the reply, may change.
+    #[test]
+    fn every_send_refusal_keeps_its_code_reason_and_message() {
+        use AgentStatus::{Blocked, Done, Idle, Working};
+        const WORKING: &str = "the agent is working: `wait` for it to finish (or pass --force to type the prompt anyway)";
+        const BLOCKED: &str =
+            "the agent is waiting on a question: see `show`, then `answer` it or press `keys`";
+        const HIDDEN: &str = "no prompt is showing to type into: a picker, menu or startup card covers it, or the agent hasn't drawn it yet. Nothing was typed. See `screen`, then send again once the prompt is back (or pass --force)";
+        const JUST: &str = "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)";
+        let working = serde_json::json!({"ok": false, "code": "working", "error": WORKING});
+        let blocked = serde_json::json!({"ok": false, "code": "blocked", "error": BLOCKED});
+        let hidden = serde_json::json!({"ok": false, "code": "blocked", "reason": "prompt_hidden", "error": HIDDEN});
+        let just = serde_json::json!({"ok": false, "code": "working", "reason": "just_submitted", "error": JUST});
+        let sent = serde_json::Value::Null;
+        // The pane's current binding is 1.
+        let live = |status| TerminalRuntimeSnapshot {
+            status,
+            reason: TerminalStatusReason::ProviderScreen,
+            background: None,
+            ..held_snapshot()
+        };
+        let held = held_snapshot();
+        let settling = |runtime: TerminalRuntimeSnapshot| TerminalRuntimeSnapshot {
+            attributable: false,
+            ..runtime
+        };
+        let old = |runtime: TerminalRuntimeSnapshot| TerminalRuntimeSnapshot {
+            binding_rev: 2,
+            ..runtime
+        };
+        // The live pane's path: `control_admission_state`, then `control_send_admission`.
+        let reply = |runtime: TerminalRuntimeSnapshot, prompt_hidden, just_submitted, force| {
+            let background = super::background_send_admitted(runtime, 1)
+                .then_some(TerminalStatusReason::BackgroundWork);
+            check_send_state(SendAdmission {
+                state: super::send_admission_state(
+                    Some(runtime_control_state(runtime, 1)),
+                    background,
+                ),
+                just_submitted,
+                prompt_hidden,
+                force,
+            })
+        };
+        // (what the pane shows, its runtime, no prompt showing, a control turn
+        // just sent, the reply without --force)
+        let rows = [
+            ("idle", live(Idle), false, false, &sent),
+            ("done", live(Done), false, false, &sent),
+            ("idle, no prompt", live(Idle), true, false, &hidden),
+            ("done, no prompt", live(Done), true, false, &hidden),
+            ("working", live(Working), false, false, &working),
+            ("working, no prompt", live(Working), true, false, &working),
+            ("blocked", live(Blocked), false, false, &blocked),
+            ("blocked, no prompt", live(Blocked), true, false, &blocked),
+            (
+                "idle, switch settling",
+                settling(live(Idle)),
+                false,
+                false,
+                &working,
+            ),
+            ("done, old binding", old(live(Done)), false, false, &working),
+            ("held for background work", held, false, false, &sent),
+            ("held, no prompt", held, true, false, &hidden),
+            (
+                "held, switch settling",
+                settling(held),
+                false,
+                false,
+                &working,
+            ),
+            ("held, old binding", old(held), false, false, &working),
+            ("idle, turn just sent", live(Idle), false, true, &just),
+            ("blocked, turn just sent", live(Blocked), false, true, &just),
+            ("no prompt, turn just sent", live(Idle), true, true, &just),
+        ];
+        for (shows, runtime, prompt_hidden, just_submitted, want) in rows {
+            let body = |force| {
+                reply(runtime, prompt_hidden, just_submitted, force)
+                    .err()
+                    .map_or(serde_json::Value::Null, |error| {
+                        serde_json::to_value(ctl::Response::err(error)).unwrap()
+                    })
+            };
+            assert_eq!(&body(false), want, "{shows}");
+            assert_eq!(body(true), sent, "{shows}, --force");
+        }
+    }
+
     #[test]
     fn activity_only_panes_do_not_keep_a_later_send_in_the_grace() {
         let turn = super::ControlTurn {
