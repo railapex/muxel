@@ -6324,8 +6324,8 @@ pub struct MuxelApp {
     conversations_gone: HashSet<Uuid>,
     /// Panes whose current launch is a wake: until their terminal draws, the
     /// pane keeps its asleep face (saying "Waking…") in place of the spinner.
-    /// Every new launch clears it (`reset_terminal_runtime`), and so does the
-    /// pane's first look once it draws (`record_woken_look`).
+    /// Every new launch clears it (`reset_terminal_runtime`). A woken pane's
+    /// first look is focus's, paid once it draws (`pay_owed_look`).
     wake_launches: HashSet<Uuid>,
     /// Terminals put to sleep whose program is still quitting (see `sleep`).
     sleep_exits: HashMap<Uuid, Entity<TerminalView>>,
@@ -15050,7 +15050,6 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_provider_session_ids(cx);
-        self.record_woken_look(cx);
         self.auto_sleep_pass(cx);
         self.pay_owed_look(cx);
         let focused = self.active_instance;

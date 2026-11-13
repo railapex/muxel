@@ -98,10 +98,11 @@ starts it rather than leaving it asleep.
 Anything through ctl (`ctl wake`, `ctl focus`) is a machine's wake, for one
 job, so until someone looks at the pane it sleeps after 30 idle minutes (or N hours, if shorter), counted from the
 later of the wake and its last work. Holding an agent's memory for four hours
-after every scripted wake would cost hours of it each time. The first time the
-user focuses the live pane, it becomes an ordinary pane on the whole
-threshold. A look before the wake doesn't count, and a restart applies the
-same limit. Thirty minutes is a guess: each wake writes
+after every scripted wake would cost hours of it each time. The first look at
+the live pane makes it an ordinary pane on the whole threshold: focusing it
+once it shows something, or its first draw while it is the focused pane of the
+active window, as when `ctl focus` wakes it in front of someone. A look before
+the wake doesn't count, and a restart applies the same limit. Thirty minutes is a guess: each wake writes
 `wake: "NAME" [ID] by CAUSE (user|machine)` to the event log, which shows how
 often a second job arrives after the short limit.
 
