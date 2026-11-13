@@ -3038,6 +3038,10 @@ pub struct Settings {
     /// it is opened by hand there.
     #[serde(default = "default_true")]
     pub older_starts_folded: bool,
+    /// How Recent work writes a row's status pill: a glyph and an age, or
+    /// words. Layout order keeps words.
+    #[serde(default)]
+    pub sidebar_pills: sidebar::PillStyle,
     /// Open old local PTY sessions asleep, until woken. Zero disables dormancy.
     #[serde(default)]
     pub dormant_after_days: u32,
@@ -3604,6 +3608,7 @@ impl Default for Settings {
         Self {
             sidebar_sort: sidebar::SidebarSort::default(),
             older_starts_folded: true,
+            sidebar_pills: sidebar::PillStyle::default(),
             dormant_after_days: 0,
             sleep_after_hours: default_sleep_after_hours(),
             default_use_tmux: true,

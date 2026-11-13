@@ -35,10 +35,10 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sidebar::{
-    ActivityBand, BandClock, FamilyFold, FamilyTags, Fold, InstancesById, RowCounts, SelectClick,
-    SidebarEntry, SidebarSort, entry_id, family_tags, instances_by_id, is_unread, label_rows,
-    nest_on_drop, next_matching, notification_in_feed, row_counts, row_state, select_rows,
-    sessions_under, sidebar_order, sidebar_rows_each,
+    ActivityBand, BandClock, FamilyFold, FamilyTags, Fold, InstancesById, PillStyle, PillText,
+    RowCounts, SelectClick, SidebarEntry, SidebarSort, entry_id, family_tags, instances_by_id,
+    is_unread, label_rows, nest_on_drop, next_matching, notification_in_feed, pill_text,
+    row_counts, row_state, select_rows, sessions_under, sidebar_order, sidebar_rows_each,
 };
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -126,7 +126,7 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
 use restart_guard::{PendingRestarts, RemoteRestartCompletion, RestartLease};
-use status_badge::status_tag;
+use status_badge::{StatusPill, status_tag};
 use strip_button::StripIconButton;
 
 /// Capture tmux eligibility before removing a pane's metadata. An absent
@@ -31028,6 +31028,7 @@ impl MuxelApp {
                         )
                         .into_any_element()
                     } else {
+                        let now = chrono::Utc::now().timestamp_millis();
                         let label = inst
                             .map(|instance| {
                                 localized_activity_label(
@@ -31035,26 +31036,54 @@ impl MuxelApp {
                                     &instance.activity,
                                     self.terminal_view(iid)
                                         .and_then(|view| view.read(cx).background_work()),
-                                    chrono::Utc::now().timestamp_millis(),
+                                    now,
                                 )
                             })
                             .unwrap_or_else(|| status_label(Some(status)).to_string());
-                        // An asleep row's pill is a moon and an age; the words
-                        // go to the tooltip.
-                        let asleep_tip = asleep.then(|| self.asleep_words(iid));
+                        let pill = pill_text(
+                            sort,
+                            self.settings.sidebar_pills,
+                            activity_state(status),
+                            asleep,
+                            inst.map_or(&AgentActivity::default(), |i| &i.activity),
+                            now,
+                        );
+                        // A moon or a glyph leaves the words to the tooltip.
+                        let tip = if asleep {
+                            Some(self.asleep_words(iid))
+                        } else if matches!(pill, PillText::Glyph { .. }) && !loading && !stopped {
+                            Some(label.clone())
+                        } else {
+                            None
+                        };
+                        // A read finish keeps its green as an outline, so the
+                        // label stays legible on the sidebar.
+                        let filled = |tag: StatusPill| {
+                            if read_done { tag.outline() } else { tag }.into_any_element()
+                        };
                         let badge = if loading {
                             status_tag(AgentStatus::Working, t("loading").to_string())
                                 .into_any_element()
                         } else if stopped {
                             status_tag(AgentStatus::Idle, t("stopped").to_string())
                                 .into_any_element()
-                        } else if asleep {
-                            self.asleep_pill(iid, cx).into_any_element()
                         } else {
-                            let tag = status_tag(status, label);
-                            // A read finish keeps its green as an outline, so
-                            // the label stays legible on the sidebar.
-                            if read_done { tag.outline() } else { tag }.into_any_element()
+                            match pill {
+                                PillText::AsleepMoon => {
+                                    self.asleep_pill(iid, false, cx).into_any_element()
+                                }
+                                PillText::AsleepWords => {
+                                    self.asleep_pill(iid, true, cx).into_any_element()
+                                }
+                                PillText::Glyph { glyph, age } => filled(status_tag(
+                                    status,
+                                    format!(
+                                        "{glyph} {}",
+                                        age.unwrap_or_else(|| t("now").to_string())
+                                    ),
+                                )),
+                                PillText::Words => filled(status_tag(status, label)),
+                            }
                         };
                         let name_color = if asleep && !finish_unread {
                             cx.theme().muted_foreground
@@ -31157,7 +31186,7 @@ impl MuxelApp {
                                     .when(asleep, |slot| {
                                         slot.child(self.asleep_wake_button(iid, row_group, cx))
                                     })
-                                    .when_some(asleep_tip, |badge, tip| {
+                                    .when_some(tip, |badge, tip| {
                                         let tip = SharedString::from(tip);
                                         badge.tooltip(move |window, cx| {
                                             gpui_component::tooltip::Tooltip::new(tip.clone())
@@ -36704,6 +36733,26 @@ impl MuxelApp {
                                     !self.settings.older_starts_folded,
                                     cx,
                                     |s| s.older_starts_folded = false,
+                                )),
+                        )
+                        .child(self.settings_label(&t("Status pills"), cx))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(self.option_btn(
+                                    "sidebar-pills-icons",
+                                    t("Icons"),
+                                    self.settings.sidebar_pills == PillStyle::Icons,
+                                    cx,
+                                    |s| s.sidebar_pills = PillStyle::Icons,
+                                ))
+                                .child(self.option_btn(
+                                    "sidebar-pills-words",
+                                    t("Words"),
+                                    self.settings.sidebar_pills == PillStyle::Words,
+                                    cx,
+                                    |s| s.sidebar_pills = PillStyle::Words,
                                 )),
                         )
                 },

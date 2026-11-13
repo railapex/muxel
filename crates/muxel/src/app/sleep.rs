@@ -761,8 +761,9 @@ impl MuxelApp {
     /// An asleep pane's sidebar pill: a moon and the age of its last work,
     /// outlined in its saved status color (green finished, amber interrupted,
     /// grey idle), with `∅` when its conversation is gone. Filled pills are
-    /// left to running panes.
-    pub(super) fn asleep_pill(&self, iid: Uuid, cx: &App) -> Tag {
+    /// left to running panes. In `words` (Recent work's Words pills) it says
+    /// "asleep · 20h", and "no history" for `∅`.
+    pub(super) fn asleep_pill(&self, iid: Uuid, words: bool, cx: &App) -> Tag {
         let inst = self.workspace.instance(iid);
         let color = self.asleep_color(iid, cx);
         let tag = match self.asleep_status(iid) {
@@ -773,6 +774,18 @@ impl MuxelApp {
         let age = inst.and_then(|inst| {
             muxel_core::sleep::asleep_age(&inst.activity, chrono::Utc::now().timestamp_millis())
         });
+        let gone = self.conversations_gone.contains(&iid);
+        if words {
+            let words: Vec<String> = std::iter::once(t("asleep").to_string())
+                .chain(age)
+                .chain(gone.then(|| t("no history").to_string()))
+                .collect();
+            return tag
+                .outline()
+                .small()
+                .text_color(color)
+                .child(words.join(" · "));
+        }
         tag.outline()
             .small()
             .gap_1()
@@ -785,7 +798,7 @@ impl MuxelApp {
                     .text_color(color),
             )
             .children(age)
-            .when(self.conversations_gone.contains(&iid), |tag| tag.child("∅"))
+            .when(gone, |tag| tag.child("∅"))
     }
 
     /// The status an asleep pane saved when its program stopped.
