@@ -8,13 +8,19 @@ use super::popout_lifecycle_tests::with_app;
 use super::recoverable_close_tests::{project, terminal, wait_for_view};
 use super::{MuxelApp, NotifKind};
 use gpui::{TestAppContext, WindowHandle};
+use muxel_core::LaunchPurpose;
 use muxel_terminal::{AgentStatus, TerminalView};
 use uuid::Uuid;
 
 /// Two waiting cmd panes, seen alive by a tick and then ended with exit code 2
-/// and exit code 0, with nobody watching. Returns (crashed, clean) once a tick
-/// has seen both exits.
-fn end_two_panes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> (Uuid, Uuid) {
+/// and exit code 0, with nobody watching. The crashed one is saved as
+/// `crashed_as`; the clean one is a command job. Returns (crashed, clean) once
+/// a tick has seen both exits.
+fn end_two_panes(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    crashed_as: LaunchPurpose,
+) -> (Uuid, Uuid) {
     let pid = project(cx, window);
     let (crashed, crashed_view, crashed_child) = terminal(cx, window, pid);
     let (clean, clean_view, clean_child) = terminal(cx, window, pid);
@@ -29,6 +35,15 @@ fn end_two_panes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> (Uu
             for (iid, name) in [(crashed, "crashed fixture"), (clean, "clean fixture")] {
                 app.workspace.instance_mut(iid).unwrap().custom_name = Some(name.into());
             }
+            // The same waiting process either way: what the pane was saved to
+            // run decides whether it is a session or a command job.
+            let instance = app.workspace.instance_mut(crashed).unwrap();
+            if crashed_as == LaunchPurpose::Session {
+                instance.args.clear();
+            }
+            assert_eq!(instance.launch_purpose(), crashed_as);
+            let clean_as = app.workspace.instance(clean).unwrap().launch_purpose();
+            assert_eq!(clean_as, LaunchPurpose::Job);
             app.tick(window, cx);
         })
         .unwrap();
@@ -49,7 +64,7 @@ fn end_two_panes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> (Uu
 #[test]
 fn an_abnormal_exit_is_reported_once_and_a_clean_exit_still_finishes() {
     with_app(|cx, window| {
-        let (crashed, clean) = end_two_panes(cx, window);
+        let (crashed, clean) = end_two_panes(cx, window, LaunchPurpose::Job);
         window
             .update(cx, |app, _, _| {
                 let entries = |pane| {
@@ -82,10 +97,44 @@ fn an_abnormal_exit_is_reported_once_and_a_clean_exit_still_finishes() {
     });
 }
 
+/// A crashed session takes the other path from the job above: its exit
+/// finishes nothing, so no job notice and no "finished", and the one report
+/// is "exited unexpectedly".
+#[test]
+fn a_crashed_session_is_reported_once_as_exited_unexpectedly() {
+    with_app(|cx, window| {
+        let (crashed, _) = end_two_panes(cx, window, LaunchPurpose::Session);
+        window
+            .update(cx, |app, _, _| {
+                let reports: Vec<&str> = app
+                    .notifications
+                    .iter()
+                    .filter(|n| {
+                        n.kind == NotifKind::Error
+                            && (n.instance == Some(crashed) || n.title.contains("crashed fixture"))
+                    })
+                    .map(|n| n.title.as_str())
+                    .collect();
+                assert_eq!(
+                    reports,
+                    ["crashed fixture: process exited unexpectedly"],
+                    "a crashed session is reported once, as exited unexpectedly"
+                );
+                assert!(
+                    !app.notifications
+                        .iter()
+                        .any(|n| n.instance == Some(crashed) && n.kind == NotifKind::Done),
+                    "a crashed session's exit is no finished turn"
+                );
+            })
+            .unwrap();
+    });
+}
+
 #[test]
 fn an_abnormal_exit_reads_ended_and_a_clean_exit_done() {
     with_app(|cx, window| {
-        let (crashed, clean) = end_two_panes(cx, window);
+        let (crashed, clean) = end_two_panes(cx, window, LaunchPurpose::Job);
         window
             .update(cx, |app, _, cx| {
                 // Both panes sit at Done. The sidebar row and the dashboard
