@@ -1944,9 +1944,9 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 // Every one of them needs more than a v1 host can honor.
                 let version = request["version"].as_u64().unwrap();
-                let expected = if request["command"]["cmd"] == "once_cancel"
-                    || request["command"]["detach"] == true
-                {
+                let expected = if request["command"]["detach"] == true {
+                    7
+                } else if request["command"]["cmd"] == "once_cancel" {
                     6
                 } else if request["command"]["cmd"] == "once_status"
                     || request["command"]["once"].is_string()

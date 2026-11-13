@@ -63,9 +63,12 @@ pub const PINNED_SEND_VERSION: u32 = 5;
 /// `send --detach` and `once-cancel` must be refused by hosts that would
 /// ignore `--detach` and hold the caller's connection for the whole wait.
 pub const DETACHED_SEND_VERSION: u32 = 6;
+/// `send --detach` must be refused by hosts that would forget the send, and
+/// its `--once` key, if muxel restarted before it typed.
+pub const PERSISTED_SEND_VERSION: u32 = 7;
 /// The newest version this host accepts, which `status` and `panes` report as
 /// `protocol` so a client can learn it without sending anything.
-pub const NEWEST_VERSION: u32 = DETACHED_SEND_VERSION;
+pub const NEWEST_VERSION: u32 = PERSISTED_SEND_VERSION;
 /// How long `send --when-idle` waits for a safe moment by default, and at most.
 pub const WHEN_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const WHEN_IDLE_TIMEOUT_MAX_SECS: u64 = 3600;
@@ -273,10 +276,10 @@ fn is_false(value: &bool) -> bool {
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
-    if matches!(
-        command,
-        Command::Send { detach: true, .. } | Command::OnceCancel { .. }
-    ) {
+    if matches!(command, Command::Send { detach: true, .. }) {
+        return PERSISTED_SEND_VERSION;
+    }
+    if matches!(command, Command::OnceCancel { .. }) {
         return DETACHED_SEND_VERSION;
     }
     if matches!(
@@ -1698,7 +1701,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--detach] [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed. --detach (with --when-idle and --once KEY) answers queued at once and muxel keeps the send with nobody waiting (a day by default, --timeout up to 86400); read its outcome with once-status."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID] [--session-id ID] [--once KEY] [--when-idle [--detach] [--timeout SECS]]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. Text already in the agent's composer refuses with draft_present. --force overrides busy, draft and own-pane refusal, but never a launch mismatch. --session-id ID types only while the agent's live terminal confirms that conversation (its session_id in status), checked again just before the paste. --once KEY types TEXT at most once into this pane: a repeat returns the first result and types nothing. --when-idle waits in muxel until the agent can take the prompt (600 seconds by default, --timeout up to 3600), then sends; closing the connection cancels it before anything is typed. --detach (with --when-idle and --once KEY) answers queued at once and muxel keeps the send with nobody waiting (a day by default, --timeout up to 86400); read its outcome with once-status. A detached send and its key survive a muxel restart."
         }
         "once-status" => {
             "usage: muxel ctl once-status AGENT KEY\nShow what became of `send --once KEY` to AGENT, without typing: state unused, pending, queued (a detached send waiting), typing, done with the first reply as result, or dropped (a detached send that ended without typing, its refusal as result)."
@@ -2348,11 +2351,23 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   returns the same reply with `duplicate: true`. Anything that ends it untyped
   (a conversation change, the agent replaced, exiting, closing or put to
   sleep, the timeout, a workspace switch) leaves it `dropped` with that
-  refusal. A closed pane takes its sends with it, and muxel exiting drops
-  them all: after a restart `once-status` answers `unused`. Detached sends
-  don't count toward the eight per muxel, but still take their pane's one
-  place. A pane that isn't running refuses it: wake it first. It needs
-  protocol v6.
+  refusal. A closed pane takes its sends with it. A detached send and its
+  key survive a muxel restart: muxel writes each to disk beside the
+  workspace (its text too, when the send is pinned) before it answers
+  `queued`, and again before the paste. After a restart a pinned send
+  (`--session-id`, no `--launch-id`) that was waiting waits on through its
+  pane's relaunch until its `expires_at`, typing into the first launch it
+  sees once its conversation checks out; `once-status` adds `restored:
+  true`, and `waiting_on: not_running` while the pane isn't running. One
+  that had reached its paste is never typed again: it is `done` with
+  `outcome: interrupted` and `pasted: null`, since muxel can't know whether
+  the paste went in. An unpinned or `--launch-id` send is `dropped` with
+  `launch_mismatch`, `reason: restarted`, and one whose time ran out while
+  muxel was closed with `timed_out`, `reason: restarted`. The `queued` reply,
+  `once-status` and `status` carry `boot_id`, which is new each time muxel
+  starts. Detached sends don't count toward the eight per muxel, but still
+  take their pane's one place. A pane that isn't running refuses it: wake it
+  first. It needs protocol v7.
 - `muxel ctl once-status AGENT KEY` - what became of `send --once KEY` to the
   agent, typing nothing: `state` is `unused` (no send with it typed, so it can
   be sent), `pending` (waiting or about to type), `queued` (a detached send
@@ -2360,10 +2375,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   `expires_at`), `typing` (it may have typed and hasn't finished), `done`, with
   `result` holding its first reply exactly as `send` gave it, or `dropped` (a
   detached send that ended without typing; `result` holds its refusal, and the
-  key can be sent again). Use it to settle a send whose reply was lost.
+  key can be sent again). A detached send's key that came through a restart
+  adds `restored: true`. Use it to settle a send whose reply was lost.
 - `muxel ctl once-cancel AGENT KEY` - withdraw a detached send that hasn't
-  typed: `{"cancelled": true}`, after which it never types and `once-status`
-  reports `dropped` with code `cancelled`. One already typing or finished,
+  typed: `{"cancelled": true}`, answered once the withdrawal is on disk, after
+  which it never types, restart or not, and `once-status` reports `dropped`
+  with code `cancelled`. One already typing or finished,
   or an attached send, answers `{"cancelled": false}` with its `once-status`
   `state` (and `result`). Protocol v6.
 - `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
@@ -2434,9 +2451,10 @@ hosts ignore this caller ID, so check the target when driving one.
 - `blocked` - waiting on a permission or choice prompt; `show` has the `question`.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
-- `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; the user has
-  to open it in muxel.
+- `starting` - launching, or running but nothing drawn on screen yet (for at
+  most a minute after launch). Nothing is typed into it, even with `--force`.
+  `exited` - the program ended. `failed` - it couldn't start. `not_running` -
+  the pane hasn't been started this session; the user has to open it in muxel.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to
@@ -3006,10 +3024,11 @@ mod tests {
     }
 
     /// A host that doesn't know `detach` ignores it and holds the caller's
-    /// connection for the whole wait; one that doesn't know `once_cancel`
-    /// can't withdraw anything. Only the version makes either refuse.
+    /// connection for the whole wait, and one from before v7 forgets the send
+    /// and its key if it restarts; one that doesn't know `once_cancel` can't
+    /// withdraw anything. Only the version makes either refuse.
     #[test]
-    fn a_detached_send_needs_protocol_v6_and_a_key_to_report_it() {
+    fn a_detached_send_needs_protocol_v7_and_a_key_to_report_it() {
         let line = |extra: &[&str]| {
             let mut line = vec!["send", "a", "hi", "--when-idle", "--once", "d-1"];
             line.extend_from_slice(extra);
@@ -3029,8 +3048,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(super::request_version(&send), super::DETACHED_SEND_VERSION);
-        assert_eq!(super::NEWEST_VERSION, super::DETACHED_SEND_VERSION);
+        assert_eq!(super::request_version(&send), super::PERSISTED_SEND_VERSION);
+        assert_eq!(super::NEWEST_VERSION, super::PERSISTED_SEND_VERSION);
         assert!(
             serde_json::to_string(&send)
                 .unwrap()
@@ -3041,7 +3060,7 @@ mod tests {
             r#"{"cmd":"send","agent":"a","text":"hi","once":"d-1","when_idle":true,"detach":true}"#,
         )
         .unwrap();
-        assert_eq!(super::request_version(&raw), super::DETACHED_SEND_VERSION);
+        assert_eq!(super::request_version(&raw), super::PERSISTED_SEND_VERSION);
         // An attached send leaves the field out, so older hosts read it as before.
         let Ok(CliCommand::Request(attached)) = parse_cli(&line(&[])) else {
             panic!("an attached send parses");

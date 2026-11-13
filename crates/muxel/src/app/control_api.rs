@@ -26,14 +26,18 @@ type CtlResult<T> = Result<T, ctl::Error>;
 mod approval;
 mod new;
 mod safe_send;
+mod send_journal;
 pub(super) use approval::PreparedCreation;
 use safe_send::QueueRequest;
 pub(super) use safe_send::{OnceKeys, QueuedSend};
+pub(super) use send_journal::JournalWriter;
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
 #[cfg(all(test, windows))]
 mod safe_send_tests;
+#[cfg(all(test, windows))]
+mod starting_tests;
 #[cfg(all(test, windows))]
 mod startup_reservation_tests;
 
@@ -289,6 +293,9 @@ pub(super) struct Typing {
     /// record (see [`MuxelApp::claude_end_check`]); the check before Enter
     /// still runs.
     end_checked: bool,
+    /// A detached send's key is on disk as typing, so a restart from here
+    /// on never types it again.
+    typing_recorded: bool,
     reply: Value,
 }
 
@@ -1031,7 +1038,7 @@ impl MuxelApp {
                             Err(error) => {
                                 let result = Err(error);
                                 if let Some(key) = typing.once.as_deref() {
-                                    app.control_once.finish(iid, key, &result);
+                                    app.finish_once(iid, key, &result, cx);
                                 }
                                 let _ = reply.send(respond(result));
                             }
@@ -1045,8 +1052,7 @@ impl MuxelApp {
                 // goes, so a repeat asked the moment this is answered sees it.
                 let finish = move |this: &WeakEntity<Self>, cx: &mut AsyncApp, result| {
                     if let Some(key) = once.as_deref() {
-                        let _ =
-                            this.update(cx, |app, _| app.control_once.finish(iid, key, &result));
+                        let _ = this.update(cx, |app, cx| app.finish_once(iid, key, &result, cx));
                     }
                     let _ = reply.send(respond(result));
                 };
@@ -1229,7 +1235,7 @@ impl MuxelApp {
                     });
                 admitted.unwrap_or_else(|error| {
                     if let Some(key) = once.as_deref() {
-                        self.control_once.finish(iid, key, &Err(error.clone()));
+                        self.finish_once(iid, key, &Err(error.clone()), cx);
                     }
                     Answer::Now(Err(error))
                 })
@@ -1239,14 +1245,33 @@ impl MuxelApp {
                     .map(|iid| self.once_status(iid, &key)),
             ),
             // Not a send that can be withdrawn is an answer, not an error, so
-            // a caller can fire it without asking first.
+            // a caller can fire it without asking first. A withdrawal is
+            // answered once it is on disk, so a restart can't bring the send
+            // back.
             Command::OnceCancel { agent, key } => {
-                Answer::Now(self.control_resolve(&agent).map(|iid| {
-                    let cancelled = self.withdraw_detached_send(iid, &key);
-                    let mut status = self.once_status(iid, &key);
-                    status["cancelled"] = json!(cancelled);
-                    status
-                }))
+                let iid = match self.control_resolve(&agent) {
+                    Ok(iid) => iid,
+                    Err(error) => return Answer::Now(Err(error)),
+                };
+                let cancelled = self.withdraw_detached_send(iid, &key, cx);
+                let mut status = self.once_status(iid, &key);
+                status["cancelled"] = json!(cancelled);
+                match self.control_sends_snapshot().filter(|_| cancelled) {
+                    None => Answer::Now(Ok(status)),
+                    Some(snapshot) => {
+                        let writer = self.control_journal.clone();
+                        Answer::Later(Box::new(move || {
+                            writer.write(snapshot).map_err(|error| {
+                                ctl::Error::from(format!(
+                                    "the send was withdrawn, but muxel couldn't record that on \
+                                     disk: if muxel restarts before its next write, the send \
+                                     comes back. {error}"
+                                ))
+                            })?;
+                            Ok(status)
+                        }))
+                    }
+                }
             }
             Command::Answer {
                 agent,
@@ -1357,8 +1382,29 @@ impl MuxelApp {
         ctl::check_self_target(caller_instance_id, iid, force)
     }
 
-    /// What a terminal pane is doing. `None` for editors, diffs and browsers.
+    /// What a terminal pane is doing, as outside control reports it. `None` for
+    /// editors, diffs and browsers. A running pane that hasn't drawn anything
+    /// visible yet is still starting, as its own spinner says: an agent that
+    /// early is still initialising, and a fresh Claude drops an Enter that
+    /// arrives then. The close prompt reads [`Self::program_state`] instead.
     pub(super) fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        let state = self.program_state(inst, cx)?;
+        Some(
+            if matches!(
+                state,
+                AgentState::Idle | AgentState::Done | AgentState::Working | AgentState::Blocked
+            ) && self.terminal_is_loading(inst.id, cx)
+            {
+                AgentState::Starting
+            } else {
+                state
+            },
+        )
+    }
+
+    /// What a terminal pane's program is doing, by its own reports. `None` for
+    /// editors, diffs and browsers.
+    pub(super) fn program_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
         if inst.kind != InstanceKind::Terminal {
             return None;
         }
@@ -1963,6 +2009,7 @@ impl MuxelApp {
             waited_ms: None,
             cancelled: None,
             end_checked: false,
+            typing_recorded: false,
             reply,
         })
     }
@@ -2152,6 +2199,51 @@ impl MuxelApp {
         self.control_typing(iid, input, turn, false, reply, cx)
     }
 
+    /// A detached send's prompt not yet on disk as typing: it must be, before
+    /// its paste, so a restart after the paste never types it again.
+    fn typing_unrecorded(&self, typing: &Typing) -> bool {
+        let withdrawn = typing
+            .cancelled
+            .as_ref()
+            .is_some_and(|gone| gone.load(Ordering::Acquire));
+        matches!(typing.input, Input::Prompt(_))
+            && !typing.typing_recorded
+            && !withdrawn
+            && typing
+                .once
+                .as_deref()
+                .is_some_and(|key| self.control_once.durable(typing.iid, key))
+    }
+
+    /// Put `typing`'s key on disk as typing, then press it: every check
+    /// [`MuxelApp::control_press`] makes runs afresh once the write lands. A
+    /// write that fails types nothing.
+    fn record_typing_then_press(
+        &mut self,
+        mut typing: Typing,
+        at: Option<i64>,
+        deferred: Option<(Arc<ClaimSite>, DeferredClaim)>,
+        cx: &mut Context<Self>,
+    ) -> Task<CtlResult<Value>> {
+        typing.typing_recorded = true;
+        if let Some(key) = typing.once.as_deref() {
+            self.control_once.typing(typing.iid, key);
+        }
+        let written = self.record_control_sends(cx);
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            written.await.map_err(|error| {
+                ctl::Error::from(format!(
+                    "muxel couldn't record the send on disk before typing it, so it typed \
+                     nothing: {error}"
+                ))
+            })?;
+            match this.update(cx, |app, cx| app.control_press(typing, at, deferred, cx)) {
+                Ok(pressed) => pressed.await,
+                Err(_) => Err("muxel is shutting down".into()),
+            }
+        })
+    }
+
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
     /// claim fixed it) or when its Enter lands. Known providers then get a
     /// bounded acceptance check; a writer receipt never proves consumption.
@@ -2167,6 +2259,9 @@ impl MuxelApp {
             Ok(session) => session,
             Err(error) => return Task::ready(Err(error)),
         };
+        if self.typing_unrecorded(&typing) {
+            return self.record_typing_then_press(typing, at, deferred, cx);
+        }
         let Typing {
             iid,
             input_epoch,
@@ -2655,9 +2750,11 @@ fn enter_verdict<T>(
     Ok(())
 }
 
-/// `status` and `panes` replies carry the newest protocol this muxel accepts.
+/// `status` and `panes` replies carry the newest protocol this muxel accepts,
+/// and which muxel process answered.
 fn with_protocol(mut reply: Value) -> Value {
     reply["protocol"] = json!(ctl::NEWEST_VERSION);
+    reply["boot_id"] = json!(safe_send::boot_id());
     reply
 }
 

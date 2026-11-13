@@ -6426,8 +6426,10 @@ pub struct MuxelApp {
     control_failed: bool,
     /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
     control_turns: HashMap<Uuid, control_api::ControlTurn>,
-    /// `send --once` keys, per pane, in memory only.
+    /// `send --once` keys, per pane. Detached sends' keys are also on disk.
     control_once: control_api::OnceKeys,
+    /// Writes the open workspace's record of detached sends.
+    control_journal: control_api::JournalWriter,
     /// `send --when-idle` calls waiting for their pane, one per pane.
     control_queue: HashMap<Uuid, control_api::QueuedSend>,
     /// The terminal binding each pane's stored conversation id was adopted
@@ -8696,6 +8698,7 @@ impl MuxelApp {
             control_failed: false,
             control_turns: HashMap::new(),
             control_once: Default::default(),
+            control_journal: Default::default(),
             control_queue: HashMap::new(),
             control_conversations: HashMap::new(),
             claude_ends: HashMap::new(),
@@ -12318,7 +12321,7 @@ impl MuxelApp {
 
         self.failed_launches.clear();
         self.control_turns.clear();
-        self.refuse_control_queue();
+        self.refuse_control_queue(cx);
         self.control_once.clear();
         self.control_conversations.clear();
         self.claude_ends.clear();
@@ -12404,6 +12407,9 @@ impl MuxelApp {
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
         }
+        // Detached ctl sends from the last time this workspace was open, before
+        // any request can ask about them.
+        self.restore_control_sends(id, cx);
         // Reopen per-monitor project windows for saved assignments whose display
         // is currently connected (a missing monitor keeps the pin for later).
         let assignments: Vec<(Uuid, Uuid)> = self

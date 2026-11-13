@@ -365,6 +365,41 @@ pub fn workspace_doc_path(id: Uuid) -> Option<PathBuf> {
     workspaces_dir().map(|d| d.join(id.to_string()).join("workspace.json"))
 }
 
+/// Path to a workspace's record of detached `ctl send`s, beside its document.
+pub fn send_journal_path(id: Uuid) -> Option<PathBuf> {
+    workspaces_dir().map(|d| d.join(id.to_string()).join("sends.json"))
+}
+
+/// Replace `path` with `bytes` so that it survives a crash or power loss once
+/// this returns: written and flushed to a temporary sibling, renamed over the
+/// target, and on Unix the directory flushed too. On failure the target is
+/// untouched.
+pub fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let written = write_synced(&tmp, bytes, path).and_then(|()| rename_with_retry(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))?;
+    // The rename itself is durable only once the directory is flushed. Windows
+    // has no handle to flush a directory through; NTFS journals the rename.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("flushing {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 /// Path to the workspaces index document.
 pub fn workspaces_index_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspaces.json"))
