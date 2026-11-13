@@ -3,7 +3,7 @@
 use super::{Answer, SendAdmission, check_send_state};
 use crate::app::MuxelApp;
 use gpui::{AppContext as _, Context, Entity, TestAppContext, WindowHandle};
-use muxel_core::control::{self as ctl, AgentState, Command, ErrorCode};
+use muxel_core::control::{self as ctl, Command, ErrorCode};
 use muxel_core::{Instance, PaneNode, Project};
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
 use std::sync::Arc;
@@ -390,8 +390,10 @@ fn a_send_refuses_a_composer_that_holds_a_draft() {
         session.write_input(b"half typed");
         let admission = draft(cx);
         assert!(admission.draft_present);
+        // The shell runs a command, so its status refuses too; the draft alone
+        // is what's under test.
         let idle = SendAdmission {
-            state: Some(AgentState::Idle),
+            refusal: None,
             ..admission
         };
         let refused = check_send_state(idle).unwrap_err();
