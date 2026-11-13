@@ -1767,7 +1767,10 @@ impl MuxelApp {
             status,
             not_running_reason: self.dormant_reason(inst.id).map(str::to_string),
             resumes: self.resumes(inst),
+            last_work_at: inst.activity.last_work_at(),
             status_since: ctl::status_since(&inst.activity),
+            unread: finish_unread(self.shown_status(inst.id, cx), Some(&inst.activity)),
+            pinned: inst.pinned,
             launch_id: ctl::launch_id(
                 status,
                 self.terminals

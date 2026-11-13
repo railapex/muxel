@@ -788,9 +788,23 @@ pub struct AgentInfo {
     /// when asked. Absent while it runs, or when muxel can't tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumes: Option<bool>,
-    /// When the agent last started working, finished or blocked (unix ms).
+    /// When the agent last started working, finished or blocked (unix ms),
+    /// kept through restarts and sleep. A turn the provider reports counts
+    /// as work once the launch has started, whoever submitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_work_at: Option<i64>,
+    /// [`Self::last_work_at`]'s older name, always the same value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
+    /// The pane finished a turn the user hasn't seen: the sidebar shows it as
+    /// an unread finish. Looking at the pane in muxel reads it. Always sent,
+    /// so a reply without it comes from a muxel that doesn't report it.
+    #[serde(default)]
+    pub unread: bool,
+    /// The user pinned the pane's tab. A pinned pane is never put to sleep.
+    /// Always sent, like `unread`.
+    #[serde(default)]
+    pub pinned: bool,
     /// This run of the pane's terminal: a new id each time muxel opens a terminal
     /// for the pane (starting or restarting its program, reconnecting or
     /// recovering its session, reopening its workspace), so a caller can tell
@@ -2571,6 +2585,15 @@ another reads as that.
 `status` and `panes` also report `protocol`, the newest control protocol
 version this muxel accepts. An older muxel leaves it out.
 
+`last_work_at` is when the agent last started working, finished or blocked
+(Unix milliseconds), kept through restarts and sleep. `status_since` is its
+older name, with the same value. `unread` is `true` while the pane has a
+finished turn the user hasn't looked at, the finish muxel's sidebar marks. It
+can be `true` while `status` is `idle`, because `status` is what the program
+reports now. `pinned` is `true` when the user pinned the pane's tab, and a
+pinned pane is never put to sleep. An older muxel leaves `unread` and `pinned`
+out rather than sending `false`.
+
 ## Errors
 
 Creation permission/approval refusals, typing refusals from `send`, `answer` or
@@ -3324,7 +3347,10 @@ mod tests {
             status: Some(AgentState::NotRunning),
             not_running_reason: None,
             resumes: None,
+            last_work_at: None,
             status_since: None,
+            unread: false,
+            pinned: false,
             launch_id: None,
             session_id: None,
             conversation_ended: None,
