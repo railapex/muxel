@@ -1476,7 +1476,10 @@ feature is added or changed, update the matching entry here in the same change**
   row to nest it there, or onto its project's header to make it a row of its
   own. Closing a parent leaves its children open as ordinary rows, unless you
   choose Close with everything under it. A pinned session nests only under a
-  pinned one.
+  pinned one. Click the chevron beside a family's top row to fold the family
+  to that row, with a line under it saying what it hides ("1 asking · 3
+  working · 2 files • 1"); the fold is remembered across restarts, and a jump
+  to a row inside it opens it.
 - **Close a session with everything under it** — in Recent work, right-click a
   session with sessions or files nested under it for **Close with everything
   under it (N)**. It closes the session, the sessions it spawned, and the
@@ -1514,7 +1517,8 @@ feature is added or changed, update the matching entry here in the same change**
   project header shows `? n` asking (amber), `▶ n` working and `• n` unread,
   open or collapsed, so a fold never hides a question. The PROJECTS heading
   totals them for the workspace: click asking or unread to go to the next such
-  session across projects, which opens its collapsed project and folded band.
+  session across projects, which opens its collapsed project, folded band and
+  folded family.
   From 300 px wide the sidebar spells the words out. Ctrl+Shift+A opens what
   hides its target the same way, and like the counts it switches to the
   target's project.

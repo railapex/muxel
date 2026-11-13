@@ -55,6 +55,17 @@ project itself is folded under its header, in the local workspace file across
 restarts, never in the layout doc it shares with other machines and the phone.
 Changing the setting still reaches a band left as it started.
 
+A family folds too. A top-level session with rows under it (child sessions or
+files) has a chevron left of its row. Folded, the family is that one row,
+where it would be, and a line under it says what it hides: its child sessions
+asking (in amber), working, done and idle, its files, and how many of all those
+are unread (`sidebar::FamilyFold`). Clicking the line or the chevron opens it.
+A folded family still sorts by every session in it, so one whose child asks
+sits in Needs you, and a folded band's unread count takes in the families
+folded inside it. Families start open. Each project keeps the families folded
+in it in the local workspace file, and forgets the fold of a session that has
+closed the next time a family is folded or opened.
+
 Bands are calendar days on this machine's clock: Today since local midnight,
 This week the six days before that, Older the rest. A done row's band comes
 from its latest event of any kind, a start, a finish or a question
@@ -283,7 +294,8 @@ The PROJECTS heading carries the workspace's totals: asking, unread and
 working. Clicking asking or unread focuses the next such session after the
 focused one, across projects in sidebar order, wrapping round
 (`sidebar::next_matching`), and opens whatever hid its row: a collapsed
-project and the folded band it sits in, both kept open as if clicked. A count
+project, the folded band it sits in and the folded family it is under, all
+kept open as if clicked. A count
 of zero is disabled. Glyphs fit the default sidebar width; from 300 px the
 words are spelled out. **Focus next agent needing attention** (Ctrl+Shift+A)
 keeps its own order, blocked then unread finished, and in Recent work opens
