@@ -74,6 +74,8 @@ mod control_api;
 #[cfg(test)]
 mod diff_refresh_tests;
 #[cfg(all(test, windows))]
+mod ended_exit_tests;
+#[cfg(all(test, windows))]
 mod first_prompt_size_tests;
 #[cfg(all(test, windows))]
 mod hidden_paint_tests;
@@ -14996,7 +14998,7 @@ impl MuxelApp {
             let mut record = self.last_status.get(&iid).copied();
             let previous_record = record;
             let previous = record.map(|seen| seen.status);
-            let effect = apply_status_sample(
+            let mut effect = apply_status_sample(
                 &mut record,
                 self.workspace
                     .instance_mut(iid)
@@ -15010,6 +15012,12 @@ impl MuxelApp {
                 ),
                 now_epoch,
             );
+            // An abnormal exit is reported once, as "exited unexpectedly"
+            // below. The Done it leaves isn't a finished turn to announce: no
+            // "finished" entry, desktop notification or chime.
+            if exited && exit_code != Some(0) {
+                effect.notify = effect.notify.filter(|kind| *kind != NotifKind::Done);
+            }
             if let Some(record) = record {
                 self.last_status.insert(iid, record);
             }

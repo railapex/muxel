@@ -1410,7 +1410,9 @@ feature is added or changed, update the matching entry here in the same change**
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
   (plus a desktop notification when unattended), and Restart relaunches in place
-  (resuming a resume-capable agent's conversation).
+  (resuming a resume-capable agent's conversation). That error is the only
+  report: the ending isn't also announced as a finished turn, with no "finished"
+  entry, desktop notification or chime. A clean exit still announces one.
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
   is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
