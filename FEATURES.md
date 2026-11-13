@@ -899,9 +899,13 @@ feature is added or changed, update the matching entry here in the same change**
   orchestrating agent such as xAI's Grok Bot, a script, another coding agent — work
   the agents running in muxel through the `muxel ctl` command: list projects, the
   pane layout and every agent (program, model, worktree, focus), see each one's
-  status (working / blocked / done / idle / exited), read its last prompt and last
-  reply, send it a prompt, answer the question it is blocked on, and press keys.
-  Every command prints JSON.
+  status (starting / working / blocked / done / idle / exited), read its last
+  prompt and last reply, send it a prompt, answer the question it is blocked on,
+  and press keys. Every command prints JSON. A pane reads `starting`, with no
+  `launch_id`, until its program has drawn something visible (as its own starting
+  spinner shows), for at most a minute after launch; until then `send`, `keys`
+  and `answer` refuse with `starting`, even with `--force`, since an agent that
+  early is still initialising and a fresh Claude drops an Enter typed then.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
   that project's toolbar preset. Run from one of that project's panes, the tab
   joins the caller's own group; otherwise it joins the focused group.

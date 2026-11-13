@@ -212,8 +212,10 @@ impl MuxelApp {
 
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
         let inst = self.workspace.instance(iid);
+        // The program's own state: a pane that hasn't drawn yet closes as the
+        // state it reports, not as ctl's `starting`.
         let mut state = inst
-            .and_then(|inst| self.control_state(inst, cx))
+            .and_then(|inst| self.program_state(inst, cx))
             .unwrap_or(AgentState::NotRunning);
         let view = self.terminal_view(iid).map(|view| view.read(cx));
         let snapshot = view.map(TerminalView::runtime_snapshot);
