@@ -1994,9 +1994,10 @@ hosts ignore this caller ID, so check the target when driving one.
 - `blocked` - waiting on a permission or choice prompt; `show` has the `question`.
 - `done` - finished its turn; the reply is ready to read.
 - `idle` - alive and waiting for a prompt.
-- `starting` - launching. `exited` - the program ended. `failed` - it couldn't
-  start. `not_running` - the pane hasn't been started this session; the user has
-  to open it in muxel.
+- `starting` - launching, or running but nothing drawn on screen yet (for at
+  most a minute after launch). Nothing is typed into it, even with `--force`.
+  `exited` - the program ended. `failed` - it couldn't start. `not_running` -
+  the pane hasn't been started this session; the user has to open it in muxel.
 
 Each agent also has a `launch_id`, which changes whenever muxel opens a new
 terminal for it: when its program starts or restarts, when muxel reconnects to

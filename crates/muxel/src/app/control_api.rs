@@ -28,6 +28,8 @@ pub(super) use approval::PreparedCreation;
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
 #[cfg(all(test, windows))]
+mod starting_tests;
+#[cfg(all(test, windows))]
 mod startup_reservation_tests;
 
 /// Shared command permission for typing into an existing terminal. This is
@@ -1133,8 +1135,29 @@ impl MuxelApp {
         Ok(iid)
     }
 
-    /// What a terminal pane is doing. `None` for editors, diffs and browsers.
+    /// What a terminal pane is doing, as outside control reports it. `None` for
+    /// editors, diffs and browsers. A running pane that hasn't drawn anything
+    /// visible yet is still starting, as its own spinner says: an agent that
+    /// early is still initialising, and a fresh Claude drops an Enter that
+    /// arrives then. The close prompt reads [`Self::program_state`] instead.
     pub(super) fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+        let state = self.program_state(inst, cx)?;
+        Some(
+            if matches!(
+                state,
+                AgentState::Idle | AgentState::Done | AgentState::Working | AgentState::Blocked
+            ) && self.terminal_is_loading(inst.id, cx)
+            {
+                AgentState::Starting
+            } else {
+                state
+            },
+        )
+    }
+
+    /// What a terminal pane's program is doing, by its own reports. `None` for
+    /// editors, diffs and browsers.
+    pub(super) fn program_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
         if inst.kind != InstanceKind::Terminal {
             return None;
         }
