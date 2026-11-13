@@ -113,6 +113,7 @@ mod sleep;
 #[cfg(all(test, windows))]
 mod sleep_tests;
 mod sound_alerts;
+mod status_badge;
 mod strip_button;
 #[cfg(test)]
 mod transcript_read_tests;
@@ -123,6 +124,7 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
 use restart_guard::{PendingRestarts, RemoteRestartCompletion, RestartLease};
+use status_badge::status_tag;
 use strip_button::StripIconButton;
 
 /// Capture tmux eligibility before removing a pane's metadata. An absent
@@ -820,11 +822,13 @@ fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &
 }
 
 #[cfg(test)]
-mod read_done_contrast_tests {
+mod status_pill_contrast_tests {
     use super::READ_DONE_OPACITY;
+    use super::status_badge::{outline_colors, pill_colors};
     use crate::theme;
     use gpui::{Hsla, Rgba, TestAppContext};
     use gpui_component::{Theme, ThemeRegistry};
+    use muxel_terminal::AgentStatus;
 
     fn luminance(c: Rgba) -> f32 {
         let lin = |v: f32| {
@@ -859,12 +863,14 @@ mod read_done_contrast_tests {
         format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
     }
 
-    /// Every bundled theme keeps a read finish visible: the outline pill's label
-    /// stays at least as legible as the theme's weakest green text, and the
-    /// dimmed icon stays visible yet fainter than an unread one. Set
-    /// `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors for review.
+    /// Every bundled theme keeps status pills legible. Each filled pill's label
+    /// reaches WCAG's 4.5:1 against its fill. A read finish stays visible: the
+    /// outline pill's label stays at least as legible as the theme's weakest
+    /// green text, and the dimmed icon stays visible yet fainter than an unread
+    /// one. Set `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors
+    /// for review.
     #[test]
-    fn read_done_stays_legible_in_every_bundled_theme() {
+    fn status_pills_stay_legible_in_every_bundled_theme() {
         let cx = TestAppContext::single();
         let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
         cx.update(|cx| {
@@ -877,18 +883,36 @@ mod read_done_contrast_tests {
                 .collect();
             assert!(!configs.is_empty());
             let mut rows = Vec::new();
+            let mut unreadable = Vec::new();
             for config in configs {
                 Theme::global_mut(cx).apply_config(&config);
                 let t = Theme::global(cx);
                 let bg = over(t.sidebar, t.background);
                 let on_bg = |c: Hsla| over(c, bg.into());
-                let unread_icon = on_bg(t.success);
-                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
-                let filled = on_bg(t.success);
-                let filled_text = over(t.success_foreground, filled.into());
-                // The read pill's label is the unread icon's green on the sidebar.
-                let (label, read) = (contrast(unread_icon, bg), contrast(read_icon, bg));
                 let name = &config.name;
+                // A filled pill's fill and label as they land on the sidebar.
+                let pill = |status| {
+                    let (fill, label, _) = pill_colors(status, t);
+                    let fill = on_bg(fill);
+                    (fill, over(label, fill.into()))
+                };
+                for status in [
+                    AgentStatus::Working,
+                    AgentStatus::Idle,
+                    AgentStatus::Blocked,
+                    AgentStatus::Done,
+                ] {
+                    let (fill, label) = pill(status);
+                    let ratio = contrast(label, fill);
+                    if ratio < 4.5 {
+                        unreadable.push(format!("{name}: {status:?} pill label {ratio:.2}:1"));
+                    }
+                }
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let (filled, filled_text) = pill(AgentStatus::Done);
+                // The read pill has no fill: its label sits on the sidebar.
+                let read_label = on_bg(outline_colors(AgentStatus::Done, t).1);
+                let (label, read) = (contrast(read_label, bg), contrast(read_icon, bg));
                 assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
                 assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
                 assert!(label > read, "{name}: read icon is not fainter than unread");
@@ -926,6 +950,7 @@ mod read_done_contrast_tests {
                 )
                 .unwrap();
             }
+            assert!(unreadable.is_empty(), "{}", unreadable.join("\n"));
         });
     }
 }
@@ -3963,16 +3988,6 @@ fn preset_icon(preset: &AgentPreset, size: Pixels, color: Hsla) -> Svg {
 /// A preset's icon as a gpui-component [`Icon`] (kind-aware).
 fn preset_icon_obj(preset: &AgentPreset) -> Icon {
     Icon::empty().path(preset_icon_path(preset))
-}
-
-/// A small status pill for an agent.
-fn status_tag(status: AgentStatus, label: String) -> Tag {
-    match status {
-        AgentStatus::Working => Tag::primary().small().child(label),
-        AgentStatus::Idle => Tag::new().small().child(label),
-        AgentStatus::Blocked => Tag::warning().small().child(label),
-        AgentStatus::Done => Tag::success().small().child(label),
-    }
 }
 
 /// Fixed worktree color palette (Tailwind 400s). Deliberately avoids blue/green/
@@ -30988,15 +31003,17 @@ impl MuxelApp {
                         let asleep_tip = asleep.then(|| self.asleep_words(iid));
                         let badge = if loading {
                             status_tag(AgentStatus::Working, t("loading").to_string())
+                                .into_any_element()
                         } else if stopped {
                             status_tag(AgentStatus::Idle, t("stopped").to_string())
+                                .into_any_element()
                         } else if asleep {
-                            self.asleep_pill(iid, cx)
+                            self.asleep_pill(iid, cx).into_any_element()
                         } else {
                             let tag = status_tag(status, label);
                             // A read finish keeps its green as an outline, so
                             // the label stays legible on the sidebar.
-                            if read_done { tag.outline() } else { tag }
+                            if read_done { tag.outline() } else { tag }.into_any_element()
                         };
                         let name_color = if asleep && !finish_unread {
                             cx.theme().muted_foreground
