@@ -29,7 +29,9 @@
 //! never reached. The cast is written either way, holding what was recorded.
 //!
 //! `--hook-log` names a file the provider's own hooks append to, one JSON
-//! object per line with `t_unix_ms` and `name`; each becomes a `hook` event.
+//! object per line with `t_unix_ms` and `name`; each becomes a `hook` event
+//! holding only the fields in `HOOK_FIELDS` (what happened, never a prompt,
+//! tool input, path or id).
 //!
 //! The cast is not sanitized (`"sanitized": false`) and carries no
 //! `out_sha256`: sanitize it, which also hashes it, before it goes anywhere.
@@ -181,7 +183,12 @@ fn run_step(shared: &Shared, session: &TerminalSession, step: &Value) -> anyhow:
     }
 }
 
-/// The provider's hook events, timed against the recording's start.
+/// The hook fields a cast keeps: what happened, never what was said. Anything
+/// else a provider writes (a prompt, tool input, a path, an id) is dropped.
+const HOOK_FIELDS: &[&str] = &["name", "source", "reason", "tool_name", "notification_type"];
+
+/// The provider's hook events, timed against the recording's start, holding
+/// only [`HOOK_FIELDS`].
 fn hook_events(path: &PathBuf, started_unix_ms: u64) -> anyhow::Result<Vec<(u64, Value)>> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(Vec::new());
@@ -192,11 +199,9 @@ fn hook_events(path: &PathBuf, started_unix_ms: u64) -> anyhow::Result<Vec<(u64,
         let at = record
             .remove("t_unix_ms")
             .and_then(|at| at.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("hook line without t_unix_ms: {line}"))?;
-        anyhow::ensure!(
-            record.contains_key("name"),
-            "hook line without name: {line}"
-        );
+            .ok_or_else(|| anyhow::anyhow!("hook line without t_unix_ms"))?;
+        record.retain(|field, _| HOOK_FIELDS.contains(&field.as_str()));
+        anyhow::ensure!(record.contains_key("name"), "hook line without name");
         events.push((at.saturating_sub(started_unix_ms), Value::Object(record)));
     }
     Ok(events)

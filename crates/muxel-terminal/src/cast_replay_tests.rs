@@ -836,28 +836,135 @@ fn personal_detail(text: &str) -> Option<String> {
     None
 }
 
+/// Every key and string inside `value`, walked whole.
+fn strings_in(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items.iter().for_each(|item| strings_in(item, out)),
+        Value::Object(map) => {
+            for (key, item) in map {
+                out.push(key.clone());
+                strings_in(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Where in `cast` the first personal detail sits, and what it is. Reads every
+/// string in the header and in every event that isn't bytes (mark notes and
+/// truth, hook fields), and each byte stream joined, so nothing hides across a
+/// read boundary. It reads bytes, not the drawn screen: text a program
+/// assembles with cursor moves isn't seen whole.
+fn personal_detail_in(cast: &Cast) -> Option<(String, String)> {
+    let mut places: Vec<(String, Vec<String>)> = Vec::new();
+    let mut header = Vec::new();
+    strings_in(&Value::Object(cast.header.clone()), &mut header);
+    places.push(("header".to_string(), header));
+    for stream in ["out", "in", "reply"] {
+        let bytes: Vec<u8> = cast
+            .events
+            .iter()
+            .filter(|(_, kind, _)| kind == stream)
+            .flat_map(|(_, _, payload)| decode_bytes(payload))
+            .collect();
+        places.push((
+            format!("{stream} stream"),
+            vec![String::from_utf8_lossy(&bytes).into_owned()],
+        ));
+    }
+    for (t, kind, payload) in &cast.events {
+        if !matches!(kind.as_str(), "out" | "in" | "reply") {
+            let mut texts = Vec::new();
+            strings_in(payload, &mut texts);
+            places.push((format!("{kind} at {t}"), texts));
+        }
+    }
+    places.into_iter().find_map(|(place, texts)| {
+        texts
+            .iter()
+            .find_map(|text| personal_detail(text))
+            .map(|found| (place, found))
+    })
+}
+
 /// Nothing personal reaches the repo: no home directory, email address or
-/// real session id in any payload or launch argument. Casts use one fixed
-/// placeholder id where a provider prints a session id.
+/// real session id anywhere in a cast. Casts use one fixed placeholder id
+/// where a provider prints a session id.
 #[test]
 fn casts_hold_no_personal_data() {
     for cast in repo_casts() {
-        let mut texts = vec![serde_json::to_string(&cast.header["launch"]).unwrap_or_default()];
-        // Each stream joined, so nothing hides across a read boundary.
-        for stream in ["out", "in", "reply"] {
-            let bytes: Vec<u8> = cast
-                .events
-                .iter()
-                .filter(|(_, kind, _)| kind == stream)
-                .flat_map(|(_, _, payload)| decode_bytes(payload))
-                .collect();
-            texts.push(String::from_utf8_lossy(&bytes).into_owned());
+        if let Some((place, found)) = personal_detail_in(&cast) {
+            panic!("{}: personal data in the {place}: {found}", cast.name);
         }
-        for text in &texts {
-            if let Some(found) = personal_detail(text) {
-                panic!("{}: personal data: {found}", cast.name);
-            }
-        }
+    }
+}
+
+/// The scan reads every part of a cast: an id planted in any one of them is
+/// found and its place named.
+#[test]
+fn the_personal_data_scan_reads_every_part_of_a_cast() {
+    const ID: &str = "0123abcd-4567-7890-abcd-ef0123456789";
+    let clean = || Cast {
+        name: "canary".to_string(),
+        header: serde_json::from_value(serde_json::json!({
+            "provider": "claude", "launch": ["--model", "sonnet"], "recorded": "2026-11-12",
+        }))
+        .expect("header"),
+        events: vec![
+            (0, "out".to_string(), Value::from("hello ")),
+            (1, "out".to_string(), Value::from("world")),
+            (2, "in".to_string(), Value::from("x")),
+            (3, "reply".to_string(), Value::from("\x1b[?6c")),
+            (4, "hook".to_string(), serde_json::json!({ "name": "Stop" })),
+            (
+                5,
+                "mark".to_string(),
+                serde_json::json!({ "id": "m", "by": "hand", "truth": {} }),
+            ),
+        ],
+    };
+    assert_eq!(personal_detail_in(&clean()), None);
+    // Split so that only the joined stream holds a whole id.
+    const SPLIT: usize = 10;
+    assert!(personal_detail(&ID[..SPLIT]).is_none() && personal_detail(&ID[SPLIT..]).is_none());
+    /// Where an id is planted, and how.
+    type Plant = (&'static str, fn(&mut Cast));
+    let plants: [Plant; 9] = [
+        ("header", |c| {
+            c.header.insert("recorded".into(), ID.into());
+        }),
+        ("header", |c| {
+            c.header
+                .insert("launch".into(), serde_json::json!(["--resume", ID]));
+        }),
+        ("header", |c| {
+            c.header.insert(ID.into(), Value::Bool(true));
+        }),
+        ("out stream", |c| {
+            c.events[0].2 = Value::from(&ID[..SPLIT]);
+            c.events[1].2 = Value::from(&ID[SPLIT..]);
+        }),
+        ("in stream", |c| c.events[2].2 = Value::from(ID)),
+        ("reply stream", |c| c.events[3].2 = Value::from(ID)),
+        ("hook at 4", |c| {
+            c.events[4].2 = serde_json::json!({ "name": "Stop", "prompt": ID });
+        }),
+        ("mark at 5", |c| {
+            c.events[5].2["note"] = Value::from(format!("seen in {ID}"));
+        }),
+        ("mark at 5", |c| {
+            c.events[5].2["truth"] = serde_json::json!({ "draft": ID });
+        }),
+    ];
+    for (place, plant) in plants {
+        let mut cast = clean();
+        plant(&mut cast);
+        assert_eq!(
+            personal_detail_in(&cast).map(|(at, _)| at).as_deref(),
+            Some(place),
+            "an id planted in the {place}"
+        );
     }
 }
 
@@ -873,15 +980,15 @@ fn the_personal_data_scan_catches_each_kind() {
     assert!(personal_detail(r"D:\work\demo · @filename").is_none());
 }
 
-/// Sanitizing must not change a single verdict. Run from a checkout that can
-/// see the unsanitized casts: `MUXEL_RAW_CASTS` names a folder whose
+/// Sanitizing must not change a single verdict. Run it where the unsanitized
+/// casts are (`--include-ignored`): `MUXEL_RAW_CASTS` names a folder whose
 /// subfolders hold `raw.cast.jsonl` files; one whose header `name` gives a
-/// repo cast's file name is compared with it. Skipped when it isn't set.
+/// repo cast's file name is compared with it.
 #[test]
+#[ignore = "needs MUXEL_RAW_CASTS: the unsanitized casts never enter the repo"]
 fn sanitizing_changes_no_verdict() {
-    let Some(root) = std::env::var_os("MUXEL_RAW_CASTS") else {
-        return;
-    };
+    let root = std::env::var_os("MUXEL_RAW_CASTS")
+        .expect("MUXEL_RAW_CASTS names the folder of unsanitized casts");
     let repo: std::collections::HashMap<_, _> = repo_casts()
         .into_iter()
         .map(|cast| (format!("{}.cast.jsonl", cast.name), cast))
