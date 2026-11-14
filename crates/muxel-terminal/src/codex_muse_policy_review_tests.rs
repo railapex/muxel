@@ -89,8 +89,13 @@ impl Probe {
     }
 }
 
+/// Ends the fixture's processes when the test leaves, and on Windows waits
+/// until `more` is gone too (`test_reap`).
 impl Drop for Probe {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        crate::test_reap::end_and_wait(&self.session);
+        #[cfg(unix)]
         self.session.kill();
     }
 }

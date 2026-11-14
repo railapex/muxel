@@ -29,6 +29,8 @@ mod replies;
 mod search;
 mod session;
 mod startup;
+#[cfg(all(test, windows))]
+mod test_reap;
 mod view;
 
 pub use colors::TerminalPalette;
