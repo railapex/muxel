@@ -456,6 +456,96 @@ a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
 
+Background work is read from the same screen. Claude and Grok detection depends
+on the supported footer/panel layouts and wording. Claude 2.1.318's footer lists it live
+in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
+clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
+a finished turn's `1 shell still running` row stays on screen after the shell ends, so
+an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
+the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
+is a scheduled wake, not running work. Codex 0.167.0's terminal badge sits directly
+above the composer and includes `/ps` and `/stop` hints. Its report already stays
+Working while a background terminal runs; the screen adds the listed shell count.
+Codex status capture excludes the column-zero composer through its independently
+recognized model/shortcut footer, even when the cursor is hidden. Indented pasted
+screens stay inside that draft. Terminal soft-wrap flags and up to nine contiguous
+provider word-wrapped rows reconstruct the badge. A missing composer or incomplete
+badge is unreadable, not a confirmed empty footer; once chrome has been recognized,
+unreadable frames retain the last confirmed shell count without establishing a
+subagent hold. Provider-owned foreground Working remains authoritative. Unsupported
+footer/composer layouts, wording or locale changes can require new fixtures.
+Muse 1.4.14 lists running terminals in the tree below the lower composer rule.
+Its earlier `Backgrounded` message remains after a task ends and is not live work.
+The tree's explicit `running` column identifies work independently of its animated
+glyph. Muse can leave its last Working title after a completed reply and task.
+With a Done hook, five seconds without output or a title update retires that
+cached title. Its generation remains retired through later screen redraws; a new
+title generation or Working hook restores the normal title authority.
+
+Codex's parent can finish while a spawned agent runs. Its `Started`, `/subagents`
+and `Completed` output is history, so local panes use child rollout records instead.
+A shared worker discovers new dated files through filesystem notifications,
+uses directory stamps as a backstop, caches their `parent_thread_id`, and
+reads matching children forward in bounded chunks. `subagent_history_start_ordinal`
+excludes copied parent events; a matching `task_complete` or `turn_aborted` ends
+the child's own `task_started` turn. Incomplete records wait for their newline.
+Rollout reads share a 2 MiB allowance and a cooperative 50 ms deadline across all
+stores in one worker refresh, checked between chunks of at most 256 KiB. Each pending
+record is capped at 1 MiB. Catch-up, a partial JSONL record or an I/O error reports
+uncertainty separately from a current result with no active child. The first request
+is pending until its worker returns. Guarded pending child evidence can withhold
+completion without inventing a running count; later refreshes continue from the
+cached byte offset. Shell-chrome uncertainty is separate and cannot confirm child
+work. Unconfirmed holds are not new activity or completion edges. Plain `ctl wait`
+follows the hold until the evidence is current or the cap expires. A current-binding
+background turn end remains observable to `--turn`. Ordinary sends additionally need
+an attributable status, so unconfirmed child catch-up does not free the composer.
+Foreground working/blocked markers prevent fallback evidence from becoming that
+background-only exception.
+Directory discovery, retained-file metadata checks and notification setup also cost
+work outside that read allowance, so it is not a hard wall-clock limit for the worker.
+Results are guarded by parent session, launch and binding. Only child turns
+started during that pane launch count, so a restarted pane does not
+inherit abandoned work. A historical child thread resumed after a restart may
+be unobserved; remote child files are not read. File and record format changes can disable
+this source; terminal footer layout changes can disable the screen sources. Only
+local direct children are aggregated. Remote and deeper descendants, compressed
+rollouts and metadata/lifecycle records over 1 MiB are outside this reader's coverage.
+
+Only subagents hold an observably finished foreground turn, for at most three
+hours, including guarded uncertainty while child records catch up. Shell and monitor
+listings remain metadata and do not delay Done. Listed work can remain after expiry
+and still makes close busy. A turn released by its cap or missing-listing grace
+cannot be held again by redraws or stale evidence without fresh foreground work.
+A new foreground turn starts its own clock when observed ending, including a turn
+whose Working and completion arrive in one batch. A replacement conversation owns
+a separate binding. Once all relevant subagent sources are current and clear, the
+hold releases after the five-second wake grace, bounded by the same three-hour cap.
+
+Plain `ctl wait` follows a subagent hold rather than returning at the foreground
+turn's end. Shell and monitor metadata do not delay it. `ctl wait --turn` stops at
+an observable turn end with
+background work still listed. It cannot override a provider's continuing Working
+report. Send admission and the background turn-end decision require the hold's
+binding revision to match the current conversation. Send admission also requires
+an attributable status, so a listing never admits input while a switch settles or
+the screen is held after one, including unconfirmed child reads. Completion
+attribution remains separate from the turn end that `--turn` observes. Foreground
+working/blocked markers prevent the background-only send exception. Legacy
+foreground-command rows retain their Working refusal. Cached holds from before
+reconciliation or a previous binding cannot authorize input or finish a wait.
+
+A held turn publishes no completion. The report that started the hold would otherwise
+stamp the pane as finished. The release is its own status change. A surviving shell listing
+after `/clear` is metadata and creates no foreground turn or completion. A surviving
+subagent hold after a conversation switch cannot admit sends until its status is
+attributable to the new binding. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
+but fires only at turn end, so it can't see work ending between turns, and it needs a
+helper on the host.
+
 ## Popout refresh
 
 Popout roots observe their pane entity for title, status and content, and the

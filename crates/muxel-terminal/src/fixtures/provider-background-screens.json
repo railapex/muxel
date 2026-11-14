@@ -1,0 +1,13 @@
+{
+  "codex": {
+    "one": ">_ OpenAI Codex (v0.167.0)\n\n• STARTED\n\n  Worked for 18s • 07:55\n\n  1 background terminal running · /ps to view · /stop to close\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 98% left · [project]\n  ← for agents · ? for shortcuts",
+    "two": ">_ OpenAI Codex (v0.167.0)\n\n• STARTED\n\n  Worked for 16s • 07:56\n\n  2 background terminals running · /ps to view · /stop to close\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 98% left · [project]\n  ← for agents · ? for shortcuts",
+    "stopped": ">_ OpenAI Codex (v0.167.0)\n\n• Stopping all background terminals.\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 98% left · [project]\n  ← for agents · ? for shortcuts",
+    "subagent": ">_ OpenAI Codex (v0.167.0)\n\n• Started `/root/sleep`\n\n• STARTED\n\n  Worked for 6s • 07:57\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 97% left · [project] · Main [default]\n  ← for agents · ? for shortcuts",
+    "none": "/ps\n\nBackground terminals\n\n  • No background terminals running.\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 97% left · [project]\n  ← for agents · ? for shortcuts"
+  },
+  "muse": {
+    "running": "  Muse Code 1.4.14\n\n❯ Run pwsh -NoProfile -Command \"Start-Sleep 90\" as a background task. Reply STARTED immediately; do not wait, poll, or stop it.\n\n◆ Backgrounded · Start background sleep task · 1.1s · ctrl+o\n\n  (↓ to view terminals)\n\n◆ STARTED\n\n── Voice input (Alt+V to start) ─────────────────────────────────────────────────────────────────────────\n❯\n──────────────────────────────────────────────────────────────────────────────────────────────────────\nmain · ↓ to select\n└ ◇ Start background sleep task  running                                                           13s\n  muse-wonder-full-1.0 · low · [project] · ctx 4%",
+    "ended": "  Muse Code 1.4.14\n\n❯ Run pwsh -NoProfile -Command \"Start-Sleep 90\" as a background task. Reply STARTED immediately; do not wait, poll, or stop it.\n\n◆ Backgrounded · Start background sleep task · 1.1s · ctrl+o\n\n  (↓ to view terminals)\n\n◆ STARTED\n\n◆ Finished · Start background sleep task · ✓ · ctrl+o\n\n◆ Background task completed (exit 0).\n\n◆ Worked for 1m 47s · 8:03 AM · 8/Nov\n\n── Voice input (Alt+V to start) ─────────────────────────────────────────────────────────────────────────\n❯\n──────────────────────────────────────────────────────────────────────────────────────────────────────\n  muse-wonder-full-1.0 · low · [project] · ctx 4%"
+  }
+}
