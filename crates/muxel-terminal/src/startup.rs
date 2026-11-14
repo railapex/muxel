@@ -1394,16 +1394,17 @@ mod tests {
         assert!(sample.codex_ctl_origin().is_none(), "nonuniform grid");
     }
 
-    /// Every empty Codex box the cast harness recorded, cut from the casts'
-    /// screens: 0.164.0 on a display-name model (codex-0.164.0-windows-question,
-    /// `idle`), and 0.167.2 on the default and on that model
-    /// (codex-0.167.2-windows-composer-tour, `idle-first`), whose status line
-    /// ends with `← for agents` while the box is empty.
+    /// Every empty Codex box in recorded Codex sessions, cut from their
+    /// screens: 0.164.0 on a display-name model, and 0.167.2 on the default
+    /// model and on that display name, whose status line ends with
+    /// `← for agents` while the box is empty. The paths stand in for the
+    /// recorded ones at the same length, so 0.164.0's status line still cuts
+    /// its path where Codex did.
     #[test]
     fn every_recorded_empty_codex_box_is_found_and_reads_empty() {
         let welcome = "
   >_ OpenAI Codex (v0.167.2)
-     D:\\tmp\\cast\\demo
+     C:\\work\\demo-app
 
   To get started, describe a task or try one of these commands:
 
@@ -1419,27 +1420,27 @@ mod tests {
             (
                 "
   >_ OpenAI Codex (v0.164.0)
-     D:\\dev\\cast-fixture-folder1\\.wip\\demo-project-000000000000000002\\project
+     C:\\work\\example-workspace\\nested\\demo-project-000000000000000002\\project
 
   Tip: Use the desktop app. Install it from https://chatgpt.com/codex?app-landing-page=true and run codex app.
 
 
 › Ask Codex to do anything
 
-  Daybreak Blue low · D:\\dev\\cast-fixture-folder1\\.wip\\demo-project-000000000000000002\\proj…  ⚠ 2 warnings · f2 to view
+  Daybreak Blue low · C:\\work\\example-workspace\\nested\\demo-project-000000000000000002\\proj…  ⚠ 2 warnings · f2 to view
 "
                 .to_string(),
                 7,
             ),
             (
                 format!(
-                    "{welcome}› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 100% left · D:\\tmp\\cast\\demo · ← for agents\n"
+                    "{welcome}› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 100% left · C:\\work\\demo-app · ← for agents\n"
                 ),
                 13,
             ),
             (
                 format!(
-                    "{welcome}› Ask Codex to do anything\n\n  Daybreak Blue low · Context 100% left · D:\\tmp\\cast\\demo · ← for agents\n"
+                    "{welcome}› Ask Codex to do anything\n\n  Daybreak Blue low · Context 100% left · C:\\work\\demo-app · ← for agents\n"
                 ),
                 13,
             ),
@@ -1452,7 +1453,7 @@ mod tests {
         // The same tour with a draft: the hint is gone.
         let draft = screen(
             &format!(
-                "{welcome}› fix the login bug\n\n  Daybreak Blue low · Context 100% left · D:\\tmp\\cast\\demo\n"
+                "{welcome}› fix the login bug\n\n  Daybreak Blue low · Context 100% left · C:\\work\\demo-app\n"
             ),
             13,
             19,
@@ -1465,9 +1466,9 @@ mod tests {
         for footer in [
             "  Daybreak Blue low · scratch",
             "  Daybreak Blue xhigh fast · scratch",
-            "  Daybreak Blue default · Context 100% left · D:\\tmp\\demo",
-            "  GPT-6.1-Sol high · Context 100% left · D:\\dev\\scratch · scratch · main",
-            "  GPT-6.1-Sol low · Context 100% left · D:\\tmp\\demo · ← for agents",
+            "  Daybreak Blue default · Context 100% left · C:\\work\\app",
+            "  GPT-6.1-Sol high · Context 100% left · C:\\src\\scratch · scratch · main",
+            "  GPT-6.1-Sol low · Context 100% left · C:\\work\\app · ← for agents",
             "  o4-mini medium · scratch · Context 0% used",
             "  o3 · scratch",
             "  llama3.1:8b · ~/src/webapp",
