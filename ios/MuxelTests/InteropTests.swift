@@ -245,6 +245,31 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(decoded.displayName, "Generated title")
     }
 
+    func testStartingLabelSurvivesWriteBackAndYieldsToAgentTitle() throws {
+        let json = #"{ "id": "aaaa", "project_id": "p", "title": "Claude", "label": "build 21246" }"#
+        var instance = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(instance.displayName, "build 21246")
+        instance.autoName = "Current agent topic"
+        XCTAssertEqual(instance.displayName, "Current agent topic")
+        let data = try MuxelJSON.encoder.encode(instance)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["label"] as? String, "build 21246")
+        let restored = try MuxelJSON.decoder.decode(Instance.self, from: data)
+        XCTAssertEqual(restored.label, "build 21246")
+        XCTAssertEqual(restored.displayName, "Current agent topic")
+        instance.customName = "Manual name"
+        XCTAssertEqual(instance.displayName, "Manual name")
+        instance.autoName = "A newer topic"
+        XCTAssertEqual(instance.displayName, "Manual name")
+
+        let legacy = try MuxelJSON.decoder.decode(Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Claude", "custom_name": "Old custom" }"#.utf8))
+        XCTAssertNil(legacy.label)
+        XCTAssertEqual(legacy.displayName, "Old custom")
+        let legacyData = try MuxelJSON.encoder.encode(legacy)
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        XCTAssertNil(legacyObject["label"])
+    }
+
     func testInstanceSessionPathRoundTrips() throws {
         // The desktop's saved Codex rollout path must survive an iOS write-back,
         // or the desktop's next restore has to look the conversation up again.

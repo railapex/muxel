@@ -15,6 +15,7 @@ use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use anyhow::Context as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -9532,6 +9533,11 @@ impl MuxelApp {
     /// (Not `last_status`: that's re-derived from the live terminal every tick and
     /// only feeds transition notifications, so a stale previous value is harmless.)
     fn reset_terminal_runtime(&mut self, iid: Uuid) {
+        if let Some(instance) = self.workspace.instance_mut(iid)
+            && instance.reset_auto_name_for_launch()
+        {
+            self.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+        }
         // A respawn replaces any exited view; its next exit is a fresh event.
         self.exit_logged.remove(&iid);
         // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
@@ -13458,6 +13464,14 @@ impl MuxelApp {
                     .instances
                     .iter()
                     .filter_map(|instance| {
+                        if instance
+                            .label
+                            .as_deref()
+                            .is_some_and(|label| !label.trim().is_empty())
+                            && this.terminal_view(instance.id).is_none()
+                        {
+                            return None;
+                        }
                         let remote = this
                             .workspace
                             .project(instance.project_id)
@@ -14036,6 +14050,10 @@ impl MuxelApp {
         let names: Vec<(Uuid, Option<String>, Option<String>)> = self
             .terminals
             .iter()
+            .chain(
+                popout_terminal_views(&self.terminals, &self.popouts, PopOut::terminal_view)
+                    .map(|(iid, _, terminal)| (iid, terminal)),
+            )
             .filter(|(iid, _)| !self.is_closing(**iid))
             .map(|(iid, view)| {
                 let view = view.read(cx);
@@ -24495,11 +24513,17 @@ impl MuxelApp {
                 .workspace
                 .project(instance.project_id)
                 .is_some_and(Project::is_remote);
-            let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
-            let program_name = self
-                .terminals
-                .get(&iid)
-                .and_then(|v| v.read(cx).program_auto_title());
+            let terminal = self.terminal_view(iid);
+            if instance
+                .label
+                .as_deref()
+                .is_some_and(|label| !label.trim().is_empty())
+                && terminal.is_none()
+            {
+                return instance.display_name().to_string().into();
+            }
+            let live_title = terminal.and_then(|v| v.read(cx).title());
+            let program_name = terminal.and_then(|v| v.read(cx).program_auto_title());
             if let Some(name) = authoritative_terminal_auto_title(
                 instance,
                 &self.codex_session_names,
@@ -27686,7 +27710,7 @@ impl MuxelApp {
                             self.terminal_launching.contains_key(&iid),
                         )
                     });
-                    let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
+                    let (agent_title, status) = if let Some(view) = self.terminal_view(iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
@@ -27705,8 +27729,7 @@ impl MuxelApp {
                                     live_title.as_deref(),
                                     program_name.as_deref(),
                                 )
-                            })
-                            .unwrap_or(meta),
+                            }),
                             shown_terminal_status(
                                 view,
                                 inst,
@@ -27714,12 +27737,15 @@ impl MuxelApp {
                             ),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
-                        (ed.read(cx).title(), AgentStatus::Idle)
+                        (Some(ed.read(cx).title()), AgentStatus::Idle)
                     } else if let Some(bv) = self.browsers.get(&iid) {
-                        (bv.read(cx).tab_title(), AgentStatus::Idle)
+                        (Some(bv.read(cx).tab_title()), AgentStatus::Idle)
                     } else {
-                        (meta, AgentStatus::Idle)
+                        (None, AgentStatus::Idle)
                     };
+                    let tooltip =
+                        inst.and_then(|instance| instance.name_tooltip(agent_title.as_deref()));
+                    let app_title = agent_title.unwrap_or(meta);
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
                     let read_done = done_is_read(status, inst.map(|i| &i.activity));
@@ -27786,6 +27812,12 @@ impl MuxelApp {
                         .into_any_element()
                     } else {
                         base.cursor_pointer()
+                            .when_some(tooltip, |row, tooltip| {
+                                row.tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                        .build(window, cx)
+                                })
+                            })
                             // Focus on click (mouse-up), not mouse-down: focusing
                             // the terminal during a press on a draggable row gets
                             // reset by the drag/release handling, so the pane would

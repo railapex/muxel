@@ -11,6 +11,130 @@ fn words(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn ctl_starting_label_yields_to_agent_title() {
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let options = NewOptions {
+        name: Some("build 21246".into()),
+        ..Default::default()
+    };
+    let mut instance = options
+        .instance(&project, &[AgentPreset::claude()], 0)
+        .unwrap();
+    assert_eq!(instance.display_name(), "build 21246");
+    assert!(instance.update_auto_name("Card 21246 rental agreements".into()));
+    assert_eq!(instance.display_name(), "Card 21246 rental agreements");
+}
+
+#[test]
+fn fixed_name_wire_mode_and_cli_alternatives_are_explicit() {
+    use muxel_core::control::Command;
+    let CliCommand::Request(Command::New { options, .. }) =
+        parse_cli(&words(&["new", "repo", "--name-fixed", "stable name"])).unwrap()
+    else {
+        panic!()
+    };
+    assert!(options.name_fixed);
+    assert_eq!(options.name.as_deref(), Some("stable name"));
+    let json = serde_json::to_value(&options).unwrap();
+    assert_eq!(
+        json["name"], "stable name",
+        "older hosts still receive the sticky name"
+    );
+    assert_eq!(json["name_fixed"], true);
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let mut instance = options
+        .instance(&project, &[AgentPreset::claude()], 0)
+        .unwrap();
+    instance.update_auto_name("Agent's newer topic".into());
+    assert_eq!(instance.display_name(), "stable name");
+    for args in [
+        words(&["new", "repo", "--name", "a", "--name-fixed", "b"]),
+        words(&["new", "repo", "--name-fixed", "a", "--name", "b"]),
+        words(&["new", "repo", "--name-fixed"]),
+    ] {
+        assert!(parse_cli(&args).is_err());
+    }
+    let missing_name: NewOptions =
+        serde_json::from_value(serde_json::json!({"name_fixed":true})).unwrap();
+    assert!(missing_name.validate().is_err());
+    let legacy: NewOptions = serde_json::from_value(serde_json::json!({"name":"initial"})).unwrap();
+    assert!(!legacy.name_fixed);
+}
+
+#[test]
+fn persisted_labels_wait_for_a_title_from_the_new_launch() {
+    let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+    instance.label = Some("starting label".into());
+    for invalid in ["  ", "00000000-0000-0000-0000-000000000000"] {
+        instance.auto_name = Some(invalid.into());
+        assert_eq!(instance.display_name(), "starting label");
+    }
+    instance.update_auto_name("Saved previous title".into());
+    let json = serde_json::to_value(&instance).unwrap();
+    assert_eq!(json["label"], "starting label");
+    let mut restored: Instance = serde_json::from_value(json).unwrap();
+    assert!(restored.reset_auto_name_for_launch());
+    assert_eq!(restored.display_name(), "starting label");
+    assert!(
+        restored.update_auto_name("Saved previous title".into()),
+        "even the same title must be newly observed"
+    );
+    assert_eq!(restored.display_name(), "Saved previous title");
+    restored.custom_name = Some("manual name".into());
+    assert_eq!(restored.display_name(), "manual name");
+    assert_eq!(
+        restored
+            .name_tooltip(Some("Current agent title"))
+            .as_deref(),
+        Some("Current agent title\nstarting label")
+    );
+
+    instance.label = None;
+    assert!(!instance.reset_auto_name_for_launch());
+    assert_eq!(instance.display_name(), "Saved previous title");
+    instance.custom_name = Some("legacy custom name".into());
+    let json = serde_json::to_value(&instance).unwrap();
+    assert!(json.get("label").is_none());
+    let legacy: Instance = serde_json::from_value(json).unwrap();
+    assert_eq!(legacy.display_name(), "legacy custom name");
+}
+
+#[test]
+fn ctl_resolves_retained_labels_without_duplicate_alias_candidates() {
+    use muxel_core::control::{AgentEntry, resolve_agent};
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let entries = [
+        AgentEntry {
+            id: a,
+            name: "Current topic",
+            label: Some("build 21246"),
+            project: "repo",
+        },
+        AgentEntry {
+            id: b,
+            name: "build 21246",
+            label: Some("build 21246"),
+            project: "other",
+        },
+    ];
+    assert_eq!(resolve_agent("Current topic", &entries, None), Ok(a));
+    assert_eq!(resolve_agent("repo/build-21246", &entries, None), Ok(a));
+    assert_eq!(resolve_agent("other/build 21246", &entries, None), Ok(b));
+    assert!(resolve_agent("build 21246", &entries, None).is_err());
+    assert_eq!(resolve_agent(&a.to_string(), &entries, None), Ok(a));
+}
+
+#[test]
+fn ctl_naming_help_explains_starting_and_fixed_modes() {
+    let help = muxel_core::control::command_help("new").unwrap();
+    for text in ["--name-fixed", "starting label", "resolvable"] {
+        assert!(help.contains(text), "{help}");
+    }
+    assert!(muxel_core::control::skill("muxel").contains("--name-fixed"));
+}
+
+#[test]
 fn outside_creation_origin_survives_restore_and_local_duplicates_get_ui_policy() {
     let project = Project::new("repo", std::env::current_dir().unwrap());
     let preset = AgentPreset::codex();
