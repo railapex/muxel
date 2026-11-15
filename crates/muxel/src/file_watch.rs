@@ -658,6 +658,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&linked);
     }
 
+    /// Take all the news so far, and any still on its way: write a record
+    /// into `marks`, which `barrier` watches, and take news until its hit
+    /// arrives. One inotify instance reports its events in order, so
+    /// nothing from before the write comes after it.
+    fn drain_through(
+        watch: &FileWatch,
+        signal: &async_channel::Receiver<()>,
+        barrier: WatchId,
+        marks: &Path,
+    ) -> Vec<(WatchId, Change)> {
+        let pane = Uuid::new_v4();
+        std::fs::write(marks.join(format!("{pane}.json")), "{}").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut drained = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "the barrier's record never came");
+            if signal.try_recv().is_err() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let news = watch.take().changes;
+            let through = news
+                .iter()
+                .any(|(from, change)| *from == barrier && change.hits.contains(&pane));
+            drained.extend(news);
+            if through {
+                return drained;
+            }
+        }
+    }
+
+    /// A tracked folder removed and made again before the pane re-plans:
+    /// the plan after lists the same folders as before, and an edit in the
+    /// new one still wakes the pane. inotify dropped the old one's watch.
+    #[test]
+    fn a_tracked_folder_back_before_the_re_plan_is_watched_through_the_platform_watcher() {
+        let repo = TestRepo::init();
+        repo.commit(&[("top.txt", ""), ("src/lib.rs", "")], "seed");
+        let root = repo.path();
+        let spec = || {
+            let plan = diff_plan(root).expect("a work tree");
+            diff_sources(root, &plan).expect("watchable")
+        };
+        let (mut watch, signal) = FileWatch::start().unwrap();
+        let id = watch.register(spec()).unwrap();
+        let marks = short_temp_path();
+        std::fs::create_dir_all(&marks).unwrap();
+        let barrier = watch.register(claude_records(&marks)).unwrap();
+        let src = root.join("src");
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "").unwrap();
+        let drained = drain_through(&watch, &signal, barrier, &marks);
+        let back = drained
+            .iter()
+            .any(|(from, change)| *from == id && change.relist);
+        assert!(back, "src came back");
+        // Only the edit below can wake the pane from here.
+        watch.unregister(barrier);
+        watch.respec(id, spec()).unwrap();
+        std::fs::write(src.join("lib.rs"), "// edited\n").unwrap();
+        let seen = gather(&watch, &signal, id, |seen| seen.touched);
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&marks);
+        assert!(seen.touched, "an edit in the new src");
+    }
+
     /// Deleting or renaming the hook directory or its parent through the real
     /// backend fails the watch, so discovery goes back to polling the
     /// recreated directory.
