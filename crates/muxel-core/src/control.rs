@@ -16,11 +16,44 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Endpoint and plain-request version. Guarded sends require an explicit v2.
+/// Work an agent's screen says is still running beside its turn. Read from the
+/// screen every time, so it is never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundWork {
+    pub shells: u32,
+    pub monitors: u32,
+    /// Running subagents, which the agent's screen may name without a count.
+    pub subagents: bool,
+}
+
+impl BackgroundWork {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+mod new;
+pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
+mod startup;
+pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
+mod delivery;
+pub use delivery::{PromptDelivery, PromptOutcome, StartupBlocker, StartupBlockerKind};
+mod card;
+pub use card::{CardPrompt, card_lines, card_prompt, card_value, is_hidden_char};
+mod approval;
+pub use approval::{
+    APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
+    LaunchClass, PendingApproval, creation_decision, creation_refusal,
+};
+
+/// Endpoint and plain-request version. Guards and plain creation require v2.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// An older v1 host ignores unknown fields but rejects this request version
 /// before forwarding a guarded send to the app.
 pub const GUARDED_SEND_VERSION: u32 = 2;
+/// Model/effort fields must never be silently ignored by older creation hosts.
+pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
 
 /// The file, in muxel's data directory, where the running app says how to reach
 /// it. Owner-only: the token in it is the whole of the authorization.
@@ -62,6 +95,10 @@ pub struct Endpoint {
 pub struct Request {
     pub version: u32,
     pub token: String,
+    /// The calling pane, if this client runs inside one. A declared label,
+    /// not an authenticated identity; older hosts ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_instance_id: Option<Uuid>,
     pub command: Command,
 }
 
@@ -76,6 +113,15 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
+    /// Open a terminal in a project: a tab in the calling pane's group, else in
+    /// the focused one.
+    New {
+        project: String,
+        #[serde(flatten)]
+        options: NewOptions,
+    },
+    /// Poll a creation approval without keeping a connection open.
+    NewStatus { request_id: Uuid },
     /// One agent's state, or every agent's.
     Status {
         #[serde(default)]
@@ -106,19 +152,70 @@ pub enum Command {
         launch_id: Option<Uuid>,
     },
     /// Pick a numbered option of the question the agent is blocked on.
-    Answer { agent: String, option: String },
+    Answer {
+        agent: String,
+        option: String,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
     /// Press keys (see [`key_bytes`]).
-    Keys { agent: String, keys: Vec<String> },
+    Keys {
+        agent: String,
+        keys: Vec<String>,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
+    /// The Tasks panel's open tasks.
+    TaskList,
+    /// One task with its progress notes. `task` is its id or an id prefix.
+    TaskShow { task: String },
+    /// Take a task: assign it to this user and start it.
+    TaskTake { task: String },
+    /// Report progress on a task, optionally with a percentage or a new
+    /// status (`in_progress`, `blocked`, `done`).
+    TaskProgress {
+        task: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
 }
 
-/// Require v2 for launch guards so older hosts refuse instead of ignoring them.
+impl Command {
+    /// The task commands, which a pane started on a task may use even with
+    /// outside control off.
+    pub fn is_task(&self) -> bool {
+        matches!(
+            self,
+            Command::TaskList
+                | Command::TaskShow { .. }
+                | Command::TaskTake { .. }
+                | Command::TaskProgress { .. }
+        )
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(command, Command::New { options, .. } if options.model.is_some() || options.effort.is_some())
+    {
+        return PARAMETERIZED_NEW_VERSION;
+    }
     if matches!(
         command,
         Command::Send {
             launch_id: Some(_),
             ..
-        }
+        } | Command::New { .. }
+            | Command::NewStatus { .. }
     ) {
         GUARDED_SEND_VERSION
     } else {
@@ -139,8 +236,19 @@ pub struct Response {
         deserialize_with = "known_code"
     )]
     pub code: Option<ErrorCode>,
+    /// A stable detail of a refusal, when its code alone is too broad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Present and true once input may have reached the pane: after a paste that
+    /// may have gone in, or a key of `keys` or `answer`. A writer error may leave
+    /// partial input; a paste tmux refused typed nothing and leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pasted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Deadline (unix ms) until which the user can undo this pane's close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_until: Option<i64>,
 }
 
 impl Response {
@@ -149,7 +257,10 @@ impl Response {
             ok: true,
             result: Some(result),
             code: None,
+            reason: None,
+            pasted: None,
             error: None,
+            undo_until: None,
         }
     }
 
@@ -159,7 +270,10 @@ impl Response {
             ok: false,
             result: None,
             code: error.code,
+            reason: error.reason,
+            pasted: error.pasted,
             error: Some(error.message),
+            undo_until: error.undo_until,
         }
     }
 
@@ -170,9 +284,12 @@ impl Response {
         }
         Err(Error {
             code: self.code,
+            reason: self.reason,
+            pasted: self.pasted,
             message: self
                 .error
                 .unwrap_or_else(|| "muxel refused the request".into()),
+            undo_until: self.undo_until,
         })
     }
 }
@@ -187,48 +304,116 @@ fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCod
 /// script can act on; `error` says the same for people and may be reworded. Other
 /// failures (a bad command line, no agent by that name) carry only `error`.
 ///
-/// These refusals type nothing, except `input_changed`: its prompt was pasted,
-/// but Enter was withheld. A lost reply after sending has an uncertain outcome;
+/// These refusals type nothing, except `input_changed` (its prompt was pasted,
+/// but Enter was withheld) and `keys_partly_pressed` (some keys went in). A lost
+/// reply after sending has an uncertain outcome;
 /// inspect the agent before retrying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    /// Outside control was revoked before the mutation.
+    ControlDisabled,
+    /// Outside terminal creation is Off.
+    CreationDisabled,
+    /// Literal argv, a shell launch, or typing into a shell or literal-argv pane
+    /// needs the shell/command grant.
+    CommandPermissionRequired,
+    /// The user denied this creation request.
+    ApprovalDenied,
+    /// No approval arrived within 120 seconds of admission.
+    ApprovalTimeout,
+    /// Only configured non-shell terminal presets accept user tasks.
+    PromptUnsupported,
+    /// A preset cannot safely express the requested model or effort override.
+    ParameterUnsupported,
     /// The agent is working: `wait` for it (or `send --force`).
     Working,
     /// The agent is waiting on a question: `answer` it, or press `keys`.
     Blocked,
     /// The agent is still starting: try again in a moment.
     Starting,
+    /// Input is refused while the pane is held for closing. Reads still work.
+    /// `undo_until` is present only during its countdown; otherwise `reason`
+    /// describes `counting_down`, `checking`, `awaiting_decision` or `restoring`
+    /// with no deadline. A countdown whose wall-clock deadline elapsed (for
+    /// example across suspend) omits that expired deadline too.
+    Closing,
     /// The pane isn't running this session, or its program failed to start.
     NotRunning,
-    /// The agent's program has exited.
+    /// The agent's program has exited, or the addressed UUID is no longer in
+    /// this workspace. A missing pane does not prove a remote process is dead.
     Exited,
-    /// Another request holds the shared tmux claim.
+    /// Another request holds the shared tmux claim, or another `send` from this
+    /// muxel hasn't pressed its Enter yet.
     ClaimedElsewhere,
     /// The pane's terminal was replaced since the caller inspected it.
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
+    /// The provider cannot insert these characters literally. Nothing was typed.
+    UnsupportedInput,
+    /// A pane behind tmux takes ctl input only through tmux, at the agent's own
+    /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
+    TmuxPaneUnresolved,
+    /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
+    TmuxPaneInMode,
+    /// tmux refused the input, or couldn't be run. Nothing was typed.
+    TmuxRefused,
+    /// Some of a `keys` request's keys were pressed, then the rest failed.
+    KeysPartlyPressed,
+    /// The caller selected its own pane without explicitly forcing the action.
+    SelfTarget,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
-    /// off, or its `control.json` can't be read or reached.
+    /// off, its `control.json` can't be read or reached, or a read-only creation
+    /// status cannot be answered.
     HostUnavailable,
     /// The endpoint's owner process did not pass the liveness check.
     StaleEndpoint,
+    /// muxel was already serving as many `muxel ctl` connections as it takes at
+    /// once, and read nothing of this one. Try again shortly.
+    Busy,
 }
 
 /// A failed request: what to tell the user, and its [`ErrorCode`] when it has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub code: Option<ErrorCode>,
+    pub reason: Option<String>,
+    pub pasted: Option<bool>,
     pub message: String,
+    pub undo_until: Option<i64>,
 }
 
 impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code: Some(code),
+            reason: None,
+            pasted: None,
             message: message.into(),
+            undo_until: None,
         }
+    }
+
+    pub fn closing(undo_until: i64) -> Self {
+        Self {
+            code: Some(ErrorCode::Closing),
+            reason: None,
+            pasted: None,
+            message: "the pane is closing: undo the close in muxel before sending more input"
+                .into(),
+            undo_until: Some(undo_until),
+        }
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn after_paste(mut self) -> Self {
+        self.pasted = Some(true);
+        self
     }
 }
 
@@ -236,7 +421,10 @@ impl From<String> for Error {
     fn from(message: String) -> Self {
         Self {
             code: None,
+            reason: None,
+            pasted: None,
             message,
+            undo_until: None,
         }
     }
 }
@@ -254,7 +442,7 @@ impl std::fmt::Display for Error {
 }
 
 /// Check immediately before pasting, including after asynchronous claim work.
-/// `--force` only overrides busy state; it never overrides a launch mismatch.
+/// `--force` never overrides a launch mismatch.
 pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<(), Error> {
     if let Some(expected) = expected
         && current != Some(expected)
@@ -269,10 +457,22 @@ pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<
     Ok(())
 }
 
+/// A pane cannot direct input at itself by accident. This uses the caller's
+/// declared environment value for convenience, not as an authorization check.
+pub fn check_self_target(caller: Option<Uuid>, target: Uuid, force: bool) -> Result<(), Error> {
+    if caller == Some(target) && !force {
+        return Err(Error::new(
+            ErrorCode::SelfTarget,
+            "this command targets your own pane; pass --force if you mean to type into it",
+        ));
+    }
+    Ok(())
+}
+
 /// A successful send receipt, created only after the paste was admitted to the
 /// PTY writer. Admission does not confirm delivery to or consumption by the agent.
 pub fn pasted_prompt_receipt(pane: Uuid, launch: Uuid) -> Value {
-    json!({ "sent": true, "pasted": true, "agent": short_id(pane), "launch_id": launch })
+    json!({ "sent": true, "pasted": true, "agent": short_id(pane), "uuid": pane, "launch_id": launch })
 }
 
 /// What an agent pane is doing, as `muxel ctl` reports it.
@@ -332,10 +532,25 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// What the agent's own screen says is still running beside its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// The foreground turn is over with background work still listed. Only
+    /// subagents hold the pane Working; shells and monitors remain metadata.
+    /// `wait --turn` stops here even during a subagent hold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_over: bool,
+    /// A startup task that failed before provider acceptance. The terminal itself
+    /// may still be running, for example at a folder-trust menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivery: Option<PromptDelivery>,
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
-    /// `None` when it is popped out into its own window.
+    /// `None` when popped out into its own window or held outside the layout
+    /// for a recoverable close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,7 +645,8 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits), a name, or `project/name` when names repeat.
+/// four or more hex digits), a name, `project/name` when names repeat, or an id
+/// prefixed by `pane` that no agent's name matches.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -445,13 +661,21 @@ pub fn resolve_agent(
             .filter(|id| agents.iter().any(|a| a.id == *id))
             .ok_or_else(|| "no pane is focused".into());
     }
-    if id_like(query) {
-        let hits: Vec<&AgentEntry> = agents.iter().filter(|a| id_matches(a.id, query)).collect();
+    let by_id = |id_query: &str| -> Option<Result<Uuid, String>> {
+        let hits: Vec<&AgentEntry> = agents
+            .iter()
+            .filter(|a| id_matches(a.id, id_query))
+            .collect();
         match hits.as_slice() {
-            [one] => return Ok(one.id),
-            [] => {}
-            many => return Err(ambiguous(query, many)),
+            [one] => Some(Ok(one.id)),
+            [] => None,
+            many => Some(Err(ambiguous(query, many))),
         }
+    };
+    if id_like(query)
+        && let Some(found) = by_id(query)
+    {
+        return found;
     }
     let (project, name) = match query.split_once('/') {
         Some((project, name)) => (Some(normalize(project)), normalize(name)),
@@ -464,9 +688,16 @@ pub fn resolve_agent(
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.id),
-        [] => Err(format!(
-            "no agent matches '{query}' — run `muxel ctl panes` to list them"
-        )),
+        // `pane<ID>` only once no agent has that name.
+        [] => query
+            .strip_prefix("pane")
+            .filter(|id| id_like(id))
+            .and_then(&by_id)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "no agent matches '{query}' — run `muxel ctl panes` to list them"
+                ))
+            }),
         many => Err(ambiguous(query, many)),
     }
 }
@@ -561,46 +792,102 @@ pub fn describe_layout(node: &PaneNode) -> (Value, HashMap<Uuid, usize>) {
 
 // --- Keys --------------------------------------------------------------------------
 
-/// The bytes a key name sends: `enter`, `esc`, `tab`, `shift-tab`, the arrows,
-/// `backspace`, `delete`, `space`, `home`, `end`, `pageup`, `pagedown`,
-/// `ctrl-<letter>`, or any single character. Arrows (and home/end) follow the
-/// terminal's cursor-key mode, as a real keypress would.
-pub fn key_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
-    let mut chars = key.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        return Some(c.to_string().into_bytes());
-    }
-    let arrow = |c: char| {
-        let lead = if app_cursor { "\x1bO" } else { "\x1b[" };
-        format!("{lead}{c}").into_bytes()
-    };
-    let name = key.trim().to_ascii_lowercase().replace('_', "-");
-    let bytes = match name.as_str() {
-        "enter" | "return" => b"\r".to_vec(),
-        "esc" | "escape" => b"\x1b".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "shift-tab" | "backtab" => b"\x1b[Z".to_vec(),
-        "up" => arrow('A'),
-        "down" => arrow('B'),
-        "right" => arrow('C'),
-        "left" => arrow('D'),
-        "home" => arrow('H'),
-        "end" => arrow('F'),
-        "backspace" => b"\x7f".to_vec(),
-        "delete" | "del" => b"\x1b[3~".to_vec(),
-        "pageup" | "page-up" => b"\x1b[5~".to_vec(),
-        "pagedown" | "page-down" => b"\x1b[6~".to_vec(),
-        "space" => b" ".to_vec(),
-        _ => {
-            let letter = name.strip_prefix("ctrl-")?;
-            let mut it = letter.chars();
-            match (it.next(), it.next()) {
-                (Some(c), None) if c.is_ascii_lowercase() => vec![c as u8 - b'a' + 1],
-                _ => return None,
-            }
+/// One key `ctl keys` can press. A terminal muxel writes to directly gets its
+/// [`Key::bytes`]; a pane behind tmux gets the tmux key it names (see
+/// `tmux::key_name`), which tmux encodes for that pane's own modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Enter,
+    Escape,
+    Tab,
+    BackTab,
+    Up,
+    Down,
+    Right,
+    Left,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    PageUp,
+    PageDown,
+    Space,
+    /// `ctrl-<letter>`, lowercase ASCII.
+    Ctrl(char),
+    /// Any single character, typed as itself.
+    Char(char),
+}
+
+impl Key {
+    /// `enter`, `esc`, `tab`, `shift-tab`, the arrows, `backspace`, `delete`,
+    /// `space`, `home`, `end`, `pageup`, `pagedown`, `ctrl-<letter>`, or any
+    /// single character.
+    pub fn parse(key: &str) -> Option<Self> {
+        let mut chars = key.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Some(Self::Char(c));
         }
-    };
-    Some(bytes)
+        let name = key.trim().to_ascii_lowercase().replace('_', "-");
+        Some(match name.as_str() {
+            "enter" | "return" => Self::Enter,
+            "esc" | "escape" => Self::Escape,
+            "tab" => Self::Tab,
+            "shift-tab" | "backtab" => Self::BackTab,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "right" => Self::Right,
+            "left" => Self::Left,
+            "home" => Self::Home,
+            "end" => Self::End,
+            "backspace" => Self::Backspace,
+            "delete" | "del" => Self::Delete,
+            "pageup" | "page-up" => Self::PageUp,
+            "pagedown" | "page-down" => Self::PageDown,
+            "space" => Self::Space,
+            _ => {
+                let letter = name.strip_prefix("ctrl-")?;
+                let mut it = letter.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), None) if c.is_ascii_lowercase() => Self::Ctrl(c),
+                    _ => return None,
+                }
+            }
+        })
+    }
+
+    /// The bytes this key sends to a terminal muxel writes to itself. Arrows
+    /// (and home/end) follow the terminal's cursor-key mode, as a real keypress
+    /// would.
+    pub fn bytes(self, app_cursor: bool) -> Vec<u8> {
+        let arrow = |c: char| {
+            let lead = if app_cursor { "\x1bO" } else { "\x1b[" };
+            format!("{lead}{c}").into_bytes()
+        };
+        match self {
+            Self::Enter => b"\r".to_vec(),
+            Self::Escape => b"\x1b".to_vec(),
+            Self::Tab => b"\t".to_vec(),
+            Self::BackTab => b"\x1b[Z".to_vec(),
+            Self::Up => arrow('A'),
+            Self::Down => arrow('B'),
+            Self::Right => arrow('C'),
+            Self::Left => arrow('D'),
+            Self::Home => arrow('H'),
+            Self::End => arrow('F'),
+            Self::Backspace => b"\x7f".to_vec(),
+            Self::Delete => b"\x1b[3~".to_vec(),
+            Self::PageUp => b"\x1b[5~".to_vec(),
+            Self::PageDown => b"\x1b[6~".to_vec(),
+            Self::Space => b" ".to_vec(),
+            Self::Ctrl(c) => vec![c as u8 - b'a' + 1],
+            Self::Char(c) => c.to_string().into_bytes(),
+        }
+    }
+}
+
+/// The bytes a key name sends (see [`Key::parse`] and [`Key::bytes`]).
+pub fn key_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
+    Key::parse(key).map(|key| key.bytes(app_cursor))
 }
 
 /// Whether pressing `key` submits what's typed.
@@ -615,6 +902,10 @@ pub fn key_submits(key: &str) -> bool {
 pub struct QuestionOption {
     pub key: String,
     pub label: String,
+    /// What the prompt prints beside the label, a column two or more spaces
+    /// on (Codex's `1. Alpha (Recommended)  Choose Alpha for this request.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// The option the prompt's cursor is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub selected: bool,
@@ -656,7 +947,13 @@ fn is_rule(line: &str) -> bool {
             .any(|c| is_box_char(c) && !matches!(c, '│' | '┃' | '║'))
 }
 
-/// `❯ 1. Yes` → ("1", "Yes", selected).
+/// `❯ 1. Yes` → ("1", "Yes", selected). Grok draws its question's options as
+/// `1 (○) Alpha (Recommended)  Choose Alpha.`, with a scrollbar `█` at the
+/// row's end. Codex and Grok both set an option's description in a column
+/// after its name, two or more spaces on: the name is the label, and the
+/// rest its `description`. Padding between Grok's marker and the name is
+/// not a column. A label with a double space of its own is cut short there,
+/// which only shortens what `show` lists: an answer goes by key.
 fn option_line(line: &str) -> Option<QuestionOption> {
     let s = unbox(line);
     let (selected, s) = match s.strip_prefix(SELECT_GLYPHS) {
@@ -667,14 +964,24 @@ fn option_line(line: &str) -> Option<QuestionOption> {
     if digits.is_empty() || digits.len() > 2 {
         return None;
     }
-    let rest = s[digits.len()..].strip_prefix(['.', ')'])?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let label = rest.trim();
+    let after = &s[digits.len()..];
+    let row = match after.strip_prefix(['.', ')']) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim(),
+        Some(_) => return None,
+        None => after
+            .strip_prefix(" (○) ")
+            .or_else(|| after.strip_prefix(" (●) "))?
+            .trim_start()
+            .trim_end_matches(|c: char| c == '█' || c.is_whitespace()),
+    };
+    let (label, description) = match row.find("  ") {
+        Some(at) => (&row[..at], Some(row[at..].trim().to_string())),
+        None => (row, None),
+    };
     (!label.is_empty()).then(|| QuestionOption {
         key: digits,
         label: label.to_string(),
+        description,
         selected,
     })
 }
@@ -695,9 +1002,14 @@ pub fn pending_question(screen: &str) -> Option<Question> {
     let mut first = None;
     if let Some(last) = last {
         let mut gap = 0;
+        // Rule and blank lines crossed since the last option.
+        let mut divider = (0, 0);
         let mut expect: Option<u32> = None;
         for i in (reach..=last).rev() {
-            match option_line(lines[i]) {
+            let line = lines[i];
+            let blank = line.trim().is_empty();
+            let beside_rule = |j: usize| lines.get(j).is_some_and(|l| is_rule(l));
+            match option_line(line) {
                 Some(opt) => {
                     let n: u32 = opt.key.parse().unwrap_or(0);
                     if expect.is_some_and(|e| n != e) {
@@ -705,14 +1017,29 @@ pub fn pending_question(screen: &str) -> Option<Question> {
                     }
                     options.push(opt);
                     first = Some(i);
-                    gap = 0;
+                    (gap, divider) = (0, (0, 0));
                     if n <= 1 {
                         break;
                     }
                     expect = Some(n - 1);
                 }
                 // A label wrapped onto the next line, or a hint under an option.
-                None if gap < 2 && !lines[i].trim().is_empty() && !is_rule(lines[i]) => gap += 1,
+                None if gap < 2 && !blank && !is_rule(line) => gap += 1,
+                // Claude's question card draws a rule between its choices and
+                // `Chat about this`. One rule, with a blank beside it, doesn't
+                // end the options: the next one up must still carry on the
+                // count, or nothing is added.
+                None if expect.is_some() && gap == 0 && is_rule(line) && divider.0 == 0 => {
+                    divider.0 += 1;
+                }
+                None if expect.is_some()
+                    && gap == 0
+                    && blank
+                    && divider.1 == 0
+                    && (beside_rule(i + 1) || i.checked_sub(1).is_some_and(beside_rule)) =>
+                {
+                    divider.1 += 1;
+                }
                 None => break,
             }
         }
@@ -854,6 +1181,8 @@ pub fn awaiting_reply(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
+    /// The startup task never obtained provider-owned acceptance.
+    SubmissionFailed,
     /// The turn ended; the reply is ready.
     Finished,
     /// The agent is asking something (see `question`).
@@ -915,6 +1244,19 @@ fn claim_field(s: &str) -> String {
         .collect()
 }
 
+fn claim_command_field(s: &str) -> String {
+    claim_field(s)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 impl Claim {
     pub fn encode(&self) -> String {
         let mut value = format!(
@@ -931,13 +1273,53 @@ impl Claim {
         value
     }
 
+    /// A claim for a nested tmux command string. Keep `encode`'s host display
+    /// compatibility, but replace metacharacters before this value is parsed by
+    /// tmux 2.x, which cannot decode octal escapes in that position.
+    pub fn encode_tmux_command(&self) -> String {
+        let mut value = format!(
+            "v1|{}|{}|{}|{}",
+            claim_command_field(&self.owner),
+            claim_command_field(&self.host),
+            self.at,
+            self.grace_ms,
+        );
+        if let Some(nonce) = self.nonce {
+            value.push('|');
+            value.push_str(&nonce.to_string());
+        }
+        value
+    }
+
     /// Both admission and cleanup must distinguish same-process, same-ms sends.
     pub fn same_turn(&self, other: &Self) -> bool {
         self.owner == other.owner && self.nonce.is_some() && self.nonce == other.nonce
     }
 
+    /// A tmux `#{m:}` (fnmatch) pattern for one send's claim. The trailing `*`
+    /// keeps matching a claim a later muxel writes with extra fields after the
+    /// nonce, which [`Claim::decode`] already accepts.
     pub fn pattern(owner: &str, nonce: Uuid) -> String {
-        format!("v1|{}|*|*|*|{nonce}", claim_field(owner))
+        format!("v1|{}|*|*|*|{nonce}*", claim_field(owner))
+    }
+
+    /// A safe tmux format pattern for comparing the claim before replacing it.
+    /// A nonce identifies modern sends even when a hostname needs quoting;
+    /// legacy claims need every encoded byte to be literal and format-safe.
+    pub fn compare_pattern(&self) -> Option<String> {
+        if let Some(nonce) = self.nonce {
+            let owner = claim_field(&self.owner);
+            owner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                .then(|| Self::pattern(&self.owner, nonce))
+        } else {
+            let value = self.encode();
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "|-_.".contains(c))
+                .then_some(value)
+        }
     }
 
     /// `None` for an unset option, or a value this version doesn't understand.
@@ -981,6 +1363,10 @@ pub fn claim_holds(
 
 /// What `muxel ctl …` asked for.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "only one command is parsed per CLI invocation; boxing adds an allocation without reducing a collection"
+)]
 pub enum CliCommand {
     /// A request the app answers directly.
     Request(Command),
@@ -989,10 +1375,12 @@ pub enum CliCommand {
         agent: String,
         timeout_secs: u64,
         full: bool,
+        /// Stop when the turn ends, even with background work still running.
+        turn: bool,
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
-    Help,
+    Help(Option<String>),
 }
 
 /// `wait`'s default patience.
@@ -1004,22 +1392,70 @@ usage: muxel ctl <command> [args]
 
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
+  new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+              [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait]
+              [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
+                                 open in background; --focus selects and raises;
+                                 --background is a compatibility no-op; --prompt - reads stdin
+  new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
   send AGENT TEXT [--force] [--launch-id ID]
                                  type TEXT and press Enter ('-' reads stdin);
                                  --launch-id refuses a replaced terminal
-  wait AGENT [--timeout SECS] [--full]
-                                 wait for the turn to end, then show it
-  answer AGENT OPTION            pick a numbered option of a pending question
-  keys AGENT KEY...              press keys: enter esc tab shift-tab up down
+  wait AGENT [--timeout SECS] [--full] [--turn]
+                                 wait for the agent to finish, then show it;
+                                 --turn stops at an observable turn end, even
+                                 with background work; a provider still
+                                 reporting Working keeps waiting
+  answer AGENT OPTION [--force]  pick a numbered option of a pending question
+  keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
+  task list                      open tasks in the Tasks panel
+  task show TASK                 one task and its notes
+  task take TASK                 assign a task to yourself and start it
+  task progress TASK TEXT [--percent N] [--status in_progress|blocked|done]
+                                 note progress on a task
   skill                          instructions for an orchestrating agent
+  help [COMMAND]                 show general or command-specific help
 
-AGENT is an id from `panes`, a name, project/name, or `focused`.
-Everything after `--` is taken literally (for text that starts with --).
-muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
+AGENT is an id from `panes` (also pane<ID>), a name, project/name, or `focused`.
+Never re-send text after an uncertain receipt. Follow the read-only `next` command to inspect the current pane; a pending_in_composer receipt does not authorize a later Enter.
+send, answer and keys refuse the caller's own pane unless --force is explicit.
+Everything after `--` is taken literally (for text that starts with -).
+Input to a pane kept in tmux goes to its tmux pane through tmux, never through the tmux client; agent panes need no shell grant.
+For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
+ALL `new` requests require outside control AND Settings > Outside control > Outside terminal creation set to Ask or Allow.
+Ask requires a click for every request. Allow covers configured non-shell terminal presets.
+Literal argv and shell presets always Ask; the click card never takes keyboard focus.
+Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
+Both mouse-down and release must belong to that same armed card.
+`--prompt` submits a user task through the one-shot runner path, once on first launch; only non-shell terminal presets support it.
+It replaces the preset's configured system prompt with the task; preset arguments are kept.
+The typed task stays exact; automatic instructions use a separate flag/config channel when available.
+In Git Bash, set MSYS_NO_PATHCONV=1 for leading-slash prompts, or use --prompt - with stdin.
+Its task text is discarded after the first launch and is not re-typed on a later launch.
+Ask returns a pending request id immediately; the CLI polls once per second until the final reply.
+Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
+Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
+`--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+With --prompt the reply comes once the pane exists: its task submitted, refused, or prompt_pending with `status` as next.
+`--wait-delivery` keeps reading until the task settles, for up to 90 seconds.
+`--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
+All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
+All three grants default off; upgrades do not infer creation permission from the older grants.
+Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
+Outside control off stops the server (while a pane started on a Cloud task is open it answers only `ctl task` and new-status); pollers report host_unavailable after their retries.
+Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
+Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
+Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
+Raw argv panes restore stopped; only Run again replays their saved command.
+`new` launch directories are never owned, registered or deleted by muxel.
+On Windows, raw argv requires a native executable; use --preset for batch wrappers.
+`new` opens terminal panes; browser presets (including a browser default) are not supported yet.
+muxel must be running with Settings > Outside control > \"Allow outside tools to control muxel\" on
+(`task` commands excepted: a pane started on a task may use them on its own task).
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
 
@@ -1027,13 +1463,143 @@ Replies are JSON. A failure is {\"ok\": false, \"error\": ...}, with a \"code\" 
 script can act on it (see `muxel ctl skill`). Exit status: 0 success,
 1 request failure (including no running muxel), 2 invalid command line or stdin.";
 
+pub fn command_help(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "projects" => "usage: muxel ctl projects\nList every project and its agent counts.",
+        "panes" => {
+            "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
+        }
+        "new" => {
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
+        }
+        "new-status" => {
+            "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
+        }
+        "status" => {
+            "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
+        }
+        "show" => {
+            "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
+        }
+        "screen" => {
+            "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
+        }
+        "send" => {
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides working, blocked and self_target, and claimed_elsewhere when another send to the agent hasn't pressed Enter or another request holds its tmux claim; it never overrides launch_mismatch."
+        }
+        "wait" => {
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
+        }
+        "answer" => {
+            "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
+        }
+        "keys" => {
+            "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
+        }
+        "task" => {
+            "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]\nWork with the Tasks panel. TASK is a task id or the start of one. An agent started on a task (Start with agent) may use these on its own task even with outside control off; anything else needs outside control. progress adds a note; agents should report every meaningful step, and --status done when the task is finished."
+        }
+        "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
+        "help" => {
+            "usage: muxel ctl help [COMMAND]\nShow general or command-specific help. Use `--` before literal prompt text that starts with -."
+        }
+        _ => return None,
+    })
+}
+
+fn unknown_command_error(command: &str) -> String {
+    let suggestion = if command == "list" {
+        Some("panes")
+    } else {
+        const VERBS: &[&str] = &[
+            "projects",
+            "panes",
+            "new",
+            "new-status",
+            "status",
+            "show",
+            "screen",
+            "send",
+            "wait",
+            "answer",
+            "keys",
+            "task",
+            "skill",
+            "help",
+        ];
+        VERBS
+            .iter()
+            .map(|verb| (*verb, edit_distance(command, verb)))
+            .min_by_key(|(_, distance)| *distance)
+            .filter(|(_, distance)| *distance <= 3)
+            .map(|(verb, _)| verb)
+    };
+    let hint = suggestion.map_or(String::new(), |verb| format!("\ndid you mean `{verb}`?"));
+    format!("unknown command '{command}'{hint}\n\n{USAGE}")
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, ch) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (col, other) in right.iter().enumerate() {
+            current[col + 1] = (previous[col + 1] + 1)
+                .min(current[col] + 1)
+                .min(previous[col] + usize::from(ch != *other));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 /// Parse the arguments after `muxel ctl`.
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let Some((cmd, rest)) = args.split_first() else {
-        return Ok(CliCommand::Help);
+        return Ok(CliCommand::Help(None));
     };
+    if matches!(cmd.as_str(), "help" | "-h" | "--help") {
+        return match rest {
+            [] => Ok(CliCommand::Help(None)),
+            [target] if command_help(target).is_some() => {
+                Ok(CliCommand::Help(Some(target.clone())))
+            }
+            [target] => Err(unknown_command_error(target)),
+            _ => Err("usage: muxel ctl help [COMMAND]".into()),
+        };
+    }
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        return if command_help(cmd).is_some() {
+            Err(format!(
+                "{cmd} was not run: use `muxel ctl help {cmd}` for help, or `--` before literal -h/--help text"
+            ))
+        } else {
+            Err(unknown_command_error(cmd))
+        };
+    }
+    if cmd == "new" {
+        return new::parse(rest);
+    }
+    if cmd == "task" {
+        return parse_task(rest);
+    }
+    if cmd == "new-status" {
+        return match rest {
+            [id] => Ok(CliCommand::Request(Command::NewStatus {
+                request_id: id
+                    .parse()
+                    .map_err(|_| "new-status needs a full request UUID")?,
+            })),
+            _ => Err("usage: muxel ctl new-status REQUEST_ID".into()),
+        };
+    }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
+    let mut turn = false;
     let mut force = false;
     let mut launch_id: Option<Uuid> = None;
     let mut lines: Option<usize> = None;
@@ -1046,6 +1612,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 break;
             }
             "--full" => full = true,
+            "--turn" => turn = true,
             "--force" => force = true,
             "--launch-id" => {
                 let value = it.next().ok_or("--launch-id needs an ID")?;
@@ -1126,7 +1693,11 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 .get(1)
                 .cloned()
                 .ok_or("`answer` needs the OPTION number to pick")?;
-            Command::Answer { agent, option }
+            Command::Answer {
+                agent,
+                option,
+                force,
+            }
         }
         "keys" => {
             let agent = agent(&words)?;
@@ -1137,7 +1708,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             if let Some(bad) = keys.iter().find(|k| key_bytes(k, false).is_none()) {
                 return Err(format!("unknown key '{bad}'"));
             }
-            Command::Keys { agent, keys }
+            Command::Keys { agent, keys, force }
         }
         "wait" => {
             at_most(1)?;
@@ -1145,11 +1716,82 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 agent: agent(&words)?,
                 timeout_secs: timeout.unwrap_or(WAIT_TIMEOUT_SECS),
                 full,
+                turn,
             });
         }
         "skill" => return Ok(CliCommand::Skill),
-        "help" | "-h" | "--help" => return Ok(CliCommand::Help),
-        other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        other => return Err(unknown_command_error(other)),
+    };
+    Ok(CliCommand::Request(command))
+}
+
+/// `muxel ctl task …`.
+fn parse_task(args: &[String]) -> Result<CliCommand, String> {
+    const USAGE_TASK: &str = "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]";
+    let Some((sub, rest)) = args.split_first() else {
+        return Err(USAGE_TASK.into());
+    };
+    let mut words: Vec<String> = Vec::new();
+    let mut percent: Option<u8> = None;
+    let mut status: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--" => {
+                words.extend(it.by_ref().cloned());
+                break;
+            }
+            "--percent" => {
+                let n: u8 = number(it.next(), "--percent")?;
+                if n > 100 {
+                    return Err("--percent is 0 to 100".into());
+                }
+                percent = Some(n);
+            }
+            "--status" => {
+                let value = it.next().ok_or("--status needs a value")?;
+                if !matches!(value.as_str(), "in_progress" | "blocked" | "done") {
+                    return Err("--status is in_progress, blocked or done".into());
+                }
+                status = Some(value.clone());
+            }
+            flag if flag.starts_with("--") && flag.len() > 2 => {
+                return Err(format!("unknown option {flag}"));
+            }
+            _ => words.push(arg.clone()),
+        }
+    }
+    if (percent.is_some() || status.is_some()) && sub != "progress" {
+        return Err("--percent and --status are only valid with `task progress`".into());
+    }
+    let task = |words: &[String]| -> Result<String, String> {
+        words
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("`task {sub}` needs a TASK id (see `muxel ctl task list`)"))
+    };
+    let command = match sub.as_str() {
+        "list" if words.is_empty() => Command::TaskList,
+        "show" if words.len() == 1 => Command::TaskShow {
+            task: task(&words)?,
+        },
+        "take" if words.len() == 1 => Command::TaskTake {
+            task: task(&words)?,
+        },
+        "progress" => {
+            let id = task(&words)?;
+            let text = words[1..].join(" ");
+            if text.trim().is_empty() && status.is_none() && percent.is_none() {
+                return Err("`task progress` needs TEXT, --percent or --status".into());
+            }
+            Command::TaskProgress {
+                task: id,
+                text,
+                percent,
+                status,
+            }
+        }
+        _ => return Err(USAGE_TASK.into()),
     };
     Ok(CliCommand::Request(command))
 }
@@ -1276,7 +1918,7 @@ Every command prints JSON. A failure exits non-zero and prints
 `{"ok": false, "error": "..."}` - the error says what went wrong and what to do,
 and a `code` is added when there is something to act on (see Errors below). If
 it says muxel isn't running or outside control is off, ask the user to open
-muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
+muxel and turn on Settings > Outside control > "Allow outside tools to control muxel".
 
 ## Commands
 
@@ -1284,18 +1926,116 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal as a
+  new tab: in your own pane's group when you run it from one of that project's
+  panes, otherwise in the group the user has focused. `--split right|down` makes
+  a new pane beside that group instead. PROJECT resolves as for `panes`.
+  DIR must be an existing absolute directory; it defaults to the project root
+  and may be a linked worktree or another directory. A preset matches its name
+  or id; omitting both launch choices uses the toolbar's preset for that project.
+  `--model` and `--effort` override the preset's values for this pane, including
+  prompt launches; restarts retain the chosen arguments. Values must contain
+  1–64 characters from `[A-Za-z0-9._:/@+-]` with no leading `-`. Each override
+  requires its Model flag / Effort flag in Settings > Agents, and that flag must
+  be absent from Extra args. A flag containing `{}` emits one argument with the
+  value substituted; other flags emit flag then value. Existing presets are not
+  migrated; fill in their flag fields. Literal `-- PROGRAM` cannot use overrides.
+  New Codex presets use `--config=model_reasoning_effort={}`; existing `-c` or
+  `--config` arguments setting that key also conflict with an effort override.
+  Unsupported combinations receive `parameter_unsupported`. Parameterized
+  presets remain eligible for Allow; Ask shows the requested model and effort.
+  Everything after `--` is literal argv, including spaces, quotes and empty
+  arguments. `--prompt TEXT` sends a user task through the existing runner path;
+  `--prompt -` reads stdin. In Git Bash, set `MSYS_NO_PATHCONV=1` for leading-slash
+  prompts, or use stdin. This replaces the preset's configured system prompt
+  with the task; preset arguments are kept. The typed task stays exact.
+  Automatic instructions use the preset's separate flag/config transport when
+  available; they are omitted for TypeIn-only presets. The task is submitted
+  once and its text is discarded after first launch. Restart, restore and resume neither
+  re-type nor resubmit it, including launches without a resumable conversation.
+  Prompts for literal, shell and browser launches receive
+  `prompt_unsupported`. Creation preserves the selected tab, focus, project and
+  window by default, without raising the window. `--focus` selects the new pane
+  and activates its window. `--background` is accepted as a compatibility no-op,
+  including alongside `--focus`. JSON callers use `focus` (default false);
+  the legacy `background` field remains accepted and does not control focus.
+  Every `new` request requires outside control plus Settings > Outside control >
+  Outside terminal creation set to Ask or Allow. Ask requires a click for every
+  request; Allow permits configured non-shell terminal presets. All literal argv,
+  even an agent
+  executable, and shell presets/defaults additionally require "Also allow typing
+  into shell panes". Configured non-literal presets not classified as shells need
+  only the first two grants. Literal argv and shell presets always Ask, even
+  under Allow. The existing shell/non-shell classifier is a soft
+  policy for trusted configured presets, not an executable allowlist.
+  All three permissions default off; upgrades leave creation off even if both
+  older grants are on. Ask the user to enable the required settings themselves.
+  Ask returns `{ "pending": true, "request_id": "UUID" }` immediately, without
+  holding a connection. The CLI polls every second and prints the final reply.
+  Temporary connection and host-availability failures retry up to three times
+  against that same UUID; a successful pending reply resets the retry count.
+  The CLI never reissues `new`. If retries fail, its error names the UUID to
+  query with `new-status`. Uncoded status errors, including an older host's
+  uncoded timeout, also give that advice. Do not repeat `new` while the original
+  may still wait.
+  `--no-wait` prints the pending reply for scripts; use `ctl new-status UUID` to
+  poll it. Requests expire 120 seconds after admission, including time behind
+  another card. Each visible card disables both buttons for 750 ms and ignores
+  double-clicks. Mouse-down and release must belong to the same armed card.
+  The card offers click-only Allow once / Deny, keeps terminal
+  keyboard focus, and shows the waiting count in FIFO order. `--from LABEL` and
+  the caller's MUXEL_INSTANCE_ID are displayed as declared information, not
+  authenticated identity (the token is the whole authorization).
+  Final replies remain available for ten minutes, bounded to the latest 256;
+  up to 64 approvals may wait. Approvals are runtime-only and do not survive a
+  host restart. Plain creation and status requests use protocol v2; creation with
+  model or effort uses v3 so older hosts cannot silently discard the choices.
+  The host requires the exact command version, including for JSON callers.
+  Turning creation or outside control off refuses all pending requests. Outside
+  control off also stops the server, so pollers receive `host_unavailable`
+  after their connection retries rather than the recorded `control_disabled`.
+  Revocation leaves
+  existing panes, already admitted launches and
+  typing permissions unchanged. Deferred requests recheck current permission;
+  human toolbar creation is unaffected.
+  Commands run as the host muxel process with its permissions and environment,
+  outside the caller's sandbox. Coding agents and configurable presets are not
+  a security sandbox. Ask the user to grant authority; do not change settings.
+  Turning "Also allow typing into shell panes" off also refuses later control
+  writes to every raw argv pane, even agent-looking or interpreter programs, and
+  shell-classified panes. Configured non-literal agents remain controllable while
+  outside control is enabled. Disabling all outside control is a separate setting. Revocation
+  does not stop the process or undo input already delivered; queued Enter/keys
+  recheck the shell-input grant and terminal/session availability before each write.
+  The JSON reply contains `id` (short), `uuid` (full), `project`, `project_id`,
+  `cwd`, `program` and `args`. Without `--prompt`, presets and defaults keep toolbar
+  system-prompt injection (including TypeIn), resume and hooks; raw argv bypasses those and tmux.
+  Raw argv panes restore stopped. Project selection, Restart and wake never replay
+  their opening brief; the pane's explicit Run again action reruns the saved argv.
+  DIR is a launch directory, never an owned worktree; closing the pane does not
+  remove it and worktree migration does not register it.
+  On Windows raw argv requires a native executable; use `--preset` for batch
+  wrappers. Installed Codex resolves to its packaged native executable.
+  Remote projects are currently refused.
+  `new` opens terminal panes; browser presets, including a browser default, are
+  not supported yet and receive a refusal.
 - `muxel ctl status [AGENT]` - one agent's status, or every agent's.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
-  blocked, the `question` it's asking with its numbered `options`. `controller`
+  blocked, the `question` it's asking with its numbered `options` (each a `key`,
+  a `label`, and the `description` some prompts print beside it). `controller`
   says which computer's muxel last typed into the agent through `muxel ctl`
   (`this_muxel` is true when it was this one) and whether that turn is still open.
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
   Use it when `show` doesn't explain what's on screen.
 - `muxel ctl send AGENT TEXT` - type TEXT into the agent and press Enter. Refused
-  while the agent is working or blocked, or while muxel on another computer is
-  mid-turn with it. For long or multi-line text, pass `-` and pipe the text on
-  stdin.
+  while the agent is working, blocked, or still in the grace after a submitted
+  control turn, while muxel on another computer is mid-turn with it, or while
+  another `send` to it from this muxel hasn't pressed Enter yet. For long
+  or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
+  literal prompt text that starts with `-`; `-h` and `--help` before `--` refuse
+  with exit 2 and are never typed. Use `muxel ctl help COMMAND` for help.
   The reply waits for Enter. If keys, pastes, mouse or wheel reports reach the
   pane after the paste, Enter is withheld and `send` fails with the prompt left
   in its input. A closed or restarted terminal also withholds Enter. Check
@@ -1305,26 +2045,113 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   terminal. This guard is checked again immediately before pasting after any
   asynchronous claim work, and `--force` never bypasses it. A successful reply
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
-  writer, not confirmation of agent delivery. A lost reply does not make a
-  retry safe; inspect the agent before typing again.
-- `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints plus
-  `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
+  writer (for an agent kept in tmux: tmux pasted it into the agent's tmux pane),
+  not confirmation of agent delivery. A lost reply does not make a
+  retry safe; inspect the agent before typing again. A failure with `pasted: true`
+  means the prompt may have reached the agent, in whole or in part; a paste tmux
+  refused typed nothing and has no `pasted`. Check `screen` before
+  retrying. A `working` error with `reason: just_submitted` means the prior
+  control turn is still in its grace on a pane with provider status or configured
+  screen markers; `wait` for its reply. Activity-only panes allow a later send.
+  Codex, Claude and Grok sends also observe provider acceptance for up to sixty
+  seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
+  false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
+  `input_changed` (other input arrived; no further Enter is sent),
+  `interrupted` (the pane closed, restarted, switched conversation or lost
+  permission) or `retry_unanswered` (tmux didn't answer whether it pressed the
+  retry Enter, so it may have arrived). Once Enter is in, the reply is this
+  receipt, never an error.
+  It is null, without waiting, when the pane can't show a receipt: an
+  unsupported provider, or neither a readable idle status title nor OSC 7501
+  status reports (tmux hides both) with a Grok, multi-paragraph or repeated
+  prompt.
+  `enter_retries` reports zero or one additional Enter. Windows Codex alone may
+  receive that retry after five seconds while its exact, fully visible ASCII
+  prose remains in the idle composer and no local input intervened. Clipped,
+  multiline, Unicode or completion drafts get no retry. Text is never pasted
+  twice. Retry also requires a compact composer frame from before the paste
+  and an added blank cursor line proving that the first Enter was consumed;
+  a pending Enter never authorizes another.
+  An unconfirmed receipt requires inspecting `screen` before more input.
+  `outcome` is `submitted` only with provider acceptance, `pending_in_composer`
+  only with the complete retained draft and current guards, or `not_delivered`
+  when input was refused before delivery. `unconfirmed` preserves uncertainty,
+  including clipped or collapsed drafts. Follow the exact command in `next`.
+  Never re-send the text. `next` inspects the current pane; a pending receipt
+  cannot guard a later Enter after the draft or launch changes. Switch and
+  input protection covers muxel-observed changes; another tmux client's input
+  is untracked.
+  Native Windows Codex launches disable heuristic paste bursts only after a
+  version probe verifies the matching codec. Configured Codex 0.167+ preserves
+  line breaks and Unicode; CRLF becomes one newline. Unsupported controller
+  characters, including tabs, are refused before typing. Its clipboard encoder
+  also refuses unsupported controls before writing and reports the refusal.
+- `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
+  turn and any subagent hold have finished (or it blocks on a question, or exits),
+  then print what `show` prints. Shell and monitor listings do not delay completion;
+  they remain visible in `wait.background`. Subagents hold a finished turn for at
+  most three hours. `--turn` stops at an observable foreground turn end instead,
+  even during a subagent hold; it cannot override a provider still reporting
+  Working. Either way `wait.background` lists anything still running.
+  Startup tasks stay pending until fresh provider-owned acceptance, not merely
+  our Enter. Codex may receive one extra Enter only while its exact task remains
+  on one exact ASCII row in its live idle editor, with no new user row. Wrapped
+  or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
+  within sixty seconds, failed readiness or unsupported provider sets
+  `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
+  before sending another task; do not repeat creation. When the task's Enter
+  went in without a receipt (`prompt_delivery.outcome` `unconfirmed` with
+  `enter_admitted: true`), a wait that then sees the pane working or blocked
+  follows that turn instead of returning submission_failed, since the task may
+  have started it. The turn may also be another, so inspect the pane after a
+  `finished` wait that still shows `startup_error`. Muse and other providers
+  without a verified startup protocol receive no task input.
+  The `wait.outcome` values are finished, blocked, exited, not_running,
+  submission_failed or timed_out. Default
   timeout 600 seconds.
 - `muxel ctl answer AGENT OPTION` - pick numbered option OPTION of the question
   the agent is blocked on.
 - `muxel ctl keys AGENT KEY...` - press keys: enter, esc, tab, shift-tab, up, down,
   left, right, backspace, space, ctrl-c, or any single character.
 
-AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
+For an agent kept in tmux, `send`, `answer`, `keys` and a `new --prompt` task
+go to the agent's own tmux pane through tmux (`paste-buffer`, `send-keys`),
+never through the tmux client muxel shows, so tmux's prefix and key bindings
+never act on them, and agent panes need no shell grant. The pane is the agent's
+own, the one its tmux session was created with, whichever pane or window the
+user has opened or made active. A prompt arrives as tmux's own `paste-buffer -p`
+pastes: line breaks as CR, without ESC. The reply to `keys` comes once tmux
+has taken every key, one tmux command per key; over SSH without a shared
+connection each is a new login. A `keys` or `answer` failure once a key may
+have gone in has `pasted: true`. If the agent's pane is gone or can't be
+reached, input is refused with `tmux_pane_unresolved` and nothing is typed;
+after a failed lookup the next waits a little longer each time, up to two
+minutes. A remote agent's input needs muxel's background SSH commands to that
+host to work.
+
+Newly created agents record their pane id before the program starts. That
+record survives pane moves and splits; reattaches preserve it. Older or adopted
+sessions use the lowest-pane lookup. Copy mode refuses input with
+`tmux_pane_in_mode`, leaving the user's scroll position intact. Leave copy mode
+before retrying. If the prompt was already pasted before Enter was refused,
+the failure has `pasted: true`: inspect `screen` before resending. An unanswered
+Enter also guards the turn as just submitted, because it may have landed.
+Servers reporting version 2.4+ check mode and write in one tmux command queue.
+Older or unreported server versions check separately before each write, adding
+a round trip. That legacy path has a small race if the user enters copy mode
+between the check and Enter; stock 2.2/2.3 use it too (server version reporting
+arrived in 2.4). There is no new tmux version requirement.
+
+AGENT is an agent's `id` from `panes` (like `1a2b3c4d`, also `pane1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
 at. PROJECT is a project's id or name. muxels on different computers that share
 a project usually show its agents under the same ids, but each command only
 reaches the muxel on the computer it runs on.
 
 If you are running in a muxel pane yourself, the environment variable
-`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT: never
-`send` to it, since that types into your own input.
+`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT. `send`,
+`answer`, and `keys` refuse that pane unless you pass `--force`. Older muxel
+hosts ignore this caller ID, so check the target when driving one.
 
 ## Statuses
 
@@ -1346,17 +2173,41 @@ and is left out while the agent is starting and once it has exited.
 
 ## Errors
 
-When `send`, `answer` or `keys` didn't type anything, or muxel couldn't be
-reached, the failure has a `code`:
+Creation permission/approval refusals, typing refusals from `send`, `answer` or
+`keys`, and host connection failures have a `code`:
 
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
   again in a moment.
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
-- `claimed_elsewhere` - another request holds the shared tmux claim.
+- `claimed_elsewhere` - another request holds the shared tmux claim, or another
+  `send` to the agent hasn't pressed Enter yet.
+- `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
+- `unsupported_input` - the native provider cannot insert the supplied control
+  characters or its multiline protocol could not be verified. Nothing was typed.
+- `tmux_pane_unresolved` - the agent's tmux pane, which takes its input, is
+  gone or couldn't be found; nothing was typed. Check `screen`; the user may
+  need to restart the agent.
+- `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
+  `screen` before pressing any again.
+- `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
+  copy mode before retrying. A failure after a paste instead has `pasted: true`.
+- `tmux_refused` - tmux refused the input or couldn't be run; nothing was
+  typed. Check `screen` before retrying.
+- `self_target` - this command would type into its caller's own pane; select a
+  different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+- `busy` - muxel was already serving as many ctl connections as it takes and
+  read nothing of this request; nothing was done. Try again shortly.
+- `control_disabled` - outside control was turned off before the mutation.
+- `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
+- `command_permission_required` - literal argv, a shell launch, or typing into a shell or literal-argv pane needs the shell/command grant.
+- `approval_denied` - the user clicked Deny; nothing was created.
+- `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
+- `prompt_unsupported` - prompts require a configured non-shell terminal preset.
+- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing
@@ -1383,6 +2234,20 @@ also withhold Enter and return an error without a code; inspect the input first.
 
 - One prompt at a time per agent. Never `send` to an agent that is `working` or
   `blocked`.
+- Never re-send prompt text after a pasted or uncertain receipt. Follow the
+  read-only `next` command to inspect the current screen. `pending_in_composer`
+  describes an observed draft; it does not guard or authorize a later Enter.
+  `not_delivered` means nothing was typed; resolve its refusal before
+  sending the task. Never repeat `new`; use its existing pane. `new --prompt`
+  replies once the pane exists, with the task `submitted`, refused, or still
+  `prompt_pending` with `status` as `next`; `--wait-delivery` reads until it
+  settles, for up to 90 seconds. `--no-wait` replies before approval, with
+  `new-status` as `next`. A failed `send` or `new --prompt` has an `outcome`
+  too: `not_delivered` only for a coded refusal before any input, otherwise
+  `unconfirmed`, as when `new`'s approval poll is lost while the task can
+  still arrive. Other commands' failures carry no outcome. `status` and
+  `show.agent` include `prompt_delivery`. A folder trust, update or login blocker
+  reports `blocked_by` and `screen_excerpt`; leave trust decisions to the user.
 - Only type into shell panes (`"is_agent": false`) when the user asks; muxel
   refuses unless the user has also allowed it in its settings.
 - To stop an agent mid-turn press `esc` (`keys AGENT esc`). Don't send `ctrl-c`
@@ -1391,7 +2256,8 @@ also withhold Enter and return an error without a code; inspect the input first.
   on both, or one the other attached to). If `send` or `answer` says muxel on
   another computer is using the agent, don't `--force` it: `wait` on the agent
   and try again, or tell the user. Several of you may be driving the same agents.
-- This interface can't create, close or rearrange panes; the layout is the user's.
+- Create panes only when asked, using `new` within the user's granted authority.
+  This interface can't close or rearrange existing panes; the layout is the user's.
 "#;
 
 #[cfg(test)]
@@ -1399,14 +2265,66 @@ mod tests {
     use super::{
         AgentEntry, AgentInfo, AgentState, CliCommand, Command, Error, ErrorCode, PaneNode,
         Request, Response, WaitOutcome, awaiting_reply, describe_layout, flag_value, key_bytes,
-        parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent, resolve_project,
-        short_id, skill, wait_outcome,
+        option_line, parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent,
+        resolve_project, short_id, skill, wait_outcome,
     };
     use crate::{AgentActivity, SplitDirection};
     use uuid::Uuid;
 
     fn words(s: &[&str]) -> Vec<String> {
         s.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn task_commands_parse() {
+        let req = |a: &[&str]| match parse_cli(&words(a)) {
+            Ok(CliCommand::Request(c)) => c,
+            other => panic!("{a:?}: {other:?}"),
+        };
+        assert_eq!(req(&["task", "list"]), Command::TaskList);
+        assert_eq!(
+            req(&["task", "take", "ab12"]),
+            Command::TaskTake {
+                task: "ab12".into()
+            }
+        );
+        let c = req(&[
+            "task",
+            "progress",
+            "ab12",
+            "wrote",
+            "the",
+            "parser",
+            "--percent",
+            "40",
+        ]);
+        assert_eq!(
+            c,
+            Command::TaskProgress {
+                task: "ab12".into(),
+                text: "wrote the parser".into(),
+                percent: Some(40),
+                status: None,
+            }
+        );
+        assert!(c.is_task());
+        assert!(!Command::Projects.is_task());
+        let c = req(&["task", "progress", "ab12", "--status", "done"]);
+        assert!(matches!(c, Command::TaskProgress { status: Some(ref s), .. } if s == "done"));
+        // The wire form round-trips.
+        let wire = serde_json::to_string(&c).unwrap();
+        assert!(wire.contains("\"cmd\":\"task_progress\""), "{wire}");
+        assert_eq!(serde_json::from_str::<Command>(&wire).unwrap(), c);
+        for bad in [
+            &["task"][..],
+            &["task", "show"],
+            &["task", "progress", "ab12"],
+            &["task", "progress", "ab12", "x", "--percent", "101"],
+            &["task", "progress", "ab12", "x", "--status", "cancelled"],
+            &["task", "take", "ab12", "--percent", "3"],
+        ] {
+            assert!(parse_cli(&words(bad)).is_err(), "{bad:?}");
+        }
     }
 
     fn id(n: u128) -> Uuid {
@@ -1453,6 +2371,30 @@ mod tests {
     }
 
     #[test]
+    fn claim_pattern_matches_a_later_version_claim_with_extra_fields() {
+        let claim = super::Claim {
+            owner: "later".into(),
+            host: "desk".into(),
+            at: 1234,
+            grace_ms: 30_000,
+            nonce: Some(id(3)),
+        };
+        let later = format!("{}|field-from-a-later-muxel", claim.encode_tmux_command());
+        let decoded = super::Claim::decode(&later).unwrap();
+        assert!(decoded.same_turn(&claim));
+        let pattern = decoded.compare_pattern().unwrap();
+        assert_eq!(pattern, super::Claim::pattern("later", id(3)));
+        assert!(pattern.ends_with(&format!("{}*", id(3))), "{pattern}");
+        assert!(claim_matches(&pattern, &later));
+        assert!(claim_matches(&pattern, &claim.encode_tmux_command()));
+        let other = super::Claim {
+            nonce: Some(id(4)),
+            ..claim
+        };
+        assert!(!claim_matches(&pattern, &other.encode_tmux_command()));
+    }
+
+    #[test]
     fn claims_from_before_the_nonce_field_still_deserialize() {
         let legacy: super::Claim =
             serde_json::from_str(r#"{"owner":"old","host":"desk","at":1,"grace_ms":30000}"#)
@@ -1466,6 +2408,7 @@ mod tests {
         let req = Request {
             version: 1,
             token: "t".into(),
+            caller_instance_id: None,
             command: Command::Show {
                 agent: "claude".into(),
                 full: true,
@@ -1478,6 +2421,7 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"token":"t","command":{"cmd":"projects"}}"#)
                 .unwrap();
         assert_eq!(unit.command, Command::Projects);
+        assert_eq!(unit.caller_instance_id, None);
         let defaults: Request = serde_json::from_str(
             r#"{"version":1,"token":"t","command":{"cmd":"send","agent":"a","text":"hi"}}"#,
         )
@@ -1494,6 +2438,69 @@ mod tests {
         // No launch guard: older requests retain their original shape.
         let line = serde_json::to_string(&defaults).unwrap();
         assert!(!line.contains("launch_id"), "{line}");
+        assert!(!line.contains("caller_instance_id"), "{line}");
+        let caller = Request {
+            caller_instance_id: Some(id(7)),
+            command: Command::Keys {
+                agent: "self".into(),
+                keys: vec!["esc".into()],
+                force: true,
+            },
+            ..req
+        };
+        let line = serde_json::to_string(&caller).unwrap();
+        assert!(line.contains("caller_instance_id"), "{line}");
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), caller);
+    }
+
+    #[test]
+    fn closing_refusal_round_trips_its_undo_deadline() {
+        let deadline = 1_800_000_000_015;
+        let error = Error::closing(deadline);
+        assert_eq!(error.code, Some(ErrorCode::Closing));
+        assert_eq!(error.undo_until, Some(deadline));
+        let wire = serde_json::to_value(Response::err(error.clone())).unwrap();
+        assert_eq!(wire["code"], "closing");
+        assert_eq!(wire["undo_until"], deadline);
+        assert_eq!(wire["ok"], false);
+        let response: Response = serde_json::from_value(wire).unwrap();
+        assert_eq!(response.into_result(), Err(error));
+    }
+
+    #[test]
+    fn replies_without_undo_deadlines_keep_their_legacy_shape() {
+        for wire in [
+            r#"{"ok":false,"code":"working","error":"busy"}"#,
+            r#"{"ok":false,"error":"no match"}"#,
+            r#"{"ok":true,"result":{"sent":true}}"#,
+        ] {
+            let response: Response = serde_json::from_str(wire).unwrap();
+            assert_eq!(response.undo_until, None);
+            assert_eq!(
+                serde_json::to_value(&response).unwrap(),
+                serde_json::from_str::<serde_json::Value>(wire).unwrap()
+            );
+            if !response.ok {
+                assert_eq!(response.into_result().unwrap_err().undo_until, None);
+            }
+        }
+        assert_eq!(Error::new(ErrorCode::Working, "busy").undo_until, None);
+        assert_eq!(Error::from("no match").undo_until, None);
+    }
+
+    #[test]
+    fn unknown_refusal_codes_preserve_the_message_and_undo_deadline() {
+        let response: Response = serde_json::from_str(
+            r#"{"ok":false,"code":"from_later","error":"keep this message","undo_until":1800000000015}"#,
+        )
+        .unwrap();
+        let error = response.into_result().unwrap_err();
+        assert_eq!(error.code, None);
+        assert_eq!(error.message, "keep this message");
+        assert_eq!(error.undo_until, Some(1_800_000_000_015));
+        let reemitted = serde_json::to_value(Response::err(error)).unwrap();
+        assert!(reemitted.get("code").is_none());
+        assert_eq!(reemitted["undo_until"], 1_800_000_000_015_i64);
     }
 
     #[test]
@@ -1523,17 +2530,32 @@ mod tests {
             serde_json::from_str(r#"{"ok":false,"code":"from_later","error":"x"}"#).unwrap();
         assert_eq!(newer.code, None);
         assert_eq!(newer.error.as_deref(), Some("x"));
+        let uncertain = Response::err(
+            Error::new(ErrorCode::Working, "check screen")
+                .with_reason("just_submitted")
+                .after_paste(),
+        );
+        let back: Response = serde_json::from_str(&line(&uncertain)).unwrap();
+        assert_eq!(back.reason.as_deref(), Some("just_submitted"));
+        assert_eq!(back.pasted, Some(true));
         for (code, word) in [
             (ErrorCode::Working, "working"),
             (ErrorCode::Blocked, "blocked"),
             (ErrorCode::Starting, "starting"),
+            (ErrorCode::Closing, "closing"),
             (ErrorCode::NotRunning, "not_running"),
             (ErrorCode::Exited, "exited"),
             (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
+            (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
+            (ErrorCode::TmuxRefused, "tmux_refused"),
+            (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
+            (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
+            (ErrorCode::Busy, "busy"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), word);
             let response = Response::err(Error::new(code, "refused"));
@@ -1636,6 +2658,10 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            background: None,
+            turn_over: false,
+            startup_error: None,
+            prompt_delivery: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,
@@ -1688,13 +2714,17 @@ mod tests {
             ErrorCode::Working,
             ErrorCode::Blocked,
             ErrorCode::Starting,
+            ErrorCode::Closing,
             ErrorCode::NotRunning,
             ErrorCode::Exited,
             ErrorCode::ClaimedElsewhere,
             ErrorCode::LaunchMismatch,
             ErrorCode::InputChanged,
+            ErrorCode::TmuxPaneUnresolved,
+            ErrorCode::KeysPartlyPressed,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
+            ErrorCode::Busy,
         ] {
             let word = serde_json::to_value(code).unwrap();
             let word = format!("`{}`", word.as_str().unwrap());
@@ -1744,6 +2774,52 @@ mod tests {
         assert!(resolve_agent("9f00", &agents, None).is_err());
         assert_eq!(resolve_agent("9f000", &agents, None), Ok(b));
         assert!(resolve_agent("gemini", &agents, None).is_err());
+    }
+
+    #[test]
+    fn ctl_ergonomics_accepts_pane_ids_without_changing_name_or_ambiguity_rules() {
+        let a = id(0x1a2b3c4d_0000_0000_0000_000000000001);
+        let b = id(0x1a2bffff_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: a,
+                name: "panebench",
+                project: "sample",
+            },
+            AgentEntry {
+                id: b,
+                name: "other",
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1a2b3c4d", &agents, None), Ok(a));
+        assert_eq!(resolve_agent(&format!("pane{a}"), &agents, None), Ok(a));
+        assert!(
+            resolve_agent("pane1a2b", &agents, None)
+                .unwrap_err()
+                .contains("more than one")
+        );
+        assert_eq!(resolve_agent("panebench", &agents, None), Ok(a));
+    }
+
+    #[test]
+    fn a_name_spelled_like_a_pane_id_resolves_to_its_own_agent() {
+        let named = id(0x0000aaaa_0000_0000_0000_000000000001);
+        let other = id(0x12340000_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: named,
+                name: "pane1234",
+                project: "sample",
+            },
+            AgentEntry {
+                id: other,
+                name: "other",
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1234", &agents, None), Ok(named));
+        assert_eq!(resolve_agent("pane12340000", &agents, None), Ok(other));
     }
 
     #[test]
@@ -1848,6 +2924,114 @@ mod tests {
         assert!(q.options[0].selected);
     }
 
+    /// Grok 1.0.70's ask_user_question card, as muxel-terminal's
+    /// provider-state-screens fixture records it. The free-text row (`z`)
+    /// isn't a numbered option. Grok 1.0.77 draws the same rows, and pressing
+    /// `1` answers Alpha.
+    #[test]
+    fn grok_question_rows_are_numbered_options() {
+        let screen = "\
+   ♦ Waiting on answers for Which option do you want?                                               9.2s ↓13.7k [stop]
+
+  │
+  │  Which option do you want?
+  │
+  │
+  │  1 (○) Alpha (Recommended)  Choose Alpha.                                                                        █
+  │  2 (○) Beta                 Choose Beta.                                                                         █
+  │  z (○) Type your answer here
+  │
+  │  ↑/↓ navigate · y copy                                                                            Enter:submit
+  │
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss
+";
+        let q = pending_question(screen).unwrap();
+        assert_eq!(q.text, "Which option do you want?");
+        assert_eq!(
+            q.options
+                .iter()
+                .map(|o| (
+                    o.key.as_str(),
+                    o.label.as_str(),
+                    o.description.as_deref(),
+                    o.selected
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("1", "Alpha (Recommended)", Some("Choose Alpha."), false),
+                ("2", "Beta", Some("Choose Beta."), false),
+            ]
+        );
+        // Padding after the marker, which no captured row has, is not the
+        // gap before a description.
+        for (row, description) in [
+            ("  │  1 (○)   Alpha", None),
+            (
+                "  │  1 (○)   Alpha   Choose Alpha.  █",
+                Some("Choose Alpha."),
+            ),
+        ] {
+            let option = option_line(row).expect("a padded row is still an option");
+            assert_eq!(
+                (option.key.as_str(), option.label.as_str()),
+                ("1", "Alpha"),
+                "{row:?}"
+            );
+            assert_eq!(option.description.as_deref(), description, "{row:?}");
+        }
+    }
+
+    /// Codex 0.164.0's question overlay sets each option's description in a
+    /// column beside its label. The rows are as Codex drew them.
+    #[test]
+    fn a_codex_options_description_is_not_its_label() {
+        let screen = "  Question 1/1 (1 unanswered)\n  Would you like to choose Alpha or Beta?\n\n  \
+                      › 1. Alpha (Recommended)  Choose Alpha for this request.\n    2. Beta                 \
+                      Choose Beta for this request.\n    3. None of the above    Optionally, add details \
+                      in notes (tab)\n\n  tab to add notes · enter to submit answer · esc to interrupt\n";
+        let q = pending_question(screen).unwrap();
+        let options: Vec<(&str, &str, Option<&str>, bool)> = q
+            .options
+            .iter()
+            .map(|o| {
+                let description = o.description.as_deref();
+                (o.key.as_str(), o.label.as_str(), description, o.selected)
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                (
+                    "1",
+                    "Alpha (Recommended)",
+                    Some("Choose Alpha for this request."),
+                    true
+                ),
+                ("2", "Beta", Some("Choose Beta for this request."), false),
+                (
+                    "3",
+                    "None of the above",
+                    Some("Optionally, add details in notes (tab)"),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            q.text,
+            "Question 1/1 (1 unanswered)\nWould you like to choose Alpha or Beta?"
+        );
+        // A label with no column beside it has no description, and `show` says
+        // nothing about one.
+        let claude = pending_question(" Continue?\n ❯ 1. Yes\n   2. No").unwrap();
+        assert_eq!(claude.options[0].description, None);
+        let shown = serde_json::to_value(&claude.options[0]).unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!({"key": "1", "label": "Yes", "selected": true})
+        );
+    }
+
     #[test]
     fn prompt_without_numbered_options_is_the_screen_tail() {
         let screen = "working on it\n\nOverwrite config.toml? (y/n)\n";
@@ -1857,6 +3041,57 @@ mod tests {
         assert_eq!(pending_question("\n  \n"), None);
         // A screen that ends in a rule (a composer's frame) holds no question.
         assert_eq!(pending_question("⏺ Done.\n────────\n"), None);
+    }
+
+    /// Claude's AskUserQuestion card, as Claude Code 2.1.310 drew it (2.1.322
+    /// draws the same rows), puts a rule between its choices and `Chat about
+    /// this`. The choices above the rule are still the question's.
+    #[test]
+    fn a_rule_between_a_cards_choices_doesnt_end_them() {
+        let rule = "─".repeat(120);
+        let card = |between: &str| {
+            format!(
+                "❯ Ask me to choose Alpha or Beta.\n{rule}\n ☐ Choice\n\nWhich do \
+                 you choose: Alpha or Beta?\n\n❯ 1. Alpha\n     Choose Alpha.\n  2. Beta\n     \
+                 Choose Beta.\n  3. Type something.\n{between}  4. Chat about this\n\nEnter to \
+                 select · ↑/↓ to navigate · Esc to cancel\n\n\n"
+            )
+        };
+        let read = |screen: &str| {
+            let q = pending_question(screen).unwrap();
+            let options: Vec<(String, String, bool)> = q
+                .options
+                .into_iter()
+                .map(|o| (o.key, o.label, o.selected))
+                .collect();
+            (q.text, options)
+        };
+        let choices = vec![
+            ("1".into(), "Alpha".into(), true),
+            ("2".into(), "Beta".into(), false),
+            ("3".into(), "Type something.".into(), false),
+            ("4".into(), "Chat about this".into(), false),
+        ];
+        let text = "☐ Choice\n\nWhich do you choose: Alpha or Beta?".to_string();
+        assert_eq!(
+            read(&card(&format!("{rule}\n"))),
+            (text.clone(), choices.clone())
+        );
+        // A blank beside the rule, either side, doesn't end them either.
+        assert_eq!(
+            read(&card(&format!("{rule}\n\n"))),
+            (text.clone(), choices.clone())
+        );
+        assert_eq!(read(&card(&format!("\n{rule}\n"))), (text, choices));
+        // Two rules, or a blank with no rule, still end the options.
+        for between in [format!("{rule}\n{rule}\n"), "\n".to_string()] {
+            let (_, options) = read(&card(&between));
+            assert_eq!(options.len(), 1, "{between:?}");
+        }
+        // So does a numbered list above a rule that doesn't carry the count on.
+        let reply = format!("Steps:\n1. Build\n2. Test\n{rule}\n  4. Chat about this\n");
+        let (_, options) = read(&reply);
+        assert_eq!(options, [("4".into(), "Chat about this".into(), false)]);
     }
 
     #[test]
@@ -2039,7 +3274,7 @@ Steps:
 
     #[test]
     fn cli_parses_commands_flags_and_literal_text() {
-        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help));
+        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
@@ -2074,7 +3309,17 @@ Steps:
             Ok(CliCommand::Wait {
                 agent: "a1b2".into(),
                 timeout_secs: 30,
-                full: false
+                full: false,
+                turn: false
+            })
+        );
+        assert_eq!(
+            parse_cli(&words(&["wait", "a1b2", "--turn"])),
+            Ok(CliCommand::Wait {
+                agent: "a1b2".into(),
+                timeout_secs: crate::control::WAIT_TIMEOUT_SECS,
+                full: false,
+                turn: true
             })
         );
         assert_eq!(
@@ -2091,6 +3336,46 @@ Steps:
         assert!(parse_cli(&words(&["show", "a", "--nope"])).is_err());
         assert!(parse_cli(&words(&["frobnicate"])).is_err());
         assert!(parse_cli(&words(&["status", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn dash_h_after_command_refuses_without_typing() {
+        for args in [
+            words(&["send", "agent", "-h"]),
+            words(&["send", "--help"]),
+            words(&["keys", "agent", "enter", "--help"]),
+            words(&["new", "project", "-h"]),
+        ] {
+            let error = parse_cli(&args).unwrap_err();
+            assert!(error.contains("was not run"), "{args:?}: {error}");
+            assert!(error.contains("muxel ctl help"), "{args:?}: {error}");
+            assert!(error.contains("`--`"), "{args:?}: {error}");
+        }
+        assert_eq!(
+            parse_cli(&words(&["help", "send"])),
+            Ok(CliCommand::Help(Some("send".into())))
+        );
+        assert!(super::command_help("send").unwrap().contains("--force"));
+        assert!(matches!(
+            parse_cli(&words(&["send", "agent", "--", "-h"])),
+            Ok(CliCommand::Request(Command::Send { text, .. })) if text == "-h"
+        ));
+    }
+
+    #[test]
+    fn unknown_command_suggests_nearest_verb() {
+        let error = parse_cli(&words(&["list"])).unwrap_err();
+        assert!(error.contains("did you mean `panes`?"), "{error}");
+    }
+
+    #[test]
+    fn send_to_own_pane_is_refused() {
+        let me = id(7);
+        let error = super::check_self_target(Some(me), me, false).unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::SelfTarget));
+        assert_eq!(super::check_self_target(Some(me), me, true), Ok(()));
+        assert_eq!(super::check_self_target(Some(me), id(8), false), Ok(()));
+        assert_eq!(super::check_self_target(None, me, false), Ok(()));
     }
 
     #[test]
@@ -2138,6 +3423,10 @@ Steps:
         };
         let value = claim.encode();
         assert_eq!(value, "v1|a1b2c3d4e5f6|Sam's-Mac-mini|1790000000000|30000");
+        assert_eq!(
+            claim.encode_tmux_command(),
+            "v1|a1b2c3d4e5f6|Sam-s-Mac-mini|1790000000000|30000"
+        );
         let back = super::Claim::decode(&value).unwrap();
         assert_eq!(back.owner, claim.owner);
         assert_eq!(back.host, "Sam's-Mac-mini");
@@ -2199,5 +3488,34 @@ Steps:
             &before,
             at + super::REPLY_GRACE_MS
         ));
+    }
+
+    #[test]
+    fn claim_compare_patterns_keep_modern_nonce_and_refuse_unsafe_legacy_values() {
+        let claim = super::Claim {
+            owner: "owner".into(),
+            host: "desk'name".into(),
+            at: 42,
+            grace_ms: super::REPLY_GRACE_MS,
+            nonce: Some(uuid::Uuid::from_u128(7)),
+        };
+        assert_eq!(
+            claim.compare_pattern(),
+            Some(super::Claim::pattern("owner", uuid::Uuid::from_u128(7)))
+        );
+        let legacy = super::Claim {
+            nonce: None,
+            host: "desk".into(),
+            ..claim
+        };
+        assert_eq!(legacy.compare_pattern(), Some(legacy.encode()));
+        assert!(
+            super::Claim {
+                host: "desk'name".into(),
+                ..legacy
+            }
+            .compare_pattern()
+            .is_none()
+        );
     }
 }

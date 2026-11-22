@@ -117,6 +117,29 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertFalse(cmd.contains("-L"))
     }
 
+    // Port of `a_session_another_pane_still_shows_outlives_the_close`: two panes on
+    // one session, their records disagreeing about the server. Closing either leaves
+    // it to the other; only the last pane to close stops it.
+    func testASessionAnotherPaneStillShowsOutlivesTheClose() {
+        let name = "muxel_p_12345678"
+        var original = Instance(id: "12345678-0000-4000-8000-000000000000", projectId: "p",
+                                title: "Claude", program: "claude", args: [])
+        original.tmuxSession = name
+        original.tmuxSocket = "default"
+        var adopted = Instance(id: "abcdef12-0000-4000-8000-000000000000", projectId: "p",
+                               title: "Claude", program: "claude", args: [])
+        adopted.tmuxSession = name
+        adopted.tmuxSocket = TmuxCommands.socketName
+        let both = [original, adopted]
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [adopted.id], in: both))
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [original.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id, adopted.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown("muxel_p_87654321", closing: [original.id], in: both))
+        var literal = adopted
+        literal.literalArgv = true
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id], in: [original, literal]))
+    }
+
     // sshd runs an exec channel's command with its bare default PATH and no profile, so a
     // Mac's Homebrew tmux (`/opt/homebrew/bin/tmux` on Apple silicon) is not on it and every
     // tmux command fails with `command not found: tmux`. Port of `ssh::tmux_path_prelude`.
@@ -141,6 +164,19 @@ final class ProtocolPortTests: XCTestCase {
         }
     }
 
+    // Mirrors pane_scope.rs `a_remote_program_runs_in_a_scope_when_the_host_can_make_one`.
+    func testRemoteProgramRunsInAScopeWhenTheHostCanMakeOne() {
+        let program = "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+        XCTAssertEqual(
+            TmuxCommands.remoteExec(program),
+            "if command -v systemd-run >/dev/null 2>&1 && "
+                + "systemd-run --user --scope --quiet --collect -p OOMPolicy=continue true </dev/null >/dev/null 2>&1; "
+                + "then exec systemd-run --user --scope --quiet --collect -p OOMPolicy=continue "
+                + "'--description=muxel pane' -- \(program); fi; exec \(program)")
+        let cmd = TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: [])
+        XCTAssertTrue(cmd.contains("OOMPolicy=continue"))
+    }
+
     // iOS must launch the agent through a login+interactive shell so it's on the
     // user's PATH (a no-PTY SSH exec has a bare PATH → the agent exits instantly).
     func testLaunchAgentWrapsInLoginShell() {
@@ -148,17 +184,21 @@ final class ProtocolPortTests: XCTestCase {
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
-            + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            + "mkdir -p -- '/work'; "
+            + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
-            + "-- \"${SHELL:-/bin/sh}\" -ilc "))
+            + "-- sh -c "))
+        XCTAssertTrue(cmd.contains("@muxel_control_pane"))
+        XCTAssertTrue(cmd.contains("${SHELL:-/bin/sh}"))
+        XCTAssertTrue(cmd.contains("-ilc"))
         XCTAssertTrue(cmd.contains("exec"))
         XCTAssertTrue(cmd.contains("claude"))
         XCTAssertTrue(cmd.contains("opus"))
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); "
-                + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
+                + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
 
@@ -170,11 +210,11 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); clear; "
-                + "exec tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; clear; "
+                + "exec tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.
-        let clearThenCreate = "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
+        let clearThenCreate = "set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
         for cmd in [
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: []),
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: []),
@@ -190,6 +230,18 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(
             line,
             "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
+    }
+
+    func testProfilerCleanupCoversFutureKeysWithoutRemovingPaneContext() {
+        let clear = TmuxCommands.clearProfilerEnvironment(environmentNames: [
+            "MUXEL_PROFILE_FUTURE", "MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL",
+        ])
+        for name in ["MUXEL_PROFILE", "MUXEL_PROFILE_FUTURE", "MUXEL_PROFILE_KEEP_DAYS", "MUXEL_PROFILE_MAX_BYTES"] {
+            XCTAssertTrue(clear.contains("set-environment -g -u \(Shell.quote(name)) ';'"))
+        }
+        for name in ["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"] {
+            XCTAssertFalse(clear.contains(name))
+        }
     }
 
     // Pane/window-target commands must use `=session:` (active pane of the session).

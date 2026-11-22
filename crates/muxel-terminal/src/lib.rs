@@ -8,29 +8,51 @@
 // master isn't `Sync`). Same trade-off gpui-component makes for its entities.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(windows)]
+mod codex_version;
 mod colors;
+mod control_input;
+mod control_paste;
 mod element;
 mod keymap;
 mod links;
 mod listener;
+mod pane_job;
 mod present_flag;
+#[cfg(unix)]
+mod process_tree_unix;
 mod profile;
+mod profile_idle;
+pub mod profile_log;
+mod program_status;
 mod replies;
 mod search;
 mod session;
+#[cfg(windows)]
+mod shell_process;
+mod startup;
 mod view;
 
 pub use colors::TerminalPalette;
+pub use control_input::{
+    ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner,
+};
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
+pub use pane_job::{HitStatus, MemoryLimitHit};
+#[cfg(windows)]
+pub use portable_pty::win::{set_console_directory, set_force_system_console};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
+pub use program_status::ProgramStatusKind;
 pub use session::{
-    CommandSpec, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk,
-    PtyOutputQueueStats, PtyReceiver, TerminalSession,
+    CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+    PtyChunk, PtyOutputQueueStats, PtyReceiver, ShellCloseCheck, ShellCloseReading,
+    TerminalSession, TitleSource, literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
-    AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
-    PathPasteErrorHandler, TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch,
-    TerminalMouseMode, TerminalNotifyCause, TerminalView, clean_agent_title,
-    paste_clipboard_into_session,
+    AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
+    PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
+    TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
+    TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
+    TextPasteErrorHandler, clean_agent_title, pane_grid, paste_clipboard_into_session,
 };

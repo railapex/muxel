@@ -82,6 +82,62 @@ pub struct TermLayout {
     font_bold_italic: Font,
 }
 
+/// The regular face a terminal grid is measured and drawn in: `family`, or the
+/// platform's monospace default when it's empty.
+pub(crate) fn terminal_font(family: &SharedString) -> Font {
+    // Use a concrete, installed monospace face. The generic "monospace"
+    // family does not resolve in gpui's font database and silently falls
+    // back to a proportional font, which breaks fixed-width cell layout
+    // (glyphs get force-spread to a wrong advance width).
+    #[cfg(target_os = "macos")]
+    let default_family = "Menlo";
+    #[cfg(target_os = "windows")]
+    let default_family = "Consolas";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let default_family = "DejaVu Sans Mono";
+    let family: SharedString = if family.is_empty() {
+        default_family.into()
+    } else {
+        family.clone()
+    };
+    Font {
+        family,
+        features: FontFeatures::disable_ligatures(),
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+            "Noto Sans Mono".into(),
+            "Source Code Pro".into(),
+            "Menlo".into(),
+            "Consolas".into(),
+        ])),
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+    }
+}
+
+/// One grid cell of `font` at `font_size`: the advance of `m` across, 1.3 ×
+/// the font size down.
+pub(crate) fn cell_size(window: &Window, font: &Font, font_size: Pixels) -> (Pixels, Pixels) {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(font);
+    let cell_width = text_system
+        .advance(font_id, font_size, 'm')
+        .map(|s| s.width)
+        .unwrap_or(font_size * 0.6);
+    (cell_width, font_size * 1.3)
+}
+
+/// The whole cells, `(cols, rows)`, that fit in `size`; at least one each way.
+pub(crate) fn grid_in(size: Size<Pixels>, cell_width: Pixels, line_height: Pixels) -> (u16, u16) {
+    let fit = |extent: Pixels, cell: Pixels| {
+        ((f32::from(extent) - 0.5) / f32::from(cell))
+            .floor()
+            .max(1.0) as u16
+    };
+    (fit(size.width, cell_width), fit(size.height, line_height))
+}
+
 impl Element for TerminalElement {
     type RequestLayoutState = TermLayout;
     type PrepaintState = Hitbox;
@@ -102,35 +158,7 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let font_size = self.font_size;
-        // Use a concrete, installed monospace face. The generic "monospace"
-        // family does not resolve in gpui's font database and silently falls
-        // back to a proportional font, which breaks fixed-width cell layout
-        // (glyphs get force-spread to a wrong advance width).
-        #[cfg(target_os = "macos")]
-        let default_family = "Menlo";
-        #[cfg(target_os = "windows")]
-        let default_family = "Consolas";
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        let default_family = "DejaVu Sans Mono";
-        let family: SharedString = if self.font_family.is_empty() {
-            default_family.into()
-        } else {
-            self.font_family.clone()
-        };
-        let font = Font {
-            family,
-            features: FontFeatures::disable_ligatures(),
-            fallbacks: Some(FontFallbacks::from_fonts(vec![
-                "DejaVu Sans Mono".into(),
-                "Liberation Mono".into(),
-                "Noto Sans Mono".into(),
-                "Source Code Pro".into(),
-                "Menlo".into(),
-                "Consolas".into(),
-            ])),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
+        let font = terminal_font(&self.font_family);
         let font_bold = Font {
             weight: FontWeight::BOLD,
             ..font.clone()
@@ -145,13 +173,7 @@ impl Element for TerminalElement {
             ..font.clone()
         };
 
-        let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&font);
-        let cell_width = text_system
-            .advance(font_id, font_size, 'm')
-            .map(|s| s.width)
-            .unwrap_or(font_size * 0.6);
-        let line_height = font_size * 1.3;
+        let (cell_width, line_height) = cell_size(window, &font, font_size);
 
         let style = Style {
             size: Size {
@@ -216,12 +238,7 @@ impl Element for TerminalElement {
         let line_h = f32::from(line_height);
 
         // Size the PTY/grid to the available area.
-        let cols = (((f32::from(bounds.size.width) - 0.5) / cell_w)
-            .floor()
-            .max(1.0)) as u16;
-        let rows = (((f32::from(bounds.size.height) - 0.5) / line_h)
-            .floor()
-            .max(1.0)) as u16;
+        let (cols, rows) = grid_in(bounds.size, cell_width, line_height);
         // Resize the PTY/grid to fit — but NOT while a pane/tab is being dragged.
         // A drag churns the layout through many intermediate sizes; resizing on
         // each one floods the agent with SIGWINCHes, making it redraw (and often
@@ -789,7 +806,11 @@ fn build_draw_list_rows(
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
-                if cell.c == ' ' && !cell.flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT) {
+                if cell.c == ' '
+                    && !cell
+                        .flags
+                        .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+                {
                     continue;
                 }
 
@@ -1410,11 +1431,12 @@ impl TerminalElement {
 
         // ---- Ctrl/Cmd+click: open the link (OSC 8 / URL / file path) under the
         // cursor. Dispatched as an action so the app decides where it opens
-        // (built-in browser vs the OS).
+        // (built-in browser vs the OS, beside this pane).
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
             let focus = self.focus_handle.clone();
+            let pane = self.instance_id;
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Left
@@ -1433,7 +1455,11 @@ impl TerminalElement {
                     cols,
                     rows,
                 ) {
-                    focus.dispatch_action(&crate::view::OpenLink(link.url), window, cx);
+                    let open = crate::view::OpenLink {
+                        url: link.url,
+                        pane,
+                    };
+                    focus.dispatch_action(&open, window, cx);
                 }
             });
         }
@@ -1442,6 +1468,7 @@ impl TerminalElement {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
             let focus = self.focus_handle.clone();
+            let pane = self.instance_id;
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Middle
@@ -1457,7 +1484,11 @@ impl TerminalElement {
                     cols,
                     rows,
                 ) {
-                    focus.dispatch_action(&crate::view::OpenLinkBackground(link.url), window, cx);
+                    let open = crate::view::OpenLinkBackground {
+                        url: link.url,
+                        pane,
+                    };
+                    focus.dispatch_action(&open, window, cx);
                     cx.stop_propagation();
                 }
             });
@@ -1845,5 +1876,62 @@ impl TerminalElement {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_draw_list;
+    use crate::colors::TerminalPalette;
+    use crate::session::{CommandSpec, PaintMetrics, TerminalSession};
+
+    /// The text runs the first row paints, as (column, text), once a screen
+    /// has parsed `bytes`.
+    fn first_row_runs(bytes: &[u8]) -> Vec<(i32, String)> {
+        // The child's own output is never parsed, so the screen holds only
+        // `bytes`.
+        #[cfg(windows)]
+        let spec = CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()]);
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _output) = TerminalSession::spawn(spec, 40, 4).expect("spawn fixture");
+        session.process_output(bytes);
+        let metrics = PaintMetrics {
+            cell_w: 8.0,
+            line_h: 17.0,
+            font_size: 13.0,
+            cols: 40,
+            rows: 4,
+            bg: [0.0; 4],
+        };
+        let list = build_draw_list(&session, &TerminalPalette::default(), 0, metrics);
+        session.kill();
+        list.runs
+            .iter()
+            .filter(|run| run.start_line == 0)
+            .map(|run| (run.start_col, run.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_of_underline_runs_on_under_the_space_between_words() {
+        for (kind, sgr) in [
+            ("single underline", "4"),
+            ("double underline", "4:2"),
+            ("curly underline", "4:3"),
+            ("dotted underline", "4:4"),
+            ("dashed underline", "4:5"),
+            ("strike", "9"),
+        ] {
+            let runs = first_row_runs(format!("\x1b[{sgr}ma b\x1b[0m").as_bytes());
+            assert_eq!(
+                runs,
+                [(0, "a b".to_string())],
+                "a {kind} breaks at the space"
+            );
+        }
+        // A space with nothing under or through it paints nothing.
+        let plain = first_row_runs(b"a b");
+        assert_eq!(plain, [(0, "a".to_string()), (2, "b".to_string())]);
     }
 }

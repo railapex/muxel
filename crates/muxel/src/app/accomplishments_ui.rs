@@ -343,6 +343,7 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_file_browser = false;
         self.show_memory = false;
+        self.reminders.show_panel = false;
         if self.accomplishments_pid != Some(pid) {
             for input in [
                 &self.accomplishments_search,
@@ -533,7 +534,9 @@ impl MuxelApp {
             None => p.root_path.display().to_string(),
         };
         let path = PathBuf::from(format!("{root}/{MEMORY_DIR}/{ACCOMPLISHMENTS_FILE}"));
-        let target = self.active_instance;
+        let origin = ResourceOrigin::Chrome {
+            near: self.active_instance,
+        };
         if is_remote {
             self.ensure_project_accomplishments(pid, cx);
         } else if let Some(loc) = self.repo_loc(pid)
@@ -541,7 +544,7 @@ impl MuxelApp {
         {
             self.add_event(NotifKind::Error, t("Accomplishment log"), format!("{e}"));
         }
-        self.open_editor_at(pid, Some(path), target, window, cx);
+        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
     }
 
     /// Step the retention window by `delta` days (Settings), pruning open logs.
@@ -614,7 +617,7 @@ impl MuxelApp {
         if !enabled {
             list = list.child(div().text_xs().text_color(muted).child(t(
                 "The log is off for this project, so agents aren't adding to it. Turn it \
-                 on from the project's right-click menu or Settings → Projects.",
+                 on in Settings → Projects.",
             )));
         }
         if !log.is_some_and(|l| l.loaded) {

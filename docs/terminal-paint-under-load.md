@@ -88,9 +88,38 @@ boolean branch.
 | `MUXEL_PROFILE=1` | enable **both** terminal + UI profilers |
 | `MUXEL_PROFILE_TERMINAL=1` | terminal key→next-read→process→paint only (`profile.rs`) |
 | `MUXEL_PROFILE_UI=1` | UI/present-pump/probe only (`ui_profile.rs`) |
-| `MUXEL_PROFILE_LOG` | terminal log path (append; rotates at 2 MB → `.1`) |
+| `MUXEL_PROFILE_LOG` | stable terminal log path (2 MiB live cap; dated archives) |
 | `MUXEL_PROFILE_UI_LOG` | UI log path (default: sibling `ui-prof*.log`) |
 | `MUXEL_PROFILE_STDERR=1` | also echo dump lines to stderr (default: file only) |
+| `MUXEL_PROFILE_KEEP_DAYS` | local calendar days retained, including today (default 14) |
+| `MUXEL_PROFILE_MAX_BYTES` | total bytes per log family, including reserved live capacity (default 268435456 / 256 MiB; minimum 2 MiB) |
+
+Both profilers share the same retention implementation. On the first record from
+a different local date, or before a record would exceed 2 MiB, the live file moves to
+`<live-path>.YYYY-MM-DD.NNNNNN` (for example
+`term-prof.log.2026-11-03.000001`). The date is the live file's previous local
+date, and the sequence increases within that date. Record timestamps choose the
+date even if a deferred record is written after midnight. At startup the first
+record supplies the live file's date, falling back to its modification date for
+older or malformed logs. Pruning uses the current local date, independently of
+record timestamps. The live path stays stable for tailers.
+Rolling and pruning run on the log workers, never PTY or paint paths.
+
+At startup and each roll, prune this family's oldest archives by date and then
+sequence. Age pruning keeps today and the preceding 13 local dates by default;
+the byte budget reserves a full 2 MiB for the live file. The previous `.1`
+backup counts toward the budget and uses its modification date for age.
+Invalid or nonpositive retention settings use defaults. Separate terminal and
+UI paths each receive their own budget. Use a distinct live path per process.
+If rename fails (for example, a Windows tailer lacks delete sharing), truncate
+the live file; if truncation fails, skip writes rather than grow beyond the
+bounds. An archive that can't be removed (read-only, or held open without
+delete sharing) is skipped, and its bytes still count toward the budget, even
+past its keep days. The rest are still pruned, writes continue while the
+family fits its byte budget, and pruning tries it again at the next roll or
+date. Only a family still over budget skips writes. Each log names its
+first append or prune failure on stderr once. This fallback can lose history;
+tailers should share read, write, and delete access.
 
 **Terminal log** (`term-prof`): ~500 ms intervals while interesting work
 happens (keys, paint spikes, high felt latency). Fields: PTY writer queue/write,
@@ -99,7 +128,7 @@ position metadata. Terminal and input contents are never logged.
 Startup and slow per-pane lines cross a bounded nonblocking handoff; the
 channel and worker each retain at most 128 records, and interval lines report
 any saturation as `deferred_dropped=`.
-`term-prof[v8]` splits typing latency into `key→next-read`,
+`term-prof[v9]` splits typing latency into `key→next-read`,
 `read→process`, and `process→paint`; slow `term-lat[v8]` chains further split
 channel drain, intentional coalescing, UI-update queueing, notify, and paint. A
 `term-write[v1]` line names the pane when queueing or the ConPTY write itself
@@ -138,16 +167,91 @@ closes queue admission before closing the pseudoconsole. The receiver is still
 held by the spawn caller at that point, so it cannot drain a full queue while
 `ClosePseudoConsole` waits for the reader.
 
-`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v8]` reports the largest
+`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v9]` reports the largest
 occupancy any pane's queue reached during that log interval. Each queue records
 its peak when it admits a read, so a prompt dequeue cannot hide it. The public
 `PtyReceiver::stats()` and `TerminalSession::output_queue_stats()` expose current
 and high-water occupancy to diagnostics without terminal content.
 
+Intervals without keys, latency samples, spikes, sync expiry, dropped records,
+or slow drain/write/process/paint stages accumulate in `term-prof[v9 idle]`,
+emitted at most once every 30 seconds. `ticks=` counts consumed intervals;
+`Δ=` sums their durations, excluding busy intervals. Counts, bytes and duration
+sums are additive; maxima and queue high-water marks preserve the worst
+constituent tick. A busy interval keeps the full tick format with version v9.
+Detailed `term-lat[v8]`, startup and slow-write records retain their formats and
+are flushed on the usual cadence even when their interval is aggregated.
+
 **UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
 and 1m / 15m / hourly snapshots (working set). Use this for settings typing and
 cursor starvation (term-prof cannot see non-terminal keys). Spikes:
 `pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
+
+Background `ui-session-lookup[v1]` details log on a hit, a change of outcome or
+provider for that pane, or elapsed time of at least 5 ms. Steady unresolved
+polls are counted without individual lines. Launch-resume lookups always log.
+Once per minute, `ui-prof[session-lookups v1]` reports per-provider discovery
+`calls`, `found`, `slow`, `emitted`, `suppressed`, summed `elapsed_us` and
+`max_us`. Sum summary counts rather than counting detailed lines; a slow storm
+remains visible. Counts cover records accepted by the bounded worker queue;
+`deferred_dropped` still reports saturation separately. Outcome memory expires
+after an hour without a lookup and is bounded to 4096 panes.
+Periodic summaries are best effort: the unfinished interval is not persisted on
+process exit (up to 30 seconds of quiet terminal work or 60 seconds of discovery
+counts). Detailed input and slow-event records keep their usual flush cadence.
+
+Each local `git` process muxel's git helpers start and wait for writes one
+`ui-prof[git v1]` record: `caller` (a fixed label for the poll or action that
+ran it, such as `branch-poll`, `git-panel` or `diff-pane`; one-off user actions
+read `unlabeled`), `sub` (the git subcommand), `dir` (a hash of the directory),
+`cmd` (a hash of the whole argument list), `status`, `elapsed`, `out` (a hash of
+the exit status and stdout) and `same`: `yes` when that exact command printed
+the same thing last time, `no` when it changed, `first` otherwise. Launches per
+minute by `caller` and `sub`, and the share of `same=yes`, show which polls
+re-ask git questions whose answers haven't moved. Hashes are 64-bit FNV-1a of
+the UTF-8 text, so a script can hash a known path to match `dir`. Remote reads
+(over ssh) and team-library jobs, which run git through their own deadline
+runner, are not recorded. Like every deferred record, a git record the full
+queue drops shows up only in `deferred_dropped`, so check that before reading a
+quiet log as no launches. The calling thread builds the record and copies
+stdout (hashing it itself only when 16 MiB of copies are already queued); the
+writer thread hashes and formats it.
+
+**Frame attribution** (`ui-frame`, `ui_profile/frame.rs`): every root-view
+draw is one frame, from `Window::draw` start (from its build, without GPUI's
+frame trace) to GPUI's arena clear after presenting. A frame of at least 50 ms
+writes `ui-frame[v1 slow]`; every ten seconds `ui-frame[v1 sum]` totals all
+frames. Both split the frame into GPUI-ordered intervals that add up to its
+`wall` (`pre` invalidation and Root render, `build`, `layout`
+request-layout, `compute` Root's request-layout around the app element plus
+taffy, `prepaint` through GPUI's deferred draws such as tooltips, `paint`,
+`tail` draw finalization, `present` platform present and arena clear; without
+GPUI's frame trace there is no `pre`, and `tail` and `present` are one
+`post`), then into window regions: `prep`,
+`actions`, `titlebar`, `sidebar`, `toolbar`, `hotbar`, `panes` (split
+containers), `panes_sb` (the pane row's scrollbar), `shell` (the body's
+sidebar and side-panel resizable groups and main column), `overlay`, and per
+tab group `stripN`, `bodyN` (the card) and `contentN` (the shown tab). Region
+values are self times per element phase (`build/layout/prepaint/paint`).
+`other` is the rest of each interval: the interval minus the region time that
+ran in it. GPUI lays some subtrees out inside an ancestor's prepaint, so a
+region's request-layout can run in the prepaint interval; `layout_late` is
+that time, and `other` doesn't count it twice. `cycles` is the UI thread's
+cycle count (Windows `QueryThreadCycleTime`) over `cpu_span`, which is the
+frame without `pre`. GPUI has no hook at draw start to read it sooner.
+Cycles are a count, not a duration. Windows warns against converting them to
+elapsed time, and the rate can differ between frames and other work, so the
+records don't convert them. `faults` is the process page-fault count. The
+summary adds `duty` (frame wall time over the interval), `ui_cpu` (the
+thread's CPU time from `GetThreadTimes`, charged per scheduler tick, so usable
+over ten seconds though not per frame), `frame_cycle_share` (the frames' share
+of the thread's cycles over the interval, `pre` outside it; a share of cycles,
+not of `ui_cpu`), `queue` (first invalidation to draw start) and a frame-time
+histogram. A counter that didn't read says `unavailable`, and a cycle share
+whose frames exceed the interval's cycles says `inconsistent`. Its interval
+averages take `pre`, `tail` and `present` over traced frames (`traced=T/F`)
+and `post` over the rest. Records hold fixed labels, counts and durations
+only.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the

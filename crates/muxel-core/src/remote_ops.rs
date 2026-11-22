@@ -41,26 +41,103 @@ fn root_of(root: &str) -> &str {
 ///
 /// The same binary on both sides; only the quoting differs.
 pub fn git(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_with_policy(os, repo, args, false)
+}
+
+/// Display reads avoid optional locks without requiring Git 2.15's CLI flag.
+pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    git_with_policy(os, repo, args, true)
+}
+
+fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
     match os {
-        RemoteOs::Unix => {
-            let mut c = format!("git -C {}", sh_quote(repo));
-            for a in args {
-                c.push(' ');
-                c.push_str(&sh_quote(a));
-            }
-            c
-        }
-        RemoteOs::Windows => {
-            let mut body = format!("& git -C {}", ps_quote(repo));
-            for a in args {
-                body.push(' ');
-                body.push_str(&ps_quote(a));
-            }
-            // git signals failure by exit code, not a PowerShell error, so the
-            // strict prelude alone would not surface it.
-            body.push_str("; exit $LASTEXITCODE");
-            ps(&body)
-        }
+        RemoteOs::Unix => sh_git(repo, args, read_only),
+        // git signals failure by exit code, not a PowerShell error, so the
+        // strict prelude alone would not surface it.
+        RemoteOs::Windows => ps(&format!(
+            "{}; exit $LASTEXITCODE",
+            ps_git(repo, args, read_only)
+        )),
+    }
+}
+
+const READ_ONLY_POLICY: &str = " -c diff.autoRefreshIndex=false";
+
+/// `git -C <repo> <args…>` for `sh`.
+fn sh_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("GIT_OPTIONAL_LOCKS=0 ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
+    for a in args {
+        c.push(' ');
+        c.push_str(&sh_quote(a));
+    }
+    c
+}
+
+/// `git -C <repo> <args…>` as PowerShell statements, git's exit code left in
+/// `$LASTEXITCODE`.
+fn ps_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("$env:GIT_OPTIONAL_LOCKS='0'; ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
+    for a in args {
+        body.push(' ');
+        body.push_str(&ps_quote(a));
+    }
+    body
+}
+
+/// What [`branches`] prints, on a line of its own, when git failed to list
+/// the branches of a repository. ssh's failures and sshpass's have exit codes
+/// of their own (sshpass's 5 is a wrong password), so the code alone can't
+/// say whose failure it was.
+pub const BRANCHES_FAILED: &str = "muxel: git could not list the branches";
+
+/// The local branches, one a line, `*` before HEAD's and a space before the
+/// others; then the branch HEAD names on a line of its own, since git's list
+/// has none for it before the first commit (exit 1 where HEAD names none).
+/// One command, so one ssh for both. Where the listing fails in a repository
+/// (a git older than 1.9 doesn't know `%(HEAD)`), git's message goes to
+/// stderr and [`BRANCHES_FAILED`] to stdout; in a folder holding no
+/// repository, or none at all, it prints nothing and succeeds. Telling the
+/// two apart costs a `git rev-parse` after a failure only, run in the folder
+/// rather than with `-C`: a git older than 1.8.5 has no `-C`, which fails the
+/// listing before `%(HEAD)` does. On Windows the check's `Test-Path` loads a
+/// module, which Windows PowerShell 5.1 reports as progress, and ssh's stderr
+/// would get it as XML after git's message; progress is turned off.
+pub fn branches(os: RemoteOs, repo: &str) -> String {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    const HEAD: &[&str] = &["symbolic-ref", "--quiet", "--short", "HEAD"];
+    match os {
+        RemoteOs::Unix => format!(
+            "{} || {{ {{ cd {} && git rev-parse --git-dir; }} >/dev/null 2>&1 || exit 0; \
+             echo {}; exit 2; }}; {}",
+            sh_git(repo, LIST, true),
+            sh_quote(repo),
+            sh_quote(BRANCHES_FAILED),
+            sh_git(repo, HEAD, true)
+        ),
+        RemoteOs::Windows => ps(&format!(
+            "$ProgressPreference='SilentlyContinue'; {}; if ($LASTEXITCODE -ne 0) {{ \
+             if (-not (Test-Path -LiteralPath {repo} -PathType Container)) {{ exit 0 }}; \
+             Set-Location -LiteralPath {repo}; & git rev-parse --git-dir | Out-Null; \
+             if ($LASTEXITCODE -ne 0) {{ exit 0 }}; {}; exit 2 }}; {}; exit $LASTEXITCODE",
+            ps_git(repo, LIST, true),
+            ps_quote(BRANCHES_FAILED),
+            ps_git(repo, HEAD, true),
+            repo = ps_quote(repo),
+        )),
     }
 }
 
@@ -73,7 +150,7 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
         RemoteOs::Unix => {
             let q = sh_quote(root);
             format!(
-                "cd {q} && (git ls-files --cached --others --exclude-standard 2>/dev/null \
+                "cd {q} && (GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard 2>/dev/null \
                  || find . -type f -not -path '*/.git/*') | head -n {cap}"
             )
         }
@@ -87,8 +164,8 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
             // slashed so both branches emit the same shape and the caller has
             // one thing to parse.
             ps(&format!(
-                "Set-Location -LiteralPath {q}; \
-                 $files = & git ls-files --cached --others --exclude-standard 2>$null; \
+                "Set-Location -LiteralPath {q}; $env:GIT_OPTIONAL_LOCKS='0'; \
+                 $files = & git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard 2>$null; \
                  if ($LASTEXITCODE -ne 0 -or $null -eq $files) {{ \
                  $root = (Get-Location).Path; \
                  $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force \
@@ -151,6 +228,19 @@ pub fn write_file(os: RemoteOs, abs_path: &str) -> String {
     }
 }
 
+/// A shell no-op that exits 0 on the remote host, used by the SSH login and
+/// connection checks.
+///
+/// On Windows, `exit 0` is valid in both `cmd.exe` and PowerShell and carries
+/// no quoting or metacharacters, so it survives either `DefaultShell` without
+/// paying a PowerShell process start on every check.
+pub fn noop(os: RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Unix => "true",
+        RemoteOs::Windows => "exit 0",
+    }
+}
+
 /// Whether a path exists and is a directory. Exit status carries the answer.
 pub fn test_dir(os: RemoteOs, dir: &str) -> String {
     match os {
@@ -182,7 +272,8 @@ pub fn test_file(os: RemoteOs, path: &str) -> String {
 }
 
 /// Create `<root>/<dir>`, seed `<root>/<dir>/<file>` with `header` when absent,
-/// and make sure `<ignore_line>` is in `.gitignore`. Idempotent.
+/// and make sure git ignores `<ignore_line>`, adding it to `.gitignore` when no
+/// ignore source covers it yet. Idempotent.
 pub fn ensure_seeded_file(
     os: RemoteOs,
     root: &str,
@@ -195,12 +286,12 @@ pub fn ensure_seeded_file(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {file} || printf '%s' {hdr} > {file}; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             file = sh_quote(rel_file),
             hdr = sh_quote(header),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -232,12 +323,12 @@ pub fn push_prep(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {rel} && cp -f {rel} {bak} || true; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             rel = sh_quote(rel_file),
             bak = sh_quote(rel_bak),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -254,8 +345,22 @@ pub fn push_prep(
     }
 }
 
-/// The PowerShell half of "add this line to .gitignore unless it is already
-/// there", shared by the two callers above.
+/// The POSIX shell half of "add this line to .gitignore unless git already
+/// ignores it", shared by the two callers above.
+///
+/// `git check-ignore` covers the ignore sources other than `.gitignore`, such
+/// as `.git/info/exclude` and `core.excludesFile`. A missing git or a root
+/// outside a repository makes it fail, so the line is appended as before.
+fn append_gitignore_sh(ignore_line: &str) -> String {
+    let ign = sh_quote(ignore_line);
+    format!(
+        "grep -qxF {ign} .gitignore 2>/dev/null \
+         || git check-ignore -q -- {ign} 2>/dev/null \
+         || printf '%s\\n' {ign} >> .gitignore"
+    )
+}
+
+/// The PowerShell twin of [`append_gitignore_sh`].
 ///
 /// Matched against the whole trimmed line, mirroring `grep -qxF`, so a
 /// `.muxel/` entry is not considered present because some other line happens to
@@ -267,6 +372,9 @@ fn append_gitignore_ps(ignore_line: &str) -> String {
          $have = (Test-Path -LiteralPath $gi -PathType Leaf) -and \
          ((Get-Content -LiteralPath $gi -ErrorAction SilentlyContinue | \
          ForEach-Object {{ $_.Trim() }}) -contains {ign}); \
+         if (-not $have -and (Get-Command git -ErrorAction SilentlyContinue)) {{ \
+         try {{ & git check-ignore -q -- {ign} 2>$null; $have = $LASTEXITCODE -eq 0 }} \
+         catch {{ $have = $false }} }}; \
          if (-not $have) {{ Add-Content -LiteralPath $gi -Value {ign} }}"
     )
 }
@@ -381,10 +489,76 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
     }
 }
 
+/// Which of `programs` the host can launch: a `MUXEL_PROG\t<program>` line for
+/// each one found, then `MUXEL_DONE` (see [`parse_found_programs`]).
+///
+/// On Unix the lookup uses the `PATH` a pane's agent actually gets. A remote
+/// program launches through the user's login+interactive shell
+/// (`ssh::login_shell_command`), so an agent in `~/.local/bin` or an nvm or
+/// npm-global prefix runs fine where sshd's bare `PATH` never sees it. That
+/// shell's `PATH` is read once, from a marked line, so anything its rc files
+/// print is ignored. When it can't be read (no `-ilc`, a failing rc, a hang cut
+/// off by `timeout`), sshd's `PATH` stands in. Either way the usual user prefixes
+/// are appended. The whole script runs under `sh -c`, since the shell running
+/// the ssh command may not be POSIX (fish).
+pub fn find_programs(os: RemoteOs, programs: &[String]) -> String {
+    match os {
+        RemoteOs::Unix => {
+            let read_path = sh_quote(r#"printf '\nMUXEL_PATH=%s\n' "$PATH""#);
+            let list = programs
+                .iter()
+                .map(|p| sh_quote(p))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = format!(
+                "t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; \
+                 lp=$($t \"${{SHELL:-/bin/sh}}\" -ilc {read_path} </dev/null 2>/dev/null \
+                 | sed -n 's/^MUXEL_PATH=//p' | tail -n 1); \
+                 [ -n \"$lp\" ] && PATH=\"$lp\"; {prelude}; \
+                 for p in {list}; do \
+                 command -v \"$p\" >/dev/null 2>&1 && printf 'MUXEL_PROG\\t%s\\n' \"$p\"; \
+                 done; echo MUXEL_DONE",
+                prelude = crate::ssh::tmux_path_prelude(),
+            );
+            format!("sh -c {}", sh_quote(&script))
+        }
+        RemoteOs::Windows => {
+            let list = programs
+                .iter()
+                .map(|p| ps_quote(p))
+                .collect::<Vec<_>>()
+                .join(",");
+            ps(&format!(
+                "foreach ($p in @({list})) {{ \
+                 if (Get-Command -Name $p -ErrorAction SilentlyContinue) \
+                 {{ Write-Output (\"MUXEL_PROG`t\" + $p) }} }}; \
+                 Write-Output 'MUXEL_DONE'"
+            ))
+        }
+    }
+}
+
+/// Parse [`find_programs`]' output: the programs found, or `None` when the
+/// listing never finished (the command died or was cut off), which says nothing
+/// about what is installed.
+pub fn parse_found_programs(out: &str) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let mut done = false;
+    for line in out.lines().map(|l| l.trim_end_matches('\r')) {
+        if line == "MUXEL_DONE" {
+            done = true;
+        } else if let Some(program) = line.strip_prefix("MUXEL_PROG\t") {
+            found.push(program.to_string());
+        }
+    }
+    done.then_some(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, list_files, paste_file_name, push_prep, read_file, scan_projects,
+        BRANCHES_FAILED, branches, ensure_seeded_file, find_programs, git, git_read_only,
+        list_files, parse_found_programs, paste_file_name, push_prep, read_file, scan_projects,
         test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
@@ -425,6 +599,43 @@ mod tests {
     const UNIX: RemoteOs = RemoteOs::Unix;
 
     #[test]
+    fn found_programs_need_the_closing_line() {
+        assert_eq!(
+            parse_found_programs("MUXEL_PROG\tpi\r\nMUXEL_PROG\tamp\nMUXEL_DONE\n"),
+            Some(vec!["pi".to_string(), "amp".to_string()])
+        );
+        // Finished, and nothing found: an honest empty answer.
+        assert_eq!(parse_found_programs("MUXEL_DONE\n"), Some(Vec::new()));
+        // Cut off before the end: no answer at all, not "nothing installed".
+        assert_eq!(parse_found_programs("MUXEL_PROG\tpi\n"), None);
+        assert_eq!(parse_found_programs(""), None);
+        // Stray output around the markers is ignored.
+        assert_eq!(
+            parse_found_programs("motd\nMUXEL_PROG\tpi\nPROG\tnope\nMUXEL_DONE\n"),
+            Some(vec!["pi".to_string()])
+        );
+    }
+
+    #[test]
+    fn program_lookup_uses_the_login_shell_path() {
+        let programs = ["pi".to_string(), "my agent".to_string()];
+        let cmd = find_programs(UNIX, &programs);
+        // POSIX sh on the far side, whatever the login shell is.
+        assert!(cmd.starts_with("sh -c '"), "{cmd}");
+        assert!(cmd.contains("-ilc"), "reads the login shell's PATH: {cmd}");
+        assert!(
+            cmd.contains("$HOME/.local/bin"),
+            "falls back on user prefixes"
+        );
+        assert!(cmd.ends_with("echo MUXEL_DONE'"), "{cmd}");
+
+        let script = script_of(&find_programs(WIN, &programs));
+        assert_opaque(&find_programs(WIN, &programs));
+        assert!(script.contains("@('pi','my agent')"), "{script}");
+        assert!(script.contains("Write-Output 'MUXEL_DONE'"), "{script}");
+    }
+
+    #[test]
     fn unix_forms_are_unchanged() {
         // These are the exact strings the app built before this module existed;
         // a remote Linux host must see no difference at all.
@@ -433,11 +644,139 @@ mod tests {
         assert_eq!(test_dir(UNIX, "/srv/app"), "test -d /srv/app");
         assert_eq!(test_file(UNIX, "/srv/a b"), "test -f '/srv/a b'");
         assert!(read_file(UNIX, "/tmp/x", 2_000_000).starts_with("if [ -f /tmp/x ]"));
-        assert!(list_files(UNIX, "/srv/app/", 500).starts_with("cd /srv/app && (git ls-files"));
+        assert!(list_files(UNIX, "/srv/app/", 500).starts_with(
+            "cd /srv/app && (GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false ls-files"
+        ));
+    }
+
+    #[test]
+    fn branches_are_listed_and_head_named_in_one_command() {
+        // The Unix form runs in the app's tests (`integrations`); here, that
+        // Windows asks the same, in order, and says git failed only where a
+        // repository is.
+        let s = script_of(&branches(WIN, "C:/p"));
+        let list = s.find("'for-each-ref'").expect("lists");
+        let gone = s
+            .find("if (-not (Test-Path -LiteralPath 'C:/p' -PathType Container)) { exit 0 }")
+            .expect("no folder: no branch");
+        let repo = s
+            .find("Set-Location -LiteralPath 'C:/p'; & git rev-parse --git-dir | Out-Null")
+            .expect("checks for a repository in the folder");
+        let none = s[repo..]
+            .find("{ exit 0 }")
+            .expect("no repository: no branch")
+            + repo;
+        let said = s
+            .find(&format!("'{BRANCHES_FAILED}'; exit 2"))
+            .expect("marks git's failure");
+        let head = s.find("'symbolic-ref'").expect("names HEAD");
+        assert!(
+            list < gone && gone < repo && repo < none && none < said && said < head,
+            "{s}"
+        );
+        // A git older than 1.8.5 has no `-C`; the check mustn't need it.
+        assert!(!s[list..said].contains(" -C "), "{s}");
+        assert!(s[head..].contains("; exit $LASTEXITCODE"), "{s}");
+    }
+
+    /// [`branches`]' Windows form, run here by Windows PowerShell as ssh runs
+    /// it on a Windows host, after `prelude` (a stand-in for that host's
+    /// git): its exit code, stdout and stderr, trimmed.
+    #[cfg(windows)]
+    fn branches_in_windows_powershell(
+        dir: &std::path::Path,
+        prelude: &str,
+    ) -> (i32, String, String) {
+        use std::os::windows::process::CommandExt as _;
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let script = format!("{prelude}{}", script_of(&branches(WIN, &dir)));
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &crate::winshell::encoded_command(&script),
+            ])
+            // A folder outside any repository stays outside one.
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .stdin(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        (code, text(&out.stdout), text(&out.stderr))
+    }
+
+    /// Windows PowerShell 5.1 answers as the Unix form does, and where git
+    /// can't list the branches, stderr holds what git said and nothing else:
+    /// the notice shows it. (5.1 reports loading a cmdlet's module as progress,
+    /// which a redirected stderr, as over ssh, gets as a block of XML.)
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_lists_branches_and_says_only_what_git_said() {
+        let root = std::env::temp_dir().join(format!("muxel-branches-{}", uuid::Uuid::new_v4()));
+        // Brackets for `-LiteralPath`, quotes for the quoting.
+        let repo = root.join("repo [x] 'q' \u{2019}q\u{2019}");
+        let plain = root.join("plain [x]");
+        let gone = root.join("gone");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repo_arg = repo.to_string_lossy().into_owned();
+        for args in [
+            vec!["init", "-q", "-b", "main", &repo_arg],
+            vec![
+                "-C",
+                &repo_arg,
+                "-c",
+                "user.name=muxel",
+                "-c",
+                "user.email=muxel@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ],
+        ] {
+            let ok = std::process::Command::new("git").args(&args).status();
+            assert!(ok.is_ok_and(|s| s.success()), "git {args:?}");
+        }
+        // git dying at a field it doesn't know, as one older than 1.9 dies at
+        // `%(HEAD)`; and git with no `-C`, as one older than 1.8.5.
+        let old_git = "function git { $a = @($args | ForEach-Object { \
+                       if ($_ -eq '--format=%(HEAD)%(refname:short)') \
+                       { '--format=%(no-such-field)' } else { $_ } }); \
+                       & git.exe @a; $global:LASTEXITCODE = $LASTEXITCODE }; ";
+        let no_c_git = "function git { if ($args -contains '-C') \
+                        { & git.exe --muxel-no-such-option } else { & git.exe @args }; \
+                        $global:LASTEXITCODE = $LASTEXITCODE }; ";
+
+        let (code, out, err) = branches_in_windows_powershell(&repo, "");
+        assert_eq!(
+            (code, out.lines().collect::<Vec<_>>()),
+            (0, vec!["*main", "main"])
+        );
+        assert_eq!(err, "");
+        let (code, out, err) = branches_in_windows_powershell(&repo, old_git);
+        assert_eq!((code, out.as_str()), (2, BRANCHES_FAILED));
+        assert_eq!(err, "fatal: unknown field name: no-such-field");
+        let (code, out, err) = branches_in_windows_powershell(&repo, no_c_git);
+        assert_eq!((code, out.as_str()), (2, BRANCHES_FAILED));
+        assert!(
+            err.contains("--muxel-no-such-option") && !err.contains("CLIXML"),
+            "{err}"
+        );
+        // No repository, or no folder: no branch, and nothing said.
+        for (dir, prelude) in [(&plain, ""), (&plain, no_c_git), (&gone, no_c_git)] {
+            let (code, out, err) = branches_in_windows_powershell(dir, prelude);
+            assert_eq!((code, out.as_str()), (0, ""), "{dir:?}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn windows_commands_are_all_opaque_base64() {
+        assert_opaque(&branches(WIN, "C:/p"));
         assert_opaque(&git(WIN, "C:/p", &["status"]));
         assert_opaque(&list_files(WIN, "C:/p", 10));
         assert_opaque(&read_file(WIN, "C:/p/a.txt", 10));
@@ -505,6 +844,23 @@ mod tests {
     }
 
     #[test]
+    fn remote_git_reads_use_environment_policy_without_new_git_flags() {
+        assert_eq!(
+            git_read_only(UNIX, "/srv/a b", &["status", "--porcelain"]),
+            "GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false -C '/srv/a b' status --porcelain"
+        );
+        let s = script_of(&git_read_only(WIN, "C:/a b", &["status"]));
+        assert!(s.contains("$env:GIT_OPTIONAL_LOCKS='0'; & git -c diff.autoRefreshIndex=false -C 'C:/a b' 'status'"), "{s}");
+        assert!(s.contains("exit $LASTEXITCODE"), "{s}");
+        for cmd in [
+            git(UNIX, "/srv/app", &["add", "."]),
+            script_of(&git(WIN, "C:/p", &["add", "."])),
+        ] {
+            assert!(!cmd.contains("GIT_OPTIONAL_LOCKS"), "mutation: {cmd}");
+        }
+    }
+
+    #[test]
     fn windows_scripts_stop_on_the_first_error() {
         for cmd in [
             write_file(WIN, "C:/p/a"),
@@ -560,7 +916,8 @@ mod tests {
     fn windows_list_files_prefers_git_then_walks() {
         let s = script_of(&list_files(WIN, "C:/p", 42));
         assert!(
-            s.contains("git ls-files --cached --others --exclude-standard"),
+            s.contains("$env:GIT_OPTIONAL_LOCKS='0';")
+                && s.contains("git -c diff.autoRefreshIndex=false ls-files --cached --others --exclude-standard"),
             "{s}"
         );
         assert!(s.contains("Get-ChildItem"), "{s}");
@@ -596,6 +953,48 @@ mod tests {
         ));
         assert!(s.contains("-contains '.muxel/'"), "{s}");
         assert!(s.contains("$_.Trim()"), "{s}");
+    }
+
+    /// Both hosts ask git before appending, so a `.muxel/` that
+    /// `.git/info/exclude` already ignores leaves `.gitignore` alone.
+    #[test]
+    fn gitignore_append_defers_to_git_check_ignore() {
+        for cmd in [
+            ensure_seeded_file(UNIX, "/p", ".muxel", ".muxel/M.md", "h", ".muxel/"),
+            push_prep(
+                UNIX,
+                "/p",
+                ".muxel",
+                ".muxel/w.json",
+                ".muxel/b.json",
+                ".muxel/",
+            ),
+        ] {
+            assert!(
+                cmd.contains(
+                    "grep -qxF .muxel/ .gitignore 2>/dev/null \
+                     || git check-ignore -q -- .muxel/ 2>/dev/null \
+                     || printf '%s\\n' .muxel/ >> .gitignore"
+                ),
+                "{cmd}"
+            );
+        }
+        let s = script_of(&ensure_seeded_file(
+            WIN,
+            "C:/p",
+            ".muxel",
+            ".muxel/M.md",
+            "h",
+            ".muxel/",
+        ));
+        assert!(
+            s.contains(
+                "try { & git check-ignore -q -- '.muxel/' 2>$null; $have = $LASTEXITCODE -eq 0 } \
+                 catch { $have = $false }"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("Get-Command git"), "{s}");
     }
 
     #[test]
@@ -654,5 +1053,31 @@ mod tests {
             push_prep(WIN, "C:/p/", ".m", "a", "b", "i"),
             push_prep(WIN, "C:/p", ".m", "a", "b", "i")
         );
+    }
+
+    #[cfg(all(test, windows))]
+    #[test]
+    fn windows_noop_exits_zero_in_cmd_and_powershell() {
+        use std::os::windows::process::CommandExt as _;
+
+        let cmd = super::noop(WIN);
+        for (shell, args) in [
+            ("cmd.exe", vec!["/C", cmd]),
+            ("powershell", vec!["-NoProfile", "-Command", cmd]),
+        ] {
+            let out = std::process::Command::new(shell)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {shell}: {e}"));
+            assert!(
+                out.status.success(),
+                "{shell} {args:?} exited {:?}: stdout={:?} stderr={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+        }
     }
 }

@@ -1,0 +1,1755 @@
+//! Where links, files and new agents land in the running app: beside the pane
+//! a link was clicked in, in the window a toolbar click or shortcut came from,
+//! and never behind a maximized pane. Focus stays with the window that shows
+//! the pane holding it.
+
+use super::hotbar::MainView;
+use super::popout_lifecycle_tests::{with_app, with_app_drawing};
+use super::{
+    AgentPreset, Instance, MuxelApp, OpenFocus, PaneNode, PaneView, Project, ResourceOrigin,
+    SecondaryWindow, WorkspaceWindow,
+};
+use gpui::{
+    AnyWindowHandle, AppContext, Context, Entity, FocusHandle, Focusable, TestAppContext, Window,
+    WindowHandle,
+};
+use muxel_core::{SplitDirection, add_tab, split};
+use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// An inert command for every pane a test starts: it waits on input until killed.
+const WAIT: [&str; 4] = ["/d", "/q", "/c", "more"];
+
+/// A project with an empty layout. The first one made is the main window's.
+fn project(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>, name: &str) -> Uuid {
+    main.update(cx, |app, _, _| {
+        let root = muxel_store::data_dir()
+            .unwrap()
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let pid = app.workspace.add_project(Project::new(name, root));
+        app.workspace.active_project.get_or_insert(pid);
+        app.current_workspace.get_or_insert_with(Uuid::new_v4);
+        app.main_window = Some(main.into());
+        app.show_terms = false;
+        app.show_workspace_selector = false;
+        app.use_tmux = false;
+        app.use_worktree = false;
+        app.presets = vec![AgentPreset {
+            program: Some("cmd.exe".into()),
+            args: WAIT.map(String::from).into(),
+            ..AgentPreset::shell()
+        }];
+        app.current_preset = 0;
+        pid
+    })
+    .unwrap()
+}
+
+/// A terminal pane in `pid` to the right of `beside` (or the layout's first),
+/// with no process behind it. One started later runs the inert command.
+fn pane(app: &mut MuxelApp, pid: Uuid, beside: Option<Uuid>) -> Uuid {
+    let mut instance = Instance::shell(pid);
+    instance.program = Some("cmd.exe".into());
+    instance.args = WAIT.map(String::from).into();
+    let iid = instance.id;
+    app.workspace.add_instance(instance);
+    let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+    match beside {
+        Some(beside) => assert!(split(layout, beside, SplitDirection::Horizontal, iid)),
+        None => *layout = Some(PaneNode::leaf(iid)),
+    }
+    iid
+}
+
+fn group(app: &MuxelApp, pid: Uuid, iid: Uuid) -> Vec<Uuid> {
+    let layout = app.workspace.project(pid).unwrap().layout.as_ref();
+    layout.unwrap().tab_group(iid).unwrap().to_vec()
+}
+
+/// The tab at the front of `iid`'s group.
+fn front_tab(app: &MuxelApp, pid: Uuid, iid: Uuid) -> Uuid {
+    let layout = app.workspace.project(pid).unwrap().layout.as_ref();
+    match layout.unwrap().leaf_containing(iid) {
+        Some(PaneNode::Leaf(leaf)) => leaf.tabs[leaf.active],
+        _ => panic!("{iid} is in no group"),
+    }
+}
+
+/// What `window` has focused.
+fn focused(cx: &mut TestAppContext, window: impl Into<AnyWindowHandle>) -> Option<FocusHandle> {
+    cx.update_window(window.into(), |_, window, cx| window.focused(cx))
+        .unwrap()
+}
+
+fn editor_focus(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>, iid: Uuid) -> FocusHandle {
+    main.read_with(cx, |app, cx| app.editors[&iid].read(cx).focus_handle(cx))
+        .unwrap()
+}
+
+/// Open `path` in project `pid` from window `window`, as the file browser does.
+fn open_file(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    window: impl Into<AnyWindowHandle>,
+    pid: Uuid,
+    path: &Path,
+    origin: ResourceOrigin,
+) -> Uuid {
+    let app = main.entity(cx).unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        app.update(cx, |app, cx| {
+            let path = Some(path.to_path_buf());
+            app.open_editor_at(pid, path, origin, OpenFocus::Focus, window, cx)
+        })
+    })
+    .unwrap()
+    .unwrap()
+}
+
+/// A file in `pid`'s root, spelled as a terminal prints it: without the `\\?\`
+/// prefix the test root's canonical path carries.
+fn text_file(app: &MuxelApp, pid: Uuid, name: &str) -> PathBuf {
+    let path = app.workspace.project(pid).unwrap().root_path.join(name);
+    std::fs::write(&path, "notes\n").unwrap();
+    PathBuf::from(path.to_string_lossy().trim_start_matches(r"\\?\"))
+}
+
+#[test]
+fn a_link_opens_beside_the_pane_it_was_clicked_in_not_the_focused_one() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        main.update(cx, |app, window, cx| {
+            let x = pane(app, pid, None);
+            let y = pane(app, pid, Some(x));
+            let z = pane(app, pid, Some(y));
+            let first = muxel_terminal::file_uri(&text_file(app, pid, "first.txt"));
+            let second = muxel_terminal::file_uri(&text_file(app, pid, "second.txt"));
+
+            // A Ctrl+click in Y raises the link before the click moves focus,
+            // so X, the pane focused until then, is still the active one.
+            app.active_instance = Some(x);
+            let link = muxel_terminal::OpenLink {
+                url: first,
+                pane: y,
+            };
+            app.on_open_link(&link, window, cx);
+            let opened = app.active_instance.unwrap();
+            assert_eq!(app.editors.len(), 1, "the link opened no editor");
+            assert_eq!(group(app, pid, opened), [z, opened], "beside Y, not X");
+            assert_eq!(group(app, pid, y), [y]);
+
+            // A middle-click lands in the same place and gives focus back to X.
+            app.focus_instance(x, window, cx);
+            let background = muxel_terminal::OpenLinkBackground {
+                url: second,
+                pane: y,
+            };
+            app.on_open_link_background(&background, window, cx);
+            assert_eq!(app.editors.len(), 2, "the link opened no editor");
+            assert_eq!(group(app, pid, z).len(), 3, "beside Y, not X");
+            assert_eq!(group(app, pid, z)[..2], [z, opened]);
+            assert_eq!(app.active_instance, Some(x));
+        })
+        .unwrap();
+    });
+}
+
+/// A second window showing `pid`, as a monitor's window does.
+fn secondary_window(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    pid: Uuid,
+) -> WindowHandle<WorkspaceWindow> {
+    let app = main.entity(cx).unwrap();
+    let weak = app.downgrade();
+    let display_uuid = Uuid::new_v4();
+    let secondary =
+        cx.add_window(|window, cx| WorkspaceWindow::new(weak, pid, display_uuid, window, cx));
+    let view = secondary.entity(cx).unwrap();
+    let handle: AnyWindowHandle = secondary.into();
+    app.update(cx, |app, _| {
+        app.secondary_windows.push(SecondaryWindow {
+            pid,
+            display_uuid,
+            window_id: handle.window_id(),
+            handle,
+            view,
+            active: true,
+        });
+    });
+    secondary
+}
+
+/// A project shows in one window at a time. When the main window's project
+/// moves to its own window, the main window switches to a project no window
+/// shows, never to one a project window already has.
+#[test]
+fn the_main_window_falls_back_past_a_project_in_its_own_window_when_one_moves_out() {
+    with_app(|cx, main| {
+        let moving = project(cx, main, "moves to its own window");
+        let elsewhere = project(cx, main, "already in its own window");
+        let unshown = project(cx, main, "in no window");
+        secondary_window(cx, main, elsewhere);
+        // Selecting a project adopts its default agent.
+        let own_default = main
+            .update(cx, |app, _, _| {
+                let preset = AgentPreset::shell();
+                let id = preset.id;
+                app.presets.push(preset);
+                app.workspace.project_mut(unshown).unwrap().default_preset = Some(id);
+                id
+            })
+            .unwrap();
+
+        main.update(cx, |app, window, cx| {
+            let display = cx.displays().into_iter().next().expect("a test display");
+            app.open_project_on_monitor(moving, display.id(), display.uuid().unwrap(), window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        main.read_with(cx, |app, _| {
+            let active = app.workspace.active_project;
+            assert_ne!(active, Some(elsewhere), "two windows show one project");
+            assert_eq!(active, Some(unshown));
+            assert_eq!(
+                app.presets[app.current_preset].id, own_default,
+                "the main window showed the project without selecting it"
+            );
+        })
+        .unwrap();
+    });
+}
+
+/// The same when the main window's project is removed, and the project it
+/// takes starts its panes, as switching to it does.
+#[test]
+fn the_main_window_falls_back_past_a_project_in_its_own_window_when_one_is_removed() {
+    with_app(|cx, main| {
+        let removed = project(cx, main, "removed");
+        let elsewhere = project(cx, main, "already in its own window");
+        let unshown = project(cx, main, "in no window");
+        let waiting = main
+            .update(cx, |app, _, _| pane(app, unshown, None))
+            .unwrap();
+        secondary_window(cx, main, elsewhere);
+
+        main.update(cx, |app, _, cx| app.delete_project(removed, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let active = main
+            .read_with(cx, |app, _| app.workspace.active_project)
+            .unwrap();
+        assert_ne!(active, Some(elsewhere), "two windows show one project");
+        assert_eq!(active, Some(unshown));
+        // Panes start in timed waves, so the clock has to move.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.executor().advance_clock(Duration::from_millis(300));
+            cx.run_until_parked();
+            let started = main
+                .read_with(cx, |app, _| {
+                    app.terminals.contains_key(&waiting)
+                        || app.terminal_launching.contains_key(&waiting)
+                        || app.failed_launches.contains_key(&waiting)
+                })
+                .unwrap();
+            if started {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the project the main window took never started its pane"
+            );
+        }
+    });
+}
+
+/// Reopening a workspace queues a window for each pinned project before any
+/// of them opens. The main window ends on a project none of them shows.
+#[test]
+fn the_main_window_ends_on_an_unpinned_project_when_a_workspace_reopens() {
+    with_app(|cx, main| {
+        let first = project(cx, main, "pinned first");
+        let second = project(cx, main, "pinned second");
+        let unpinned = project(cx, main, "unpinned");
+
+        // As restore does: every pinned window queued in one pass.
+        main.update(cx, |app, window, cx| {
+            let display = cx.displays().into_iter().next().expect("a test display");
+            let uuid = display.uuid().unwrap();
+            app.open_project_on_monitor(first, display.id(), uuid, window, cx);
+            app.open_project_on_monitor(second, display.id(), uuid, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        main.read_with(cx, |app, _| {
+            let windows: Vec<Uuid> = app.secondary_windows.iter().map(|s| s.pid).collect();
+            assert_eq!(windows.len(), 2, "the pinned windows didn't both open");
+            let active = app.workspace.active_project;
+            assert!(
+                active.is_none_or(|pid| !windows.contains(&pid)),
+                "two windows show one project"
+            );
+            assert_eq!(active, Some(unpinned));
+        })
+        .unwrap();
+    });
+}
+
+#[test]
+fn toolbar_and_shortcut_agents_open_in_the_window_they_came_from() {
+    with_app(|cx, main| {
+        let shown = project(cx, main, "main window");
+        let other = project(cx, main, "second window");
+        let (main_pane, other_pane) = main
+            .update(cx, |app, _, _| {
+                (pane(app, shown, None), pane(app, other, None))
+            })
+            .unwrap();
+        let secondary = secondary_window(cx, main, other);
+        let app = main.entity(cx).unwrap();
+        let in_secondary =
+            |cx: &mut TestAppContext,
+             run: fn(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>)| {
+                secondary
+                    .update(cx, |_, window, cx| {
+                        app.update(cx, |app, cx| run(app, window, cx))
+                    })
+                    .unwrap();
+            };
+        let set_focus = |cx: &mut TestAppContext, iid: Uuid| {
+            main.update(cx, |app, _, _| app.active_instance = Some(iid))
+                .unwrap();
+        };
+
+        // Focus is in the second window: its toolbar button and Ctrl+Alt+1 open there.
+        set_focus(cx, other_pane);
+        in_secondary(cx, |app, window, cx| app.new_tab(window, cx));
+        in_secondary(cx, |app, window, cx| app.new_agent_preset(1, window, cx));
+        // Its toolbar acts on its own project even when focus is in the main window.
+        set_focus(cx, main_pane);
+        in_secondary(cx, |app, window, cx| app.new_tab(window, cx));
+        // And the main window's shortcut acts on the main window's project.
+        set_focus(cx, other_pane);
+        main.update(cx, |app, window, cx| app.new_agent_preset(1, window, cx))
+            .unwrap();
+
+        main.read_with(cx, |app, _| {
+            assert_eq!(group(app, other, other_pane).len(), 4);
+            assert_eq!(group(app, shown, main_pane).len(), 2);
+        })
+        .unwrap();
+    });
+}
+
+#[test]
+fn a_file_opened_beside_a_maximized_pane_ends_the_maximize() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        main.update(cx, |app, window, cx| {
+            let opener = pane(app, pid, None);
+            let beside = pane(app, pid, Some(opener));
+            let notes = text_file(app, pid, "notes.txt");
+            let open = |app: &mut MuxelApp,
+                        window: &mut Window,
+                        cx: &mut Context<MuxelApp>,
+                        path: &PathBuf,
+                        origin: ResourceOrigin| {
+                let path = Some(path.clone());
+                app.open_editor_at(pid, path, origin, OpenFocus::Focus, window, cx)
+                    .unwrap()
+            };
+
+            // The file joins the pane beside the opener, which the maximize hides.
+            app.active_instance = Some(opener);
+            app.maximized = Some(opener);
+            let file = open(app, window, cx, &notes, ResourceOrigin::Pane(opener));
+            assert_eq!(group(app, pid, file), [beside, file]);
+            assert_eq!(app.maximized, None);
+
+            // Opening it again finds it in that same hidden group.
+            app.maximized = Some(opener);
+            assert_eq!(
+                open(app, window, cx, &notes, ResourceOrigin::Pane(opener)),
+                file
+            );
+            assert_eq!(app.maximized, None);
+
+            // A file joining the maximized group itself is already in view.
+            app.maximized = Some(file);
+            let todo = text_file(app, pid, "todo.txt");
+            let near = ResourceOrigin::Chrome { near: Some(file) };
+            let second = open(app, window, cx, &todo, near);
+            assert_eq!(group(app, pid, second), [beside, file, second]);
+            assert_eq!(app.maximized, Some(second));
+        })
+        .unwrap();
+    });
+}
+
+/// Two windows, each with its own focus: the main window shows `shown` with
+/// editor A focused (the app's focused pane), and the second window shows
+/// `other`, where editor C sits beside terminal pane B and has that window's
+/// focus.
+struct TwoWindows {
+    shown: Uuid,
+    other: Uuid,
+    secondary: WindowHandle<WorkspaceWindow>,
+    a: Uuid,
+    b: Uuid,
+    c: Uuid,
+    a_focus: FocusHandle,
+    c_focus: FocusHandle,
+}
+
+fn two_windows(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>) -> TwoWindows {
+    let shown = project(cx, main, "main window");
+    let other = project(cx, main, "second window");
+    let (a_path, c_path) = main
+        .update(cx, |app, _, _| {
+            (
+                text_file(app, shown, "a.txt"),
+                text_file(app, other, "c.txt"),
+            )
+        })
+        .unwrap();
+    let near = ResourceOrigin::Chrome { near: None };
+    let a = open_file(cx, main, main, shown, &a_path, near);
+    let secondary = secondary_window(cx, main, other);
+    let b = main.update(cx, |app, _, _| pane(app, other, None)).unwrap();
+    let c = open_file(cx, main, secondary, other, &c_path, ResourceOrigin::Pane(b));
+    main.update(cx, |app, window, cx| app.focus_instance(a, window, cx))
+        .unwrap();
+    let (a_focus, c_focus) = (editor_focus(cx, main, a), editor_focus(cx, main, c));
+    assert_eq!(focused(cx, secondary), Some(c_focus.clone()));
+    TwoWindows {
+        shown,
+        other,
+        secondary,
+        a,
+        b,
+        c,
+        a_focus,
+        c_focus,
+    }
+}
+
+impl TwoWindows {
+    /// A middle-click on `url` in pane `from`, shown in `window`.
+    fn middle_click(
+        &self,
+        cx: &mut TestAppContext,
+        main: WindowHandle<MuxelApp>,
+        window: impl Into<AnyWindowHandle>,
+        url: String,
+        from: Uuid,
+    ) {
+        let app = main.entity(cx).unwrap();
+        let link = muxel_terminal::OpenLinkBackground { url, pane: from };
+        cx.update_window(window.into(), |_, window, cx| {
+            app.update(cx, |app, cx| app.on_open_link_background(&link, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Each window still has its own focus, A is still the app's focused
+    /// pane, and C, which has the second window's focus, is still in view.
+    fn assert_focus_kept(&self, cx: &mut TestAppContext, main: WindowHandle<MuxelApp>, open: &str) {
+        let secondary = focused(cx, self.secondary);
+        assert_eq!(
+            secondary,
+            Some(self.c_focus.clone()),
+            "{open}: the second window lost its focus"
+        );
+        let main_focus = focused(cx, main);
+        assert_eq!(
+            main_focus,
+            Some(self.a_focus.clone()),
+            "{open}: the main window lost its focus"
+        );
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(self.a), "{open}");
+            let front = front_tab(app, self.other, self.c);
+            assert_eq!(
+                front, self.c,
+                "{open}: the second window's focused tab was hidden"
+            );
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_background_open_leaves_each_windows_focus_its_own() {
+    with_app(|cx, main| {
+        let w = two_windows(cx, main);
+        let d = main
+            .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
+            .unwrap();
+
+        // A middle-click on a path in B, in the second window.
+        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
+        w.assert_focus_kept(cx, main, "a new file");
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the link opened no editor");
+            assert_eq!(group(app, w.other, w.c).len(), 2, "beside B, in C's group");
+        })
+        .unwrap();
+
+        // The same path middle-clicked in the main window reuses that file.
+        let caller = main
+            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            .unwrap();
+        w.middle_click(cx, main, main, muxel_terminal::file_uri(&d), caller);
+        w.assert_focus_kept(cx, main, "a reused file");
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the file opened twice");
+        })
+        .unwrap();
+    });
+}
+
+/// Going to a link's line moves the editor's cursor, which focuses the editor
+/// in the window the open runs in.
+#[test]
+fn a_background_link_to_a_line_leaves_each_windows_focus_its_own() {
+    with_app(|cx, main| {
+        let w = two_windows(cx, main);
+        let e = main
+            .update(cx, |app, _, _| text_file(app, w.other, "e.txt"))
+            .unwrap();
+        let url = format!("{}#L2", muxel_terminal::file_uri(&e));
+
+        w.middle_click(cx, main, w.secondary, url.clone(), w.b);
+        w.assert_focus_kept(cx, main, "a new file at a line");
+        // Again from the main window, where the file is the other window's.
+        let caller = main
+            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            .unwrap();
+        w.middle_click(cx, main, main, url, caller);
+        w.assert_focus_kept(cx, main, "a reused file at a line");
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the file opened twice");
+        })
+        .unwrap();
+    });
+}
+
+/// Reopening a clean file that changed on disk reloads it, which focuses its
+/// editor in the window the open runs in.
+#[test]
+fn a_background_reopen_of_a_changed_file_leaves_each_windows_focus_its_own() {
+    with_app(|cx, main| {
+        let w = two_windows(cx, main);
+        let d = main
+            .update(cx, |app, _, _| text_file(app, w.other, "d.txt"))
+            .unwrap();
+        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
+
+        std::fs::write(&d, "changed\n").unwrap();
+        w.middle_click(cx, main, w.secondary, muxel_terminal::file_uri(&d), w.b);
+        w.assert_focus_kept(cx, main, "a reload in the file's window");
+        // Again from the main window, where the file is the other window's.
+        std::fs::write(&d, "changed again\n").unwrap();
+        let caller = main
+            .update(cx, |app, _, _| pane(app, w.shown, Some(w.a)))
+            .unwrap();
+        w.middle_click(cx, main, main, muxel_terminal::file_uri(&d), caller);
+        w.assert_focus_kept(cx, main, "a reload from another window");
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the file opened twice");
+        })
+        .unwrap();
+    });
+}
+
+/// A live terminal in `pid`, made in `window`: a shell that prints a line and
+/// waits, so its pane draws the terminal rather than the starting cue.
+fn live_terminal(
+    app: &mut MuxelApp,
+    pid: Uuid,
+    window: &mut Window,
+    cx: &mut Context<MuxelApp>,
+) -> (Uuid, Entity<TerminalView>) {
+    let mut instance = Instance::shell(pid);
+    instance.program = Some("cmd.exe".into());
+    instance.args = ["/d", "/k", "echo", "ready"].map(String::from).into();
+    let iid = instance.id;
+    let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+    app.workspace.add_instance(instance);
+    let launch = TerminalLaunch::spawn(spec, (80, 24)).expect("spawn the terminal");
+    let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+    app.terminals.insert(iid, view.clone());
+    (iid, view)
+}
+
+#[test]
+fn open_in_new_tab_from_a_terminals_menu_keeps_focus_where_the_menu_leaves_it() {
+    with_app_drawing(true, |cx, main| {
+        project(cx, main, "main window");
+        let pid = project(cx, main, "second window");
+        main.update(cx, |app, window, cx| {
+            let display = cx.displays().into_iter().next().expect("a test display");
+            app.open_project_on_monitor(pid, display.id(), display.uuid().unwrap(), window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (secondary, f_path) = main
+            .read_with(cx, |app, _| {
+                let own = app.secondary_windows.iter().find(|s| s.pid == pid);
+                let own = own.expect("the project's window").handle;
+                (own, text_file(app, pid, "f.txt"))
+            })
+            .unwrap();
+        // Terminal B and file F share a group, with B in front; A, beside
+        // them, has the window's focus.
+        let near = ResourceOrigin::Chrome { near: None };
+        let f = open_file(cx, main, secondary, pid, &f_path, near);
+        let app = main.entity(cx).unwrap();
+        let (a, b, b_view) = cx
+            .update_window(secondary, |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    let (b, b_view) = live_terminal(app, pid, window, cx);
+                    let (a, _) = live_terminal(app, pid, window, cx);
+                    let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                    assert!(add_tab(layout, f, b));
+                    assert!(split(layout, b, SplitDirection::Horizontal, a));
+                    app.focus_instance(a, window, cx);
+                    (a, b, b_view)
+                })
+            })
+            .unwrap();
+        // A right-click lands on a drawn terminal. Wait until the window's last
+        // frame holds B's terminal under the window's root, so the menu's
+        // action has B's node to start from; on a missing node it's a no-op.
+        let (root, b_focus) = main
+            .read_with(cx, |app, cx| {
+                let own = app.secondary_windows.iter().find(|s| s.pid == pid);
+                let root = own.unwrap().view.read(cx).focus_handle.clone();
+                (root, b_view.read(cx).focus_handle(cx))
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // The real shell and GPUI's virtual paint timers both advance
+            // before the pane draws its terminal and the window redraws.
+            cx.executor().advance_clock(Duration::from_millis(300));
+            cx.run_until_parked();
+            let drawn = cx
+                .update_window(secondary, |_, window, _| root.contains(&b_focus, window))
+                .unwrap();
+            if drawn {
+                break;
+            }
+            assert!(Instant::now() < deadline, "B's terminal never drew");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let a_focus = main
+            .read_with(cx, |app, cx| app.terminals[&a].read(cx).focus_handle(cx))
+            .unwrap();
+        assert_eq!(focused(cx, secondary), Some(a_focus.clone()));
+
+        // Right-click F's path in B and choose Open in new tab. The item runs
+        // inside B's own update with the menu focused, and dismissing the
+        // menu then gives the focus back to A.
+        let menu = cx.update(|cx| cx.focus_handle());
+        let url = muxel_terminal::file_uri(&f_path);
+        cx.update_window(secondary, |_, window, cx| {
+            b_view.update(cx, |terminal, cx| {
+                window.focus(&menu, cx);
+                super::open_link_from_menu(terminal, url, true, window, cx);
+                window.focus(&a_focus, cx);
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(focused(cx, secondary), Some(a_focus));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 1, "the file opened twice");
+            let front = front_tab(app, pid, b);
+            let name = [(a, "A"), (b, "B"), (f, "F")]
+                .into_iter()
+                .find(|(iid, _)| *iid == front)
+                .map(|(_, name)| name);
+            assert_eq!(
+                front, f,
+                "the file didn't come forward: {name:?} is in front"
+            );
+            assert_eq!(app.active_instance, Some(a));
+        })
+        .unwrap();
+    });
+}
+
+/// A page in a project window keeps what the user is typing in its address
+/// bar. The tick that syncs the page runs in the main window, where that
+/// address bar never has focus, so a sync judged there replaced the typing.
+#[test]
+fn typing_in_a_project_windows_page_address_bar_survives_the_tick() {
+    with_app(|cx, main| {
+        project(cx, main, "main window");
+        let pid = project(cx, main, "second window");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let secondary = secondary_window(cx, main, pid);
+        let app = main.entity(cx).unwrap();
+        let page = cx
+            .update_window(secondary.into(), |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    let url = "https://example.test/first".to_string();
+                    let near = ResourceOrigin::Pane(caller);
+                    app.open_browser_in_project(
+                        pid,
+                        url,
+                        near,
+                        None,
+                        OpenFocus::Background,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .unwrap();
+        let view = main
+            .read_with(cx, |app, _| app.browsers[&page].clone())
+            .unwrap();
+
+        // The user starts typing an address while the page follows a link.
+        cx.update_window(secondary.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.type_address_for_test("example.test/sec", window, cx)
+            })
+        })
+        .unwrap();
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/second")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.address_for_test(cx)),
+            "example.test/sec",
+            "the tick replaced what the user was typing"
+        );
+        let synced = main
+            .read_with(cx, |app, _| {
+                app.workspace.instance(page).unwrap().browser_url.clone()
+            })
+            .unwrap();
+        assert_eq!(
+            synced.as_deref(),
+            Some("https://example.test/second"),
+            "the tick didn't sync the page"
+        );
+    });
+}
+
+#[test]
+fn a_link_in_a_popped_out_terminal_opens_in_its_projects_window() {
+    with_app_drawing(true, |cx, main| {
+        let shown = project(cx, main, "main window");
+        let pid = project(cx, main, "popped out");
+        let (term, view) = main
+            .update(cx, |app, window, cx| {
+                let mut instance = Instance::shell(pid);
+                instance.program = Some("cmd.exe".into());
+                instance.args = WAIT.map(String::from).into();
+                let iid = instance.id;
+                let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+                app.workspace.add_instance(instance);
+                let launch = TerminalLaunch::spawn(spec, (80, 24)).expect("spawn the terminal");
+                let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+                app.terminals.insert(iid, view.clone());
+                app.pop_out_instance(iid, window, cx);
+                let display = cx.displays().into_iter().next().expect("a test display");
+                app.open_project_on_monitor(pid, display.id(), display.uuid().unwrap(), window, cx);
+                (iid, view)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (popout, secondary) = main
+            .read_with(cx, |app, _| {
+                let own = app.secondary_windows.iter().find(|s| s.pid == pid);
+                (
+                    app.popouts[&term].window,
+                    own.expect("the project's window").handle,
+                )
+            })
+            .unwrap();
+        let drawn = super::POPOUT_TEST_RENDERS.with(|r| r.borrow().get(&term).copied());
+        assert!(drawn.is_some(), "the popout never drew its terminal");
+        let term_focus = view.read_with(cx, |view, cx| view.focus_handle(cx));
+        let (first, second) = main
+            .read_with(cx, |app, _| {
+                (
+                    text_file(app, pid, "first.txt"),
+                    text_file(app, pid, "second.txt"),
+                )
+            })
+            .unwrap();
+        // A click in the terminal raises the link from its own focus node.
+        let click = |cx: &mut TestAppContext, action: &dyn gpui::Action| {
+            popout
+                .update(cx, |_, window, cx| {
+                    term_focus.dispatch_action(action, window, cx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        let link = muxel_terminal::OpenLink {
+            url: muxel_terminal::file_uri(&first),
+            pane: term,
+        };
+        click(cx, &link);
+        let opened = main
+            .read_with(cx, |app, _| {
+                assert_eq!(app.editors.len(), 1, "the link opened nothing");
+                let opened = *app.editors.keys().next().unwrap();
+                assert_eq!(group(app, pid, opened), [opened]);
+                assert!(app.workspace.project(shown).unwrap().layout.is_none());
+                opened
+            })
+            .unwrap();
+        let opened_focus = editor_focus(cx, main, opened);
+        assert_eq!(focused(cx, secondary), Some(opened_focus.clone()));
+        assert_eq!(focused(cx, popout), Some(term_focus.clone()));
+
+        // A middle-click opens beside it and moves no focus.
+        let link = muxel_terminal::OpenLinkBackground {
+            url: muxel_terminal::file_uri(&second),
+            pane: term,
+        };
+        click(cx, &link);
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 2, "the link opened nothing");
+            assert_eq!(group(app, pid, opened).len(), 2);
+        })
+        .unwrap();
+        assert_eq!(focused(cx, secondary), Some(opened_focus));
+        assert_eq!(focused(cx, popout), Some(term_focus.clone()));
+    });
+}
+
+#[test]
+fn reopening_a_file_from_another_project_shows_its_project() {
+    with_app(|cx, main| {
+        let first = project(cx, main, "first");
+        let second = project(cx, main, "second");
+        let notes = main
+            .update(cx, |app, _, _| text_file(app, first, "notes.txt"))
+            .unwrap();
+        let near = ResourceOrigin::Chrome { near: None };
+        let open = open_file(cx, main, main, first, &notes, near);
+        let caller = main
+            .update(cx, |app, window, cx| {
+                app.select_project(second, window, cx);
+                pane(app, second, None)
+            })
+            .unwrap();
+
+        // A Ctrl+click on its path in the second project, in the same window.
+        main.update(cx, |app, window, cx| {
+            let link = muxel_terminal::OpenLink {
+                url: muxel_terminal::file_uri(&notes),
+                pane: caller,
+            };
+            app.on_open_link(&link, window, cx);
+        })
+        .unwrap();
+
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 1, "the file opened twice");
+            assert_eq!(
+                app.workspace.active_project,
+                Some(first),
+                "the file's project isn't shown"
+            );
+            assert_eq!(app.active_instance, Some(open));
+        })
+        .unwrap();
+        assert_eq!(focused(cx, main), Some(editor_focus(cx, main, open)));
+    });
+}
+
+#[test]
+fn reopening_a_file_or_diff_shown_in_another_window_focuses_it_there() {
+    with_app(|cx, main| {
+        let first = project(cx, main, "first");
+        let second = project(cx, main, "second");
+        let caller = main
+            .update(cx, |app, window, cx| {
+                app.select_project(second, window, cx);
+                pane(app, second, None)
+            })
+            .unwrap();
+        let secondary = secondary_window(cx, main, first);
+        let (notes, todo, root) = main
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(first).unwrap().root_path.clone();
+                let notes = text_file(app, first, "notes.txt");
+                (notes, text_file(app, first, "todo.txt"), root)
+            })
+            .unwrap();
+        let seed = ResourceOrigin::Chrome { near: None };
+        let notes_editor = open_file(cx, main, secondary, first, &notes, seed);
+        let near = ResourceOrigin::Chrome {
+            near: Some(notes_editor),
+        };
+        let app = main.entity(cx).unwrap();
+        let diff = secondary
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_diff_for_dir(first, root.clone(), near, window, cx);
+                    app.active_instance.unwrap()
+                })
+            })
+            .unwrap();
+        // The second window's focus moves off both before they're reopened.
+        let todo_editor = open_file(cx, main, secondary, first, &todo, near);
+        let main_focus = focused(cx, main);
+
+        main.update(cx, |app, window, cx| {
+            let link = muxel_terminal::OpenLink {
+                url: muxel_terminal::file_uri(&notes),
+                pane: caller,
+            };
+            app.on_open_link(&link, window, cx);
+        })
+        .unwrap();
+        assert_eq!(
+            focused(cx, main),
+            main_focus,
+            "the main window was handed the other window's pane"
+        );
+        assert_eq!(
+            focused(cx, secondary),
+            Some(editor_focus(cx, main, notes_editor))
+        );
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the file opened twice");
+            assert_eq!(app.workspace.active_project, Some(second));
+            assert_eq!(app.active_instance, Some(notes_editor));
+        })
+        .unwrap();
+
+        // The same for the project diff, reopened from the second project.
+        let origin = ResourceOrigin::Pane(caller);
+        main.update(cx, |app, window, cx| {
+            app.open_diff_for_dir(second, root.clone(), origin, window, cx)
+        })
+        .unwrap();
+        assert_eq!(focused(cx, main), main_focus);
+        assert_eq!(focused(cx, secondary), Some(editor_focus(cx, main, diff)));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 3, "the diff opened twice");
+            assert_eq!(app.active_instance, Some(diff));
+        })
+        .unwrap();
+
+        // Going to a line, and reloading a changed file, both focus the editor
+        // in the window they run in: here, the main window.
+        std::fs::write(&todo, "changed\n").unwrap();
+        main.update(cx, |app, window, cx| {
+            let link = muxel_terminal::OpenLink {
+                url: format!("{}#L2", muxel_terminal::file_uri(&todo)),
+                pane: caller,
+            };
+            app.on_open_link(&link, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            focused(cx, main),
+            main_focus,
+            "the main window was handed the other window's file"
+        );
+        assert_eq!(
+            focused(cx, secondary),
+            Some(editor_focus(cx, main, todo_editor))
+        );
+    });
+}
+
+/// A popped-out file or diff has left the layout but is still open: opening it
+/// again focuses it in its own window, which comes to the front, rather than
+/// docking a second copy. A link to a line of a changed file reloads it and
+/// moves its cursor there, in its own window: the caller keeps its focus.
+#[test]
+fn reopening_a_popped_out_file_or_diff_focuses_its_window_instead_of_docking_a_copy() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let (caller, notes, root) = main
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                (pane(app, pid, None), text_file(app, pid, "notes.txt"), root)
+            })
+            .unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let file = open_file(cx, main, main, pid, &notes, near);
+        let diff = main
+            .update(cx, |app, window, cx| {
+                app.open_diff_for_dir(pid, root.clone(), near, window, cx);
+                app.active_instance.unwrap()
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.pop_out_instance(file, window, cx);
+            app.pop_out_instance(diff, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let popped = |cx: &mut TestAppContext, iid: Uuid| {
+            main.read_with(cx, |app, cx| {
+                let popout = &app.popouts[&iid];
+                (popout.window, popout.view.focus_handle(cx))
+            })
+            .unwrap()
+        };
+        let (file_window, file_focus) = popped(cx, file);
+        let (diff_window, diff_focus) = popped(cx, diff);
+        for window in [file_window, diff_window] {
+            window.update(cx, |_, window, _| window.blur()).unwrap();
+        }
+        let main_focus = focused(cx, main);
+        let still_one_of_each = |cx: &mut TestAppContext, what: &str| {
+            main.read_with(cx, |app, _| {
+                assert!(app.editors.is_empty(), "the {what} was docked again");
+                assert_eq!(app.popouts.len(), 2);
+                let docked = app.workspace.project(pid).unwrap().instances();
+                assert_eq!(docked, [caller], "the {what} was docked again");
+            })
+            .unwrap();
+        };
+
+        let activate_main = |cx: &mut TestAppContext| {
+            main.update(cx, |_, window, _| window.activate_window())
+                .unwrap();
+        };
+        let active = |cx: &mut TestAppContext| cx.update(|cx| cx.active_window());
+
+        std::fs::write(&notes, "first\nsecond\n").unwrap();
+        activate_main(cx);
+        main.update(cx, |app, window, cx| {
+            let link = muxel_terminal::OpenLink {
+                url: format!("{}#L2", muxel_terminal::file_uri(&notes)),
+                pane: caller,
+            };
+            app.on_open_link(&link, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        still_one_of_each(cx, "file");
+        main.read_with(cx, |app, cx| {
+            let editor = app.open_editor_view(file).unwrap();
+            assert_eq!(editor.read(cx).text(cx), "first\nsecond\n");
+            assert_eq!(editor.read(cx).cursor(cx).line, 1, "the line jump");
+        })
+        .unwrap();
+        assert_eq!(
+            focused(cx, main),
+            main_focus,
+            "the main window was handed the popped-out file"
+        );
+        assert_eq!(focused(cx, file_window), Some(file_focus));
+        assert_eq!(active(cx), Some(file_window.into()));
+
+        activate_main(cx);
+        main.update(cx, |app, window, cx| {
+            app.open_diff_for_dir(pid, root.clone(), near, window, cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        still_one_of_each(cx, "diff");
+        assert_eq!(focused(cx, diff_window), Some(diff_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        assert_eq!(active(cx), Some(diff_window.into()));
+    });
+}
+
+/// A popped-out page is found by the page it shows now: opening that page
+/// again focuses the pop-out, whose window comes to the front, rather than
+/// docking a copy.
+#[test]
+fn reopening_the_page_a_popped_out_browser_went_to_focuses_it() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let open = |cx: &mut TestAppContext, url: &str| {
+            main.update(cx, |app, window, cx| {
+                let url = url.to_string();
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let page = open(cx, "https://example.test/first");
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let (page_window, view) = main
+            .read_with(cx, |app, _| {
+                let popout = &app.popouts[&page];
+                let PaneView::Browser(view) = &popout.view else {
+                    panic!("the pop-out isn't a browser");
+                };
+                (popout.window, view.clone())
+            })
+            .unwrap();
+        // As its address bar does: the page moves on, and its instance's URL
+        // stays behind until a tick syncs it.
+        view.update(cx, |view, cx| {
+            view.navigate("https://example.test/second", cx)
+        });
+        page_window
+            .update(cx, |_, window, _| window.blur())
+            .unwrap();
+        let main_focus = focused(cx, main);
+        main.update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+
+        let reopened = open(cx, "https://example.test/second");
+        cx.run_until_parked();
+        main.read_with(cx, |app, _| {
+            assert_eq!(reopened, page, "the page was docked again");
+            assert!(app.browsers.is_empty(), "the page was docked again");
+            assert_eq!(app.popouts.len(), 1);
+            let docked = app.workspace.project(pid).unwrap().instances();
+            assert_eq!(docked, [caller], "the page was docked again");
+        })
+        .unwrap();
+        let page_focus = main
+            .read_with(cx, |app, cx| app.popouts[&page].view.focus_handle(cx))
+            .unwrap();
+        assert_eq!(focused(cx, page_window), Some(page_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(page_window.into()));
+    });
+}
+
+/// A link clicked in a page, or a redirect, moves it before the tick syncs
+/// that to its instance: a popped-out page is found at the page its webview is
+/// on, not the one it left. An address-bar navigation that hasn't committed
+/// counts as where it's going. The tick then syncs the page in its own window.
+#[test]
+fn a_popped_out_page_is_found_where_its_webview_is_before_the_tick() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let open = |cx: &mut TestAppContext, url: &str| {
+            main.update(cx, |app, window, cx| {
+                let url = url.to_string();
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let page = open(cx, "https://example.test/first");
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let view = main
+            .read_with(cx, |app, _| match &app.popouts[&page].view {
+                PaneView::Browser(view) => view.clone(),
+                _ => panic!("the pop-out isn't a browser"),
+            })
+            .unwrap();
+        let docked = |cx: &mut TestAppContext| {
+            main.read_with(cx, |app, _| app.workspace.project(pid).unwrap().instances())
+                .unwrap()
+        };
+
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/second")
+        });
+        assert_eq!(
+            open(cx, "https://example.test/second"),
+            page,
+            "the page it went to was docked again"
+        );
+        assert_eq!(docked(cx), [caller], "the page it went to was docked again");
+        assert_ne!(
+            open(cx, "https://example.test/first"),
+            page,
+            "the page it left reopened the page it went to"
+        );
+
+        view.update(cx, |view, cx| {
+            view.navigate("https://example.test/third", cx)
+        });
+        assert_eq!(
+            open(cx, "https://example.test/third"),
+            page,
+            "an address-bar navigation that hasn't committed was lost"
+        );
+
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/fourth")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        main.read_with(cx, |app, cx| {
+            let synced = app.workspace.instance(page).unwrap().browser_url.as_deref();
+            assert_eq!(
+                synced,
+                Some("https://example.test/fourth"),
+                "the tick didn't sync the popped-out page"
+            );
+            assert_eq!(view.read(cx).url(), "https://example.test/fourth");
+        })
+        .unwrap();
+    });
+}
+
+/// Open `url` beside `caller` and pop it out: the page, its window and its view.
+fn popped_out_page(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    caller: Uuid,
+    url: &str,
+) -> (Uuid, AnyWindowHandle, Entity<crate::browser::BrowserView>) {
+    let page = main
+        .update(cx, |app, window, cx| {
+            let near = ResourceOrigin::Pane(caller);
+            let url = url.to_string();
+            app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    main.read_with(cx, |app, _| {
+        let popout = &app.popouts[&page];
+        match &popout.view {
+            PaneView::Browser(view) => (page, popout.window.into(), view.clone()),
+            _ => panic!("the pop-out isn't a browser"),
+        }
+    })
+    .unwrap()
+}
+
+/// A link in a page that asks for a new window reaches the app as a request
+/// the tick takes. From a popped-out page it opens as a link clicked in a
+/// popped-out terminal does: docked in the page's project, whose window comes
+/// to the front.
+#[test]
+fn a_popped_out_pages_new_window_opens_in_its_projects_window() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (page, page_window, view) =
+            popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        cx.update_window(page_window, |_, window, _| window.activate_window())
+            .unwrap();
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(page_window));
+
+        view.read_with(cx, |view, _| {
+            view.request_window_for_test("https://example.test/popup")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let opened = main
+            .read_with(cx, |app, _| {
+                let opened: Vec<Uuid> = app.browsers.keys().copied().collect();
+                assert_eq!(opened.len(), 1, "the page's new window opened nothing");
+                let url = app
+                    .workspace
+                    .instance(opened[0])
+                    .unwrap()
+                    .browser_url
+                    .clone();
+                assert_eq!(url.as_deref(), Some("https://example.test/popup"));
+                let docked = app.workspace.project(pid).unwrap().instances();
+                assert!(
+                    docked.contains(&opened[0]),
+                    "the new page isn't in the project"
+                );
+                assert!(app.popouts.contains_key(&page));
+                opened[0]
+            })
+            .unwrap();
+        let opened_focus = main
+            .read_with(cx, |app, cx| {
+                app.browsers[&opened].read(cx).focus_handle(cx)
+            })
+            .unwrap();
+        assert_eq!(focused(cx, main), Some(opened_focus));
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(main.into()),
+            "the new page opened behind the pop-out"
+        );
+    });
+}
+
+/// A click into a page never reaches GPUI either. In a popped-out page the tick
+/// takes it in the page's window: an address bar that was typed in gives up
+/// GPUI's focus, and the main window's focus and active pane stay as they were.
+#[test]
+fn a_click_into_a_popped_out_page_blurs_its_address_bar() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (_, page_window, view) =
+            popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        let address_focused = |cx: &mut TestAppContext| {
+            cx.update_window(page_window, |_, window, cx| {
+                view.read(cx).address_focused(window, cx)
+            })
+            .unwrap()
+        };
+        cx.update_window(page_window, |_, window, cx| {
+            view.update(cx, |view, cx| view.focus_address_for_test(window, cx))
+        })
+        .unwrap();
+        assert!(address_focused(cx));
+        let main_focus = focused(cx, main);
+        let active = main.read_with(cx, |app, _| app.active_instance).unwrap();
+
+        view.read_with(cx, |view, _| view.click_page_for_test());
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            !address_focused(cx),
+            "a click into the page left its address bar focused"
+        );
+        let page_focus = view.read_with(cx, |view, cx| view.focus_handle(cx));
+        assert_eq!(focused(cx, page_window), Some(page_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        let after = main.read_with(cx, |app, _| app.active_instance).unwrap();
+        assert_eq!(
+            after, active,
+            "a click into the pop-out moved the active pane"
+        );
+    });
+}
+
+const POPUP: &str = "https://example.test/popup";
+/// A link wry is still handing over when the page moves: it lands in the old
+/// page's queue after the move, since wry sends from a thread of its own.
+const LATE: &str = "https://example.test/late";
+
+/// How many times `url` reached project `pid`: the pages it opened, and the
+/// reloads of them, which a second delivery of the same link makes.
+fn deliveries(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    url: &str,
+) -> usize {
+    main.read_with(cx, |app, cx| {
+        let instances = app.workspace.instances.iter();
+        instances
+            .filter(|i| i.project_id == pid && i.browser_url.as_deref() == Some(url))
+            .map(|i| {
+                let reloads = app
+                    .browsers
+                    .get(&i.id)
+                    .map(|v| v.read(cx).reloads_for_test());
+                1 + reloads.unwrap_or(0)
+            })
+            .sum()
+    })
+    .unwrap()
+}
+
+/// Two of the app's one-second ticks.
+fn two_ticks(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>) {
+    for _ in 0..2 {
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+/// A page's new-window link waits for the tick. A page popped out before then
+/// is rebuilt in its own window, and the link goes with it, as does one still on
+/// its way: each opens once.
+#[test]
+fn a_new_window_link_asked_for_just_before_a_page_pops_out_opens_once() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let page = main
+            .update(cx, |app, window, cx| {
+                let url = "https://example.test/first".to_string();
+                let near = ResourceOrigin::Pane(caller);
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap();
+        let docked = main
+            .read_with(cx, |app, _| app.browsers[&page].clone())
+            .unwrap();
+        docked.read_with(cx, |view, _| view.request_window_for_test(POPUP));
+
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            main.read_with(cx, |app, _| app.popouts.contains_key(&page))
+                .unwrap()
+        );
+        docked.read_with(cx, |view, _| view.request_window_for_test(LATE));
+        two_ticks(cx, main);
+
+        let before = deliveries(cx, main, pid, POPUP);
+        assert_eq!(
+            before, 1,
+            "the link asked for before the pop-out arrived {before} times"
+        );
+        let late = deliveries(cx, main, pid, LATE);
+        assert_eq!(
+            late, 1,
+            "the link on its way at the pop-out arrived {late} times"
+        );
+    });
+}
+
+/// The same for a popped-out page docked back before the tick: it's rebuilt in
+/// the main window, and both links go with it.
+#[test]
+fn a_new_window_link_asked_for_just_before_a_page_docks_opens_once() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (page, _, view) = popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        view.read_with(cx, |view, _| view.request_window_for_test(POPUP));
+
+        // As the pop-out's Dock button does, then the main window's next frame.
+        main.update(cx, |app, window, cx| {
+            app.redock_popout(page, cx);
+            app.drain_browser_redocks(window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            main.read_with(cx, |app, _| app.browsers.contains_key(&page))
+                .unwrap()
+        );
+        view.read_with(cx, |view, _| view.request_window_for_test(LATE));
+        two_ticks(cx, main);
+
+        let before = deliveries(cx, main, pid, POPUP);
+        assert_eq!(
+            before, 1,
+            "the link asked for before the re-dock arrived {before} times"
+        );
+        let late = deliveries(cx, main, pid, LATE);
+        assert_eq!(
+            late, 1,
+            "the link on its way at the re-dock arrived {late} times"
+        );
+    });
+}
+
+/// A path names the same file only on the same machine. A remote file or diff
+/// popped out of one host's project isn't reused for the same path on another
+/// host, while its own host still finds it past the other's docked copy.
+#[test]
+fn a_remote_file_or_diff_is_reused_only_on_its_own_host() {
+    with_app(|cx, main| {
+        let (a, b) = (project(cx, main, "a"), project(cx, main, "b"));
+        let root = PathBuf::from("/srv/app");
+        let file = root.join("main.rs");
+        main.update(cx, |app, _, _| {
+            for pid in [a, b] {
+                app.workspace.project_mut(pid).unwrap().remote = Some(muxel_core::RemoteRef {
+                    host_id: Uuid::new_v4(),
+                    remote_root: "/srv/app".into(),
+                });
+            }
+        })
+        .unwrap();
+        let chrome = ResourceOrigin::Chrome { near: None };
+        let diffs = |cx: &mut TestAppContext| {
+            main.read_with(cx, |app, cx| {
+                app.editor_views()
+                    .filter(|(_, editor)| editor.read(cx).is_diff())
+                    .count()
+            })
+            .unwrap()
+        };
+        let file_a = open_file(cx, main, main, a, &file, chrome);
+        let diff_a = main
+            .update(cx, |app, window, cx| {
+                app.open_diff_for_dir(a, root.clone(), chrome, window, cx);
+                app.active_instance.unwrap()
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.pop_out_instance(file_a, window, cx);
+            app.pop_out_instance(diff_a, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let file_b = open_file(cx, main, main, b, &file, chrome);
+        assert_ne!(file_b, file_a, "host b's path opened host a's file");
+        main.update(cx, |app, window, cx| {
+            app.open_diff_for_dir(b, root.clone(), chrome, window, cx)
+        })
+        .unwrap();
+        assert_eq!(diffs(cx), 2, "host b's directory opened host a's diff");
+
+        assert_eq!(
+            open_file(cx, main, main, a, &file, chrome),
+            file_a,
+            "host a's path didn't find its own popped-out file"
+        );
+    });
+}
+
+#[test]
+fn reopening_a_file_behind_the_dashboard_shows_it() {
+    with_app(|cx, main| {
+        let first = project(cx, main, "main window");
+        let second = project(cx, main, "second window");
+        let notes = main
+            .update(cx, |app, _, _| text_file(app, first, "notes.txt"))
+            .unwrap();
+        let near = ResourceOrigin::Chrome { near: None };
+        let open = open_file(cx, main, main, first, &notes, near);
+        let caller = main
+            .update(cx, |app, _, _| {
+                app.main_view = MainView::Dashboard;
+                pane(app, second, None)
+            })
+            .unwrap();
+        let secondary = secondary_window(cx, main, second);
+        let secondary_focus = focused(cx, secondary);
+
+        // A Ctrl+click on its path in the second window.
+        let app = main.entity(cx).unwrap();
+        let link = muxel_terminal::OpenLink {
+            url: muxel_terminal::file_uri(&notes),
+            pane: caller,
+        };
+        cx.update_window(secondary.into(), |_, window, cx| {
+            app.update(cx, |app, cx| app.on_open_link(&link, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.editors.len(), 1, "the file opened twice");
+            assert_eq!(
+                app.main_view,
+                MainView::Panes,
+                "the Dashboard hides the file"
+            );
+            assert_eq!(app.workspace.active_project, Some(first));
+        })
+        .unwrap();
+        assert_eq!(focused(cx, main), Some(editor_focus(cx, main, open)));
+        assert_eq!(focused(cx, secondary), secondary_focus);
+    });
+}
+
+#[test]
+fn reopening_a_file_no_window_shows_from_a_second_window_focuses_it_only_in_the_main_window() {
+    with_app(|cx, main| {
+        let hidden = project(cx, main, "main window, not shown");
+        let shown = project(cx, main, "main window");
+        let other = project(cx, main, "second window");
+        let (notes, readme, todo) = main
+            .update(cx, |app, _, _| {
+                (
+                    text_file(app, hidden, "notes.txt"),
+                    text_file(app, shown, "readme.txt"),
+                    text_file(app, other, "todo.txt"),
+                )
+            })
+            .unwrap();
+        let near = ResourceOrigin::Chrome { near: None };
+        let open = open_file(cx, main, main, hidden, &notes, near);
+        let secondary = secondary_window(cx, main, other);
+        let caller = main.update(cx, |app, _, _| pane(app, other, None)).unwrap();
+        let held = open_file(
+            cx,
+            main,
+            secondary,
+            other,
+            &todo,
+            ResourceOrigin::Pane(caller),
+        );
+        let held_focus = editor_focus(cx, main, held);
+        let app = main.entity(cx).unwrap();
+
+        // Going to a line, and reloading a changed file, both focus the editor
+        // in the window they run in: here, the second window.
+        let line = format!("{}#L2", muxel_terminal::file_uri(&notes));
+        for (url, text) in [
+            (line, "notes\n"),
+            (muxel_terminal::file_uri(&notes), "changed\n"),
+        ] {
+            // The main window turns to another project's file, so no window
+            // shows the notes' project.
+            open_file(cx, main, main, shown, &readme, near);
+            std::fs::write(&notes, text).unwrap();
+            assert_eq!(focused(cx, secondary), Some(held_focus.clone()));
+
+            // A Ctrl+click on its path in the second window.
+            let link = muxel_terminal::OpenLink {
+                url: url.clone(),
+                pane: caller,
+            };
+            cx.update_window(secondary.into(), |_, window, cx| {
+                app.update(cx, |app, cx| app.on_open_link(&link, window, cx))
+            })
+            .unwrap();
+            cx.run_until_parked();
+
+            assert_eq!(
+                focused(cx, secondary),
+                Some(held_focus.clone()),
+                "{url}: the second window was handed the main window's file"
+            );
+            assert_eq!(
+                focused(cx, main),
+                Some(editor_focus(cx, main, open)),
+                "{url}: the main window didn't focus the file"
+            );
+            main.read_with(cx, |app, cx| {
+                assert_eq!(app.editors.len(), 3, "{url}: the file opened twice");
+                assert_eq!(app.editors[&open].read(cx).text(cx), text, "{url}");
+                assert_eq!(app.workspace.active_project, Some(hidden), "{url}");
+            })
+            .unwrap();
+        }
+    });
+}
+
+#[test]
+fn next_tab_and_next_pane_stay_in_a_project_window() {
+    with_app(|cx, main| {
+        let shown = project(cx, main, "main window");
+        let other = project(cx, main, "second window");
+        let (main_first, tab_one, tab_two, neighbour) = main
+            .update(cx, |app, _, _| {
+                let main_first = pane(app, shown, None);
+                pane(app, shown, Some(main_first));
+
+                let tab_one = pane(app, other, None);
+                let mut second_tab = Instance::shell(other);
+                second_tab.program = Some("cmd.exe".into());
+                second_tab.args = WAIT.map(String::from).into();
+                let tab_two = second_tab.id;
+                app.workspace.add_instance(second_tab);
+                let layout = &mut app.workspace.project_mut(other).unwrap().layout;
+                assert!(add_tab(layout, tab_one, tab_two));
+                let neighbour = pane(app, other, Some(tab_one));
+                (main_first, tab_one, tab_two, neighbour)
+            })
+            .unwrap();
+        let secondary = secondary_window(cx, main, other);
+        let app = main.entity(cx).unwrap();
+        let in_secondary =
+            |cx: &mut TestAppContext,
+             run: fn(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>)| {
+                secondary
+                    .update(cx, |_, window, cx| {
+                        app.update(cx, |app, cx| run(app, window, cx))
+                    })
+                    .unwrap();
+            };
+
+        secondary
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| app.focus_instance(tab_one, window, cx))
+            })
+            .unwrap();
+
+        // Next Tab moves between the two tabs in the project window.
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_two));
+            assert_eq!(front_tab(app, other, tab_one), tab_two);
+        })
+        .unwrap();
+
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+            assert_eq!(front_tab(app, other, tab_one), tab_one);
+        })
+        .unwrap();
+
+        // From the second tab, Next Pane moves to the neighbour in the same window.
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(neighbour));
+            assert_eq!(
+                app.workspace
+                    .instance(app.active_instance.unwrap())
+                    .map(|i| i.project_id),
+                Some(other)
+            );
+        })
+        .unwrap();
+
+        // After focusing a main-window pane, returning to the project window
+        // without clicking a pane still cycles from the tab it was showing.
+        secondary
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| app.focus_instance(tab_two, window, cx))
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.focus_instance(main_first, window, cx)
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+            assert_eq!(front_tab(app, other, tab_one), tab_one);
+        })
+        .unwrap();
+
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.update(cx, |app, window, cx| {
+            app.focus_instance(main_first, window, cx)
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(neighbour));
+        })
+        .unwrap();
+
+        // Both still work in the project window when the main window shows no project.
+        main.update(cx, |app, _, _| app.workspace.active_project = None)
+            .unwrap();
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_two));
+            assert_eq!(front_tab(app, other, tab_one), tab_two);
+        })
+        .unwrap();
+    });
+}

@@ -15,17 +15,23 @@ mod browser_helper;
 mod browser_storage;
 mod control;
 mod editor;
+mod file_watch;
 mod filetree;
 mod i18n;
 mod integrations;
 mod libraries;
+mod new_window;
+mod pane_scope;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod remote_paste;
 mod secrets;
 mod session_binding;
+mod settings_model;
 mod settings_view;
+mod skills;
+mod sound;
 mod split;
 mod stt;
 #[cfg(test)]
@@ -203,6 +209,7 @@ fn cli_info(first_arg: Option<&str>) -> Option<String> {
             "muxel {version} — a multi-agent terminal multiplexer\n\
              \n\
              usage: muxel                  open the muxel window\n       \
+             muxel --new-window     open another window, on the workspace selector\n       \
              muxel ctl <command>    control the running muxel (`muxel ctl help`)\n       \
              muxel --version        print the version and exit\n       \
              muxel --help           print this help and exit"
@@ -222,6 +229,28 @@ pub(crate) fn window_options() -> WindowOptions {
         titlebar: Some(TitleBar::title_bar_options()),
         window_decorations: Some(WindowDecorations::Client),
         ..Default::default()
+    }
+}
+
+struct LaunchLogger(env_logger::Logger);
+
+impl log::Log for LaunchLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        log::Log::enabled(&self.0, metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        // portable-pty can log its own spawn error before returning it to us.
+        if record.target().starts_with("portable_pty::")
+            && record.args().to_string().contains("--prompt-interactive=")
+        {
+            return;
+        }
+        log::Log::log(&self.0, record);
+    }
+
+    fn flush(&self) {
+        log::Log::flush(&self.0);
     }
 }
 
@@ -254,6 +283,11 @@ fn main() {
             .collect();
         std::process::exit(control::run_cli(&args));
     }
+    if session_binding::run_muse_hook_from_args(&args) {
+        // Exit also terminates any hook worker whose filesystem or pipe I/O
+        // exceeded its deadline. Never let an observation hook block Muse.
+        std::process::exit(0);
+    }
     match session_binding::hook_instance_from_args(
         args.iter().cloned(),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
@@ -274,11 +308,36 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // `--new-window` / `--workspace ID`, as New Window passes them. What's left
+    // is read again only by Linux's `--browser` below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let args = match new_window::configure(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     install_panic_reporter();
+    // Linux: find out now whether panes can run in systemd scopes of their own.
+    pane_scope::warm();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let default_log_filter = if cfg!(windows) {
+        "warn,portable_pty::win::psuedocon=info"
+    } else {
+        "warn"
+    };
+    let logger = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_log_filter),
+    )
+    .build();
+    let level = logger.filter();
+    log::set_boxed_logger(Box::new(LaunchLogger(logger))).expect("install logger");
+    log::set_max_level(level);
+    #[cfg(windows)]
+    let _console_directory = update::prepare_windows_console();
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what
@@ -406,10 +465,14 @@ fn main() {
 
             let window_bounds = muxel_store::load_window_geom().and_then(|g| {
                 if g.width > 0.0 && g.height > 0.0 {
-                    let bounds = Bounds {
+                    let mut bounds = Bounds {
                         origin: point(px(g.x), px(g.y)),
                         size: size(px(g.width), px(g.height)),
                     };
+                    // New Window: beside the window that opened it, not on top.
+                    if new_window::launch_request().cascade {
+                        bounds = new_window::cascaded(bounds);
+                    }
                     Some(if g.maximized {
                         WindowBounds::Maximized(bounds)
                     } else {

@@ -1,0 +1,517 @@
+# Terminal runtime facts
+
+`TerminalView` keeps one runtime snapshot for each live PTY launch. Its readers
+(`status()`, `status_attributable()`, `completion_ready()`, `runtime_snapshot()`)
+return the stored snapshot; they never parse terminal rows or advance status.
+Attribution also checks the session's current binding revision, so a switch
+invalidates cached facts before its queued reconciliation runs.
+
+## Recoverable close and outside control
+
+A held terminal keeps its process and runtime snapshot. It leaves ctl listings,
+but `status`, `show`, `screen` and `wait` can still address it by id or name.
+Input, including forced sends and delayed keys, refuses with `closing`.
+`undo_until` is present only during an active countdown. Otherwise `reason`
+is `counting_down`, `checking`, `awaiting_decision` or `restoring`, with no
+deadline. `counting_down` covers a hold whose monotonic grace period continues
+after its wall-clock deadline elapsed, such as across suspend. Keep or
+Undo in the app restores input. A pane removed while `wait` polls or collects
+its result returns an `exited` error explaining that it closed or left the
+workspace.
+
+For shared layouts, expiry waits for a read begun after the deadline was
+noticed. Explicit Close starts a fresh read barrier after the click, including
+when an earlier expiry read succeeded before suspend. Malformed or failed
+reads and reads overtaken by a local push do not release that barrier. A
+confirmed missing local layout does. Unreadable layouts offer an explicit
+Close without reading or Keep. Quit and workspace departure restore shared
+closes instead of committing removal without a fresh comparison.
+
+Local tmux removal saves a pending kill and a fresh close token in the project's
+ledger before I/O, then saves any resolved legacy server owner before killing.
+Only the original in-memory attempt can stamp that token on the session. A
+retry never stamps; the tmux server compares the saved token and observed
+session id before killing that exact id. A replacement, including a new server
+reusing an id, does not inherit the stamp. A mismatch preserves the session
+and files; an unknown or failed query retains the ledger. The ten-second bound
+starts at the final close, after any Undo hold. The first stamp identifies the
+session present when that attempt runs, not at the original click, and a forced
+close doesn't recheck the pane during its hold, so a peer's replacement in that
+window isn't detected. An attempt that fails before stamping leaves nothing to
+prove, so the next activation cancels it and keeps the session.
+
+Worktree answers run only through their hold's final close. Quit and workspace
+departure void them: files stay, and a worktree left without a pane is detached
+so the sidebar still lists it. Loading a workspace applies the same rule to local
+worktrees saved attached with no pane.
+
+Activation reconciles shared layout before replay, and cancels any close whose
+instance reappeared or whose target a current pane shows. Closes without a
+verifiable token are cancelled without killing. The event log retains the target's
+name and any known server. Import keeps its existing discovery scope; an arbitrary
+recorded server outside that scope needs an explicit reattach. Import excludes
+pending closes from every project on the same host. Automatic worktree cleanup
+runs only after confirmed local session death; unconfirmed remote teardown
+keeps the worktree and logs why.
+
+Worktree choices still pass through busy confirmation and the Undo countdown.
+A file answer runs only if the close it was given for is accepted and takes every
+captured pane. Close only the idle ones leaving one open, a replaced prompt, a
+newer close, a cancelled client check, or any captured pane leaving before
+acceptance (exiting, or closed by a peer through the shared layout), even with
+others still open, each drop the answer, and the worktree asks again when its
+last pane goes.
+
+The selected file action waits until the captured panes have closed and the kills
+for that worktree's panes are confirmed. Each ledger entry records the worktree its
+pane ran in, so another pane's kill holds nothing back; an entry saved before that
+was recorded counts as any worktree. A worktree with its own kill still running
+waits without a notice. A local one whose kill fails, can't be saved to the ledger
+or can't be confirmed is kept and detached, so the sidebar still lists it; an
+activation retry settles it as the first attempt would have. A remote one is never removed on close.
+It stays on the host and attached, since a peer's panes may use it. Undo, Cancel, a new worktree member, or a
+failed or unsaved kill or preserved session for that worktree cancels the pending file action, so a retry that
+confirms the kill later leaves the files alone. Dirty,
+unmerged or shared legacy worktrees are kept rather than force-removed.
+
+Project removal never waits on the ledger, which goes with the project. Kills
+already running finish in the background, older unconfirmed entries get one last
+try, and nothing retries after that. A session that survives keeps running on its
+host, the removal says so, and Import lists it. A held pane's file answer is dropped
+and its files stay. A worktree whose kill finishes after removal also stays on disk,
+as no project is left to act from.
+
+## Reconciliation edges
+
+The view reconciles after drained PTY output, process exit, a settled resize,
+a submission, a provider binding switch, an acknowledged bell, or the earliest
+due quiet/provider debounce, switch settle, or synchronized-output deadline.
+A one-entry runtime trigger coalesces
+redundant invalidations. Timers carry a generation and become no-ops after a
+newer deadline replaces them.
+
+Output reconciliation captures the latest visible screen when configured markers
+or the provider adapter needs it. Active output is coalesced to at most one scan
+per 50 ms with one exact trailing deadline; unchanged generations and ordinary
+reads never scan the grid. Render therefore cannot manufacture a lifecycle
+transition by polling more often.
+
+The captured screen includes cursor and bracketed-paste metadata. Claude's status
+sources exclude its input box, whether it holds a draft or the placeholder: the
+rows inside the screen's last rule and the nearest identical rule above it, when
+the first of them starts with `❯`. The box's edges are the same full-width rule;
+a rule typed into a draft is drawn under the prompt, two columns in, so it can't
+pass for an edge. Status recognition may locate the box while a repaint hides or
+moves the cursor; this does not authorize startup input, whose stricter cursor
+guards are unchanged. A real dialog without a box keeps the full screen.
+
+Claude's marker lists, built-in (`esc to interrupt` for working; `❯ 1.` and
+`Do you want to proceed` for blocked) or edited, match against that same
+context, beside its strict permission and live-work parsers. A draft can't
+supply a marker, while chrome outside the box still does: a permission form's
+`❯ 1.` choice row, or the `esc to interrupt` footer below the box in a tmux
+pane, which never sees Claude's title. A form replaces the box below a rule
+and opens with its title or question, so it doesn't pass for the box. Text
+outside the box matches as written, a reply quoting a marker included. A draft
+still counts, as it did before, where the box isn't found whole: when a rule
+row sits below the box (a statusLine separator), when a draft row at column 0
+reproduces the box's edge, or in bash mode, whose prompt is `!` rather than
+`❯`. Grok's unanswered question card reports Blocked while its title still says
+Working, when the card's footer is the screen's last row. Under a tmux status
+bar the card isn't read and the title's Working stands.
+
+## Snapshot fields
+
+`TerminalRuntimeSnapshot` holds:
+
+- `launch_id`: a fresh UUID minted by each spawned `TerminalSession`;
+- `binding_rev`: advances when the launch switches provider conversations (see
+  below). A provider that switches without telling muxel leaves it unchanged.
+  A launch into a conversation muxel knows at spawn begins at revision 1: one
+  it pinned with a session flag (`--session-id`, `--resume`), or the one a
+  program that reports no id of its own is in. A launch whose provider names
+  its conversation once running (a fresh Codex) begins at 0, and its first UUID
+  title begins revision 1. A known launch's first UUID title is no switch
+  unless it names a different id than the pinned one;
+- `snapshot_seq`: advances when the status, its reason, whether it is
+  attributable (see below), the binding, completion readiness, coverage, or
+  completion revision changes, and when the launch observes a completion in
+  any binding (`TerminalView::launch_completion_revision`, which a held close
+  compares and a binding switch doesn't reset);
+- `input_rev`: advances before ordinary non-empty input writes reach
+  the PTY writer; fallible control submissions commit it after successful writer
+  admission. Keys, pastes, sends, and mouse and wheel reports count. Focus
+  reports and the terminal's own replies to the program don't count;
+- `draft_latched`: set by typed input and cleared by a submission (see below);
+  mouse and wheel reports leave it as it was;
+- `completion_revision`: counts observed program completion transitions in this
+  launch and binding. Consumers compare it even when successive sampled badges
+  are both Done, or new Working/Blocked reports follow a completion in one drain;
+- the status, whether it is attributable, its strongest reason,
+  completion readiness, and evidence coverage.
+
+## Program status reports
+
+Direct PTY panes accept validated OSC 7501 root reports, and the reducer uses
+them only on panes whose program is a known reporter (Claude, Codex, Grok,
+Muse). Elsewhere any printed bytes can carry a report, so those panes keep
+fallback detection. A current root supplies `ProgramStatus` coverage and
+overrides visible fallback detection, except that Blocked read now from the
+provider's screen or title, or a blocked marker, replaces a Working root. It
+applies only while that evidence is attributable (no held screen, no settling
+or unsettled silent-switch title) and keeps its visible reason. Child-id reports cannot control the pane. The PTY reader answers
+capability queries through the existing ordered reply queue, preserving earlier
+grid-dependent replies and following DA replies. Only the UI drain publishes
+status reports.
+
+A root that isn't Working settles the provider for completion readiness, like
+an Idle title; a Working root alone does not, since Codex reports Working while
+it boots a resumed session. The app keeps a durable Done through a report's
+Working until a turn is submitted in the launch, for the restore guard's
+startup window (30 seconds plus the preset's startup delay). Past that window
+a report's Working is a turn: a cross-session message, a scheduled wakeup or a
+remote prompt starts one without input through the PTY.
+
+Claude suppresses its OSC title glyph after a successful capability probe.
+Once any root report has arrived in a launch, the terminal accepts this
+glyph-less text for naming only, through later clears, RIS and binding
+switches; the current root's decoded nonempty `title` takes precedence. Before
+a report, glyph-less Claude titles remain unrecognized. Title-derived lifecycle
+parsing does not change. Process exit removes the naming authority.
+
+The drain's passive observer processes each timed segment after synchronized
+capacity replay selects its read time and before VTE can defer title callbacks.
+While no escape, OSC or pending terminator is open, it skips plain output and
+any ESC pair that can't start an OSC or a reset (CSI's `ESC [`, charset and
+string introducers) without feeding VTE: no skipped byte can raise an event it
+reports, and VTE enters Escape at the next fed ESC from any state. Old partial reports retain their
+opening freshness and binding generation; a fresh terminator cannot revive
+them. Replayed bytes are not observed twice. The synchronized-output deadline
+flushes a stuck frame without another read, retaining its original time.
+
+Working/Blocked-to-Done/Error transitions advance the completion counter. Codex
+also completes a submitted Working-to-Idle turn in its current binding. Explicit
+initial prompt paths may carry Working evidence through the first UUID title;
+a bare Enter cannot. This completion hint never grants loop ownership to a
+prompt submitted before its identity was known.
+
+Clear and reset release protocol authority. A shell prompt retires unfinished
+Working/Blocked reports; completed Done/Error reports remain visible. Process
+exit uses fallback status. Clear and exit preserve completion pulses already
+observed in that binding, so a fast finish is not lost before the next sample.
+A provider binding switch or relaunch retires both reports and their completion
+counts. Local and remote tmux panes keep fallback detection because tmux does
+not forward OSC 7501 reports.
+
+## Provider bindings
+
+OSC title edges, bells, and submissions are recorded in one order per launch,
+each with its time. PTY output carries when the reader received it, not when
+the drain parsed it: a batch can wait in the queue and in the background
+coalescing delay. A title split across reads keeps the opening ESC/OSC read
+time through its terminator. DEC 2026 buffered output keeps its frame's opening
+time when VTE replays it, including a replay forced by VTE's buffer limit.
+Bytes that arrive after that replay keep their own read time. A binding begins
+at a point in that order; evidence
+before it belongs to the conversation it replaced. When the binding changes,
+the reducer resets its latches and reads the new binding's title edges from its
+start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
+from the current title without a completion edge.
+
+On Windows, every Grok discovery poll still reads the current registry and
+records that read's actual start and finish. Only the process ancestry snapshot
+is reused. A changed registry row (including a different identity or timestamp
+on the same PID), pane root PID, or pane launch refreshes it immediately. Stable
+inputs reuse one snapshot for at most 30 seconds; an empty registry or root set
+skips process enumeration, and a failed empty snapshot is retried next poll.
+The worker shares the snapshot by reference rather than copying the machine's
+process population for each poll. Root observations are shared across staggered
+pane batches; a pane missing from one batch is not treated as a process change.
+Inactive observations are pruned on refresh. Poll cadence, newest-registration
+selection, ownership checks and switch-interval calculation stay the same.
+
+An unchanged stale registry can retain old ancestry until that freshness limit;
+registry changes always invalidate it before selecting a new conversation.
+This bounds steady-state enumeration cost without adding a backoff delay to
+in-process conversation switches.
+
+- A pinned `--session-id` or `--resume` launch begins at binding revision one,
+  as does a provider with no binding source. Its first matching UUID title
+  confirms that binding; a different UUID begins a replacement binding.
+  An unpinned provider with a binding source waits for its first report.
+- A Codex title with a different UUID thread begins the binding at that title,
+  in exact order. Earlier frames, and a bell that rang before it, are retired;
+  a bell after it, even in the same drained batch, survives.
+- Claude's `SessionStart` hook and Grok's session registry report a switch out
+  of band, on a clock that can't be ordered exactly against PTY output. Muxel
+  reads Grok's up to a tick later, and Claude's when its directory watcher
+  reports the write (up to two seconds later without one, or while the record
+  can't be read; at worst thirty seconds later when the watcher loses the
+  event). The report places the switch in an
+  interval: the hook's own timestamp (for an older muxel's hook, its record's
+  write time); Grok's registration time through the last instant it can stand
+  for (a time written in whole seconds, to the end of that second); or, for a
+  Grok row without one, anywhere from the start of this pane's previous accepted
+  registry observation in the same launch and process (the epoch when unknown)
+  to the return of this read. Unrelated panes and unresolved polls cannot advance
+  that lower bound. A two-second
+  slack allows for delayed reports and reads; it is not a bound on either delay.
+
+  Around the interval lies an ambiguity window, from its start less the slack
+  to whichever is later: when muxel learned of the switch, or the interval's
+  end plus the slack.
+  - Output read before the window is the old conversation's; its title is
+    retired.
+  - Output read inside the window is ambiguous. The current title stays as
+    level state (Working, Idle or Blocked), but nothing in the window forms a
+    completion edge, latches Done, rings the bell, changes the session hint, or
+    starts another UUID binding.
+  - Output read after the window, and input written after the interval's end,
+    are attributed to the new conversation.
+
+  An OSC title split across reads keeps the read time of its opening escape
+  through BEL or ST. A control such as BEL executed between that escape and
+  the OSC selector uses its own read time without changing the title's origin.
+  DEC synchronized updates can defer title callbacks until
+  ESU or a timeout; replay keeps the oldest read time of that frame. Each new
+  frame gets its own origin, even when the previous frame closes in the same
+  read. A late terminator or ESU cannot turn an old UUID into a new binding.
+
+  Until fresh evidence arrives (a title read after the window or, with no
+  title, any output read after it), the reducer shows level state only. An
+  Idle there may be the old conversation's, so it neither starts a completion
+  edge nor arms one; a submission made after the switch still arms. A turn
+  that starts and finishes inside the window shows no Done.
+
+  An idle provider may print nothing more after `/clear` or `/resume`, so the
+  wait is bounded: two seconds after the window closes, a deadline of its own
+  reconciles the reducer, which then takes the level state it shows as the new
+  conversation's. That forms no completion edge either (an Idle reached this
+  way arms the next turn, as at startup) and doesn't end a screen hold: only a
+  title read after the window can confirm a held marker.
+  Independently, five seconds of PTY silence retires an old Working or Blocked
+  title to Idle when there is no current-binding submission, fresh semantic
+  title, screen marker, bell or exit. This forms no completion edge and does not
+  seed readiness. New output resumes the normal evidence rules.
+
+  The status shown meanwhile is marked non-attributable
+  (`status_attributable()`): a Blocked from an old title or a prompt still on
+  screen may be the old conversation's. The app neither notifies for a
+  non-attributable status nor records it as the pane's last status (unread
+  state, transitions), so a Blocked or Done that fresh evidence confirms is
+  still a transition and still notifies. A process exit, and a bell (which
+  rings only for output read after the window), stay attributable.
+
+  Fresh output alone doesn't make an unchanged screen marker the new
+  conversation's. A switch reported out of band starts a hold on the screen;
+  muxel doesn't capture the screen at the switch, so later captures decide when
+  the hold ends. While it lasts, a status read from a screen marker (a provider
+  prompt or a configured marker) stays non-attributable, after the window too.
+  The hold ends when a capture shows no marker, or when a title read after the
+  window reports the state the screen shows. Held Working evidence never enters
+  completion history: removing an old marker cannot finish a newly submitted
+  turn. Explicit submissions survive the hold independently.
+
+  Retained provider evidence must be attributable at its source. Uncertain
+  titles do not seed sticky semantic status or readiness. Grok's 750 ms Blocked
+  title hold and two-second Working row hold start only from an attributable
+  title or row; an old row cannot acquire a fresh lifetime when it disappears.
+
+  Control commands use current runtime facts rather than the attention history
+  held through uncertainty. A non-attributable status, including a cached
+  snapshot from before the session's current revision, is treated as Working:
+  an ordinary `send` is refused and `wait` keeps waiting, at most until the
+  settle deadline unless an old prompt's screen hold persists. `send --force`
+  retains its explicit override. Exit and failed/not-running launch states keep their
+  existing control behavior.
+
+  Docked and popped-out terminals use the same attribution gate for activity
+  and attendance. A popout records later attendance once without delivering
+  alerts or audio. Redocking always transfers the live terminal, but preserves
+  attention cards until its status is attributable to the current binding.
+  Scheduled-loop heartbeats also resolve the live terminal across both windows;
+  moving a pane does not release its run. Existing Exit cleanup removes the
+  live terminal and popout window when it closes that pane.
+  Window removal runs after the app update returns so synchronous close
+  observers can update the app safely. Restart redocks a popped-out terminal
+  before stopping its old process and installing its replacement.
+
+  Scheduled-loop cleanup also reads the current snapshot, never retained
+  attention history. It owns the launch and the conversation that received
+  the first submitted turn, only when its identity was known before that
+  submission: known at spawn (a fresh Claude loop pane, launched with the
+  `--session-id` muxel minted) or named by a title first. Without a prior
+  identity (a fresh Codex launch whose prompt precedes its first title),
+  ownership stays unknown for the whole run: a later UUID or hook cannot prove
+  which conversation received the prompt.
+  Later identities or submissions do not establish or transfer ownership.
+  Replacement
+  launches or conversations abandon the old run without completion or close.
+  Completion and closing at the runtime safety cap require attributable
+  evidence for the owned binding. The cap always releases tracking: if startup
+  never submits or the status stays uncertain, it abandons the run without
+  completion or pane close, allowing later scheduled fires. Unknown ownership
+  has the same non-closing behavior. In that ordering, an Exit-policy loop
+  leaves its pane open until a human closes it.
+
+  The app records each pane's last status with its binding (launch and binding
+  revision). Within one PTY launch, the first attributable status after a
+  switch is a transition and a new event in the pane's activity, even when it
+  repeats the old conversation's last state. Across a relaunch, equal statuses
+  still compare as unchanged, so after a relaunch into a different
+  conversation, an event in the state last recorded for the pane can be
+  missed.
+- Claude's hook stamps each record with a nonce; older records are identified
+  by their exact bytes and write time. A new record is a switch even when it
+  names the bound conversation, so `/resume B` then `/resume A` between two
+  reads retires the old runtime. Only a `resume` receipt from a launch that
+  used muxel's generated `--resume` flag, recorded after spawn and before its
+  first submitted turn, confirms that launch without opening another binding.
+  Configured provider arguments are opaque, so their receipts are switches.
+  A fresh `--session-id` launch has no startup receipt. A tmux attach cannot
+  prove whether a new process started; a same-ID resume before the first prompt
+  can still be indistinguishable from a startup receipt. Recurring discovery validates an
+  immutable snapshot on a worker. The UI claims the current record by
+  renaming it, then requires its bytes and write time to match that snapshot
+  before applying or acknowledging it. Prelaunch recovery uses the same UI
+  claim owner. A record the hook writes meanwhile waits at the shared path;
+  a newer mismatching claim or one whose binding failed to save is retained
+  and validated before the next shared record. So is a record muxel can't
+  adopt yet: its transcript doesn't validate yet (`/clear` can run before
+  Claude creates the cwd's project directory), or another pane owns its
+  conversation. A newer shared record supersedes it, so one that never
+  validates can't hold back the next; only a record that isn't a Claude
+  `SessionStart` event is dropped unadopted while its writer runs. Such a
+  record names a conversation of the process that wrote it, so prelaunch
+  recovery keeps it only when the launch reattaches that process's live tmux
+  session; a launch that starts a new process (a direct pane, an ended tmux
+  session, or one tmux can't answer for) drops it, so the new process never
+  adopts its predecessor's conversation. Prelaunch recovery refuses the
+  launch when a pending record can't be claimed or read, or its binding can't
+  be saved. Failing to acknowledge a saved binding is logged and the launch
+  goes ahead, unless a newer record waits behind the stuck claim.
+- An accepted Grok identity is retained separately from durable workspace
+  metadata. A real identity change invalidates the live terminal before saving,
+  so a failed save cannot leave an old Exit-policy loop owning the replacement.
+  Metadata still rolls back on failure; retrying the same accepted identity only
+  retries persistence. A new launch or child process starts with no prior Grok
+  observation. An accepted identity also reserves the conversation against
+  sibling discovery while its metadata save is pending. The ownership snapshot
+  checks the current pane, launch and child PID and updates claims as each result
+  in a batch is staged, including a switch back that leaves metadata unchanged.
+  Before Restart stops the process or redocks the pane, it saves the accepted
+  identity for the resume command. A failed save refuses Restart and leaves the
+  current process and window owner intact.
+- A submission counts only in the binding it was made in, so the Enter that
+  picks a conversation in `/resume` doesn't arm the resumed conversation's
+  completion, including when the resumed UUID is the first identity observed.
+
+## Submissions
+
+A submission is muxel's own judgement, not a provider's. A bare carriage
+return typed at the keyboard marks one; `ESC CR` (Shift+Enter, Alt+Enter)
+never does. Muxel's automated sends that end in Enter mark one too: a startup
+prompt, auto-continue, a broadcast, a snippet, an inserted transcript, and a
+`ctl` send. A provider can read the same bytes differently. OpenCode queues a
+message on Alt+Enter, which muxel doesn't count as a submission.
+
+Control Enter commits writer admission, submission evidence, draft clearing,
+and runtime notification together. A refused write or flush leaves no pending
+submission for the next typed character to consume.
+Its input timestamp is captured before publishing bytes and committed only
+after admission succeeds, so a resume hook caused by that Enter cannot make
+the selector count as a submission to the replacement conversation.
+
+For ctl delivery through tmux, input is refused while the target pane is in
+copy mode (`tmux_pane_in_mode`). Muxel preserves the user's scroll position;
+the user must leave copy mode before a caller retries. Enter is checked too,
+so entering copy mode after a paste yields an error with `pasted: true` rather
+than a successful submission receipt. A reported server version of 2.4 or newer
+uses an atomic mode check/write in tmux's command queue. Older or unreported
+versions use a separate `display-message` mode check before each write. This
+preserves legacy support without invoking tmux 2.1's unsafe `if-shell -t`
+target lookup on a vanished pane. The legacy path adds a round trip and has a
+small race if the user enters copy mode between the check and Enter. Stock
+2.2/2.3 take that path too because `#{version}` arrived in 2.4; muxel checks the
+server, not a client binary that may have been upgraded while it kept running.
+The existing pane lookup also reads the server version. Muxel caches that
+capability with the pinned pane without another version round trip.
+An unanswered Enter may already have started a turn, so ctl sets its
+local `just_submitted` guard before releasing the send's in-flight marker.
+
+A new agent's launch records `$TMUX_PANE` in the session's
+`@muxel_control_pane` option before exec-ing the program. A program with no
+arguments still runs through the user's shell, as tmux does with a lone command
+string, so `npx opencode` and shell-only PATH keep working. The launch wrapper
+does not run on reattach. First ctl delivery caches that record, which remains
+authoritative after joins, moves and default-command splits. Sessions without
+the option retain the lowest-pane lookup; a vanished recorded pane never
+redirects input to another pane. If moving the only pane destroys its source
+session before the first ctl lookup, its session record is gone too; delivery
+refuses as unresolved. A pin already cached before that move remains usable.
+
+## Coverage boundary
+
+The reducer keeps the existing no-hook classifier. Provider titles, visible
+rows, configured markers, bells, recent output, and process exit are valid
+evidence for the fields they describe. Quiet visible output never proves that
+a provider has no hidden background work, so the snapshot reports
+`ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
+claiming more than the terminal shows.
+
+Background listings are read from the same screen. Claude 2.1.318's captured footer
+uses `1 shell`, `1 monitor` or `/tasks to see subagents` in each permission mode.
+A listing is not a liveness guarantee, so subagent holds have a three-hour cap.
+Shell and monitor counts remain metadata without delaying foreground completion.
+A turn released by its cap or
+missing-listing grace cannot be held again without a fresh foreground turn.
+Legacy agent, MCP-task and cloud-session labels do not establish subagents.
+Its `← 4 agents` is on every footer and is not a running count, and
+a finished turn's `1 shell still running` row stays on screen after the shell ends, so
+an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
+the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
+is a scheduled wake, not running work. Codex's report already stays Working while a
+background terminal runs. Its parent reads finished while a spawned agent runs, and
+nothing on its terminal says so. Screen detection depends on the supported footer
+and panel layouts and wording.
+
+Plain `ctl wait` follows subagent holds. Shell and monitor counts alone do not delay
+foreground Done, completion alerts, Recent work or plain wait. `ctl wait --turn`
+stops at an observable turn end with
+background work still listed. It cannot override a provider's continuing Working
+report. Send admission and the background turn-end decision require the hold's
+binding revision to match the current conversation. Send admission also requires
+an attributable status, so a listing never admits input while a switch settles or
+the screen is held after one. Completion attribution stays
+separate: a surviving footer after `/clear` can still leave the current composer
+free without updating activity. Foreground working/blocked markers prevent that
+background-only exception. Released foreground turns with current-binding listed
+work keep that admission behavior even when activity attribution is suppressed.
+Legacy foreground-command rows retain their Working refusal. Cached snapshots
+from a previous binding cannot authorize input or finish a wait.
+
+A held turn takes no completion: the report that started the hold would otherwise stamp
+the pane as finished. The release is its own status change. A switch reads the same way:
+`/clear` beside listed subagents leaves no report until the next turn, and only a title
+reading Working would end the screen hold, which no title does between turns. So the pane
+holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
+but fires only at turn end, so it can't see work ending between turns, and it needs a
+helper on the host.
+
+## Popout refresh
+
+Popout roots observe their pane entity for title, status and content, and the
+theme global for appearance changes. App notifications invalidate a popout
+only when its own presence, recoverable-close hold or close confirmation
+changes. The confirmation snapshot includes its displayed text and button labels;
+opening, changing and cancelling it all invalidate that popout. Theme palette
+refresh also visits popout-owned terminals, updating their painting and OSC
+color-query palette; unchanged palettes do not invalidate terminal content.
+
+Rendering uses the snapshot rather than reading the app entity, since initial
+window drawing can run inside the app update that opens the window. A recoverable
+close still removes the popout window while retaining its terminal; Undo
+restores that same terminal through the existing close lifecycle.

@@ -9,25 +9,27 @@ use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::tmux::{SessionTarget, Socket};
+use muxel_core::reminders::{self, Reminder};
+use muxel_core::tmux::{ClaimWrite, ServerOrigin, SessionTarget, Socket};
 use muxel_core::{
-    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
-    accomplishments_header, memory_header, remote_ops, ssh,
+    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, REMINDERS_FILE, RemoteHost, RemoteOs, SshAuth,
+    accomplishments_header, memory_header, reminders_header, remote_ops, ssh,
 };
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// `std::process::Command` for `program`, with the console window suppressed on
 /// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
 /// would otherwise flash a cmd window on every call — extremely visible because
 /// muxel polls git in the background. No-op off Windows.
-fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    let mut cmd = muxel_core::child_env::command(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -140,7 +142,7 @@ impl RepoLoc {
 
 /// Build the local `ssh`/`sshpass` Command that runs `remote_cmd` (one shell
 /// string) on the connection's host, reusing its ControlMaster.
-fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
+pub(crate) fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     let mut argv = ssh::connection_args(&c.host, &c.control_path);
     // `ConnectTimeout` comes from `base_args`; `BatchMode` makes a key/agent
     // failure fail fast instead of blocking on a password prompt to a non-tty.
@@ -165,16 +167,88 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     }
 }
 
+/// `Command::output` for git, also recorded by the UI profiler when it's on
+/// (`ui_profile::git_launched`; the caller label comes from
+/// `ui_profile::git_caller`).
+trait ProfiledOutput {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Commands this thread ran through [`ProfiledOutput`], for tests that
+    /// count git launches.
+    static LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Commands this thread has run through [`ProfiledOutput`] so far. gpui's test
+/// executor runs background tasks on the test's own thread, so an app test
+/// sees its panes' git here too.
+#[cfg(test)]
+pub(crate) fn git_launches() -> usize {
+    LAUNCHES.with(std::cell::Cell::get)
+}
+
+impl ProfiledOutput for Command {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        LAUNCHES.with(|n| n.set(n.get() + 1));
+        if !crate::ui_profile::is_enabled() {
+            return self.output();
+        }
+        let started = Instant::now();
+        let out = self.output();
+        crate::ui_profile::git_launched(self, started.elapsed(), &out);
+        out
+    }
+}
+
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, true).profiled_output()
+}
+
+/// Mutations deliberately keep git's normal locking behavior.
+fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, false).profiled_output()
+}
+
+const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
+
+fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
     match loc {
-        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
+        RepoLoc::Local(path) => {
+            let mut cmd = if read_only {
+                git_read_command()
+            } else {
+                command("git")
+            };
+            cmd.arg("-C").arg(path).args(args);
+            cmd
+        }
         RepoLoc::Remote(c) => {
-            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
-            remote_ssh_command(c, remote).output()
+            let remote = if read_only {
+                remote_ops::git_read_only(c.host.os, &c.remote_path, args)
+            } else {
+                remote_ops::git(c.host.os, &c.remote_path, args)
+            };
+            remote_ssh_command(c, remote)
         }
     }
+}
+
+/// Shared default for background/display git reads.
+fn git_read_command() -> Command {
+    read_only_git(command("git"))
+}
+
+fn read_only_git(mut cmd: Command) -> Command {
+    // Porcelain diff can run update-index --refresh even with optional locks
+    // disabled, so suppress its automatic refresh explicitly as well.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", READ_ONLY_GIT_CONFIG]);
+    cmd
 }
 
 /// Cap on the size of a remote file muxel will read into the editor (2 MB).
@@ -254,7 +328,7 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
 pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
     let mut panes = Vec::new();
     for socket in local_tmux_sockets() {
-        let out = tmux_on(socket)
+        let out = tmux_on(&socket)
             .args(muxel_core::tmux::list_sessions_args())
             .stdin(std::process::Stdio::null())
             .output()
@@ -299,7 +373,7 @@ pub fn upload_paste(loc: &RepoLoc, name: &str, bytes: &[u8]) -> Result<String> {
 
 /// Run `cmd` on the host with `input` piped to its stdin. `Err` with ssh's stderr
 /// (or `failed` when it said nothing) unless the command succeeds.
-fn pipe_to_remote(
+pub(crate) fn pipe_to_remote(
     c: &RemoteConn,
     cmd: String,
     input: &[u8],
@@ -333,15 +407,16 @@ fn pipe_to_remote(
 }
 
 /// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare
-/// `MEMORY_DIR` form counts too). Idempotent; shared by the memory-file and
-/// layout-sync writers.
+/// `MEMORY_DIR` form counts too) and git does not already ignore it through
+/// another source, such as `.git/info/exclude` or `core.excludesFile`.
+/// Idempotent; shared by the memory-file and layout-sync writers.
 fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
     let ignored = current
         .lines()
         .any(|l| l.trim() == ignore_line || l.trim() == MEMORY_DIR);
-    if ignored {
+    if ignored || git_ignores(root, ignore_line) {
         return Ok(());
     }
     let mut next = current;
@@ -351,6 +426,17 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     next.push_str(ignore_line);
     next.push('\n');
     std::fs::write(&gitignore, next).with_context(|| format!("updating {}", gitignore.display()))
+}
+
+/// Whether git at `root` ignores `path` from any ignore source. `false` when
+/// git is missing or `root` is not in a repository.
+fn git_ignores(root: &Path, path: &str) -> bool {
+    git_read_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--", path])
+        .profiled_output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Ensure a project's shared memory file exists and is git-ignored, idempotently:
@@ -367,6 +453,16 @@ pub fn ensure_accomplishments_file(loc: &RepoLoc) -> Result<()> {
         ACCOMPLISHMENTS_FILE,
         accomplishments_header(),
         "ensure accomplishments failed",
+    )
+}
+
+/// [`ensure_memory_file`] for the project's `.muxel/REMINDERS.md`.
+pub fn ensure_reminders_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(
+        loc,
+        REMINDERS_FILE,
+        reminders_header(),
+        "ensure reminders failed",
     )
 }
 
@@ -572,6 +668,50 @@ pub fn edit_accomplishments(
     Ok(kept)
 }
 
+/// Overwrite a project's reminders with `text`, creating `.muxel/` (git-ignored)
+/// first if needed.
+fn write_reminders_text(loc: &RepoLoc, text: &str) -> Result<()> {
+    ensure_reminders_file(loc)?;
+    let path = muxel_file_abs(loc, REMINDERS_FILE);
+    match loc {
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
+    }
+}
+
+/// Load a project's reminders, maintained (keyed moves and cancels folded, sorted
+/// soonest first), rewriting the file only when that changes it, and re-reading
+/// just before the write so a line an agent appended in between is kept.
+pub fn maintain_reminders(loc: &RepoLoc, zone: &impl reminders::Zone) -> Result<Vec<Reminder>> {
+    let text = read_muxel_text(loc, REMINDERS_FILE)?;
+    if reminders::plan_rewrite(&text, zone).is_none() {
+        return Ok(reminders::reminders_in(&text, zone));
+    }
+    let fresh = read_muxel_text(loc, REMINDERS_FILE)?;
+    match reminders::plan_rewrite(&fresh, zone) {
+        Some(doc) => {
+            write_reminders_text(loc, &doc)?;
+            Ok(reminders::reminders_in(&doc, zone))
+        }
+        None => Ok(reminders::reminders_in(&fresh, zone)),
+    }
+}
+
+/// Apply a user edit (dismiss, snooze, add, delete) to the reminders as they are on
+/// disk *now*, then write the maintained result and return it.
+pub fn edit_reminders(
+    loc: &RepoLoc,
+    zone: &impl reminders::Zone,
+    edit: impl FnOnce(&mut Vec<Reminder>),
+) -> Result<Vec<Reminder>> {
+    let text = read_muxel_text(loc, REMINDERS_FILE)?;
+    let mut list = reminders::reminders_in(&text, zone);
+    edit(&mut list);
+    let kept = reminders::maintain(list.into_iter().map(reminders::Line::Reminder).collect());
+    write_reminders_text(loc, &reminders::render_document(&kept, zone))?;
+    Ok(kept)
+}
+
 /// Filename of a remote project's synced pane layout, under `<root>/.muxel/`.
 const REMOTE_LAYOUT_FILE: &str = "workspace.json";
 /// One-level backup of the previous layout, written before each overwrite.
@@ -632,6 +772,25 @@ pub fn fetch_remote_layout(loc: &RepoLoc) -> Option<String> {
     }
 }
 
+/// A poll distinguishes a missing local layout from a failed/oversized read.
+/// Only a successful read (or confirmed absence) may release a pending close.
+pub fn fetch_layout_for_poll(loc: &RepoLoc) -> (bool, Option<String>) {
+    if let RepoLoc::Local(root) = loc {
+        let path = local_layout_abs(root);
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (true, None),
+            Ok(metadata) if metadata.len() <= MAX_REMOTE_BYTES => {}
+            _ => return (false, None),
+        }
+        return match std::fs::read_to_string(path) {
+            Ok(json) => (true, Some(json)),
+            Err(_) => (false, None),
+        };
+    }
+    let json = fetch_remote_layout(loc);
+    (json.is_some(), json)
+}
+
 /// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json`, backing up
 /// the previous copy to `workspace.bak.json` first and ensuring `.muxel/` is
 /// git-ignored — over SSH for a remote project, on the local filesystem for a local
@@ -669,7 +828,8 @@ fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
 
 /// `git <args>` at `loc`; `bail!`s with stderr (a useful toast) on failure.
 fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
-    let out = git_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let out =
+        git_write_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -736,7 +896,52 @@ fn ssh_run(
         cmd = command("ssh");
         cmd.args(&argv);
     }
-    cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))
+    ssh_output(host.auth, &mut cmd).map_err(|e| ssh_spawn_error(host.auth, e))
+}
+
+/// Pauses before each rerun of an `sshpass` that couldn't open its local pty —
+/// see [`ssh_output`]. About 1.5s in all, well inside a connect's timeout.
+const SSHPASS_PTY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(400),
+    Duration::from_millis(1000),
+];
+
+/// `cmd.output()` for an ssh run built for `auth`. A password run goes through
+/// `sshpass`, which first opens a local pty to type the password into; macOS
+/// occasionally refuses that for a moment ("Failed to get a pseudo terminal:
+/// Unknown error: -6") with ptys to spare, and a manual retry then works. sshpass
+/// gives up before it starts ssh, so nothing reached the host and rerunning is
+/// always safe: it's retried a few times, and the last output returned as-is.
+fn ssh_output(auth: SshAuth, cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let mut out = cmd.output()?;
+    if auth != SshAuth::Password {
+        return Ok(out);
+    }
+    for delay in SSHPASS_PTY_RETRY_DELAYS {
+        if !is_sshpass_pty_failure(out.status.code(), &out.stderr) {
+            break;
+        }
+        std::thread::sleep(delay);
+        out = cmd.output()?;
+    }
+    Ok(out)
+}
+
+/// Whether an `sshpass` run failed setting up its local pty, before it ran ssh:
+/// its runtime-error exit (3) after one of the lines it prints when
+/// `posix_openpt`, `grantpt` or `unlockpt` fails.
+fn is_sshpass_pty_failure(code: Option<i32>, stderr: &[u8]) -> bool {
+    const PTY_SETUP: [&str; 3] = [
+        "Failed to get a pseudo terminal",
+        "Failed to change pseudo terminal's permission",
+        "Failed to unlock pseudo terminal",
+    ];
+    code == Some(3) && {
+        let err = String::from_utf8_lossy(stderr);
+        let err = err.trim_start();
+        PTY_SETUP.iter().any(|line| err.starts_with(line))
+    }
 }
 
 /// A human message for an ssh transport/auth failure: ssh's stderr, or a generic
@@ -824,11 +1029,11 @@ fn ssh_spawn_error(auth: SshAuth, e: std::io::Error) -> anyhow::Error {
     }
 }
 
-/// Verify a host's SSH config by opening a quick connection (`ssh … -- true`).
+/// Verify a host's SSH config by opening a quick connection (an OS no-op).
 /// Also establishes the master at `control_path`, so the panes that ride it
 /// connect instantly.
 pub fn ssh_check(host: &RemoteHost, control_path: &str, password: Option<&str>) -> Result<()> {
-    ssh_exec(host, control_path, password, "true")
+    ssh_exec(host, control_path, password, remote_ops::noop(host.os))
 }
 
 /// Verify a host's *credentials* with a **fresh** connection. Unlike [`ssh_check`]
@@ -855,7 +1060,7 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
     }
     argv.push(ssh::target(host));
     argv.push("--".into());
-    argv.push("true".into());
+    argv.push(remote_ops::noop(host.os).into());
 
     let mut cmd;
     if host.auth == SshAuth::Password {
@@ -868,7 +1073,7 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
         cmd = command("ssh");
         cmd.args(&argv);
     }
-    let out = cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))?;
+    let out = ssh_output(host.auth, &mut cmd).map_err(|e| ssh_spawn_error(host.auth, e))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = err.trim();
@@ -880,6 +1085,23 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
         bail!("{msg}");
     }
     Ok(())
+}
+
+/// How long the remote agent lookup may take, the user's login shell included,
+/// before it is abandoned (and then nothing is hidden).
+const REMOTE_PROGRAMS_BUDGET: Duration = Duration::from_secs(20);
+
+/// Which of `programs` the connection's host can launch (see
+/// [`remote_ops::find_programs`]), or `None` when the lookup failed or ran out
+/// of time, which says nothing about what is installed.
+pub fn remote_installed_programs(
+    conn: &RemoteConn,
+    programs: &[String],
+) -> Option<HashSet<String>> {
+    let cmd = remote_ssh_command(conn, remote_ops::find_programs(conn.host.os, programs));
+    let out = run_tmux_output_until(cmd, Instant::now() + REMOTE_PROGRAMS_BUDGET).ok()?;
+    let found = remote_ops::parse_found_programs(&String::from_utf8_lossy(&out.stdout))?;
+    Some(found.into_iter().collect())
 }
 
 /// Check that `dir` exists (and is a directory) on the remote host.
@@ -946,11 +1168,11 @@ pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(Str
 
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
+        .profiled_output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -962,7 +1184,7 @@ pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Resul
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
         .arg(worktree_path)
-        .output()
+        .profiled_output()
         .context("running `git worktree add`")?;
     if !output.status.success() {
         bail!(
@@ -979,11 +1201,11 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -1001,20 +1223,372 @@ pub fn repo_head(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "HEAD"])
 }
 
-/// The repo's current branch name (e.g. `main`); `None` when detached (`"HEAD"`)
-/// or git fails. Used only for display. Works for local or remote repos.
+/// The repo's current branch, including before its first commit, spelled as
+/// [`list_branches`] spells it so the branch switcher can mark it. `None` when
+/// detached or git fails. Used only for display; works for local and remote
+/// repos. The branch poll reads a local project's branch with its branch list
+/// instead (see [`read_branches`]).
 pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
-    git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
+    // `rev-parse --abbrev-ref` shortens a name as `git branch` does
+    // (`heads/<name>` when a remote-tracking ref shares it, where
+    // `symbolic-ref --short` doesn't), but has no answer before the first
+    // commit, where it exits 128. Only then is `symbolic-ref` worth a second
+    // launch: ssh failing to connect exits 255.
+    let out = git_output(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        return (!head.is_empty() && head != "HEAD").then_some(head);
+    }
+    // Where there's no repository git exits 128 too, printing nothing.
+    if out.status.code() != Some(128) || head != "HEAD" {
+        return None;
+    }
+    git_line_loc(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+}
+
+/// Environment variables that choose the repository or change how git looks
+/// for it. Git children inherit muxel's environment, and [`git_ref_stamp`]
+/// doesn't follow these, so with any of them set the stamp is unsettled (see
+/// [`GitRefStamp`]). `GIT_CEILING_DIRECTORIES` needn't be: a ceiling can only
+/// stop git short of the repository the stamp watches.
+const GIT_DISCOVERY_ENV: [&str; 4] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// Whether git accepts a ref name, whole or the part after `refs/heads/`, by
+/// the rules of its `check_refname_format`: no empty component, none starting
+/// with `.` or ending in `.lock`, no `..` or `@{`, no trailing `.`, and no
+/// control character, DEL, space or any of `~ ^ : ? * [ \`. git reads a HEAD
+/// naming anything else as no ref at all.
+fn is_valid_ref_name(name: &str) -> bool {
+    !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || br" ~^:?*[\".contains(&b))
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// HEAD's contents in `git_dir`, when git's answer for the current branch rests
+/// only on files [`git_ref_stamp`] watches, so the stamp moves whenever that
+/// answer can: HEAD is a file, not a symlink, and the ref it names, if any,
+/// holds an object id itself (see [`ref_is_direct`]). `None` where git would
+/// follow HEAD on through a file the stamp doesn't read. That folder's stamp
+/// is then unsettled (see [`GitRefStamp`]).
+fn settled_head(git_dir: &Path, common: &Path) -> Option<Vec<u8>> {
+    let path = git_dir.join("HEAD");
+    if std::fs::symlink_metadata(&path).ok()?.is_symlink() {
+        return None;
+    }
+    let head = std::fs::read(&path).ok()?;
+    // git trims the end and skips whitespace after `ref:`. Anything else is an
+    // object id, a detached HEAD the stamp holds as it is.
+    if let Some(target) = trim_git_space_end(&head).strip_prefix(b"ref:") {
+        let at = target
+            .iter()
+            .position(|b| !is_git_space(b))
+            .unwrap_or(target.len());
+        let refname = std::str::from_utf8(&target[at..]).ok()?;
+        if !ref_is_direct(git_dir, common, refname) {
+            return None;
+        }
+    }
+    Some(head)
+}
+
+/// Whether `refname` holds an object id itself rather than naming another ref:
+/// a loose file of just an id, or no loose file (packed, where a ref can't name
+/// another, or not created yet). A name git rejects counts too, since git reads
+/// no file for it. Per-worktree refs (outside `refs/`, or under `refs/bisect/`,
+/// `refs/worktree/` or `refs/rewritten/`) live in the worktree's own git dir,
+/// the rest in the common one.
+fn ref_is_direct(git_dir: &Path, common: &Path, refname: &str) -> bool {
+    if !is_valid_ref_name(refname) {
+        return true;
+    }
+    let per_worktree = !refname.starts_with("refs/")
+        || ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter()
+            .any(|prefix| refname.starts_with(prefix));
+    let path = if per_worktree { git_dir } else { common }.join(refname);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            meta.is_file()
+                && std::fs::read(&path).is_ok_and(|bytes| {
+                    let id = trim_git_space_end(&bytes);
+                    matches!(id.len(), 40 | 64) && id.iter().all(u8::is_ascii_hexdigit)
+                })
+        }
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whitespace as git's `isspace` has it: space, tab, newline, carriage return.
+fn is_git_space(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// `bytes` without trailing git whitespace, as git's `strbuf_rtrim` leaves a ref.
+fn trim_git_space_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|b| !is_git_space(b))
+        .map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
+/// Where a git dir's shared refs live: the main repo's git dir for a linked
+/// worktree (its `commondir` file), else the git dir itself.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|_| git_dir.to_path_buf())
+}
+
+/// A cheap stamp of the git metadata [`read_branches`] reads for a local
+/// `dir`: the git dir found, HEAD's contents, the loose branch
+/// names, and the size/mtime of `packed-refs` and reftable's `tables.list` (a
+/// linked worktree's own as well, which holds its HEAD). It takes a few `stat`s
+/// and no `git` subprocess, so the status poll re-runs git only when this
+/// moves. Not a repo is a stamp too, so a `git init` there is noticed.
+///
+/// Where those files can't vouch for what git reads, the stamp is unsettled:
+/// that is with a variable from [`GIT_DISCOVERY_ENV`] set, a folder that can't
+/// be resolved, or a HEAD [`settled_head`] turns down. Unsettled is a state,
+/// not a change: such stamps all compare equal, so only a move into or out of
+/// it, or the shorter backstop [`GitRefStamp::backstop`] gives it, asks git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitRefStamp {
+    unsettled: bool,
+    git_dir: Option<PathBuf>,
+    head: Option<Vec<u8>>,
+    branches: Vec<PathBuf>,
+    packed_refs: Option<(std::time::SystemTime, u64)>,
+    reftable: Option<(std::time::SystemTime, u64)>,
+    worktree_reftable: Option<(std::time::SystemTime, u64)>,
+}
+
+impl GitRefStamp {
+    /// How long the branch poll lets this stamp stand before asking git
+    /// anyway. A settled stamp waits five minutes, for what it can't see (git
+    /// config, `safe.directory`, git installed later). An unsettled one can't
+    /// see the repository or ref git reads, so it gets the one minute the poll
+    /// waited before the stamp could vouch for anything: a label there is at
+    /// most that stale, at no more launches than then.
+    pub fn backstop(&self) -> Duration {
+        Duration::from_secs(if self.unsettled { 60 } else { 300 })
+    }
+}
+
+pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
+    git_ref_stamp_with(dir, |key| std::env::var_os(key))
+}
+
+/// [`git_ref_stamp`], reading git's environment from `env`.
+fn git_ref_stamp_with(dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> GitRefStamp {
+    let unsettled = || GitRefStamp {
+        unsettled: true,
+        ..GitRefStamp::default()
+    };
+    if GIT_DISCOVERY_ENV.iter().any(|key| env(key).is_some()) {
+        return unsettled();
+    }
+    // No ceilings: a ceiling can only stop git short of the repo this walk
+    // finds, so watching that repo may cost a launch but never misses a change.
+    let (git_dir, broken) = match find_git_dir(dir) {
+        Ok(None) => return GitRefStamp::default(),
+        Ok(Some(GitDir::Dot(git_dir) | GitDir::Bare(git_dir))) => (git_dir, false),
+        Ok(Some(GitDir::Broken(dot))) => (dot, true),
+        Err(_) => return unsettled(),
+    };
+    // A linked worktree's branches live in the main repo's git dir.
+    let common = common_git_dir(&git_dir);
+    // git stops at a broken `.git` with an error until the folder changes.
+    let head = if broken {
+        None
+    } else {
+        let Some(head) = settled_head(&git_dir, &common) else {
+            return unsettled();
+        };
+        Some(head)
+    };
+    let file_stamp = |path: PathBuf| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    let heads = common.join("refs").join("heads");
+    let mut branches = Vec::new();
+    let mut dirs = vec![heads.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+            } else if let Ok(name) = path.strip_prefix(&heads) {
+                branches.push(name.to_path_buf());
+            }
+        }
+    }
+    branches.sort();
+    let reftable = file_stamp(common.join("reftable").join("tables.list"));
+    // Switching branches in a linked reftable worktree rewrites only its own
+    // table: its HEAD file is the placeholder.
+    let worktree_reftable = (reftable.is_some() && git_dir != common)
+        .then(|| file_stamp(git_dir.join("reftable").join("tables.list")))
+        .flatten();
+    GitRefStamp {
+        unsettled: false,
+        head,
+        branches,
+        packed_refs: file_stamp(common.join("packed-refs")),
+        reftable,
+        worktree_reftable,
+        git_dir: Some(git_dir),
+    }
+}
+
+/// Where git finds the repository for a folder.
+#[derive(Debug, PartialEq, Eq)]
+enum GitDir {
+    /// A `.git` directory that is a repository, or the repository a `.git`
+    /// file's `gitdir:` names (a linked worktree, a submodule).
+    Dot(PathBuf),
+    /// A folder that is itself a repository: a bare repo, or the inside of a
+    /// `.git`.
+    Bare(PathBuf),
+    /// A `.git` file that doesn't name a repository. git stops there with an
+    /// error.
+    Broken(PathBuf),
+}
+
+/// The git dir for `dir`, found as git finds it. git starts from the folder's
+/// real path, since its `chdir` resolves symlinks and junctions, and walks up to
+/// the nearest folder with a `.git` file, a `.git` directory that is a
+/// repository, or that is a repository itself (see [`is_git_directory`]). On
+/// Linux and macOS it stops at a filesystem boundary. Ceilings aren't followed
+/// (see [`GIT_DISCOVERY_ENV`]). `Ok(None)` when there is none, or when `dir` is
+/// missing or not a folder, where git can't start. `Err` when `dir` can't be
+/// resolved or a `.git` file can't be read.
+fn find_git_dir(dir: &Path) -> std::io::Result<Option<GitDir>> {
+    let real = match real_dir(dir) {
+        Ok(real) if real.is_dir() => real,
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    let elsewhere = {
+        use std::os::unix::fs::MetadataExt as _;
+        let device = std::fs::metadata(&real)?.dev();
+        move |d: &Path| std::fs::metadata(d).map(|m| m.dev()).ok() != Some(device)
+    };
+    for d in real.ancestors() {
+        #[cfg(unix)]
+        if d != real && elsewhere(d) {
+            return Ok(None);
+        }
+        let dot = d.join(".git");
+        match std::fs::metadata(&dot) {
+            Ok(meta) if meta.is_file() => {
+                // git takes the rest of the file after `gitdir: `, less
+                // trailing newlines, relative to the folder holding it.
+                let text = String::from_utf8(std::fs::read(&dot)?)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let target = text
+                    .strip_prefix("gitdir: ")
+                    .map(|rest| rest.trim_end_matches(['\n', '\r']))
+                    .filter(|rest| !rest.is_empty())
+                    .map(|rest| d.join(rest))
+                    .filter(|target| is_git_directory(target));
+                return Ok(Some(target.map_or(GitDir::Broken(dot), GitDir::Dot)));
+            }
+            Ok(_) if is_git_directory(&dot) => return Ok(Some(GitDir::Dot(dot))),
+            // git passes over a `.git` directory that isn't a repository.
+            Ok(_) | Err(_) => {}
+        }
+        if is_git_directory(d) {
+            return Ok(Some(GitDir::Bare(d.to_path_buf())));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether git takes `dir` for a repository, by the test its discovery applies
+/// (`is_git_directory` in git's `setup.c`): a HEAD git's `validate_headref`
+/// accepts, and `objects` and `refs` in the common dir. On Linux and macOS git
+/// also needs to be able to enter those two, which this doesn't check.
+fn is_git_directory(dir: &Path) -> bool {
+    if !head_is_valid(&dir.join("HEAD")) {
+        return false;
+    }
+    let common = common_git_dir(dir);
+    ["objects", "refs"]
+        .iter()
+        .all(|part| std::fs::metadata(common.join(part)).is_ok())
+}
+
+/// Whether git's `validate_headref` accepts the HEAD at `path`: a symlink into
+/// `refs/`, or a file whose first 255 bytes are `ref:`, optional whitespace and
+/// `refs/…`, or begin with an object id.
+fn head_is_valid(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_symlink() {
+        return std::fs::read_link(path)
+            .is_ok_and(|target| target.as_os_str().as_encoded_bytes().starts_with(b"refs/"));
+    }
+    let mut start = Vec::with_capacity(255);
+    if std::fs::File::open(path)
+        .and_then(|file| file.take(255).read_to_end(&mut start))
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(rest) = start.strip_prefix(b"ref:") {
+        let at = rest
+            .iter()
+            .position(|b| !is_git_space(b))
+            .unwrap_or(rest.len());
+        if rest[at..].starts_with(b"refs/") {
+            return true;
+        }
+    }
+    start.len() >= 40 && start[..40].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// `dir` with symlinks and junctions resolved. On Windows, without the `\\?\`
+/// prefix on a drive path, so a relative `gitdir:` joined onto it still
+/// resolves `..`.
+fn real_dir(dir: &Path) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(dir)?;
+    #[cfg(windows)]
+    if let Some(rest) = real.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(PathBuf::from(rest));
+    }
+    Ok(real)
 }
 
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = command("git")
+    let out = git_read_command()
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1028,11 +1602,11 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -1047,7 +1621,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
-        .output()
+        .profiled_output()
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
@@ -1055,20 +1629,35 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
-            .output();
+            .profiled_output();
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }
 
-/// Delete `branch` from `repo` (force). Best-effort — only valid once the branch
-/// is no longer checked out in any worktree.
-pub fn delete_branch(repo: &Path, branch: &str) {
-    let _ = command("git")
+/// Delete `branch` from `repo` (force), and say whether it is gone. Git keeps a
+/// branch a worktree still has checked out.
+pub fn delete_branch(repo: &Path, branch: &str) -> bool {
+    let deleted = command("git")
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
-        .output();
+        .profiled_output()
+        .is_ok_and(|out| out.status.success());
+    deleted || !branch_exists(repo, branch)
+}
+
+/// Whether `repo` has a local branch `branch`; yes when git can't say. A missing
+/// ref exits 1, and a repository git can't read exits 128.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let missing = command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .profiled_output()
+        .is_ok_and(|out| out.status.code() == Some(1));
+    !missing
 }
 
 /// Stage **all** changes (tracked, untracked, and deletions) and commit them at
@@ -1102,13 +1691,50 @@ pub struct GitChange {
 /// List every changed/untracked file at `loc` — exactly what `git add -A` would
 /// stage — from `git status --porcelain=v1 -z`. Empty on git failure or a clean
 /// tree. The `-z` (NUL-separated) form sidesteps the path quoting `git status`
-/// otherwise applies to names with spaces or non-ASCII characters.
+/// otherwise applies to names with spaces or non-ASCII characters. Paths are
+/// from the repository's root, whatever folder of it `loc` is.
 pub fn git_status_files(loc: &RepoLoc) -> Vec<GitChange> {
     git_output(loc, &["status", "--porcelain=v1", "-z"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| parse_status_z(&o.stdout))
         .unwrap_or_default()
+}
+
+/// Where a folder sits in its repository, as `git rev-parse` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPlace {
+    /// The repository's root, as git writes it (on the host, for a remote
+    /// folder).
+    pub top: String,
+    /// The folder's path from the root: empty at the root, else ending in `/`.
+    pub prefix: String,
+}
+
+impl RepoPlace {
+    /// A path from the root, as [`git_status_files`] lists it, from the
+    /// folder instead, or `None` when it lies outside the folder.
+    pub fn in_folder<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.strip_prefix(self.prefix.as_str())
+    }
+}
+
+/// Where `loc`'s folder sits in its repository, or `None` outside one.
+pub fn git_place(loc: &RepoLoc) -> Option<RepoPlace> {
+    let out = git_output(loc, &["rev-parse", "--show-toplevel", "--show-prefix"])
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let top = lines.next().filter(|top| !top.is_empty())?.to_string();
+    let prefix = lines.next().unwrap_or_default().to_string();
+    Some(RepoPlace { top, prefix })
+}
+
+/// A path from the repository's root, as [`git_status_files`] lists it, as a
+/// literal pathspec git reads from the root in any folder of the repository.
+fn from_root(path: &str) -> String {
+    format!(":(top,literal){path}")
 }
 
 /// Parse the NUL-separated records of `git status --porcelain -z`: each record is
@@ -1119,14 +1745,16 @@ fn parse_status_z(bytes: &[u8]) -> Vec<GitChange> {
     let mut fields = text.split('\0').filter(|s| !s.is_empty());
     let mut out = Vec::new();
     while let Some(rec) = fields.next() {
-        // A record needs the two status chars, the separator space, and at least
-        // one path character.
-        if rec.len() < 4 {
+        // Check the ASCII prefix and nonempty path before slicing the UTF-8 record.
+        let [x, y, b' ', _, ..] = rec.as_bytes() else {
+            continue;
+        };
+        if !x.is_ascii() || !y.is_ascii() {
             continue;
         }
         let status = rec[..2].to_string();
         let path = rec[3..].to_string();
-        let orig = if status.starts_with('R') || status.starts_with('C') {
+        let orig = if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
             fields.next().map(str::to_string)
         } else {
             None
@@ -1148,10 +1776,29 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     };
-    let mut out = run(&["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default();
+    let spec = from_root(path);
+    let mut out = run(&[
+        "-c",
+        "diff.relative=false",
+        "diff",
+        "HEAD",
+        "--no-color",
+        "--",
+        &spec,
+    ])
+    .unwrap_or_default();
     if out.trim().is_empty() {
         // New/staged file: HEAD has nothing for it, so show the staged diff.
-        out = run(&["diff", "--cached", "--no-color", "--", path]).unwrap_or_default();
+        out = run(&[
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--cached",
+            "--no-color",
+            "--",
+            &spec,
+        ])
+        .unwrap_or_default();
     }
     if out.len() > MAX_DIFF_BYTES {
         out.truncate(MAX_DIFF_BYTES);
@@ -1164,20 +1811,23 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
     }
 }
 
-/// Stage a single file at `loc` (`git add -- <path>`).
+/// Stage a single file at `loc` (`git add -- <path>`), `path` as
+/// [`git_status_files`] lists it.
 pub fn git_stage_path(loc: &RepoLoc, path: &str) -> Result<String> {
-    git_run_loc(loc, &["add", "--", path])
+    git_run_loc(loc, &["add", "--", &from_root(path)])
 }
 
-/// Unstage a single file at `loc` (`git restore --staged -- <path>`).
+/// Unstage a single file at `loc` (`git restore --staged -- <path>`), `path`
+/// as [`git_status_files`] lists it.
 pub fn git_unstage_path(loc: &RepoLoc, path: &str) -> Result<String> {
-    git_run_loc(loc, &["restore", "--staged", "--", path])
+    git_run_loc(loc, &["restore", "--staged", "--", &from_root(path)])
 }
 
-/// Discard all changes to a single file at `loc`: revert a tracked file's index
-/// and worktree to HEAD, or delete it if untracked. DESTRUCTIVE — the caller must
-/// confirm first.
+/// Discard all changes to a single file at `loc`, `path` as
+/// [`git_status_files`] lists it: revert a tracked file's index and worktree to
+/// HEAD, or delete it if untracked. DESTRUCTIVE — the caller must confirm first.
 pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
+    let spec = from_root(path);
     git_run_loc(
         loc,
         &[
@@ -1186,19 +1836,20 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
             "--staged",
             "--worktree",
             "--",
-            path,
+            &spec,
         ],
     )
-    .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", path]))
+    .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", &spec]))
 }
 
 /// Merge `branch` into whatever is checked out at `loc` (the base). `RepoLoc`
 /// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
 /// so the repo isn't left mid-merge.
 pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
-    let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
+    let out =
+        git_write_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
     if !out.status.success() {
-        let _ = git_output(loc, &["merge", "--abort"]);
+        let _ = git_write_output(loc, &["merge", "--abort"]);
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1207,7 +1858,7 @@ pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Remove the worktree at `worktree_path` (force) and prune stale entries, at
 /// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
 pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
-    let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
+    let out = git_write_output(loc, &["worktree", "remove", "--force", worktree_path])
         .context("running `git worktree remove`")?;
     if !out.status.success() {
         bail!(
@@ -1215,7 +1866,7 @@ pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let _ = git_output(loc, &["worktree", "prune"]);
+    let _ = git_write_output(loc, &["worktree", "prune"]);
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1228,12 +1879,14 @@ pub fn delete_branch_loc(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Stage exactly `paths` (their additions, modifications, and deletions, via
 /// `git add -A -- <paths>`) and commit only those paths at `loc` (`git commit
 /// --only`). Files outside `paths` are left untouched — even if already staged.
-/// Errors on an empty selection or git failure.
+/// `paths` are as [`git_status_files`] lists them. Errors on an empty selection
+/// or git failure.
 pub fn git_commit_paths(loc: &RepoLoc, msg: &str, paths: &[String]) -> Result<String> {
     if paths.is_empty() {
         bail!("Select at least one file to commit");
     }
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let specs: Vec<String> = paths.iter().map(|path| from_root(path)).collect();
+    let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
 
     // Stage the selected paths first so untracked ones become known to git; then
     // commit only those paths, taking their working-tree state.
@@ -1252,7 +1905,7 @@ pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
-        .output()
+        .profiled_output()
         .context("running `git push`")?;
     if !out.status.success() {
         bail!("git push: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -1297,7 +1950,7 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
             .arg("-C")
             .arg(worktree_path)
             .args(args)
-            .output()
+            .profiled_output()
             .context("running git")
     };
     let reset = run(&["reset", "--hard", base_ref])?;
@@ -1312,56 +1965,329 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
     Ok(())
 }
 
-/// Remove a worktree (force) and prune stale entries. Best-effort.
-pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
-    let _ = command("git")
+/// What a worktree removal left on disk, as git and the disk tell it afterwards.
+#[derive(Debug)]
+pub struct WorktreeLeft {
+    /// Whether git still lists the worktree. `Some(true)`: git refused the
+    /// removal (a locked worktree, a repository error), so nothing was removed
+    /// and the folder is still a working checkout. `Some(false)`: git dropped
+    /// the worktree and only its folder is left. `None`: git can't be asked,
+    /// or the folder can't be checked, so neither is known.
+    pub registered: Option<bool>,
+    /// Git's error, or why the folder is still there.
+    pub error: String,
+}
+
+/// Remove a worktree (force) and prune stale entries. Fails when the folder is
+/// still on disk afterwards, or can't be checked, with what git says of it.
+/// Git drops the worktree's registration even when it can't delete the folder
+/// (on Windows, while a program has it as its current folder or holds a file in
+/// it open), and then nothing can retry the removal through git. It keeps the
+/// registration, and the folder whole, when it refuses the removal outright.
+pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<(), WorktreeLeft> {
+    let removed = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
-        .output();
+        .profiled_output();
     let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
-        .output();
+        .profiled_output();
+    // A folder that can't be read is not known to be gone.
+    let exists = worktree_path.try_exists();
+    if matches!(exists, Ok(false)) {
+        return Ok(());
+    }
+    let error = match (removed, &exists) {
+        // Git wraps its advice onto a second line.
+        (Ok(out), _) if !out.status.success() => String::from_utf8_lossy(&out.stderr)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        (Ok(_), Err(e)) => {
+            format!("git removed the worktree, but its folder can't be checked: {e}")
+        }
+        (Ok(_), Ok(_)) => "git removed the worktree but its folder is still there".to_string(),
+        (Err(e), _) => format!("running git worktree remove: {e}"),
+    };
+    Err(WorktreeLeft {
+        registered: exists
+            .ok()
+            .and_then(|_| worktree_registered(repo, worktree_path)),
+        error,
+    })
+}
+
+/// Whether `git worktree list` still names `worktree_path`, or `None` when git
+/// can't say.
+fn worktree_registered(repo: &Path, worktree_path: &Path) -> Option<bool> {
+    let out = command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .profiled_output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let resolve = |path: &Path| std::fs::canonicalize(path).ok();
+    let wanted = resolve(worktree_path);
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|listed| {
+                let listed = Path::new(listed);
+                same_folder(
+                    (listed, resolve(listed).as_deref()),
+                    (worktree_path, wanted.as_deref()),
+                )
+            }),
+    )
+}
+
+/// Whether two paths, each as written and as the disk resolves it (`None`
+/// when it can't), name the same folder. Resolved paths are compared only
+/// with each other: on Windows a resolved path is verbatim (`\\?\D:\…`), which
+/// never equals one as written. When either can't be resolved, both are
+/// compared as written, which on Windows takes `/` and `\` alike and ignores
+/// case: git lists a worktree with its folders' case on disk, whatever case it
+/// was added with.
+fn same_folder(
+    (a, a_resolved): (&Path, Option<&Path>),
+    (b, b_resolved): (&Path, Option<&Path>),
+) -> bool {
+    match (a_resolved, b_resolved) {
+        (Some(a), Some(b)) => a == b,
+        _ if cfg!(windows) => {
+            let folded = |path: &Path| {
+                path.components()
+                    .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                    .collect::<Vec<_>>()
+            };
+            folded(a) == folded(b)
+        }
+        _ => a == b,
+    }
 }
 
 /// Maximum diff text we load into the viewer (bytes), so a giant diff can't
 /// bloat the editor buffer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
+/// The first line of `git_diff`'s text, shown before the diff has run.
+pub fn git_diff_placeholder(dir: &Path) -> String {
+    tf(
+        "# Changes in {dir}\n",
+        &[("dir", &dir.display().to_string())],
+    )
+}
+
+/// What a diff pane's watch needs to know about `dir`'s repository. Resolved by
+/// [`diff_plan`] when the pane is first refreshed, and again after HEAD or the
+/// index changes.
+#[derive(Debug, Clone)]
+pub struct DiffPlan {
+    /// `git rev-parse --show-toplevel`, as git prints it.
+    pub toplevel: String,
+    /// Files tracked under `dir`, relative to it.
+    pub tracked: Vec<PathBuf>,
+    /// HEAD and the index.
+    pub state: Vec<PathBuf>,
+    /// HEAD's target: the current branch's loose ref, `packed-refs`, and
+    /// reftable's `tables.list` (a linked worktree's own too).
+    pub refs: Vec<PathBuf>,
+    /// Whether those files settle what `git diff HEAD` reads, by the same
+    /// rules as [`GitRefStamp`]: no variable from [`GIT_DISCOVERY_ENV`] set,
+    /// and a HEAD [`settled_head`] accepts. Nor is a repository with a
+    /// submodule settled: an edit inside one changes the diff (`-dirty`)
+    /// without touching a tracked file. An unsettled repository isn't
+    /// watched; its pane polls while visible.
+    pub settled: bool,
+    /// HEAD and the index as they stood before the tracked files were
+    /// listed. When they differ at a later refresh, the event that should
+    /// have re-planned was lost, and the plan is resolved again.
+    pub inputs: PlanInputs,
+}
+
+/// The size and modification time of each file a plan was read from (or
+/// `None` where it was missing), compared at each refresh to catch a change
+/// whose event the watcher lost, without running git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanInputs(Vec<(PathBuf, Option<(u64, SystemTime)>)>);
+
+impl PlanInputs {
+    pub fn read(files: &[PathBuf]) -> Self {
+        Self(
+            files
+                .iter()
+                .map(|file| {
+                    let stamp = std::fs::metadata(file)
+                        .ok()
+                        .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+                    (file.clone(), stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether every file still stands as it did when read.
+    pub fn current(&self) -> bool {
+        let files: Vec<PathBuf> = self.0.iter().map(|(file, _)| file.clone()).collect();
+        Self::read(&files) == *self
+    }
+}
+
+/// `path` with `.` and `..` resolved without touching the disk, so it compares
+/// equal to the paths a watcher reports.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// A path git printed with `-z`. Elsewhere than Unix a name that isn't UTF-8
+/// is skipped: the watch then misses its edits, which the backstop refresh
+/// still shows.
+fn git_path(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+/// Resolve [`DiffPlan`] for `dir` with two git commands, `rev-parse` and
+/// `ls-files`. `None` where `dir` isn't in a work tree git will read.
+pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
+    let git = |args: &[&str]| {
+        git_read_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .profiled_output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout)
+    };
+    let dirs = String::from_utf8(git(&[
+        "rev-parse",
+        "--show-toplevel",
+        "--absolute-git-dir",
+    ])?)
+    .ok()?;
+    let mut lines = dirs.lines();
+    let toplevel = lines.next()?.to_string();
+    let git_dir = lexical(Path::new(lines.next()?));
+    // As [`git_ref_stamp`] finds it, from the `commondir` file.
+    let common = lexical(&common_git_dir(&git_dir));
+    let state = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    // Before listing: a change after this makes the plan stale, never the
+    // other way round.
+    let inputs = PlanInputs::read(&state);
+    let (tracked, submodules) = tracked_files(&git(&["ls-files", "-z", "-s", "--", "."])?);
+    let head = (!GIT_DISCOVERY_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some()))
+    .then(|| settled_head(&git_dir, &common))
+    .flatten();
+    let mut refs = vec![
+        common.join("packed-refs"),
+        common.join("reftable").join("tables.list"),
+    ];
+    if git_dir != common {
+        refs.push(git_dir.join("reftable").join("tables.list"));
+    }
+    // The branch HEAD names, where its loose ref would be.
+    if let Some(refname) = head
+        .as_deref()
+        .and_then(|head| std::str::from_utf8(head).ok())
+        .and_then(|head| head.trim_end().strip_prefix("ref:"))
+        .map(str::trim)
+        .filter(|refname| is_valid_ref_name(refname))
+    {
+        let per_worktree = !refname.starts_with("refs/")
+            || ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+                .iter()
+                .any(|prefix| refname.starts_with(prefix));
+        refs.push(if per_worktree { &git_dir } else { &common }.join(refname));
+    }
+    Some(DiffPlan {
+        toplevel,
+        tracked,
+        state,
+        refs,
+        settled: head.is_some() && !submodules,
+        inputs,
+    })
+}
+
+/// The paths in `git ls-files -z -s` output (`<mode> <object> <stage>\t<path>`),
+/// once each though a conflict lists a path per stage, and whether any is a
+/// submodule (mode 160000).
+fn tracked_files(listing: &[u8]) -> (Vec<PathBuf>, bool) {
+    let mut submodules = false;
+    let mut tracked: Vec<PathBuf> = listing
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            submodules |= entry.starts_with(b"160000 ");
+            git_path(&entry[tab + 1..])
+        })
+        .collect();
+    tracked.dedup();
+    (tracked, submodules)
+}
+
+/// What a diff pane shows for a folder git won't read, or that's gone.
+pub fn not_a_git_repo(dir: &Path) -> String {
+    tf(
+        "# {dir}\n\nNot a git repository.\n",
+        &[("dir", &dir.display().to_string())],
+    )
+}
+
 /// Working-tree changes for `dir`: tracked changes vs HEAD, scoped to the folder.
 /// Returns display-ready unified-diff text, or a short human message when there's
 /// nothing to show or `dir` isn't a git repo. Untracked/new files are not shown
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
-pub fn git_diff(dir: &Path) -> String {
+/// With the repository's `toplevel` already known (from a [`DiffPlan`]) it runs
+/// one git command instead of two.
+pub fn git_diff(dir: &Path, toplevel: Option<&str>) -> String {
     let git = |args: &[&str]| {
-        command("git")
+        git_read_command()
             .arg("-C")
             .arg(dir)
             .arg("--no-pager")
             .args(args)
-            .output()
+            .profiled_output()
     };
 
     // Resolve the repo root (also our "is this a git repo?" check, in one call).
-    let toplevel = match git(&["rev-parse", "--show-toplevel"]) {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            return tf(
-                "# {dir}\n\nNot a git repository.\n",
-                &[("dir", &dir.display().to_string())],
-            );
-        }
+    let toplevel = match toplevel {
+        Some(toplevel) => toplevel.to_string(),
+        None => match git(&["rev-parse", "--show-toplevel"]) {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => return not_a_git_repo(dir),
+        },
     };
 
     // A header so it's always obvious which folder the diff is reading from, and
     // a heads-up when that folder is only a subdirectory of a larger repo.
-    let mut header = tf(
-        "# Changes in {dir}\n",
-        &[("dir", &dir.display().to_string())],
-    );
+    let mut header = git_diff_placeholder(dir);
     let is_subdir = matches!(
         (dir.canonicalize(), Path::new(&toplevel).canonicalize()),
         (Ok(d), Ok(t)) if d != t
@@ -1419,23 +2345,142 @@ pub fn git_diff(dir: &Path) -> String {
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
 ///
 /// The server is this profile's own: `mxl` for the regular profile, or the
-/// isolated root's named socket.
-pub fn ensure_tmux_server(socket: Socket) {
+/// isolated root's named socket. Any other owner is left alone: the default
+/// server is the user's, and a named one a pane recorded belongs to another
+/// muxel version or profile, which muxel didn't start, so it would read as
+/// foreign below and have its environment rewritten.
+///
+/// The server's environment has to be muxel's too. A pane's program starts from
+/// the server's global environment, which tmux copies from whatever process
+/// started the server. If that wasn't muxel (say a pane killed the server and then
+/// ran `tmux new-session`), muxel gives the server the environment it would have
+/// started it with before opening a pane there. See
+/// `muxel_core::tmux::SERVER_MARK_ENV`.
+pub fn ensure_tmux_server(socket: &Socket) {
     let root = local_tmux_root();
-    let socket = SessionTarget::new("", Some(socket))
+    let socket = SessionTarget::new("", Some(socket.clone()))
         .for_profile(root.as_deref())
         .socket
         .unwrap();
-    if socket == Socket::Default {
+    if matches!(socket, Socket::Default | Socket::Named(_)) {
         return;
     }
-    let mut tmux = tmux_server_command(socket, root.as_deref());
+    ensure_tmux_server_on(&socket, root.as_deref());
+}
+
+/// [`ensure_tmux_server`] on `socket`, for the profile rooted at `root`.
+fn ensure_tmux_server_on(socket: &Socket, root: Option<&Path>) {
+    let mut tmux = tmux_server_command(socket.clone(), root);
     default_utf8_locale(&mut tmux);
-    let _ = tmux
+    let started = tmux
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|status| status.success());
+    if started && tmux_server_origin(socket) == Some(ServerOrigin::Foreign) {
+        reseed_tmux_server(socket, &command_environment(&tmux));
+    }
+}
+
+/// Who started the local server on `socket`, read from the marker that
+/// [`tmux_server_command`] gives a server it starts. Reading it also flags the
+/// marker removed, so no pane inherits it. `None` if tmux couldn't be run.
+fn tmux_server_origin(socket: &Socket) -> Option<ServerOrigin> {
+    let out = tmux_on(socket)
+        .args(muxel_core::tmux::server_origin_args())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(ServerOrigin::from_probe(&out.stdout))
+}
+
+/// The environment `cmd` runs with: this process's, plus `cmd`'s own changes.
+/// For [`tmux_server_command`] this is the global environment of a server it
+/// starts, apart from the `PWD` tmux adds.
+fn command_environment(cmd: &Command) -> Vec<(OsString, OsString)> {
+    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => env.insert(name.to_owned(), value.to_owned()),
+            None => env.remove(name),
+        };
+    }
+    env.into_iter().collect()
+}
+
+/// Give the local server on `socket`, which muxel didn't start, the environment
+/// muxel would have started it with (`wanted`), and mark it as muxel's either way,
+/// so this happens once per server. Blocking, best-effort, and logged. See
+/// `muxel_core::tmux::reseed_environment_script`.
+fn reseed_tmux_server(socket: &Socket, wanted: &[(OsString, OsString)]) {
+    let Ok(out) = tmux_on(socket)
+        .args(["show-environment", "-g"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let current = muxel_core::tmux::environment_names(&out.stdout);
+    let wanted: Vec<_> = wanted
+        .iter()
+        .map(|(name, value)| (name.as_encoded_bytes(), value.as_encoded_bytes()))
+        .collect();
+    let script = muxel_core::tmux::reseed_environment_script(&current, &wanted);
+    let server = String::from(socket.clone());
+    if tmux_source_stdin(socket, &script) {
+        let removed: Vec<_> = muxel_core::tmux::environment_extras(&current, &wanted)
+            .into_iter()
+            .map(String::from_utf8_lossy)
+            .collect();
+        let removed = if removed.is_empty() {
+            "nothing".to_string()
+        } else {
+            removed.join(", ")
+        };
+        muxel_store::append_event_log(&format!(
+            "tmux server {server} was not started by muxel; gave it muxel's environment (removed: {removed})"
+        ));
+    } else {
+        // Mark it anyway: another try on this server would fail the same way, on
+        // every pane.
+        let _ = tmux_on(socket)
+            .args(muxel_core::tmux::mark_server_args())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        muxel_store::append_event_log(&format!(
+            "tmux server {server} was not started by muxel; could not give it muxel's environment (needs tmux 3.1 or newer)"
+        ));
+    }
+}
+
+/// Run `script` on the local server on `socket` through `tmux source-file -`, so
+/// nothing in it lands in a command line. Whether tmux ran it.
+fn tmux_source_stdin(socket: &Socket, script: &str) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = tmux_on(socket)
+        .args(["source-file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // Dropping stdin ends the script. A tmux too old to read one from stdin looks
+    // for a file named `-` instead, and fails.
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(script.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| status.success()) && written
 }
 
 fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
@@ -1445,6 +2490,7 @@ fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
         .unwrap();
     let mut tmux = tmux_on(socket);
     tmux.args(muxel_core::tmux::start_server_args())
+        .env(muxel_core::tmux::SERVER_MARK_ENV, "1")
         .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV);
     if root.is_some() {
         // A server first started by an isolated GUI must not make its profile
@@ -1478,7 +2524,451 @@ mod tmux_server_environment_tests {
             for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
                 assert_eq!(removed.contains(&OsStr::new(key)), isolated);
             }
+            assert!(command.get_envs().any(|(key, value)| {
+                key == OsStr::new(muxel_core::tmux::SERVER_MARK_ENV) && value.is_some()
+            }));
         }
+    }
+}
+
+/// Against a real tmux, each on a socket of its own.
+#[cfg(all(test, unix))]
+mod tmux_server_origin_tests {
+    use super::{ensure_tmux_server_on, tmux_on, tmux_source_stdin};
+    use muxel_core::tmux::{SERVER_MARK_ENV, Socket};
+    use std::time::{Duration, Instant};
+
+    /// A server on a socket no other test or muxel uses, killed when dropped.
+    struct Server(Socket);
+
+    impl Server {
+        fn new() -> Self {
+            Self(Socket::Isolated(uuid::Uuid::new_v4().as_u128() as u64))
+        }
+
+        fn global(&self, name: &str) -> String {
+            let out = tmux_on(&self.0)
+                .args(["show-environment", "-g", name])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        }
+
+        /// `name` as a new pane's program sees it, or `None` if it isn't set.
+        fn pane_sees(&self, name: &str) -> Option<String> {
+            let file = std::env::temp_dir().join(format!("muxel-tmux-{}", uuid::Uuid::new_v4()));
+            let done = file.with_extension("done");
+            let script = r#"eval "test \${$1+set}" && eval "printf %s \"\$$1\"" > "$2"; : > "$3""#;
+            let status = tmux_on(&self.0)
+                .args(["new-session", "-d", "--", "sh", "-c", script, "sh", name])
+                .arg(&file)
+                .arg(&done)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done.exists() {
+                assert!(Instant::now() < deadline, "the pane never ran");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let value = std::fs::read(&file).ok();
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_file(&done);
+            value.map(|bytes| String::from_utf8(bytes).unwrap())
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = tmux_on(&self.0).arg("kill-server").output();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn a_server_muxel_starts_is_marked_without_panes_seeing_the_marker() {
+        let server = Server::new();
+        ensure_tmux_server_on(&server.0, None);
+        assert_eq!(
+            server.global(SERVER_MARK_ENV),
+            format!("-{SERVER_MARK_ENV}")
+        );
+        assert_eq!(server.pane_sees(SERVER_MARK_ENV), None);
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn a_server_something_else_started_gets_muxels_environment() {
+        let root = std::env::temp_dir().join(format!("muxel-tmux-{}", uuid::Uuid::new_v4()));
+        let storage = muxel_store::test_support::set_root(root.clone());
+        let server = Server::new();
+        let home = std::env::var("HOME").unwrap();
+        // What a pane that kills the server and runs `tmux new-session` leaves.
+        let started = tmux_on(&server.0)
+            .args(muxel_core::tmux::start_server_args())
+            .env("HOME", "/nonexistent")
+            .env("MUXEL_TEST_LEFTOVER", "1")
+            .status()
+            .unwrap();
+        assert!(started.success());
+        assert_eq!(server.pane_sees("HOME").as_deref(), Some("/nonexistent"));
+
+        ensure_tmux_server_on(&server.0, None);
+        assert_eq!(server.pane_sees("HOME"), Some(home));
+        assert_eq!(server.pane_sees("MUXEL_TEST_LEFTOVER"), None);
+        assert_eq!(
+            server.global(SERVER_MARK_ENV),
+            format!("-{SERVER_MARK_ENV}")
+        );
+        let log = std::fs::read_to_string(muxel_store::event_log_path().unwrap()).unwrap();
+        assert!(log.contains("was not started by muxel"), "{log}");
+        assert!(log.contains("MUXEL_TEST_LEFTOVER"), "{log}");
+        drop(storage);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn values_reach_panes_byte_for_byte() {
+        let server = Server::new();
+        ensure_tmux_server_on(&server.0, None);
+        let value = " $HOME ${HOME} ~ \"q\" 'q' \\ ; \\; #{pid} %if {} -x\nline\ttab é ";
+        let script = muxel_core::tmux::reseed_environment_script(
+            &[],
+            &[
+                (b"MUXEL_TEST_VALUE", value.as_bytes()),
+                (b"MUXEL_TEST_EMPTY", b""),
+            ],
+        );
+        assert!(tmux_source_stdin(&server.0, &script));
+        assert_eq!(server.pane_sees("MUXEL_TEST_VALUE").as_deref(), Some(value));
+        assert_eq!(server.pane_sees("MUXEL_TEST_EMPTY").as_deref(), Some(""));
+    }
+}
+
+/// The checked probes against a real tmux, each test on a throwaway named socket
+/// of its own (never the default server or muxel's), skipped without tmux.
+#[cfg(all(test, unix))]
+mod tmux_probe_tests {
+    use super::{
+        ensure_tmux_server, kill_tmux_session_confirmed, local_tmux_has_session_confirmed,
+        local_tmux_root, restart_local_tmux, run_local_tmux_input, run_tmux_input, tmux_on,
+    };
+    use muxel_core::tmux::{SERVER_MARK_ENV, SessionTarget, Socket};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A named server no other test or muxel uses, killed when dropped. It reads no
+    /// tmux config, so nothing of the user's runs in it.
+    struct Server(Socket);
+
+    impl Server {
+        /// `None` (the test skips) without a tmux to run, or under an isolated
+        /// profile, where `kill_tmux_session_confirmed` would aim at the profile's
+        /// own server instead.
+        fn new() -> Option<Self> {
+            if local_tmux_root().is_some() {
+                eprintln!("skipped: MUXEL_USER_DATA_DIR is set");
+                return None;
+            }
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("skipped: tmux is not installed");
+                return None;
+            }
+            let name = format!("mxltest-{}", uuid::Uuid::new_v4().simple());
+            Some(Self(Socket::Named(name)))
+        }
+
+        /// Start the server with `env` in its global environment, kept running
+        /// with no sessions (`exit-empty off`, as muxel's own), so a probe right
+        /// after the last session is killed can't catch it shutting down.
+        fn start_with(&self, env: &[(&str, &str)]) {
+            let status = tmux_on(&self.0)
+                .args(["-f", "/dev/null"])
+                .args(muxel_core::tmux::start_server_args())
+                .envs(env.iter().copied())
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "starting the server");
+        }
+
+        fn start(&self, sessions: &[&str]) {
+            self.start_with(&[]);
+            for session in sessions {
+                let status = tmux_on(&self.0)
+                    .args(["new-session", "-d", "-s", session, "sleep", "600"])
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "starting {session}");
+            }
+        }
+
+        fn has(&self, session: &str) -> bool {
+            local_tmux_has_session_confirmed(&self.0, session, deadline()).unwrap()
+        }
+
+        fn target(&self, session: &str) -> SessionTarget {
+            SessionTarget::new(session, Some(self.0.clone()))
+        }
+
+        /// `name` in the server's global environment, as `show-environment -g`
+        /// prints it, or `None` if it isn't there.
+        fn global(&self, name: &str) -> Option<String> {
+            let out = tmux_on(&self.0)
+                .args(["show-environment", "-g", name])
+                .output()
+                .unwrap();
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        }
+
+        /// Kill the server and wait until it has gone: while it shuts down, a
+        /// client can still reach it and get "lost server". Whether it went.
+        fn stop(&self) -> bool {
+            let _ = tmux_on(&self.0).arg("kill-server").output();
+            let until = deadline();
+            loop {
+                let gone = tmux_on(&self.0)
+                    .arg("list-sessions")
+                    .output()
+                    .is_ok_and(|out| {
+                        muxel_core::tmux::confirmed_no_server(&String::from_utf8_lossy(&out.stderr))
+                    });
+                if gone || Instant::now() >= until {
+                    return gone;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop();
+            // tmux leaves the socket file behind; it is this test's alone.
+            let dir = std::env::var_os("TMUX_TMPDIR")
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| "/tmp".into());
+            // SAFETY: `getuid` has no preconditions and cannot fail.
+            let uid = unsafe { libc::getuid() };
+            let socket = std::path::Path::new(&dir)
+                .join(format!("tmux-{uid}"))
+                .join(self.0.name().as_ref());
+            let _ = std::fs::remove_file(socket);
+        }
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Every launch of a pane on Default goes through these answers, so tmux's own
+    /// wording for "no such session" and "no server" must read as absent, and
+    /// only the exact name as present.
+    #[test]
+    fn has_session_reads_a_real_servers_answers() {
+        let Some(server) = Server::new() else {
+            return;
+        };
+        assert!(!server.has("work"), "no server yet");
+        server.start(&[]);
+        assert!(!server.has("work"), "a server with no sessions");
+        server.start(&["work", "work two"]);
+        assert!(server.has("work"));
+        assert!(server.has("work two"));
+        for absent in ["wor", "work2", "other"] {
+            assert!(!server.has(absent), "{absent}");
+        }
+        assert!(server.stop());
+        assert!(!server.has("work"), "server gone");
+    }
+
+    #[test]
+    fn a_confirmed_kill_stops_only_its_session() {
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start(&["work", "other"]);
+        let target = server.target("work");
+        assert_eq!(
+            kill_tmux_session_confirmed(&target, deadline()).unwrap(),
+            target
+        );
+        assert!(!server.has("work"));
+        assert!(server.has("other"));
+        // Already gone, and then no server at all: both are a finished kill.
+        assert_eq!(
+            kill_tmux_session_confirmed(&target, deadline()).unwrap(),
+            target
+        );
+        assert!(server.stop());
+        assert_eq!(
+            kill_tmux_session_confirmed(&target, deadline()).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn a_local_restart_kills_only_after_saving_its_owner() {
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start(&["work"]);
+        let target = server.target("work");
+        let refused = restart_local_tmux(&target, deadline(), |_| anyhow::bail!("save failed"));
+        assert!(refused.is_err());
+        assert!(server.has("work"), "a failed save leaves the agent running");
+
+        let mut saved = None;
+        let (owner, next) = restart_local_tmux(&target, deadline(), |owner| {
+            saved = Some(owner.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(saved, Some(target.clone()));
+        assert_eq!((owner, next), (target.clone(), target));
+        assert!(!server.has("work"));
+    }
+
+    /// A pane's recorded named owner is another muxel version's or profile's
+    /// server, which this muxel didn't start: muxel must not take it over and
+    /// give it its own environment.
+    #[test]
+    fn a_named_owners_server_keeps_its_own_environment() {
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start_with(&[("MUXEL_TEST_FOREIGN", "1")]);
+        ensure_tmux_server(&server.0);
+        assert_eq!(
+            server.global("MUXEL_TEST_FOREIGN").as_deref(),
+            Some("MUXEL_TEST_FOREIGN=1")
+        );
+        assert_eq!(
+            server.global(SERVER_MARK_ENV),
+            None,
+            "not marked as muxel's"
+        );
+    }
+
+    /// A local pane's ctl input runner, on a real server: it finds the pane,
+    /// pastes text it is given on standard input (never in an argument, where
+    /// tmux would split `;` into another command), and reports tmux's refusal
+    /// as a failed command rather than as an error starting it.
+    #[test]
+    fn ctl_input_runs_on_the_panes_server_with_its_text_on_stdin() {
+        use muxel_core::control::Key;
+        use muxel_core::tmux;
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start_with(&[]);
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recv = dir.join("agent.bin");
+        let agent = format!("stty raw -echo; exec cat > '{}'", recv.display());
+        let status = tmux_on(&server.0)
+            .args(["new-session", "-d", "-s", "agent", "sh", "-c", &agent])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !recv.exists() {
+            assert!(Instant::now() < until, "the agent never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(&server.0, &tmux::control_pane_args("agent"), None).unwrap();
+        let pane = tmux::parse_control_pane("agent", &String::from_utf8_lossy(&out.stdout), true)
+            .expect("the agent's pane");
+        let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
+        let text = "it's; $HOME `id` \"x\" ; display-message boom";
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_paste_args(&buffer, &pane, true),
+            Some(text.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args(&pane, &[Key::Char(';'), Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = format!("{text};\r");
+        let until = Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&recv).unwrap_or_default() != expected.as_bytes() {
+            assert!(
+                Instant::now() < until,
+                "the agent got {:?}",
+                String::from_utf8_lossy(&std::fs::read(&recv).unwrap_or_default())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args("%999", &[Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(!out.status.success(), "a missing pane is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ctl input command answers within its deadline, even when the child
+    /// exits but leaves something holding its output open, or never exits.
+    #[test]
+    fn ctl_input_commands_answer_within_their_deadline() {
+        let within = Duration::from_millis(500);
+        let started = Instant::now();
+        let mut lingering = Command::new("sh");
+        lingering.args(["-c", "sleep 30 & echo started"]);
+        let error = run_tmux_input(lingering, None, false, within)
+            .expect_err("a reply still open at the deadline is unanswered");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "cat >/dev/null; sleep 30"]);
+        let error = run_tmux_input(stuck, Some(b"never read to the end"), false, within)
+            .expect_err("a command that never exits is unanswered");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "cat; echo done >&2"]);
+        let out = run_tmux_input(quick, Some(b"echoed"), false, within).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"echoed");
+        assert_eq!(out.stderr, b"done\n");
     }
 }
 
@@ -1534,7 +3024,7 @@ fn cached_tmux_session_env_support(
 ///
 /// Only this profile's own server: the default one is the user's.
 pub fn restore_tmux_exit_empty() {
-    let _ = tmux_on(local_tmux_sockets()[0])
+    let _ = tmux_on(&local_tmux_sockets()[0])
         .args(muxel_core::tmux::restore_exit_empty_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1544,9 +3034,9 @@ pub fn restore_tmux_exit_empty() {
 
 /// `tmux` on `socket` — muxel's own server, or the default one (see
 /// `muxel_core::tmux::Socket`).
-fn tmux_on(socket: Socket) -> Command {
+fn tmux_on(socket: impl std::borrow::Borrow<Socket>) -> Command {
     let mut cmd = command("tmux");
-    cmd.args(socket.args());
+    cmd.args(socket.borrow().args());
     cmd
 }
 
@@ -1556,7 +3046,7 @@ fn local_tmux_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn local_tmux_sockets() -> Vec<Socket> {
+pub(crate) fn local_tmux_sockets() -> Vec<Socket> {
     Socket::local(local_tmux_root().as_deref())
 }
 
@@ -1591,7 +3081,235 @@ pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
     let session = profile_tmux_target(session);
     session
         .socket
+        .clone()
         .unwrap_or_else(|| Socket::locate(|socket| local_tmux_has_session(socket, &session.name)))
+}
+
+/// The launch target may move off Default only after both exact-name probes
+/// answer. A Private namesake belongs to somebody else and is never adopted.
+pub fn local_tmux_launch_target(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    local_tmux_launch_target_with(&session, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
+}
+
+/// [`local_tmux_launch_target`] on `probe`, an exact-name `has-session` on one
+/// server. With no tmux to run ([`tmux_missing`]) nothing can say where the
+/// session lives or that a move off Default is safe, so the recorded binding is
+/// kept: the launch then fails on it, as it always did without tmux.
+fn local_tmux_launch_target_with(
+    session: &SessionTarget,
+    mut probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    let target = resolve_tmux_owner_with(session, &mut probe)
+        .and_then(|owner| confirmed_tmux_respawn_target(&owner, &mut probe));
+    match target {
+        Err(error) if tmux_missing(&error) => Ok(session.clone()),
+        target => target,
+    }
+}
+
+/// `session` with its owner resolved: the recorded one, or for legacy metadata
+/// the server `probe` finds it on. A failed probe is an error, never an empty
+/// server.
+fn resolve_tmux_owner_with(
+    session: &SessionTarget,
+    mut probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    let socket = match &session.socket {
+        Some(socket) => socket.clone(),
+        None => Socket::try_locate(|socket| probe(&socket))?,
+    };
+    Ok(SessionTarget::new(session.name.clone(), Some(socket)))
+}
+
+pub(crate) fn confirmed_tmux_respawn_target(
+    session: &SessionTarget,
+    probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    session.for_respawn(probe)?.with_context(|| {
+        t("A session with this name is already running on another tmux server, so this pane was not started. It attaches by itself if another muxel sharing this project's layout assigns that session to it; otherwise stop that session, then restart the pane.")
+    })
+}
+
+fn local_tmux_has_session_confirmed(
+    socket: &Socket,
+    session: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let mut cmd = tmux_on(socket);
+    cmd.args(muxel_core::tmux::has_session_args(session));
+    has_session_reply(cmd, session, deadline)
+}
+
+/// Whether `error` says tmux itself couldn't be run: not installed, or not on
+/// `PATH`. Then a kill has nothing to stop, but no probe has answered either: a
+/// tmux muxel can't find (one outside the `PATH` it was started with) may still
+/// run the session, so this never authorizes a change of owner.
+fn tmux_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// [`local_tmux_has_session_confirmed`] for a prepared `has-session` command.
+/// No tmux to run is an error ([`tmux_missing`]), not an absent session.
+fn has_session_reply(cmd: Command, session: &str, deadline: Instant) -> Result<bool> {
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let error = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(1) && muxel_core::tmux::has_session_absent(&error) {
+        return Ok(false);
+    }
+    bail!("couldn't query tmux session “{session}”: {}", error.trim())
+}
+
+/// Collect a bounded command reply within one deadline, killing and reaping an
+/// overdue child. Both pipes drain concurrently; oversized replies fail closed.
+fn run_tmux_output_until(cmd: Command, deadline: Instant) -> Result<std::process::Output> {
+    run_tmux_output_with(cmd, deadline, &GitEnv::production())
+}
+
+fn run_tmux_output_with(
+    mut cmd: Command,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    fn capture(
+        pipe: impl Read + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            const MAX_REPLY: u64 = 1024 * 1024;
+            let mut bytes = Vec::new();
+            let reply = pipe
+                .take(MAX_REPLY + 1)
+                .read_to_end(&mut bytes)
+                .and_then(|_| {
+                    if bytes.len() as u64 > MAX_REPLY {
+                        Err(std::io::Error::other("tmux probe reply is too large"))
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = tx.send(reply);
+        });
+        rx
+    }
+    if Instant::now() >= deadline {
+        bail!("tmux probe timed out");
+    }
+    cmd.env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = lifecycle.spawn(&mut cmd).context("starting tmux probe")?;
+    let stdout = capture(child.child.stdout.take().context("tmux probe stdout")?);
+    let stderr = capture(child.child.stderr.take().context("tmux probe stderr")?);
+    let (child, status) = lifecycle.wait_until(child, deadline);
+    lifecycle.reap(child);
+    let status = status.context("tmux probe timed out")?;
+    let stdout = stdout.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+    let stderr = stderr.recv_timeout(deadline.saturating_duration_since(Instant::now()))??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Complete, checked inventory for a Default-owner launch. Partial output or an
+/// inaccessible server cannot authorize migration to another socket.
+pub fn remote_tmux_launch_target(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    instance: uuid::Uuid,
+    require_absent: bool,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let RepoLoc::Remote(conn) = loc else {
+        bail!("not a remote project")
+    };
+    let (session, sockets) = tmux_launch_inventory(session, local_tmux_root().as_deref());
+    let out = remote_session_names(conn, &sockets, deadline)?;
+    // A session still running on Default is reattached there, on Default's answer
+    // alone. Only moving it off Default needs every server's checked answer.
+    if ssh::still_on_default(
+        &ssh::checked_session_listings_on(&out, &sockets),
+        &sockets,
+        &session,
+    ) {
+        if require_absent {
+            bail!("tmux session “{session}” is still running");
+        }
+        return Ok(session);
+    }
+    let sessions = ssh::parse_session_listings_for_migration_on(&out, &sockets)
+        .context("couldn't confirm the tmux servers queried")?;
+    let resolved = muxel_core::tmux::ClosedSession {
+        name: session.name.clone(),
+        socket: session.socket.clone(),
+        instance,
+        local_close_token: None,
+        worktree: Default::default(),
+    }
+    .resolve_owner(&sessions, profile_tmux_socket())
+    .target();
+    if require_absent
+        && sessions
+            .iter()
+            .any(|row| Some(&row.socket) == session.socket.as_ref() && row.name == resolved.name)
+    {
+        bail!("tmux session “{session}” is still running");
+    }
+    confirmed_tmux_respawn_target(&resolved, |socket| {
+        Ok(sessions
+            .iter()
+            .any(|row| &row.socket == socket && row.name == resolved.name))
+    })
+}
+
+/// [`ssh::list_session_names_command_on`] `sockets` on the host, within `deadline`.
+fn remote_session_names(
+    conn: &RemoteConn,
+    sockets: &[Socket],
+    deadline: Instant,
+) -> Result<String> {
+    let command = format!(
+        "export LC_ALL=C; {}",
+        ssh::list_session_names_command_on(sockets)
+    );
+    let out = run_tmux_output_until(remote_ssh_command(conn, command), deadline)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn tmux_launch_inventory(
+    session: &SessionTarget,
+    root: Option<&Path>,
+) -> (SessionTarget, Vec<Socket>) {
+    let session = session.for_profile(root);
+    let sockets = match &session.socket {
+        Some(Socket::Named(_) | Socket::Isolated(_)) => session.socket.as_slice().to_vec(),
+        _ => Socket::local(root),
+    };
+    (session, sockets)
 }
 
 /// Whether a tmux session is still alive, on this profile's servers (exact-match target,
@@ -1599,8 +3317,8 @@ pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
 /// a pane that just died.
 pub fn tmux_session_exists(session: &SessionTarget) -> bool {
     let session = profile_tmux_target(session);
-    match session.socket {
-        Some(socket) => local_tmux_has_session(socket, &session.name),
+    match &session.socket {
+        Some(socket) => local_tmux_has_session(socket.clone(), &session.name),
         None => Socket::BOTH
             .into_iter()
             .any(|socket| local_tmux_has_session(socket, &session.name)),
@@ -1694,6 +3412,209 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
     muxel_core::import::conversation_summary(&String::from_utf8_lossy(&head))
 }
 
+/// Read the number of clients attached to this exact tmux session.
+/// Blocking, for background callers only. Socket discovery and the query share
+/// a two-second deadline; unavailable sessions and invalid replies are errors.
+pub fn attached_tmux_clients(loc: &RepoLoc, target: &SessionTarget) -> Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut target = profile_tmux_target(target);
+    if matches!(loc, RepoLoc::Local(_)) {
+        target = resolve_tmux_owner_with(&target, |socket| {
+            local_tmux_has_session_confirmed(socket, &target.name, deadline)
+        })?;
+    }
+    let cmd = attached_tmux_clients_command(loc, &target)?;
+    let out = run_tmux_output_until(cmd, deadline)?;
+    parse_attached_tmux_clients(&target.name, out.status.success(), &out.stdout, &out.stderr)
+}
+
+fn attached_tmux_clients_command(loc: &RepoLoc, target: &SessionTarget) -> Result<Command> {
+    // Include the session name because display-message can succeed with an
+    // empty/default format context when the requested target has disappeared.
+    let args = vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        format!("={}:", target.name),
+        "#{session_name}:#{session_attached}".into(),
+    ];
+    let mut cmd = match loc {
+        RepoLoc::Local(_) => {
+            let socket = target
+                .socket
+                .as_ref()
+                .context("tmux session owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(&args);
+            cmd
+        }
+        RepoLoc::Remote(conn) => {
+            if conn.host.os.is_windows() {
+                bail!("tmux is unavailable on Windows remote hosts");
+            }
+            remote_ssh_command(conn, ssh::session_tmux_command(target, &args))
+        }
+    };
+    cmd.stdin(Stdio::null());
+    Ok(cmd)
+}
+
+fn parse_attached_tmux_clients(
+    session: &str,
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<usize> {
+    if !success {
+        bail!(
+            "couldn't query attached tmux clients: {}",
+            String::from_utf8_lossy(stderr).trim()
+        );
+    }
+    let reply = std::str::from_utf8(stdout).context("invalid tmux client count encoding")?;
+    let reply = reply.strip_suffix('\n').unwrap_or(reply);
+    let reply = reply.strip_suffix('\r').unwrap_or(reply);
+    let count = reply
+        .strip_prefix(session)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+        .context("tmux client count did not identify the requested session")?;
+    count.parse().context("invalid tmux client count")
+}
+
+#[cfg(test)]
+mod attached_tmux_client_tests {
+    use super::{RepoLoc, attached_tmux_clients_command, parse_attached_tmux_clients};
+    use muxel_core::tmux::{SessionTarget, Socket};
+    use muxel_core::{RemoteHost, RemoteOs, ssh};
+    use std::path::Path;
+
+    #[test]
+    fn attached_count_accepts_zero_one_and_multiple_clients() {
+        for count in [0, 1, 2, 23, usize::MAX] {
+            for ending in ["", "\n", "\r\n"] {
+                let reply = format!("work :{count}{ending}");
+                assert_eq!(
+                    parse_attached_tmux_clients("work ", true, reply.as_bytes(), b"").unwrap(),
+                    count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attached_count_rejects_missing_wrong_or_malformed_session_reply() {
+        for reply in [
+            "",
+            "0",
+            "work2:0",
+            "work:",
+            "work:-1",
+            "work:+1",
+            "work:1 2",
+            "work: 1",
+            "work:1\nwork:0",
+            "work:1\n\n",
+            "work:1.0",
+            "work:999999999999999999999999999999999999999999999999",
+        ] {
+            assert!(parse_attached_tmux_clients("work", true, reply.as_bytes(), b"").is_err());
+        }
+        assert!(parse_attached_tmux_clients("work", true, b"work:\xff", b"").is_err());
+        assert!(parse_attached_tmux_clients("work", false, b"work:0\n", b"no server").is_err());
+    }
+
+    #[test]
+    fn attached_count_local_command_uses_exact_target_and_recorded_socket() {
+        let target = SessionTarget::new("work '名", Some(Socket::Named("peer 'socket".into())));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        assert_eq!(cmd.get_program(), "tmux");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "peer 'socket",
+                "display-message",
+                "-p",
+                "-t",
+                "=work '名:",
+                "#{session_name}:#{session_attached}",
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_count_isolated_command_never_selects_regular_sockets() {
+        let target =
+            SessionTarget::new("work", None).for_profile(Some(Path::new("/isolated-count")));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(&args[..2], target.socket.as_ref().unwrap().args());
+        assert!(!args.contains(&"mxl"));
+        assert!(
+            attached_tmux_clients_command(
+                &RepoLoc::Local("/unused".into()),
+                &SessionTarget::new("work", None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attached_count_remote_command_quotes_session_and_socket_and_reuses_connection() {
+        let target =
+            SessionTarget::new("work '名;echo", Some(Socket::Named("peer 'socket".into())));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        assert_eq!(cmd.get_program(), "ssh");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args.contains(&"ControlPath=/control-count"),
+            cfg!(not(target_os = "windows"))
+        );
+        assert!(args.contains(&"BatchMode=yes"));
+        let script = args.last().unwrap();
+        assert!(script.contains(&ssh::sh_quote("=work '名;echo:")));
+        assert!(script.contains(&ssh::sh_quote("peer 'socket")));
+        assert!(script.ends_with("'#{session_name}:#{session_attached}'"));
+    }
+
+    #[test]
+    fn attached_count_refuses_windows_remote_hosts() {
+        let mut host = RemoteHost::new("test", "test.example");
+        host.os = RemoteOs::Windows;
+        let loc = RepoLoc::remote(host, "C:/unused".into(), "/control-count".into(), None);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(attached_tmux_clients_command(&loc, &target).is_err());
+    }
+
+    #[test]
+    fn attached_count_isolated_remote_query_has_no_legacy_socket_probe() {
+        let target = SessionTarget::new("work", Some(Socket::Default))
+            .for_profile(Some(Path::new("/isolated-count")));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        let script = args.last().unwrap().to_str().unwrap();
+        let socket_args = target.socket.as_ref().unwrap().args();
+        assert!(script.contains(&socket_args[1]));
+        assert!(!script.contains("has-session"));
+    }
+}
+
 /// Run `tmux <args>` on the server holding `session`, where its project's sessions
 /// live: on this machine, or on its SSH host (reusing the host's ControlMaster).
 /// `None` for a Windows host, which has no tmux.
@@ -1724,14 +3645,265 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
     Some(cmd)
 }
 
+/// How long one outside-control tmux command may take before it counts as
+/// unanswered.
+const TMUX_INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One outside-control input command (`muxel_terminal::TmuxInputRoute`) on the
+/// local tmux server `socket` a pane's client attached to, with `stdin` as its
+/// standard input. Blocking and bounded.
+pub fn run_local_tmux_input(
+    socket: &Socket,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = tmux_on(socket.clone());
+    cmd.args(args);
+    run_tmux_input(cmd, stdin, false, TMUX_INPUT_DEADLINE)
+}
+
+/// The same on a remote pane's host, over the host's commands master, on the
+/// server holding `session` (as the shared claim is read and written). The
+/// input text travels on ssh's standard input, never in the command line.
+pub fn run_remote_tmux_input(
+    conn: &RemoteConn,
+    session: &SessionTarget,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    if conn.host.os.is_windows() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a Windows host has no tmux",
+        ));
+    }
+    let cmd = remote_ssh_command(conn, ssh::session_tmux_command(session, args));
+    run_tmux_input(cmd, stdin, true, TMUX_INPUT_DEADLINE)
+}
+
+fn run_tmux_input(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    over_ssh: bool,
+    within: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write as _};
+    use std::sync::mpsc::Receiver;
+    // Each pipe is read on its own thread and collected within the one
+    // deadline: a process the child left behind (a backgrounded ssh master,
+    // say) can hold a pipe open after the child exits, and must not hold the
+    // caller with it. A thread left reading ends when that pipe closes.
+    fn drain(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+        rx
+    }
+    let unanswered = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no answer within {} seconds", within.as_secs_f32()),
+        )
+    };
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    // Written from its own thread, so a child that never reads can't hold this
+    // one past the deadline. It ends when the child's end of the pipe closes,
+    // and nothing waits for it.
+    if let Some((data, mut pipe)) = stdin.zip(child.stdin.take()) {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&data);
+        });
+    }
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+    let deadline = Instant::now() + within;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                // The whole process group on Unix (ssh under `sshpass` sits in
+                // its own session on sshpass's pty and is hung up when sshpass
+                // dies), the whole tree on Windows.
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(unanswered());
+            }
+        }
+    };
+    let collect = |pipe: Option<Receiver<Vec<u8>>>| match pipe {
+        Some(pipe) => pipe
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| unanswered()),
+        None => Ok(Vec::new()),
+    };
+    let stdout = collect(stdout)?;
+    let stderr = collect(stderr)?;
+    // ssh exits 255 for its own failures, which can come after the remote
+    // command ran.
+    if over_ssh && status.code() == Some(255) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("ssh failed: {}", String::from_utf8_lossy(&stderr).trim()),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
-/// agent does — Settings → Grok Bot's Test.
+/// agent does — Settings → Outside control's Test.
 pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
     command(exe)
         .arg("ctl")
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
+}
+
+/// The title of local `session`'s active pane (`#{pane_title}`): what its
+/// program last set with OSC 0/2. A tmux client forwards none of those titles
+/// unless `set-titles` is on, which muxel leaves to the user's own tmux config.
+/// Blocking and bounded to two seconds; `None` when the session or server is
+/// gone. Never `capture-pane`.
+pub fn tmux_pane_title(socket: &Socket, session: &str) -> Option<String> {
+    pane_title_from(tmux_on(socket), session)
+}
+
+fn pane_title_from(mut tmux: Command, session: &str) -> Option<String> {
+    use std::io::Read as _;
+    tmux.args(muxel_core::tmux::pane_title_args(session))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        tmux.process_group(0);
+    }
+    let mut child = tmux.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status
+        .success()
+        .then(|| muxel_core::tmux::parse_pane_title(session, &out))
+        .flatten()
+}
+
+/// Against a real tmux on a throwaway socket that no muxel profile uses.
+/// Skipped where tmux isn't installed.
+#[cfg(all(test, unix))]
+mod pane_title_tests {
+    use super::pane_title_from;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct Server(String);
+
+    impl Server {
+        fn tmux(&self) -> Command {
+            let mut tmux = Command::new("tmux");
+            tmux.args(["-L", &self.0, "-f", "/dev/null"])
+                .env_remove("TMUX");
+            tmux
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let socket = self
+                .tmux()
+                .args(["display-message", "-p", "#{socket_path}"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+                .filter(|path| path.ends_with(&self.0));
+            let _ = self.tmux().arg("kill-server").output();
+            if let Some(socket) = socket {
+                let _ = std::fs::remove_file(socket);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tmux_panes_program_title_is_read_without_set_titles() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let server = Server(format!("mxltest-{}", uuid::Uuid::new_v4().simple()));
+        let session = "muxel_title_12345678";
+        let status = server
+            .tmux()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "--",
+            ])
+            .args([
+                "sh",
+                "-c",
+                r"printf '\033]2;scratch | Ready\033\\'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let title = pane_title_from(server.tmux(), session);
+            if title.as_deref() == Some("scratch | Ready") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane title never arrived: {title:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The exact-match target never reads a namesake, and a missing
+        // session or server is no title rather than a stale one.
+        assert_eq!(pane_title_from(server.tmux(), "muxel_title_1234567"), None);
+        let gone = Server(format!("mxltest-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(pane_title_from(gone.tmux(), session), None);
+    }
 }
 
 /// A tmux session's user option (`@name`), wherever the session lives. `None`
@@ -1742,28 +3914,199 @@ pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Opti
         session,
         &muxel_core::tmux::show_option_args(&session.name, option),
     )?;
+    option_value(&out)
+}
+
+/// A `show-options -qv` reply's value: `None` when the option is unset or the
+/// command failed.
+fn option_value(out: &std::process::Output) -> Option<String> {
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
-/// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(
+/// How `session`'s tmux server can publish a claim. Probed once per host and
+/// remembered for this process; a probe that can't run is not remembered, and
+/// the conditional write it falls back to fails the same way an unreachable
+/// tmux always has, leaving the send unclaimed.
+pub fn tmux_claim_write(loc: &RepoLoc, session: &SessionTarget) -> ClaimWrite {
+    static HOSTS: std::sync::OnceLock<Mutex<HashMap<String, ClaimWrite>>> =
+        std::sync::OnceLock::new();
+    claim_write_cached(HOSTS.get_or_init(Default::default), tmux_host(loc), || {
+        let probe = muxel_core::tmux::match_format_probe_args(&session.name);
+        let out = tmux_at(loc, session, &probe)?;
+        out.status.success().then(|| {
+            muxel_core::tmux::claim_write_from_probe(&String::from_utf8_lossy(&out.stdout))
+        })
+    })
+}
+
+/// The machine whose tmux runs `loc`'s sessions. Local panes all use this
+/// machine's tmux; a remote one is the SSH login's.
+fn tmux_host(loc: &RepoLoc) -> String {
+    match loc {
+        RepoLoc::Local(_) => "local".into(),
+        RepoLoc::Remote(c) => format!(
+            "ssh:{}@{}:{}",
+            c.host.user,
+            c.host.hostname,
+            c.host.port.unwrap_or(22)
+        ),
+    }
+}
+
+fn claim_write_cached(
+    hosts: &Mutex<HashMap<String, ClaimWrite>>,
+    host: String,
+    probe: impl FnOnce() -> Option<ClaimWrite>,
+) -> ClaimWrite {
+    if let Some(known) = hosts.lock().unwrap_or_else(|e| e.into_inner()).get(&host) {
+        return *known;
+    }
+    // No lock across the probe: it may wait on SSH. Racing first probes of
+    // one host learn the same answer.
+    let Some(found) = probe() else {
+        return ClaimWrite::Conditional;
+    };
+    hosts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(host, found);
+    found
+}
+
+/// Publish a claim through one tmux server command, conditionally where the
+/// server can compare it with the pre-paste observation. A false `if-shell`
+/// branch exits cleanly; the caller reads the option back to learn whether its
+/// nonce won.
+pub fn set_tmux_claim(
     loc: &RepoLoc,
     session: &SessionTarget,
     option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
     value: &str,
 ) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(&session.name, option, value);
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
     let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
     if !out.status.success() {
         bail!(
-            "tmux set-option failed: {}",
+            "tmux claim set-option failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+fn claim_write_args(
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Vec<String>> {
+    muxel_core::tmux::claim_write_args(&session.name, option, write, expected_pattern, value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote the tmux claim safely"))
+}
+
+/// Publish a forced send's claim between its paste and Enter, then read it
+/// back. Both commands share one two-second deadline, as claim cleanup does,
+/// so an SSH stall withholds Enter within that bound rather than holding the
+/// pasted prompt for the connect timeout. Returns the value read back.
+pub fn publish_tmux_claim_bounded(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
+    let target = BoundedTmux::find(loc, session, deadline, &lifecycle)?;
+    let show = muxel_core::tmux::show_option_args(&target.session.name, option);
+    publish_claim_until(
+        target.command(&args)?,
+        || target.command(&show),
+        deadline,
+        &lifecycle,
+    )
+}
+
+/// [`publish_tmux_claim_bounded`] for prepared commands: `read` runs only after
+/// `write` succeeds, and both stop at `deadline`.
+fn publish_claim_until(
+    write: Command,
+    read: impl FnOnce() -> Result<Command>,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<Option<String>> {
+    run_claim_command(write, deadline, lifecycle)?;
+    let out = run_tmux_output_with(read()?, deadline, lifecycle)?;
+    Ok(option_value(&out))
+}
+
+/// Replace an unreadable or uncomparable claim only if its raw bytes have not
+/// changed. A unique temporary option holds the expected value outside the
+/// command string, where arbitrary option bytes cannot become tmux syntax.
+pub fn normalize_tmux_option_if_raw(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    raw: &str,
+    normalized: &str,
+) -> Result<()> {
+    let temp = format!("@muxel-ctl-expected-{}", uuid::Uuid::new_v4().simple());
+    let set = muxel_core::tmux::set_option_args(&session.name, &temp, raw);
+    let Some(set_out) = tmux_at(loc, session, &set) else {
+        bail!("tmux isn't reachable for session “{session}”");
+    };
+    if !set_out.status.success() {
+        bail!(
+            "tmux could not prepare claim repair: {}",
+            String::from_utf8_lossy(&set_out.stderr).trim()
+        );
+    }
+    let update =
+        muxel_core::tmux::set_option_if_option_args(&session.name, option, &temp, normalized)
+            .ok_or_else(|| anyhow::anyhow!("can't prepare conditional tmux claim repair safely"))?;
+    let updated = tmux_at(loc, session, &update);
+    let cleanup = vec![
+        "set-option".to_string(),
+        "-qu".to_string(),
+        "-t".to_string(),
+        format!("={}:", session.name),
+        temp,
+    ];
+    if tmux_at(loc, session, &cleanup).is_none_or(|out| !out.status.success()) {
+        log::warn!("muxel ctl: couldn't clean temporary claim comparison option for {session}");
+    }
+    let Some(out) = updated else {
+        bail!("tmux isn't reachable for session “{session}” during claim repair");
+    };
+    if !out.status.success() {
+        bail!(
+            "tmux conditional claim repair failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Restore the displaced claim after a pre-paste refusal with the same bounded
+/// conditional command used by claim cleanup.
+pub fn restore_tmux_option_if(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    pattern: &str,
+    value: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::set_option_if_args(&session.name, option, Some(pattern), value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim restoration safely"))?;
+    run_bounded_tmux_claim_command(loc, session, args)
 }
 
 /// Give claim cleanup two seconds before terminating its command.
@@ -1773,26 +4116,73 @@ pub fn unset_tmux_option_if(
     option: &str,
     pattern: &str,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let lifecycle = GitEnv::production();
-    let session = profile_tmux_target(session);
     let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
-    let cmd = match loc {
-        RepoLoc::Local(_) => {
-            let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {
+    run_bounded_tmux_claim_command(loc, session, args)
+}
+
+/// How long a claim command may run where it can hold up typing: cleanup and
+/// restore after a send, and a forced send's publish between paste and Enter.
+const CLAIM_COMMAND_BOUND: Duration = Duration::from_secs(2);
+
+fn run_bounded_tmux_claim_command(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    args: Vec<String>,
+) -> Result<()> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let cmd = BoundedTmux::find(loc, session, deadline, &lifecycle)?.command(&args)?;
+    run_claim_command(cmd, deadline, &lifecycle)
+}
+
+/// Where bounded claim commands run: a local socket found within the
+/// deadline, or the session's SSH host.
+struct BoundedTmux<'a> {
+    loc: &'a RepoLoc,
+    session: SessionTarget,
+    socket: Option<Socket>,
+}
+
+impl<'a> BoundedTmux<'a> {
+    fn find(
+        loc: &'a RepoLoc,
+        session: &SessionTarget,
+        deadline: Instant,
+        lifecycle: &GitEnv,
+    ) -> Result<Self> {
+        let session = profile_tmux_target(session);
+        let socket = match loc {
+            RepoLoc::Local(_) => Some(bounded_tmux_socket(
+                &session,
+                deadline,
+                lifecycle,
+                |socket| {
+                    let mut cmd = tmux_on(socket);
+                    cmd.args(muxel_core::tmux::has_session_args(&session.name));
+                    cmd
+                },
+            )?),
+            RepoLoc::Remote(_) => None,
+        };
+        Ok(Self {
+            loc,
+            session,
+            socket,
+        })
+    }
+
+    fn command(&self, args: &[String]) -> Result<Command> {
+        match &self.socket {
+            Some(socket) => {
                 let mut cmd = tmux_on(socket);
-                cmd.args(muxel_core::tmux::has_session_args(&session.name));
-                cmd
-            })?;
-            let mut cmd = tmux_on(socket);
-            cmd.args(args);
-            cmd
+                cmd.args(args);
+                Ok(cmd)
+            }
+            None => tmux_command_at(self.loc, &self.session, args)
+                .ok_or_else(|| anyhow::anyhow!("tmux is unavailable")),
         }
-        RepoLoc::Remote(_) => tmux_command_at(loc, &session, &args)
-            .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?,
-    };
-    run_claim_cleanup(cmd, deadline, &lifecycle)
+    }
 }
 
 fn bounded_tmux_socket(
@@ -1801,8 +4191,8 @@ fn bounded_tmux_socket(
     lifecycle: &GitEnv,
     mut probe: impl FnMut(Socket) -> Command,
 ) -> Result<Socket> {
-    if let Some(socket) = session.socket {
-        return Ok(socket);
+    if let Some(socket) = &session.socket {
+        return Ok(socket.clone());
     }
     Socket::try_locate(|socket| {
         let status = run_tmux_until(probe(socket), deadline, lifecycle)?
@@ -1811,11 +4201,11 @@ fn bounded_tmux_socket(
     })
 }
 
-fn run_claim_cleanup(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
+fn run_claim_command(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
     match run_tmux_until(cmd, deadline, lifecycle)? {
         Some(status) if status.success() => Ok(()),
-        Some(status) => bail!("tmux claim cleanup failed: {status}"),
-        None => bail!("tmux claim cleanup timed out"),
+        Some(status) => bail!("tmux claim command failed: {status}"),
+        None => bail!("tmux claim command timed out"),
     }
 }
 
@@ -1841,11 +4231,366 @@ fn run_tmux_until(
     Ok(status)
 }
 
-/// Kill a tmux session on its owner, resolving legacy bindings first. Best-effort.
-pub fn kill_tmux_session(session: &SessionTarget) {
-    let _ = tmux_on(local_tmux_socket(session))
-        .args(muxel_core::tmux::kill_session_args(&session.name))
-        .output();
+/// Resolve a local close's owner so the caller can save it before teardown.
+/// Run on a background executor, sharing its deadline with the later kill.
+pub fn resolve_local_tmux_close(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    resolve_tmux_owner_with(&session, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
+}
+
+/// Close a local tmux session on its recorded or confirmed legacy owner.
+/// Discovery, kill and absence confirmation share one deadline. Every child is
+/// supervised and reaped by the bounded runner; failure never authorizes a kill
+/// on another server or a migration to it. Run only on a background executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalTmuxClose {
+    Gone,
+    Preserved,
+}
+
+pub fn close_local_tmux(
+    session: &SessionTarget,
+    token: uuid::Uuid,
+    initialize: bool,
+    deadline: Instant,
+) -> Result<LocalTmuxClose> {
+    let session = profile_tmux_target(session);
+    let socket = session
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if initialize {
+        let mut cmd = tmux_on(socket);
+        cmd.args(muxel_core::tmux::set_option_args(
+            &session.name,
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION,
+            &token.to_string(),
+        ));
+        let out = run_tmux_output_until(cmd, deadline)?;
+        if !out.status.success() {
+            if !local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+                return Ok(LocalTmuxClose::Gone);
+            }
+            bail!(
+                "couldn't bind tmux close generation: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let id = std::cell::RefCell::new(None::<String>);
+    close_local_tmux_with(
+        &session,
+        deadline,
+        |socket, deadline| {
+            let Some((observed_id, observed_token)) =
+                local_close_generation(socket, &session.name, deadline)?
+            else {
+                return Ok(false);
+            };
+            if observed_token != Some(token) {
+                return Ok(false);
+            }
+            let mut expected = id.borrow_mut();
+            if let Some(expected) = expected.as_ref() {
+                Ok(*expected == observed_id)
+            } else {
+                *expected = Some(observed_id);
+                Ok(true)
+            }
+        },
+        |owner, deadline| {
+            let socket = owner
+                .socket
+                .as_ref()
+                .context("tmux close owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            let id = id.borrow();
+            let args = muxel_core::tmux::kill_local_generation_args(
+                &owner.name,
+                id.as_deref().context("tmux generation was not observed")?,
+                token,
+            )
+            .context("invalid tmux session id")?;
+            cmd.args(args);
+            // The server compares the token and id again in the same command
+            // queue as kill-session. A peer restart cannot transfer the kill.
+            run_tmux_output_until(cmd, deadline)?;
+            Ok(())
+        },
+    )?;
+    if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
+        Ok(LocalTmuxClose::Preserved)
+    } else {
+        Ok(LocalTmuxClose::Gone)
+    }
+}
+
+fn local_close_generation(
+    socket: &Socket,
+    session: &str,
+    deadline: Instant,
+) -> Result<Option<(String, Option<uuid::Uuid>)>> {
+    let mut cmd = tmux_on(socket);
+    // Keep imported Unicode names intact even with the runner's C locale.
+    cmd.arg("-u");
+    cmd.args([
+        "display-message".to_string(),
+        "-p".into(),
+        "-t".into(),
+        format!("={session}:"),
+        // tmux sanitizes control characters (including tabs) under the
+        // runner's LC_ALL=C. Colons remain printable; parse from the right
+        // so the session name cannot change the id/token boundaries.
+        format!(
+            "#{{session_name}}:#{{session_id}}:#{{{}}}",
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION
+        ),
+    ]);
+    let out = run_tmux_output_until(cmd, deadline)?;
+    if out.status.success() {
+        let text = String::from_utf8(out.stdout).context("tmux generation is not UTF-8")?;
+        let line = text.strip_suffix('\n').unwrap_or(&text);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some((prefix, token)) = line.rsplit_once(':')
+            && let Some((name, id)) = prefix.rsplit_once(':')
+            && name == session
+            && id.strip_prefix('$').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        {
+            return Ok(Some((id.into(), uuid::Uuid::parse_str(token).ok())));
+        }
+    }
+    // display-message may succeed without a target. An invalid response is
+    // never proof of absence; only has-session can confirm that.
+    if !local_tmux_has_session_confirmed(socket, session, deadline)? {
+        return Ok(None);
+    }
+    bail!("couldn't read the generation of tmux session “{session}”")
+}
+
+fn close_local_tmux_with(
+    session: &SessionTarget,
+    deadline: Instant,
+    mut probe: impl FnMut(&Socket, Instant) -> Result<bool>,
+    kill: impl FnOnce(&SessionTarget, Instant) -> Result<()>,
+) -> Result<()> {
+    let owner = resolve_tmux_owner_with(session, |socket| probe(socket, deadline))?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if !probe(socket, deadline)? {
+        return Ok(());
+    }
+    kill(&owner, deadline)?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if probe(socket, deadline)? {
+        bail!("tmux session “{owner}” is still running");
+    }
+    Ok(())
+}
+
+/// Restart requires a confirmed teardown; a failed kill must never turn into a
+/// silent create-or-attach of the old process.
+pub fn kill_tmux_session_confirmed(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    let socket = session
+        .socket
+        .as_ref()
+        .context("resolve the tmux owner before restart")?;
+    let mut cmd = tmux_on(socket);
+    cmd.args(muxel_core::tmux::kill_session_args(&session.name));
+    kill_tmux_session_confirmed_with(
+        &session,
+        || kill_session_reply(cmd, deadline),
+        |socket| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+    )
+}
+
+/// [`kill_tmux_session_confirmed`] on `kill` and `probe` (an exact-name
+/// `has-session` on one server), for `session` with a resolved owner.
+///
+/// With no tmux to run ([`tmux_missing`]) nothing runs that muxel could stop or
+/// attach to, so the restart goes on, but on the recorded owner: no probe
+/// answered, so nothing says a move off Default is safe.
+fn kill_tmux_session_confirmed_with(
+    session: &SessionTarget,
+    kill: impl FnOnce() -> Result<()>,
+    mut probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    let owner = session
+        .socket
+        .as_ref()
+        .context("resolve the tmux owner before restart")?;
+    kill()?;
+    let next = probe(owner).and_then(|running| {
+        if running {
+            bail!("tmux session “{session}” is still running");
+        }
+        confirmed_tmux_respawn_target(session, |other| {
+            if other == owner {
+                Ok(false) // The owned session was just confirmed gone.
+            } else {
+                probe(other)
+            }
+        })
+    });
+    match next {
+        Err(error) if tmux_missing(&error) => Ok(session.clone()),
+        next => next,
+    }
+}
+
+/// Run a prepared `kill-session` within `deadline`. Its exit status says nothing
+/// (a session already gone fails too); the caller confirms the session is gone.
+/// No tmux to run means no session muxel could stop.
+fn kill_session_reply(cmd: Command, deadline: Instant) -> Result<()> {
+    match run_tmux_until(cmd, deadline, &GitEnv::production()) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => bail!("tmux restart timed out"),
+        Err(error) if tmux_missing(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The tmux half of restarting a local pane: resolve the owner of its recorded
+/// `session`, record it through `save_owner` before anything is stopped, kill
+/// and confirm it, and pick the server its next session starts on. Returns that
+/// owner and the next target, for the caller to save before relaunching.
+pub fn restart_local_tmux(
+    session: &SessionTarget,
+    deadline: Instant,
+    save_owner: impl FnOnce(&SessionTarget) -> Result<()>,
+) -> Result<(SessionTarget, SessionTarget)> {
+    let session = profile_tmux_target(session);
+    restart_local_tmux_with(
+        &session,
+        |socket| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+        save_owner,
+        |owner| kill_tmux_session_confirmed(owner, deadline),
+    )
+}
+
+/// [`restart_local_tmux`] on `probe` (an exact-name `has-session` on one server)
+/// and `kill` ([`kill_tmux_session_confirmed`]).
+///
+/// A pane on Default whose name `mxl` already holds can't start a session after
+/// the kill (see [`SessionTarget::for_respawn`]), so that is checked first and
+/// its agent is left running: killed, it would leave the pane with nothing.
+///
+/// With no tmux to run ([`tmux_missing`]) before anything is saved, nothing is
+/// stopped or saved and the pane relaunches on its recorded binding, which
+/// fails as it always did without tmux.
+fn restart_local_tmux_with(
+    session: &SessionTarget,
+    mut probe: impl FnMut(&Socket) -> Result<bool>,
+    save_owner: impl FnOnce(&SessionTarget) -> Result<()>,
+    kill: impl FnOnce(&SessionTarget) -> Result<SessionTarget>,
+) -> Result<(SessionTarget, SessionTarget)> {
+    let checked = resolve_tmux_owner_with(session, &mut probe).and_then(|owner| {
+        confirmed_tmux_respawn_target(&owner, |socket| {
+            if socket == &Socket::Default {
+                Ok(false) // As it will be once killed.
+            } else {
+                probe(socket)
+            }
+        })?;
+        Ok(owner)
+    });
+    let owner = match checked {
+        Err(error) if tmux_missing(&error) => return Ok((session.clone(), session.clone())),
+        owner => owner?,
+    };
+    save_owner(&owner)?;
+    let next = kill(&owner)?;
+    Ok((owner, next))
+}
+
+/// Restart a pinned remote owner. `begin_command` admits each kill and the
+/// subsequent migration/verification phase immediately before command planning.
+/// Its returned guard stays alive through that phase's I/O, so cancellation can
+/// refuse new work while the caller waits for already-admitted work to drain.
+pub fn restart_remote_tmux<G>(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    instance: uuid::Uuid,
+    deadline: Instant,
+    begin_command: impl FnMut() -> Option<G>,
+) -> Result<SessionTarget> {
+    let RepoLoc::Remote(conn) = loc else {
+        bail!("not a remote project")
+    };
+    let session = profile_tmux_target(session);
+    if session.socket.is_none() {
+        bail!("resolve and save the tmux owner before restart")
+    }
+    if session.socket == Some(Socket::Default) {
+        // As a local restart does: a namesake on `mxl` would stop the restart only
+        // after the kill, with nothing started in the agent's place.
+        let (target, sockets) = tmux_launch_inventory(&session, local_tmux_root().as_deref());
+        let rows = ssh::parse_session_listings_for_migration_on(
+            &remote_session_names(conn, &sockets, deadline)?,
+            &sockets,
+        )
+        .context("couldn't confirm the tmux servers queried")?;
+        confirmed_tmux_respawn_target(&target, |socket| {
+            Ok(socket != &Socket::Default
+                && rows
+                    .iter()
+                    .any(|row| &row.socket == socket && row.name == target.name))
+        })?;
+    }
+    guarded_remote_restart(
+        begin_command,
+        || {
+            let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
+            let out = run_tmux_output_until(cmd, deadline)?;
+            if !out.status.success() {
+                bail!("{}", ssh_error_message(&out))
+            }
+            Ok(())
+        },
+        || {
+            if session.socket == Some(Socket::Default) {
+                remote_tmux_launch_target(loc, &session, instance, true, deadline)
+            } else {
+                let rows = ssh::parse_session_listings_for_migration_on(
+                    &remote_session_names(conn, session.socket.as_slice(), deadline)?,
+                    session.socket.as_slice(),
+                )
+                .context("couldn't confirm the tmux session's owner")?;
+                if rows.iter().any(|row| row.name == session.name) {
+                    bail!("tmux session “{session}” is still running");
+                }
+                Ok(session.clone())
+            }
+        },
+    )
+}
+
+fn guarded_remote_restart<G>(
+    mut begin_command: impl FnMut() -> Option<G>,
+    kill: impl FnOnce() -> Result<()>,
+    next_target: impl FnOnce() -> Result<SessionTarget>,
+) -> Result<SessionTarget> {
+    {
+        let _command = begin_command().context("remote restart was cancelled before kill")?;
+        kill()?;
+    }
+    let _command = begin_command().context("remote restart was cancelled before migration")?;
+    next_target()
 }
 
 /// Resolve a legacy close without mutating either server. The caller must save
@@ -1862,14 +4607,19 @@ pub fn resolve_remote_tmux_close(
         return Ok(closed);
     }
     let sockets = local_tmux_sockets();
-    let out = ssh_run(
-        host,
-        control_path,
-        password,
-        &ssh::list_sessions_command_on(&sockets),
-    )?;
-    let sessions = ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
-        .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
+    let command = format!(
+        "export LC_ALL=C; {}",
+        ssh::list_session_names_command_on(&sockets)
+    );
+    let out = ssh_run(host, control_path, password, &command)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out))
+    }
+    let sessions = ssh::parse_session_listings_for_migration_on(
+        &String::from_utf8_lossy(&out.stdout),
+        &sockets,
+    )
+    .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
     Ok(closed.resolve_owner(&sessions, profile_tmux_socket()))
 }
 
@@ -1907,23 +4657,23 @@ pub fn kill_remote_tmux(
     }
 }
 
-/// Give this machine's tmux client for `session` on `host` the window size again
-/// (see [`ssh::claim_window_size_command`]), over the host's ControlMaster. Only a
-/// failure to reach the host is an error: a client that never recorded itself, or
-/// has since gone, simply has nothing to claim.
-pub fn claim_tmux_window_size(
+/// Give this machine's tmux clients for `sessions` on `host` the window size again
+/// (see [`ssh::claim_window_sizes_command`]), in one ssh over the host's
+/// ControlMaster. Only a failure to reach the host is an error: a client that never
+/// recorded itself, or has since gone, simply has nothing to claim.
+pub fn claim_tmux_window_sizes(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &SessionTarget,
+    sessions: &[SessionTarget],
     tag: &str,
 ) -> Result<()> {
-    let session = profile_tmux_target(session);
+    let sessions: Vec<SessionTarget> = sessions.iter().map(profile_tmux_target).collect();
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::claim_window_size_command(&session, tag),
+        &ssh::claim_window_sizes_command(&sessions, tag),
     )?;
     // ssh reports its own failures as 255; anything else is the command's answer.
     if out.status.code() == Some(255) {
@@ -1971,7 +4721,7 @@ pub fn kill_remote_tmux_detached(
 /// Fire-and-forget kill of a local tmux session on its owner (quit-time cleanup).
 pub fn kill_local_tmux_detached(session: &SessionTarget) {
     let session = profile_tmux_target(session);
-    let mut cmd = match session.socket {
+    let mut cmd = match &session.socket {
         Some(socket) => {
             let mut cmd = tmux_on(socket);
             cmd.args(muxel_core::tmux::kill_session_args(&session.name));
@@ -2028,19 +4778,122 @@ pub fn open_microphone_settings() {
         .output();
 }
 
-/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`.
+/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`. Read with
+/// `for-each-ref`, which lists branches only: `git branch` adds a line for a
+/// detached HEAD, a rebase or a bisect (`(HEAD detached at 1a2b3c4)`).
 pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
-    git_output(loc, &["branch", "--format=%(refname:short)"])
+    git_output(
+        loc,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// What a branch poll read at a repository.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BranchRead {
+    /// The branch HEAD names (`None` when it names none, or the folder holds
+    /// no repository), spelled as [`list_branches`] spells it, and the local
+    /// branches.
+    Read(Option<String>, Vec<String>),
+    /// Nothing came back: ssh or sshpass failed, couldn't start, or was
+    /// stopped.
+    Unknown,
+    /// git failed to list a remote repository's branches, saying this (or
+    /// nothing). A git older than 1.9 does, at `%(HEAD)`.
+    Failed(String),
+}
+
+/// What the branch poll shows for a project at `loc`. One git round, so one
+/// ssh for a remote one, where a [`repo_current_branch`] and a
+/// [`list_branches`] were two. A local failure reads as no branches.
+pub fn read_branches(loc: &RepoLoc) -> BranchRead {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    let out = match loc {
+        RepoLoc::Remote(c) => {
+            return remote_branch_read(
+                remote_ssh_command(c, remote_ops::branches(c.host.os, &c.remote_path))
+                    .profiled_output(),
+            );
+        }
+        // The same two reads, the second only where the first marks no branch.
+        RepoLoc::Local(_) => git_output(loc, LIST).and_then(|mut out| {
+            let marked = out
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"*"));
+            if out.status.success() && !marked {
+                let head = git_output(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+                out.stdout.extend_from_slice(&head.stdout);
+                out.status = head.status;
+            }
+            Ok(out)
+        }),
+    };
+    let (branch, branches) = out
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        // 1: HEAD names no branch.
+        .filter(|out| matches!(out.status.code(), Some(0 | 1)))
+        .map(|out| parse_branches(&out.stdout))
+        .unwrap_or_default();
+    BranchRead::Read(branch, branches)
+}
+
+/// How [`remote_ops::branches`]' ssh command ended: git's failure is told by
+/// the line it prints after one, since ssh (255) and sshpass (5 for a wrong
+/// password, 6 for an unknown host key) end with codes of their own.
+fn remote_branch_read(out: std::io::Result<std::process::Output>) -> BranchRead {
+    let Ok(out) = out else {
+        return BranchRead::Unknown;
+    };
+    let failed = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == remote_ops::BRANCHES_FAILED);
+    if failed {
+        return BranchRead::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    match out.status.code() {
+        // 1: HEAD names no branch.
+        Some(0 | 1) => {
+            let (branch, branches) = parse_branches(&out.stdout);
+            BranchRead::Read(branch, branches)
+        }
+        _ => BranchRead::Unknown,
+    }
+}
+
+/// [`read_branches`]' output: `*name` for HEAD's branch and ` name` for the
+/// others, then the branch HEAD names, if any, on a line of its own.
+fn parse_branches(stdout: &[u8]) -> (Option<String>, Vec<String>) {
+    let text = String::from_utf8_lossy(stdout);
+    let (mut marked, mut named, mut branches) = (None, None, Vec::new());
+    // A branch's name holds neither `*` nor a space.
+    for line in text.lines().map(|line| line.trim_end_matches('\r')) {
+        if let Some(name) = line.strip_prefix('*') {
+            marked = Some(name.to_string());
+            branches.push(name.to_string());
+        } else if let Some(name) = line.strip_prefix(' ') {
+            branches.push(name.to_string());
+        } else if !line.is_empty() {
+            named = Some(line.to_string());
+        }
+    }
+    // The list's spelling (`heads/main` where a tag shares the name), else the
+    // name of a branch with no commit yet.
+    (marked.or(named), branches)
 }
 
 /// Check out an existing branch.
@@ -2248,6 +5101,7 @@ impl GitEnv {
     }
 
     fn spawn(&self, command: &mut Command) -> std::io::Result<GitChild> {
+        muxel_core::child_env::remove_profiler_env(command);
         #[cfg(test)]
         let spawn_started = Instant::now();
         let child = command.spawn()?;
@@ -2330,9 +5184,13 @@ fn probe_ssh_command_config(
     ceiling: Option<&Path>,
     deadline: Instant,
 ) -> SshConfigProbe {
+    if Instant::now() >= deadline {
+        return SshConfigProbe::Failed;
+    }
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };
+    cmd = read_only_git(cmd);
     cmd.args(["config", "--get", "core.sshCommand"])
         .stderr(Stdio::null());
     let Ok(child) = env.spawn(&mut cmd) else {
@@ -2347,6 +5205,17 @@ fn probe_ssh_command_config(
     }
 }
 
+/// The pause before the next exit poll in [`GitEnv::wait_until`], after one of
+/// `pause`: starting at a millisecond and doubling to 50 ms. A short command
+/// (a tmux probe, run on the UI thread) is seen to exit within about its own
+/// run time, rather than costing a whole 50 ms step; a long one is still polled
+/// only every 50 ms.
+fn next_exit_poll(pause: Option<Duration>) -> Duration {
+    const FIRST: Duration = Duration::from_millis(1);
+    const MAX: Duration = Duration::from_millis(50);
+    pause.map_or(FIRST, |pause| (pause * 2).min(MAX))
+}
+
 impl GitEnv {
     /// Poll until exit or the original deadline, then kill and wait. Test
     /// receipts distinguish deadline expiry from a poll error and OS latency.
@@ -2356,6 +5225,7 @@ impl GitEnv {
         let mut child = spawned.child;
         #[cfg(test)]
         let mut stop = GitStopReason::Deadline;
+        let mut pause = None;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -2388,7 +5258,9 @@ impl GitEnv {
             if now >= deadline {
                 break;
             }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+            let next = next_exit_poll(pause);
+            pause = Some(next);
+            std::thread::sleep((deadline - now).min(next));
         }
         #[cfg(test)]
         let stop_observed = Instant::now();
@@ -2613,7 +5485,7 @@ fn clone_ceiling(lib_dir: &Path) -> &Path {
 
 /// 8 random hex digits for a clone's temporary siblings (`<id>.c-…`, `.r-…`,
 /// `.o-…`). Short so git's paths below them stay under Windows `MAX_PATH`.
-fn temp_suffix() -> String {
+pub(crate) fn temp_suffix() -> String {
     let mut hex = uuid::Uuid::new_v4().simple().to_string();
     hex.truncate(8);
     hex
@@ -2814,9 +5686,8 @@ fn check_git_output(
     if Instant::now() >= deadline {
         return None;
     }
-    let mut cmd = env.base_command(Some(clone), clone.parent())?;
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-c", "core.fsmonitor=false"]);
+    let mut cmd = read_only_git(env.base_command(Some(clone), clone.parent())?);
+    cmd.args(["-c", "core.fsmonitor=false"]);
     if let Some(opt) = LONG_PATHS {
         cmd.arg("-c").arg(opt);
     }
@@ -2887,6 +5758,380 @@ fn clear_read_only(path: &Path) {
 mod tests {
     use super::*;
 
+    /// What the branch poll reads: the branch HEAD names, and the local
+    /// branches. Detached, mid-bisect and mid-rebase, HEAD names none, and
+    /// `git branch` adds a line saying so (`(no branch, rebasing side)`),
+    /// which isn't a branch. Before the first commit HEAD's branch has no ref
+    /// to list, but is still named.
+    #[test]
+    fn branches_read_names_head_and_lists_only_branches() {
+        let repo = crate::test_support::TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let read = || match read_branches(&loc) {
+            BranchRead::Read(branch, branches) => (branch, branches),
+            other => panic!("unreadable: {other:?}"),
+        };
+        let main = || Some("main".to_string());
+        assert_eq!(read(), (main(), Vec::new()), "no commit yet");
+        repo.commit(&[("a.txt", "one\n")], "one");
+        repo.git(&["switch", "-q", "-c", "side"]);
+        repo.commit(&[("b.txt", "side\n")], "side");
+        repo.git(&["switch", "-q", "main"]);
+        repo.commit(&[("a.txt", "two\n")], "two");
+        repo.commit(&[("a.txt", "three\n")], "three");
+        let both = vec!["main".to_string(), "side".to_string()];
+        assert_eq!(read(), (main(), both.clone()));
+        let none_named = |what: &str| {
+            assert_eq!(read(), (None, both.clone()), "{what}");
+            assert_eq!(list_branches(&loc), both, "{what}");
+        };
+        repo.git(&["switch", "-q", "--detach", "HEAD"]);
+        none_named("detached");
+        repo.git(&["switch", "-q", "main"]);
+        repo.git(&["bisect", "start", "HEAD", "HEAD~2"]);
+        none_named("bisecting");
+        repo.git(&["bisect", "reset"]);
+        // `--exec false` stops the rebase after its one pick.
+        repo.git(&["switch", "-q", "side"]);
+        let stopped = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "-c",
+                "user.name=muxel-test",
+                "-c",
+                "user.email=muxel-test@example.invalid",
+            ])
+            .args(["rebase", "--exec", "false", "main"])
+            .output()
+            .unwrap();
+        assert!(!stopped.status.success(), "the rebase stopped");
+        none_named("rebasing");
+        repo.git(&["rebase", "--abort"]);
+        assert_eq!(read(), (Some("side".to_string()), both.clone()));
+    }
+
+    /// A Unix host's shell, to run its commands here. On Windows that's Git for
+    /// Windows' bash, found where the Git Bash preset finds it: a bare `sh` is
+    /// on PATH only in a shell that put Git's `bin` there, and without it every
+    /// spawn would fail and read as ssh's failure.
+    fn host_sh() -> Command {
+        if !cfg!(windows) {
+            return command("sh");
+        }
+        let bash = muxel_core::git_bash_program();
+        assert!(
+            Path::new(&bash).is_file(),
+            "no Git for Windows bash to run a Unix host's command (tried {bash}; \
+             MUXEL_GIT_BASH names another)"
+        );
+        command(bash)
+    }
+
+    /// [`remote_ops::branches`]' Unix command, run here by a Unix shell as ssh
+    /// runs it there, after `prelude` (a stand-in for that host's git).
+    fn remote_branches_here(dir: &Path, prelude: &str) -> std::io::Result<std::process::Output> {
+        let script = remote_ops::branches(
+            muxel_core::RemoteOs::Unix,
+            &dir.to_string_lossy().replace('\\', "/"),
+        );
+        host_sh()
+            .arg("-c")
+            .arg(format!("{prelude}{script}"))
+            // A folder outside any repository stays outside one.
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .stdin(Stdio::null())
+            .output()
+    }
+
+    /// git before 1.9 dies at `%(HEAD)` as today's does at a field it doesn't
+    /// know. That reads as git's failure, with what git said; a folder with no
+    /// repository reads as no branch, as it did before the listing could fail.
+    #[test]
+    fn a_remote_git_that_cant_list_branches_says_so() {
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "one");
+        let old_git = "git() { case \"$*\" in *'%(HEAD)'*) \
+                       echo 'fatal: unknown field name: HEAD' >&2; return 128;; esac; \
+                       command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), old_git)),
+            BranchRead::Failed("fatal: unknown field name: HEAD".into())
+        );
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), "")),
+            BranchRead::Read(Some("main".into()), vec!["main".into()])
+        );
+        // git before 1.8.5 has no `-C` either, so the listing fails before it
+        // reaches `%(HEAD)`; telling a repository apart mustn't need `-C`.
+        let older_git = "git() { case \" $* \" in *' -C '*) \
+                         echo 'Unknown option: -C' >&2; return 129;; esac; \
+                         command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), older_git)),
+            BranchRead::Failed("Unknown option: -C".into())
+        );
+        let plain = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&plain).unwrap();
+        let read = remote_branch_read(remote_branches_here(&plain, ""));
+        let older = remote_branch_read(remote_branches_here(&plain, older_git));
+        let _ = std::fs::remove_dir_all(&plain);
+        assert_eq!(read, BranchRead::Read(None, Vec::new()), "no repository");
+        assert_eq!(
+            older,
+            BranchRead::Read(None, Vec::new()),
+            "nor with that git"
+        );
+        // A folder that's gone is no repository either, wherever ssh starts.
+        let gone = remote_branch_read(remote_branches_here(&plain, older_git));
+        assert_eq!(
+            gone,
+            BranchRead::Read(None, Vec::new()),
+            "a folder that's gone"
+        );
+    }
+
+    /// ssh's own failure is 255; sshpass's wrong password is 5 and its unknown
+    /// host key 6. None of them is git's, whatever they printed.
+    #[test]
+    fn a_failure_before_git_ran_is_not_blamed_on_git() {
+        for code in [255, 5, 6] {
+            // The shell has to run, or this reads Unknown for the wrong reason.
+            let out = host_sh()
+                .arg("-c")
+                .arg(format!("echo 'Permission denied' >&2; exit {code}"))
+                .stdin(Stdio::null())
+                .output()
+                .expect("the host shell runs");
+            assert_eq!(out.status.code(), Some(code), "the host shell exits {code}");
+            assert_eq!(
+                remote_branch_read(Ok(out)),
+                BranchRead::Unknown,
+                "exit {code}"
+            );
+        }
+        let missing = command("muxel-no-such-ssh").output();
+        assert_eq!(remote_branch_read(missing), BranchRead::Unknown);
+    }
+
+    #[test]
+    fn review_close_retry_cannot_kill_when_the_original_generation_is_gone() {
+        let target = SessionTarget::new("same-name-replacement", Some(Socket::Private));
+        // The expected generation no longer exists. A name still present on
+        // that server can be a peer's replacement, never permission to kill it.
+        close_local_tmux_with(
+            &target,
+            Instant::now() + Duration::from_secs(2),
+            |_, _| Ok(false),
+            |_, _| panic!("kill reached the replacement after the original generation was gone"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let killed = std::cell::Cell::new(false);
+        let probes = std::cell::RefCell::new(Vec::new());
+        let target = SessionTarget::new("work", None);
+        close_local_tmux_with(
+            &target,
+            deadline,
+            |socket, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                probes.borrow_mut().push(socket.clone());
+                Ok(!killed.get() && *socket == Socket::Default)
+            },
+            |owner, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                assert_eq!(owner.name, "work");
+                assert_eq!(owner.socket, Some(Socket::Default));
+                killed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(killed.get());
+        assert_eq!(
+            *probes.borrow(),
+            [
+                Socket::Private,
+                Socket::Default,
+                Socket::Default,
+                Socket::Default
+            ]
+        );
+    }
+
+    #[test]
+    fn local_close_keeps_named_owner_and_fails_closed_on_uncertain_or_live_session() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let target = SessionTarget::new("work", Some(Socket::Named("recorded-peer".into())));
+        let killed = std::cell::Cell::new(false);
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    Ok(true)
+                },
+                |owner, _| {
+                    assert_eq!(owner, &target);
+                    killed.set(true);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        let uncertain = SessionTarget::new("work", None);
+        assert!(
+            close_local_tmux_with(
+                &uncertain,
+                deadline,
+                |_, _| anyhow::bail!("socket discovery timed out"),
+                |_, _| panic!("unconfirmed legacy owner must never be killed"),
+            )
+            .is_err()
+        );
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    Ok(true)
+                },
+                |_, _| anyhow::bail!("kill timed out"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_close_expired_deadline_refuses_before_running_a_command() {
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(close_local_tmux(&target, uuid::Uuid::new_v4(), false, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn cancelled_remote_restart_refuses_before_planning_a_kill() {
+        let planned = std::cell::Cell::new(false);
+        let result = guarded_remote_restart(
+            || None::<()>,
+            || {
+                planned.set(true);
+                Ok(())
+            },
+            || panic!("cancelled restart must not plan migration or verification"),
+        );
+        assert!(result.is_err());
+        assert!(!planned.get());
+    }
+
+    #[test]
+    fn remote_restart_rechecks_admission_before_migration_after_a_kill() {
+        let active = std::cell::Cell::new(true);
+        let migrated = std::cell::Cell::new(false);
+        let admissions = std::cell::Cell::new(0);
+        let result = guarded_remote_restart(
+            || {
+                admissions.set(admissions.get() + 1);
+                active.get().then_some(())
+            },
+            || {
+                active.set(false); // Hold lands while the admitted kill runs.
+                Ok(())
+            },
+            || {
+                migrated.set(true);
+                Ok(SessionTarget::new("work", Some(Socket::Private)))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(admissions.get(), 2);
+        assert!(!migrated.get());
+    }
+
+    #[test]
+    fn remote_restart_retains_each_command_guard_until_its_operation_returns() {
+        struct Guard<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let in_flight = std::cell::Cell::new(0);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        let result = guarded_remote_restart(
+            || {
+                in_flight.set(in_flight.get() + 1);
+                Some(Guard(&in_flight))
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(())
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(target.clone())
+            },
+        );
+        assert_eq!(result.unwrap(), target);
+        assert_eq!(in_flight.get(), 0);
+        assert!(
+            guarded_remote_restart(
+                || {
+                    in_flight.set(in_flight.get() + 1);
+                    Some(Guard(&in_flight))
+                },
+                || anyhow::bail!("kill failed"),
+                || panic!("failed kill must not migrate"),
+            )
+            .is_err()
+        );
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[test]
+    fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {
+        let root = Path::new("/isolated-migration");
+        let isolated = Socket::isolated(root);
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+            Some(Socket::Named("peer '名".into())),
+        ] {
+            let saved = SessionTarget::new("exact name ", prior);
+            let (target, sockets) = tmux_launch_inventory(&saved, Some(root));
+            assert_eq!(target.name, saved.name);
+            assert_eq!(target.socket, Some(isolated.clone()));
+            assert_eq!(sockets, std::slice::from_ref(&isolated));
+            assert_eq!(
+                confirmed_tmux_respawn_target(&target, |_| panic!("global migration probe"))
+                    .unwrap(),
+                target
+            );
+            let reply = "exact name \n:muxel-listed:0\n";
+            let rows = ssh::parse_session_listings_for_migration_on(reply, &sockets).unwrap();
+            assert_eq!(rows[0].target(), target);
+            assert!(ssh::parse_session_listings_for_migration_on(reply, &Socket::BOTH).is_none());
+        }
+        let named = SessionTarget::new("work", Some(Socket::Named("peer '名".into())));
+        let (target, sockets) = tmux_launch_inventory(&named, None);
+        assert_eq!(target, named);
+        assert_eq!(sockets, named.socket.as_slice());
+        for owner in [None, Some(Socket::Private), Some(Socket::Default)] {
+            let saved = SessionTarget::new("work", owner);
+            assert_eq!(
+                tmux_launch_inventory(&saved, None),
+                (saved, Socket::BOTH.to_vec())
+            );
+        }
+    }
+
     fn hanging_tmux_command() -> Command {
         if cfg!(windows) {
             let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
@@ -2917,7 +6162,7 @@ mod tests {
     fn claim_cleanup_stops_a_command_that_does_not_finish() {
         let lifecycle = GitEnv::for_tests();
         let started = Instant::now();
-        let err = run_claim_cleanup(
+        let err = run_claim_command(
             hanging_tmux_command(),
             started + Duration::from_millis(50),
             &lifecycle,
@@ -2926,6 +6171,337 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    fn shell_command(script: &str) -> Command {
+        if cfg!(windows) {
+            let mut cmd = command("cmd.exe");
+            cmd.args(["/D", "/C", script]);
+            cmd
+        } else {
+            let mut cmd = command("/bin/sh");
+            cmd.args(["-c", script]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn forced_claim_publish_and_readback_share_one_deadline() {
+        // A stalled write stops at the deadline and the readback never runs.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = publish_claim_until(
+            hanging_tmux_command(),
+            || Ok(shell_command("echo never")),
+            deadline,
+            &lifecycle,
+        )
+        .expect_err("a stalled publish must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+
+        // The readback gets only what is left of the same deadline.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let err = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(hanging_tmux_command()),
+            started + Duration::from_secs(1),
+            &lifecycle,
+        )
+        .expect_err("a stalled readback must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 2);
+
+        let lifecycle = GitEnv::for_tests();
+        let read = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(shell_command("echo v1-claim")),
+            Instant::now() + Duration::from_secs(10),
+            &lifecycle,
+        )
+        .unwrap();
+        assert_eq!(read.as_deref(), Some("v1-claim"));
+    }
+
+    #[test]
+    fn claim_write_is_probed_once_per_host_and_an_unanswered_probe_is_retried() {
+        let hosts = Mutex::new(HashMap::new());
+        let probes = std::cell::Cell::new(0);
+        let probe = |answer: Option<ClaimWrite>| {
+            probes.set(probes.get() + 1);
+            answer
+        };
+        // Unreachable tmux: try conditionally now, and probe again next time.
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(None)),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Unconditional
+            ))),
+            ClaimWrite::Unconditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Unconditional,
+            "a host's answer is remembered"
+        );
+        assert_eq!(probes.get(), 2);
+        assert_eq!(
+            claim_write_cached(&hosts, "local".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(probes.get(), 3);
+    }
+
+    #[test]
+    fn claim_probes_are_keyed_by_the_tmux_host() {
+        let remote = |user: &str, hostname: &str, port| {
+            let mut host = RemoteHost::new("label", hostname);
+            host.user = user.into();
+            host.port = port;
+            RepoLoc::remote(host, "/srv".into(), "/tmp/cm".into(), None)
+        };
+        assert_eq!(tmux_host(&RepoLoc::Local("/a".into())), "local");
+        assert_eq!(tmux_host(&RepoLoc::Local("/b".into())), "local");
+        assert_eq!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(22)))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("you", "box", None))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(2222)))
+        );
+    }
+
+    #[test]
+    fn migration_probe_timeout_reaps_the_child_and_does_not_authorize_absence() {
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let error = run_tmux_output_with(
+            hanging_tmux_command(),
+            started + Duration::from_millis(50),
+            &lifecycle,
+        )
+        .expect_err("a hung query cannot confirm an empty server");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    #[test]
+    fn migration_probe_expired_deadline_does_not_spawn() {
+        let lifecycle = GitEnv::for_tests();
+        assert!(run_tmux_output_with(hanging_tmux_command(), Instant::now(), &lifecycle).is_err());
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    /// A probe that exits at once is seen within about its own run time, not a
+    /// whole 50 ms poll step; a long wait still polls every 50 ms.
+    #[test]
+    fn exit_polls_start_short_and_back_off_to_fifty_ms() {
+        let mut pauses = Vec::new();
+        let mut pause = None;
+        for _ in 0..9 {
+            let next = next_exit_poll(pause);
+            pauses.push(next.as_millis());
+            pause = Some(next);
+        }
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 50, 50, 50]);
+    }
+
+    /// A spawn that fails with NotFound, as running a tmux muxel can't find does.
+    fn tmux_not_found() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("starting tmux probe")
+    }
+
+    /// No tmux to run: a kill has nothing muxel could stop, but a probe is no
+    /// answer, so it never authorizes a move off Default. A tmux outside the
+    /// `PATH` muxel started with (MacPorts' `/opt/local/bin` when muxel is opened
+    /// from the Dock, say) may still be running the agent there.
+    #[test]
+    fn a_missing_tmux_never_moves_a_pane_off_default() {
+        let missing = || command("muxel-test-no-such-tmux");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = has_session_reply(missing(), "work", deadline).unwrap_err();
+        assert!(tmux_missing(&error), "{error:#}");
+        kill_session_reply(missing(), deadline).unwrap();
+        assert!(tmux_missing(&tmux_not_found()));
+        assert!(!tmux_missing(&anyhow::anyhow!("tmux probe timed out")));
+
+        let on_default = SessionTarget::new("owned", Some(Socket::Default));
+        let legacy = SessionTarget::new("owned", None);
+        // Launch: the recorded binding is kept, so the launch fails on it as before.
+        for session in [&on_default, &legacy] {
+            assert_eq!(
+                local_tmux_launch_target_with(session, |_| Err(tmux_not_found())).unwrap(),
+                *session
+            );
+        }
+        // Any other probe failure still stops the launch.
+        assert!(
+            local_tmux_launch_target_with(&on_default, |_| Err(anyhow::anyhow!("denied"))).is_err()
+        );
+        // Restart, before anything is saved: nothing is saved or killed.
+        for session in [&on_default, &legacy] {
+            let (result, _, steps) = local_restart_on(session.clone(), |_| Err(tmux_not_found()));
+            assert_eq!(result.unwrap(), (session.clone(), session.clone()));
+            assert!(steps.is_empty(), "{steps:?}");
+        }
+        // Restart, once killed: the confirmation can't say Default is safe to leave.
+        let mut killed = false;
+        let next = kill_tmux_session_confirmed_with(
+            &on_default,
+            || {
+                killed = true;
+                Ok(())
+            },
+            |_| Err(tmux_not_found()),
+        )
+        .unwrap();
+        assert!(killed);
+        assert_eq!(next, on_default);
+        // tmux there, the same confirmation moves it once both servers answer.
+        let next = kill_tmux_session_confirmed_with(&on_default, || Ok(()), |_| Ok(false)).unwrap();
+        assert_eq!(next.socket, Some(Socket::Private));
+    }
+
+    /// The message a namesake refusal shows points at what actually ends it.
+    #[test]
+    fn a_namesake_refusal_names_a_way_out_that_exists() {
+        let target = SessionTarget::new("owned", Some(Socket::Default));
+        let error = confirmed_tmux_respawn_target(&target, |socket| Ok(socket == &Socket::Private))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sharing this project's layout"), "{error}");
+        assert!(error.contains("restart the pane"), "{error}");
+        assert!(!error.contains("Refresh the project layout"), "{error}");
+    }
+
+    /// The order a local restart works in, on fake servers: `probes` records each
+    /// `has-session` (server, answer), `steps` the save and the kill.
+    fn local_restart(
+        session: SessionTarget,
+        running: &[Socket],
+        save_ok: bool,
+    ) -> (
+        Result<(SessionTarget, SessionTarget)>,
+        Vec<Socket>,
+        Vec<&'static str>,
+    ) {
+        local_restart_with(session, |socket| Ok(running.contains(socket)), save_ok)
+    }
+
+    /// [`local_restart`] on any `answer`, with the save succeeding.
+    fn local_restart_on(
+        session: SessionTarget,
+        answer: impl Fn(&Socket) -> Result<bool>,
+    ) -> (
+        Result<(SessionTarget, SessionTarget)>,
+        Vec<Socket>,
+        Vec<&'static str>,
+    ) {
+        local_restart_with(session, answer, true)
+    }
+
+    fn local_restart_with(
+        session: SessionTarget,
+        answer: impl Fn(&Socket) -> Result<bool>,
+        save_ok: bool,
+    ) -> (
+        Result<(SessionTarget, SessionTarget)>,
+        Vec<Socket>,
+        Vec<&'static str>,
+    ) {
+        let probes = std::cell::RefCell::new(Vec::new());
+        let steps = std::cell::RefCell::new(Vec::new());
+        let probe = |socket: &Socket| {
+            probes.borrow_mut().push(socket.clone());
+            answer(socket)
+        };
+        let result = restart_local_tmux_with(
+            &session,
+            probe,
+            |_| {
+                steps.borrow_mut().push("save");
+                if save_ok {
+                    Ok(())
+                } else {
+                    bail!("couldn't save the tmux session owner before restart")
+                }
+            },
+            |owner| {
+                steps.borrow_mut().push("kill");
+                kill_tmux_session_confirmed_with(
+                    owner,
+                    || Ok(()),
+                    |socket| {
+                        // The owner's session is gone once killed.
+                        Ok(socket != owner.socket.as_ref().unwrap() && answer(socket)?)
+                    },
+                )
+            },
+        );
+        (result, probes.into_inner(), steps.into_inner())
+    }
+
+    #[test]
+    fn a_local_restart_saves_the_owner_before_it_kills() {
+        let named = Socket::Named("peer".into());
+        for socket in [Socket::Private, named.clone()] {
+            let target = SessionTarget::new("work", Some(socket.clone()));
+            let (result, probes, steps) =
+                local_restart(target.clone(), std::slice::from_ref(&socket), true);
+            assert_eq!(result.unwrap(), (target.clone(), target.clone()));
+            assert!(probes.is_empty(), "a recorded owner needs no lookup");
+            assert_eq!(steps, ["save", "kill"]);
+
+            // A failed save stops before anything is killed.
+            let (result, _, steps) = local_restart(target, &[socket], false);
+            assert!(format!("{:#}", result.unwrap_err()).contains("couldn't save"));
+            assert_eq!(steps, ["save"]);
+        }
+        // A legacy binding is resolved first, and that owner is what gets saved.
+        let (result, probes, steps) =
+            local_restart(SessionTarget::new("work", None), &[Socket::Default], true);
+        let (owner, next) = result.unwrap();
+        assert_eq!(owner.socket, Some(Socket::Default));
+        assert_eq!(next.socket, Some(Socket::Private));
+        assert_eq!(probes[..2], [Socket::Private, Socket::Default]);
+        assert_eq!(steps, ["save", "kill"]);
+    }
+
+    /// With a live Default session and a namesake on `mxl`, the kill would leave the
+    /// pane with nothing to start: the restart refuses first, agent untouched.
+    #[test]
+    fn a_local_restart_checks_for_a_namesake_before_it_kills() {
+        let target = SessionTarget::new("owned", Some(Socket::Default));
+        let (result, probes, steps) =
+            local_restart(target.clone(), &[Socket::Default, Socket::Private], true);
+        assert!(result.unwrap_err().to_string().contains("restart the pane"));
+        assert_eq!(probes, [Socket::Private]);
+        assert!(steps.is_empty(), "neither saved nor killed");
+
+        // Without one, it moves off Default once the old session is gone.
+        let (result, _, steps) = local_restart(target.clone(), &[Socket::Default], true);
+        let (owner, next) = result.unwrap();
+        assert_eq!(owner, target);
+        assert_eq!(next, SessionTarget::new("owned", Some(Socket::Private)));
+        assert_eq!(steps, ["save", "kill"]);
     }
 
     #[test]
@@ -3000,6 +6576,128 @@ mod tests {
     }
 
     #[test]
+    fn sshpass_pty_failure_is_recognized() {
+        // What macOS sshpass printed when `posix_openpt` failed transiently.
+        let seen = b"Failed to get a pseudo terminal: Unknown error: -6\n";
+        assert!(is_sshpass_pty_failure(Some(3), seen));
+        assert!(is_sshpass_pty_failure(
+            Some(3),
+            b"Failed to unlock pseudo terminal: Device not configured\n"
+        ));
+        assert!(is_sshpass_pty_failure(
+            Some(3),
+            b"Failed to change pseudo terminal's permission: Permission denied\n"
+        ));
+        // Another exit code is something else (e.g. a remote command's own status).
+        assert!(!is_sshpass_pty_failure(Some(1), seen));
+        assert!(!is_sshpass_pty_failure(None, seen));
+        // A real connection/auth failure is not retried.
+        assert!(!is_sshpass_pty_failure(
+            Some(3),
+            b"ssh: connect to host h port 22: Connection refused\n"
+        ));
+        assert!(!is_sshpass_pty_failure(Some(5), b""));
+    }
+
+    /// The host's agent lookup, run here as the far side would run it: through
+    /// `sh`, with a login shell that prints a banner and adds the bin dir an
+    /// agent was installed into, as a user's rc files do.
+    #[cfg(unix)]
+    #[test]
+    fn remote_program_lookup_finds_agents_on_the_login_shell_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("muxel-remote-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // `pi` is only on the login shell's PATH (an npm or nvm prefix), `amp`
+        // sits in `~/.local/bin`, and `codex` isn't installed at all. Prefixed,
+        // so a real agent in a fallback dir like /usr/local/bin can't answer.
+        exe(&root.join("npm/bin/muxel-test-pi"), "#!/bin/sh\n");
+        exe(&root.join("home/.local/bin/muxel-test-amp"), "#!/bin/sh\n");
+        exe(
+            &root.join("login-shell"),
+            &format!(
+                "#!/bin/sh\necho 'Welcome to the host'\nPATH={}:$PATH\nshift\nexec /bin/sh -c \"$1\"\n",
+                root.join("npm/bin").display()
+            ),
+        );
+        let programs = ["muxel-test-amp", "muxel-test-codex", "muxel-test-pi"].map(String::from);
+        let found = |shell: &Path| {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(remote_ops::find_programs(RemoteOs::Unix, &programs))
+                .env("SHELL", shell)
+                .env("HOME", root.join("home"))
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            remote_ops::parse_found_programs(&String::from_utf8_lossy(&out.stdout))
+        };
+
+        assert_eq!(
+            found(&root.join("login-shell")),
+            Some(vec![
+                "muxel-test-amp".to_string(),
+                "muxel-test-pi".to_string()
+            ])
+        );
+        // A login shell that can't be run leaves sshd's PATH and the usual user
+        // prefixes: `pi` is out of reach then, but the lookup still answers.
+        assert_eq!(
+            found(&root.join("no-such-shell")),
+            Some(vec!["muxel-test-amp".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stand-in for sshpass that fails to get its pty on the first two runs.
+    #[cfg(unix)]
+    fn flaky_pty_command(dir: &Path) -> Command {
+        let script = "n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n > runs; \
+                      if [ $n -lt 3 ]; then \
+                      echo 'Failed to get a pseudo terminal: Unknown error: -6' >&2; exit 3; \
+                      fi; echo ok";
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]).current_dir(dir);
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sshpass_pty_failure_is_retried_for_password_auth() {
+        let fresh_dir = |label: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "muxel-sshpass-retry-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+
+        let dir = fresh_dir("password");
+        let out = ssh_output(SshAuth::Password, &mut flaky_pty_command(&dir)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.trim(), "3");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Key/agent auth runs plain ssh, never sshpass: its output stands.
+        let dir = fresh_dir("key");
+        let out = ssh_output(SshAuth::Key, &mut flaky_pty_command(&dir)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.trim(), "1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn worktree_create_and_remove() {
         let repo = std::env::temp_dir().join("muxel-it-repo");
         let worktree = std::env::temp_dir().join("muxel-it-worktree");
@@ -3031,10 +6729,63 @@ mod tests {
             "worktree should be checked out"
         );
 
-        remove_worktree(&repo, &worktree);
+        remove_worktree(&repo, &worktree).expect("worktree should be removed");
         assert!(!worktree.exists(), "worktree should be removed");
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `git worktree list` names a worktree when both paths resolve to the
+    /// same folder or, when either can't be resolved, when both match as
+    /// written. A resolved path is never held against one as written.
+    #[test]
+    fn worktree_paths_compare_resolved_with_resolved_or_both_as_written() {
+        let p = Path::new;
+        let wt = p("/srv/wt");
+        assert!(same_folder(
+            (p("/srv/link"), Some(p("/data/wt"))),
+            (wt, Some(p("/data/wt")))
+        ));
+        assert!(!same_folder(
+            (wt, Some(p("/data/a"))),
+            (wt, Some(p("/data/b")))
+        ));
+        // Only the worktree's own path resolves.
+        assert!(same_folder((wt, None), (wt, Some(p("/data/wt")))));
+        #[cfg(windows)]
+        assert!(same_folder(
+            (p("D:/Work/wt"), None),
+            (p(r"d:\work\WT"), Some(p(r"\\?\D:\work\wt"))),
+        ));
+    }
+
+    /// Git won't delete a branch a worktree has checked out: `delete_branch`
+    /// says it stayed, and says it is gone once deleted, or already gone.
+    #[test]
+    fn delete_branch_says_whether_the_branch_is_gone() {
+        let base = std::env::temp_dir().join(format!("muxel-it-branch-{}", uuid::Uuid::new_v4()));
+        let (repo, worktree) = (base.join("repo"), base.join("worktree"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        create_worktree(&repo, &worktree, "muxel/held").expect("create worktree");
+        let while_checked_out = delete_branch(&repo, "muxel/held");
+        let removed = remove_worktree(&repo, &worktree);
+        let deleted = delete_branch(&repo, "muxel/held");
+        let again = delete_branch(&repo, "muxel/held");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(removed.is_ok(), "{removed:?}");
+        assert_eq!([while_checked_out, deleted, again], [false, true, true]);
     }
 
     #[test]
@@ -3082,7 +6833,7 @@ mod tests {
         assert_eq!(worktree_unmerged_count(&worktree, &base2), 0);
 
         // Cleanup: remove the worktree, then the (now merged) branch.
-        remove_worktree(&repo, &worktree);
+        remove_worktree(&repo, &worktree).expect("remove the worktree");
         delete_branch(&repo, "muxel/test");
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -3114,7 +6865,17 @@ mod tests {
         std::fs::write(repo.join("sub/insub.txt"), "a\nSUBCHANGED\n").unwrap();
         std::fs::write(repo.join("untracked_new.txt"), "nope\n").unwrap();
 
-        let diff = git_diff(&repo);
+        let diff = git_diff(&repo, None);
+        // A watched pane's refresh, which knows the top level, shows the same.
+        for dir in [repo.clone(), repo.join("sub")] {
+            let plan = diff_plan(&dir).expect("a work tree");
+            assert_eq!(
+                git_diff(&dir, Some(&plan.toplevel)),
+                git_diff(&dir, None),
+                "{}",
+                dir.display()
+            );
+        }
         // The header names the exact folder being diffed.
         assert!(
             diff.contains(&repo.display().to_string()),
@@ -3133,7 +6894,7 @@ mod tests {
 
         // Diffing the subfolder is scoped to it: flags the parent repo, shows the
         // subfolder's change, and does NOT include the parent's tracked.txt change.
-        let sub_diff = git_diff(&repo.join("sub"));
+        let sub_diff = git_diff(&repo.join("sub"), None);
         assert!(
             sub_diff.contains("subfolder of git repo"),
             "subfolder note shown:\n{sub_diff}"
@@ -3152,9 +6913,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&plain);
         std::fs::create_dir_all(&plain).unwrap();
         assert!(
-            git_diff(&plain).contains("Not a git repository."),
+            git_diff(&plain, None).contains("Not a git repository."),
             "non-repo message"
         );
+        assert!(diff_plan(&plain).is_none(), "nothing to watch");
 
         let _ = std::fs::remove_dir_all(&plain);
         let _ = std::fs::remove_dir_all(&repo);
@@ -3182,6 +6944,44 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that already ignores `.muxel/` through `.git/info/exclude` keeps its
+    /// tracked `.gitignore` unmodified; one that doesn't still gets the line.
+    #[test]
+    fn ensure_memory_file_respects_info_exclude() {
+        let root = std::env::temp_dir().join("muxel-it-memory-exclude");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = command("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init");
+        std::fs::write(root.join(".gitignore"), "target\n").unwrap();
+        let exclude = root.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".muxel/\n").unwrap();
+
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory");
+        assert!(root.join(MEMORY_DIR).join(MEMORY_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n",
+            ".gitignore untouched when info/exclude already ignores .muxel/"
+        );
+
+        std::fs::write(&exclude, "").unwrap();
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory again");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n.muxel/\n",
+            "appended once nothing else ignores .muxel/"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3474,6 +7274,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_z_reads_worktree_rename_source() {
+        // Captured after moving src/old.txt to new.txt and running git add -N new.txt.
+        let raw = b" R new.txt\0src/old.txt\0 M z.txt\0";
+        assert_eq!(
+            parse_status_z(raw),
+            vec![
+                GitChange {
+                    status: " R".into(),
+                    path: "new.txt".into(),
+                    orig: Some("src/old.txt".into()),
+                },
+                GitChange {
+                    status: " M".into(),
+                    path: "z.txt".into(),
+                    orig: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_status_z_skips_a_multibyte_separator() {
+        // Git writes a space after the two status characters; here é takes its place.
+        let raw = " Mé.txt\0 M é.txt\0";
+        assert_eq!(
+            parse_status_z(raw.as_bytes()),
+            vec![GitChange {
+                status: " M".into(),
+                path: "é.txt".into(),
+                orig: None,
+            }]
+        );
+    }
+
+    #[test]
     fn status_files_lists_all_changes_and_commit_paths_is_selective() {
         let repo = std::env::temp_dir().join("muxel-it-commit-paths");
         let _ = std::fs::remove_dir_all(&repo);
@@ -3602,6 +7437,164 @@ mod tests {
         assert!(!repo.join("junk.txt").exists(), "untracked file removed");
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A repository with `crates/app/src/main.rs` and `docs/notes.md`
+    /// committed, for a project opened at `crates/app`.
+    fn repo_with_a_project_folder() -> (PathBuf, PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("muxel-it-below-root-{}", uuid::Uuid::new_v4()));
+        let folder = repo.join("crates").join("app");
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let git = |args: &[&str]| {
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(folder.join("src").join("main.rs"), "one\n").unwrap();
+        std::fs::write(repo.join("docs").join("notes.md"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        (repo, folder)
+    }
+
+    /// `git status --porcelain=v1 -z` lists paths from the repository's root,
+    /// whatever folder of it runs it, so a project opened below the root lists
+    /// `crates/app/src/main.rs`, and files outside its folder too. Each
+    /// per-file op takes a path as listed, even with `diff.relative=true`.
+    #[test]
+    fn per_file_ops_in_a_folder_below_the_root_act_on_the_listed_files() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let loc = RepoLoc::Local(folder.clone());
+        assert!(
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "diff.relative", "true"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(folder.join("src").join("main.rs"), "two\n").unwrap();
+        std::fs::write(repo.join("docs").join("notes.md"), "two\n").unwrap();
+        std::fs::write(folder.join("new.txt"), "x\n").unwrap();
+        let status = |path: &str| {
+            git_status_files(&loc)
+                .into_iter()
+                .find(|change| change.path == path)
+                .map(|change| change.status)
+        };
+        let mut listed: Vec<String> = git_status_files(&loc).into_iter().map(|c| c.path).collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                "crates/app/new.txt",
+                "crates/app/src/main.rs",
+                "docs/notes.md"
+            ]
+        );
+
+        let main = "crates/app/src/main.rs";
+        let diff = git_diff_for(&loc, main);
+        let outside_diff = git_diff_for(&loc, "docs/notes.md");
+        let stage = git_stage_path(&loc, main).map(|_| status(main));
+        let unstage = git_unstage_path(&loc, main).map(|_| status(main));
+        let discard_outside = git_discard_path(&loc, "docs/notes.md")
+            .map(|_| std::fs::read_to_string(repo.join("docs").join("notes.md")).unwrap());
+        let discard_new =
+            git_discard_path(&loc, "crates/app/new.txt").map(|_| folder.join("new.txt").exists());
+        let commit = git_commit_paths(&loc, "two", &[main.to_string()]).map(|_| status(main));
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(diff.contains("+two"), "the diff: {diff}");
+        assert!(
+            outside_diff.contains("+two"),
+            "outside diff under diff.relative=true: {outside_diff}"
+        );
+        assert_eq!(stage.ok(), Some(Some("M ".to_string())), "stage");
+        assert_eq!(unstage.ok(), Some(Some(" M".to_string())), "unstage");
+        assert_eq!(discard_outside.ok().as_deref(), Some("one\n"), "discard");
+        assert_eq!(discard_new.ok(), Some(false), "discard an untracked file");
+        assert_eq!(commit.ok(), Some(None), "commit");
+    }
+
+    /// Where a folder sits in its repository: the root, and the folder's path
+    /// from it, which takes a listed path to one from the folder.
+    #[test]
+    fn a_folders_place_in_its_repository() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let below = git_place(&RepoLoc::Local(folder));
+        let at_root = git_place(&RepoLoc::Local(repo.clone()));
+        let outside = git_place(&RepoLoc::Local(
+            std::env::temp_dir().join("muxel-no-such-folder"),
+        ));
+        let top = below
+            .as_ref()
+            .and_then(|below| std::fs::canonicalize(&below.top).ok());
+        let repo_resolved = std::fs::canonicalize(&repo).ok();
+        let _ = std::fs::remove_dir_all(&repo);
+
+        let below = below.expect("the folder is in a repository");
+        assert_eq!(top, repo_resolved, "{below:?}");
+        assert_eq!(below.prefix, "crates/app/");
+        assert_eq!(
+            below.in_folder("crates/app/src/main.rs"),
+            Some("src/main.rs")
+        );
+        assert_eq!(below.in_folder("docs/notes.md"), None);
+        let at_root = at_root.expect("the root is in its repository");
+        assert_eq!(at_root.prefix, "");
+        assert_eq!(at_root.in_folder("docs/notes.md"), Some("docs/notes.md"));
+        assert_eq!(outside, None);
+    }
+
+    /// A filename containing git pathspec glob characters (`[ab].txt`) must be
+    /// matched literally, never expanding to also act on siblings like `a.txt`.
+    #[test]
+    fn discarding_a_wildcard_named_file_leaves_matching_siblings_alone() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let git = |args: &[&str]| {
+            let out = command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(folder.join("[ab].txt"), "one\n").unwrap();
+        std::fs::write(folder.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "wildcard pair"]);
+
+        std::fs::write(folder.join("[ab].txt"), "two\n").unwrap();
+        std::fs::write(folder.join("a.txt"), "two\n").unwrap();
+
+        let loc = RepoLoc::Local(folder.clone());
+        let discarded = git_discard_path(&loc, "crates/app/[ab].txt");
+        let wild = std::fs::read_to_string(folder.join("[ab].txt")).unwrap();
+        let sibling = std::fs::read_to_string(folder.join("a.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(discarded.is_ok(), "discard failed: {discarded:?}");
+        assert_eq!(wild, "one\n", "[ab].txt was not discarded");
+        assert_eq!(
+            sibling, "two\n",
+            "discarding [ab].txt also reverted sibling a.txt"
+        );
     }
 
     // ---- Team libraries: non-interactive git runner ----
@@ -4919,6 +8912,58 @@ mod tests {
     }
 
     #[test]
+    fn display_git_reads_leave_index_untouched() {
+        let repo = check_remote();
+        let clone = repo.path();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(clone.join(LIB_FILE), FILE_V1).unwrap();
+        let index = index_state(clone);
+        let loc = RepoLoc::Local(clone.to_path_buf());
+
+        assert_eq!(worktree_change_count(clone), 0);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "worktree count refreshed the index"
+        );
+        assert!(git_status_files(&loc).is_empty());
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display status refreshed the index"
+        );
+        let _ = git_diff_for(&loc, LIB_FILE);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display diff refreshed the index"
+        );
+
+        // A stale optional lock must not obstruct reads, but mutations must
+        // still honor the index lock owned by another git process.
+        let lock = clone.join(".git/index.lock");
+        std::fs::write(&lock, "owned by another process").unwrap();
+        std::fs::write(clone.join("pending.txt"), "untracked").unwrap();
+        let status = git_status_files(&loc);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].path, "pending.txt");
+        assert_eq!(worktree_change_count(clone), 1);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "reads under lock refreshed the index"
+        );
+        assert!(git_stage_path(&loc, LIB_FILE).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"owned by another process");
+        std::fs::remove_file(lock).unwrap();
+        std::fs::remove_file(clone.join("pending.txt")).unwrap();
+
+        // Positive control: the same status without the read policy writes.
+        git_out(clone, &["status", "--porcelain"]);
+        assert_ne!(index_state(clone), index, "control: plain status");
+    }
+
+    #[test]
     fn library_check_is_read_only_and_offline() {
         let repo = check_remote();
         let (lib_dir, _, clone) = lib_cloned(&repo);
@@ -4979,5 +9024,334 @@ mod tests {
         assert!(!marker.exists());
         lib_cleanup(&lib_dir);
         lib_cleanup(&dir);
+    }
+
+    // ---- Branch-poll stamp ----
+
+    #[test]
+    fn git_ref_stamp_moves_with_head_and_branches() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let base = git_ref_stamp(repo.path());
+        assert_eq!(base, git_ref_stamp(repo.path()), "stable while untouched");
+        let deeper = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&deeper).unwrap();
+        assert_eq!(git_ref_stamp(&deeper), base, "found from a subdirectory");
+
+        repo.git(&["branch", "feature/x"]);
+        let created = git_ref_stamp(repo.path());
+        assert_ne!(created, base, "new nested branch");
+
+        repo.git(&["checkout", "-q", "feature/x"]);
+        let switched = git_ref_stamp(repo.path());
+        assert_ne!(switched, created, "checkout");
+
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["pack-refs", "--all"]);
+        let packed = git_ref_stamp(repo.path());
+        repo.git(&["branch", "-D", "feature/x"]);
+        assert_ne!(git_ref_stamp(repo.path()), packed, "packed branch deleted");
+    }
+
+    #[test]
+    fn git_ref_stamp_reads_a_linked_worktrees_branches_from_the_main_repo() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        let before = git_ref_stamp(&wt);
+        assert_ne!(before, git_ref_stamp(repo.path()), "its own HEAD");
+        repo.git(&["branch", "other"]);
+        assert_ne!(git_ref_stamp(&wt), before, "branch made in the main repo");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn git_ref_stamp_notices_git_init() {
+        let dir = lib_temp_dir();
+        let plain = git_ref_stamp(&dir);
+        assert_eq!(plain, git_ref_stamp(&dir));
+        git_out(&dir, &["init", "-q", "-b", "main"]);
+        assert_ne!(git_ref_stamp(&dir), plain);
+        lib_cleanup(&dir);
+    }
+
+    /// What `f` returned, and how many git launches it made on this thread.
+    fn launches<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = LAUNCHES.with(std::cell::Cell::get);
+        let out = f();
+        (out, LAUNCHES.with(std::cell::Cell::get) - before)
+    }
+
+    /// The branch poll's one launch lists the branches with HEAD's marked, as
+    /// git spells it; only a listing that marks none costs a second.
+    #[test]
+    fn the_branch_poll_reads_the_branch_with_the_list() {
+        let repo = TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let read = || launches(|| read_branches(&loc));
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let main = Some("main".to_string());
+        let unborn = BranchRead::Read(main.clone(), vec![]);
+        assert_eq!(read(), (unborn, 2), "before the first commit");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["branch", "other"]);
+        let on_main = BranchRead::Read(main, names(&["main", "other"]));
+        assert_eq!(read(), (on_main, 1), "on a branch");
+        // A tag with the branch's name: git calls the branch `heads/v1`.
+        repo.git(&["switch", "-q", "-c", "v1"]);
+        repo.git(&["tag", "v1"]);
+        let listed = names(&["main", "other", "heads/v1"]);
+        let on_v1 = BranchRead::Read(Some("heads/v1".to_string()), listed.clone());
+        assert_eq!(read(), (on_v1, 1), "a tag shares its name");
+        repo.git(&["switch", "-q", "--detach"]);
+        assert_eq!(read(), (BranchRead::Read(None, listed), 2), "detached");
+        let plain = lib_temp_dir();
+        let read_plain = launches(|| read_branches(&RepoLoc::Local(plain.clone())));
+        assert_eq!(
+            read_plain,
+            (BranchRead::Read(None, vec![]), 1),
+            "no repository"
+        );
+        lib_cleanup(&plain);
+    }
+
+    /// With `core.preferSymlinkRefs` git writes a symbolic ref as a symlink
+    /// holding the name of the ref it points at, which no file is at relative
+    /// to the link. git still reads it, so a branch named like the remote is
+    /// `heads/origin` to git.
+    #[test]
+    fn a_symlinked_remote_head_leaves_the_branch_spelled_as_git_spells_it() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        repo.git(&["switch", "-q", "-c", "origin"]);
+        let link = repo.path().join(".git/refs/remotes/origin/HEAD");
+        let target: PathBuf = ["refs", "remotes", "origin", "main"].iter().collect();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link);
+        if made.is_err() {
+            eprintln!("skipping: can't make a symlink here");
+            return;
+        }
+        let names = repo.git(&["symbolic-ref", "refs/remotes/origin/HEAD"]);
+        assert_eq!(
+            names.trim(),
+            "refs/remotes/origin/main",
+            "git reads the link"
+        );
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        assert_eq!(repo_current_branch(&loc).as_deref(), Some("heads/origin"));
+        let BranchRead::Read(branch, _) = read_branches(&loc) else {
+            panic!("a local read is always read");
+        };
+        assert_eq!(branch.as_deref(), Some("heads/origin"));
+    }
+
+    /// `rev-parse` exits 128 both before the first commit and where there's no
+    /// repository, over ssh too; only before the first commit is there a branch
+    /// for `symbolic-ref` to name.
+    #[test]
+    fn the_branch_read_asks_symbolic_ref_only_before_the_first_commit() {
+        let plain = lib_temp_dir();
+        let loc = RepoLoc::Local(plain.clone());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (None, 1), "no repository");
+        lib_cleanup(&plain);
+        let repo = TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let main = Some("main".to_string());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (main.clone(), 2), "before the first commit");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        assert_eq!(
+            launches(|| repo_current_branch(&loc)),
+            (main, 1),
+            "on a branch"
+        );
+    }
+
+    /// `git init` a reftable repository on `branch`; `false`, with a note, when
+    /// this git can't.
+    fn init_reftable(dir: &Path, branch: &str) -> bool {
+        let init = command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q", "--ref-format=reftable", "-b", branch])
+            .output()
+            .unwrap();
+        if !init.status.success() {
+            eprintln!("skipping: this git has no reftable support");
+        }
+        init.status.success()
+    }
+
+    #[test]
+    fn git_ref_stamp_sees_a_switch_in_a_linked_reftable_worktree() {
+        let dir = lib_temp_dir();
+        if !init_reftable(&dir, "main") {
+            return lib_cleanup(&dir);
+        }
+        git_out(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_out(&dir, &["branch", "one"]);
+        git_out(&dir, &["branch", "two"]);
+        let wt = crate::test_support::short_temp_path();
+        git_out(
+            &dir,
+            &["worktree", "add", "-q", &wt.to_string_lossy(), "one"],
+        );
+        let before = git_ref_stamp(&wt);
+        git_out(&wt, &["switch", "-q", "two"]);
+        assert_ne!(
+            git_ref_stamp(&wt),
+            before,
+            "switched between existing branches"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        lib_cleanup(&dir);
+    }
+
+    /// Whether this process has a variable set that points git elsewhere, so
+    /// a check of the lookup itself would follow it.
+    fn discovery_env_set() -> bool {
+        let set = GIT_DISCOVERY_ENV
+            .iter()
+            .any(|key| std::env::var_os(key).is_some());
+        if set {
+            eprintln!("skipping a lookup check: a git discovery variable is set here");
+        }
+        set
+    }
+
+    /// Seconds after the first poll at which the gate checks below ask whether
+    /// git may run: the next tick, then either side of the unsettled backstop
+    /// and of the settled one.
+    const TICKS: [u64; 5] = [1, 59, 60, 299, 300];
+    /// Shut until the settled backstop: nothing git reads moved.
+    const SHUT: [bool; 5] = [false, false, false, false, true];
+    /// Open from the next tick: the stamp moved.
+    const OPEN: [bool; 5] = [true; 5];
+    /// Shut until the unsettled backstop, master's one minute.
+    const MINUTE: [bool; 5] = [false, false, true, true, true];
+
+    /// Whether the branch poll's gate, kept as the app keeps it, lets git run
+    /// at each of [`TICKS`] after `change`, with git's environment read from
+    /// `env`. Each tick takes a fresh stamp, as the poll does.
+    fn gate_opens(dir: &Path, env: &[(&str, &Path)], change: impl FnOnce()) -> [bool; 5] {
+        let lookup = |key: &str| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_os_str().to_owned())
+        };
+        let mut gate = muxel_core::refresh_gate::RefreshGate::per_stamp(GitRefStamp::backstop);
+        let start = Instant::now();
+        let first = git_ref_stamp_with(dir, lookup);
+        assert!(gate.due(&(), &first, start), "the first poll runs git");
+        gate.record((), first, start);
+        change();
+        TICKS.map(|secs| {
+            let stamp = git_ref_stamp_with(dir, lookup);
+            gate.due(&(), &stamp, start + Duration::from_secs(secs))
+        })
+    }
+
+    /// The gate must let git run on the next tick when the stamp sees git's
+    /// answer move, wait for master's one-minute backstop where the stamp
+    /// can't see what git reads, and otherwise wait for the five-minute one.
+    #[test]
+    fn the_branch_gate_reopens_whenever_gits_answer_can_move() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        repo.git(&["branch", "other"]);
+        let switch = |branch: &str| {
+            repo.git(&["switch", "-q", branch]);
+        };
+        let mut wrong = Vec::new();
+        let mut expect = |case: &str, want: [bool; 5], got: [bool; 5]| {
+            if got != want {
+                wrong.push(format!(
+                    "{case}: due at {TICKS:?} s was {got:?}, want {want:?}"
+                ));
+            }
+        };
+        expect("untouched", SHUT, gate_opens(repo.path(), &[], || {}));
+        expect(
+            "a switch",
+            OPEN,
+            gate_opens(repo.path(), &[], || switch("other")),
+        );
+
+        // The stamp watches the folder shown; git reads the repo named.
+        let shown = TestRepo::init();
+        shown.commit(&[("b.txt", "two\n")], "init");
+        let chosen = repo.path().join(".git");
+        for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
+            let got = gate_opens(shown.path(), &[(key, &chosen)], || switch("main"));
+            expect(&format!("{key}: a switch there"), MINUTE, got);
+            switch("other");
+        }
+
+        // The stamp holds branch names, not what a symbolic one names.
+        repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
+        let onto_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        };
+        let got = gate_opens(repo.path(), &[], onto_alias);
+        expect("HEAD moved onto a symbolic branch", OPEN, got);
+        let retarget = || {
+            repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/other"]);
+        };
+        let got = gate_opens(repo.path(), &[], retarget);
+        expect("that branch retargeted", MINUTE, got);
+        if !discovery_env_set() {
+            let loc = RepoLoc::Local(repo.path().to_path_buf());
+            assert_eq!(repo_current_branch(&loc).as_deref(), Some("other"));
+        }
+        let off_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/other"]);
+        };
+        let got = gate_opens(repo.path(), &[], off_alias);
+        expect("HEAD back on a plain branch", OPEN, got);
+        repo.git(&["update-ref", "-d", "--no-deref", "refs/heads/alias"]);
+
+        // Folders git walks on past must not take the repo's place.
+        let fixture = repo.path().join("fixture");
+        for part in ["objects", "refs"] {
+            std::fs::create_dir_all(fixture.join(part)).unwrap();
+        }
+        std::fs::write(fixture.join("HEAD"), "fixture\n").unwrap();
+        let got = gate_opens(&fixture, &[], || switch("main"));
+        expect("objects, refs and a HEAD git rejects", OPEN, got);
+        let hollow = repo.path().join("hollow");
+        std::fs::create_dir_all(hollow.join(".git")).unwrap();
+        let got = gate_opens(&hollow, &[], || switch("other"));
+        expect("an empty .git folder", OPEN, got);
+        let got = gate_opens(&fixture, &[], || {});
+        expect("below them, untouched", SHUT, got);
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The switcher marks the current branch by finding it in the branch list,
+    /// which trims Unicode whitespace from its lines.
+    #[test]
+    fn a_name_with_unicode_whitespace_still_matches_the_branch_list() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        for name in ["topic\u{a0}", "\u{a0}topic"] {
+            repo.git(&["switch", "-q", "-c", name]);
+            if !discovery_env_set() {
+                let current = repo_current_branch(&loc);
+                let listed = list_branches(&loc);
+                assert!(
+                    current.as_ref().is_some_and(|c| listed.contains(c)),
+                    "{name:?}: {current:?} isn't in {listed:?}"
+                );
+            }
+            repo.git(&["switch", "-q", "main"]);
+        }
     }
 }

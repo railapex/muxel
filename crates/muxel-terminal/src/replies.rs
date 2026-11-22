@@ -13,12 +13,14 @@
 
 use crate::colors::{TerminalPalette, index_to_rgb};
 use crate::listener::SharedWriter;
+use crate::program_status::{CAPABILITY_REPLY, Event as ProgramStatusEvent, Scanner};
 use alacritty_terminal::term::{Config as TermConfig, Osc52};
 use alacritty_terminal::vte::ansi::{Handler, Mode, PrivateMode, Processor, Timeout};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Primary device attributes, as alacritty answers them: a VT102.
@@ -28,6 +30,57 @@ const PRIMARY_DA: &str = "\x1b[?6c";
 const SECONDARY_DA: &str = "\x1b[>0;2501;1c";
 /// `CSI 5 n` operating status: OK.
 const STATUS_OK: &str = "\x1b[0n";
+
+/// Who reads the replies on the far side of the PTY, which decides whether
+/// device attributes get answered at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyPeer {
+    /// Any program run directly: device attributes are answered, since a
+    /// probe ("query X, then primary DA") waits for that answer.
+    Program,
+    /// A tmux client, local or over SSH. tmux asks for both device
+    /// attributes on every attach and treats any that arrive after its 5s
+    /// timer as typing for the pane, so a reply delayed by a busy or sleeping
+    /// machine fills an agent's prompt with `6c0;2501;1`. The delay can be
+    /// anywhere between tmux and the attaching muxel, even on a peer machine
+    /// that dozes off mid-attach, so no reply is fast enough to be safe. And
+    /// tmux learns nothing from muxel's VT102 `?6c` and alacritty `>0;…c`
+    /// replies: it only acts on VT levels 61–65 and on mintty, tmux and rxvt
+    /// identifiers. Left unanswered, tmux applies the same defaults when its
+    /// timer fires.
+    TmuxClient,
+}
+
+/// The size, `(cols, rows)`, the PTY and the emulator grid have been resized
+/// to; the two always change together. It lets the reader answer the
+/// text-area size query (`CSI 18 t`) without the grid. tmux's client sends that
+/// query on every resize when the PTY reports no pixel size, right before its
+/// device-attributes queries on attach. Owed to the UI's drain, it held those
+/// replies past tmux's 5s window whenever the UI was busy (every remote pane
+/// reconnecting after a sleep), and tmux then typed them into the pane as
+/// `6c0;2501;1c`.
+#[derive(Debug)]
+pub(crate) struct GridSize(AtomicU32);
+
+impl GridSize {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        Self(AtomicU32::new(Self::pack(cols, rows)))
+    }
+
+    /// Call before resizing the PTY, so a query the resize prompts sees it.
+    pub(crate) fn set(&self, cols: u16, rows: u16) {
+        self.0.store(Self::pack(cols, rows), Ordering::Release);
+    }
+
+    fn get(&self) -> (u16, u16) {
+        let packed = self.0.load(Ordering::Acquire);
+        ((packed >> 16) as u16, packed as u16)
+    }
+
+    fn pack(cols: u16, rows: u16) -> u32 {
+        (u32::from(cols) << 16) | u32::from(rows)
+    }
+}
 
 /// The PTY's reply path, shared by the reader thread and alacritty's listener,
 /// which keeps replies in the order their queries were sent.
@@ -111,9 +164,10 @@ impl Replies {
 
 /// Whether an alacritty reply is one the reader thread sends itself: device
 /// attributes (`…c`) and the operating status report (`…n`) are the only
-/// alacritty replies ending in those bytes.
+/// alacritty replies ending in those bytes, and `CSI 8 ; rows ; cols t` is its
+/// text-area size report.
 fn answered_by_reader(reply: &str) -> bool {
-    reply.ends_with('c') || reply.ends_with('n')
+    reply.ends_with('c') || reply.ends_with('n') || reply.starts_with("\x1b[8;")
 }
 
 /// Parses PTY output on the reader thread, as it's read, answering every query
@@ -121,6 +175,7 @@ fn answered_by_reader(reply: &str) -> bool {
 pub(crate) struct ImmediateReplies {
     parser: Processor<Unsynchronized>,
     handler: ReplyHandler,
+    program_status_scanner: Scanner,
 }
 
 impl ImmediateReplies {
@@ -129,13 +184,18 @@ impl ImmediateReplies {
     pub(crate) fn new(
         replies: Arc<Replies>,
         palette: Arc<Mutex<TerminalPalette>>,
+        grid_size: Arc<GridSize>,
+        peer: ReplyPeer,
         config: &TermConfig,
     ) -> Self {
         Self {
             parser: Processor::new(),
+            program_status_scanner: Scanner::default(),
             handler: ReplyHandler {
                 replies,
                 palette,
+                grid_size,
+                device_attributes: peer == ReplyPeer::Program,
                 kitty_keyboard: config.kitty_keyboard,
                 clipboard_reads: matches!(config.osc52, Osc52::OnlyPaste | Osc52::CopyPaste),
             },
@@ -143,7 +203,31 @@ impl ImmediateReplies {
     }
 
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.handler, bytes);
+        // Query and DA can arrive in the same PTY read. Feed VTE the span up
+        // through each completed 7501 event before handling it, then resume.
+        // This preserves reply order without calling VTE once per byte.
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let Some(event) = self.program_status_scanner.advance(byte) else {
+                continue;
+            };
+            self.parser
+                .advance(&mut self.handler, &bytes[start..=index]);
+            start = index + 1;
+            match event {
+                ProgramStatusEvent::Query => {
+                    log::debug!("program status source=osc7501 query; sending capability answer");
+                    self.handler.replies.send(CAPABILITY_REPLY.to_owned());
+                }
+                ProgramStatusEvent::Report(_)
+                | ProgramStatusEvent::Reset
+                | ProgramStatusEvent::ShellPrompt
+                | ProgramStatusEvent::Title(_) => {}
+            }
+        }
+        if start < bytes.len() {
+            self.parser.advance(&mut self.handler, &bytes[start..]);
+        }
     }
 }
 
@@ -166,12 +250,20 @@ impl Timeout for Unsynchronized {
 struct ReplyHandler {
     replies: Arc<Replies>,
     palette: Arc<Mutex<TerminalPalette>>,
+    grid_size: Arc<GridSize>,
+    /// False for a tmux client; see [`ReplyPeer::TmuxClient`].
+    device_attributes: bool,
     kitty_keyboard: bool,
     clipboard_reads: bool,
 }
 
 impl Handler for ReplyHandler {
+    /// alacritty's own answer is always dropped (see [`answered_by_reader`]),
+    /// so skipping it here leaves the query unanswered.
     fn identify_terminal(&mut self, intermediate: Option<char>) {
+        if !self.device_attributes {
+            return;
+        }
         match intermediate {
             None => self.replies.send(PRIMARY_DA.to_string()),
             Some('>') => self.replies.send(SECONDARY_DA.to_string()),
@@ -196,8 +288,10 @@ impl Handler for ReplyHandler {
         self.replies.await_grid_reply();
     }
 
+    /// Formatted as alacritty formats it.
     fn text_area_size_chars(&mut self) {
-        self.replies.await_grid_reply();
+        let (cols, rows) = self.grid_size.get();
+        self.replies.send(format!("\x1b[8;{rows};{cols}t"));
     }
 
     fn report_keyboard_mode(&mut self) {
@@ -238,9 +332,10 @@ impl Handler for ReplyHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImmediateReplies, Replies, SECONDARY_DA};
+    use super::{GridSize, ImmediateReplies, Replies, ReplyPeer, SECONDARY_DA};
     use crate::colors::{TerminalPalette, index_to_rgb};
     use crate::listener::MuxelListener;
+    use crate::program_status::CAPABILITY_REPLY;
     use crate::session::term_config;
     use alacritty_terminal::event::{Event, EventListener};
     use alacritty_terminal::term::Term;
@@ -288,10 +383,15 @@ mod tests {
 
     impl Pipeline {
         fn new() -> Self {
+            Self::for_peer(ReplyPeer::Program)
+        }
+
+        fn for_peer(peer: ReplyPeer) -> Self {
             let sent = Sent::default();
             let replies = Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(sent.clone())))));
             let listener = MuxelListener {
                 replies: replies.clone(),
+                evidence: Default::default(),
                 title: Default::default(),
                 title_generation: Default::default(),
                 title_changed_at: Default::default(),
@@ -299,8 +399,13 @@ mod tests {
                 bell: Default::default(),
                 clipboard_store: Default::default(),
             };
-            let reader =
-                ImmediateReplies::new(replies, Arc::new(Mutex::new(palette())), &term_config());
+            let reader = ImmediateReplies::new(
+                replies,
+                Arc::new(Mutex::new(palette())),
+                Arc::new(GridSize::new(80, 24)),
+                peer,
+                &term_config(),
+            );
             let term = Term::new(term_config(), &TermSize::new(80, 24), listener);
             Self {
                 reader,
@@ -399,6 +504,108 @@ mod tests {
         assert_eq!(pipeline.drain(probe), "\x1b[1;1R\x1b[?6c");
         // With nothing owed any more, the next query is answered at once again.
         assert_eq!(pipeline.read(b"\x1b[c"), "\x1b[?6c");
+    }
+
+    /// tmux's client asks for the text-area size on a resize, then for device
+    /// attributes on attach. Neither may wait for the UI: a reply that misses
+    /// tmux's window is typed into the pane.
+    #[test]
+    fn tmux_size_query_does_not_hold_device_attributes() {
+        let mut pipeline = Pipeline::new();
+        let attach = b"\x1b[18t\x1b[14t\x1b[c\x1b[>c\x1b[>q\x1b[?2026$p";
+        assert_eq!(
+            pipeline.read(attach),
+            format!("\x1b[8;24;80t\x1b[?6c{SECONDARY_DA}")
+        );
+        // Only the mode report, which needs the grid, is left to the drain.
+        assert_eq!(pipeline.drain(attach), "\x1b[?2026;2$y");
+    }
+
+    /// A late device-attributes reply is typed into the pane by tmux, and
+    /// muxel's tell tmux nothing, so a tmux client gets none. Its other
+    /// attach queries are still answered.
+    #[test]
+    fn a_tmux_client_gets_no_device_attributes() {
+        let mut pipeline = Pipeline::for_peer(ReplyPeer::TmuxClient);
+        // tmux 3.4's attach requests, as it writes them.
+        let attach = b"\x1b[c\x1b[>c\x1b[>q\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+        assert_eq!(
+            pipeline.read(attach),
+            "\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\"
+        );
+        assert_eq!(pipeline.drain(attach), "");
+        // tmux 3.6 adds a size query ahead of them, and a mode report after.
+        let attach = b"\x1b[18t\x1b[c\x1b[>c\x1b[>q\x1b[?2026$p";
+        assert_eq!(pipeline.read(attach), "\x1b[8;24;80t");
+        assert_eq!(pipeline.drain(attach), "\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn size_report_follows_resizes() {
+        let sent = Sent::default();
+        let replies = Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(sent.clone())))));
+        let size = Arc::new(GridSize::new(80, 24));
+        let mut reader = ImmediateReplies::new(
+            replies,
+            Arc::new(Mutex::new(palette())),
+            size.clone(),
+            ReplyPeer::Program,
+            &term_config(),
+        );
+        size.set(198, 51);
+        reader.advance(b"\x1b[18t");
+        assert_eq!(sent.take(), "\x1b[8;51;198t");
+    }
+
+    #[test]
+    fn program_status_answer_precedes_da_in_the_same_read() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let mut pipeline = Pipeline::new();
+            let wire = format!("\x1b]7501;?{terminator}\x1b[c");
+            assert_eq!(
+                pipeline.read(wire.as_bytes()),
+                format!("{CAPABILITY_REPLY}\x1b[?6c")
+            );
+            assert_eq!(pipeline.drain(wire.as_bytes()), "");
+
+            let mut reversed = Pipeline::new();
+            let wire = format!("\x1b[c\x1b]7501;?{terminator}");
+            assert_eq!(
+                reversed.read(wire.as_bytes()),
+                format!("\x1b[?6c{CAPABILITY_REPLY}")
+            );
+        }
+    }
+
+    #[test]
+    fn program_status_answer_waits_for_earlier_grid_reply() {
+        let mut pipeline = Pipeline::new();
+        let wire = b"\x1b[6n\x1b]7501;?\x1b\\\x1b[c";
+        assert_eq!(pipeline.read(wire), "");
+        assert_eq!(
+            pipeline.drain(wire),
+            format!("\x1b[1;1R{CAPABILITY_REPLY}\x1b[?6c")
+        );
+    }
+
+    #[test]
+    fn interrupted_dcs_then_ris_restores_capability_queries() {
+        let mut pipeline = Pipeline::new();
+        assert_eq!(pipeline.read(b"\x1bPunterminated\x1b"), "");
+        assert_eq!(pipeline.read(b"c\x1b]7501;?\x07"), CAPABILITY_REPLY);
+    }
+
+    #[test]
+    fn reports_and_malformed_queries_never_get_an_answer() {
+        let mut pipeline = Pipeline::new();
+        for wire in [
+            b"\x1b]7501;state=working\x07".as_slice(),
+            b"\x1b]7501;?extra\x07",
+            b"\x1b]7501;?\x1bX",
+            b"\x1b]7501;?\x18",
+        ] {
+            assert_eq!(pipeline.read(wire), "");
+        }
     }
 
     /// The reader and alacritty must agree on exactly which queries get a reply

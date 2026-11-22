@@ -7,8 +7,13 @@ mod agent;
 mod appimage;
 pub mod audio;
 pub mod autopilot;
+pub mod child_env;
+pub mod chime;
+pub mod cloud;
 pub mod control;
 pub mod diff;
+pub mod diff_schedule;
+pub mod file_watch;
 pub mod geometry;
 mod gui_path;
 pub mod import;
@@ -16,13 +21,22 @@ pub mod isolated_root;
 pub mod library;
 pub mod locale;
 pub mod memory;
+pub mod muse;
 pub mod outage;
 mod pane;
+pub mod pane_scope;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
+pub mod recoverable_close;
+pub mod refresh_gate;
+pub mod reminders;
 pub mod remote_ops;
+pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
+pub mod skills;
+pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
 pub mod stt;
@@ -34,22 +48,29 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
-    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
-    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
-    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
-    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    ACCOMPLISHMENTS_FILE, AgentPreset, ClaudeSession, ClaudeSessionRequest, CodexHintMiss,
+    CodexResumePath, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
+    MEMORY_FILE, PresetKind, REMINDERS_FILE, ResolvedLaunch, accomplishments_header,
+    accomplishments_instruction, antigravity_has_conversation_arg, append_agent_instruction,
+    claude_session_cwd, claude_session_cwd_with_len, claude_session_path,
+    codex_developer_instructions_override, codex_latest_session_id, codex_latest_sessions,
+    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
+    codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
+    find_claude_session_path, git_bash_program, is_antigravity_program, is_known_agent_program,
+    launches_known_agent, memory_header, memory_instruction, memory_reference,
+    muxel_file_reference, reminders_header, reminders_instruction, resolve_launch,
+    resolve_launch_for_session, resolved_git_bash_program, session_resume_args,
+    stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
-    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
+    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
+    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, swap_instances,
+    swap_panes,
 };
 pub use readaloud::{ReadAloudAuto, ReadAloudScope};
 pub use shell::{join_words, split_words};
@@ -504,12 +525,19 @@ pub struct Instance {
     pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Run the saved argv unchanged, without preset injection or session rewriting.
+    #[serde(default)]
+    pub literal_argv: bool,
     /// Optional system prompt delivered to the agent on startup.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// How the system prompt is delivered.
     #[serde(default)]
     pub injection: InjectionMode,
+    /// Frozen separate transport for automatic instructions on a ctl task.
+    /// Older task records omit this and receive no extra typed instructions.
+    #[serde(default)]
+    pub instruction_injection: Option<InjectionMode>,
     /// Name of the preset this instance was created from (for display).
     #[serde(default)]
     pub preset: String,
@@ -531,8 +559,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
-    /// The server that owns the session. Absent only for older saved panes.
-    #[serde(default)]
+    /// The server that owns the session. Absent only for older saved panes (or
+    /// one recorded under a name tmux can't use, see [`tmux::recorded_socket`]).
+    #[serde(default, deserialize_with = "tmux::recorded_socket")]
     pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
@@ -544,7 +573,10 @@ pub struct Instance {
     /// size means nothing has to resize at all.
     #[serde(default)]
     pub grid: Option<(u16, u16)>,
-    /// Worktree directory, once created (becomes this instance's working dir).
+    /// Launch directory supplied by the caller; never owned or removed by muxel.
+    #[serde(default)]
+    pub launch_dir: Option<PathBuf>,
+    /// Owned worktree directory (including legacy worktrees before migration).
     #[serde(default)]
     pub worktree_path: Option<std::path::PathBuf>,
     /// Branch checked out in the worktree.
@@ -561,6 +593,16 @@ pub struct Instance {
     /// Created by a runner (one-off task launcher).
     #[serde(default)]
     pub is_runner: bool,
+    /// A task supplied by `ctl new --prompt`. Erase its text after building the
+    /// first launch plan so a non-resuming relaunch cannot re-type the old task.
+    /// `instruction_injection` keeps the preset's separate rules transport;
+    /// `injection` remains TypeIn for the exact typed user task.
+    #[serde(default)]
+    pub control_prompt: bool,
+    /// Outside creation must never substitute an unapproved fallback shell.
+    /// Retain the launch policy across restore and restart.
+    #[serde(default)]
+    pub control_created: bool,
     /// Press Enter to submit after typing the startup prompt. New instances set
     /// this true; a runner clears it after its first launch so reopening the app
     /// re-types the prompt but does NOT auto-submit it (defaults false for
@@ -579,13 +621,94 @@ pub struct Instance {
     /// on restart. `None` until first launch / for agents without resume support.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Validated provider transcript/rollout path for the saved session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<PathBuf>,
+    /// Last consumed Claude hook receipt. Retain it across same-pane fresh
+    /// starts so a retained hook cannot restore a discarded conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_hook_record: Option<String>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalLaunchReason {
+    NewPane,
+    RunAgain,
+    Restore,
+    ProjectSelection,
+    Restart,
+    Wake,
+    EnsureRunning,
+    Recovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeCleanup {
+    None,
+    Registered(Uuid),
+    Legacy(PathBuf),
+}
+
 impl Instance {
+    /// Called after the launch plan has captured its startup input, before the
+    /// updated instance is persisted. Reusable runners keep their task text.
+    pub fn consume_runner_prompt(&mut self) -> bool {
+        if !self.is_runner {
+            return false;
+        }
+        let changed = self.auto_submit || (self.control_prompt && self.system_prompt.is_some());
+        self.auto_submit = false;
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
+        changed
+    }
+
+    /// Literal commands may replay an opening brief, so only creation and the
+    /// explicit Run again action can start them. Recovery must leave them stopped.
+    pub fn permits_launch(&self, reason: TerminalLaunchReason) -> bool {
+        self.kind == InstanceKind::Terminal
+            && (!self.literal_argv
+                || matches!(
+                    reason,
+                    TerminalLaunchReason::NewPane | TerminalLaunchReason::RunAgain
+                ))
+    }
+
+    pub fn working_directory(&self) -> Option<&std::path::Path> {
+        self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// An unspawned saved literal command is stopped, rather than an idle agent.
+    /// Retained views keep their lifecycle badge, including done after exit.
+    /// Do not show stopped while a user-requested launch is in flight.
+    pub fn is_stopped_literal(&self, has_terminal_view: bool, launching: bool) -> bool {
+        self.literal_argv && self.kind == InstanceKind::Terminal && !has_terminal_view && !launching
+    }
+
+    /// Capture before removing instance metadata. Launch directories never enter
+    /// this plan, even when they happen to be git worktrees of the project repo.
+    pub fn worktree_cleanup(&self) -> WorktreeCleanup {
+        match (self.worktree_id, &self.worktree_path) {
+            (Some(id), _) => WorktreeCleanup::Registered(id),
+            (None, Some(path)) => WorktreeCleanup::Legacy(path.clone()),
+            _ => WorktreeCleanup::None,
+        }
+    }
+
+    pub fn needs_peer_session(&self) -> bool {
+        self.kind == InstanceKind::Terminal
+            && !self.literal_argv
+            && self
+                .tmux_session
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+    }
+
     /// Display label precedence. Empty persisted values do not mask the next
     /// useful source.
     pub fn display_name(&self) -> &str {
@@ -616,8 +739,17 @@ impl Instance {
     /// A duplicated pane copies launch settings, not the source conversation.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
+        self.session_path = None;
+        self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
+        // Duplication is a new local UI action, not the outside launch approval.
+        self.control_created = false;
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane.
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
     }
 
     /// A plain shell instance.
@@ -628,7 +760,7 @@ impl Instance {
     pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
         tmux::SessionTarget::new(
             tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
-            self.tmux_socket,
+            self.tmux_socket.clone(),
         )
     }
 
@@ -645,6 +777,7 @@ impl Instance {
             auto_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
+            literal_argv: false,
             system_prompt: preset.system_prompt.clone(),
             injection: preset.injection.clone(),
             preset: preset.name.clone(),
@@ -656,17 +789,23 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
+            control_created: false,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
             auto_submit: true,
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -709,6 +848,7 @@ impl Instance {
             auto_name: None,
             program: None,
             args: Vec::new(),
+            literal_argv: false,
             system_prompt: None,
             injection: InjectionMode::default(),
             preset: String::new(),
@@ -720,15 +860,21 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
             auto_submit: false,
+            control_created: false,
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -979,6 +1125,11 @@ pub struct Project {
     /// append each finished feature/fix/… to `.muxel/ACCOMPLISHMENTS.md`.
     #[serde(default)]
     pub accomplishments_enabled: bool,
+    /// Inject the reminders instruction into this project's agents, so they append
+    /// reminders the user asks for to `.muxel/REMINDERS.md`, which muxel watches and
+    /// alerts on when each comes due.
+    #[serde(default)]
+    pub reminders_enabled: bool,
     /// Unix-seconds version stamp for this project's pane layout, advanced when the
     /// layout/instances change. Drives newer-wins sync of a remote project's layout
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
@@ -986,10 +1137,21 @@ pub struct Project {
     pub layout_updated_at: Option<u64>,
     /// Panes closed on this project's host whose tmux session muxel has not yet
     /// confirmed dead. Persisted because the confirmation may have to wait for the
-    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// next connect or local project activation — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
+    /// [`RemoteLayout::fingerprint`] of the shared layout doc as this machine last
+    /// wrote or adopted it. Remembered across restarts so a connect can tell a doc
+    /// a peer rewrote while this machine was away (adopt it) from one this machine
+    /// has changes on top of (push them) — see [`connect_layout_action`]. Local
+    /// bookkeeping, never part of the synced layout doc.
+    #[serde(default)]
+    pub layout_synced: Option<String>,
+    /// muxel Cloud overrides of the workspace's team binding (activity sharing,
+    /// team tasks). Local preference; never part of the synced layout doc.
+    #[serde(default, skip_serializing_if = "cloud::ProjectCloud::is_default")]
+    pub cloud: cloud::ProjectCloud,
 }
 
 /// One agent in a project's saved startup set.
@@ -1016,8 +1178,11 @@ impl Project {
             remote: None,
             memory_enabled: false,
             accomplishments_enabled: false,
+            reminders_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
+            layout_synced: None,
+            cloud: cloud::ProjectCloud::default(),
         }
     }
 
@@ -1030,21 +1195,54 @@ impl Project {
     /// the host confirms it is gone. Idempotent per instance: closing, failing to
     /// confirm, and closing again leaves one entry.
     ///
-    /// Capped, oldest first: a host that is never reachable again would otherwise
-    /// grow the ledger without bound, and an entry that old has long stopped
-    /// protecting anything — its instance is gone from the workspace.
+    /// Remote history is capped, oldest first. Local pending kills must all
+    /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
+        let previous = self.closed_sessions.iter().find(|closed| {
+            closed.instance == instance
+                && closed.name == session.name
+                && (closed.socket == session.socket || closed.socket.is_none())
+        });
+        let local_close_token = previous.and_then(|closed| closed.local_close_token);
+        let worktree = self
+            .closed_sessions
+            .iter()
+            .find(|closed| closed.instance == instance)
+            .map_or_else(Default::default, |closed| closed.worktree.clone());
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
             socket: session.socket,
             instance,
+            local_close_token,
+            worktree,
         });
-        let over = self
+        if self.is_remote() {
+            let over = self
+                .closed_sessions
+                .len()
+                .saturating_sub(MAX_CLOSED_SESSIONS);
+            self.closed_sessions.drain(..over);
+        }
+    }
+
+    /// Record where a remembered close's pane ran.
+    pub fn set_closed_worktree(&mut self, instance: Uuid, worktree: tmux::ClosedWorktree) {
+        if let Some(closed) = self
             .closed_sessions
-            .len()
-            .saturating_sub(MAX_CLOSED_SESSIONS);
-        self.closed_sessions.drain(..over);
+            .iter_mut()
+            .find(|closed| closed.instance == instance)
+        {
+            closed.worktree = worktree;
+        }
+    }
+
+    /// Whether an unconfirmed kill could be for a pane that ran in the worktree
+    /// at `path`. Other panes' kills say nothing about those files.
+    pub fn close_pending_in(&self, path: &std::path::Path) -> bool {
+        self.closed_sessions
+            .iter()
+            .any(|closed| closed.worktree.may_be(path))
     }
 
     /// Forget a close whose session the host has confirmed gone.
@@ -1127,9 +1325,15 @@ pub struct Workspace {
     /// Persisted accomplishments-panel sidebar width in pixels (None = default).
     #[serde(default)]
     pub accomplishments_panel_width: Option<f32>,
+    /// Persisted reminders-panel sidebar width in pixels (None = default).
+    #[serde(default)]
+    pub reminders_panel_width: Option<f32>,
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
+    /// Whether the sidebar's NOTIFICATIONS section is collapsed to its header.
+    #[serde(default)]
+    pub notifications_collapsed: bool,
     /// Named git worktrees, referenced by instances via `Instance.worktree_id`.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1138,6 +1342,36 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+    /// muxel Cloud team binding; `None` = a private workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<cloud::WorkspaceCloud>,
+    /// Panes started on a task (instance id → task id). Kept here rather than
+    /// on `Instance`, whose serialization is shared with remote peers.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub task_links: std::collections::HashMap<Uuid, Uuid>,
+    /// Persisted Tasks panel width in pixels (None = default).
+    #[serde(default)]
+    pub tasks_panel_width: Option<f32>,
+}
+
+#[cfg(test)]
+mod workspace_notifications_tests {
+    use super::Workspace;
+
+    #[test]
+    fn notifications_collapsed_defaults_off_and_round_trips() {
+        let old: Workspace =
+            serde_json::from_str(r#"{"projects":[],"active_project":null,"instances":[]}"#)
+                .unwrap();
+        assert!(!old.notifications_collapsed);
+
+        let ws = Workspace {
+            notifications_collapsed: true,
+            ..Workspace::default()
+        };
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(back.notifications_collapsed);
+    }
 }
 
 /// Where a project's dedicated window lives: which monitor (stable UUID) and
@@ -1252,6 +1486,20 @@ impl Workspace {
         self.worktrees.retain(|w| w.id != id);
     }
 
+    /// Where `instance` runs, for its close's ledger entry. Capture before
+    /// removing its metadata.
+    pub fn closed_worktree_of(&self, instance: &Instance) -> tmux::ClosedWorktree {
+        match (instance.worktree_id, &instance.worktree_path) {
+            (Some(id), _) => self
+                .worktree(id)
+                .map_or(tmux::ClosedWorktree::Unknown, |worktree| {
+                    tmux::ClosedWorktree::In(worktree.path.clone())
+                }),
+            (None, Some(path)) => tmux::ClosedWorktree::In(path.clone()),
+            (None, None) => tmux::ClosedWorktree::Outside,
+        }
+    }
+
     /// Instance ids currently referencing `worktree_id`.
     pub fn instances_using(&self, worktree_id: Uuid) -> Vec<Uuid> {
         self.instances
@@ -1263,6 +1511,26 @@ impl Workspace {
 
     /// Next color index for a new worktree in `project_id`: the lowest unused
     /// slot 0..8 among the project's live (non-detached) worktrees, wrapping.
+    /// Detach each worktree `candidate` selects that no pane uses. The sidebar
+    /// lists a pane-less worktree only when detached, so one left attached can't
+    /// be reached. Instances held for close still count as using theirs. Returns
+    /// whether anything changed.
+    pub fn detach_unused_worktrees(&mut self, candidate: impl Fn(&Worktree) -> bool) -> bool {
+        let used: std::collections::HashSet<Uuid> = self
+            .instances
+            .iter()
+            .filter_map(|i| i.worktree_id)
+            .collect();
+        let mut changed = false;
+        for worktree in &mut self.worktrees {
+            if !worktree.detached && !used.contains(&worktree.id) && candidate(worktree) {
+                worktree.detached = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn next_worktree_color(&self, project_id: Uuid) -> u8 {
         let used: Vec<u8> = self
             .worktrees
@@ -1292,7 +1560,7 @@ pub struct RemoteLayout {
     /// project and is ignored.
     pub remote_root: String,
     pub layout: Option<PaneNode>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_shared_instances")]
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1315,6 +1583,37 @@ pub struct RemoteLayout {
     /// the host appends to the one file. `None` = a doc from before the field.
     #[serde(default)]
     pub accomplishments_enabled: Option<bool>,
+    /// Whether the project's reminders (`.muxel/REMINDERS.md`) are on. Shared for
+    /// the same reason: agents on every machine append to the one file. `None` = a
+    /// doc from before the field.
+    #[serde(default)]
+    pub reminders_enabled: Option<bool>,
+}
+
+// Local Workspace persistence keeps these fields; the shared document omits them.
+fn serialize_shared_instances<S: serde::Serializer>(
+    instances: &[Instance],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+
+    let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
+    for instance in instances {
+        let antigravity = is_antigravity_program(instance.program.as_deref());
+        if instance.claude_hook_record.is_some() || antigravity {
+            let mut shared = instance.clone();
+            shared.claude_hook_record = None;
+            if antigravity {
+                shared.session_id = None;
+                shared.session_path = None;
+                shared.session_started = false;
+            }
+            sequence.serialize_element(&shared)?;
+        } else {
+            sequence.serialize_element(instance)?;
+        }
+    }
+    sequence.end()
 }
 
 impl RemoteLayout {
@@ -1356,6 +1655,7 @@ impl RemoteLayout {
             worktrees,
             memory_enabled: Some(project.memory_enabled),
             accomplishments_enabled: Some(project.accomplishments_enabled),
+            reminders_enabled: Some(project.reminders_enabled),
         }
     }
 
@@ -1364,6 +1664,15 @@ impl RemoteLayout {
     pub fn parse(json: &str, expect_root: &str) -> Option<Self> {
         let doc: Self = serde_json::from_str(json).ok()?;
         (doc.version == REMOTE_LAYOUT_VERSION && doc.remote_root == expect_root).then_some(doc)
+    }
+
+    /// Whether the doc has any panes. A folder opened as a new project may already
+    /// be worked in from elsewhere — a remote project another machine keeps on this
+    /// one, or the iOS app — and then these are the panes opening it should show.
+    pub fn has_panes(&self) -> bool {
+        self.layout
+            .as_ref()
+            .is_some_and(|layout| layout.first_instance().is_some())
     }
 
     /// Pretty JSON for storage on the remote.
@@ -1379,8 +1688,9 @@ impl RemoteLayout {
     /// Per-machine state is left out, so it never reads as a layout change: the
     /// owning project's id (every machine has its own id for the same project) and
     /// what this machine observes of a pane — its program-supplied title, terminal
-    /// grid and agent activity. Counting those pushed the layout on every resize
-    /// and agent turn, and made two peers look out of sync when nothing differed.
+    /// grid, agent activity and consumed hook receipts. Counting those pushed the
+    /// layout on every resize and agent turn, and made two peers look out of sync
+    /// when nothing differed.
     pub fn content_key(&self) -> String {
         self.key(false)
     }
@@ -1398,6 +1708,18 @@ impl RemoteLayout {
         self.key(true)
     }
 
+    /// A short fingerprint of a [`content_key`](Self::content_key), so a project can
+    /// remember which doc it last synced ([`Project::layout_synced`]) without
+    /// storing the whole layout a second time. FNV-1a rather than DefaultHasher,
+    /// whose output may change with Rust releases and would forget every project's
+    /// sync across an upgrade.
+    pub fn fingerprint(key: &str) -> String {
+        let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        format!("{hash:016x}")
+    }
+
     fn key(&self, edits_only: bool) -> String {
         let instances: Vec<Instance> = self
             .instances
@@ -1406,14 +1728,18 @@ impl RemoteLayout {
             .map(|mut instance| {
                 instance.project_id = Uuid::nil();
                 instance.auto_name = None;
+                instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
-                    instance.session_id = None;
-                    instance.session_started = false;
                     instance.auto_submit = false;
+                }
+                if edits_only || is_antigravity_program(instance.program.as_deref()) {
+                    instance.session_id = None;
+                    instance.session_path = None;
+                    instance.session_started = false;
                 }
                 instance
             })
@@ -1435,6 +1761,7 @@ impl RemoteLayout {
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
             "accomplishments_enabled": self.accomplishments_enabled,
+            "reminders_enabled": self.reminders_enabled,
         })
         .to_string()
     }
@@ -1474,6 +1801,44 @@ pub fn peer_layout_action(
     }
 }
 
+/// Decide a connect's first sync with the shared file (`remote`) by the live-poll
+/// rule ([`peer_layout_action`]), with the doc this machine last wrote or adopted
+/// known only by its persisted fingerprint, `synced` ([`Project::layout_synced`]).
+///
+/// Without it, a connect could only compare revisions, and a tie went to this
+/// machine. But a peer catching up on session bookkeeping — rebinding a pane's
+/// tmux session, picking up the conversation a pane moved to — pushes without a
+/// new revision (see [`RemoteLayout::edit_key`]). A machine coming back with its
+/// old copy then pushed that copy's stale bookkeeping over the peer's: panes
+/// pointed back at a server their session had left, and at conversations they
+/// had moved on from, which the next restart would resume. Knowing it has changed
+/// nothing since its last sync, this machine adopts the file instead. When the
+/// fingerprint matches neither side (both changed, or a doc from before this was
+/// remembered) the revisions decide, as before.
+pub fn connect_layout_action(
+    remote: &RemoteLayout,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> PeerLayoutAction {
+    let remote_key = remote.content_key();
+    let known = |key: &str| synced == Some(RemoteLayout::fingerprint(key).as_str());
+    let synced_key = if known(&remote_key) {
+        Some(remote_key.as_str())
+    } else if known(local_key) {
+        Some(local_key)
+    } else {
+        None
+    };
+    peer_layout_action(
+        &remote_key,
+        remote.updated_at,
+        synced_key,
+        local_key,
+        local_rev,
+    )
+}
+
 /// Whether writing this machine's layout over the shared file as it stands now
 /// would undo a peer: the file holds a write this machine hasn't seen, and under
 /// [`peer_layout_action`]'s rule that write wins. The push must then adopt it and
@@ -1494,11 +1859,75 @@ pub fn push_overwrites_peer(
     ) == PeerLayoutAction::Adopt
 }
 
+/// Panes in the shared file a peer opened that this machine has never had: neither
+/// in the doc it last wrote or adopted (`synced`, a [`RemoteLayout::content_key`])
+/// nor in its own layout (`local`), not even as another pane on the same tmux
+/// session. In the file's reading order.
+///
+/// A push whose own change is newer than the file's would write over them, though
+/// they were never closed: their panes would be gone on every machine while their
+/// agents ran on. Without `synced` nothing is reported, since a pane this machine
+/// closed then looks the same as one it never had.
+pub fn unseen_peer_panes(
+    file: &RemoteLayout,
+    synced: Option<&str>,
+    local: &RemoteLayout,
+) -> Vec<Uuid> {
+    let Some(seen) = synced.and_then(content_key_instances) else {
+        return Vec::new();
+    };
+    let Some(layout) = &file.layout else {
+        return Vec::new();
+    };
+    let shown_here = |session: &Option<String>| {
+        session.is_some() && local.instances.iter().any(|i| i.tmux_session == *session)
+    };
+    layout
+        .collect_instances()
+        .into_iter()
+        .filter(|id| {
+            !seen.contains(id)
+                && !local.instances.iter().any(|i| i.id == *id)
+                && file
+                    .instances
+                    .iter()
+                    .any(|i| i.id == *id && !shown_here(&i.tmux_session))
+        })
+        .collect()
+}
+
+/// The pane ids a [`RemoteLayout::content_key`] lists.
+fn content_key_instances(key: &str) -> Option<std::collections::HashSet<Uuid>> {
+    let key: serde_json::Value = serde_json::from_str(key).ok()?;
+    Some(
+        key.get("instances")?
+            .as_array()?
+            .iter()
+            .filter_map(|instance| instance.get("id")?.as_str()?.parse().ok())
+            .collect(),
+    )
+}
+
+/// The revision for closing a tmux pane because its session ended (a peer closed the
+/// pane, or the program in it quit), given the revision the project had.
+///
+/// Every machine showing the pane closes it when its client exits, but one back from
+/// sleep only notices then. Stamped with that moment, its close outranked everything
+/// its peers did meanwhile, and newer-wins pushed its stale copy of the layout over
+/// theirs: a pane a peer opened while it slept was dropped there, its agent left
+/// running with no pane. One past the revision it had orders the close after what
+/// this machine has seen and behind any edit a peer made since, so the push takes
+/// the peer's layout instead ([`push_overwrites_peer`]).
+pub fn observed_close_revision(current: Option<u64>) -> u64 {
+    current.unwrap_or(0).saturating_add(1)
+}
+
 /// A peer layout's instances as this machine should hold them: every one the peer
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
 /// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content.
+/// and never part of the shared content. A validated rollout path survives a peer
+/// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
     peer: Vec<Instance>,
@@ -1507,8 +1936,23 @@ pub fn merge_peer_instances(
     peer.into_iter()
         .map(|mut instance| {
             instance.project_id = project_id;
-            if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
+            // A peer's consumed receipt says nothing about this machine, even
+            // when this is the first time it has seen the pane.
+            instance.claude_hook_record = None;
+            let mine = local.iter().find(|l| l.id == instance.id);
+            let antigravity = is_antigravity_program(instance.program.as_deref());
+            let local_antigravity =
+                mine.filter(|local| is_antigravity_program(local.program.as_deref()));
+            if antigravity {
+                instance.session_id = local_antigravity.and_then(|local| local.session_id.clone());
+                instance.session_path =
+                    local_antigravity.and_then(|local| local.session_path.clone());
+                instance.session_started =
+                    local_antigravity.is_some_and(|local| local.session_started);
+            }
+            if let Some(mine) = mine {
                 instance.auto_name = mine.auto_name.clone();
+                instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
                 // Older peers cannot write socket ownership. Preserve an already
@@ -1518,11 +1962,89 @@ pub fn merge_peer_instances(
                         || instance.tmux_session == mine.tmux_session)
                 {
                     instance.tmux_session = mine.tmux_session.clone();
-                    instance.tmux_socket = mine.tmux_socket;
+                    instance.tmux_socket = mine.tmux_socket.clone();
+                } else if moved_off_default(&instance, mine) {
+                    instance.tmux_socket = mine.tmux_socket.clone();
+                }
+                if !antigravity
+                    && local_antigravity.is_none()
+                    && instance.session_id.is_some()
+                    && instance.session_id == mine.session_id
+                {
+                    instance.session_path =
+                        mine.session_path.clone().or(instance.session_path.take());
+                }
+                // Older peers drop the outside-creation launch policy too, which
+                // would turn a literal command back into a tmux-wrapped,
+                // auto-restored pane allowed a fallback shell. A missing value
+                // can't be told apart from a cleared one, but nothing clears
+                // these on an existing pane: they are set once at creation (a
+                // duplicate is a new id), so absent always means "not known here".
+                instance.literal_argv |= mine.literal_argv;
+                instance.control_created |= mine.control_created;
+                instance.control_prompt |= mine.control_prompt;
+                if instance.launch_dir.is_none() {
+                    instance.launch_dir = mine.launch_dir.clone();
+                }
+                if instance.instruction_injection.is_none() {
+                    instance.instruction_injection = mine.instruction_injection.clone();
                 }
             }
             instance
         })
+        .collect()
+}
+
+/// Whether `moved` has already taken `stale`'s session off the default tmux
+/// server: both name the same session, `stale` on Default and `moved` on muxel's
+/// own. No client creates a session on Default any more, so that move is one-way,
+/// and a copy of the pane that predates it (a peer's layout, or this machine's
+/// own unpushed one) must not undo it. Undone, the pane would refuse to launch
+/// (Default is gone and `mxl` has the namesake) and closing it would kill on
+/// Default, orphaning the agent on `mxl`. A literal pane runs no session, so
+/// its stale tmux fields never take part in a move.
+pub fn moved_off_default(stale: &Instance, moved: &Instance) -> bool {
+    !stale.literal_argv
+        && !moved.literal_argv
+        && stale.tmux_socket == Some(tmux::Socket::Default)
+        && moved.tmux_socket == Some(tmux::Socket::Private)
+        && stale.tmux_session.is_some()
+        && stale.tmux_session == moved.tmux_session
+}
+
+/// Before this machine's layout (`local`) overwrites the shared file: keep every
+/// Default→`mxl` move the file records that `local` doesn't have yet (see
+/// [`moved_off_default`]). Returns the panes it moved, with their session names,
+/// for this machine to make the same move.
+pub fn keep_moves_off_default(local: &mut [Instance], file: &[Instance]) -> Vec<(Uuid, String)> {
+    let mut moved = Vec::new();
+    for instance in local {
+        if let Some(theirs) = file.iter().find(|f| f.id == instance.id)
+            && moved_off_default(instance, theirs)
+            && let Some(name) = instance.tmux_session.clone()
+        {
+            instance.tmux_socket = theirs.tmux_socket.clone();
+            moved.push((instance.id, name));
+        }
+    }
+    moved
+}
+
+/// The panes in both `before` and `after` whose tmux binding (session name and
+/// owner) differs between them: after a peer layout is adopted, a pane that failed
+/// to launch on its old binding can try the new one. A literal pane has no tmux
+/// transport, so a peer's stale binding never retries it.
+pub fn rebound_instances(before: &[Instance], after: &[Instance]) -> Vec<Uuid> {
+    after
+        .iter()
+        .filter(|now| !now.literal_argv)
+        .filter(|now| {
+            before.iter().any(|was| {
+                was.id == now.id
+                    && (was.tmux_session != now.tmux_session || was.tmux_socket != now.tmux_socket)
+            })
+        })
+        .map(|now| now.id)
         .collect()
 }
 
@@ -1553,7 +2075,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket.clone(), s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -1605,6 +2127,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -1789,6 +2312,10 @@ pub fn migrate_worktrees(workspace: &mut Workspace) {
     }
 }
 
+fn default_sound_volume() -> u8 {
+    sound_alert::DEFAULT_VOLUME
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1816,6 +2343,35 @@ fn default_pane_border() -> String {
 fn default_terminal_mouse() -> String {
     "copy_paste".to_string()
 }
+
+fn default_new_agent_placement() -> String {
+    NEW_AGENT_TAB.to_string()
+}
+
+/// [`Settings::new_agent_placement`]: a new agent joins the focused pane as a tab.
+pub const NEW_AGENT_TAB: &str = "tab";
+/// [`Settings::new_agent_placement`]: a new agent gets a pane of its own.
+pub const NEW_AGENT_PANE: &str = "pane";
+
+fn default_sound_done_when() -> String {
+    DONE_CHIME_BACKGROUND.to_string()
+}
+
+/// [`Settings::sound_done_when`]: the done chime rings only for a pane you
+/// aren't looking at.
+pub const DONE_CHIME_BACKGROUND: &str = "background";
+/// [`Settings::sound_done_when`]: the done chime also rings for the pane you're
+/// looking at.
+pub const DONE_CHIME_ALWAYS: &str = "always";
+
+fn default_reminder_alert() -> String {
+    REMINDER_ALERT_POPUP.to_string()
+}
+
+/// [`Settings::reminder_alert`]: a due reminder opens a dialog in muxel.
+pub const REMINDER_ALERT_POPUP: &str = "popup";
+/// [`Settings::reminder_alert`]: a due reminder sends a desktop notification.
+pub const REMINDER_ALERT_NOTIFICATION: &str = "notification";
 
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1882,24 +2438,110 @@ impl Runner {
         instance
     }
 
-    /// Built-in example runners.
+    /// Built-in example runners. They run in auto mode, so each prompt forbids
+    /// edits (Security Review fixes only the findings the user then picks), and
+    /// the scope covers staged, untracked and branch work (a worktree's agent may
+    /// already have committed it).
     pub fn defaults() -> Vec<Runner> {
         vec![
             Runner::new(
                 "Review",
-                "Review the current changes (git diff) for correctness, bugs, and \
-                 code quality. Call out specific issues with file:line references and \
-                 suggest concrete fixes.\n\n{{input}}",
+                "Review the current code changes for bugs and correctness problems. \
+                 This is a read-only review: don't edit, stage, or commit anything; \
+                 I'll decide what to fix.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Read the surrounding code, callers, and tests, not just the diff \
+                 hunks, so you judge each change in context.\n\
+                 - Look for logic errors, mishandled edge cases (empty, missing, \
+                 boundary, concurrent), errors that are swallowed or misreported, \
+                 resource leaks, behavior changes that break existing callers, and \
+                 new behavior with missing or wrong tests.\n\
+                 - Confirm each suspicion before reporting it; you may run the \
+                 existing tests or a quick read-only check. Drop anything you can't \
+                 back up.\n\
+                 - Skip style and formatting preferences.\n\
+                 \n\
+                 Report findings most severe first. For each: file:line, what's \
+                 wrong, a concrete scenario where it fails (input or state, then the \
+                 wrong result), and the fix you'd make. If nothing needs fixing, say \
+                 so plainly instead of padding the list. End with a one-line verdict: \
+                 ready to merge, or what must change first.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
             Runner::new(
                 "Security Review",
-                "Perform a security review of the current changes (git diff). Look for \
-                 injection, auth/authorization gaps, unsafe input handling, leaked \
-                 secrets, and risky dependencies. Report findings with severity and \
-                 file:line.\n\n{{input}}",
+                "Do a security review of the current code changes. Don't edit, \
+                 stage, or commit anything until I've chosen what to fix, and don't \
+                 run exploits against live systems.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Work out where untrusted data enters (network requests, files, \
+                 command-line arguments, environment, IPC, user or third-party \
+                 content) and trace it through the changed code, reading callers \
+                 and helpers outside the diff as needed.\n\
+                 - Look for injection (shell, SQL, path traversal, templates, XSS), \
+                 missing or bypassable authentication and authorization, unsafe \
+                 deserialization, SSRF, secrets in code or logs, weak crypto or \
+                 randomness, unsafe file handling (permissions, symlinks, races), \
+                 memory-unsafe code, unbounded resource use, and new or upgraded \
+                 dependencies with known problems.\n\
+                 - Report only issues with a plausible attack path. A pre-existing \
+                 problem counts only if this change introduces, exposes, or \
+                 worsens it.\n\
+                 \n\
+                 Present your findings as a table ranked from highest to lowest \
+                 priority (severity first, then how likely the attack is), with the \
+                 columns #, Severity (Critical, High, Medium, Low, or Info for minor \
+                 hardening ideas), Issue, Location (file:line), and Recommendation \
+                 (fix now, fix later, or accept the risk). Under the table, give each \
+                 finding a short note by number: who the attacker is and what they \
+                 control, what they gain, and the fix. If you find nothing \
+                 exploitable, say so plainly; don't inflate severity to fill the \
+                 table.\n\
+                 \n\
+                 Then recommend which findings to fix (for example, \"I'd fix 1, 2 \
+                 and 4\"), ask me which ones you should fix, and stop until I answer. \
+                 Fix only the ones I pick, then run the relevant tests and summarize \
+                 what you changed.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
         ]
     }
+
+    /// The built-in runner prompts before v19, by runner name. An unedited copy
+    /// of one is replaced with the current built-in prompt.
+    const LEGACY_PROMPTS: [(&'static str, &'static str); 2] = [
+        (
+            "Review",
+            "Review the current changes (git diff) for correctness, bugs, and \
+             code quality. Call out specific issues with file:line references and \
+             suggest concrete fixes.\n\n{{input}}",
+        ),
+        (
+            "Security Review",
+            "Perform a security review of the current changes (git diff). Look for \
+             injection, auth/authorization gaps, unsafe input handling, leaked \
+             secrets, and risky dependencies. Report findings with severity and \
+             file:line.\n\n{{input}}",
+        ),
+    ];
 }
 
 /// A reusable snippet of text typed into an **already-running** pane on demand
@@ -2133,11 +2775,12 @@ pub struct Settings {
     /// Close a pane automatically when its process exits.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
-    /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on (they hold a running process); editors/diffs default off (cheap to
-    /// reopen, nothing is lost).
+    /// Ask before closing a busy or uncertain terminal (default on). A quiet
+    /// one counts down with Undo either way.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
+    /// No longer used: a dirty editor always offers Save, and a clean editor
+    /// or diff pane closes at once. Kept so older settings still load.
     #[serde(default)]
     pub confirm_close_editor: bool,
     #[serde(default)]
@@ -2189,6 +2832,11 @@ pub struct Settings {
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
+    /// Where the toolbar's agent button and Ctrl+Alt+1–9 put a new agent:
+    /// [`NEW_AGENT_TAB`] (in the focused pane) or [`NEW_AGENT_PANE`] (a new pane
+    /// beside it). Anything else reads as a tab.
+    #[serde(default = "default_new_agent_placement")]
+    pub new_agent_placement: String,
     /// Diff window layout: `true` = side-by-side split, `false` = unified.
     #[serde(default)]
     pub diff_split_view: bool,
@@ -2199,6 +2847,10 @@ pub struct Settings {
     /// Enable the developer console (a popped-out error log toggled with F12).
     #[serde(default)]
     pub dev_console_enabled: bool,
+    /// Settings opens in a window of its own, which can sit outside the main
+    /// window, rather than as a dialog over it.
+    #[serde(default)]
+    pub settings_floating: bool,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -2246,6 +2898,9 @@ pub struct Settings {
     /// Which transcription engine dictation uses.
     #[serde(default)]
     pub stt_engine: SttEngine,
+    /// muxel Cloud preferences (`[cloud]`). Credentials live in the keychain.
+    #[serde(default)]
+    pub cloud: cloud::CloudSettings,
     /// whisper.cpp model for the local engine (`tiny` | `base` | `small` | …).
     #[serde(default = "default_stt_model")]
     pub stt_model: String,
@@ -2326,13 +2981,67 @@ pub struct Settings {
     /// Stop after about this many characters, at a sentence (0 = read it all).
     #[serde(default)]
     pub read_aloud_max_chars: u32,
+    // --- Sound alerts (see `sound_alert`) ---
+    /// Chime when an agent finishes a turn in a pane you aren't watching.
+    #[serde(default = "default_true")]
+    pub sound_on_done: bool,
+    /// Which panes the done chime rings for: [`DONE_CHIME_BACKGROUND`] (only
+    /// one you aren't looking at) or [`DONE_CHIME_ALWAYS`] (the one you're
+    /// looking at too). Anything else reads as background.
+    #[serde(default = "default_sound_done_when")]
+    pub sound_done_when: String,
+    /// Chime when an agent is blocked waiting on you.
+    #[serde(default = "default_true")]
+    pub sound_on_blocked: bool,
+    /// The user's own sound for Done (WAV, MP3, OGG, FLAC, …); `None` plays the
+    /// built-in chime (`chime`).
+    #[serde(default)]
+    pub sound_done_file: Option<PathBuf>,
+    /// The user's own sound for Blocked; `None` plays the built-in chime.
+    #[serde(default)]
+    pub sound_blocked_file: Option<PathBuf>,
+    /// Alert volume, 0–100.
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: u8,
+    // --- Reminders (see `reminders`) ---
+    /// How a due reminder alerts: [`REMINDER_ALERT_POPUP`] (a dialog in muxel, which
+    /// raises its window) or [`REMINDER_ALERT_NOTIFICATION`] (a desktop
+    /// notification). Anything else reads as popup.
+    #[serde(default = "default_reminder_alert")]
+    pub reminder_alert: String,
+    /// Repeat the reminder sound until the user silences or dismisses it.
+    #[serde(default = "default_true")]
+    pub reminder_sound: bool,
+    /// The user's own sound for reminders; `None` plays the built-in chime.
+    #[serde(default)]
+    pub reminder_sound_file: Option<PathBuf>,
+    // --- New tasks from muxel Cloud ---
+    /// Chime when a sync brings a task you didn't have (from another computer
+    /// or a teammate).
+    #[serde(default = "default_true")]
+    pub task_sound: bool,
+    /// The user's own sound for new tasks; `None` plays the built-in chime.
+    #[serde(default)]
+    pub task_sound_file: Option<PathBuf>,
+    /// Show a desktop notification for new tasks.
+    #[serde(default = "default_true")]
+    pub task_notify: bool,
     // --- Outside control (`muxel ctl`; see `control`) ---
     /// Let other programs on this computer (an orchestrating agent such as Grok
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
     #[serde(default)]
     pub control_enabled: bool,
-    /// …including typing into shell panes, which is running commands. Off by
-    /// default: outside control reaches coding agents only.
+    /// Off / Ask / Allow for outside terminal creation. Allow opens only presets
+    /// running a known agent provider; every other program Asks. Literal argv and
+    /// shell presets always Ask and also require control_allow_shells. A bool
+    /// from a development build loads as Off / Ask. Revocation refuses pending
+    /// approvals, not existing panes.
+    #[serde(default)]
+    pub control_allow_new: control::CreationPolicy,
+    /// Also allow typing into shell panes and `ctl new` shell presets/defaults
+    /// or any literal argv. Commands run as the host muxel process, outside the
+    /// caller's sandbox. Off by default; non-literal agent writes need only global
+    /// outside control. Creation also requires a non-Off control_allow_new policy.
     #[serde(default)]
     pub control_allow_shells: bool,
     // --- Team libraries (`library`) ---
@@ -2349,6 +3058,62 @@ pub struct Settings {
     /// older entries are pruned from `.muxel/ACCOMPLISHMENTS.md`.
     #[serde(default = "default_accomplishment_retention_days")]
     pub accomplishment_retention_days: u32,
+    /// Turn shared memory on for every project created from now on.
+    #[serde(default)]
+    pub new_project_memory: bool,
+    /// Turn the accomplishment log on for every project created from now on.
+    #[serde(default)]
+    pub new_project_accomplishments: bool,
+    /// Turn reminders on for every project created from now on.
+    #[serde(default)]
+    pub new_project_reminders: bool,
+    /// The memory limit for local panes, in GB (0 = no limit). On Windows it
+    /// is how much each process a pane starts may commit: a process that asks
+    /// for more is refused, which usually stops it. On Linux it is how much the
+    /// pane's processes may use together (a systemd scope's `MemoryMax`): when
+    /// they reach it, the kernel kills the largest. Elsewhere it does nothing.
+    #[serde(default = "default_pane_memory_limit_gb")]
+    pub pane_memory_limit_gb: u32,
+}
+
+/// Default per-process memory limit for local panes, in GB, fitted to a
+/// measured developer workload: on a 64 GB machine the largest legitimate
+/// process peaked near 6 GB committed (a local Node service); rustc building
+/// and testing this workspace peaked under 5 GB and the linker near 2 GB.
+/// 16 GB is more than twice the largest of those. Workloads outside that
+/// (large JVM heaps, LTO links, local model runners) can legitimately need
+/// more, which is what the setting is for. The limit only bounds one process;
+/// it reserves nothing, so it can't stop a machine with less free commit than
+/// the limit from running out.
+pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
+
+fn default_pane_memory_limit_gb() -> u32 {
+    DEFAULT_PANE_MEMORY_LIMIT_GB
+}
+
+impl Settings {
+    /// The memory limit for new local panes, in bytes; `None` when off.
+    pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
+        (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
+
+    /// Whether new agents get a pane of their own rather than a tab in the
+    /// focused pane (see [`Settings::new_agent_placement`]).
+    pub fn new_agents_open_as_panes(&self) -> bool {
+        self.new_agent_placement == NEW_AGENT_PANE
+    }
+
+    /// Whether the done chime also rings for the pane you're looking at (see
+    /// [`Settings::sound_done_when`]).
+    pub fn done_chime_always(&self) -> bool {
+        self.sound_done_when == DONE_CHIME_ALWAYS
+    }
+
+    /// Whether a due reminder alerts with a desktop notification rather than a
+    /// popup (see [`Settings::reminder_alert`]).
+    pub fn reminder_notifies(&self) -> bool {
+        self.reminder_alert == REMINDER_ALERT_NOTIFICATION
+    }
 }
 
 fn default_stt_model() -> String {
@@ -2544,6 +3309,7 @@ mod instance_tests {
         instance.custom_name = Some("Manual name".into());
         instance.auto_name = Some("Generated title".into());
         instance.session_id = Some(Uuid::new_v4().to_string());
+        instance.claude_hook_record = Some("consumed receipt".into());
         instance.session_started = true;
 
         instance.reset_conversation_for_duplicate();
@@ -2551,7 +3317,29 @@ mod instance_tests {
         assert_eq!(instance.custom_name.as_deref(), Some("Manual name"));
         assert_eq!(instance.auto_name, None);
         assert_eq!(instance.session_id, None);
+        assert_eq!(instance.claude_hook_record, None);
         assert!(!instance.session_started);
+    }
+
+    #[test]
+    fn duplicate_never_carries_an_unconsumed_outside_task() {
+        let mut task = Instance::shell(Uuid::new_v4());
+        task.is_runner = true;
+        task.control_prompt = true;
+        task.control_created = true;
+        task.system_prompt = Some("deploy the branch".into());
+        task.reset_conversation_for_duplicate();
+        assert_eq!(task.system_prompt, None);
+        assert!(!task.control_created);
+        // An ordinary runner's prompt is its reusable launch setting.
+        let mut runner = Instance::shell(Uuid::new_v4());
+        runner.is_runner = true;
+        runner.system_prompt = Some("Review the current changes".into());
+        runner.reset_conversation_for_duplicate();
+        assert_eq!(
+            runner.system_prompt.as_deref(),
+            Some("Review the current changes")
+        );
     }
 }
 
@@ -2598,9 +3386,11 @@ impl Default for Settings {
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
+            new_agent_placement: default_new_agent_placement(),
             diff_split_view: false,
             minimize_to_tray: false,
             dev_console_enabled: false,
+            settings_floating: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             snippets: Snippet::defaults(),
@@ -2615,6 +3405,7 @@ impl Default for Settings {
             editor_line_numbers: true,
             editor_indent_guides: true,
             stt_engine: SttEngine::default(),
+            cloud: cloud::CloudSettings::default(),
             stt_model: default_stt_model(),
             stt_language: String::new(),
             stt_provider_url: default_stt_provider_url(),
@@ -2638,13 +3429,50 @@ impl Default for Settings {
             read_aloud_short_paths: true,
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
+            sound_on_done: true,
+            sound_done_when: default_sound_done_when(),
+            sound_on_blocked: true,
+            sound_done_file: None,
+            sound_blocked_file: None,
+            sound_volume: sound_alert::DEFAULT_VOLUME,
+            reminder_alert: default_reminder_alert(),
+            reminder_sound: true,
+            reminder_sound_file: None,
+            task_sound: true,
+            task_sound_file: None,
+            task_notify: true,
             control_enabled: false,
+            control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
             libraries: Vec::new(),
             shared_loops: Vec::new(),
             shared_runner_confirmations: Vec::new(),
             accomplishment_retention_days: default_accomplishment_retention_days(),
+            new_project_memory: false,
+            new_project_accomplishments: false,
+            new_project_reminders: false,
+            pane_memory_limit_gb: default_pane_memory_limit_gb(),
         }
+    }
+}
+
+impl Settings {
+    /// A project created from now on, with the features these settings turn on
+    /// for new projects.
+    pub fn new_project(&self, name: impl Into<String>, root_path: impl Into<PathBuf>) -> Project {
+        let mut project = Project::new(name, root_path);
+        project.memory_enabled = self.new_project_memory;
+        project.accomplishments_enabled = self.new_project_accomplishments;
+        project.reminders_enabled = self.new_project_reminders;
+        project
+    }
+
+    /// Where the global default preset is in `presets`: the one whose id, or
+    /// (as older settings hold it) name, `default_preset` gives.
+    pub fn default_preset_index(&self, presets: &[AgentPreset]) -> Option<usize> {
+        presets
+            .iter()
+            .position(|p| p.id.to_string() == self.default_preset || p.name == self.default_preset)
     }
 }
 
@@ -2663,7 +3491,10 @@ impl Default for Settings {
 /// v16: added the Windows Git Bash preset.
 /// v17: Grok preset gains a runner startup delay (its output never goes quiet).
 /// v18: added the Muse Code preset.
-pub const PRESET_SEED_VERSION: u32 = 18;
+/// v19: refreshed the built-in Review and Security Review runner prompts.
+/// v20: added the Antigravity (agy) preset.
+/// v21: added the Gemini CLI (gemini) preset.
+pub const PRESET_SEED_VERSION: u32 = 21;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2682,8 +3513,10 @@ impl Settings {
     }
 
     /// Apply pending built-in migrations, matching presets by name. The v18
-    /// migration only adds Muse; older catch-up migrations must not replay over
-    /// choices saved at v17. Returns whether settings should be persisted.
+    /// migration only adds Muse, v19 only refreshes unedited built-in runner
+    /// prompts, v20 only adds Antigravity, and v21 only adds Gemini CLI; older
+    /// catch-up migrations must not replay over choices saved at v17. Returns
+    /// whether settings should be persisted.
     pub fn seed_builtin_presets(&mut self) -> bool {
         if self.preset_seed_version >= PRESET_SEED_VERSION {
             return false;
@@ -2691,10 +3524,9 @@ impl Settings {
         // Preserve the historical catch-up for installs that have not reached
         // v17. Later additions have their own migration below.
         if self.preset_seed_version < 17 {
-            for builtin in AgentPreset::defaults()
-                .into_iter()
-                .filter(|p| p.name != "Muse Code")
-            {
+            for builtin in AgentPreset::defaults().into_iter().filter(|p| {
+                p.name != "Muse Code" && p.name != "Antigravity" && p.name != "Gemini CLI"
+            }) {
                 if !self.presets.iter().any(|p| p.name == builtin.name) {
                     self.presets.push(builtin);
                 }
@@ -2774,6 +3606,35 @@ impl Settings {
                 self.presets.push(muse);
             }
         }
+        // A built-in runner still carrying its old prompt word for word gets the
+        // current one; any edit to the prompt keeps the user's text.
+        if self.preset_seed_version < 19 {
+            for builtin in Runner::defaults() {
+                let Some((_, legacy)) = Runner::LEGACY_PROMPTS
+                    .iter()
+                    .find(|(name, _)| *name == builtin.name)
+                else {
+                    continue;
+                };
+                for runner in &mut self.runners {
+                    if runner.name == builtin.name && runner.prompt == *legacy {
+                        runner.prompt = builtin.prompt.clone();
+                    }
+                }
+            }
+        }
+        if self.preset_seed_version < 20 {
+            let agy = AgentPreset::agy();
+            if !self.presets.iter().any(|preset| preset.name == agy.name) {
+                self.presets.push(agy);
+            }
+        }
+        if self.preset_seed_version < 21 {
+            let gemini = AgentPreset::gemini();
+            if !self.presets.iter().any(|preset| preset.name == gemini.name) {
+                self.presets.push(gemini);
+            }
+        }
         self.preset_seed_version = PRESET_SEED_VERSION;
         true
     }
@@ -2801,6 +3662,8 @@ mod settings_tests {
         assert!(s.presets.iter().any(|p| p.name == "Ollama"));
         assert!(s.presets.iter().any(|p| p.name == "Pi"));
         assert!(s.presets.iter().any(|p| p.name == "Muse Code"));
+        assert!(s.presets.iter().any(|p| p.name == "Antigravity"));
+        assert!(s.presets.iter().any(|p| p.name == "Gemini CLI"));
         // Built-in runners are seeded too.
         assert!(s.runners.iter().any(|r| r.name == "Review"));
         assert!(s.runners.iter().any(|r| r.name == "Security Review"));
@@ -2870,7 +3733,7 @@ mod settings_tests {
             }
             let before = serde_json::to_value(&settings).unwrap();
             assert!(settings.seed_builtin_presets());
-            assert_eq!(settings.preset_seed_version, 18);
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
             assert_eq!(
                 settings
                     .presets
@@ -2882,13 +3745,261 @@ mod settings_tests {
             if !existing_muse {
                 let added = settings.presets.pop().unwrap();
                 assert_eq!(added.name, "Muse Code");
-                assert_eq!(added.injection, InjectionMode::None);
+                assert_eq!(added.injection, InjectionMode::SessionHook);
             }
             settings.preset_seed_version = 17;
             assert_eq!(
                 serde_json::to_value(&settings).unwrap(),
                 before,
                 "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn unedited_legacy_runner_prompts_are_refreshed_once() {
+        let legacy = |name: &str| {
+            let (_, prompt) = Runner::LEGACY_PROMPTS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            prompt.to_string()
+        };
+        let current = |name: &str| {
+            Runner::defaults()
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .prompt
+        };
+        let mut settings = Settings {
+            preset_seed_version: 18,
+            ..Settings::default()
+        };
+        settings.runners[0].prompt = legacy("Review");
+        settings.runners[0].auto_mode_presses = 1;
+        settings.runners[1].prompt =
+            format!("{} Also check the CI config.", legacy("Security Review"));
+        let mut renamed = settings.runners[0].clone();
+        renamed.name = "My Review".to_string();
+        settings.runners.push(renamed);
+
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, current("Review"));
+        assert_eq!(
+            settings.runners[0].auto_mode_presses, 1,
+            "only the prompt changes"
+        );
+        assert!(
+            settings.runners[1]
+                .prompt
+                .ends_with("Also check the CI config."),
+            "an edited prompt is the user's own"
+        );
+        assert_eq!(
+            settings.runners[2].prompt,
+            legacy("Review"),
+            "matched by name"
+        );
+
+        // Restoring the old text afterwards sticks: the migration runs once.
+        settings.runners[0].prompt = legacy("Review");
+        assert!(!settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, legacy("Review"));
+    }
+
+    #[test]
+    fn agy_preset_is_seeded_only_once() {
+        let mut settings = Settings {
+            preset_seed_version: 19,
+            presets: vec![AgentPreset::shell()],
+            ..Settings::default()
+        };
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .filter(|preset| preset.name == "Antigravity")
+                .count(),
+            1
+        );
+        settings
+            .presets
+            .retain(|preset| preset.name != "Antigravity");
+        assert!(
+            !settings.seed_builtin_presets(),
+            "a deliberate deletion stays deleted"
+        );
+        assert!(
+            !settings
+                .presets
+                .iter()
+                .any(|preset| preset.name == "Antigravity")
+        );
+    }
+
+    #[test]
+    fn agy_upgrade_preserves_v19_settings_except_addition_and_version() {
+        for existing_agy in [false, true] {
+            let mut settings = Settings {
+                preset_seed_version: 19,
+                ..Settings::default()
+            };
+            settings
+                .presets
+                .retain(|preset| preset.name != "Antigravity" && preset.name != "Ollama");
+            settings.runners.retain(|runner| runner.name != "Review");
+            settings.runners[0].prompt = "custom review task".to_string();
+            for preset in &mut settings.presets {
+                preset.session_id_flag = None;
+                preset.resume_flag = None;
+                preset.startup_delay_ms = 0;
+                preset.working_markers.clear();
+            }
+            if existing_agy {
+                let mut custom = AgentPreset::agy();
+                custom.program = Some("custom-agy".to_string());
+                custom.effort = Some("medium".to_string());
+                custom.injection = InjectionMode::TypeIn;
+                settings.presets.push(custom);
+            }
+            let before = serde_json::to_value(&settings).unwrap();
+            assert!(settings.seed_builtin_presets());
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
+            assert_eq!(
+                settings
+                    .presets
+                    .iter()
+                    .filter(|preset| preset.name == "Antigravity")
+                    .count(),
+                1
+            );
+            if !existing_agy {
+                let added = settings.presets.pop().unwrap();
+                assert_eq!(added.name, "Antigravity");
+                assert_eq!(added.program.as_deref(), Some("agy"));
+                assert_eq!(added.injection, InjectionMode::None);
+            }
+            settings.preset_seed_version = 19;
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                before,
+                "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_preset_is_seeded_only_once() {
+        let mut settings = Settings {
+            preset_seed_version: 20,
+            presets: vec![AgentPreset::shell()],
+            ..Settings::default()
+        };
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .filter(|preset| preset.name == "Gemini CLI")
+                .count(),
+            1
+        );
+        settings
+            .presets
+            .retain(|preset| preset.name != "Gemini CLI");
+        assert!(
+            !settings.seed_builtin_presets(),
+            "a deliberate deletion stays deleted"
+        );
+        assert!(
+            !settings
+                .presets
+                .iter()
+                .any(|preset| preset.name == "Gemini CLI")
+        );
+    }
+
+    #[test]
+    fn gemini_upgrade_preserves_v20_settings_except_addition_and_version() {
+        for existing_gemini in [false, true] {
+            let mut settings = Settings {
+                preset_seed_version: 20,
+                ..Settings::default()
+            };
+            settings
+                .presets
+                .retain(|preset| preset.name != "Gemini CLI" && preset.name != "Ollama");
+            settings.runners.retain(|runner| runner.name != "Review");
+            settings.runners[0].prompt = "custom review task".to_string();
+            for preset in &mut settings.presets {
+                preset.session_id_flag = None;
+                preset.resume_flag = None;
+                preset.startup_delay_ms = 0;
+                preset.working_markers.clear();
+            }
+            if existing_gemini {
+                let mut custom = AgentPreset::gemini();
+                custom.program = Some("custom-gemini".to_string());
+                custom.model = Some("flash".to_string());
+                custom.injection = InjectionMode::TypeIn;
+                settings.presets.push(custom);
+            }
+            let before = serde_json::to_value(&settings).unwrap();
+            assert!(settings.seed_builtin_presets());
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
+            assert_eq!(
+                settings
+                    .presets
+                    .iter()
+                    .filter(|preset| preset.name == "Gemini CLI")
+                    .count(),
+                1
+            );
+            if !existing_gemini {
+                let added = settings.presets.pop().unwrap();
+                assert_eq!(added.name, "Gemini CLI");
+                assert_eq!(added.program.as_deref(), Some("gemini"));
+                assert_eq!(added.injection, InjectionMode::None);
+            }
+            settings.preset_seed_version = 20;
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                before,
+                "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_runner_prompts_take_details_and_end_cleanly_without_them() {
+        let preset = AgentPreset::claude();
+        for runner in Runner::defaults() {
+            assert!(
+                runner
+                    .prompt
+                    .to_lowercase()
+                    .contains("don't edit, stage, or commit anything"),
+                "{} starts in auto mode, so it must not edit unasked",
+                runner.name
+            );
+            let with = runner.build_instance(Uuid::nil(), &preset, "only src/auth.rs");
+            assert!(
+                with.system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults.\n\nonly src/auth.rs"),
+                "{}",
+                runner.name
+            );
+            let without = runner.build_instance(Uuid::nil(), &preset, "");
+            assert!(
+                without
+                    .system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults."),
+                "{}",
+                runner.name
             );
         }
     }
@@ -2902,6 +4013,38 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn new_projects_get_the_features_settings_turn_on_for_them() {
+        // Off for a config from before these settings, so nothing changes on upgrade.
+        let mut s: Settings = serde_json::from_str("{}").expect("parse");
+        let p = s.new_project("app", "/srv/app");
+        assert!(!p.memory_enabled && !p.accomplishments_enabled);
+        assert_eq!(
+            (p.name.as_str(), p.root_path.as_path()),
+            ("app", Path::new("/srv/app"))
+        );
+
+        s.new_project_memory = true;
+        let p = s.new_project("app", "/srv/app");
+        assert!(p.memory_enabled && !p.accomplishments_enabled);
+        s.new_project_accomplishments = true;
+        assert!(s.new_project("app", "/srv/app").accomplishments_enabled);
+        assert!(!s.new_project("app", "/srv/app").reminders_enabled);
+        s.new_project_reminders = true;
+        assert!(s.new_project("app", "/srv/app").reminders_enabled);
+    }
+
+    #[test]
+    fn reminder_alert_settings_default_for_old_configs() {
+        let mut s: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(s.reminder_alert, REMINDER_ALERT_POPUP);
+        assert!(!s.reminder_notifies());
+        assert!(s.reminder_sound);
+        assert!(s.reminder_sound_file.is_none());
+        s.reminder_alert = REMINDER_ALERT_NOTIFICATION.to_string();
+        assert!(s.reminder_notifies());
     }
 
     #[test]
@@ -2928,15 +4071,91 @@ mod settings_tests {
     }
 
     #[test]
+    fn pane_memory_limit_is_on_for_old_configs_and_zero_turns_it_off() {
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(16 << 30));
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 0}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), None);
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 48}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(48 << 30));
+    }
+
+    #[test]
+    fn sound_alerts_default_on_for_old_configs() {
+        // A config from before sound alerts: both chimes on, built-in sounds,
+        // the default volume.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(s.sound_on_done && s.sound_on_blocked);
+        assert!(s.sound_done_file.is_none() && s.sound_blocked_file.is_none());
+        assert_eq!(s.sound_volume, sound_alert::DEFAULT_VOLUME);
+        // Saved choices come back, through the TOML the settings file uses.
+        let mut s = Settings {
+            sound_on_done: false,
+            sound_blocked_file: Some(PathBuf::from("/sounds/knock.ogg")),
+            sound_volume: 35,
+            ..Settings::default()
+        };
+        s = toml::from_str(&toml::to_string(&s).expect("save")).expect("load");
+        assert!(!s.sound_on_done && s.sound_on_blocked);
+        assert_eq!(
+            sound_alert::AlertSound::Blocked.file(&s),
+            Some(std::path::Path::new("/sounds/knock.ogg"))
+        );
+        assert_eq!(sound_alert::AlertSound::Done.file(&s), None);
+        assert_eq!(s.sound_volume, 35);
+    }
+
+    #[test]
     fn outside_control_is_off_for_old_and_new_configs() {
         // Nothing outside muxel can drive its agents until the user says so.
         let s: Settings = serde_json::from_str("{}").expect("parse");
         assert!(!s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
         assert!(!Settings::default().control_enabled);
+        assert_eq!(
+            Settings::default().control_allow_new,
+            control::CreationPolicy::Off
+        );
+        assert!(!Settings::default().control_allow_shells);
         let s: Settings = serde_json::from_str(r#"{"control_enabled": true}"#).expect("parse");
         assert!(s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
+    }
+
+    #[test]
+    fn outside_terminal_creation_is_an_independent_opt_in() {
+        let legacy: Settings =
+            serde_json::from_str(r#"{"control_enabled":true,"control_allow_shells":true}"#)
+                .unwrap();
+        assert!(legacy.control_enabled);
+        assert!(legacy.control_allow_shells);
+        assert!(
+            legacy.control_allow_new == control::CreationPolicy::Off,
+            "old grants must not authorize creation on upgrade"
+        );
+        for enabled in [false, true] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "control_enabled": true, "control_allow_shells": true,
+                "control_allow_new": enabled,
+            }))
+            .unwrap();
+            let saved = serde_json::to_value(&settings).unwrap();
+            // A development build's bool never becomes Allow.
+            let policy = if enabled {
+                control::CreationPolicy::Ask
+            } else {
+                control::CreationPolicy::Off
+            };
+            assert_eq!(
+                saved["control_allow_new"],
+                if enabled { "ask" } else { "off" }
+            );
+            let restored: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.control_allow_new, policy);
+            assert!(restored.control_enabled && restored.control_allow_shells);
+        }
     }
 
     #[test]
@@ -3108,6 +4327,84 @@ mod settings_tests {
     }
 
     #[test]
+    fn retired_close_confirmations_still_load_and_keep_their_values() {
+        // Settings from before the close rule replaced per-kind confirmation.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let fields = v.as_object_mut().unwrap();
+        fields.insert("confirm_close_editor".into(), true.into());
+        fields.insert("confirm_close_diff".into(), true.into());
+        fields.insert("confirm_close_terminal".into(), false.into());
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_editor && s.confirm_close_diff);
+        assert!(!s.confirm_close_terminal);
+        // Missing, the busy-terminal question stays on.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for key in [
+            "confirm_close_terminal",
+            "confirm_close_editor",
+            "confirm_close_diff",
+        ] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_terminal);
+        assert!(!s.confirm_close_editor && !s.confirm_close_diff);
+    }
+
+    #[test]
+    fn the_done_chime_is_for_background_panes_unless_set_to_always() {
+        assert!(!Settings::default().done_chime_always());
+        // A config from before the setting existed keeps chiming only for
+        // panes you aren't looking at.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("sound_done_when");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.sound_done_when, DONE_CHIME_BACKGROUND);
+        let always = Settings {
+            sound_done_when: DONE_CHIME_ALWAYS.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&always).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .done_chime_always()
+        );
+        // A value this version doesn't know reads as the default.
+        let odd = Settings {
+            sound_done_when: "never".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.done_chime_always());
+    }
+
+    #[test]
+    fn new_agents_open_as_tabs_unless_set_to_panes() {
+        assert!(!Settings::default().new_agents_open_as_panes());
+        // A config from before the setting existed keeps opening tabs.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("new_agent_placement");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.new_agent_placement, NEW_AGENT_TAB);
+        let panes = Settings {
+            new_agent_placement: NEW_AGENT_PANE.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&panes).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .new_agents_open_as_panes()
+        );
+        // A value this version doesn't know reads as the default, a tab.
+        let odd = Settings {
+            new_agent_placement: "window".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.new_agents_open_as_panes());
+    }
+
+    #[test]
     fn settings_terminal_mouse_default_and_round_trip() {
         assert_eq!(Settings::default().terminal_mouse, "copy_paste");
         // An old config missing the key still loads, defaulting to copy_paste.
@@ -3136,12 +4433,48 @@ mod closed_session_tests {
     use uuid::Uuid;
 
     #[test]
+    fn local_close_ledger_survives_a_large_batch_and_restart() {
+        let mut project = Project::new("local", "/local");
+        let ids: std::collections::HashSet<_> = (0..128)
+            .map(|n| {
+                let id = Uuid::new_v4();
+                project.remember_closed_session(format!("local-{n}").into(), id);
+                project
+                    .closed_sessions
+                    .last_mut()
+                    .unwrap()
+                    .local_close_token = Some(id);
+                id
+            })
+            .collect();
+        let saved = serde_json::to_vec(&project).unwrap();
+        let restored: Project = serde_json::from_slice(&saved).unwrap();
+        assert!(
+            restored
+                .closed_sessions
+                .iter()
+                .all(|entry| entry.local_close_token == Some(entry.instance))
+        );
+        let retryable: std::collections::HashSet<_> = restored
+            .closed_sessions
+            .iter()
+            .map(|c| c.instance)
+            .collect();
+        assert_eq!(
+            retryable, ids,
+            "a crash must not lose any unconfirmed local kill"
+        );
+    }
+
+    #[test]
     fn closing_the_same_pane_twice_leaves_one_entry() {
         let mut p = Project::new("app", "/srv/app");
         let iid = Uuid::new_v4();
         p.remember_closed_session("muxel_app_1".into(), iid);
+        p.closed_sessions[0].local_close_token = Some(iid);
         p.remember_closed_session("muxel_app_1".into(), iid);
         assert_eq!(p.closed_sessions.len(), 1);
+        assert_eq!(p.closed_sessions[0].local_close_token, Some(iid));
         assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
         assert!(p.closed_sessions.is_empty());
         assert!(
@@ -3155,6 +4488,10 @@ mod closed_session_tests {
     #[test]
     fn the_ledger_is_capped_oldest_first() {
         let mut p = Project::new("app", "/srv/app");
+        p.remote = Some(super::RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/srv/app".into(),
+        });
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();
@@ -3241,6 +4578,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -3285,6 +4623,37 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn a_folder_worked_in_remotely_opens_locally_with_its_panes() {
+        // Another machine's remote project wrote the host's doc for this folder.
+        let mut ws = Workspace::default();
+        let mut remote = remote_project("/srv/app");
+        let pane = Instance::shell(remote.id);
+        remote.layout = Some(PaneNode::leaf(pane.id));
+        remote.layout_updated_at = Some(50);
+        ws.add_instance(pane);
+        ws.projects = vec![remote.clone()];
+        let json = RemoteLayout::capture(&remote, &ws, 60).to_json();
+
+        // Opened locally on the host, the folder's doc is this project's own.
+        let doc = RemoteLayout::parse(&json, "/srv/app").expect("doc for this root");
+        assert!(doc.has_panes());
+        // A project just opened there has no panes and has never synced, so its
+        // first sync takes the doc rather than pushing its empty layout over it.
+        let fresh = Project::new("app", "/srv/app");
+        let local = RemoteLayout::capture(&fresh, &Workspace::default(), 70);
+        assert_eq!(
+            connect_layout_action(&doc, None, &local.content_key(), 0),
+            PeerLayoutAction::Adopt
+        );
+
+        // A doc with no panes left leaves the folder to open with a fresh one.
+        let mut emptied = remote;
+        emptied.layout = None;
+        let json = RemoteLayout::capture(&emptied, &ws, 60).to_json();
+        assert!(!RemoteLayout::parse(&json, "/srv/app").unwrap().has_panes());
+    }
+
+    #[test]
     fn content_key_ignores_updated_at_but_tracks_layout() {
         let mut ws = Workspace::default();
         let mut proj = remote_project("/srv/app");
@@ -3294,6 +4663,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -3308,6 +4678,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -3323,6 +4694,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -3338,6 +4710,134 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn pr108_claude_hook_record_does_not_change_shared_content_keys() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let mut instance = Instance::shell(project.id);
+        instance.program = Some("claude".into());
+        project.layout = Some(PaneNode::leaf(instance.id));
+        ws.instances.push(instance);
+        ws.projects.push(project.clone());
+        let original = RemoteLayout::capture(&project, &ws, 1);
+        for receipt in [
+            Some("first-local-receipt"),
+            Some("second-local-receipt"),
+            None,
+        ] {
+            ws.instances[0].claude_hook_record = receipt.map(str::to_string);
+            let consumed = RemoteLayout::capture(&project, &ws, 1);
+            assert_eq!(
+                consumed.content_key(),
+                original.content_key(),
+                "receipt consumption must not push shared layout content"
+            );
+            assert_eq!(consumed.edit_key(), original.edit_key());
+        }
+        ws.instances[0].custom_name = Some("Shared rename".into());
+        let renamed = RemoteLayout::capture(&project, &ws, 1);
+        assert_ne!(renamed.content_key(), original.content_key());
+    }
+
+    #[test]
+    fn pr108_claude_hook_record_is_local_persistence_not_shared_serialization() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let mut instance = Instance::shell(project.id);
+        instance.program = Some("claude".into());
+        instance.claude_hook_record = Some("consumed-local-receipt".into());
+        project.layout = Some(PaneNode::leaf(instance.id));
+        ws.instances.push(instance);
+        ws.projects.push(project.clone());
+        let local_json = serde_json::to_value(&ws).unwrap();
+        assert_eq!(
+            local_json["instances"][0]["claude_hook_record"],
+            "consumed-local-receipt"
+        );
+        let local_back: Workspace = serde_json::from_value(local_json).unwrap();
+        assert_eq!(
+            local_back.instances[0].claude_hook_record,
+            ws.instances[0].claude_hook_record
+        );
+        let mut shared = RemoteLayout::capture(&project, &ws, 1);
+        // Cover reserializing a document read from an older desktop too, not
+        // just a capture that could clear the field in its temporary clone.
+        shared.instances[0].claude_hook_record = Some("receipt-from-older-desktop".into());
+        let wire = serde_json::to_value(&shared).unwrap();
+        assert!(
+            wire["instances"][0].get("claude_hook_record").is_none(),
+            "RemoteLayout must not publish a machine's consumed receipt"
+        );
+        let stored: serde_json::Value = serde_json::from_str(&shared.to_json()).unwrap();
+        assert!(stored["instances"][0].get("claude_hook_record").is_none());
+        assert_eq!(
+            ws.instances[0].claude_hook_record.as_deref(),
+            Some("consumed-local-receipt")
+        );
+    }
+
+    #[test]
+    fn pr108_peer_merge_keeps_this_machines_claude_hook_record() {
+        let local_pid = Uuid::new_v4();
+        let peer_pid = Uuid::new_v4();
+        for consumed in [None, Some("consumed-local-receipt")] {
+            let mut mine = Instance::shell(local_pid);
+            mine.program = Some("claude".into());
+            mine.session_id = Some("local-conversation".into());
+            mine.claude_hook_record = consumed.map(str::to_string);
+            for session in ["local-conversation", "peer-changed-conversation"] {
+                for receipt_field in ["missing", "null", "foreign"] {
+                    let mut incoming = serde_json::to_value(&mine).unwrap();
+                    incoming["project_id"] = serde_json::json!(peer_pid);
+                    incoming["session_id"] = serde_json::json!(session);
+                    incoming["custom_name"] = serde_json::json!("Peer rename");
+                    match receipt_field {
+                        "missing" => {
+                            incoming
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("claude_hook_record");
+                        }
+                        "null" => incoming["claude_hook_record"] = serde_json::Value::Null,
+                        _ => {
+                            incoming["claude_hook_record"] =
+                                serde_json::json!("consumed-peer-receipt")
+                        }
+                    }
+                    let peer: Instance = serde_json::from_value(incoming).unwrap();
+                    let merged =
+                        merge_peer_instances(std::slice::from_ref(&mine), vec![peer], local_pid);
+                    assert_eq!(
+                        merged[0].claude_hook_record, mine.claude_hook_record,
+                        "peer receipt field {receipt_field} / session {session} must not change local consumption"
+                    );
+                    assert_eq!(merged[0].project_id, local_pid);
+                    assert_eq!(merged[0].session_id.as_deref(), Some(session));
+                    assert_eq!(merged[0].custom_name.as_deref(), Some("Peer rename"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pr108_new_peer_pane_does_not_adopt_another_machines_claude_hook_record() {
+        let local_pid = Uuid::new_v4();
+        let mut peer = Instance::shell(Uuid::new_v4());
+        peer.program = Some("claude".into());
+        peer.session_id = Some("peer-conversation".into());
+        peer.claude_hook_record = Some("consumed-peer-receipt".into());
+        let merged = merge_peer_instances(&[], vec![peer.clone()], local_pid);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, peer.id);
+        assert_eq!(merged[0].project_id, local_pid);
+        assert_eq!(merged[0].session_id, peer.session_id);
+        assert_eq!(merged[0].program, peer.program);
+        assert!(
+            merged[0].claude_hook_record.is_none(),
+            "a peer's consumed receipt does not prove this machine consumed it"
+        );
+    }
+
+    #[test]
     fn content_key_ignores_per_machine_state() {
         let mut ws = Workspace::default();
         let mut proj = remote_project("/srv/app");
@@ -3348,6 +4848,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -3386,6 +4887,58 @@ mod remote_layout_tests {
         assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
     }
 
+    /// The bug: a machine back from being away tied with the host file on revision
+    /// (a peer's session bookkeeping never bumps it) and pushed its own stale copy
+    /// over the peer's — panes pointing back at conversations they had left.
+    #[test]
+    fn a_connect_adopts_a_peers_bookkeeping_when_nothing_changed_here() {
+        use PeerLayoutAction::{Adopt, Ignore, InSync};
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let mut pane = Instance::shell(proj.id);
+        pane.session_id = Some("old-conversation".into());
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![pane.id],
+            active: 0,
+            split_from: None,
+        }));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![pane];
+        ws.projects = vec![proj.clone()];
+        let ours = RemoteLayout::capture(&proj, &ws, 100);
+        let ours_key = ours.content_key();
+        let synced = RemoteLayout::fingerprint(&ours_key);
+
+        // A peer moved the pane on to another conversation, same revision.
+        let mut theirs = ours.clone();
+        theirs.instances[0].session_id = Some("new-conversation".into());
+        assert_eq!(theirs.updated_at, 100);
+        let action = |synced: Option<&str>, local: &str, rev| {
+            connect_layout_action(&theirs, synced, local, rev)
+        };
+        assert_eq!(action(Some(&synced), &ours_key, 100), Adopt);
+        // Even when this machine's clock stamped it later: it changed nothing since.
+        assert_eq!(action(Some(&synced), &ours_key, 500), Adopt);
+        // Nothing remembered (a doc from before this existed): revisions decide.
+        assert_eq!(action(None, &ours_key, 100), Ignore);
+
+        // This machine has changes the file was synced before: they are pushed.
+        let theirs_synced = RemoteLayout::fingerprint(&theirs.content_key());
+        assert_eq!(action(Some(&theirs_synced), "edited here", 100), Ignore);
+        // Both sides changed since: the newer revision wins.
+        assert_eq!(action(Some("0000000000000000"), "edited here", 100), Ignore);
+        assert_eq!(action(Some("0000000000000000"), "edited here", 99), Adopt);
+        // Already the same.
+        assert_eq!(action(None, &theirs.content_key(), 1), InSync);
+    }
+
+    #[test]
+    fn a_layout_fingerprint_is_stable_across_builds() {
+        assert_eq!(RemoteLayout::fingerprint(""), "cbf29ce484222325");
+        assert_eq!(RemoteLayout::fingerprint("foobar"), "85944171f73967e8");
+    }
+
     #[test]
     fn session_bookkeeping_is_not_an_edit() {
         let mut ws = Workspace::default();
@@ -3396,6 +4949,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -3405,6 +4959,7 @@ mod remote_layout_tests {
         ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
         ws.instances[1].tmux_socket = Some(tmux::Socket::Default);
         ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
+        ws.instances[1].claude_hook_record = Some("consumed receipt".into());
         ws.instances[1].session_started = true;
         let bound = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(bound.content_key(), before.content_key());
@@ -3437,6 +4992,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -3482,6 +5038,159 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn a_close_noticed_after_sleep_takes_the_peers_newer_pane() {
+        // Both machines show shell S (rev 100). This one sleeps; the other closes S,
+        // which ends its tmux session, and opens agent C (rev 200).
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let shell = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(shell.id));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![shell.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let agent = Instance::shell(proj.id);
+        let mut peer = base.clone();
+        peer.layout = Some(PaneNode::leaf(agent.id));
+        peer.instances = vec![agent];
+        peer.updated_at = 200;
+
+        // Awake again, this machine sees S's client exit cleanly and closes S.
+        let mut closed = proj;
+        closed.layout = None;
+        let ours = RemoteLayout::capture(&closed, &ws, 300).content_key();
+        let synced = base.content_key();
+
+        // Stamped as the session's end, the close ranks behind the peer's edit:
+        // the push takes the peer's layout, with C in it.
+        let rev = observed_close_revision(Some(100));
+        assert!(push_overwrites_peer(&peer, Some(&synced), &ours, rev));
+        // Stamped when it was noticed, it outranked the peer and wrote this
+        // machine's empty layout over C.
+        assert!(!push_overwrites_peer(&peer, Some(&synced), &ours, 300));
+        // With nothing new from the peer, the close is pushed as it is.
+        assert!(!push_overwrites_peer(&base, Some(&synced), &ours, rev));
+    }
+
+    #[test]
+    fn a_held_close_lands_on_top_of_peer_edits_adopted_while_it_was_held() {
+        // Both machines show shells A and H (rev 100). This one closes H, which
+        // counts down with H still in the shared document.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let held = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(a.id));
+        assert!(pane::add_tab(&mut proj.layout, a.id, held.id));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![a.clone(), held.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let base_key = base.content_key();
+
+        // Meanwhile the peer renames A (rev 200). The live poll still runs, and
+        // this machine's document is unchanged by the hold: it adopts the rename.
+        let mut peer = base.clone();
+        peer.instances
+            .iter_mut()
+            .find(|i| i.id == a.id)
+            .unwrap()
+            .custom_name = Some("Reviewer".into());
+        peer.updated_at = 200;
+        let peer_key = peer.content_key();
+        assert_eq!(
+            peer_layout_action(&peer_key, 200, Some(&base_key), &base_key, 100),
+            PeerLayoutAction::Adopt
+        );
+
+        // The close becomes final at 300, an edit on top of the adopted layout.
+        let mut adopted = peer.clone();
+        assert!(pane::remove(&mut adopted.layout, held.id));
+        adopted.instances.retain(|i| i.id != held.id);
+        adopted.updated_at = 300;
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&peer_key),
+            &adopted.content_key(),
+            300
+        ));
+        assert_eq!(
+            adopted.instances[0].custom_name.as_deref(),
+            Some("Reviewer"),
+            "the pushed close keeps the peer's rename"
+        );
+
+        // Frozen for the hold, this machine never saw the rename. Its close, newer
+        // than the peer's write, went out over it and undid the rename everywhere.
+        let mut frozen = base.clone();
+        assert!(pane::remove(&mut frozen.layout, held.id));
+        frozen.instances.retain(|i| i.id != held.id);
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&base_key),
+            &frozen.content_key(),
+            300
+        ));
+        assert_eq!(frozen.instances[0].custom_name, None);
+    }
+
+    #[test]
+    fn unseen_peer_panes_are_the_peers_new_ones_not_this_machines_closes() {
+        // Both machines show shells A and B (rev 100).
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let b = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(a.id));
+        assert!(pane::split(
+            &mut proj.layout,
+            a.id,
+            SplitDirection::Horizontal,
+            b.id
+        ));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![a.clone(), b.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let synced = base.content_key();
+
+        // Apart, the peer opens agent C beside A (rev 200), and this machine closes
+        // B and opens shell D (rev 300): this push is newer and would win.
+        let c = Instance::shell(proj.id);
+        let mut peer = base.clone();
+        assert!(pane::add_tab(&mut peer.layout, a.id, c.id));
+        peer.instances.push(c.clone());
+        peer.updated_at = 200;
+        let d = Instance::shell(proj.id);
+        assert!(pane::remove(&mut proj.layout, b.id));
+        assert!(pane::add_tab(&mut proj.layout, a.id, d.id));
+        ws.instances = vec![a, d.clone()];
+        let ours = RemoteLayout::capture(&proj, &ws, 300);
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&synced),
+            &ours.content_key(),
+            300
+        ));
+
+        // Only C is the peer's own: B is this machine's close, D its new pane.
+        assert_eq!(unseen_peer_panes(&peer, Some(&synced), &ours), vec![c.id]);
+        // Unless this machine already shows C's session, in a pane of its own.
+        let session = |doc: &mut RemoteLayout, id: Uuid| {
+            let pane = doc.instances.iter_mut().find(|i| i.id == id).unwrap();
+            pane.tmux_session = Some("muxel_proj_0c0c0c0c".into());
+        };
+        let (mut shown, mut ours_shown) = (peer.clone(), ours.clone());
+        session(&mut shown, c.id);
+        session(&mut ours_shown, d.id);
+        assert!(unseen_peer_panes(&shown, Some(&synced), &ours_shown).is_empty());
+        // The file as this machine left it holds nothing unseen.
+        assert!(unseen_peer_panes(&base, Some(&synced), &ours).is_empty());
+        // Without the doc it last synced, a close can't be told from a new pane.
+        assert!(unseen_peer_panes(&peer, None, &ours).is_empty());
+    }
+
+    #[test]
     fn merge_peer_instances_keeps_local_observation() {
         let local_pid = Uuid::new_v4();
         let mut kept = Instance::shell(local_pid);
@@ -3518,6 +5227,176 @@ mod remote_layout_tests {
 
         let a = merged.iter().find(|i| i.id == added.id).unwrap();
         assert_eq!(a.tmux_session, added.tmux_session);
+    }
+
+    #[test]
+    fn antigravity_peer_rows_cannot_supply_or_erase_a_local_binding() {
+        let project = Uuid::new_v4();
+        let preset = AgentPreset::agy();
+        let mut local = Instance::from_preset(project, &preset);
+        local.session_id = Some("owned".into());
+        local.session_path = Some(PathBuf::from("owned.db"));
+        local.session_started = true;
+        let binding = |instance: &Instance| {
+            (
+                instance.session_id.clone(),
+                instance.session_path.clone(),
+                instance.session_started,
+            )
+        };
+        let mut peer = local.clone();
+        for remote_id in [Some("peer"), None] {
+            peer.session_id = remote_id.map(str::to_owned);
+            peer.session_path = remote_id.map(|id| PathBuf::from(format!("{id}.db")));
+            peer.session_started = remote_id.is_some();
+            let merged =
+                merge_peer_instances(std::slice::from_ref(&local), vec![peer.clone()], project);
+            assert_eq!(binding(&merged[0]), binding(&local));
+        }
+        let imported = merge_peer_instances(&[], vec![local.clone()], project);
+        assert_eq!(binding(&imported[0]), (None, None, false));
+
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let mut other = Instance::from_preset(project, &preset);
+            other.id = local.id;
+            other.session_started = true;
+            other.session_path = Some(PathBuf::from("peer.jsonl"));
+            // Equal IDs still cannot transfer the local Antigravity path.
+            for id in ["peer", "owned"] {
+                other.session_id = Some(id.into());
+                let from_antigravity = merge_peer_instances(
+                    std::slice::from_ref(&local),
+                    vec![other.clone()],
+                    project,
+                );
+                let to_antigravity = merge_peer_instances(
+                    std::slice::from_ref(&other),
+                    vec![local.clone()],
+                    project,
+                );
+                assert_eq!(binding(&from_antigravity[0]), binding(&other));
+                assert_eq!(binding(&to_antigravity[0]), (None, None, false));
+            }
+        }
+    }
+
+    /// A pane this machine moved off Default (saved, not yet pushed) against a
+    /// peer layout that still has it there, and the reverse.
+    fn moved_and_stale() -> (Instance, Instance) {
+        let mut moved = Instance::shell(Uuid::new_v4());
+        moved.tmux_session = Some("muxel_proj_12345678".into());
+        moved.tmux_socket = Some(tmux::Socket::Private);
+        let mut stale = moved.clone();
+        stale.tmux_socket = Some(tmux::Socket::Default);
+        stale.custom_name = Some("Renamed by the peer".into());
+        (moved, stale)
+    }
+
+    #[test]
+    fn literal_panes_take_no_part_in_a_move_off_default() {
+        let (moved, stale) = moved_and_stale();
+        for (mut stale, mut moved, literal_moved) in
+            [(stale.clone(), moved.clone(), false), (stale, moved, true)]
+        {
+            if literal_moved {
+                moved.literal_argv = true;
+            } else {
+                stale.literal_argv = true;
+            }
+            assert!(!moved_off_default(&stale, &moved));
+            let mut local = vec![stale.clone()];
+            assert!(keep_moves_off_default(&mut local, std::slice::from_ref(&moved)).is_empty());
+            assert_eq!(local[0].tmux_socket, stale.tmux_socket);
+        }
+    }
+
+    #[test]
+    fn a_peer_layout_cannot_move_a_pane_back_onto_default() {
+        let (moved, stale) = moved_and_stale();
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&moved),
+            vec![stale.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(merged[0].tmux_session, moved.tmux_session);
+        // The rest of the peer's copy still wins.
+        assert_eq!(merged[0].custom_name, stale.custom_name);
+
+        // The other way round the peer's move is adopted as usual.
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&stale),
+            vec![moved.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+
+        // Only the same session moves one way: a peer that rebound the pane to
+        // another session on Default, or to another server, is adopted.
+        let mut rebound = stale.clone();
+        rebound.tmux_session = Some("imported".into());
+        let mut named = stale.clone();
+        named.tmux_socket = Some(tmux::Socket::Named("peer".into()));
+        for peer in [rebound, named] {
+            let merged = merge_peer_instances(
+                std::slice::from_ref(&moved),
+                vec![peer.clone()],
+                moved.project_id,
+            );
+            assert_eq!(merged[0].tmux_socket, peer.tmux_socket);
+            assert_eq!(merged[0].tmux_session, peer.tmux_session);
+        }
+    }
+
+    #[test]
+    fn a_push_keeps_a_move_off_default_the_file_already_has() {
+        let (moved, stale) = moved_and_stale();
+        let mut other = Instance::shell(moved.project_id);
+        other.tmux_session = Some("work".into());
+        other.tmux_socket = Some(tmux::Socket::Default);
+        let mut local = vec![stale.clone(), other.clone()];
+        let mut file_other = other.clone();
+        file_other.tmux_session = Some("elsewhere".into());
+        file_other.tmux_socket = Some(tmux::Socket::Private);
+        let ids = keep_moves_off_default(&mut local, &[moved.clone(), file_other]);
+        assert_eq!(ids, vec![(moved.id, "muxel_proj_12345678".to_string())]);
+        assert_eq!(local[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(
+            local[0].custom_name, stale.custom_name,
+            "only the owner moves"
+        );
+        assert_eq!(
+            (&local[1].tmux_session, &local[1].tmux_socket),
+            (&other.tmux_session, &other.tmux_socket),
+            "a different session is not this pane's move"
+        );
+
+        // A file that predates the move changes nothing.
+        let mut local = vec![moved.clone()];
+        assert!(keep_moves_off_default(&mut local, &[stale]).is_empty());
+        assert_eq!(local[0].tmux_socket, moved.tmux_socket);
+    }
+
+    #[test]
+    fn rebound_instances_are_those_whose_session_or_owner_changed() {
+        let (moved, stale) = moved_and_stale();
+        let mut renamed = stale.clone();
+        renamed.tmux_session = Some("other".into());
+        let mut titled = stale.clone();
+        titled.custom_name = Some("only the title".into());
+        let added = Instance::shell(moved.project_id);
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), std::slice::from_ref(&moved)),
+            vec![moved.id]
+        );
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), &[renamed]),
+            vec![stale.id]
+        );
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[titled, added]).is_empty());
+        let mut literal = moved.clone();
+        literal.literal_argv = true;
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[literal]).is_empty());
     }
 
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
@@ -3562,11 +5441,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -3601,6 +5482,94 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn an_older_peer_cannot_strip_outside_creation_launch_policy() {
+        let pid = Uuid::new_v4();
+        let mut literal = Instance::shell(pid);
+        literal.program = Some("/usr/local/bin/native".into());
+        literal.args = vec!["opening brief".into(), "".into()];
+        literal.literal_argv = true;
+        literal.control_created = true;
+        literal.launch_dir = Some("/srv/external".into());
+        let mut task = Instance::from_preset(pid, &AgentPreset::claude());
+        task.control_created = true;
+        task.control_prompt = true;
+        task.instruction_injection = Some(InjectionMode::CliFlag {
+            flag: "--append-system-prompt".into(),
+        });
+        task.launch_dir = Some("/srv/external".into());
+        let local = vec![literal.clone(), task.clone()];
+        // The same panes as an older build writes them back: unknown fields gone.
+        let older: Vec<Instance> = local
+            .iter()
+            .map(|instance| {
+                let mut json = serde_json::to_value(instance).unwrap();
+                let fields = json.as_object_mut().unwrap();
+                for field in [
+                    "literal_argv",
+                    "launch_dir",
+                    "control_created",
+                    "control_prompt",
+                    "instruction_injection",
+                ] {
+                    fields.remove(field);
+                }
+                serde_json::from_value(json).unwrap()
+            })
+            .collect();
+        assert!(!older[0].literal_argv && older[0].launch_dir.is_none());
+        let merged = merge_peer_instances(&local, older, pid);
+        for (merged, mine) in merged.iter().zip(&local) {
+            assert_eq!(merged.literal_argv, mine.literal_argv);
+            assert_eq!(merged.control_created, mine.control_created);
+            assert_eq!(merged.control_prompt, mine.control_prompt);
+            assert_eq!(merged.launch_dir, mine.launch_dir);
+            assert_eq!(merged.instruction_injection, mine.instruction_injection);
+        }
+        // A pane only the peer has keeps exactly what the peer wrote.
+        let added = Instance::shell(pid);
+        let merged = merge_peer_instances(&local, vec![added.clone()], pid);
+        assert!(!merged[0].literal_argv && !merged[0].control_created);
+        assert!(merged[0].launch_dir.is_none());
+    }
+
+    #[test]
+    fn peer_without_session_path_keeps_this_machines_rollout_for_the_same_conversation() {
+        let pid = Uuid::new_v4();
+        let mut mine = Instance::from_preset(pid, &AgentPreset::codex());
+        mine.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+        mine.session_started = true;
+        mine.session_path =
+            Some("/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl".into());
+        // What a peer that predates the field (or an older iOS build) writes back.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc.as_object_mut().unwrap().remove("session_path");
+        let old_peer: Instance = serde_json::from_value(doc).unwrap();
+        assert_eq!(old_peer.session_path, None);
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![old_peer], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // An iOS write-back carries the field as `null` or its value.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc["session_path"] = serde_json::Value::Null;
+        let ios: Instance = serde_json::from_value(doc).unwrap();
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![ios], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // A peer that switched the pane's conversation describes another rollout.
+        let mut switched = mine.clone();
+        switched.session_id = Some("01a1543c-9700-7000-8000-000000000002".into());
+        switched.session_path = None;
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![switched], pid);
+        assert_eq!(merged[0].session_path, None);
+
+        // This machine has none yet: the peer's copy of it stands.
+        let mut unsaved = mine.clone();
+        unsaved.session_path = None;
+        let merged = merge_peer_instances(&[unsaved], vec![mine.clone()], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+    }
+
+    #[test]
     fn namesakes_on_different_sockets_survive_dedupe_and_old_peer_sync() {
         let mut ws = Workspace::default();
         let mut a = Instance::shell(Uuid::new_v4());
@@ -3619,6 +5588,64 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn unfamiliar_socket_owners_preserve_every_peer_pane() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "   ", "owner '名; $()"]
+            .into_iter()
+            .map(|name| {
+                let mut instance = Instance::shell(project.id);
+                instance.tmux_session = Some("same-name".into());
+                instance.tmux_socket = Some(tmux::Socket::try_from(name.to_string()).unwrap());
+                instance
+            })
+            .collect();
+        let ids: Vec<_> = instances.iter().map(|i| i.id).collect();
+        project.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: ids.clone(),
+            active: 0,
+            split_from: None,
+        }));
+        ws.instances = instances.clone();
+        ws.projects = vec![project.clone()];
+        let doc = RemoteLayout::capture(&project, &ws, 42);
+        let parsed = RemoteLayout::parse(&doc.to_json(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        assert_eq!(parsed.layout.as_ref().unwrap().collect_instances(), ids);
+        for expected in &instances {
+            let actual = parsed
+                .instances
+                .iter()
+                .find(|i| i.id == expected.id)
+                .unwrap();
+            assert_eq!(actual.tmux_target("p"), expected.tmux_target("p"));
+        }
+        assert_eq!(
+            RemoteLayout::parse(&parsed.to_json(), "/srv/app")
+                .unwrap()
+                .content_key(),
+            doc.content_key()
+        );
+        ws.instances = merge_peer_instances(&instances, parsed.instances, project.id);
+        dedupe_instances(&mut ws);
+        assert_eq!(
+            ws.instances.len(),
+            instances.len(),
+            "different owners must not collapse namesakes"
+        );
+
+        // An owner tmux can't use as a socket name costs only that owner.
+        let mut json: serde_json::Value = serde_json::from_str(&doc.to_json()).unwrap();
+        json["instances"][2]["tmux_socket"] = serde_json::json!("../elsewhere");
+        let parsed = RemoteLayout::parse(&json.to_string(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        let invalid = &parsed.instances[2];
+        assert_eq!(invalid.tmux_socket, None);
+        assert_eq!(invalid.tmux_session.as_deref(), Some("same-name"));
+    }
+
+    #[test]
     fn json_round_trips_and_parse_validates() {
         let mut ws = Workspace::default();
         let mut proj = remote_project("/srv/app");
@@ -3627,6 +5654,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -3682,6 +5710,94 @@ mod worktree_registry_tests {
         assert_eq!(ws.worktree(wid).map(|w| w.color), Some(2));
         ws.remove_worktree_meta(wid);
         assert!(ws.worktree(wid).is_none());
+    }
+
+    #[test]
+    fn a_pending_kill_only_holds_the_worktree_its_pane_ran_in() {
+        use std::path::Path;
+        let mut project = Project::new("p", "/repo");
+        let (mine, theirs) = (Path::new("/wt/mine"), Path::new("/wt/theirs"));
+        assert!(!project.close_pending_in(mine));
+        let target = |name: &str| tmux::SessionTarget::new(name, Some(tmux::Socket::Private));
+
+        let outside = Uuid::new_v4();
+        project.remember_closed_session(target("outside"), outside);
+        project.set_closed_worktree(outside, tmux::ClosedWorktree::Outside);
+        assert!(!project.close_pending_in(mine));
+
+        let member = Uuid::new_v4();
+        project.remember_closed_session(target("member"), member);
+        project.set_closed_worktree(member, tmux::ClosedWorktree::In(mine.into()));
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        // Resolving the owner later re-remembers the close, sometimes under the
+        // name the host really has. It must stay scoped.
+        project.remember_closed_session(target("member"), member);
+        assert!(project.close_pending_in(mine));
+        project.remember_closed_session(target("member-resolved"), member);
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        assert!(project.forget_closed_session(member));
+        assert!(!project.close_pending_in(mine));
+    }
+
+    #[test]
+    fn a_close_saved_before_worktrees_were_recorded_could_be_any_of_them() {
+        let closed: tmux::ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "older",
+            "instance": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert_eq!(closed.worktree, tmux::ClosedWorktree::Unknown);
+        assert!(closed.worktree.may_be(std::path::Path::new("/wt/any")));
+        let round: tmux::ClosedSession = serde_json::from_value(
+            serde_json::to_value(tmux::ClosedSession {
+                worktree: tmux::ClosedWorktree::In("/wt/mine".into()),
+                ..closed
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round.worktree, tmux::ClosedWorktree::In("/wt/mine".into()));
+    }
+
+    #[test]
+    fn a_closing_instance_records_the_worktree_it_ran_in() {
+        let mut workspace = Workspace::default();
+        let project = Uuid::new_v4();
+        let registered = Worktree {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: "w".into(),
+            path: "/wt/registered".into(),
+            branch: "b".into(),
+            color: 0,
+            detached: false,
+        };
+        let wid = registered.id;
+        workspace.add_worktree(registered);
+        let mut instance = Instance::shell(project);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Outside
+        );
+        instance.worktree_path = Some("/wt/legacy".into());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/legacy".into())
+        );
+        instance.worktree_id = Some(wid);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/registered".into())
+        );
+        instance.worktree_id = Some(Uuid::new_v4());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Unknown
+        );
     }
 
     #[test]

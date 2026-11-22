@@ -9,7 +9,9 @@ reads/writes the same per-project `.muxel/workspace.json` and uses muxel's exact
 tmux session naming, so the phone and desktop see the same sessions.
 
 This app is **independent of the Rust cargo workspace** — `cargo` does not build it,
-and the CI gate (`cargo fmt/clippy/test/build`) does not cover it. It re-implements
+and the cargo gate (`cargo fmt/clippy/test/build`) does not cover it. A separate
+workflow, `.github/workflows/ios.yml`, builds it unsigned and runs `MuxelTests` on a
+simulator whenever `ios/` changes. It re-implements
 (ports) a small, versioned slice of `muxel-core`'s *remote protocol* and must track
 it (see the contract below).
 
@@ -96,10 +98,12 @@ the matching Swift port and the `RemoteLayout` version handling.
 |---|---|---|
 | tmux session name `muxel_<host-slug>_<uuid8>` | `crates/muxel-core/src/tmux.rs` | `Tmux/TmuxSession.swift` |
 | muxel's own tmux server `tmux -L mxl`; a session found there, else on the default server, else new on muxel's | `tmux.rs` (`SOCKET_NAME`, `Socket::locate`), `ssh.rs` (`select_tmux_socket`) | `Tmux/TmuxCommands.swift` (`socketName`, `selectSocket`) |
-| Optional `Instance.tmux_socket` (`mxl`, `default`, or `mxl-` plus sixteen hex digits for an isolated profile) preserves server ownership through discovery, attachment, polling and cleanup; a missing legacy owner is resolved before mutation | `tmux.rs` (`SessionTarget`), `lib.rs` (`Instance`), `ssh.rs` (`select_session_socket`) | `Models/Instance.swift`, `Tmux/TmuxCommands.swift` (`SessionTarget`, `resolveTarget`), `Interop/PollService.swift` |
+| Optional `Instance.tmux_socket` (`mxl`, `default`, or any recorded named server) preserves the exact name through decode/encode, attachment, polling and cleanup on both platforms; unknown names never become legacy discovery or discard a layout. A name tmux can't use as a socket file name (empty, `.`, `..`, holding `/` or NUL) decodes as no owner | `tmux.rs` (`Socket::Named`, `Socket::try_from`, `recorded_socket`, `SessionTarget`), `lib.rs` (`Instance`), `ssh.rs` (`select_session_socket`) | `Models/Instance.swift`, `Tmux/TmuxCommands.swift` (`isSocketName`, `SessionTarget`, `resolveTarget`), `Interop/PollService.swift` |
+| An extinct Default binding may move to `mxl` only after checked replies confirm no same-name session on either server. A session still listed on Default under its name reattaches on Default's answer alone. Checked listings are names only; a status-0 answer with an empty line is no answer. A Private namesake retains the saved Default binding and stops attachment pending ownership refresh. A fresh authoritative layout binding for the same instance ID can permit Private attachment; never infer that owner from namesake inventory. Persist only if the observed durable binding is unchanged, before preparing a PTY. The move is one-way: a stale copy naming Default never replaces a saved `mxl` owner of the same session | `tmux.rs` (`SessionTarget::for_respawn`), `ssh.rs` (`checked_session_listings_on`, `still_on_default`, `parse_session_listings_for_migration`), `lib.rs` (`moved_off_default`) | `Tmux/TmuxCommands.swift` (`parseConfirmedListings`, `defaultOwnerTargets`, `parseConfirmedTargets`, `targetForNewSession`), `App/AppState.swift` (`prepareTmuxAttachmentPlan`, `bindTmuxTarget`) |
 | `tmux new-session -A -d -s … -c … -- prog args` | `tmux.rs` | `Tmux/TmuxCommands.swift` |
 | `tmux start-server ';' set -s exit-empty off` before the first session | `tmux.rs` (`start_server_args`) | `Tmux/TmuxCommands.swift` (`startServer`) |
 | `set-environment -g -u MUXEL_INSTANCE_ID ';'` ahead of every `new-session` | `tmux.rs` (`launch_session_args_with_env`), `ssh.rs` | `Tmux/TmuxCommands.swift` (`clearInstanceId`) |
+| Record the initial agent's `$TMUX_PANE` as `@muxel_control_pane` before exec, only on creation | `tmux.rs` (`control_pane_program`), `ssh.rs` | `Tmux/TmuxCommands.swift` (`launchAgent`, `newAttachedPTYCommand`) |
 | `RemoteLayout` v1 JSON (`.muxel/workspace.json`) | `crates/muxel-core/src/lib.rs` | `Models/RemoteLayout.swift` |
 | Pane tree (`leaf`/`split` tagged enum, legacy `instance` leaf) | `crates/muxel-core/src/pane.rs` | `Models/PaneNode.swift` |
 | Pane-tree mutations (`split`/`move_into_split`/`add_tab`/`remove`/`normalize`) | `pane.rs` | `Models/PaneMutations.swift` |
